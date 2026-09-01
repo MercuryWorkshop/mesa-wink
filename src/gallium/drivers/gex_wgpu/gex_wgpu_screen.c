@@ -286,6 +286,16 @@ struct gex_wgpu_screen {
       WGPUBindGroup group;
    } bg_cache[GEX_WGPU_BG_CACHE_SLOTS];
    uint64_t bg_cache_hits, bg_cache_misses;
+   /* Bumped whenever a cached bind group or pipeline is evicted and released.
+    *
+    * The per-pass "already emitted" state compares raw handles, and a handle
+    * that has been freed can be handed back for a different object at the
+    * same address -- at which point a stale entry compares equal and the
+    * bind is skipped, so the draw runs with whatever the pass had before.
+    * That is invisible until it is not: SuperTuxKart went black while still
+    * presenting sixty frames a second. Evictions are rare next to draws, so
+    * throwing the whole emitted state away on one costs nothing. */
+   uint64_t cache_epoch;
    /* Render pipelines, keyed on the bytes of their descriptor and everything
     * it points at. Serialising rather than enumerating the fields on purpose:
     * a field left out of an enumerated key returns the *wrong* pipeline,
@@ -459,6 +469,7 @@ struct gex_wgpu_context {
       uint32_t scissor[4];
       bool scissor_set;
    } emitted;
+   uint64_t emitted_epoch;
    /* Everything those draws read or write. A map or an upload has to push the
     * batch out only if it lands on one of these -- and almost none of them
     * do: an application streaming geometry maps a fresh buffer every time.
@@ -12131,8 +12142,10 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
    /* Safe to release the evicted one now: it is a different key from the one
     * this draw just took, and Dawn keeps its own reference for any work
     * already submitted with it. */
-   if (slot->used)
+   if (slot->used) {
+      ++screen->cache_epoch;
       wgpuRenderPipelineRelease(slot->pipeline);
+   }
    slot->used = true;
    slot->hash = hash;
    slot->key_length = length;
@@ -12184,6 +12197,7 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    if (!group)
       return NULL;
    if (slot->used) {
+      ++screen->cache_epoch;
       if (screen->retired_count < ARRAY_SIZE(screen->retired_groups))
          screen->retired_groups[screen->retired_count++] = slot->group;
       else
@@ -14372,6 +14386,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       memset(&ctx->emitted, 0, sizeof(ctx->emitted));
       if (!counting && ctx->pending_pass)
          ctx->pending_pass_key = wanted_pass;
+   }
+   /* An eviction since the last draw may have recycled a handle this state
+    * still names; see gex_wgpu_screen::cache_epoch. */
+   if (ctx->emitted_epoch != screen->cache_epoch) {
+      memset(&ctx->emitted, 0, sizeof(ctx->emitted));
+      ctx->emitted_epoch = screen->cache_epoch;
    }
    WGPURenderPassEncoder pass = ctx->pending_pass;
    if (gex_timing) gex_wgpu_time_begin += os_time_get_nano() - t_begin_start;
