@@ -437,6 +437,28 @@ struct gex_wgpu_context {
       bool depth_read_only;
       bool stencil_read_only;
    } pending_pass_key;
+   /* What the open pass was last told. Consecutive draws in a scene mostly
+    * differ in one uniform offset and nothing else, but the driver re-issued
+    * the pipeline, every bind group, every vertex buffer, the index buffer
+    * and the viewport for each one -- a Dawn encoder call is not free, it
+    * validates. Re-emitting only what changed is what a Vulkan driver does
+    * with dirty bits, and is most of the gap on a scene of many small draws.
+    * All of it is cleared when a pass begins. */
+   struct {
+      WGPURenderPipeline pipeline;
+      WGPUBindGroup groups[4];
+      uint32_t dynamic_count[4];
+      uint32_t dynamic[4][GEX_WGPU_MAX_CONSTANT_BUFFERS];
+      WGPUBuffer vertex[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
+      uint64_t vertex_offset[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
+      unsigned vertex_count;
+      WGPUBuffer index;
+      WGPUIndexFormat index_format;
+      uint64_t index_offset;
+      float viewport[6];
+      uint32_t scissor[4];
+      bool scissor_set;
+   } emitted;
    /* Everything those draws read or write. A map or an upload has to push the
     * batch out only if it lands on one of these -- and almost none of them
     * do: an application streaming geometry maps a fresh buffer every time.
@@ -3763,6 +3785,7 @@ static void *
 gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
                                  const struct pipe_rasterizer_state *state)
 {
+   GEX_ENTRY_TIMER();
    /* The fields this driver acts on, plus the ones it is safe to ignore.
     *
     * A refused rasterizer state is not a refused feature: cso binds it as
@@ -3887,6 +3910,7 @@ gex_wgpu_bind_rasterizer_state(struct pipe_context *pipe, void *state)
 static void
 gex_wgpu_delete_rasterizer_state(struct pipe_context *pipe, void *state)
 {
+   GEX_ENTRY_TIMER();
    (void)pipe;
    FREE(state);
 }
@@ -3905,6 +3929,7 @@ static void *
 gex_wgpu_create_dsa_state(struct pipe_context *pipe,
                           const struct pipe_depth_stencil_alpha_state *state)
 {
+   GEX_ENTRY_TIMER();
    (void)pipe;
    /* Checked field by field, not by memcmp against a rebuilt copy. The memcmp
     * made every *disabled* feature's leftover bytes part of the comparison,
@@ -4003,12 +4028,14 @@ static void
 gex_wgpu_set_stencil_ref(struct pipe_context *pipe,
                          const struct pipe_stencil_ref ref)
 {
+   GEX_ENTRY_TIMER();
    ((struct gex_wgpu_context *)pipe)->stencil_ref = ref;
 }
 
 static void
 gex_wgpu_delete_dsa_state(struct pipe_context *pipe, void *state)
 {
+   GEX_ENTRY_TIMER();
    (void)pipe;
    FREE(state);
 }
@@ -4017,6 +4044,7 @@ static void *
 gex_wgpu_create_blend_state(struct pipe_context *pipe,
                             const struct pipe_blend_state *state)
 {
+   GEX_ENTRY_TIMER();
    (void)pipe;
    struct pipe_blend_state supported = {0};
    (void)supported;
@@ -4201,6 +4229,7 @@ static void
 gex_wgpu_set_blend_color(struct pipe_context *pipe,
                          const struct pipe_blend_color *color)
 {
+   GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    if (!color || !isfinite(color->color[0]) || !isfinite(color->color[1]) ||
        !isfinite(color->color[2]) || !isfinite(color->color[3])) {
@@ -4220,6 +4249,7 @@ gex_wgpu_bind_blend_state(struct pipe_context *pipe, void *state)
 static void
 gex_wgpu_delete_blend_state(struct pipe_context *pipe, void *state)
 {
+   GEX_ENTRY_TIMER();
    (void)pipe;
    FREE(state);
 }
@@ -4275,6 +4305,7 @@ gex_wgpu_set_scissor_states(struct pipe_context *pipe, unsigned start_slot,
                             unsigned num_scissors,
                             const struct pipe_scissor_state *states)
 {
+   GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    if (start_slot != 0 || num_scissors != 1 || !states ||
        states[0].minx > states[0].maxx || states[0].miny > states[0].maxy) {
@@ -4527,6 +4558,7 @@ gex_wgpu_create_vertex_elements_state(struct pipe_context *pipe,
                                       unsigned num_elements,
                                       const struct pipe_vertex_element *elements)
 {
+   GEX_ENTRY_TIMER();
    (void)pipe;
    if (num_elements > GEX_WGPU_MAX_VERTEX_ELEMENTS ||
        (num_elements && !elements)) {
@@ -4650,6 +4682,7 @@ gex_wgpu_bind_vertex_elements_state(struct pipe_context *pipe, void *state)
 static void
 gex_wgpu_delete_vertex_elements_state(struct pipe_context *pipe, void *state)
 {
+   GEX_ENTRY_TIMER();
    (void)pipe;
    FREE(state);
 }
@@ -6058,6 +6091,7 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
                              struct pipe_resource *texture,
                              const struct pipe_sampler_view *templ)
 {
+   GEX_ENTRY_TIMER();
    /* A refused sampler view is returned as NULL, and not every caller checks:
     * u_blitter builds one for its blit source and dereferences it, which is a
     * null read at offset 4 -- the fault that takes down the whole module. So
@@ -6220,6 +6254,7 @@ static void
 gex_wgpu_sampler_view_destroy(struct pipe_context *pipe,
                               struct pipe_sampler_view *base)
 {
+   GEX_ENTRY_TIMER();
    (void)pipe;
    struct gex_wgpu_sampler_view *view = (struct gex_wgpu_sampler_view *)base;
    pipe_resource_reference(&view->base.texture, NULL);
@@ -6250,6 +6285,7 @@ static void *
 gex_wgpu_create_sampler_state(struct pipe_context *pipe,
                               const struct pipe_sampler_state *state)
 {
+   GEX_ENTRY_TIMER();
    const bool border = state->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
                        state->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
                        state->wrap_r == PIPE_TEX_WRAP_CLAMP_TO_BORDER;
@@ -6393,6 +6429,7 @@ gex_wgpu_bind_sampler_states(struct pipe_context *pipe,
 static void
 gex_wgpu_delete_sampler_state(struct pipe_context *pipe, void *state)
 {
+   GEX_ENTRY_TIMER();
    (void)pipe;
    struct gex_wgpu_sampler *sampler = state;
    if (sampler && sampler->sampler)
@@ -11672,6 +11709,7 @@ uint64_t gex_wgpu_presents;
 uint64_t gex_wgpu_present_nanos;
 static uint64_t gex_wgpu_batched_submits;
 static uint64_t gex_wgpu_batched_draws;
+
 static int64_t gex_wgpu_time_origin;
 static uint64_t gex_wgpu_timed_draws;
 
@@ -11816,6 +11854,98 @@ gex_wgpu_cached_pipeline_layout(struct gex_wgpu_screen *screen,
 static const char *gex_wgpu_submit_cause[GEX_WGPU_SUBMIT_CAUSES];
 static uint64_t gex_wgpu_submit_cause_count[GEX_WGPU_SUBMIT_CAUSES];
 
+/* The periodic rolling report. Called from the draw path whether or not the
+ * draw is issued, so GEX_WGPU_NO_DRAW still reports a frame rate. */
+static void
+gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
+{
+   if (++gex_wgpu_timed_draws % 20000 != 0)
+      return;
+
+         const int64_t wall = os_time_get_nano() - gex_wgpu_time_origin;
+         const uint64_t n = gex_wgpu_timed_draws;
+         /* Since the previous report, not since the start: an application
+          * spends its first minute loading, and an average over that says
+          * nothing about how fast it runs once it is going. */
+         static int64_t last_at;
+         static uint64_t last_draws, last_presents;
+         static int64_t last_draw_nanos, last_entry_nanos;
+         const double seconds = (wall - last_at) / 1e9;
+         static uint64_t last_present_nanos;
+         if (seconds > 0.0)
+            fprintf(stderr,
+                    "gex-wgpu: %.1f frames/s, %.0f draws/s, %.0f draws/frame"
+                    ", %.0f%% of wall in draw_vbo, %.0f%% in state calls"
+                    ", %.0f%% in present\n",
+                    (gex_wgpu_presents - last_presents) / seconds,
+                    (n - last_draws) / seconds,
+                    gex_wgpu_presents > last_presents
+                       ? (double)(n - last_draws) /
+                         (double)(gex_wgpu_presents - last_presents) : 0.0,
+                    100.0 * (gex_wgpu_time_draw - last_draw_nanos) /
+                       (double)(wall - last_at),
+                    100.0 * (gex_wgpu_time_entry - last_entry_nanos) /
+                       (double)(wall - last_at),
+                    100.0 * (gex_wgpu_present_nanos - last_present_nanos) /
+                       (double)(wall - last_at));
+         last_entry_nanos = gex_wgpu_time_entry;
+         last_present_nanos = gex_wgpu_present_nanos;
+         last_draw_nanos = gex_wgpu_time_draw;
+         last_at = wall;
+         last_draws = n;
+         last_presents = gex_wgpu_presents;
+         fprintf(stderr,
+                 "gex-wgpu: %llu draws, %lld ms wall, %lld ms in draw_vbo "
+                 "(%.0f us/draw: bounds %.0f, fs-module %.0f, layouts+bindgroups %.0f, "
+                 "pipeline %.0f, views %.0f, encoder %.0f, bindgroups %.0f, begin %.0f, "
+                 "setters %.0f, end %.0f, "
+                 "finish %.0f, "
+                 "submit %.0f, "
+                 "rest %.0f)\n",
+                 (unsigned long long)n, (long long)(wall / 1000000),
+                 (long long)(gex_wgpu_time_draw / 1000000),
+                 gex_wgpu_time_draw / 1000.0 / n,
+                 gex_wgpu_time_bounds / 1000.0 / n,
+                 gex_wgpu_time_fsmod / 1000.0 / n,
+                 gex_wgpu_time_bind / 1000.0 / n,
+                 gex_wgpu_time_pipeline / 1000.0 / n,
+                 gex_wgpu_time_views / 1000.0 / n,
+                 gex_wgpu_time_encoder / 1000.0 / n,
+                 gex_wgpu_time_bg / 1000.0 / n,
+                 gex_wgpu_time_begin / 1000.0 / n,
+                 (gex_wgpu_time_record - gex_wgpu_time_views -
+                  gex_wgpu_time_finish - gex_wgpu_time_begin -
+                  gex_wgpu_time_end - gex_wgpu_time_bg -
+                  gex_wgpu_time_encoder) / 1000.0 / n,
+                 gex_wgpu_time_end / 1000.0 / n,
+                 gex_wgpu_time_finish / 1000.0 / n,
+                 gex_wgpu_time_submit / 1000.0 / n,
+                 (gex_wgpu_time_draw - gex_wgpu_time_bounds -
+                  gex_wgpu_time_fsmod -
+                  gex_wgpu_time_bind - gex_wgpu_time_pipeline -
+                  gex_wgpu_time_record -
+                  gex_wgpu_time_submit) / 1000.0 / n);
+
+         const uint64_t bg = sc->bg_cache_hits + sc->bg_cache_misses;
+         const uint64_t pl = sc->pipeline_cache_hits + sc->pipeline_cache_misses;
+         fprintf(stderr,
+                 "gex-wgpu: cache hit rate -- bind groups %.1f%% (%llu), "
+                 "pipelines %.1f%% (%llu)\n",
+                 bg ? 100.0 * sc->bg_cache_hits / bg : 0.0,
+                 (unsigned long long)sc->bg_cache_misses,
+                 pl ? 100.0 * sc->pipeline_cache_hits / pl : 0.0,
+                 (unsigned long long)sc->pipeline_cache_misses);
+         fprintf(stderr, "gex-wgpu: %llu submits for %llu batched draws;"
+                         " broken by:",
+                 (unsigned long long)gex_wgpu_batched_submits,
+                 (unsigned long long)gex_wgpu_batched_draws);
+         for (unsigned i = 0; i < GEX_WGPU_SUBMIT_CAUSES; ++i)
+            if (gex_wgpu_submit_cause[i])
+               fprintf(stderr, " %s=%llu", gex_wgpu_submit_cause[i],
+                       (unsigned long long)gex_wgpu_submit_cause_count[i]);
+         fprintf(stderr, "\n");
+      }
+
 /* Closes the open render pass, leaving the encoder to carry on. Every path
  * that stops recording draws goes through here: a different framebuffer, a
  * clear, an occlusion query, or the submit itself. */
@@ -11828,6 +11958,7 @@ gex_wgpu_end_pass(struct gex_wgpu_context *ctx)
    wgpuRenderPassEncoderRelease(ctx->pending_pass);
    ctx->pending_pass = NULL;
    memset(&ctx->pending_pass_key, 0, sizeof(ctx->pending_pass_key));
+   memset(&ctx->emitted, 0, sizeof(ctx->emitted));
 }
 
 static void
@@ -12297,6 +12428,20 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * which also contains the application and the frame readback. */
    const bool gex_timing = gex_wgpu_timing_enabled();
    const int64_t t_draw_start = gex_timing ? os_time_get_nano() : 0;
+   /* GEX_WGPU_NO_DRAW=1 drops every draw on the floor. Not useful output --
+    * the point is the frame rate it leaves, which is the ceiling everything
+    * above this driver imposes: the application's own CPU work and st/mesa's.
+    * Comparing that with the real frame rate says whether there is anything
+    * left to win down here. */
+   static int gex_no_draw = -1;
+   if (gex_no_draw < 0) {
+      const char *value = getenv("GEX_WGPU_NO_DRAW");
+      gex_no_draw = value && *value && *value != '0';
+   }
+   if (gex_no_draw) {
+      gex_wgpu_report_timing(gex_screen(pipe->screen));
+      return;
+   }
    gex_wgpu_release_retired_groups(gex_screen(pipe->screen));
 
    /* A topology WebGPU does not have is rewritten into one it does, which
@@ -13912,8 +14057,35 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       wanted_pass.layers[i] = ctx->color_layers[i];
    }
    wanted_pass.depth = ctx->depth;
+   /* Depth is read-only when this draw samples the texture it is attached to
+    * and does not write it; computed here rather than with the attachment
+    * because the answer is part of the key. */
+   if (ctx->depth) {
+      bool depth_sampled = false;
+      for (unsigned i = 0; i < GEX_WGPU_MAX_SAMPLERS; ++i) {
+         const struct pipe_sampler_view *view = ctx->sampler_views[i];
+         if (view && view->texture == ctx->depth) {
+            depth_sampled = true;
+            break;
+         }
+      }
+      wanted_pass.depth_read_only =
+         depth_sampled && !(ctx->dsa && ctx->dsa->depth_writemask);
+   }
+   /* If the open pass already has exactly these attachments, none of the
+    * views, descriptors or checks below are needed: they describe a pass that
+    * is not going to be begun. Creating them anyway cost two to three
+    * microseconds of every draw. */
+   const bool counting_now = ctx->active_query && ctx->occlusion_set;
+   const bool reuse = !counting_now && ctx->pending_pass &&
+      memcmp(&ctx->pending_pass_key, &wanted_pass, sizeof(wanted_pass)) == 0;
    WGPUTextureView views[GEX_WGPU_MAX_COLOR_TARGETS] = {0};
+   WGPUTextureView depth_view = NULL;
    bool missing_view = false;
+   /* Only a pass that is about to begin needs attachment views. Making them
+    * for a pass that is already open, and releasing them unused, was two to
+    * three microseconds of every draw. */
+   if (!reuse)
    for (unsigned i = 0; i < ctx->color_count; ++i) {
       /* Named explicitly: when the surface reinterprets an sRGB texture as
        * linear, or the reverse, the view is what carries that. */
@@ -13945,8 +14117,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          gex_resource(ctx->colors[i])->texture, &color_view);
       missing_view |= !views[i];
    }
-   WGPUTextureView depth_view = ctx->depth
-      ? wgpuTextureCreateView(gex_resource(ctx->depth)->texture, NULL) : NULL;
+   if (!reuse && ctx->depth)
+      depth_view = wgpuTextureCreateView(gex_resource(ctx->depth)->texture,
+                                         NULL);
    if (gex_timing) gex_wgpu_time_views += os_time_get_nano() - t_record_start;
    const int64_t t_encoder_start = gex_timing ? os_time_get_nano() : 0;
    /* Joins whatever draws are already recorded rather than starting its own
@@ -14096,8 +14269,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       (needs_texture && !bind_groups[0]) ||
       (needs_vertex_constant && !bind_groups[1]) ||
       (needs_fragment_constant && !bind_groups[2]);
-   if (!pipeline || missing_view || (ctx->depth && !depth_view) || !encoder ||
-       bind_failed) {
+   if (!pipeline || (!reuse && (missing_view || (ctx->depth && !depth_view))) ||
+       !encoder || bind_failed) {
       fprintf(stderr,
               "gex-wgpu: draw objects pipeline=%s view=%s encoder=%s bind=%s\n",
               pipeline ? "ok" : "failed", !missing_view ? "ok" : "failed",
@@ -14192,12 +14365,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* Reuse the open pass when this draw wants exactly the same attachments.
     * A counting draw never reuses one and never leaves one open, because the
     * occlusion query index belongs to the pass. */
-   const bool reuse = !counting && ctx->pending_pass &&
-      memcmp(&ctx->pending_pass_key, &wanted_pass, sizeof(wanted_pass)) == 0;
    if (!reuse) {
       gex_wgpu_end_pass(ctx);
       ctx->pending_pass =
          wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+      memset(&ctx->emitted, 0, sizeof(ctx->emitted));
       if (!counting && ctx->pending_pass)
          ctx->pending_pass_key = wanted_pass;
    }
@@ -14206,7 +14378,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (pass) {
       if (counting)
          wgpuRenderPassEncoderBeginOcclusionQuery(pass, 0);
-      wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+      if (ctx->emitted.pipeline != pipeline) {
+         wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+         ctx->emitted.pipeline = pipeline;
+      }
       if (ctx->depth &&
           util_format_has_stencil(
              util_format_description(ctx->depth->format)))
@@ -14219,17 +14394,44 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          };
          wgpuRenderPassEncoderSetBlendConstant(pass, &blend_color);
       }
-      wgpuRenderPassEncoderSetViewport(pass, viewport_x, viewport_y,
-                                       viewport_width, viewport_height,
-                                       min_depth, max_depth);
-      if (scissor_enabled)
-         wgpuRenderPassEncoderSetScissorRect(pass, scissor_x, scissor_y,
-                                             scissor_width, scissor_height);
+      const float wanted_viewport[6] = { viewport_x, viewport_y,
+                                         viewport_width, viewport_height,
+                                         min_depth, max_depth };
+      if (memcmp(ctx->emitted.viewport, wanted_viewport,
+                 sizeof(wanted_viewport)) != 0) {
+         wgpuRenderPassEncoderSetViewport(pass, viewport_x, viewport_y,
+                                          viewport_width, viewport_height,
+                                          min_depth, max_depth);
+         memcpy(ctx->emitted.viewport, wanted_viewport,
+                sizeof(wanted_viewport));
+      }
+      if (scissor_enabled) {
+         const uint32_t wanted[4] = { scissor_x, scissor_y,
+                                      scissor_width, scissor_height };
+         if (!ctx->emitted.scissor_set ||
+             memcmp(ctx->emitted.scissor, wanted, sizeof(wanted)) != 0) {
+            wgpuRenderPassEncoderSetScissorRect(pass, scissor_x, scissor_y,
+                                                scissor_width, scissor_height);
+            memcpy(ctx->emitted.scissor, wanted, sizeof(wanted));
+            ctx->emitted.scissor_set = true;
+         }
+      }
       for (unsigned group = 0; group < 4; ++group) {
-         if (bind_groups[group])
-            wgpuRenderPassEncoderSetBindGroup(
-               pass, group, bind_groups[group], dynamic[group].count,
-               dynamic[group].count ? dynamic[group].offset : NULL);
+         if (!bind_groups[group])
+            continue;
+         const size_t offset_bytes = dynamic[group].count * sizeof(uint32_t);
+         if (ctx->emitted.groups[group] == bind_groups[group] &&
+             ctx->emitted.dynamic_count[group] == dynamic[group].count &&
+             memcmp(ctx->emitted.dynamic[group], dynamic[group].offset,
+                    offset_bytes) == 0)
+            continue;
+         wgpuRenderPassEncoderSetBindGroup(
+            pass, group, bind_groups[group], dynamic[group].count,
+            dynamic[group].count ? dynamic[group].offset : NULL);
+         ctx->emitted.groups[group] = bind_groups[group];
+         ctx->emitted.dynamic_count[group] = dynamic[group].count;
+         memcpy(ctx->emitted.dynamic[group], dynamic[group].offset,
+                offset_bytes);
       }
       /* By dense slot, matching the pipeline's layout array. Binding by
        * Gallium index instead both overran WebGPU's eight slots and walked
@@ -14237,22 +14439,44 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       for (unsigned slot = 0; slot < vb_slot_count; ++slot) {
          struct pipe_resource *buffer = ctx->vertex_buffers[vb_buffer[slot]];
          const uint32_t offset = ctx->vertex_buffer_offsets[vb_buffer[slot]];
+         WGPUBuffer handle = gex_resource(buffer)->buffer;
+         if (ctx->emitted.vertex[slot] == handle &&
+             ctx->emitted.vertex_offset[slot] == offset)
+            continue;
          wgpuRenderPassEncoderSetVertexBuffer(
-            pass, slot, gex_resource(buffer)->buffer, offset,
-            buffer->width0 - offset);
+            pass, slot, handle, offset, buffer->width0 - offset);
+         ctx->emitted.vertex[slot] = handle;
+         ctx->emitted.vertex_offset[slot] = offset;
       }
       /* After the application's, because the slot it goes in may still hold a
        * buffer bound for an earlier draw. */
-      if (default_attribute_slot >= 0)
-         wgpuRenderPassEncoderSetVertexBuffer(
-            pass, (uint32_t)default_attribute_slot,
-            gex_screen(pipe->screen)->default_attributes, 0, 32);
+      if (default_attribute_slot >= 0) {
+         /* Tracked like any other slot: a later draw may put a real buffer
+          * here, and it must not look unchanged because this one was never
+          * recorded. */
+         WGPUBuffer defaults = gex_screen(pipe->screen)->default_attributes;
+         if (ctx->emitted.vertex[default_attribute_slot] != defaults ||
+             ctx->emitted.vertex_offset[default_attribute_slot] != 0) {
+            wgpuRenderPassEncoderSetVertexBuffer(
+               pass, (uint32_t)default_attribute_slot, defaults, 0, 32);
+            ctx->emitted.vertex[default_attribute_slot] = defaults;
+            ctx->emitted.vertex_offset[default_attribute_slot] = 0;
+         }
+      }
       if (index_resource) {
-         wgpuRenderPassEncoderSetIndexBuffer(
-            pass, gex_resource(index_resource)->buffer,
-            info->index_size == 2 ? WGPUIndexFormat_Uint16 : WGPUIndexFormat_Uint32,
-            index_byte_offset,
-            index_resource->width0 - index_byte_offset);
+         WGPUBuffer index_handle = gex_resource(index_resource)->buffer;
+         const WGPUIndexFormat index_format = info->index_size == 2
+            ? WGPUIndexFormat_Uint16 : WGPUIndexFormat_Uint32;
+         if (ctx->emitted.index != index_handle ||
+             ctx->emitted.index_format != index_format ||
+             ctx->emitted.index_offset != index_byte_offset) {
+            wgpuRenderPassEncoderSetIndexBuffer(
+               pass, index_handle, index_format, index_byte_offset,
+               index_resource->width0 - index_byte_offset);
+            ctx->emitted.index = index_handle;
+            ctx->emitted.index_format = index_format;
+            ctx->emitted.index_offset = index_byte_offset;
+         }
          ++gex_wgpu_draws_issued;
          gex_wgpu_count_draw_vs(ctx->vs);
          gex_wgpu_count_draw_target(
@@ -14289,8 +14513,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    /* The views were recorded into the pass, which holds its own references,
     * so this draw is done with them even though nothing is submitted yet. */
+   /* Null on the reuse path, where no views were made. */
    for (unsigned i = 0; i < ctx->color_count; ++i)
-      wgpuTextureViewRelease(views[i]);
+      if (views[i])
+         wgpuTextureViewRelease(views[i]);
    if (depth_view)
       wgpuTextureViewRelease(depth_view);
    if (!pipeline_cached)
@@ -14341,90 +14567,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (gex_timing) {
       gex_wgpu_time_submit += os_time_get_nano() - t_submit_start;
       gex_wgpu_time_draw += os_time_get_nano() - t_draw_start;
-      if (++gex_wgpu_timed_draws % 20000 == 0) {
-         const int64_t wall = os_time_get_nano() - gex_wgpu_time_origin;
-         const uint64_t n = gex_wgpu_timed_draws;
-         /* Since the previous report, not since the start: an application
-          * spends its first minute loading, and an average over that says
-          * nothing about how fast it runs once it is going. */
-         static int64_t last_at;
-         static uint64_t last_draws, last_presents;
-         static int64_t last_draw_nanos, last_entry_nanos;
-         const double seconds = (wall - last_at) / 1e9;
-         static uint64_t last_present_nanos;
-         if (seconds > 0.0)
-            fprintf(stderr,
-                    "gex-wgpu: %.1f frames/s, %.0f draws/s, %.0f draws/frame"
-                    ", %.0f%% of wall in draw_vbo, %.0f%% in state calls"
-                    ", %.0f%% in present\n",
-                    (gex_wgpu_presents - last_presents) / seconds,
-                    (n - last_draws) / seconds,
-                    gex_wgpu_presents > last_presents
-                       ? (double)(n - last_draws) /
-                         (double)(gex_wgpu_presents - last_presents) : 0.0,
-                    100.0 * (gex_wgpu_time_draw - last_draw_nanos) /
-                       (double)(wall - last_at),
-                    100.0 * (gex_wgpu_time_entry - last_entry_nanos) /
-                       (double)(wall - last_at),
-                    100.0 * (gex_wgpu_present_nanos - last_present_nanos) /
-                       (double)(wall - last_at));
-         last_entry_nanos = gex_wgpu_time_entry;
-         last_present_nanos = gex_wgpu_present_nanos;
-         last_draw_nanos = gex_wgpu_time_draw;
-         last_at = wall;
-         last_draws = n;
-         last_presents = gex_wgpu_presents;
-         fprintf(stderr,
-                 "gex-wgpu: %llu draws, %lld ms wall, %lld ms in draw_vbo "
-                 "(%.0f us/draw: bounds %.0f, fs-module %.0f, layouts+bindgroups %.0f, "
-                 "pipeline %.0f, views %.0f, encoder %.0f, bindgroups %.0f, begin %.0f, "
-                 "setters %.0f, end %.0f, "
-                 "finish %.0f, "
-                 "submit %.0f, "
-                 "rest %.0f)\n",
-                 (unsigned long long)n, (long long)(wall / 1000000),
-                 (long long)(gex_wgpu_time_draw / 1000000),
-                 gex_wgpu_time_draw / 1000.0 / n,
-                 gex_wgpu_time_bounds / 1000.0 / n,
-                 gex_wgpu_time_fsmod / 1000.0 / n,
-                 gex_wgpu_time_bind / 1000.0 / n,
-                 gex_wgpu_time_pipeline / 1000.0 / n,
-                 gex_wgpu_time_views / 1000.0 / n,
-                 gex_wgpu_time_encoder / 1000.0 / n,
-                 gex_wgpu_time_bg / 1000.0 / n,
-                 gex_wgpu_time_begin / 1000.0 / n,
-                 (gex_wgpu_time_record - gex_wgpu_time_views -
-                  gex_wgpu_time_finish - gex_wgpu_time_begin -
-                  gex_wgpu_time_end - gex_wgpu_time_bg -
-                  gex_wgpu_time_encoder) / 1000.0 / n,
-                 gex_wgpu_time_end / 1000.0 / n,
-                 gex_wgpu_time_finish / 1000.0 / n,
-                 gex_wgpu_time_submit / 1000.0 / n,
-                 (gex_wgpu_time_draw - gex_wgpu_time_bounds -
-                  gex_wgpu_time_fsmod -
-                  gex_wgpu_time_bind - gex_wgpu_time_pipeline -
-                  gex_wgpu_time_record -
-                  gex_wgpu_time_submit) / 1000.0 / n);
-         const struct gex_wgpu_screen *sc = gex_screen(pipe->screen);
-         const uint64_t bg = sc->bg_cache_hits + sc->bg_cache_misses;
-         const uint64_t pl = sc->pipeline_cache_hits + sc->pipeline_cache_misses;
-         fprintf(stderr,
-                 "gex-wgpu: cache hit rate -- bind groups %.1f%% (%llu), "
-                 "pipelines %.1f%% (%llu)\n",
-                 bg ? 100.0 * sc->bg_cache_hits / bg : 0.0,
-                 (unsigned long long)sc->bg_cache_misses,
-                 pl ? 100.0 * sc->pipeline_cache_hits / pl : 0.0,
-                 (unsigned long long)sc->pipeline_cache_misses);
-         fprintf(stderr, "gex-wgpu: %llu submits for %llu batched draws;"
-                         " broken by:",
-                 (unsigned long long)gex_wgpu_batched_submits,
-                 (unsigned long long)gex_wgpu_batched_draws);
-         for (unsigned i = 0; i < GEX_WGPU_SUBMIT_CAUSES; ++i)
-            if (gex_wgpu_submit_cause[i])
-               fprintf(stderr, " %s=%llu", gex_wgpu_submit_cause[i],
-                       (unsigned long long)gex_wgpu_submit_cause_count[i]);
-         fprintf(stderr, "\n");
-      }
+      gex_wgpu_report_timing(screen);
    }
 }
 
