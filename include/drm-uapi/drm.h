@@ -45,7 +45,10 @@ typedef unsigned int drm_handle_t;
 
 #include <stdint.h>
 #include <sys/types.h>
-#if defined(__GNU__)
+#if defined(__GNU__) || defined(__EMSCRIPTEN__)
+/* Emscripten is musl-shaped: the _IOC macros come from <sys/ioctl.h> and
+   there is no <sys/ioccom.h>. Nothing here issues an ioctl on wasm -- the
+   virtio-gpu winsys is not built -- but drm_fourcc.h wants these typedefs. */
 #include <sys/ioctl.h>
 #else
 #include <sys/ioccom.h>

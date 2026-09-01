@@ -70,6 +70,58 @@ gex_replay = executable(
   install : false,
 )
 
+# The same decoder again, on the driver that already draws these pixels well:
+# Gallium's virgl encoder, with virglrenderer decoding on the page's WebGL.
+# Where the softpipe build is an oracle and the WebGPU one is where this is
+# going, this is the one that ships today -- guest Mesa's rendering path with
+# the guest taken out of it.
+if host_machine.system() == 'emscripten'
+  gex_virgl_replay = executable(
+    'gex-virgl-replay',
+    [
+      join_paths(gex_root, 'web', 'mobilegl', 'gexgl-mobilegl.cpp'),
+      # The virgl driver offers video decode, so it references the five
+      # `vl_video_buffer_*` helpers. Nothing here decodes video, but the
+      # symbols have to exist, and the file that defines them wants nothing
+      # but pipe and util -- so it is compiled rather than stubbed.
+      files('../../auxiliary/vl/vl_video_buffer.c'),
+    ],
+    include_directories : [
+      inc_include,
+      inc_src,
+      inc_mesa,
+      inc_gallium,
+      inc_gallium_aux,
+      inc_gallium_winsys,
+      inc_gallium_drivers,
+      include_directories('../../winsys/virgl/vtest'),
+    ],
+    cpp_args : ['-DGEX_MESA_WASM=1', '-DGEX_MESA_VIRGL=1'],
+    link_whole : [libglapi_bridge],
+    link_with : [libglapi, libgallium, libmesa, libws_null],
+    dependencies : [
+      idep_mesautil,
+      idep_nir,
+      idep_libglsl,
+      driver_virgl,
+      dep_thread,
+      dep_clock,
+    ],
+    link_args : [
+      '--no-entry',
+      '-sALLOW_MEMORY_GROWTH=1',
+      '-sASSERTIONS=2',
+      '-sMODULARIZE=1',
+      '-sEXPORT_ES6=1',
+      '-sEXPORT_NAME=createGexMesa',
+      '-sENVIRONMENT=web,worker,node',
+      '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_malloc,_free',
+      '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
+    ],
+    install : false,
+  )
+endif
+
 # Sanitizer shadow memory and metadata make the instrumented static image much
 # larger.  Apply the larger heap only to these diagnostic targets; release
 # browser artifacts retain their small initial allocation and grow on demand.

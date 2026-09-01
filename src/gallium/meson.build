@@ -179,7 +179,12 @@ endif
 if with_gallium_virgl
   subdir('winsys/virgl/common')
   if not with_platform_windows
-    subdir('winsys/virgl/drm')
+    # The DRM winsys wants a virtio-gpu device node and libdrm; wasm has
+    # neither, and the vtest winsys -- a socket to virglrenderer -- is the
+    # whole point of the driver there.
+    if host_machine.system() != 'emscripten'
+      subdir('winsys/virgl/drm')
+    endif
     subdir('winsys/virgl/vtest')
   endif
   subdir('drivers/virgl')

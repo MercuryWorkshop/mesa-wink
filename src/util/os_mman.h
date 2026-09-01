@@ -40,7 +40,11 @@
 
 #include "util/detect_os.h"
 
-#if DETECT_OS_POSIX
+#if DETECT_OS_POSIX || DETECT_OS_POSIX_LITE
+/* Emscripten is POSIX-lite (see detect_os.h) and provides this header: mmap
+ * of a descriptor the other side of a socket handed over cannot work there,
+ * but nothing asks it to -- the vtest winsys only maps a shm fd a server
+ * offered, and a server that cannot pass one never does. */
 #  include <sys/mman.h>
 #else
 #  error Unsupported OS
