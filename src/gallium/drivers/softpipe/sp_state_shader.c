@@ -283,6 +283,8 @@ softpipe_delete_vs_state(struct pipe_context *pipe, void *vs)
 
    struct sp_vertex_shader *state = (struct sp_vertex_shader *) vs;
 
+   assert(state != softpipe->vs);
+
    draw_delete_vertex_shader(softpipe->draw, state->draw_data);
    tgsi_free_tokens(state->shader.tokens);
    FREE( state );
@@ -345,6 +347,8 @@ softpipe_delete_gs_state(struct pipe_context *pipe, void *gs)
 
    struct sp_geometry_shader *state =
       (struct sp_geometry_shader *)gs;
+
+   assert(state != softpipe->gs);
 
    draw_delete_geometry_shader(softpipe->draw,
                                (state) ? state->draw_data : 0);

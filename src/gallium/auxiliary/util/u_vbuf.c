@@ -461,6 +461,7 @@ u_vbuf_translate_buffers(struct u_vbuf *mgr, struct translate_key *key,
 {
    struct translate *tr;
    struct pipe_transfer *vb_transfer[PIPE_MAX_ATTRIBS] = {0};
+   enum pipe_error err = PIPE_OK;
    struct pipe_resource *out_buffer = NULL;
    uint8_t *out_map;
    unsigned out_offset, mask;
@@ -489,6 +490,24 @@ u_vbuf_translate_buffers(struct u_vbuf *mgr, struct translate_key *key,
          if (!vb->buffer.resource) {
             static uint64_t dummy_buf[4] = { 0 };
             tr->set_buffer(tr, i, dummy_buf, 0, 0);
+            continue;
+         }
+
+         /* A draw whose first vertex already lies past the end of this buffer
+          * reads nothing that exists, so feed it zeros with a zero stride --
+          * the same answer the missing-resource case above gives.
+          *
+          * Without this the clamp below underflows: `size` is unsigned, so
+          * `width0 - offset` for an offset past the end becomes about 4G.
+          * That reaches pipe_buffer_map_range as a negative pipe_box width
+          * (SuperTuxKart hit it as offset 54868 into a 44-byte buffer, mapping
+          * 54868+-54824), and the num_vertices recomputed from it came to
+          * 97 million -- enough translated output to exhaust the GPU's memory
+          * and lose the device. The existing clamp only covers a range that
+          * starts inside the buffer and runs off the end. */
+         if (offset >= vb->buffer.resource->width0) {
+            static uint64_t past_end_buf[4] = { 0 };
+            tr->set_buffer(tr, i, past_end_buf, 0, 0);
             continue;
          }
 
@@ -546,8 +565,10 @@ u_vbuf_translate_buffers(struct u_vbuf *mgr, struct translate_key *key,
                      key->output_stride * draw->count, 4,
                      &out_offset, &out_buffer, releasebuf,
                      (void**)&out_map);
-      if (!out_buffer)
-         return PIPE_ERROR_OUT_OF_MEMORY;
+      if (!out_buffer) {
+         err = PIPE_ERROR_OUT_OF_MEMORY;
+         goto unmap_sources;
+      }
 
       if (info->has_user_indices) {
          map = (uint8_t*)info->index.user + offset;
@@ -580,15 +601,29 @@ u_vbuf_translate_buffers(struct u_vbuf *mgr, struct translate_key *key,
                      key->output_stride * num_vertices, 4,
                      &out_offset, &out_buffer, releasebuf,
                      (void**)&out_map);
-      if (!out_buffer)
-         return PIPE_ERROR_OUT_OF_MEMORY;
+      if (!out_buffer) {
+         err = PIPE_ERROR_OUT_OF_MEMORY;
+         goto unmap_sources;
+      }
 
       out_offset -= key->output_stride * start_vertex;
 
       tr->run(tr, 0, num_vertices, 0, 0, out_map);
    }
 
-   /* Unmap all buffers. */
+   /* Unmap all buffers.
+    *
+    * Reached by `goto` from the allocation failures above as well as by
+    * falling through, because returning straight out of those leaked every
+    * source buffer this call had mapped -- and an allocation failure is
+    * exactly when memory must not be leaked. Under pressure it fed itself:
+    * the leaked transfers pin their resources, the pinned resources keep
+    * their driver-side shadows alive, and the next allocation is that much
+    * more likely to fail. A SuperTuxKart run accumulated 19,937 open
+    * PIPE_MAP_READ maps of PIPE_BIND_VERTEX_BUFFER resources this way,
+    * holding about 1.9 GB.
+    */
+unmap_sources:
    mask = vb_mask;
    while (mask) {
       unsigned i = u_bit_scan(&mask);
@@ -597,6 +632,8 @@ u_vbuf_translate_buffers(struct u_vbuf *mgr, struct translate_key *key,
          pipe_buffer_unmap(mgr->pipe, vb_transfer[i]);
       }
    }
+   if (err != PIPE_OK)
+      return err;
 
    /* Setup the new vertex buffer. */
    mgr->real_vertex_buffer[out_vb].buffer_offset = out_offset;

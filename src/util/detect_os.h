@@ -57,6 +57,13 @@
 #define DETECT_OS_POSIX_LITE 1
 #endif
 
+/* Emscripten provides the libc/time/thread subset Mesa's POSIX-lite utility
+ * path needs, but it is neither Linux nor a full Unix window-system target. */
+#if defined(__EMSCRIPTEN__)
+#define DETECT_OS_EMSCRIPTEN 1
+#define DETECT_OS_POSIX_LITE 1
+#endif
+
 #if defined(__GNU__)
 #define DETECT_OS_HURD 1
 #define DETECT_OS_POSIX 1
@@ -118,6 +125,9 @@
 #endif
 #ifndef DETECT_OS_FUCHSIA
 #define DETECT_OS_FUCHSIA 0
+#endif
+#ifndef DETECT_OS_EMSCRIPTEN
+#define DETECT_OS_EMSCRIPTEN 0
 #endif
 #ifndef DETECT_OS_HURD
 #define DETECT_OS_HURD 0

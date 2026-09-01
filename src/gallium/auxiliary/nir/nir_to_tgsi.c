@@ -1002,9 +1002,41 @@ tgsi_return_type_from_base_type(enum glsl_base_type type)
    }
 }
 
+/* TGSI declares one combined texture/sampler per index and tgsi_scan asserts
+ * that every access agrees on the declared target.  With separate texture and
+ * bare-sampler uniforms (what a Vulkan-style driver-facing NIR shader looks
+ * like) the shadow bit lives on neither uniform -- only on the access -- so
+ * collect it from the texture instructions themselves.
+ */
+static void
+ntt_gather_shadow_indices(nir_shader *s, BITSET_WORD *shadow)
+{
+   nir_foreach_function_impl(impl, s) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (!tex->is_shadow)
+               continue;
+
+            if (tex->texture_index < PIPE_MAX_SHADER_SAMPLER_VIEWS)
+               BITSET_SET(shadow, tex->texture_index);
+            if (tex->sampler_index < PIPE_MAX_SHADER_SAMPLER_VIEWS)
+               BITSET_SET(shadow, tex->sampler_index);
+         }
+      }
+   }
+}
+
 static void
 ntt_setup_uniforms(struct ntt_compile *c)
 {
+   BITSET_DECLARE(shadow_indices, PIPE_MAX_SHADER_SAMPLER_VIEWS);
+   memset(shadow_indices, 0, sizeof(shadow_indices));
+   ntt_gather_shadow_indices(c->s, shadow_indices);
+
    nir_foreach_uniform_variable(var, c->s) {
       if (glsl_type_is_sampler(glsl_without_array(var->type)) ||
           glsl_type_is_texture(glsl_without_array(var->type))) {
@@ -1016,14 +1048,31 @@ ntt_setup_uniforms(struct ntt_compile *c)
                     glsl_type_get_texture_count(var->type);
 
          const struct glsl_type *stype = glsl_without_array(var->type);
-         enum tgsi_texture_type target = tgsi_texture_type_from_sampler_dim(glsl_get_sampler_dim(stype),
-                                                                            glsl_sampler_type_is_array(stype),
-                                                                            glsl_sampler_type_is_shadow(stype));
+         /* TGSI has one combined texture/sampler namespace.  A separate bare
+          * sampler has no view type to declare and the texture declaration
+          * below already creates the combined TGSI sampler for this access. */
+         if (glsl_type_is_bare_sampler(stype))
+            continue;
+
+         /* Separate texture objects are not shadow samplers.  Driver-facing
+          * NIR can contain texture and bare-sampler uniforms independently;
+          * do not feed a texture type to the sampler-only query. */
+         const bool type_is_shadow = glsl_type_is_sampler(stype) &&
+                                     glsl_sampler_type_is_shadow(stype);
          enum tgsi_return_type ret_type = tgsi_return_type_from_base_type(glsl_get_sampler_result_type(stype));
          for (int i = 0; i < size; i++) {
-            ureg_DECL_sampler_view(c->ureg, var->data.binding + i,
+            const unsigned index = var->data.binding + i;
+            const bool is_shadow = type_is_shadow ||
+               (index < PIPE_MAX_SHADER_SAMPLER_VIEWS &&
+                BITSET_TEST(shadow_indices, index));
+            enum tgsi_texture_type target =
+               tgsi_texture_type_from_sampler_dim(glsl_get_sampler_dim(stype),
+                                                  glsl_sampler_type_is_array(stype),
+                                                  is_shadow);
+
+            ureg_DECL_sampler_view(c->ureg, index,
                target, ret_type, ret_type, ret_type, ret_type);
-            ureg_DECL_sampler(c->ureg, var->data.binding + i);
+            ureg_DECL_sampler(c->ureg, index);
          }
       } else if (glsl_contains_atomic(var->type)) {
          uint32_t offset = var->data.offset / 4;

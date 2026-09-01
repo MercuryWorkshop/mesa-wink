@@ -167,6 +167,15 @@ static void
 softpipe_delete_sampler_state(struct pipe_context *pipe,
                               void *sampler)
 {
+#ifndef NDEBUG
+   struct softpipe_context *softpipe = softpipe_context(pipe);
+
+   for (unsigned shader = 0; shader < MESA_SHADER_STAGES; shader++) {
+      for (unsigned i = 0; i < softpipe->num_samplers[shader]; i++)
+         assert(softpipe->samplers[shader][i] != sampler);
+   }
+#endif
+
    FREE( sampler );
 }
 

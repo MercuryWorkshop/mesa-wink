@@ -63,6 +63,10 @@ static void
 softpipe_delete_rasterizer_state(struct pipe_context *pipe,
                                  void *rasterizer)
 {
+   ASSERTED struct softpipe_context *softpipe = softpipe_context(pipe);
+
+   assert(rasterizer != softpipe->rasterizer);
+
    FREE( rasterizer );
 }
 

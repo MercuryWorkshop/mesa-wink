@@ -86,7 +86,7 @@ os_time_sleep(int64_t usecs)
    time.tv_nsec = (usecs % 1000000) * 1000;
    while (clock_nanosleep(CLOCK_MONOTONIC, 0, &time, &time) == EINTR);
 
-#elif DETECT_OS_POSIX
+#elif DETECT_OS_POSIX_LITE
    usleep(usecs);
 
 #elif DETECT_OS_WINDOWS

@@ -52,6 +52,13 @@ struct ntv_info {
    bool broken_arbitary_type_const;
    bool has_demote_to_helper;
    bool is_native_vulkan; //ignore zink-isms
+   /* WebGPU treats any fragment Index decoration as dual-source blending.
+    * Ordinary source zero must therefore omit the optional Vulkan decoration.
+    */
+   bool omit_fragment_output_index_zero;
+   /* WebGPU's SPIR-V ingest rejects SPV_KHR_fma.  Use the equivalent core
+    * GLSL.std.450 Fma extended instruction for nir_op_ffma instead. */
+   bool avoid_spv_khr_fma;
    bool have_shader_viewport_index_layer;
    bool have_shader_output_layer;
    struct {

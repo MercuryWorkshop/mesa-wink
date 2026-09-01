@@ -289,7 +289,8 @@ write_depth_stencil_values( struct depth_data *data,
       for (j = 0; j < TGSI_QUAD_SIZE; j++) {
          int x = quad->input.x0 % TILE_SIZE + (j & 1);
          int y = quad->input.y0 % TILE_SIZE + (j >> 1);
-         tile->data.depth32[y][x] = (data->stencilVals[j] << 24) | data->bzzzz[j];
+         tile->data.depth32[y][x] =
+            ((uint32_t)data->stencilVals[j] << 24) | data->bzzzz[j];
       }
       break;
    case PIPE_FORMAT_S8_UINT_Z24_UNORM:

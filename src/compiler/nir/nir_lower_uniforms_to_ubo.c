@@ -98,8 +98,8 @@ nir_lower_uniforms_to_ubo_instr(nir_builder *b, nir_instr *instr, void *data)
           */
          if (nir_src_is_const(intr->src[0])) {
             nir_intrinsic_set_align(load, NIR_ALIGN_MUL_MAX,
-                                    (nir_src_as_uint(intr->src[0]) +
-                                     nir_intrinsic_base(intr) * multiplier) %
+                                    ((nir_src_as_uint(intr->src[0]) +
+                                      nir_intrinsic_base(intr)) * multiplier) %
                                        NIR_ALIGN_MUL_MAX);
          } else {
             nir_intrinsic_set_align(load, MAX2(multiplier, intr->def.bit_size / 8), 0);

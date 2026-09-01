@@ -30,7 +30,8 @@ static bool
 type_needs_lowering(const struct glsl_type *type, bool lower_samplers)
 {
    type = glsl_without_array(type);
-   if (!glsl_type_is_image(type) && !glsl_type_is_sampler(type))
+   if (!glsl_type_is_image(type) && !glsl_type_is_sampler(type) &&
+       !glsl_type_is_texture(type))
       return false;
    if (glsl_get_sampler_dim(type) != GLSL_SAMPLER_DIM_CUBE)
       return false;
@@ -83,9 +84,18 @@ lower_int_cubmap_to_array_filter(const nir_instr *instr,
          return false;
       }
 
-      int sampler_deref = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
-      assert(sampler_deref >= 0);
-      nir_deref_instr *deref = nir_def_as_deref(tex->src[sampler_deref].src.ssa);
+      /* NIR may represent a sampled image either as a combined sampler or as
+       * separate texture and bare-sampler variables.  Prefer the texture
+       * deref: unlike a bare sampler, it retains the dimensionality and result
+       * type needed to decide whether this integer-cube lowering applies. */
+      int texture_deref =
+         nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+      int sampler_deref =
+         nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+      int resource_deref = texture_deref >= 0 ? texture_deref : sampler_deref;
+      assert(resource_deref >= 0);
+      nir_deref_instr *deref =
+         nir_def_as_deref(tex->src[resource_deref].src.ssa);
       nir_variable *cube = nir_deref_instr_get_variable(deref);
       return glsl_base_type_is_integer(glsl_get_sampler_result_type(cube->type));
    }
@@ -453,11 +463,13 @@ lower_cube_image_size(nir_builder *b, nir_intrinsic_instr *intr)
 static const struct glsl_type *
 make_2darray_sampler_from_cubemap(const struct glsl_type *type)
 {
-   return  glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_CUBE ?
-            glsl_sampler_type(
-               GLSL_SAMPLER_DIM_2D,
-               false, true,
-               glsl_get_sampler_result_type(type)) : type;
+   if (glsl_get_sampler_dim(type) != GLSL_SAMPLER_DIM_CUBE)
+      return type;
+   if (glsl_type_is_texture(type))
+      return glsl_texture_type(GLSL_SAMPLER_DIM_2D, true,
+                               glsl_get_sampler_result_type(type));
+   return glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, true,
+                            glsl_get_sampler_result_type(type));
 }
 
 static const struct glsl_type *

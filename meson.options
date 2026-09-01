@@ -88,6 +88,7 @@ option(
     'asahi', 'crocus', 'd3d12', 'ethosu', 'etnaviv', 'freedreno', 'i915', 'iris',
     'lima', 'llvmpipe', 'nouveau', 'panfrost', 'r300', 'r600', 'radeonsi',
     'rocket', 'softpipe', 'svga', 'tegra', 'v3d', 'vc4', 'virgl', 'zink',
+    'gex_wgpu',
   ],
   description : 'List of gallium drivers to build. If this is set to auto ' +
                 'all drivers applicable to the target OS/architecture ' +
@@ -914,4 +915,32 @@ option(
   type : 'boolean',
   value : false,
   description : 'Build panfrost Rust components.'
+)
+
+option(
+  'gex-emdawn-dir',
+  type : 'string',
+  value : '',
+  description : 'Path to the pinned emdawnwebgpu package for the gex Wasm target.'
+)
+
+option(
+  'gex-dawn-native-dir',
+  type : 'string',
+  value : '',
+  description : 'Directory holding a native Dawn libwebgpu_dawn, for a desktop gex_wgpu build. Empty means the browser build, where the page owns the device.',
+)
+
+option(
+  'gex-tint-dir',
+  type : 'string',
+  value : '',
+  description : 'Path to the pinned Tint headers and libtint.a for the gex Wasm target.'
+)
+
+option(
+  'gex-sanitize',
+  type : 'boolean',
+  value : false,
+  description : 'Reserve the larger initial Wasm heap required by ASan/UBSan gex corpus targets.'
 )

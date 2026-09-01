@@ -74,6 +74,10 @@ softpipe_bind_vertex_elements_state(struct pipe_context *pipe,
 static void
 softpipe_delete_vertex_elements_state(struct pipe_context *pipe, void *velems)
 {
+   ASSERTED struct softpipe_context *softpipe = softpipe_context(pipe);
+
+   assert(velems != softpipe->velems);
+
    FREE( velems );
 }
 

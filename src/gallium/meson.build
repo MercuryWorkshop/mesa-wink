@@ -53,6 +53,14 @@ if with_gallium_softpipe
 else
   driver_softpipe = declare_dependency()
 endif
+# The driver itself is winsys-agnostic: a browser build takes its device from
+# the page, a desktop one from native Dawn. Either needs the WebGPU headers.
+if get_option('gex-emdawn-dir') != ''
+  subdir('drivers/zink/nir_to_spirv')
+  subdir('drivers/gex_wgpu')
+else
+  driver_gex_wgpu = declare_dependency()
+endif
 if with_any_llvmpipe
   subdir('drivers/llvmpipe')
 else
@@ -254,6 +262,13 @@ endif
 if with_swrast_vk
   subdir('frontends/lavapipe')
   subdir('targets/lavapipe')
+endif
+
+# gex links Mesa's desktop GL state tracker directly into a browser worker.
+# Keep this target independent of EGL/GLX: the guest-facing library already
+# supplies those APIs and transports GL commands to the worker.
+if host_machine.system() == 'emscripten' and with_opengl and with_gallium_softpipe
+  subdir('targets/gex-wasm')
 endif
 
 if with_teflon

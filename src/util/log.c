@@ -33,6 +33,10 @@
 
 #if DETECT_OS_POSIX
 #include <syslog.h>
+#endif
+
+#if !DETECT_OS_WINDOWS
+#include <unistd.h>
 #include "util/u_process.h"
 #endif
 

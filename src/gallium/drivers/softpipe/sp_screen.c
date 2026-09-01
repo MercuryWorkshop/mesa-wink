@@ -351,7 +351,7 @@ softpipe_init_screen_caps(struct softpipe_screen *sp_screen)
          /* Cap to 2 GB on 32 bits system. We do this because llvmpipe does
           * eat application memory, which is quite limited on 32 bits. App
           * shouldn't expect too much available memory. */
-         system_memory = MIN2(system_memory, 2048 << 20);
+         system_memory = MIN2(system_memory, UINT64_C(2048) << 20);
 
       caps->video_memory = system_memory >> 20;
    } else {

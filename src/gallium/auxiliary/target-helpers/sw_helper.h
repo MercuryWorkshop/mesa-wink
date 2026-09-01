@@ -33,6 +33,10 @@
 #include "virgl/vtest/virgl_vtest_public.h"
 #endif
 
+#ifdef GALLIUM_GEX_WGPU
+#include "gex_wgpu/gex_wgpu_public.h"
+#endif
+
 static inline struct pipe_screen *
 sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config *config, const char *driver)
 {
@@ -54,6 +58,15 @@ sw_screen_create_named(struct sw_winsys *winsys, const struct pipe_screen_config
 #if defined(GALLIUM_SOFTPIPE)
    if (screen == NULL && strcmp(driver, "softpipe") == 0)
       screen = softpipe_create_screen(winsys);
+#endif
+
+#if defined(GALLIUM_GEX_WGPU)
+   /* GALLIUM_DRIVER=gex_wgpu. Named rather than default because it is chosen
+    * deliberately: it renders through native Dawn and reads each frame back
+    * to present, which is the right trade for testing the driver under real
+    * applications and the wrong one for anything else. */
+   if (screen == NULL && strcmp(driver, "gex_wgpu") == 0)
+      screen = gex_wgpu_sw_screen_create(winsys);
 #endif
 
 #if defined(GALLIUM_ZINK)

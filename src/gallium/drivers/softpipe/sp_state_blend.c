@@ -61,6 +61,14 @@ static void
 softpipe_delete_blend_state(struct pipe_context *pipe,
                             void *blend)
 {
+   ASSERTED struct softpipe_context *softpipe = softpipe_context(pipe);
+
+   /* Deleting a state object that is still bound leaves a dangling
+    * pointer in the context; catch that in debug builds instead of
+    * waiting for the eventual use-after-free.
+    */
+   assert(blend != softpipe->blend);
+
    FREE( blend );
 }
 
@@ -108,6 +116,10 @@ softpipe_bind_depth_stencil_state(struct pipe_context *pipe,
 static void
 softpipe_delete_depth_stencil_state(struct pipe_context *pipe, void *depth)
 {
+   ASSERTED struct softpipe_context *softpipe = softpipe_context(pipe);
+
+   assert(depth != softpipe->depth_stencil);
+
    FREE( depth );
 }
 

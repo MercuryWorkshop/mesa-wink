@@ -1020,7 +1020,9 @@ emit_output(struct ntv_context *ctx, struct nir_variable *var)
       if (var->data.location >= FRAG_RESULT_DATA0) {
          spirv_builder_emit_location(&ctx->builder, var_id,
                                      var->data.location - FRAG_RESULT_DATA0);
-         spirv_builder_emit_index(&ctx->builder, var_id, var->data.index);
+         if (!(ctx->sinfo->omit_fragment_output_index_zero &&
+               var->data.index == 0))
+            spirv_builder_emit_index(&ctx->builder, var_id, var->data.index);
       } else {
          switch (var->data.location) {
          case FRAG_RESULT_COLOR:
@@ -1041,7 +1043,9 @@ emit_output(struct ntv_context *ctx, struct nir_variable *var)
          default:
             spirv_builder_emit_location(&ctx->builder, var_id,
                                         var->data.location);
-            spirv_builder_emit_index(&ctx->builder, var_id, var->data.index);
+            if (!(ctx->sinfo->omit_fragment_output_index_zero &&
+                  var->data.index == 0))
+               spirv_builder_emit_index(&ctx->builder, var_id, var->data.index);
          }
       }
       if (var->data.sample)
@@ -1964,6 +1968,36 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
          result = emit_unop(ctx, SpvOpNot, dest_type, src[0]);
       break;
 
+   /* A 32-bit NIR boolean narrowed to a 1-bit one. Without this the default
+    * arm below aborted the whole module -- KHR-GL32.get_uniform_tests reaches
+    * b2b1 -- which takes the GL device with it rather than failing one
+    * shader.
+    *
+    * The identity is only right when the source is already a SPIR-V bool.
+    * Emitting it unconditionally was worse than the abort it replaced: the
+    * float the source was actually stored as got recorded under a def whose
+    * type is bool, and the next swizzle of it asked for
+    * "OpCompositeExtract %bool" from a float composite -- which Tint rejects
+    * with "Result type (OpTypeBool) does not match the type that results from
+    * indexing into the composite (OpTypeFloat)". A wide source is a 0/~0
+    * integer, so the conversion is a comparison against zero. */
+   case nir_op_b2b1: {
+      assert(nir_op_infos[alu->op].num_inputs == 1);
+      const unsigned src_bits = nir_src_bit_size(alu->src[0].src);
+      if (src_bits == 1 || stype[0] == nir_type_bool) {
+         result = src[0];
+         break;
+      }
+      const unsigned src_components = alu_instr_src_components(alu, 0);
+      SpvId int_type =
+         get_alu_type(ctx, nir_type_int, src_components, src_bits);
+      SpvId value = stype[0] == nir_type_int
+         ? src[0] : emit_bitcast(ctx, int_type, src[0]);
+      result = emit_binop(ctx, SpvOpINotEqual, dest_type, value,
+                          get_ivec_constant(ctx, src_bits, src_components, 0));
+      break;
+   }
+
    case nir_op_b2i8:
    case nir_op_b2i16:
    case nir_op_b2i32:
@@ -2020,6 +2054,14 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
    BUILTIN_UNOP(nir_op_ufind_msb, GLSLstd450FindUMsb)
    BUILTIN_UNOP(nir_op_find_lsb, GLSLstd450FindILsb)
    BUILTIN_UNOP(nir_op_ifind_msb, GLSLstd450FindSMsb)
+
+   case nir_op_fsat:
+      assert(nir_op_infos[alu->op].num_inputs == 1);
+      result = emit_builtin_triop(
+         ctx, GLSLstd450FClamp, dest_type, src[0],
+         get_fvec_constant(ctx, bit_size, num_components, 0),
+         get_fvec_constant(ctx, bit_size, num_components, 1));
+      break;
 
    case nir_op_pack_half_2x16:
       assert(nir_op_infos[alu->op].num_inputs == 1);
@@ -2168,6 +2210,16 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
          result = emit_binop(ctx, SpvOpFOrdEqual, dest_type, src[0], src[1]);
       break;
 
+   case nir_op_fmad: {
+      assert(nir_op_infos[alu->op].num_inputs == 3);
+      SpvId product = emit_binop(ctx, SpvOpFMul, dest_type,
+                                 src[0], src[1]);
+      spirv_builder_emit_decoration(&ctx->builder, product,
+                                    SpvDecorationNoContraction);
+      result = emit_binop(ctx, SpvOpFAdd, dest_type, product, src[2]);
+      break;
+   }
+
    case nir_op_flrp:
       assert(nir_op_infos[alu->op].num_inputs == 3);
       result = emit_builtin_triop(ctx, GLSLstd450FMix, dest_type,
@@ -2299,9 +2351,15 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
 
    case nir_op_ffma: {
       assert(nir_op_infos[alu->op].num_inputs == 3);
-      spirv_builder_emit_cap(&ctx->builder, SpvCapabilityFMAKHR);
-      spirv_builder_emit_extension(&ctx->builder, "SPV_KHR_fma");
-      result = emit_triop(ctx, SpvOpFmaKHR, dest_type, src[0], src[1], src[2]);
+      if (ctx->sinfo->avoid_spv_khr_fma) {
+         result = emit_builtin_triop(ctx, GLSLstd450Fma, dest_type,
+                                     src[0], src[1], src[2]);
+      } else {
+         spirv_builder_emit_cap(&ctx->builder, SpvCapabilityFMAKHR);
+         spirv_builder_emit_extension(&ctx->builder, "SPV_KHR_fma");
+         result = emit_triop(ctx, SpvOpFmaKHR, dest_type,
+                             src[0], src[1], src[2]);
+      }
       break;
    }
 
@@ -5254,9 +5312,14 @@ nir_to_spirv(struct nir_shader *s, const struct ntv_info *sinfo)
       ctx.image_var[var->data.driver_location] = var;
    nir_foreach_variable_with_modes(var, s, nir_var_uniform) {
       if (glsl_type_is_sampler(glsl_without_array(var->type))) {
-         if (var->data.descriptor_set == ctx.bindless_set_idx)
+         if (var->data.descriptor_set == ctx.bindless_set_idx) {
+            /* A driver that leaves bindless_set_idx at a set it actually uses
+             * would otherwise scribble past this table.
+             */
+            assert(var->data.driver_location <
+                   ARRAY_SIZE(ctx.bindless_sampler_var));
             ctx.bindless_sampler_var[var->data.driver_location] = var;
-         else
+         } else
             ctx.sampler_var[var->data.driver_location] = var;
          ctx.last_sampler = MAX2(ctx.last_sampler, var->data.driver_location);
       }
