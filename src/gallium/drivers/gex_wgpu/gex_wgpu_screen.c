@@ -422,12 +422,35 @@ struct gex_wgpu_context {
    /* Draws recorded into one command encoder, not yet submitted. */
    WGPUCommandEncoder pending_encoder;
    unsigned pending_draws;
+   /* And the render pass they are being recorded into, held open across
+    * consecutive draws that want the same attachments. One pass per draw is
+    * what pinned every application to about 20000 draws a second whatever
+    * its resolution -- the cost was the pass, not the pixels. */
+   WGPURenderPassEncoder pending_pass;
+   struct gex_wgpu_pass_key {
+      struct pipe_resource *colors[GEX_WGPU_MAX_COLOR_TARGETS];
+      enum pipe_format formats[GEX_WGPU_MAX_COLOR_TARGETS];
+      unsigned levels[GEX_WGPU_MAX_COLOR_TARGETS];
+      unsigned layers[GEX_WGPU_MAX_COLOR_TARGETS];
+      unsigned color_count;
+      struct pipe_resource *depth;
+      bool depth_read_only;
+      bool stencil_read_only;
+   } pending_pass_key;
    /* Everything those draws read or write. A map or an upload has to push the
     * batch out only if it lands on one of these -- and almost none of them
     * do: an application streaming geometry maps a fresh buffer every time.
     * Without this, Minecraft broke its batch 806439 times, once every nine
     * draws, and batching cost more than it saved. */
-   struct gex_wgpu_resource *batch_touched[192];
+   /* Referenced, not just noted. Dawn's per-pass usage tracking keeps raw
+    * pointers to the buffers and textures a recorded draw uses, and resolves
+    * them at submit; a resource freed in between leaves that list pointing at
+    * nothing. With one submit per draw the window did not exist. With draws
+    * batched it does, and Minecraft walked straight into it -- a crash inside
+    * dawn::native::vulkan::Buffer::EnsureDataInitialized, a few seconds after
+    * a world loaded. Holding a reference until the batch is submitted is both
+    * the fix and exactly what the batch means. */
+   struct pipe_resource *batch_touched[256];
    unsigned batch_touched_count;
    bool batch_touched_overflowed;
    /* Occlusion queries. WebGPU counts into a query set slot across a render
@@ -1107,11 +1130,42 @@ static void gex_wgpu_map_callback(WGPUMapAsyncStatus status,
  * read map of a GPU-written buffer and to fill a shadow that is being created
  * after the fact -- once the aligned-subdata path below stops creating one
  * eagerly, a later reader has to be able to recover the contents. */
+/* Wall clock inside the driver's hot state-setting entry points, so that
+ * "the rest of the frame" can be split into the driver's share and the
+ * application's. Compiled to nothing unless GEX_WGPU_TIMING is on. */
+static int64_t gex_wgpu_time_entry;
+static bool gex_wgpu_timing_enabled(void);
+
+struct gex_wgpu_entry_timer { int64_t start; };
+static inline void
+gex_wgpu_entry_timer_end(struct gex_wgpu_entry_timer *timer)
+{
+   if (timer->start)
+      gex_wgpu_time_entry += os_time_get_nano() - timer->start;
+}
+/* GEX_WGPU_TIMING=2, not 1: two clock reads in a call this small cost about
+ * as much as the call, so leaving it on halves the frame rate and makes the
+ * share it reports an overestimate of itself. */
+static bool gex_wgpu_entry_timing_enabled(void);
+#define GEX_ENTRY_TIMER()                                                     \
+   struct gex_wgpu_entry_timer gex_entry_timer                                \
+      __attribute__((cleanup(gex_wgpu_entry_timer_end))) = {                  \
+         gex_wgpu_entry_timing_enabled() ? os_time_get_nano() : 0 }
+
+static void gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx,
+                                          const char *why);
+static void gex_wgpu_end_pass(struct gex_wgpu_context *ctx);
+#define gex_wgpu_submit_pending(ctx) \
+   gex_wgpu_submit_pending_named((ctx), __func__)
+
 static bool
 gex_wgpu_buffer_readback(struct pipe_context *pipe,
                          struct gex_wgpu_resource *gex,
                          uint32_t offset, uint32_t size, void *dest)
 {
+   /* Submits its own command buffer, so anything already recorded has to
+    * reach the queue first or it would run after this. */
+   gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
    if (!size)
       return true;
@@ -3420,12 +3474,14 @@ gex_wgpu_create_fs_state(struct pipe_context *pipe,
 static void
 gex_wgpu_bind_vs_state(struct pipe_context *pipe, void *state)
 {
+   GEX_ENTRY_TIMER();
    ((struct gex_wgpu_context *)pipe)->vs = state;
 }
 
 static void
 gex_wgpu_bind_fs_state(struct pipe_context *pipe, void *state)
 {
+   GEX_ENTRY_TIMER();
    ((struct gex_wgpu_context *)pipe)->fs = state;
 }
 
@@ -3824,6 +3880,7 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
 static void
 gex_wgpu_bind_rasterizer_state(struct pipe_context *pipe, void *state)
 {
+   GEX_ENTRY_TIMER();
    ((struct gex_wgpu_context *)pipe)->rasterizer = state;
 }
 
@@ -4156,6 +4213,7 @@ gex_wgpu_set_blend_color(struct pipe_context *pipe,
 static void
 gex_wgpu_bind_blend_state(struct pipe_context *pipe, void *state)
 {
+   GEX_ENTRY_TIMER();
    ((struct gex_wgpu_context *)pipe)->blend = state;
 }
 
@@ -4171,6 +4229,7 @@ gex_wgpu_set_viewport_states(struct pipe_context *pipe, unsigned start_slot,
                              unsigned num_viewports,
                              const struct pipe_viewport_state *states)
 {
+   GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    /* An all-zero viewport is what a caller restores when this context never
     * had one -- u_blitter saves the current viewport before its draw and puts
@@ -4584,6 +4643,7 @@ gex_wgpu_create_vertex_elements_state(struct pipe_context *pipe,
 static void
 gex_wgpu_bind_vertex_elements_state(struct pipe_context *pipe, void *state)
 {
+   GEX_ENTRY_TIMER();
    ((struct gex_wgpu_context *)pipe)->vertex_elements = state;
 }
 
@@ -4598,6 +4658,7 @@ static void
 gex_wgpu_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
                             const struct pipe_vertex_buffer *buffers)
 {
+   GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    /* Kept whole for u_blitter, which restores by handing this straight back. */
    for (unsigned i = 0; i < ARRAY_SIZE(ctx->vertex_buffer_state); ++i) {
@@ -4666,8 +4727,6 @@ gex_wgpu_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
    ctx->vertex_buffer_count = count;
 }
 
-static void gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx,
-                                          const char *why);
 
 /* The staged uniform bytes nobody has told the queue about yet. */
 static void
@@ -4694,13 +4753,17 @@ gex_wgpu_batch_touch(struct gex_wgpu_context *ctx,
    if (gex->in_batch)
       return;
    if (ctx->batch_touched_count >= ARRAY_SIZE(ctx->batch_touched)) {
-      /* Out of room to remember: fall back to breaking the batch for every
-       * map, which is what the driver did before any of this. */
+      /* Nowhere left to hold a reference, so the batch can no longer promise
+       * this resource outlives it. The draw finishes and the caller submits.
+       */
       ctx->batch_touched_overflowed = true;
       return;
    }
    gex->in_batch = true;
-   ctx->batch_touched[ctx->batch_touched_count++] = gex;
+   struct pipe_resource **slot = &ctx->batch_touched[ctx->batch_touched_count];
+   *slot = NULL;
+   pipe_resource_reference(slot, resource);
+   ++ctx->batch_touched_count;
 }
 
 /* Whether an operation on this resource has to wait for the recorded draws. */
@@ -4709,8 +4772,7 @@ gex_wgpu_batch_conflicts(struct gex_wgpu_context *ctx,
                          struct pipe_resource *resource)
 {
    return ctx->pending_encoder &&
-          (ctx->batch_touched_overflowed || !resource ||
-           gex_resource(resource)->in_batch);
+          (!resource || gex_resource(resource)->in_batch);
 }
 
 /* The same question for a transfer, which can answer it itself.
@@ -4729,14 +4791,13 @@ gex_wgpu_batch_conflicts_usage(struct gex_wgpu_context *ctx,
       return false;
    return gex_wgpu_batch_conflicts(ctx, resource);
 }
-#define gex_wgpu_submit_pending(ctx) \
-   gex_wgpu_submit_pending_named((ctx), __func__)
 
 static void
 gex_wgpu_set_constant_buffer(struct pipe_context *pipe,
                              mesa_shader_stage shader, uint index,
                              const struct pipe_constant_buffer *buffer)
 {
+   GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    /* An unbind has to succeed for every stage and every slot, including the
     * ones this driver does not implement: st/mesa and cso_context clear
@@ -5808,6 +5869,7 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
                          const void *data, unsigned stride,
                          uintptr_t layer_stride)
 {
+   GEX_ENTRY_TIMER();
    if (gex_wgpu_batch_conflicts_usage((struct gex_wgpu_context *)pipe,
                                      resource, usage))
       gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
@@ -6296,6 +6358,7 @@ gex_wgpu_bind_sampler_states(struct pipe_context *pipe,
                              mesa_shader_stage shader, unsigned start_slot,
                              unsigned num_samplers, void **samplers)
 {
+   GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    if (start_slot >= GEX_WGPU_MAX_SAMPLERS ||
        num_samplers > GEX_WGPU_MAX_SAMPLERS - start_slot) {
@@ -6343,6 +6406,7 @@ gex_wgpu_set_sampler_views(struct pipe_context *pipe,
                            unsigned num_views, unsigned unbind_num_trailing_slots,
                            struct pipe_sampler_view **views)
 {
+   GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    if (shader != MESA_SHADER_FRAGMENT && shader != MESA_SHADER_VERTEX) {
       /* Clearing another stage has to succeed, for the same reason
@@ -6600,6 +6664,9 @@ static bool
 gex_wgpu_resolve_depth(struct pipe_context *pipe, struct pipe_resource *dst,
                        struct pipe_resource *src)
 {
+   /* Submits its own command buffer, so anything already recorded has to
+    * reach the queue first or it would run after this. */
+   gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
    const WGPUTextureFormat wgpu = gex_wgpu_texture_format(dst->format);
    if (!gex_wgpu_msaa_depth_pipeline(screen, wgpu))
@@ -6701,6 +6768,9 @@ gex_wgpu_write_depth(struct gex_wgpu_context *ctx,
                      const struct pipe_box *box, const uint8_t *src,
                      unsigned src_stride)
 {
+   /* Submits its own command buffer, so anything already recorded has to
+    * reach the queue first or it would run after this. */
+   gex_wgpu_submit_pending(ctx);
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
    const enum pipe_format format = resource->format;
    const WGPUTextureFormat wgpu = gex_wgpu_texture_format(format);
@@ -6957,6 +7027,9 @@ gex_wgpu_read_depth(struct gex_wgpu_context *ctx,
                     const struct pipe_box *box, uint8_t *out,
                     unsigned out_stride)
 {
+   /* Submits its own command buffer, so anything already recorded has to
+    * reach the queue first or it would run after this. */
+   gex_wgpu_submit_pending(ctx);
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
    if (!gex_wgpu_depth_resolve_pipeline(screen))
       return false;
@@ -7570,6 +7643,7 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
                     const struct pipe_box *box,
                     struct pipe_transfer **out_transfer)
 {
+   GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct gex_wgpu_resource *gex = gex_resource(resource);
    *out_transfer = NULL;
@@ -7770,6 +7844,7 @@ gex_wgpu_transfer_flush_region(struct pipe_context *pipe,
                                struct pipe_transfer *transfer,
                                const struct pipe_box *box)
 {
+   GEX_ENTRY_TIMER();
    if (transfer &&
        gex_wgpu_batch_conflicts_usage((struct gex_wgpu_context *)pipe,
                                       transfer->resource, transfer->usage))
@@ -7823,6 +7898,7 @@ static void
 gex_wgpu_buffer_unmap(struct pipe_context *pipe,
                       struct pipe_transfer *transfer)
 {
+   GEX_ENTRY_TIMER();
    if (transfer &&
        gex_wgpu_batch_conflicts_usage((struct gex_wgpu_context *)pipe,
                                       transfer->resource, transfer->usage))
@@ -8750,6 +8826,9 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
                              struct pipe_resource *src, unsigned src_level,
                              const struct pipe_box *box, bool flip_y)
 {
+   /* Submits its own command buffer, so anything already recorded has to
+    * reach the queue first or it would run after this. */
+   gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
    struct gex_wgpu_resource *gex_dst = gex_resource(dst);
@@ -8963,6 +9042,9 @@ gex_wgpu_resolve(struct pipe_context *pipe, struct pipe_resource *dst,
                  unsigned dst_level, struct pipe_resource *src,
                  unsigned src_level)
 {
+   /* Submits its own command buffer, so anything already recorded has to
+    * reach the queue first or it would run after this. */
+   gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
    if (dst->format != src->format || dst_level != 0 || src_level != 0) {
       static bool said;
@@ -9508,6 +9590,7 @@ static void
 gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
                                const struct pipe_framebuffer_state *state)
 {
+   GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    /* Kept whole for u_blitter, as above. */
    util_copy_framebuffer_state(&ctx->framebuffer, state);
@@ -10477,6 +10560,9 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
                           const struct pipe_draw_info *info,
                           const struct pipe_draw_start_count_bias *draw)
 {
+   /* Submits its own command buffer, so anything already recorded has to
+    * reach the queue first or it would run after this. */
+   gex_wgpu_submit_pending(ctx);
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
 
    /* An instanced capture still needs the invocation index to reach the
@@ -10902,6 +10988,9 @@ gex_wgpu_dispatch(struct gex_wgpu_context *ctx, WGPUShaderModule module,
                   const struct gex_wgpu_bindings *g1,
                   struct pipe_resource *zero, unsigned workgroups)
 {
+   /* Submits its own command buffer, so anything already recorded has to
+    * reach the queue first or it would run after this. */
+   gex_wgpu_submit_pending(ctx);
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
    WGPUBindGroupLayout layout0 = gex_wgpu_group_layout(screen->device, g0);
    WGPUBindGroupLayout layout1 = gex_wgpu_group_layout(screen->device, g1);
@@ -11578,10 +11667,24 @@ static int64_t gex_wgpu_time_end;
 static int64_t gex_wgpu_time_bg;
 static int64_t gex_wgpu_time_encoder;
 uint64_t gex_wgpu_presents;
+/* Nanoseconds inside flush_frontbuffer: the readback plus however long the
+ * GPU still needed. The native target adds to it. */
+uint64_t gex_wgpu_present_nanos;
 static uint64_t gex_wgpu_batched_submits;
 static uint64_t gex_wgpu_batched_draws;
 static int64_t gex_wgpu_time_origin;
 static uint64_t gex_wgpu_timed_draws;
+
+static bool
+gex_wgpu_entry_timing_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *value = getenv("GEX_WGPU_TIMING");
+      enabled = value && *value == '2';
+   }
+   return enabled != 0;
+}
 
 static bool
 gex_wgpu_timing_enabled(void)
@@ -11713,9 +11816,24 @@ gex_wgpu_cached_pipeline_layout(struct gex_wgpu_screen *screen,
 static const char *gex_wgpu_submit_cause[GEX_WGPU_SUBMIT_CAUSES];
 static uint64_t gex_wgpu_submit_cause_count[GEX_WGPU_SUBMIT_CAUSES];
 
+/* Closes the open render pass, leaving the encoder to carry on. Every path
+ * that stops recording draws goes through here: a different framebuffer, a
+ * clear, an occlusion query, or the submit itself. */
+static void
+gex_wgpu_end_pass(struct gex_wgpu_context *ctx)
+{
+   if (!ctx->pending_pass)
+      return;
+   wgpuRenderPassEncoderEnd(ctx->pending_pass);
+   wgpuRenderPassEncoderRelease(ctx->pending_pass);
+   ctx->pending_pass = NULL;
+   memset(&ctx->pending_pass_key, 0, sizeof(ctx->pending_pass_key));
+}
+
 static void
 gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
 {
+   gex_wgpu_end_pass(ctx);
    if (!ctx->pending_encoder)
       return;
    for (unsigned i = 0; i < GEX_WGPU_SUBMIT_CAUSES; ++i) {
@@ -11729,8 +11847,10 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
    const unsigned draws = ctx->pending_draws;
    ctx->pending_encoder = NULL;
    ctx->pending_draws = 0;
-   for (unsigned i = 0; i < ctx->batch_touched_count; ++i)
-      ctx->batch_touched[i]->in_batch = false;
+   for (unsigned i = 0; i < ctx->batch_touched_count; ++i) {
+      gex_resource(ctx->batch_touched[i])->in_batch = false;
+      pipe_resource_reference(&ctx->batch_touched[i], NULL);
+   }
    ctx->batch_touched_count = 0;
    ctx->batch_touched_overflowed = false;
    WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, NULL);
@@ -13777,6 +13897,21 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (gex_timing)
       gex_wgpu_time_pipeline += os_time_get_nano() - t_pipeline_start;
    const int64_t t_record_start = gex_timing ? os_time_get_nano() : 0;
+   /* Can this draw go into the pass that is already open?
+    *
+    * Everything the pass descriptor is built from goes in the key. An
+    * occlusion query is the one thing never merged: the query index is per
+    * pass, so two counting draws sharing one would both write slot zero. */
+   struct gex_wgpu_pass_key wanted_pass;
+   memset(&wanted_pass, 0, sizeof(wanted_pass));
+   wanted_pass.color_count = ctx->color_count;
+   for (unsigned i = 0; i < ctx->color_count; ++i) {
+      wanted_pass.colors[i] = ctx->colors[i];
+      wanted_pass.formats[i] = ctx->color_formats[i];
+      wanted_pass.levels[i] = ctx->color_levels[i];
+      wanted_pass.layers[i] = ctx->color_layers[i];
+   }
+   wanted_pass.depth = ctx->depth;
    WGPUTextureView views[GEX_WGPU_MAX_COLOR_TARGETS] = {0};
    bool missing_view = false;
    for (unsigned i = 0; i < ctx->color_count; ++i) {
@@ -14013,6 +14148,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
       const bool writes_depth = ctx->dsa && ctx->dsa->depth_writemask;
       const bool read_only = depth_sampled && !writes_depth;
+      wanted_pass.depth_read_only = read_only;
       depth_attachment.view = depth_view;
       depth_attachment.depthReadOnly = read_only;
       /* Unconditionally, and outside the branch below. `..._INIT` leaves this
@@ -14053,8 +14189,19 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       pass_desc.occlusionQuerySet = ctx->occlusion_set;
    if (gex_timing) gex_wgpu_time_bg += os_time_get_nano() - t_bg_start;
    const int64_t t_begin_start = gex_timing ? os_time_get_nano() : 0;
-   WGPURenderPassEncoder pass =
-      wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+   /* Reuse the open pass when this draw wants exactly the same attachments.
+    * A counting draw never reuses one and never leaves one open, because the
+    * occlusion query index belongs to the pass. */
+   const bool reuse = !counting && ctx->pending_pass &&
+      memcmp(&ctx->pending_pass_key, &wanted_pass, sizeof(wanted_pass)) == 0;
+   if (!reuse) {
+      gex_wgpu_end_pass(ctx);
+      ctx->pending_pass =
+         wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+      if (!counting && ctx->pending_pass)
+         ctx->pending_pass_key = wanted_pass;
+   }
+   WGPURenderPassEncoder pass = ctx->pending_pass;
    if (gex_timing) gex_wgpu_time_begin += os_time_get_nano() - t_begin_start;
    if (pass) {
       if (counting)
@@ -14134,9 +14281,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       if (counting)
          wgpuRenderPassEncoderEndOcclusionQuery(pass);
       const int64_t t_end_start = gex_timing ? os_time_get_nano() : 0;
-      wgpuRenderPassEncoderEnd(pass);
+      /* Left open for the next draw. Whatever stops recording -- a different
+       * framebuffer, a clear, a map, the submit -- closes it. */
+      if (counting)
+         gex_wgpu_end_pass(ctx);
       if (gex_timing) gex_wgpu_time_end += os_time_get_nano() - t_end_start;
-      wgpuRenderPassEncoderRelease(pass);
    }
    /* The views were recorded into the pass, which holds its own references,
     * so this draw is done with them even though nothing is submitted yet. */
@@ -14184,13 +14333,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       if (ctx->so_targets[i])
          gex_wgpu_batch_touch(ctx, ctx->so_targets[i]->buffer);
    /* Bounded, so one command buffer cannot grow without limit and the GPU
-    * always has something to be getting on with. */
-   if (++ctx->pending_draws >= GEX_WGPU_MAX_BATCHED_DRAWS)
+    * always has something to be getting on with -- and submitted at once if
+    * the batch ran out of room to keep this draw's resources alive. */
+   if (++ctx->pending_draws >= GEX_WGPU_MAX_BATCHED_DRAWS ||
+       ctx->batch_touched_overflowed)
       gex_wgpu_submit_pending(ctx);
    if (gex_timing) {
       gex_wgpu_time_submit += os_time_get_nano() - t_submit_start;
       gex_wgpu_time_draw += os_time_get_nano() - t_draw_start;
-      if (++gex_wgpu_timed_draws % 2000 == 0) {
+      if (++gex_wgpu_timed_draws % 20000 == 0) {
          const int64_t wall = os_time_get_nano() - gex_wgpu_time_origin;
          const uint64_t n = gex_wgpu_timed_draws;
          /* Since the previous report, not since the start: an application
@@ -14198,15 +14349,28 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           * nothing about how fast it runs once it is going. */
          static int64_t last_at;
          static uint64_t last_draws, last_presents;
+         static int64_t last_draw_nanos, last_entry_nanos;
          const double seconds = (wall - last_at) / 1e9;
+         static uint64_t last_present_nanos;
          if (seconds > 0.0)
             fprintf(stderr,
-                    "gex-wgpu: %.1f frames/s, %.0f draws/s, %.0f draws/frame\n",
+                    "gex-wgpu: %.1f frames/s, %.0f draws/s, %.0f draws/frame"
+                    ", %.0f%% of wall in draw_vbo, %.0f%% in state calls"
+                    ", %.0f%% in present\n",
                     (gex_wgpu_presents - last_presents) / seconds,
                     (n - last_draws) / seconds,
                     gex_wgpu_presents > last_presents
                        ? (double)(n - last_draws) /
-                         (double)(gex_wgpu_presents - last_presents) : 0.0);
+                         (double)(gex_wgpu_presents - last_presents) : 0.0,
+                    100.0 * (gex_wgpu_time_draw - last_draw_nanos) /
+                       (double)(wall - last_at),
+                    100.0 * (gex_wgpu_time_entry - last_entry_nanos) /
+                       (double)(wall - last_at),
+                    100.0 * (gex_wgpu_present_nanos - last_present_nanos) /
+                       (double)(wall - last_at));
+         last_entry_nanos = gex_wgpu_time_entry;
+         last_present_nanos = gex_wgpu_present_nanos;
+         last_draw_nanos = gex_wgpu_time_draw;
          last_at = wall;
          last_draws = n;
          last_presents = gex_wgpu_presents;

@@ -27,6 +27,7 @@
 #include "pipe/p_context.h"
 #include "pipe/p_screen.h"
 #include "util/u_inlines.h"
+#include "util/os_time.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
 #include "util/format/u_format.h"
@@ -34,6 +35,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sched.h>
 #include <time.h>
 
 struct gex_wgpu_sw_screen {
@@ -240,12 +242,28 @@ gex_wgpu_jspi_wait(void)
 {
    if (!native_instance) return;
    wgpuInstanceProcessEvents(native_instance);
-   /* ProcessEvents does not block, and every caller is a `while (!done)`, so
-    * without this the wait is a spin on a core for the whole readback. */
-   const struct timespec tick = { .tv_sec = 0, .tv_nsec = 20000 };
+   /* Yield rather than sleep, for a while.
+    *
+    * A readback finishes in about a millisecond, and nanosleep cannot be
+    * asked for less than the scheduler's granularity -- ask for 20 us and
+    * get 60 -- so a fixed sleep per poll spent most of the wait asleep past
+    * the point the data had arrived. That showed up as 43% of Minecraft's
+    * frame inside flush_frontbuffer. sched_yield returns immediately when
+    * nothing else wants the core, which makes this a polite spin.
+    *
+    * The sleep is kept for the tail: if something really is not coming back,
+    * burning a core on it helps nobody. */
+   static unsigned spins;
+   if (++spins < 4096) {
+      sched_yield();
+      return;
+   }
+   const struct timespec tick = { .tv_sec = 0, .tv_nsec = 50000 };
    nanosleep(&tick, NULL);
 }
 
+/* Reset by the caller's success, so a long wait does not leave the next one
+ * starting in its slow tail. */
 void
 gex_wgpu_jspi_signal(void)
 {
@@ -263,6 +281,8 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
 {
    struct gex_wgpu_sw_screen *state = sw_state;
    if (!state || !state->winsys || !resource || !pipe) return;
+   extern uint64_t gex_wgpu_present_nanos;
+   const int64_t present_start = os_time_get_nano();
    struct sw_winsys *winsys = state->winsys;
 
    if (state->target &&
@@ -319,6 +339,7 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
 
    extern uint64_t gex_wgpu_presents;
    ++gex_wgpu_presents;
+   gex_wgpu_present_nanos += os_time_get_nano() - present_start;
    winsys->displaytarget_display(winsys, state->target, context_private,
                                  nboxes, sub_box);
    (void)screen;
