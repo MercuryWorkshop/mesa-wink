@@ -20,6 +20,7 @@
 #include "pipe/p_state.h"
 #include "util/format/u_format.h"
 #include "util/half_float.h"
+#include <stdarg.h>
 #include "util/u_inlines.h"
 #include "compiler/nir/nir_builtin_builder.h"
 #include "util/simple_mtx.h"
@@ -6183,6 +6184,61 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
    FREE(gex);
 }
 
+/* The command stream, as recorded, for one frame.
+ *
+ * This is the instrument that was missing. Everything before it either watched
+ * what was written to a buffer -- which says nothing about what the draw was
+ * told -- or read the GPU's state back, which synchronises and so destroys the
+ * state it was meant to observe. Writing the calls down costs nothing and
+ * changes nothing, and it is the only thing that can show a binding the draw
+ * needs never being issued at all, which the redundancy checks in this path
+ * make possible.
+ *
+ * GEX_WGPU_CMD_LOG=<frame> logs every draw of that presented frame. The scene
+ * this was written for is static, so the same frame number in two runs is the
+ * same picture and the logs diff directly.
+ */
+static char gex_wgpu_cmd_line[2048];
+static unsigned gex_wgpu_cmd_used;
+static bool
+gex_wgpu_cmd_logging(void)
+{
+   static int64_t want = -2;
+   if (want == -2) {
+      const char *value = getenv("GEX_WGPU_CMD_LOG");
+      want = value ? atoll(value) : -1;
+   }
+   extern uint64_t gex_wgpu_presents;
+   return want >= 0 && gex_wgpu_presents == (uint64_t)want;
+}
+static void
+gex_wgpu_cmd_note(const char *format, ...)
+{
+   if (!gex_wgpu_cmd_logging() ||
+       gex_wgpu_cmd_used + 96 > sizeof(gex_wgpu_cmd_line))
+      return;
+   va_list args;
+   va_start(args, format);
+   const int wrote = vsnprintf(gex_wgpu_cmd_line + gex_wgpu_cmd_used,
+                               sizeof(gex_wgpu_cmd_line) - gex_wgpu_cmd_used,
+                               format, args);
+   va_end(args);
+   if (wrote > 0)
+      gex_wgpu_cmd_used += (unsigned)wrote;
+   if (gex_wgpu_cmd_used + 4 < sizeof(gex_wgpu_cmd_line)) {
+      memcpy(gex_wgpu_cmd_line + gex_wgpu_cmd_used, " | ", 4);
+      gex_wgpu_cmd_used += 3;
+   }
+}
+static void
+gex_wgpu_cmd_end(void)
+{
+   if (gex_wgpu_cmd_logging() && gex_wgpu_cmd_used)
+      fprintf(stderr, "gex-cmd %s\n", gex_wgpu_cmd_line);
+   gex_wgpu_cmd_used = 0;
+   gex_wgpu_cmd_line[0] = 0;
+}
+
 /* A checksum of what an upload actually puts on the queue, so two runs that
  * take different paths to the same buffer can be compared byte for byte
  * without reading anything back. GEX_WGPU_UPLOAD_LOG=1. */
@@ -6190,9 +6246,49 @@ static void
 gex_wgpu_log_upload(const char *via, unsigned width0, uint32_t offset,
                     const void *data, size_t size)
 {
+   /* GEX_WGPU_UPLOAD_BIG=<bytes> logs every upload to a buffer at least that
+    * large, for the whole run and with a checksum. The scene meshes live in
+    * one big buffer filled at load time, so a window of the first N uploads
+    * or a single frame's worth never covers it -- which is how it went
+    * unexamined while everything around it was compared. */
+   {
+      const char *big = getenv("GEX_WGPU_UPLOAD_BIG");
+      if (big && width0 >= (unsigned)atoi(big)) {
+         static unsigned bigseq;
+         uint32_t h = 2166136261u;
+         const uint8_t *b = data;
+         for (size_t i = 0; i < size; ++i) { h ^= b[i]; h *= 16777619u; }
+         fprintf(stderr, "gex-big[%u] %-7s width0=%u off=%u size=%u sum=%08x\n",
+                 bigseq++, via, width0, offset, (unsigned)size, h);
+      }
+   }
    const char *want = getenv("GEX_WGPU_UPLOAD_LOG");
-   if (!want)
+   if (!want && !gex_wgpu_cmd_logging())
       return;
+   if (!want) {
+      /* Interleaved with the command log, which is the point: an upload that
+       * lands between draws already recorded into the open pass replaces the
+       * bytes those draws will read when the pass is finally submitted. That
+       * ordering is invisible to either log on its own. */
+      fprintf(stderr, "gex-cmd UPLOAD %-6s width0=%u off=%u size=%u", via,
+              width0, offset, (unsigned)size);
+      /* The values, not a checksum. A 44-byte block is one object's
+       * per-instance data, and the question is whether the two paths upload
+       * the *same* numbers -- which a checksum of two unaligned runs could
+       * never answer, and which matters because the staged path hands the
+       * caller a zeroed block where the shadow path hands it the buffer's
+       * previous contents. A caller that reads what it mapped would compute
+       * from zeros in one and from real data in the other. */
+      if (size == 44) {
+         float f[11];
+         memcpy(f, data, sizeof(f));
+         fprintf(stderr, " =");
+         for (unsigned i = 0; i < 11; ++i)
+            fprintf(stderr, " %.3f", f[i]);
+      }
+      fprintf(stderr, "\n");
+      return;
+   }
    /* Skipping matters: the first few hundred uploads are all loading, and
     * comparing only those said the two paths were identical when the
     * per-frame rewrites had never been looked at. GEX_WGPU_UPLOAD_LOG=<skip>
@@ -6270,6 +6366,7 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
       (uint64_t)offset + size <= resource->width0;
    if (subdata_direct) {
       gex->bytes_written += size;
+      gex_wgpu_log_upload("sub-dir", resource->width0, offset, data, size);
       wgpuQueueWriteBuffer(gex_screen(pipe->screen)->queue, gex->buffer,
                            offset, data, size);
       return;
@@ -6292,6 +6389,7 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
    if (!size)
       return;
    memcpy(gex->shadow + offset, data, size);
+   gex_wgpu_log_upload("sub-sh", resource->width0, offset, data, size);
    const uint32_t aligned_start = offset & ~3u;
    const uint32_t aligned_end = ALIGN_POT(offset + size, 4);
    /* Only an unaligned range needs bytes the caller did not supply. */
@@ -8277,15 +8375,9 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
     * crowd scene is 66-70 fps with staging and 71-76 without, so restricting
     * it costs nothing there. GEX_WGPU_NO_STAGED_MAP=1 disables it entirely,
     * which is how this was found. */
-   /* GEX_WGPU_STAGE_WHOLE=1 restores the old behaviour of also staging a
-    * whole-resource discard, so the broken and correct paths are both
-    * reachable from one build and can be compared directly. */
-   static int stage_whole = -1;
-   if (stage_whole < 0)
-      stage_whole = getenv("GEX_WGPU_STAGE_WHOLE") ? 1 : 0;
    const bool overwrites_whole_range =
       (usage & (PIPE_MAP_DISCARD_RANGE |
-                (stage_whole ? PIPE_MAP_DISCARD_WHOLE_RESOURCE : 0))) != 0;
+                PIPE_MAP_DISCARD_WHOLE_RESOURCE)) != 0;
    const bool staged =
       !no_staged && overwrites_whole_range &&
       !gex->shadow && !(usage & PIPE_MAP_READ) &&
@@ -8414,12 +8506,19 @@ gex_wgpu_transfer_flush_region(struct pipe_context *pipe,
                               (uint32_t)box->width, 4);
       if (from < map_start) from = map_start;
       if (to > map_end) to = map_end;
-      if (to > from)
+      if (to > from) {
+         /* Same invariant as the staged unmap upload above. */
+         gex->bytes_written += (uint64_t)(to - from);
+         gex_wgpu_log_upload("flu-st", resource->width0, from,
+                             (const uint8_t *)gex_transfer->data +
+                                (from - map_start),
+                             to - from);
          wgpuQueueWriteBuffer(gex_screen(pipe->screen)->queue, gex->buffer,
                               from,
                               (const uint8_t *)gex_transfer->data +
                                  (from - map_start),
                               to - from);
+      }
       return;
    }
    if (!gex->shadow)
@@ -8433,6 +8532,9 @@ gex_wgpu_transfer_flush_region(struct pipe_context *pipe,
       gex_fail(ctx);
       return;
    }
+   gex_wgpu_log_upload("flu-sh", resource->width0, aligned_start,
+                       gex->shadow + aligned_start,
+                       aligned_end - aligned_start);
    wgpuQueueWriteBuffer(gex_screen(pipe->screen)->queue, gex->buffer,
                         aligned_start, gex->shadow + aligned_start,
                         aligned_end - aligned_start);
@@ -8487,6 +8589,36 @@ gex_wgpu_buffer_unmap(struct pipe_context *pipe,
        transfer->box.width > 0) {
       /* The staged block covers exactly the mapped range, and the range is
        * 4-aligned by construction, so it uploads as it stands. */
+      /* GEX_WGPU_STAGE_MIRROR=1 keeps a shadow *and* keeps it current, by
+       * copying the block into it here. The staged path normally leaves no
+       * shadow at all, and the shadow is not merely a copy in this driver --
+       * it is the source for every transfer_flush_region upload, 291,926 of
+       * them per SuperTuxKart run. This separates "something needs the shadow
+       * to exist" from "something needs it to be up to date". */
+      /* Record that the buffer now has contents the shadow does not know
+       * about. This is the whole bug SuperTuxKart's missing scene came down
+       * to.
+       *
+       * gex_wgpu_shadow_for_read only reads a buffer back off the GPU when it
+       * believes the buffer holds something:
+       *
+       *   const bool needs_contents = gex->bytes_written != 0 ||
+       *                               gex->gpu_written;
+       *
+       * buffer_subdata's direct path keeps that invariant -- it bypasses the
+       * shadow too, and counts the bytes it wrote. This path bypassed the
+       * shadow and counted nothing, so a buffer written only through staged
+       * maps looked empty. The next thing to need a shadow got a freshly
+       * zeroed one instead of the buffer's real contents, and
+       * transfer_flush_region -- which uploads *from* the shadow, 291,926
+       * times in an STK run -- then wrote those zeros back over the mesh.
+       * Every vertex collapsed onto the origin, which is why the scene did
+       * not rasterise while the skybox and HUD, on other buffers, still did.
+       *
+       * Nothing about the upload itself was ever wrong, which is why
+       * checksumming the uploads, reading the buffers back and diffing the
+       * whole command stream all showed two identical runs. */
+      gex->bytes_written += (uint64_t)transfer->box.width;
       gex_wgpu_log_upload("staged", resource->width0,
                           (uint32_t)transfer->box.x, gex_transfer->data,
                           (size_t)transfer->box.width);
@@ -12675,6 +12807,8 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
       gex_fail(ctx);
       return;
    }
+   if (gex_wgpu_cmd_logging())
+      fprintf(stderr, "gex-cmd SUBMIT %s draws=%u\n", why ? why : "?", draws);
    /* Every uniform these draws read, in one write. It has to go on the queue
     * before the submit, which is exactly here. */
    gex_wgpu_flush_constant_ring(ctx);
@@ -15149,6 +15283,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * occlusion query index belongs to the pass. */
    if (!reuse) {
       gex_wgpu_end_pass(ctx);
+      gex_wgpu_cmd_note("BEGIN-PASS");
       ctx->pending_pass =
          wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
       ++screen->pass_serial;
@@ -15167,6 +15302,21 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (pass) {
       if (counting)
          wgpuRenderPassEncoderBeginOcclusionQuery(pass, 0);
+      /* The pipeline by the state that built it, not by its handle: depth,
+       * cull, topology and target format are what decide whether geometry
+       * appears at all, and a handle normalised away for cross-run comparison
+       * tells you nothing about them. */
+      gex_wgpu_cmd_note("pipe depth=%d/%d/%d cull=%d ccw=%d topo=%u ms=%u "
+                        "cfmt=%d vp=%.0fx%.0f sc=%d",
+                        ctx->dsa ? (int)ctx->dsa->depth_enabled : -1,
+                        ctx->dsa ? (int)ctx->dsa->depth_func : -1,
+                        ctx->dsa ? (int)ctx->dsa->depth_writemask : -1,
+                        ctx->rasterizer ? (int)ctx->rasterizer->cull_face : -1,
+                        ctx->rasterizer ? (int)ctx->rasterizer->front_ccw : -1,
+                        (unsigned)info->mode, MAX2(1u, ctx->fb_samples),
+                        ctx->color_count ? (int)ctx->color_formats[0] : -1,
+                        viewport_width, viewport_height,
+                        (int)scissor_enabled);
       if (ctx->emitted.pipeline != pipeline) {
          wgpuRenderPassEncoderSetPipeline(pass, pipeline);
          ctx->emitted.pipeline = pipeline;
@@ -15226,6 +15376,29 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          if (!bind_groups[group])
             continue;
          const size_t offset_bytes = dynamic[group].count * sizeof(uint32_t);
+         /* By what the group *contains*, not by its handle. A handle is a
+          * fresh allocation each run, so normalising handles to compare two
+          * runs collapses every distinct group to the same token and hides
+          * precisely the thing worth looking for: a different resource
+          * bound. Dynamic offsets are numbers and stable; textures are named
+          * by size and format. */
+         if (gex_wgpu_cmd_logging()) {
+            gex_wgpu_cmd_note("bg%u n=%u", group, dynamic[group].count);
+            for (unsigned d = 0; d < dynamic[group].count; ++d)
+               gex_wgpu_cmd_note("dyn%u=%u", d, dynamic[group].offset[d]);
+            if (group == 1) {
+               for (unsigned t = 0; t < ctx->fs->texture_count; ++t) {
+                  const unsigned tslot = ctx->fs->texture_slots[t];
+                  const struct pipe_sampler_view *v = ctx->sampler_views[tslot];
+                  if (!v || !v->texture)
+                     gex_wgpu_cmd_note("t%u=none", tslot);
+                  else
+                     gex_wgpu_cmd_note("t%u=%ux%u/%u", tslot,
+                                       v->texture->width0, v->texture->height0,
+                                       (unsigned)v->format);
+               }
+            }
+         }
          if (ctx->emitted.groups[group] == bind_groups[group] &&
              ctx->emitted.dynamic_count[group] == dynamic[group].count &&
              memcmp(ctx->emitted.dynamic[group], dynamic[group].offset,
@@ -15247,8 +15420,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const uint32_t offset = ctx->vertex_buffer_offsets[vb_buffer[slot]];
          WGPUBuffer handle = gex_resource(buffer)->buffer;
          if (ctx->emitted.vertex[slot] == handle &&
-             ctx->emitted.vertex_offset[slot] == offset)
+             ctx->emitted.vertex_offset[slot] == offset) {
+            gex_wgpu_cmd_note("vb%u w0=%u+%u SKIPPED", slot, buffer->width0,
+                              offset);
             continue;
+         }
+         gex_wgpu_cmd_note("vb%u w0=%u+%u", slot, buffer->width0, offset);
          wgpuRenderPassEncoderSetVertexBuffer(
             pass, slot, handle, offset, buffer->width0 - offset);
          ctx->emitted.vertex[slot] = handle;
@@ -15273,6 +15450,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          WGPUBuffer index_handle = gex_resource(index_resource)->buffer;
          const WGPUIndexFormat index_format = info->index_size == 2
             ? WGPUIndexFormat_Uint16 : WGPUIndexFormat_Uint32;
+         gex_wgpu_cmd_note("ib w0=%u+%u fmt=%u", index_resource->width0,
+                           index_byte_offset, (unsigned)index_format);
          if (ctx->emitted.index != index_handle ||
              ctx->emitted.index_format != index_format ||
              ctx->emitted.index_offset != index_byte_offset) {
@@ -15294,6 +15473,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
              gex_resource(ctx->colors[0])->texture ==
                 gex_wgpu_presented_texture)
             ++gex_wgpu_draws_to_presented;
+         gex_wgpu_cmd_note("drawIndexed count=%u inst=%u first=%u bias=%d",
+                           draws[0].count, info->instance_count, first_index,
+                           draws[0].index_bias);
+         gex_wgpu_cmd_end();
          wgpuRenderPassEncoderDrawIndexed(
             pass, draws[0].count, info->instance_count, first_index,
             draws[0].index_bias, info->start_instance);
@@ -15305,6 +15488,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             ctx->color_count && ctx->colors[0]
                ? gex_resource(ctx->colors[0])->texture : NULL,
             ctx->color_count ? ctx->color_formats[0] : PIPE_FORMAT_NONE);
+         gex_wgpu_cmd_note("draw count=%u inst=%u first=%u",
+                           draws[0].count, info->instance_count,
+                           draws[0].start);
+         gex_wgpu_cmd_end();
          wgpuRenderPassEncoderDraw(pass, draws[0].count, info->instance_count,
                                    draws[0].start, info->start_instance);
       }
