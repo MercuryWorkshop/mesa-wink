@@ -107,6 +107,20 @@ extern void gex_wgpu_jspi_signal(void);
  * shader is going to consume them. */
 #define GEX_WGPU_VARYING_OUT_BINDING (GEX_WGPU_CAPTURE_PARAMS_BINDING + 1)
 
+/* Bindings of the de-indexing gather pass, which has its own group 0. See
+ * gex_wgpu_gather_indexed_vertices. */
+#define GEX_WGPU_GATHER_PARAMS_BINDING 0
+#define GEX_WGPU_GATHER_INDEX_BINDING 1
+#define GEX_WGPU_GATHER_SRC_BINDING 2
+#define GEX_WGPU_GATHER_DST_BINDING 3
+/* Words of its parameter buffer: how many dwords one vertex occupies, where
+ * the source buffer starts, and how many dwords there are to copy. */
+#define GEX_WGPU_GATHER_PARAM_STRIDE 0
+#define GEX_WGPU_GATHER_PARAM_SRC_BASE 1
+#define GEX_WGPU_GATHER_PARAM_DWORDS 2
+#define GEX_WGPU_GATHER_PARAM_WORDS 4
+#define GEX_WGPU_GATHER_GROUP 64
+
 /* Bindings of the geometry stage's own compute pipeline, which is a separate
  * pipeline and so has its own group 0. */
 #define GEX_WGPU_GS_PARAMS_BINDING 0
@@ -173,6 +187,10 @@ gex_wgpu_topology(enum mesa_prim mode)
 
 struct gex_wgpu_screen {
    struct pipe_screen base;
+   /* The de-indexing gather shader, built on first use and kept: it is one
+    * module for every layout, because the copy is by dword rather than by
+    * attribute. See gex_wgpu_gather_indexed_vertices. */
+   WGPUShaderModule gather_module;
    WGPUDevice device;
    WGPUQueue queue;
    /* Reading depth back.
@@ -445,6 +463,15 @@ struct gex_wgpu_context {
       struct pipe_resource *corners;
       unsigned corner_offset;
    } point_expand;
+   /* De-indexed vertex buffers, kept across draws and grown as needed: an
+    * indexed point draw gathers the vertices it references into these and is
+    * then bound to them instead of to the application's. The mask says which
+    * slots this draw redirected; the other two arrays are the gather's own
+    * inputs. */
+   struct pipe_resource *point_gathered[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
+   uint32_t point_gather_mask;
+   bool point_gather_wanted[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
+   unsigned point_gather_stride[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
    /* Set while a provoking-vertex rewrite is re-issuing its draw, so the
     * rewrite does not see its own output and recurse. */
    bool provoking_rewritten;
@@ -3043,8 +3070,12 @@ gex_wgpu_wide_point_ids_instr(nir_builder *b, nir_intrinsic_instr *intr,
    (void)data;
    b->cursor = nir_before_instr(&intr->instr);
    switch (intr->intrinsic) {
+   /* Only the full form. The screen's nir_options deliberately do not ask for
+    * `vertex_id_zero_based`, so `load_vertex_id_zero_base` never appears here
+    * -- and handling it would be wrong rather than merely unused, because a
+    * shader using it adds `load_first_vertex` on top and would then count the
+    * draw's start twice. */
    case nir_intrinsic_load_vertex_id:
-   case nir_intrinsic_load_vertex_id_zero_base:
       nir_def_replace(&intr->def, nir_load_instance_id(b));
       return true;
    case nir_intrinsic_load_instance_id:
@@ -13402,6 +13433,233 @@ gex_wgpu_bind_constants(struct gex_wgpu_context *ctx,
 
 /* The three-pass geometry path: vertex shader to a buffer, geometry shader to
  * vertices and indices, then an ordinary indexed draw of the result. */
+/* De-indexing a draw, so that the wide-point expansion can have it.
+ *
+ * The expansion needs the per-point data on the *instance* index, and WebGPU's
+ * index buffer addresses only the vertex one -- so an indexed point draw could
+ * not be expanded at all, and drew one pixel wide. That is not a corner case:
+ * KHR-GL33.primitive_restart.restart_mode draws indexed points from a vertex
+ * shader that writes `gl_PointSize = 4.0`, and the driver's own log named it
+ * ("points drawn one pixel wide (indexed)") after five other explanations for
+ * that failure had been ruled out.
+ *
+ * What happens instead is that the referenced vertices are gathered into a
+ * fresh buffer, in draw order, and the draw proceeds as if it had never been
+ * indexed. Nothing downstream changes: the strides are the same, so every
+ * attribute's `src_offset` still lands where it did, and the corner buffer,
+ * the step modes and both shader variants are untouched.
+ *
+ * The copy is format-agnostic on purpose. A vertex is a run of bytes whose
+ * meaning belongs to the vertex elements, so one invocation per *dword* --
+ * `vertex = i / stride`, `dword = i % stride` -- needs no per-layout shader
+ * and no loop. One dispatch per vertex buffer, because 8 sources and 8
+ * destinations would be sixteen storage bindings and the device offers ten.
+ */
+static WGPUShaderModule
+gex_wgpu_gather_module(struct gex_wgpu_context *ctx)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   if (screen->gather_module)
+      return screen->gather_module;
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, screen->base.nir_options[MESA_SHADER_COMPUTE],
+      "gex-gather");
+   nir_variable *params =
+      gex_wgpu_word_block(b.shader, "gex_gather_params",
+                          GEX_WGPU_GATHER_PARAMS_BINDING, 0, true);
+   nir_variable *index =
+      gex_wgpu_word_block(b.shader, "gex_gather_index",
+                          GEX_WGPU_GATHER_INDEX_BINDING, 1, true);
+   nir_variable *src = gex_wgpu_word_block(b.shader, "gex_gather_src",
+                                           GEX_WGPU_GATHER_SRC_BINDING, 2,
+                                           true);
+   nir_variable *dst = gex_wgpu_word_block(b.shader, "gex_gather_dst",
+                                           GEX_WGPU_GATHER_DST_BINDING, 3,
+                                           false);
+
+   nir_deref_instr *param_words = gex_wgpu_block_words(&b, params);
+   nir_def *stride = nir_load_deref(
+      &b, nir_build_deref_array(&b, param_words,
+                                nir_imm_int(&b, GEX_WGPU_GATHER_PARAM_STRIDE)));
+   nir_def *src_base = nir_load_deref(
+      &b, nir_build_deref_array(&b, param_words,
+                                nir_imm_int(&b,
+                                            GEX_WGPU_GATHER_PARAM_SRC_BASE)));
+   nir_def *dwords = nir_load_deref(
+      &b, nir_build_deref_array(&b, param_words,
+                                nir_imm_int(&b,
+                                            GEX_WGPU_GATHER_PARAM_DWORDS)));
+
+   nir_def *slot = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   /* The dispatch is rounded up to a whole workgroup, so the tail has to be
+    * dropped rather than allowed to address past either buffer. */
+   nir_push_if(&b, nir_uge(&b, slot, dwords));
+   nir_jump(&b, nir_jump_return);
+   nir_pop_if(&b, NULL);
+
+   nir_def *vertex = nir_udiv(&b, slot, stride);
+   nir_def *dword = nir_umod(&b, slot, stride);
+   nir_deref_instr *index_words = gex_wgpu_block_words(&b, index);
+   nir_def *source_vertex =
+      nir_load_deref(&b, nir_build_deref_array(&b, index_words, vertex));
+   nir_deref_instr *src_words = gex_wgpu_block_words(&b, src);
+   nir_def *at = nir_iadd(&b, src_base,
+                          nir_iadd(&b, nir_imul(&b, source_vertex, stride),
+                                   dword));
+   nir_def *value =
+      nir_load_deref(&b, nir_build_deref_array(&b, src_words, at));
+   nir_deref_instr *dst_words = gex_wgpu_block_words(&b, dst);
+   nir_store_deref(&b, nir_build_deref_array(&b, dst_words, slot), value, 0x1);
+
+   nir_shader *nir = b.shader;
+   NIR_PASS(_, nir, nir_lower_returns);
+   nir->info.workgroup_size[0] = GEX_WGPU_GATHER_GROUP;
+   nir->info.workgroup_size[1] = 1;
+   nir->info.workgroup_size[2] = 1;
+   nir->info.workgroup_size_variable = false;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+   char *error = NULL;
+   screen->gather_module =
+      gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false,
+                           &error);
+   if (!screen->gather_module)
+      fprintf(stderr, "gex-wgpu: gather shader failed to compile: %s\n",
+              error ? error : "unknown");
+   FREE(error);
+   return screen->gather_module;
+}
+
+/* The draw's vertex indices, resolved on the CPU. The index buffer is already
+ * mapped by the provoking and unfilled rewrites for the same reason: it is
+ * small, it is usually a resource the driver wrote itself, and reading it here
+ * costs one map against a dispatch that would otherwise need its own
+ * addressing parameters. */
+static uint32_t *
+gex_wgpu_read_indices(struct pipe_context *pipe,
+                      const struct pipe_draw_info *info,
+                      const struct pipe_draw_start_count_bias *draw,
+                      unsigned count)
+{
+   uint32_t *out = MALLOC(count * sizeof(*out));
+   if (!out)
+      return NULL;
+   const uint8_t *bytes = NULL;
+   struct pipe_transfer *transfer = NULL;
+   const unsigned first = draw->start * info->index_size;
+   if (info->has_user_indices) {
+      bytes = info->index.user ? (const uint8_t *)info->index.user + first
+                               : NULL;
+   } else if (info->index.resource) {
+      bytes = pipe_buffer_map_range(pipe, info->index.resource, first,
+                                    count * info->index_size, PIPE_MAP_READ,
+                                    &transfer);
+   }
+   if (!bytes) {
+      FREE(out);
+      return NULL;
+   }
+   for (unsigned i = 0; i < count; ++i) {
+      uint32_t value = 0;
+      if (info->index_size == 2) {
+         uint16_t narrow;
+         memcpy(&narrow, bytes + (size_t)i * 2, 2);
+         value = narrow;
+      } else {
+         memcpy(&value, bytes + (size_t)i * 4, 4);
+      }
+      out[i] = value + (uint32_t)draw->index_bias;
+   }
+   if (transfer)
+      pipe_buffer_unmap(pipe, transfer);
+   return out;
+}
+
+static bool
+gex_wgpu_gather_indexed_vertices(struct gex_wgpu_context *ctx,
+                                 const struct pipe_draw_info *info,
+                                 const struct pipe_draw_start_count_bias *draw,
+                                 unsigned count)
+{
+   struct pipe_context *pipe = &ctx->base;
+   WGPUShaderModule module = gex_wgpu_gather_module(ctx);
+   if (!module)
+      return false;
+   uint32_t *indices = gex_wgpu_read_indices(pipe, info, draw, count);
+   if (!indices)
+      return false;
+   if (getenv("GEX_WGPU_POINT_LOG")) {
+      static unsigned told;
+      if (told < 8) { ++told;
+         fprintf(stderr, "gex-wgpu: gather n=%u start=%u bias=%d user=%d "
+                 "[0]=%u [n-1]=%u\n", count, draw->start, draw->index_bias,
+                 (int)info->has_user_indices, indices[0], indices[count - 1]); }
+   }
+   struct pipe_resource *table =
+      gex_wgpu_params_buffer(ctx, indices, count);
+   FREE(indices);
+   if (!table)
+      return false;
+
+   bool ok = true;
+   for (unsigned buffer = 0;
+        ok && buffer < ctx->vertex_buffer_count &&
+        buffer < GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS; ++buffer) {
+      if (!ctx->vertex_buffers[buffer] || !ctx->point_gather_wanted[buffer])
+         continue;
+      const unsigned stride = ctx->point_gather_stride[buffer];
+      /* A stride of zero is a constant attribute, which every vertex reads
+       * from the same place -- gathering it would copy one vertex `count`
+       * times to no effect, and the original binding is already right. */
+      if (!stride)
+         continue;
+      const unsigned dwords = stride / 4;
+      const unsigned total = count * dwords;
+      if (!gex_wgpu_ensure_buffer(ctx, &ctx->point_gathered[buffer],
+                                  count * stride,
+                                  PIPE_BIND_VERTEX_BUFFER |
+                                  PIPE_BIND_SHADER_BUFFER)) {
+         ok = false;
+         break;
+      }
+      uint32_t params[GEX_WGPU_GATHER_PARAM_WORDS] = {0};
+      params[GEX_WGPU_GATHER_PARAM_STRIDE] = dwords;
+      params[GEX_WGPU_GATHER_PARAM_SRC_BASE] =
+         ctx->vertex_buffer_offsets[buffer] / 4;
+      params[GEX_WGPU_GATHER_PARAM_DWORDS] = total;
+      struct pipe_resource *param_buffer =
+         gex_wgpu_params_buffer(ctx, params, GEX_WGPU_GATHER_PARAM_WORDS);
+      struct gex_wgpu_bindings group0 = {0}, group1 = {0};
+      gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GATHER_PARAMS_BINDING,
+                                   param_buffer, true);
+      gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GATHER_INDEX_BINDING,
+                                   table, true);
+      gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GATHER_SRC_BINDING,
+                                   ctx->vertex_buffers[buffer], true);
+      gex_wgpu_bind_storage(&group0, GEX_WGPU_GATHER_DST_BINDING,
+                            ctx->point_gathered[buffer]);
+      ok = param_buffer &&
+           gex_wgpu_dispatch(ctx, module, &group0, &group1, NULL,
+                             DIV_ROUND_UP(total, GEX_WGPU_GATHER_GROUP));
+      if (getenv("GEX_WGPU_POINT_LOG")) {
+         static unsigned told;
+         if (told < 6) { ++told;
+            fprintf(stderr, "gex-wgpu: gather buf%u stride=%u dwords=%u "
+                    "total=%u srcbase=%u count=%u ok=%d src=%u dst=%u\n",
+                    buffer, stride, dwords, total,
+                    params[GEX_WGPU_GATHER_PARAM_SRC_BASE], count, (int)ok,
+                    ctx->vertex_buffers[buffer]->width0,
+                    ctx->point_gathered[buffer]->width0); }
+      }
+      pipe_resource_reference(&param_buffer, NULL);
+      if (ok)
+         ctx->point_gather_mask |= 1u << buffer;
+   }
+   pipe_resource_reference(&table, NULL);
+   return ok;
+}
+
 static bool
 gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                  const struct pipe_draw_info *info, unsigned drawid_offset,
@@ -15865,10 +16123,234 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (discard)
       return;
 
+   /* Wide points become quads. See gex_wgpu_lower_wide_point for the shape of
+    * it; what is decided here is whether this draw can take that road at all.
+    *
+    * The refusals are not features being dropped -- an unexpanded point still
+    * draws, as the single pixel WebGPU rasterises -- so each one costs
+    * accuracy rather than the draw. Indexed draws are the structural one: the
+    * expansion needs the per-point data on the *instance* index and WebGPU's
+    * index buffer addresses only the vertex one.
+    */
+   ctx->point_expand.active = false;
+   ctx->point_expand.corners = NULL;
+   ctx->point_gather_mask = 0;
+   if (info && draws && info->mode == MESA_PRIM_POINTS && ctx->vs &&
+       ctx->rasterizer && draws[0].count > 0 && !ctx->failed) {
+      const bool writes_size =
+         ctx->rasterizer->point_size_per_vertex && ctx->vs->original_nir &&
+         (ctx->vs->original_nir->info.outputs_written & VARYING_BIT_PSIZ);
+      const float fixed_size = ctx->rasterizer->point_size;
+      const bool want = writes_size || fixed_size > 1.0f;
+      /* The GL viewport, not the WebGPU one: the clipped-viewport fold above
+       * has already replaced viewport_width with the framebuffer's. */
+      const float vp_width = ctx->viewport_set
+         ? fabsf(2.0f * ctx->viewport.scale[0]) : (float)ctx->fb_width;
+      const float vp_height = ctx->viewport_set
+         ? fabsf(2.0f * ctx->viewport.scale[1]) : (float)ctx->fb_height;
+      unsigned instanced_elements = 0;
+      if (ctx->vertex_elements)
+         for (unsigned i = 0; i < ctx->vertex_elements->count; ++i)
+            instanced_elements +=
+               ctx->vertex_elements->elements[i].instance_divisor != 0;
+      const unsigned corner_location =
+         gex_wgpu_point_corner_location(ctx->vs);
+      /* An indexed draw is de-indexed rather than refused; see
+       * gex_wgpu_gather_indexed_vertices. Only the two widths WebGPU has,
+       * and only a draw whose strides are whole dwords -- the gather copies
+       * by dword, and a packed byte stride would need a byte-addressed
+       * variant for nothing: no vertex layout st/mesa builds has one. */
+      bool gather = false;
+      if (want && info->index_size &&
+          (info->index_size == 2 || info->index_size == 4) &&
+          !info->primitive_restart && ctx->vertex_elements) {
+         gather = true;
+         memset(ctx->point_gather_wanted, 0,
+                sizeof(ctx->point_gather_wanted));
+         memset(ctx->point_gather_stride, 0, sizeof(ctx->point_gather_stride));
+         for (unsigned i = 0; i < ctx->vertex_elements->count; ++i) {
+            const struct pipe_vertex_element *ve =
+               &ctx->vertex_elements->elements[i];
+            const unsigned buffer = ve->vertex_buffer_index;
+            if (buffer >= GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS ||
+                buffer >= ctx->vertex_buffer_count ||
+                !ctx->vertex_buffers[buffer])
+               continue;
+            if (ve->src_stride % 4 || ctx->vertex_buffer_offsets[buffer] % 4) {
+               gather = false;
+               break;
+            }
+            ctx->point_gather_wanted[buffer] = true;
+            ctx->point_gather_stride[buffer] = ve->src_stride;
+         }
+      }
+      const char *why =
+         !want                       ? NULL
+         : info->index_size && !gather ? "indexed"
+         : info->instance_count > 1  ? "instanced"
+         : instanced_elements        ? "per-instance attributes"
+         : corner_location == ~0u    ? "no free vertex attribute"
+         /* Two: one for the corner buffer, and one the default-attribute
+          * buffer may still claim below -- whether it does is not known
+          * until the attribute loop has run, which is after this. */
+         : vb_slot_count + 2 > GEX_WGPU_MAX_VERTEX_BUFFERS
+                                     ? "no free vertex buffer slot"
+         : vp_width <= 0.0f || vp_height <= 0.0f ? "empty viewport"
+         : NULL;
+      if (want && !why) {
+         /* Whether anything reads the sprite coordinate. GL_COORD_REPLACE
+          * feeds texcoords from it as well as gl_PointCoord itself. */
+         const bool wants_coord =
+            ctx->fs && (ctx->fs->reads_point_coord ||
+                        ctx->rasterizer->sprite_coord_enable != 0 ||
+                        ctx->rasterizer->point_smooth);
+         unsigned coord_location = ~0u;
+         if (wants_coord) {
+            coord_location = gex_wgpu_point_coord_location(ctx);
+            if (coord_location == ~0u)
+               why = "no free varying for gl_PointCoord";
+         }
+         if (!why) {
+            /* Two triangles over the point, with the offset already scaled:
+             * clip space spans 2 across the viewport, so one pixel is
+             * 2/viewport, and half of the point's size lies each side of the
+             * vertex. With a per-vertex size the shader supplies the size and
+             * this carries 2/viewport alone.
+             *
+             * Which way t runs comes from sprite_coord_mode, which st/mesa
+             * sets from GL_POINT_SPRITE_COORD_ORIGIN *and* the framebuffer's
+             * orientation -- the origin is defined in window coordinates and
+             * an FBO's y runs the other way, so the two cases genuinely
+             * differ. The y-flipped vertex module inverts t again on top of
+             * this; gl44-point-probe measures the result rather than
+             * asserting it. */
+            const float half = writes_size ? 0.5f : 0.5f * fixed_size;
+            const float dx = 2.0f * half / vp_width;
+            const float dy = 2.0f * half / vp_height;
+            const bool lower_left =
+               ctx->rasterizer->sprite_coord_mode == PIPE_SPRITE_COORD_LOWER_LEFT;
+            static const int8_t quad[6][2] = {
+               {-1, -1}, {1, -1}, {1, 1}, {-1, -1}, {1, 1}, {-1, 1},
+            };
+            /* A sub-pixel nudge, so that a point centred on an integral
+             * window coordinate covers the pixel GL says it does.
+             *
+             * GL rasterises a point as the fragments whose centres lie in
+             * [x - s/2, x + s/2], and for s = 1 states the answer outright:
+             * floor(x_w). A quad with its edges exactly on pixel centres is a
+             * tie, and WebGPU's fill rule breaks it the other way -- a point
+             * at 16.0 landed on pixel 15 where llvmpipe puts it on 16. That
+             * is invisible for a point four pixels across and decisive for
+             * one pixel, which is a case that reaches here whenever the
+             * *shader* writes gl_PointSize: the size is then unknown until
+             * the shader runs, so the draw is expanded whatever it turns out
+             * to be. tests/gl44-probe.sh primrestart caught exactly that,
+             * with a shader writing gl_PointSize = 1.0.
+             *
+             * The nudge is a translation, equal for all six corners, and
+             * small enough to change nothing except an exact tie. Its y sign
+             * is baked here rather than in the shader because the y-flipped
+             * module negates what it is given, and the corner buffer belongs
+             * to one draw, which uses one module. */
+            const float nudge = 1.0f / 512.0f;
+            const bool flipped =
+               ctx->viewport_set && ctx->viewport.scale[1] > 0.0f;
+            const float nudge_x = 2.0f * nudge / vp_width;
+            const float nudge_y =
+               (flipped ? -2.0f : 2.0f) * nudge / vp_height;
+            float corners[6][4];
+            for (unsigned i = 0; i < 6; ++i) {
+               const float sx = (float)quad[i][0];
+               const float sy = (float)quad[i][1];
+               corners[i][0] = sx * dx + nudge_x;
+               corners[i][1] = sy * dy + nudge_y;
+               corners[i][2] = 0.5f * (sx + 1.0f);
+               corners[i][3] = lower_left ? 0.5f * (sy + 1.0f)
+                                          : 0.5f * (1.0f - sy);
+            }
+            /* The gather first, and the corner upload after it. The gather
+             * submits a command buffer of its own, and the uploader's buffer
+             * is *mapped* between u_upload_data and u_upload_unmap -- so
+             * submitting in between loses the corners on a backend whose
+             * mapped writes only reach the GPU on unmap. That is exactly what
+             * the browser does: the quad collapsed to six copies of one
+             * vertex and the draw covered no pixels, with every other point
+             * case still passing and no validation error to say why. Native
+             * Dawn was unaffected, which is the sort of difference only a
+             * browser gate catches. */
+            if (info->index_size &&
+                !gex_wgpu_gather_indexed_vertices(ctx, info, &draws[0],
+                                                  draws[0].count))
+               why = "the indexed vertices could not be gathered";
+            /* Through the stream uploader rather than a buffer of the
+             * driver's own: a draw already encoded into this pass must keep
+             * the corners it was given, and a queue write would overwrite
+             * them before the submit. */
+            unsigned offset = 0;
+            struct pipe_resource *resource = NULL;
+            if (!why) {
+               struct pipe_resource *released = NULL;
+               u_upload_data(ctx->base.stream_uploader, 0, sizeof(corners), 16,
+                             corners, &offset, &resource, &released);
+               pipe_resource_reference(&released, NULL);
+            }
+            if (resource) {
+               u_upload_unmap(ctx->base.stream_uploader);
+               ctx->point_expand.active = true;
+               ctx->point_expand.per_vertex_size = writes_size;
+               ctx->point_expand.corner_location = corner_location;
+               ctx->point_expand.coord_location = coord_location;
+               ctx->point_expand.corners = resource;
+               ctx->point_expand.corner_offset = offset;
+            } else if (!why) {
+               why = "the corner buffer could not be uploaded";
+            }
+         }
+      }
+      if (getenv("GEX_WGPU_POINT_LOG")) {
+         static unsigned told;
+         if (told < 8) { ++told;
+            fprintf(stderr, "gex-wgpu: points count=%u size=%.2f pv=%d "
+                    "psiz=%d vp=%.0fx%.0f reads_pc=%d sprite=0x%x "
+                    "smooth=%d coord=%d why=%s\n",
+                    draws[0].count, fixed_size,
+                    (int)ctx->rasterizer->point_size_per_vertex,
+                    (int)writes_size, vp_width, vp_height,
+                    ctx->fs ? (int)ctx->fs->reads_point_coord : -1,
+                    ctx->rasterizer->sprite_coord_enable,
+                    (int)ctx->rasterizer->point_smooth,
+                    (int)ctx->point_expand.coord_location,
+                    why ? why : (want ? "expanded" : "not wide")); }
+      }
+      /* Once per distinct reason, so a program that draws indexed points
+       * every frame says so once. Keyed on the pointer because every reason
+       * above is a string literal, which makes the identity stable and the
+       * table small. */
+      if (why) {
+         static const char *said[8];
+         bool told = false;
+         unsigned free_slot = 8;
+         for (unsigned i = 0; i < 8; ++i) {
+            if (said[i] == why)
+               told = true;
+            else if (!said[i] && free_slot == 8)
+               free_slot = i;
+         }
+         if (!told && free_slot < 8) {
+            said[free_slot] = why;
+            fprintf(stderr, "gex-wgpu: points drawn one pixel wide (%s)\n",
+                    why);
+         }
+      }
+   }
+
    struct pipe_resource *index_resource = NULL;
    struct pipe_resource *uploaded_index_resource = NULL;
    unsigned index_upload_offset = 0;
-   if (info->index_size) {
+   /* A de-indexed point draw has no index buffer left to bind: the gather
+    * above put the referenced vertices in draw order, so the draw below is
+    * the ordinary non-indexed one. */
+   if (info->index_size && !ctx->point_expand.active) {
       if (info->has_user_indices) {
          /* glDrawElements from a client array. u_upload_mgr stages it into a
           * real buffer, which is the only form WebGPU can bind -- latching
@@ -15915,7 +16397,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * written. The scan feeds a diagnostic overrun check and nothing else,
        * so not knowing is only a lost warning. */
       bool bounds_known = true;
-      if (info->index_size) {
+      /* `index_resource`, not `info->index_size`: a de-indexed point draw has
+       * the second without the first, and this dereferenced NULL. The draw
+       * reads its gathered buffer linearly, so `last_vertex` computed from
+       * the draw's own start and count is exactly right for it. */
+      if (index_resource) {
          last_vertex = 0;
          const uint8_t *shadow = gex_resource(index_resource)->shadow;
          if (!shadow) {
@@ -16133,155 +16619,6 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          return;
       scissor_width = maxx - scissor_x;
       scissor_height = maxy - scissor_y;
-   }
-
-   /* Wide points become quads. See gex_wgpu_lower_wide_point for the shape of
-    * it; what is decided here is whether this draw can take that road at all.
-    *
-    * The refusals are not features being dropped -- an unexpanded point still
-    * draws, as the single pixel WebGPU rasterises -- so each one costs
-    * accuracy rather than the draw. Indexed draws are the structural one: the
-    * expansion needs the per-point data on the *instance* index and WebGPU's
-    * index buffer addresses only the vertex one.
-    */
-   ctx->point_expand.active = false;
-   ctx->point_expand.corners = NULL;
-   if (info && draws && info->mode == MESA_PRIM_POINTS && ctx->vs &&
-       ctx->rasterizer && draws[0].count > 0 && !ctx->failed) {
-      const bool writes_size =
-         ctx->rasterizer->point_size_per_vertex && ctx->vs->original_nir &&
-         (ctx->vs->original_nir->info.outputs_written & VARYING_BIT_PSIZ);
-      const float fixed_size = ctx->rasterizer->point_size;
-      const bool want = writes_size || fixed_size > 1.0f;
-      /* The GL viewport, not the WebGPU one: the clipped-viewport fold above
-       * has already replaced viewport_width with the framebuffer's. */
-      const float vp_width = ctx->viewport_set
-         ? fabsf(2.0f * ctx->viewport.scale[0]) : (float)ctx->fb_width;
-      const float vp_height = ctx->viewport_set
-         ? fabsf(2.0f * ctx->viewport.scale[1]) : (float)ctx->fb_height;
-      unsigned instanced_elements = 0;
-      if (ctx->vertex_elements)
-         for (unsigned i = 0; i < ctx->vertex_elements->count; ++i)
-            instanced_elements +=
-               ctx->vertex_elements->elements[i].instance_divisor != 0;
-      const unsigned corner_location =
-         gex_wgpu_point_corner_location(ctx->vs);
-      const char *why =
-         !want                       ? NULL
-         : info->index_size          ? "indexed"
-         : info->instance_count > 1  ? "instanced"
-         : instanced_elements        ? "per-instance attributes"
-         : corner_location == ~0u    ? "no free vertex attribute"
-         /* Two: one for the corner buffer, and one the default-attribute
-          * buffer may still claim below -- whether it does is not known
-          * until the attribute loop has run, which is after this. */
-         : vb_slot_count + 2 > GEX_WGPU_MAX_VERTEX_BUFFERS
-                                     ? "no free vertex buffer slot"
-         : vp_width <= 0.0f || vp_height <= 0.0f ? "empty viewport"
-         : NULL;
-      if (want && !why) {
-         /* Whether anything reads the sprite coordinate. GL_COORD_REPLACE
-          * feeds texcoords from it as well as gl_PointCoord itself. */
-         const bool wants_coord =
-            ctx->fs && (ctx->fs->reads_point_coord ||
-                        ctx->rasterizer->sprite_coord_enable != 0 ||
-                        ctx->rasterizer->point_smooth);
-         unsigned coord_location = ~0u;
-         if (wants_coord) {
-            coord_location = gex_wgpu_point_coord_location(ctx);
-            if (coord_location == ~0u)
-               why = "no free varying for gl_PointCoord";
-         }
-         if (!why) {
-            /* Two triangles over the point, with the offset already scaled:
-             * clip space spans 2 across the viewport, so one pixel is
-             * 2/viewport, and half of the point's size lies each side of the
-             * vertex. With a per-vertex size the shader supplies the size and
-             * this carries 2/viewport alone.
-             *
-             * Which way t runs comes from sprite_coord_mode, which st/mesa
-             * sets from GL_POINT_SPRITE_COORD_ORIGIN *and* the framebuffer's
-             * orientation -- the origin is defined in window coordinates and
-             * an FBO's y runs the other way, so the two cases genuinely
-             * differ. The y-flipped vertex module inverts t again on top of
-             * this; gl44-point-probe measures the result rather than
-             * asserting it. */
-            const float half = writes_size ? 0.5f : 0.5f * fixed_size;
-            const float dx = 2.0f * half / vp_width;
-            const float dy = 2.0f * half / vp_height;
-            const bool lower_left =
-               ctx->rasterizer->sprite_coord_mode == PIPE_SPRITE_COORD_LOWER_LEFT;
-            static const int8_t quad[6][2] = {
-               {-1, -1}, {1, -1}, {1, 1}, {-1, -1}, {1, 1}, {-1, 1},
-            };
-            float corners[6][4];
-            for (unsigned i = 0; i < 6; ++i) {
-               const float sx = (float)quad[i][0];
-               const float sy = (float)quad[i][1];
-               corners[i][0] = sx * dx;
-               corners[i][1] = sy * dy;
-               corners[i][2] = 0.5f * (sx + 1.0f);
-               corners[i][3] = lower_left ? 0.5f * (sy + 1.0f)
-                                          : 0.5f * (1.0f - sy);
-            }
-            /* Through the stream uploader rather than a buffer of the
-             * driver's own: a draw already encoded into this pass must keep
-             * the corners it was given, and a queue write would overwrite
-             * them before the submit. */
-            unsigned offset = 0;
-            struct pipe_resource *resource = NULL;
-            struct pipe_resource *released = NULL;
-            u_upload_data(ctx->base.stream_uploader, 0, sizeof(corners), 16,
-                          corners, &offset, &resource, &released);
-            pipe_resource_reference(&released, NULL);
-            if (resource) {
-               u_upload_unmap(ctx->base.stream_uploader);
-               ctx->point_expand.active = true;
-               ctx->point_expand.per_vertex_size = writes_size;
-               ctx->point_expand.corner_location = corner_location;
-               ctx->point_expand.coord_location = coord_location;
-               ctx->point_expand.corners = resource;
-               ctx->point_expand.corner_offset = offset;
-            } else {
-               why = "the corner buffer could not be uploaded";
-            }
-         }
-      }
-      if (getenv("GEX_WGPU_POINT_LOG")) {
-         static unsigned told;
-         if (told < 8) { ++told;
-            fprintf(stderr, "gex-wgpu: points count=%u size=%.2f pv=%d "
-                    "psiz=%d vp=%.0fx%.0f reads_pc=%d sprite=0x%x "
-                    "smooth=%d coord=%d why=%s\n",
-                    draws[0].count, fixed_size,
-                    (int)ctx->rasterizer->point_size_per_vertex,
-                    (int)writes_size, vp_width, vp_height,
-                    ctx->fs ? (int)ctx->fs->reads_point_coord : -1,
-                    ctx->rasterizer->sprite_coord_enable,
-                    (int)ctx->rasterizer->point_smooth,
-                    (int)ctx->point_expand.coord_location,
-                    why ? why : (want ? "expanded" : "not wide")); }
-      }
-      /* Once per distinct reason, so a program that draws indexed points
-       * every frame says so once. Keyed on the pointer because every reason
-       * above is a string literal, which makes the identity stable and the
-       * table small. */
-      if (why) {
-         static const char *said[8];
-         bool told = false;
-         unsigned free_slot = 8;
-         for (unsigned i = 0; i < 8; ++i) {
-            if (said[i] == why)
-               told = true;
-            else if (!said[i] && free_slot == 8)
-               free_slot = i;
-         }
-         if (!told && free_slot < 8) {
-            said[free_slot] = why;
-            fprintf(stderr, "gex-wgpu: points drawn one pixel wide (%s)\n",
-                    why);
-         }
-      }
    }
 
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
@@ -17840,8 +18177,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * Gallium index instead both overran WebGPU's eight slots and walked
        * into the empty ones a disabled vertex array leaves behind. */
       for (unsigned slot = 0; slot < vb_slot_count; ++slot) {
-         struct pipe_resource *buffer = ctx->vertex_buffers[vb_buffer[slot]];
-         const uint32_t offset = ctx->vertex_buffer_offsets[vb_buffer[slot]];
+         const unsigned which = vb_buffer[slot];
+         /* A gathered slot is bound to the de-indexed copy instead, at offset
+          * zero: the gather already applied the buffer's own offset. */
+         const bool gathered = (ctx->point_gather_mask & (1u << which)) != 0;
+         struct pipe_resource *buffer = gathered
+            ? ctx->point_gathered[which] : ctx->vertex_buffers[which];
+         const uint32_t offset =
+            gathered ? 0u : ctx->vertex_buffer_offsets[which];
          WGPUBuffer handle = gex_resource(buffer)->buffer;
          if (ctx->emitted.vertex[slot] == handle &&
              ctx->emitted.vertex_offset[slot] == offset) {
@@ -17934,8 +18277,20 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             ? draws[0].count : info->instance_count;
          const uint32_t first_vertex =
             ctx->point_expand.active ? 0u : draws[0].start;
-         const uint32_t first_instance = ctx->point_expand.active
-            ? draws[0].start : info->start_instance;
+         /* A de-indexed draw starts at zero: the gather put the vertices it
+          * referenced in draw order, so the draw's own start has already
+          * been applied. Passing it again asked for instances 7..12 of a
+          * six-vertex buffer --
+          *
+          *   Instance range (first: 7, count: 6) requires a larger buffer
+          *   (104) than the bound buffer size (48)
+          *
+          * -- which is a validation error, so the whole command buffer went
+          * with it and the second half of every restart-split point draw
+          * vanished. tests/gl44-probe.sh primrestart caught it. */
+         const uint32_t first_instance = !ctx->point_expand.active
+            ? info->start_instance
+            : info->index_size ? 0u : draws[0].start;
          gex_wgpu_cmd_note("draw count=%u inst=%u first=%u", vertices,
                            instances, first_vertex);
          gex_wgpu_cmd_end();
@@ -18210,6 +18565,8 @@ gex_wgpu_screen_destroy(struct pipe_screen *base)
    simple_mtx_destroy(&gex_screen(base)->queue_lock);
    mtx_destroy(&gex_screen(base)->device_lock);
    struct gex_wgpu_screen *screen = gex_screen(base);
+   if (screen->gather_module)
+      wgpuShaderModuleRelease(screen->gather_module);
    if (screen->queue)
       wgpuQueueRelease(screen->queue);
    FREE(screen);
