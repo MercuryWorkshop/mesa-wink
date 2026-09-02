@@ -699,6 +699,17 @@ struct gex_wgpu_rasterizer {
    unsigned cull_face;
    bool discard;
    bool unclipped_depth;
+   /* glPolygonOffset, which WebGPU takes directly as depth bias. GL adds
+    * `factor * m + units * r` to a fragment's depth, where m is the maximum
+    * depth slope of the primitive and r the smallest resolvable difference;
+    * WebGPU's depthBias counts in units of r and depthBiasSlopeScale
+    * multiplies the slope, so the two say the same thing. Gallium halves
+    * units unless offset_units_unscaled says otherwise, so it is doubled
+    * back here -- the same correction zink applies. */
+   bool depth_bias_enabled;
+   int32_t depth_bias;
+   float depth_bias_slope;
+   float depth_bias_clamp;
 };
 
 /* Which varyings travel between two stages through a buffer, and in what
@@ -2643,7 +2654,59 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    NIR_PASS(_, nir, nir_shader_instructions_pass,
             gex_wgpu_lower_query_lod_instr,
             nir_metadata_control_flow | nir_metadata_loop_analysis, NULL);
+   /* Keep st/mesa's vertex input numbering across ntv_shader_prepare.
+    *
+    * That pass rewrites every vertex input's driver_location -- which becomes
+    * the module's @location -- as
+    *
+    *   location >= VERT_ATTRIB_GENERIC0 ? location - VERT_ATTRIB_GENERIC0
+    *                                    : location
+    *
+    * and those two ranges overlap. VERT_ATTRIB_POS is 0 and
+    * VERT_ATTRIB_GENERIC0 is 16, so any shader using a fixed-function
+    * attribute together with a generic one declares two inputs at
+    * @location(0), and the SPIR-V is invalid before Tint even sees it:
+    *
+    *   [VUID-StandaloneSpirv-OpEntryPoint-08721] Entry-point has conflicting
+    *   input location assignment at location 0, component 0
+    *
+    * st/mesa builds exactly that shape for its own fixed-function work --
+    * VERT_ATTRIB_POS, VERT_ATTRIB_COLOR0 and VERT_ATTRIB_GENERIC0 together --
+    * so glDrawPixels, glCopyPixels and the FBO clear paths all produced a
+    * rejected vertex shader, which latched the context, after which every
+    * texture_map returned NULL and the application segfaulted on it. That was
+    * 17 of the 27 crashes in a sweep of the 336 installed GL programs, and
+    * seven more refusals besides.
+    *
+    * st/mesa's own numbering does not collide: it is dense from zero, and it
+    * is what Gallium's vertex elements are indexed by -- so it is also the
+    * numbering the pipeline's shaderLocation uses. Keeping it makes the two
+    * sides agree by construction rather than by a formula that has to be
+    * mirrored. Keyed by variable pointer, because these passes may reorder
+    * the variable list. */
+   unsigned saved_locations[GEX_WGPU_MAX_VERTEX_ELEMENTS * 2];
+   const nir_variable *saved_vars[GEX_WGPU_MAX_VERTEX_ELEMENTS * 2];
+   unsigned saved_count = 0;
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      nir_foreach_shader_in_variable(var, nir) {
+         if (saved_count >= ARRAY_SIZE(saved_vars))
+            break;
+         saved_vars[saved_count] = var;
+         saved_locations[saved_count] = var->data.driver_location;
+         ++saved_count;
+      }
+   }
    ntv_shader_prepare(nir);
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      nir_foreach_shader_in_variable(var, nir) {
+         for (unsigned i = 0; i < saved_count; ++i) {
+            if (saved_vars[i] == var) {
+               var->data.driver_location = saved_locations[i];
+               break;
+            }
+         }
+      }
+   }
    /* No deref may outlive the block it is used in.
     *
     * A NIR deref is an SSA value and ntv translates one into a single
@@ -3700,9 +3763,11 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
           * @location(1..3) while the pipeline offered 0..2, and WebGPU
           * rejected it as "vertex attribute slot 3 not present in the
           * VertexState". */
-         const unsigned base_location =
-            var->data.location >= VERT_ATTRIB_GENERIC0
-               ? var->data.location - VERT_ATTRIB_GENERIC0 : var->data.location;
+         /* The module now declares @location(driver_location), which is
+          * st/mesa's numbering and therefore the vertex element index. The
+          * formula this replaces mirrored ntv_shader_prepare's overlapping
+          * ranges and inherited their collision. */
+         const unsigned base_location = var->data.driver_location;
          for (unsigned slot = 0; slot < slots; ++slot) {
             const unsigned element = var->data.driver_location + slot;
             const unsigned location = base_location + slot;
@@ -4151,6 +4216,18 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
       state->unclamped_fragment_depth_values;
    supported.rasterization_stream = state->rasterization_stream;
    supported.sprite_coord_enable = state->sprite_coord_enable;
+   /* Polygon offset. WebGPU has depthBias, depthBiasSlopeScale and
+    * depthBiasClamp, so all of this is representable exactly; refusing it
+    * bound no rasterizer state at all, which cost culling and the scissor
+    * too. Six of the installed GL programs set it, decals and shadow
+    * volumes being what it is for. */
+   supported.offset_point = state->offset_point;
+   supported.offset_line = state->offset_line;
+   supported.offset_tri = state->offset_tri;
+   supported.offset_units_unscaled = state->offset_units_unscaled;
+   supported.offset_units = state->offset_units;
+   supported.offset_scale = state->offset_scale;
+   supported.offset_clamp = state->offset_clamp;
    /* Which vertex of a primitive a flat-qualified varying takes its value
     * from. WGSL's flat interpolation takes the first, so GL's
     * FIRST_VERTEX_CONVENTION -- this field set -- is the one that can be
@@ -4218,6 +4295,15 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
    if (rasterizer) {
       rasterizer->scissor = state->scissor;
       rasterizer->front_ccw = state->front_ccw;
+      /* util_get_offset picks the enable that goes with the fill mode, which
+       * is what GL means by GL_POLYGON_OFFSET_FILL/LINE/POINT. */
+      rasterizer->depth_bias_enabled =
+         util_get_offset(state, state->fill_front);
+      rasterizer->depth_bias = (int32_t)(state->offset_units *
+                                         (state->offset_units_unscaled ? 1.0f
+                                                                       : 2.0f));
+      rasterizer->depth_bias_slope = state->offset_scale;
+      rasterizer->depth_bias_clamp = state->offset_clamp;
       rasterizer->cull_face = state->cull_face;
       rasterizer->discard = state->rasterizer_discard;
       rasterizer->unclipped_depth = !state->depth_clip_near;
@@ -14445,6 +14531,21 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          ? WGPUOptionalBool_True : WGPUOptionalBool_False;
       depth_state.depthCompare = enabled
          ? gex_wgpu_compare(ctx->dsa->depth_func) : WGPUCompareFunction_Always;
+      /* Only for a triangle topology. WebGPU refuses the pipeline outright --
+       * "depthBias must be 0 when using PrimitiveTopology::LineStrip" -- and
+       * that matches GL, where polygon offset applies to polygon
+       * rasterization and a line or point draw is not one. An application
+       * that leaves GL_POLYGON_OFFSET_FILL enabled while drawing lines is
+       * ordinary, and `offset` does exactly that. */
+      const WGPUPrimitiveTopology bias_topology =
+         gex_wgpu_topology(info->mode);
+      if (ctx->rasterizer && ctx->rasterizer->depth_bias_enabled &&
+          (bias_topology == WGPUPrimitiveTopology_TriangleList ||
+           bias_topology == WGPUPrimitiveTopology_TriangleStrip)) {
+         depth_state.depthBias = ctx->rasterizer->depth_bias;
+         depth_state.depthBiasSlopeScale = ctx->rasterizer->depth_bias_slope;
+         depth_state.depthBiasClamp = ctx->rasterizer->depth_bias_clamp;
+      }
       if (has_stencil) {
          const bool stencil_enabled = ctx->dsa && ctx->dsa->stencil[0].enabled;
          const struct pipe_stencil_state *stencil = stencil_enabled
