@@ -15066,6 +15066,19 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * renderer cuts out its font glyphs and foliage -- and nothing in the
     * browser had reached it, core profile having removed the feature. */
    caps->alpha_test = false;
+   /* Doubles are deliberately not advertised, and the reason is circular.
+    *
+    * Mesa can lower fp64 in software -- float64.glsl and nir_lower_doubles,
+    * which st runs by itself once lower_doubles_options asks for it. But st
+    * only *builds* that shader when GLSL is 4.00 or better, and Mesa clamps
+    * the GLSL version to the GL version, which stays at 3.3 until the whole
+    * GL 4.0 extension set is present -- fp64 among it. So fp64 cannot be
+    * delivered on its own; it arrives with the rung or not at all.
+    *
+    * Setting caps.doubles anyway is worse than leaving it: st advertises
+    * ARB_gpu_shader_fp64, an application writes a double, and the draw dies
+    * on `assert(softfp64 != NULL)` inside nir_lower_double_ops instead of
+    * failing to compile. Measured, not guessed. */
    caps->glsl_feature_level = 330;
    caps->glsl_feature_level_compatibility = 330;
 
@@ -15416,6 +15429,32 @@ gex_wgpu_init_nir_options(struct gex_wgpu_screen *screen)
        * away is an op it cannot emit. The one deliberate difference is
        * lower_fsat, which nir_to_spirv does handle (as a clamp) and which is
        * better left for it than expanded into two more instructions here. */
+      /* 64-bit anything, in software.
+       *
+       * WGSL has neither f64 nor i64, so every 64-bit operation has to become
+       * a pair of 32-bit ones. Mesa already knows how: st runs
+       * nir_lower_doubles against src/compiler/glsl/float64.glsl -- the same
+       * software fp64 Intel ships -- and nir_lower_int64 for the integer
+       * halves that lowering then produces. The driver's part is to ask for
+       * it, which is these two masks and caps.doubles.
+       *
+       * ARB_gpu_shader_fp64 is one requirement of GL 4.0; the rung also wants
+       * a tessellator, which nothing has written yet. */
+      .lower_doubles_options = (nir_lower_doubles_options)(
+         nir_lower_drcp | nir_lower_dsqrt | nir_lower_drsq | nir_lower_dtrunc |
+         nir_lower_dfloor | nir_lower_dceil | nir_lower_dfract |
+         nir_lower_dround_even | nir_lower_dmod | nir_lower_dsub |
+         nir_lower_ddiv | nir_lower_dsign | nir_lower_dminmax |
+         nir_lower_dsat | nir_lower_fp64_full_software),
+      .lower_int64_options = (nir_lower_int64_options)(
+         nir_lower_imul64 | nir_lower_isign64 | nir_lower_divmod64 |
+         nir_lower_imul_high64 | nir_lower_bcsel64 | nir_lower_icmp64 |
+         nir_lower_iadd64 | nir_lower_iabs64 | nir_lower_ineg64 |
+         nir_lower_logic64 | nir_lower_minmax64 | nir_lower_shift64 |
+         nir_lower_imul_2x32_64 | nir_lower_extract64 | nir_lower_ufind_msb64 |
+         nir_lower_bit_count64 | nir_lower_find_lsb64 | nir_lower_conv64 |
+         nir_lower_uadd_sat64 | nir_lower_usub_sat64 | nir_lower_iadd_sat64 |
+         nir_lower_bitfield_reverse64 | nir_lower_bitfield_extract64),
       .lower_scmp = true,
       .lower_hadd = true,
       .lower_iadd_sat = true,
