@@ -432,6 +432,19 @@ struct gex_wgpu_context {
     * map renders each cascade into one layer of a depth array. */
    unsigned depth_level;
    unsigned depth_layer;
+   /* How this draw expands its points into quads, decided in draw_vbo_inner
+    * and read by the pipeline builder and the draw itself. Inactive for every
+    * draw that is not wide points. See gex_wgpu_lower_wide_point. */
+   struct {
+      bool active;
+      bool per_vertex_size;
+      unsigned corner_location;
+      unsigned coord_location;
+      /* The six corner offsets, uploaded through the stream uploader so a
+       * draw already encoded into this pass keeps the values it was given. */
+      struct pipe_resource *corners;
+      unsigned corner_offset;
+   } point_expand;
    /* Set while a provoking-vertex rewrite is re-issuing its draw, so the
     * rewrite does not see its own output and recurse. */
    bool provoking_rewritten;
@@ -631,6 +644,22 @@ struct gex_wgpu_context {
    struct pipe_sampler_view *vertex_sampler_views[GEX_WGPU_MAX_SAMPLERS];
 };
 
+/* How one draw expands its points into quads. Kept here rather than beside
+ * the pass that reads it because a vertex shader variant is keyed on it.
+ * See gex_wgpu_lower_wide_point. */
+struct gex_wgpu_wide_point {
+   /* The @location the corner attribute was given: the lowest one the shader
+    * does not already declare. */
+   unsigned corner_location;
+   /* The driver location of the gl_PointCoord varying the pass writes, or
+    * ~0u when nothing reads the sprite coordinate. */
+   unsigned coord_location;
+   /* Multiply the corner offset by the shader's own gl_PointSize. */
+   bool per_vertex_size;
+   /* Emit the sprite coordinate's t flipped, for the y-flipped module. */
+   bool flip_coord_t;
+};
+
 struct gex_wgpu_shader {
    enum mesa_shader_stage stage;
    unsigned ubo_count;
@@ -672,6 +701,10 @@ struct gex_wgpu_shader {
    /* Whether the shader reads gl_DrawID. Only then does a non-zero
     * drawid_offset change what it computes. */
    bool reads_draw_id;
+   /* Whether the fragment stage reads gl_PointCoord. An expanded wide point
+    * feeds it from the corner attribute through a varying, which costs a
+    * varying slot, so it is only added where something reads it. */
+   bool reads_point_coord;
    /* The base type this shader writes to colour output zero. WebGPU requires
     * it to match the target's; a mismatch is a validation error, and a
     * validation error poisons the device for every later command. */
@@ -726,6 +759,11 @@ struct gex_wgpu_interp_variant {
     * shader compiled for one attribute layout cannot be reused for another:
     * the unpack is baked into the module. */
    uint8_t attrib_unpack[GEX_WGPU_MAX_VERTEX_ELEMENTS];
+   /* The wide-point expansion this module was built with, all zero for an
+    * ordinary draw. Keyed rather than rebuilt because a program that draws
+    * both points and triangles through one shader -- which `spriteblast`
+    * does -- would otherwise recompile on every mode change. */
+   struct gex_wgpu_wide_point wide;
    uint64_t mask;
    /* Scale and translate folded into gl_Position for a viewport WebGPU
     * cannot set. All zero when the viewport fits and nothing is folded. */
@@ -750,6 +788,14 @@ struct gex_wgpu_shader_variant {
    unsigned coord_replace;
    /* Which fragment inputs this variant zeroed for want of a producer. */
    uint64_t unproduced;
+   /* The varying driver location this variant reads gl_PointCoord from, or
+    * ~0u where it took the single-pixel centre instead. Keyed like
+    * coord_replace: the same shader drawing triangles must not get the
+    * points variant. */
+   unsigned point_coord_location;
+   /* Whether this variant discards the corners of the point, for
+    * GL_POINT_SMOOTH. */
+   bool point_smooth;
    /* The polygon stipple this variant baked in as immediates. Not the
     * framebuffer height: the row index does not depend on it, see
     * gex_wgpu_lower_poly_stipple. */
@@ -781,6 +827,15 @@ struct gex_wgpu_rasterizer {
     * instead of from the vertex shader, as a mask of texcoord slots. Only
     * meaningful while drawing points. */
    unsigned sprite_coord_enable;
+   /* glPointSize, and whether the vertex shader supplies it per vertex.
+    * WebGPU has neither -- a point is one pixel and there is no point_size
+    * builtin -- so a point wider than one pixel is drawn as a quad; see
+    * gex_wgpu_lower_wide_point. sprite_coord_mode decides which way
+    * gl_PointCoord's t runs across it. */
+   float point_size;
+   bool point_size_per_vertex;
+   bool point_smooth;
+   unsigned sprite_coord_mode;
    /* glPolygonMode, as PIPE_POLYGON_MODE_*. FILL is the ordinary case; LINE
     * and POINT are drawn by rewriting the primitive, since WebGPU has no
     * polygon mode.
@@ -2304,6 +2359,13 @@ gex_wgpu_zero_unproduced_input(nir_builder *b, nir_intrinsic_instr *intr,
       return false;
    if (state->produced & BITFIELD64_BIT(var->data.location))
       return false;
+   if (getenv("GEX_WGPU_POINT_LOG")) {
+      static unsigned told;
+      if (told < 8) { ++told;
+         fprintf(stderr, "gex-wgpu: unproduced input loc=%d comps=%u "
+                 "sprite=%d\n", var->data.location, intr->def.num_components,
+                 (state->sprite & BITFIELD64_BIT(var->data.location)) != 0); }
+   }
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *value;
    if (state->sprite & BITFIELD64_BIT(var->data.location)) {
@@ -2841,6 +2903,399 @@ gex_wgpu_lower_point_coord_instr(nir_builder *b, nir_intrinsic_instr *intr,
    nir_def *centre = nir_imm_vec2(b, 0.5f, 0.5f);
    nir_def_replace(&intr->def, centre);
    return true;
+}
+
+/* Wide points, which WebGPU has no way to draw.
+ *
+ * A WebGPU point is one pixel and there is no `point_size` builtin -- Tint
+ * refuses SpvBuiltInPointSize outright -- so glPointSize did nothing, and
+ * eight of the installed programs are about nothing else. `spriteblast` and
+ * `points` were the two largest divergences in the whole llvmpipe comparison
+ * (RMSE 0.26 and 0.21): a particle system drawn as single pixels shares no
+ * structure with the same particle system drawn as sprites.
+ *
+ * A point becomes a quad, which is the standard answer, and the interesting
+ * part is where the quad's corners come from. WebGPU's vertex fetch offers
+ * exactly two indices -- `vertex_index` and `instance_index` -- and the three
+ * corners of a triangle must vary along the *vertex* one, because a triangle
+ * is three consecutive vertices of one instance. So the per-point data has to
+ * vary along the *instance* one instead: every vertex buffer is rebound with
+ * `stepMode: instance` and the draw becomes six vertices by N instances. The
+ * corner itself comes from a six-entry buffer the driver uploads per draw.
+ *
+ * That inversion is what makes indexed point draws unreachable: the index
+ * buffer would have to index the instance dimension, and WebGPU indexes only
+ * the vertex one. Those still draw as single pixels -- see the refusal in
+ * draw_vbo_inner.
+ *
+ * The corner buffer carries the offset already scaled, so the shader adds
+ * `corner.xy * position.w` and nothing else. The scale is 2*size/viewport,
+ * because clip space spans 2 across the viewport, and it is the *viewport*
+ * rather than the framebuffer even when the viewport transform is folded into
+ * this shader -- the fold multiplies x by viewport/framebuffer, so an offset
+ * expressed against the viewport comes out right either way. This pass
+ * therefore has to run before gex_wgpu_lower_viewport_transform, which it
+ * does.
+ *
+ * gl_PointSize keeps working too: with a per-vertex size the corner buffer
+ * carries 2/viewport and the shader multiplies by the value the shader wrote,
+ * which is stashed in a temporary on its way past. A temporary rather than
+ * the SSA value directly because st/mesa stores gl_PointSize *after*
+ * gl_Position, so the value does not dominate the position store.
+ */
+struct gex_wgpu_wide_point_stash {
+   nir_variable *size;
+   nir_variable *position;
+   /* The shader's own gl_Position output, stored to a second time once the
+    * offset is known. */
+   nir_variable *position_out;
+   nir_variable *corner;
+   nir_variable *coord_out;
+   const struct gex_wgpu_wide_point *how;
+};
+
+/* The gl_PointSize store on its way past: keep the value, drop the store.
+ * gex_wgpu_strip_point_size would drop it outright, and this runs instead of
+ * it for an expanded draw. */
+static bool
+gex_wgpu_wide_point_size_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                               void *data)
+{
+   struct gex_wgpu_wide_point_stash *stash = data;
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_shader_out ||
+       var->data.location != VARYING_SLOT_PSIZ)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_store_var(b, stash->size, nir_channel(b, intr->src[1].ssa, 0), 0x1);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+/* The gl_Position store on its way past: the value is kept and the store left
+ * alone. The offset cannot be applied here, because gl_PointSize is not
+ * necessarily known yet -- st/mesa emits its output stores in slot order and
+ * VARYING_SLOT_PSIZ comes after VARYING_SLOT_POS, so a per-vertex size read
+ * at this point is still the 1.0 the temporary was initialised with. That is
+ * exactly what `point-param`'s attenuated points and `spriteblast`'s sprites
+ * looked like: expanded, and one pixel across. */
+static bool
+gex_wgpu_wide_point_position_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                                   void *data)
+{
+   struct gex_wgpu_wide_point_stash *stash = data;
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_shader_out ||
+       var->data.location != VARYING_SLOT_POS)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_store_var(b, stash->position, intr->src[1].ssa, 0xf);
+   stash->position_out = var;
+   return true;
+}
+
+/* The offset itself, after every store the shader makes, so that both the
+ * position and the point size are in hand. Storing gl_Position a second time
+ * is what makes the ordering irrelevant: the last store is the one that
+ * counts, and the viewport fold that runs after this rewrites both. */
+static void
+gex_wgpu_wide_point_offset(nir_builder *b,
+                           struct gex_wgpu_wide_point_stash *stash)
+{
+   nir_def *pos = nir_load_var(b, stash->position);
+   nir_def *corner = nir_load_var(b, stash->corner);
+   nir_def *scale = nir_channel(b, pos, 3);
+   if (stash->how->per_vertex_size)
+      scale = nir_fmul(b, scale, nir_load_var(b, stash->size));
+   nir_def *x = nir_ffma(b, nir_channel(b, corner, 0), scale,
+                         nir_channel(b, pos, 0));
+   nir_def *y = nir_ffma(b, nir_channel(b, corner, 1), scale,
+                         nir_channel(b, pos, 1));
+   nir_store_var(b, stash->position_out,
+                 nir_vec4(b, x, y, nir_channel(b, pos, 2),
+                          nir_channel(b, pos, 3)), 0xf);
+   if (stash->coord_out) {
+      nir_def *sprite_s = nir_channel(b, corner, 2);
+      nir_def *sprite_t = nir_channel(b, corner, 3);
+      if (stash->how->flip_coord_t)
+         sprite_t = nir_fsub_imm(b, 1.0f, sprite_t);
+      nir_store_var(b, stash->coord_out, nir_vec2(b, sprite_s, sprite_t),
+                    0x3);
+   }
+}
+
+/* gl_VertexID and gl_InstanceID, which the inversion moves.
+ *
+ * The point's index is now the instance index -- WGSL's instance_index counts
+ * from firstInstance, which the draw sets to the first vertex, so it *is*
+ * gl_VertexID -- and the vertex index is the corner, which no GL shader has
+ * any business reading. A shader that reads gl_VertexID with points is rare
+ * but `vp-array`-shaped programs exist, and leaving it would feed them 0..5.
+ */
+static bool
+gex_wgpu_wide_point_ids_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                              void *data)
+{
+   (void)data;
+   b->cursor = nir_before_instr(&intr->instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_vertex_id:
+   case nir_intrinsic_load_vertex_id_zero_base:
+      nir_def_replace(&intr->def, nir_load_instance_id(b));
+      return true;
+   case nir_intrinsic_load_instance_id:
+      nir_def_replace(&intr->def, nir_imm_int(b, 0));
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+gex_wgpu_lower_wide_point(nir_shader *nir,
+                          const struct gex_wgpu_wide_point *how)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl)
+      return false;
+
+   struct gex_wgpu_wide_point_stash stash = {0};
+   stash.how = how;
+   stash.corner = nir_variable_create(nir, nir_var_shader_in,
+                                      glsl_vec4_type(), "gex_point_corner");
+   stash.corner->data.location =
+      VERT_ATTRIB_GENERIC0 + how->corner_location;
+   stash.corner->data.driver_location = how->corner_location;
+   if (how->coord_location != ~0u) {
+      stash.coord_out = nir_variable_create(nir, nir_var_shader_out,
+                                            glsl_vec2_type(),
+                                            "gex_point_coord");
+      stash.coord_out->data.location =
+         VARYING_SLOT_VAR0 + how->coord_location;
+      stash.coord_out->data.driver_location = how->coord_location;
+      stash.coord_out->data.interpolation = INTERP_MODE_NONE;
+   }
+   stash.position = nir_local_variable_create(impl, glsl_vec4_type(),
+                                              "gex_point_position");
+   if (how->per_vertex_size) {
+      stash.size = nir_local_variable_create(impl, glsl_float_type(),
+                                             "gex_point_size");
+      nir_builder b = nir_builder_at(nir_before_impl(impl));
+      nir_store_var(&b, stash.size, nir_imm_float(&b, 1.0f), 0x1);
+      nir_shader_intrinsics_pass(nir, gex_wgpu_wide_point_size_instr,
+                                 nir_metadata_control_flow, &stash);
+   }
+   nir_shader_intrinsics_pass(nir, gex_wgpu_wide_point_ids_instr,
+                              nir_metadata_control_flow, NULL);
+   if (!nir_shader_intrinsics_pass(nir, gex_wgpu_wide_point_position_instr,
+                                   nir_metadata_control_flow, &stash) ||
+       !stash.position_out)
+      return false;
+   nir_builder end = nir_builder_at(nir_after_impl(impl));
+   gex_wgpu_wide_point_offset(&end, &stash);
+   nir_progress(true, impl, nir_metadata_none);
+   /* The temporaries have to become SSA before ntv sees them; the emitter has
+    * no lowering of its own for function-scope variables. */
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   nir_shader_gather_info(nir, impl);
+   return true;
+}
+
+/* GL_POINT_SMOOTH: a round point rather than a square one.
+ *
+ * GL antialiases a smooth point by turning the fragment's coverage of the
+ * point's circle into alpha. What this does instead is discard the fragments
+ * outside the circle, which gets the *shape* right -- the whole of the
+ * difference in a comparison against llvmpipe, since `points` and
+ * `point-wide-smooth` draw opaque dots -- and leaves the one-pixel soft edge
+ * that coverage would add. Alpha modulation would need the fragment's colour
+ * outputs rewritten, and would be visible only where the program also
+ * blends.
+ *
+ * The radius is measured in sprite-coordinate space, where the point is the
+ * unit square whatever its size in pixels, so this needs no size uniform.
+ */
+static bool
+gex_wgpu_lower_point_smooth(nir_shader *nir, unsigned location)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl)
+      return false;
+   nir_variable *coord = NULL;
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+      if (var->data.location == (int)(VARYING_SLOT_VAR0 + location))
+         coord = var;
+   }
+   if (!coord)
+      return false;
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *offset = nir_fadd_imm(&b, nir_load_var(&b, coord), -0.5f);
+   nir_def *squared = nir_fdot2(&b, offset, offset);
+   nir_discard_if(&b, nir_flt(&b, nir_imm_float(&b, 0.25f), squared));
+   nir->info.fs.uses_discard = true;
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
+}
+
+/* The @location to give the corner attribute: the lowest one this shader does
+ * not already declare. WebGPU takes sixteen vertex attributes, so a shader
+ * using all of them cannot have another and the draw goes unexpanded. */
+static unsigned
+gex_wgpu_point_corner_location(const struct gex_wgpu_shader *vs)
+{
+   for (unsigned location = 0; location < 16; ++location)
+      if (!(vs->vertex_locations & BITFIELD64_BIT(location)))
+         return location;
+   return ~0u;
+}
+
+/* The varying to carry the sprite coordinate on: the lowest @location neither
+ * stage uses. Returned as the @location, from which both stages derive the
+ * same VARYING_SLOT_VAR* -- which is the only slot range that works.
+ *
+ * ntv_shader_prepare recomputes every varying's driver_location, and so its
+ * @location, from its slot:
+ *
+ *   location >= VARYING_SLOT_VAR0 ? location - VARYING_SLOT_VAR0 : location
+ *
+ * VARYING_SLOT_PNTC is 25 under that rule, which is past WebGPU's sixteen
+ * inter-stage locations -- so writing gl_PointCoord to the slot GL names for
+ * it produced an invalid pipeline every time:
+ *
+ *   Vertex output variable "<retval>.gex_point_coord_1" has a location (25)
+ *   that is too large. It should be less than (16).
+ *
+ * The same rule is why the search is over *effective* @locations rather than
+ * slots: gl_TexCoord[0] is slot 4 and lands on @location(4), so a VAR slot
+ * chosen by counting VAR slots alone would collide with it. */
+static unsigned
+gex_wgpu_point_coord_location(const struct gex_wgpu_context *ctx)
+{
+   uint32_t taken = 0;
+   const nir_shader *stages[2] = {
+      ctx->vs ? ctx->vs->original_nir : NULL,
+      ctx->fs ? ctx->fs->original_nir : NULL,
+   };
+   for (unsigned i = 0; i < 2; ++i) {
+      if (!stages[i])
+         continue;
+      const nir_variable_mode mode =
+         i == 0 ? nir_var_shader_out : nir_var_shader_in;
+      nir_foreach_variable_with_modes(var, stages[i], mode) {
+         if (!gex_wgpu_is_location_varying(var->data.location))
+            continue;
+         const int slot = var->data.location;
+         const unsigned location = slot >= VARYING_SLOT_VAR0
+            ? (unsigned)(slot - VARYING_SLOT_VAR0) : (unsigned)slot;
+         if (location < 32)
+            taken |= 1u << location;
+      }
+   }
+   /* WebGPU's inter-stage limit is sixteen locations, and gl_Position and the
+    * point coordinate itself are not among them -- but a driver that hands
+    * out the sixteenth has nothing left for a shader that wants it, and the
+    * pipeline is then a validation error, which poisons the device. Fifteen
+    * is the cautious ceiling; the draw goes unexpanded above it. */
+   for (unsigned location = 0; location < 15; ++location)
+      if (!(taken & (1u << location)))
+         return location;
+   return ~0u;
+}
+
+/* gl_PointCoord for an expanded wide point, which is a varying rather than a
+ * constant: the vertex stage writes the corner's sprite coordinate and the
+ * rasteriser interpolates it across the quad, which is precisely what GL's
+ * point rasteriser does for a point it draws as more than one pixel.
+ *
+ * The driver asks st/mesa for gl_PointCoord as a system value
+ * (caps->fs_point_is_sysval), because as a varying with no producer the
+ * pipeline is invalid -- so what arrives here is nir_load_point_coord, and
+ * this turns it back into an input. The location is chosen per draw, above
+ * every varying either stage already uses, and both stages are told the same
+ * one.
+ */
+struct gex_wgpu_point_coord_lowering {
+   nir_variable *input;
+   /* Varying locations GL_COORD_REPLACE feeds from the sprite. */
+   uint64_t sprite;
+   bool replaced_varying;
+};
+
+static bool
+gex_wgpu_lower_point_coord_varying_instr(nir_builder *b,
+                                         nir_intrinsic_instr *intr,
+                                         void *data)
+{
+   struct gex_wgpu_point_coord_lowering *state = data;
+   if (intr->intrinsic == nir_intrinsic_load_point_coord ||
+       intr->intrinsic == nir_intrinsic_load_point_coord_maybe_flipped) {
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def_replace(&intr->def, nir_load_var(b, state->input));
+      return true;
+   }
+   /* GL_COORD_REPLACE, which has to be applied whether or not the vertex
+    * stage writes the texcoord it replaces.
+    *
+    * This used to ride on the unproduced-input substitution, which only fires
+    * for a location nothing produces -- and st/mesa's fixed-function vertex
+    * shader writes gl_TexCoord[0] as a matter of course. With a one-pixel
+    * point that was invisible, since the sprite coordinate was the constant
+    * (0.5, 0.5) either way. With a real quad it is the whole difference:
+    * `point-sprite` sampled its 2x2 texture at one corner and drew a solid
+    * yellow square, and `spriteblast`'s glyphs came out as flat blocks. */
+   if (!state->sprite || intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+   if (!var || var->data.mode != nir_var_shader_in ||
+       var->data.location >= GEX_WGPU_MAX_VARYING_LOCATIONS ||
+       !(state->sprite & BITFIELD64_BIT(var->data.location)))
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *coord = nir_load_var(b, state->input);
+   /* (s, t) from the sprite, r = 0 and q = 1, which is what GL_COORD_REPLACE
+    * specifies for the other two components. */
+   nir_def *sprite = nir_vec4(b, nir_channel(b, coord, 0),
+                              nir_channel(b, coord, 1),
+                              nir_imm_float(b, 0.0f),
+                              nir_imm_float(b, 1.0f));
+   nir_def_replace(&intr->def,
+                   intr->def.num_components >= 4
+                      ? sprite
+                      : nir_trim_vector(b, sprite,
+                                        intr->def.num_components));
+   state->replaced_varying = true;
+   return true;
+}
+
+static bool
+gex_wgpu_lower_point_coord_varying(nir_shader *nir, unsigned location,
+                                   uint64_t sprite)
+{
+   struct gex_wgpu_point_coord_lowering state = {0};
+   state.sprite = sprite;
+   state.input = nir_variable_create(nir, nir_var_shader_in,
+                                     glsl_vec2_type(), "gex_point_coord");
+   state.input->data.location = VARYING_SLOT_VAR0 + location;
+   state.input->data.driver_location = location;
+   state.input->data.interpolation = INTERP_MODE_NONE;
+   const bool any =
+      nir_shader_intrinsics_pass(nir, gex_wgpu_lower_point_coord_varying_instr,
+                                 nir_metadata_control_flow, &state);
+   /* A replaced texcoord leaves its own input variable behind with no reads.
+    * The emitter declares an input for every shader_in variable there is, so
+    * it has to go -- and if the vertex stage does not write it, the pipeline
+    * is invalid while it stays. */
+   if (state.replaced_varying) {
+      NIR_PASS(_, nir, nir_opt_dce);
+      nir_remove_dead_variables(nir, nir_var_shader_in, NULL);
+   }
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   return any;
 }
 
 static void
@@ -4285,6 +4740,23 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * state that is only known once the other stage is bound. */
    shader->reads_draw_id =
       BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_DRAW_ID);
+   /* Scanned for rather than read off info.system_values_read, which does
+    * not carry gl_PointCoord: the bit stayed clear on a shader that plainly
+    * reads it, so every expanded point was given the single-pixel centre and
+    * `pointcoord` drew one flat colour where llvmpipe draws a gradient. */
+   shader->reads_point_coord = false;
+   if (expected_stage == MESA_SHADER_FRAGMENT) {
+      nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            const nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            if (op == nir_intrinsic_load_point_coord ||
+                op == nir_intrinsic_load_point_coord_maybe_flipped)
+               shader->reads_point_coord = true;
+         }
+      }
+   }
    shader->original_nir =
       (expected_stage == MESA_SHADER_FRAGMENT ||
        expected_stage == MESA_SHADER_VERTEX)
@@ -4495,10 +4967,37 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
     * time in the same loop that records interpolation and width, so the mask
     * means "this location is produced". Coord-replaced texcoords count as
     * produced, because the substitution above supplies them. */
+   /* Bit k of sprite_coord_enable names VARYING_SLOT_TEX0 + k here.
+    * st_atom_rasterizer's comment says "GENERIC[k]", which is true for a
+    * driver whose texcoords are generic varyings -- but this Mesa gives
+    * st/mesa's fixed-function fragment shader its texcoord at
+    * VARYING_SLOT_TEX0, which GEX_WGPU_POINT_LOG prints if you want to see
+    * it. Shifting by VARYING_SLOT_VAR0 instead matched nothing at all. */
    const uint64_t sprite_locations =
       coord_replace ? ((uint64_t)coord_replace << VARYING_SLOT_TEX0) : 0u;
-   const uint64_t produced =
+   /* An expanded wide point reads gl_PointCoord from a varying the vertex
+    * variant writes, so this location has a producer. ~0u when the draw is
+    * not an expanded point, or nothing asks for the coordinate. */
+   const unsigned point_coord_location =
+      drawing_points && ctx->point_expand.active
+         ? ctx->point_expand.coord_location : ~0u;
+   /* GL_POINT_SMOOTH, which needs the sprite coordinate whether or not the
+    * shader itself reads it -- the decision in draw_vbo_inner asks for the
+    * varying on its behalf. */
+   const bool want_point_smooth =
+      point_coord_location != ~0u && ctx->rasterizer &&
+      ctx->rasterizer->point_smooth;
+   uint64_t produced =
       ctx->vs ? ctx->vs->varying_interp_mask : ~(uint64_t)0;
+   /* The vertex variant writes the sprite coordinate, so that slot has a
+    * producer too. Without this the unproduced-input pass zeroed the driver's
+    * own varying -- it runs after the substitution and cannot tell one
+    * shader_in from another -- so the sprite coordinate came out (0, 0)
+    * everywhere, which draws a solid square of whichever texel that is. Only
+    * a shader that *had* an unproduced input was affected, which is why one
+    * reading gl_PointCoord and nothing else was already right. */
+   if (point_coord_location != ~0u)
+      produced |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + point_coord_location);
    uint64_t unproduced = 0;
    if (ctx->vs && fs->original_nir) {
       nir_foreach_shader_in_variable(var, fs->original_nir) {
@@ -4513,8 +5012,15 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    /* glPolygonStipple, applied as a discard against the pattern. */
    const bool want_stipple = ctx->rasterizer && ctx->rasterizer->poly_stipple &&
                              ctx->poly_stipple_set;
+   /* point_coord_location among them: a shader reading gl_PointCoord and
+    * nothing else -- `pointcoord`, exactly -- took this exit and got the base
+    * module, whose gl_PointCoord is the single-pixel centre. The expanded
+    * point then drew one flat colour where llvmpipe draws a gradient, with
+    * every other point case already right, which is a good reminder that
+    * "the variant is built" and "the variant is reached" are separate
+    * claims. */
    if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
-       !want_stipple)
+       !want_stipple && point_coord_location == ~0u && !want_point_smooth)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -4616,7 +5122,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
     * both. */
    const bool needs_variant =
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
-      unproduced != 0 || want_stipple;
+      unproduced != 0 || want_stipple || point_coord_location != ~0u ||
+      want_point_smooth;
    if (!needs_variant)
       return fs->module;
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
@@ -4624,6 +5131,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       bool match = cached->sampler_mask == sampler_mask &&
                    cached->color_output_type == wanted_output &&
                    cached->coord_replace == coord_replace &&
+                   cached->point_coord_location == point_coord_location &&
+                   cached->point_smooth == want_point_smooth &&
                    cached->unproduced == unproduced &&
                    cached->poly_stipple == want_stipple &&
                    (!want_stipple ||
@@ -4670,8 +5179,33 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
     * place -- and the emitter declares an input for every shader_in variable
     * there is, so the pipeline stayed invalid. One pass does both
     * substitutions on the form actually present. */
+   /* Before the unproduced substitution, which would otherwise replace a
+    * coord-replaced texcoord with the one-pixel constant and leave nothing
+    * for this to find. */
+   if (getenv("GEX_WGPU_POINT_LOG") && point_coord_location != ~0u) {
+      static unsigned told;
+      if (told < 4) { ++told;
+         fprintf(stderr, "gex-wgpu: fs variant sprite=0x%llx coord_loc=%u "
+                 "unproduced=0x%llx\n", (unsigned long long)sprite_locations,
+                 point_coord_location, (unsigned long long)unproduced);
+         nir_foreach_variable_with_modes(var, variant, nir_var_shader_in)
+            fprintf(stderr, "gex-wgpu:   fs in loc=%d drv=%u\n",
+                    var->data.location, var->data.driver_location);
+      }
+   }
+   if (point_coord_location != ~0u)
+      gex_wgpu_lower_point_coord_varying(variant, point_coord_location,
+                                         sprite_locations);
    if (unproduced)
       gex_wgpu_drop_unproduced_inputs(variant, produced, sprite_locations);
+   if (want_point_smooth)
+      gex_wgpu_lower_point_smooth(variant, point_coord_location);
+   if (point_coord_location != ~0u && getenv("GEX_WGPU_POINT_NIR")) {
+      static unsigned told;
+      if (told < 6) { ++told;
+         fprintf(stderr, "==== gex wide-point FS variant %u\n", told);
+         nir_print_shader(variant, stderr); }
+   }
    /* Before the texture lowering, which reads gl_FragCoord for nothing and
     * would otherwise see the load this adds. */
    if (want_stipple)
@@ -4704,6 +5238,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    cached->sampler_mask = sampler_mask;
    cached->color_output_type = wanted_output;
    cached->coord_replace = coord_replace;
+   cached->point_coord_location = point_coord_location;
+   cached->point_smooth = want_point_smooth;
    cached->unproduced = unproduced;
    cached->poly_stipple = want_stipple;
    memcpy(cached->stipple, ctx->poly_stipple, sizeof(cached->stipple));
@@ -4902,6 +5438,10 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
       rasterizer->fill_mode = state->fill_front == state->fill_back
          ? state->fill_front : PIPE_POLYGON_MODE_FILL;
       rasterizer->sprite_coord_enable = state->sprite_coord_enable;
+      rasterizer->point_size = state->point_size;
+      rasterizer->point_size_per_vertex = state->point_size_per_vertex;
+      rasterizer->point_smooth = state->point_smooth;
+      rasterizer->sprite_coord_mode = state->sprite_coord_mode;
       rasterizer->poly_stipple = state->poly_stipple_enable;
       rasterizer->flatshade_first = state->flatshade_first;
       rasterizer->cull_face = state->cull_face;
@@ -13062,7 +13602,8 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
  */
 static WGPUShaderModule
 gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
-                            const float viewport[4])
+                            const float viewport[4],
+                            const struct gex_wgpu_wide_point *wide)
 {
    struct gex_wgpu_shader *vs = ctx->vs;
    struct gex_wgpu_shader *fs = ctx->fs;
@@ -13074,6 +13615,10 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
     * when this is set: it would read the dword as if it were the final
     * value. */
    static const uint8_t no_unpack[GEX_WGPU_MAX_VERTEX_ELEMENTS] = {0};
+   /* Wide points, which rewrite gl_Position and so have no base module
+    * either -- `plain` is never a legal answer while this is set. */
+   static const struct gex_wgpu_wide_point no_wide = {0};
+   const struct gex_wgpu_wide_point *want_wide = wide ? wide : &no_wide;
    const struct gex_wgpu_vertex_elements *ve = ctx->vertex_elements;
    const bool unpack_attribs = ve && ve->any_unpack;
    const uint8_t *want_unpack = unpack_attribs ? ve->unpack : no_unpack;
@@ -13132,9 +13677,10 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    }
    if (!lower_textures)
       sampler_mask = 0;
-   if ((!fs && !fold_viewport && !unpack_attribs && !lower_textures) ||
-       !vs->original_nir)
-      return fold_viewport || unpack_attribs || lower_textures ? NULL : plain;
+   if ((!fs && !fold_viewport && !unpack_attribs && !lower_textures &&
+        !wide) || !vs->original_nir)
+      return fold_viewport || unpack_attribs || lower_textures || wide
+         ? NULL : plain;
 
    const uint64_t fs_mask = fs ? fs->varying_interp_mask : 0;
    const uint64_t shared = vs->varying_interp_mask & fs_mask;
@@ -13144,7 +13690,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
           (vs->varying_interp[i] != fs->varying_interp[i] ||
            vs->varying_components[i] != fs->varying_components[i]))
          differs = true;
-   if (!differs && !fold_viewport && !unpack_attribs && !lower_textures)
+   if (!differs && !fold_viewport && !unpack_attribs && !lower_textures &&
+       !wide)
       return plain;
 
    const float none[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -13154,6 +13701,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    for (struct gex_wgpu_interp_variant *v = vs->interp_variants; v;
         v = v->next) {
       bool match = v->mask == fs_mask && v->sampler_mask == sampler_mask &&
+                   memcmp(&v->wide, want_wide, sizeof(v->wide)) == 0 &&
                    memcmp(v->viewport, want, sizeof(v->viewport)) == 0 &&
                    memcmp(v->attrib_unpack, want_unpack,
                           sizeof(v->attrib_unpack)) == 0 &&
@@ -13189,8 +13737,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    struct gex_wgpu_interp_variant *variant =
       CALLOC_STRUCT(gex_wgpu_interp_variant);
    if (!variant)
-      return fold_viewport || unpack_attribs ? NULL : plain;
+      return fold_viewport || unpack_attribs || wide ? NULL : plain;
    variant->mask = fs_mask;
+   variant->wide = *want_wide;
    memcpy(variant->viewport, want, sizeof(variant->viewport));
    memcpy(variant->attrib_unpack, want_unpack,
           sizeof(variant->attrib_unpack));
@@ -13229,6 +13778,26 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
             if (fs->varying_interp_mask & (1ull << i))
                want_width[i] = fs->varying_components[i];
          gex_wgpu_fit_varyings(clone, want_width);
+      }
+      /* Before the viewport fold, which is what makes the offset's scale a
+       * viewport rather than a framebuffer one -- see
+       * gex_wgpu_lower_wide_point. */
+      if (wide) {
+         struct gex_wgpu_wide_point how = *wide;
+         how.flip_coord_t = pass == 1;
+         if (!gex_wgpu_lower_wide_point(clone, &how)) {
+            /* No gl_Position store to offset: nothing to expand, and the
+             * quad would be six copies of one vertex. */
+            ralloc_free(clone);
+            break;
+         }
+      }
+      if (wide && wide->coord_location != ~0u && pass == 0 &&
+          getenv("GEX_WGPU_POINT_NIR")) {
+         static unsigned told;
+         if (told < 6) { ++told;
+            fprintf(stderr, "==== gex wide-point VS variant %u\n", told);
+            nir_print_shader(clone, stderr); }
       }
       if (fold_viewport) {
          /* compile_nir flips y after this, so the y translate has to be
@@ -13271,7 +13840,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
                          "(interpolation, viewport, attribute unpack or "
                          "integer sampling)\n");
       }
-      return fold_viewport || unpack_attribs || lower_textures ? NULL : plain;
+      return fold_viewport || unpack_attribs || lower_textures || wide
+         ? NULL : plain;
    }
    variant->next = vs->interp_variants;
    vs->interp_variants = variant;
@@ -14871,9 +15441,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    static int no_pv = -1;
    if (no_pv < 0)
       no_pv = getenv("GEX_WGPU_NO_PROVOKING") ? 1 : 0;
+   /* Points are excluded, and not only to save the work: a point primitive
+    * has one vertex, so its first vertex *is* its provoking one and the
+    * rewrite cannot change any flat varying's value. What it can do is turn a
+    * non-indexed draw into an indexed one, which the wide-point expansion
+    * below then has to refuse -- so a program whose fragment shader happens
+    * to have a flat varying would silently lose its wide points. */
    if (!no_pv && !ctx->failed && !ctx->provoking_rewritten && info && draws &&
        num_draws == 1 && !indirect && ctx->fs && ctx->rasterizer &&
        !ctx->rasterizer->flatshade_first &&
+       u_reduced_prim(info->mode) != MESA_PRIM_POINTS &&
        gex_wgpu_shader_has_flat_varying(ctx->fs) &&
        gex_wgpu_draw_provoking_last(pipe, info, drawid_offset, &draws[0]))
       return;
@@ -15558,6 +16135,155 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       scissor_height = maxy - scissor_y;
    }
 
+   /* Wide points become quads. See gex_wgpu_lower_wide_point for the shape of
+    * it; what is decided here is whether this draw can take that road at all.
+    *
+    * The refusals are not features being dropped -- an unexpanded point still
+    * draws, as the single pixel WebGPU rasterises -- so each one costs
+    * accuracy rather than the draw. Indexed draws are the structural one: the
+    * expansion needs the per-point data on the *instance* index and WebGPU's
+    * index buffer addresses only the vertex one.
+    */
+   ctx->point_expand.active = false;
+   ctx->point_expand.corners = NULL;
+   if (info && draws && info->mode == MESA_PRIM_POINTS && ctx->vs &&
+       ctx->rasterizer && draws[0].count > 0 && !ctx->failed) {
+      const bool writes_size =
+         ctx->rasterizer->point_size_per_vertex && ctx->vs->original_nir &&
+         (ctx->vs->original_nir->info.outputs_written & VARYING_BIT_PSIZ);
+      const float fixed_size = ctx->rasterizer->point_size;
+      const bool want = writes_size || fixed_size > 1.0f;
+      /* The GL viewport, not the WebGPU one: the clipped-viewport fold above
+       * has already replaced viewport_width with the framebuffer's. */
+      const float vp_width = ctx->viewport_set
+         ? fabsf(2.0f * ctx->viewport.scale[0]) : (float)ctx->fb_width;
+      const float vp_height = ctx->viewport_set
+         ? fabsf(2.0f * ctx->viewport.scale[1]) : (float)ctx->fb_height;
+      unsigned instanced_elements = 0;
+      if (ctx->vertex_elements)
+         for (unsigned i = 0; i < ctx->vertex_elements->count; ++i)
+            instanced_elements +=
+               ctx->vertex_elements->elements[i].instance_divisor != 0;
+      const unsigned corner_location =
+         gex_wgpu_point_corner_location(ctx->vs);
+      const char *why =
+         !want                       ? NULL
+         : info->index_size          ? "indexed"
+         : info->instance_count > 1  ? "instanced"
+         : instanced_elements        ? "per-instance attributes"
+         : corner_location == ~0u    ? "no free vertex attribute"
+         /* Two: one for the corner buffer, and one the default-attribute
+          * buffer may still claim below -- whether it does is not known
+          * until the attribute loop has run, which is after this. */
+         : vb_slot_count + 2 > GEX_WGPU_MAX_VERTEX_BUFFERS
+                                     ? "no free vertex buffer slot"
+         : vp_width <= 0.0f || vp_height <= 0.0f ? "empty viewport"
+         : NULL;
+      if (want && !why) {
+         /* Whether anything reads the sprite coordinate. GL_COORD_REPLACE
+          * feeds texcoords from it as well as gl_PointCoord itself. */
+         const bool wants_coord =
+            ctx->fs && (ctx->fs->reads_point_coord ||
+                        ctx->rasterizer->sprite_coord_enable != 0 ||
+                        ctx->rasterizer->point_smooth);
+         unsigned coord_location = ~0u;
+         if (wants_coord) {
+            coord_location = gex_wgpu_point_coord_location(ctx);
+            if (coord_location == ~0u)
+               why = "no free varying for gl_PointCoord";
+         }
+         if (!why) {
+            /* Two triangles over the point, with the offset already scaled:
+             * clip space spans 2 across the viewport, so one pixel is
+             * 2/viewport, and half of the point's size lies each side of the
+             * vertex. With a per-vertex size the shader supplies the size and
+             * this carries 2/viewport alone.
+             *
+             * Which way t runs comes from sprite_coord_mode, which st/mesa
+             * sets from GL_POINT_SPRITE_COORD_ORIGIN *and* the framebuffer's
+             * orientation -- the origin is defined in window coordinates and
+             * an FBO's y runs the other way, so the two cases genuinely
+             * differ. The y-flipped vertex module inverts t again on top of
+             * this; gl44-point-probe measures the result rather than
+             * asserting it. */
+            const float half = writes_size ? 0.5f : 0.5f * fixed_size;
+            const float dx = 2.0f * half / vp_width;
+            const float dy = 2.0f * half / vp_height;
+            const bool lower_left =
+               ctx->rasterizer->sprite_coord_mode == PIPE_SPRITE_COORD_LOWER_LEFT;
+            static const int8_t quad[6][2] = {
+               {-1, -1}, {1, -1}, {1, 1}, {-1, -1}, {1, 1}, {-1, 1},
+            };
+            float corners[6][4];
+            for (unsigned i = 0; i < 6; ++i) {
+               const float sx = (float)quad[i][0];
+               const float sy = (float)quad[i][1];
+               corners[i][0] = sx * dx;
+               corners[i][1] = sy * dy;
+               corners[i][2] = 0.5f * (sx + 1.0f);
+               corners[i][3] = lower_left ? 0.5f * (sy + 1.0f)
+                                          : 0.5f * (1.0f - sy);
+            }
+            /* Through the stream uploader rather than a buffer of the
+             * driver's own: a draw already encoded into this pass must keep
+             * the corners it was given, and a queue write would overwrite
+             * them before the submit. */
+            unsigned offset = 0;
+            struct pipe_resource *resource = NULL;
+            struct pipe_resource *released = NULL;
+            u_upload_data(ctx->base.stream_uploader, 0, sizeof(corners), 16,
+                          corners, &offset, &resource, &released);
+            pipe_resource_reference(&released, NULL);
+            if (resource) {
+               u_upload_unmap(ctx->base.stream_uploader);
+               ctx->point_expand.active = true;
+               ctx->point_expand.per_vertex_size = writes_size;
+               ctx->point_expand.corner_location = corner_location;
+               ctx->point_expand.coord_location = coord_location;
+               ctx->point_expand.corners = resource;
+               ctx->point_expand.corner_offset = offset;
+            } else {
+               why = "the corner buffer could not be uploaded";
+            }
+         }
+      }
+      if (getenv("GEX_WGPU_POINT_LOG")) {
+         static unsigned told;
+         if (told < 8) { ++told;
+            fprintf(stderr, "gex-wgpu: points count=%u size=%.2f pv=%d "
+                    "psiz=%d vp=%.0fx%.0f reads_pc=%d sprite=0x%x "
+                    "smooth=%d coord=%d why=%s\n",
+                    draws[0].count, fixed_size,
+                    (int)ctx->rasterizer->point_size_per_vertex,
+                    (int)writes_size, vp_width, vp_height,
+                    ctx->fs ? (int)ctx->fs->reads_point_coord : -1,
+                    ctx->rasterizer->sprite_coord_enable,
+                    (int)ctx->rasterizer->point_smooth,
+                    (int)ctx->point_expand.coord_location,
+                    why ? why : (want ? "expanded" : "not wide")); }
+      }
+      /* Once per distinct reason, so a program that draws indexed points
+       * every frame says so once. Keyed on the pointer because every reason
+       * above is a string literal, which makes the identity stable and the
+       * table small. */
+      if (why) {
+         static const char *said[8];
+         bool told = false;
+         unsigned free_slot = 8;
+         for (unsigned i = 0; i < 8; ++i) {
+            if (said[i] == why)
+               told = true;
+            else if (!said[i] && free_slot == 8)
+               free_slot = i;
+         }
+         if (!told && free_slot < 8) {
+            said[free_slot] = why;
+            fprintf(stderr, "gex-wgpu: points drawn one pixel wide (%s)\n",
+                    why);
+         }
+      }
+   }
+
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
    WGPUColorTargetState color_targets[GEX_WGPU_MAX_COLOR_TARGETS];
    WGPUBlendState blend_states[GEX_WGPU_MAX_COLOR_TARGETS];
@@ -15620,8 +16346,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    fragment.targetCount = ctx->color_count;
    fragment.targets = color_targets;
    WGPURenderPipelineDescriptor pipeline_desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+   struct gex_wgpu_wide_point wide_point = {0};
+   if (ctx->point_expand.active) {
+      wide_point.corner_location = ctx->point_expand.corner_location;
+      wide_point.coord_location = ctx->point_expand.coord_location;
+      wide_point.per_vertex_size = ctx->point_expand.per_vertex_size;
+   }
    WGPUShaderModule vertex_module = gex_wgpu_interp_variant_get(
-      ctx, vertex_flipped, fold_viewport ? viewport_fold : NULL);
+      ctx, vertex_flipped, fold_viewport ? viewport_fold : NULL,
+      ctx->point_expand.active ? &wide_point : NULL);
    if (!vertex_module)
       return;
    pipeline_desc.vertex.module = vertex_module;
@@ -15630,6 +16363,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       vertex_attributes[GEX_WGPU_MAX_VERTEX_BUFFERS][GEX_WGPU_MAX_VERTEX_ELEMENTS];
    WGPUVertexBufferLayout vertex_layouts[GEX_WGPU_MAX_VERTEX_BUFFERS];
    int default_attribute_slot = -1;
+   /* The slot the six corner offsets are bound to, appended past the
+    * application's own the way the default-attribute buffer is. */
+   int point_corner_slot = -1;
    uint64_t supplied_locations = 0;
    if (ctx->vertex_elements) {
       /* Indexed by the dense WebGPU slot `vb_slot` assigned, not by Gallium's
@@ -15688,8 +16424,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                break;
             }
          }
-         vertex_layouts[slot].stepMode = instanced
-            ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
+         /* An expanded point moves the per-point data to the instance
+          * index, because the corners have to occupy the vertex one. A draw
+          * with per-instance attributes is not expanded at all, so there is
+          * nothing here whose step mode this contradicts. */
+         vertex_layouts[slot].stepMode =
+            instanced || ctx->point_expand.active
+               ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
          vertex_layouts[slot].attributeCount = attribute_counts[slot];
          vertex_layouts[slot].attributes = vertex_attributes[slot];
       }
@@ -15962,6 +16703,26 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          }
       }
       unsigned layout_count = vb_slot_count;
+      if (ctx->point_expand.active &&
+          layout_count < GEX_WGPU_MAX_VERTEX_BUFFERS) {
+         const unsigned slot = layout_count;
+         vertex_layouts[slot] =
+            (WGPUVertexBufferLayout)WGPU_VERTEX_BUFFER_LAYOUT_INIT;
+         vertex_layouts[slot].arrayStride = 4 * sizeof(float);
+         vertex_layouts[slot].stepMode = WGPUVertexStepMode_Vertex;
+         vertex_attributes[slot][0] =
+            (WGPUVertexAttribute)WGPU_VERTEX_ATTRIBUTE_INIT;
+         vertex_attributes[slot][0].format = WGPUVertexFormat_Float32x4;
+         vertex_attributes[slot][0].offset = 0;
+         vertex_attributes[slot][0].shaderLocation =
+            ctx->point_expand.corner_location;
+         vertex_layouts[slot].attributeCount = 1;
+         vertex_layouts[slot].attributes = vertex_attributes[slot];
+         layout_count = slot + 1;
+         point_corner_slot = (int)slot;
+         pipeline_desc.vertex.bufferCount = layout_count;
+         pipeline_desc.vertex.buffers = vertex_layouts;
+      }
       if (missing && layout_count < GEX_WGPU_MAX_VERTEX_BUFFERS &&
           gex_wgpu_default_attribute_buffer(gex_screen(pipe->screen))) {
          const unsigned slot = layout_count;
@@ -15996,6 +16757,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
    }
    pipeline_desc.primitive.topology = gex_wgpu_topology(info->mode);
+   if (ctx->point_expand.active)
+      pipeline_desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
    /* WebGPU wants a strip pipeline to name its index format up front, because
     * that is what decides the primitive restart value. */
    if (info->index_size &&
@@ -16018,6 +16781,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       ? WGPUCullMode_Front
       : ctx->rasterizer->cull_face == PIPE_FACE_BACK
       ? WGPUCullMode_Back : WGPUCullMode_None;
+   /* GL culls polygons; a point is not one, and glPolygonMode's rewrite into
+    * lines and points had to learn the same thing. Expanded points *are*
+    * triangles as far as WebGPU is concerned, so the cull state has to be
+    * turned off explicitly or a program that culls back faces -- which is
+    * most of them -- would lose half its particles to their winding. */
+   if (ctx->point_expand.active)
+      pipeline_desc.primitive.cullMode = WGPUCullMode_None;
    /* Must equal the attachments' sample count, or WebGPU rejects the pipeline
     * with "attachment state ... not compatible". This was hardcoded to one. */
    pipeline_desc.multisample.count = MAX2(1, ctx->fb_samples);
@@ -17085,6 +17855,18 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          ctx->emitted.vertex[slot] = handle;
          ctx->emitted.vertex_offset[slot] = offset;
       }
+      if (point_corner_slot >= 0 && ctx->point_expand.corners) {
+         WGPUBuffer corners =
+            gex_resource(ctx->point_expand.corners)->buffer;
+         const uint32_t offset = ctx->point_expand.corner_offset;
+         /* Tracked like every other slot, and the uploader hands out a fresh
+          * region per draw, so this rebinds each time. */
+         wgpuRenderPassEncoderSetVertexBuffer(
+            pass, (uint32_t)point_corner_slot, corners, offset,
+            6 * 4 * sizeof(float));
+         ctx->emitted.vertex[point_corner_slot] = corners;
+         ctx->emitted.vertex_offset[point_corner_slot] = offset;
+      }
       /* After the application's, because the slot it goes in may still hold a
        * buffer bound for an earlier draw. */
       if (default_attribute_slot >= 0) {
@@ -17142,12 +17924,23 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             ctx->color_count && ctx->colors[0]
                ? gex_resource(ctx->colors[0])->texture : NULL,
             ctx->color_count ? ctx->color_formats[0] : PIPE_FORMAT_NONE);
-         gex_wgpu_cmd_note("draw count=%u inst=%u first=%u",
-                           draws[0].count, info->instance_count,
-                           draws[0].start);
+         /* An expanded point draw is six vertices by one instance per
+          * point, and firstInstance carries the draw's start -- which is
+          * also what makes WGSL's instance_index equal gl_VertexID, since it
+          * counts from firstInstance. */
+         const uint32_t vertices =
+            ctx->point_expand.active ? 6u : draws[0].count;
+         const uint32_t instances = ctx->point_expand.active
+            ? draws[0].count : info->instance_count;
+         const uint32_t first_vertex =
+            ctx->point_expand.active ? 0u : draws[0].start;
+         const uint32_t first_instance = ctx->point_expand.active
+            ? draws[0].start : info->start_instance;
+         gex_wgpu_cmd_note("draw count=%u inst=%u first=%u", vertices,
+                           instances, first_vertex);
          gex_wgpu_cmd_end();
-         wgpuRenderPassEncoderDraw(pass, draws[0].count, info->instance_count,
-                                   draws[0].start, info->start_instance);
+         wgpuRenderPassEncoderDraw(pass, vertices, instances, first_vertex,
+                                   first_instance);
       }
       if (counting)
          wgpuRenderPassEncoderEndOcclusionQuery(pass);
@@ -17829,7 +18622,10 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    caps->fs_coord_pixel_center_integer = false;
 
    caps->min_point_size = 1.0f;
-   caps->max_point_size = 1.0f;
+   /* Wide points are expanded into quads -- see gex_wgpu_lower_wide_point --
+    * so the range is a real one rather than WebGPU's single pixel. 255 is
+    * llvmpipe's, which is what the pixel comparison measures against. */
+   caps->max_point_size = 255.0f;
    caps->min_line_width = 1.0f;
    caps->max_line_width = 1.0f;
    caps->point_size_granularity = 0.1f;
