@@ -12142,6 +12142,39 @@ static int64_t gex_wgpu_time_end;
 static int64_t gex_wgpu_time_bg;
 static int64_t gex_wgpu_time_encoder;
 uint64_t gex_wgpu_presents;
+/* Which draw of the current frame is about to be recorded, and how many of
+ * them to keep.
+ *
+ * With a scene of a few dozen draws, "which draw fails to put anything on
+ * screen" is answerable by bisection and by nothing else: the draw is
+ * submitted, its attributes are all supplied, no state is refused and no
+ * validation error is raised, and it still produces no pixels. Capturing the
+ * frame at each limit and diffing consecutive images names the draw.
+ *
+ *   GEX_WGPU_DRAW_LIMIT=n   keep the first n draws of every frame
+ *   GEX_WGPU_DRAW_ONLY=n    keep only draw n
+ */
+uint64_t gex_wgpu_frame_draw;
+static int
+gex_wgpu_draw_limit(void)
+{
+   static int limit = -2;
+   if (limit == -2) {
+      const char *value = getenv("GEX_WGPU_DRAW_LIMIT");
+      limit = value ? atoi(value) : -1;
+   }
+   return limit;
+}
+static int
+gex_wgpu_draw_only(void)
+{
+   static int only = -2;
+   if (only == -2) {
+      const char *value = getenv("GEX_WGPU_DRAW_ONLY");
+      only = value ? atoi(value) : -1;
+   }
+   return only;
+}
 /* Nanoseconds inside flush_frontbuffer: the readback plus however long the
  * GPU still needed. The native target adds to it. */
 uint64_t gex_wgpu_present_nanos;
@@ -12895,6 +12928,17 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
                   unsigned num_draws)
 {
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+
+   /* Bisection over a frame's draws; see gex_wgpu_frame_draw. Counted only at
+    * the outermost level, so a draw split into several by the restart or
+    * indirect paths stays one draw as the application issued it. */
+   if (ctx->draw_depth == 0) {
+      const int index = (int)gex_wgpu_frame_draw++;
+      const int limit = gex_wgpu_draw_limit();
+      const int only = gex_wgpu_draw_only();
+      if ((limit >= 0 && index >= limit) || (only >= 0 && index != only))
+         return;
+   }
 
    /* See draw_depth: the two re-entrant paths below can loop, and the abort
     * that follows is not recoverable. Eight is far above the two levels a

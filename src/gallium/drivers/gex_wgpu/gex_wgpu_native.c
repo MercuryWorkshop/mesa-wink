@@ -339,6 +339,9 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
 
    extern uint64_t gex_wgpu_presents;
    ++gex_wgpu_presents;
+   /* The frame boundary the draw bisection counts from. */
+   extern uint64_t gex_wgpu_frame_draw;
+   gex_wgpu_frame_draw = 0;
    gex_wgpu_present_nanos += os_time_get_nano() - present_start;
    winsys->displaytarget_display(winsys, state->target, context_private,
                                  nboxes, sub_box);
