@@ -14580,16 +14580,33 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          memcpy(ctx->emitted.viewport, wanted_viewport,
                 sizeof(wanted_viewport));
       }
+      /* A draw with the scissor disabled wants the whole attachment, and has
+       * to say so: the scissor belongs to the pass, and draws now share one,
+       * so leaving it alone means inheriting whatever rect the last draw
+       * asked for. SuperTuxKart's scrolling news ticker is clipped away from
+       * the icon bar beside it, and without this the two were drawn on top of
+       * each other -- the sort of thing that looks like a layout quirk until
+       * the same frame from softpipe is put next to it. */
+      uint32_t wanted_scissor[4];
       if (scissor_enabled) {
-         const uint32_t wanted[4] = { scissor_x, scissor_y,
-                                      scissor_width, scissor_height };
-         if (!ctx->emitted.scissor_set ||
-             memcmp(ctx->emitted.scissor, wanted, sizeof(wanted)) != 0) {
-            wgpuRenderPassEncoderSetScissorRect(pass, scissor_x, scissor_y,
-                                                scissor_width, scissor_height);
-            memcpy(ctx->emitted.scissor, wanted, sizeof(wanted));
-            ctx->emitted.scissor_set = true;
-         }
+         wanted_scissor[0] = scissor_x;
+         wanted_scissor[1] = scissor_y;
+         wanted_scissor[2] = scissor_width;
+         wanted_scissor[3] = scissor_height;
+      } else {
+         wanted_scissor[0] = 0;
+         wanted_scissor[1] = 0;
+         wanted_scissor[2] = ctx->fb_width;
+         wanted_scissor[3] = ctx->fb_height;
+      }
+      if (!ctx->emitted.scissor_set ||
+          memcmp(ctx->emitted.scissor, wanted_scissor,
+                 sizeof(wanted_scissor)) != 0) {
+         wgpuRenderPassEncoderSetScissorRect(
+            pass, wanted_scissor[0], wanted_scissor[1],
+            wanted_scissor[2], wanted_scissor[3]);
+         memcpy(ctx->emitted.scissor, wanted_scissor, sizeof(wanted_scissor));
+         ctx->emitted.scissor_set = true;
       }
       for (unsigned group = 0; group < 4; ++group) {
          if (!bind_groups[group])
