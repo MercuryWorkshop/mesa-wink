@@ -843,13 +843,24 @@ compile_vertex_list(struct gl_context *ctx)
 
    _mesa_reference_buffer_object(ctx, &node->cold->ib.obj, save->current_bo);
 
-   /* Upload the vertices first (see buffer_offset) */
-   _mesa_bufferobj_subdata(ctx,
-                           save->current_bo_bytes_used,
-                           total_vert_count * save->vertex_size * sizeof(fi_type),
-                           vertex_to_index ? temp_vertices_buffer : save->vertex_store->buffer_in_ram,
-                           node->cold->ib.obj);
-   save->current_bo_bytes_used += total_vert_count * save->vertex_size * sizeof(fi_type);
+   /* Upload the vertices first (see buffer_offset).
+    *
+    * Guarded on the buffer object existing, as the index upload below already
+    * is. There are two ways to reach here without one: the allocation above
+    * failed and set save->out_of_memory, or -- for a display list that
+    * records no vertices and no indices at all -- total_bytes_needed was zero
+    * and no allocation was attempted, leaving save->current_bo at NULL.
+    * _mesa_bufferobj_subdata reads obj->Size, so either was a null
+    * dereference inside glEndList. `dlist-degenerate` from mesa-demos does
+    * exactly that. */
+   if (node->cold->ib.obj) {
+      _mesa_bufferobj_subdata(ctx,
+                              save->current_bo_bytes_used,
+                              total_vert_count * save->vertex_size * sizeof(fi_type),
+                              vertex_to_index ? temp_vertices_buffer : save->vertex_store->buffer_in_ram,
+                              node->cold->ib.obj);
+      save->current_bo_bytes_used += total_vert_count * save->vertex_size * sizeof(fi_type);
+   }
    node->cold->bo_bytes_used = save->current_bo_bytes_used;
    ctx->ListState.Current.NeedsFlush = true;
 
@@ -886,7 +897,11 @@ compile_vertex_list(struct gl_context *ctx)
    /* The other info fields will be updated in vbo_save_playback_vertex_list */
    node->cold->info.index_size = 4;
    node->cold->info.instance_count = 1;
-   node->cold->info.index.resource = node->cold->ib.obj->buffer;
+   /* Same guard as the two uploads above: the else branch a few lines up
+    * exists precisely because ib.obj can be NULL here, and this dereferenced
+    * it anyway. */
+   node->cold->info.index.resource =
+      node->cold->ib.obj ? node->cold->ib.obj->buffer : NULL;
    if (merged_prim_count == 1) {
       node->cold->info.mode = merged_prims[0].mode;
       node->start_count.start = merged_prims[0].start;

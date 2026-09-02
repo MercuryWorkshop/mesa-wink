@@ -428,6 +428,10 @@ struct gex_wgpu_context {
    unsigned color_layers[GEX_WGPU_MAX_COLOR_TARGETS];
    unsigned color_count;
    struct pipe_resource *depth;
+   /* And for the depth attachment, for the same reason: a cascaded shadow
+    * map renders each cascade into one layer of a depth array. */
+   unsigned depth_level;
+   unsigned depth_layer;
    uint32_t fb_width;
    uint32_t fb_height;
    /* Samples per pixel of the bound framebuffer. WebGPU requires the render
@@ -485,6 +489,10 @@ struct gex_wgpu_context {
       unsigned layers[GEX_WGPU_MAX_COLOR_TARGETS];
       unsigned color_count;
       struct pipe_resource *depth;
+      /* Which slice of it, so a pass rendering one cascade of a depth array
+       * is not reused for the next. */
+      unsigned depth_level;
+      unsigned depth_layer;
       bool depth_read_only;
       bool stencil_read_only;
    } pending_pass_key;
@@ -2394,9 +2402,16 @@ gex_wgpu_lower_old_style_shadow(nir_builder *b, nir_instr *instr, void *data)
    if (instr->type != nir_instr_type_tex)
       return false;
    nir_tex_instr *tex = nir_instr_as_tex(instr);
+   /* Queries are excluded, and the exclusion is not cosmetic. A size query
+    * derived from a shadow lookup keeps its is_shadow flag -- nir_lower_tex's
+    * rect lowering builds one through nir_get_texture_size, which copies it
+    * -- so a txs on a 2D shadow texture matched everything below and had its
+    * two components collapsed to one and splatted. `sampler2DRectShadow`
+    * then divided its coordinate by vec2(width, width), and Tint refused the
+    * module with "Result Type has 1 components, but 2 expected". */
    if (!tex->is_shadow || tex->is_new_style_shadow ||
-       tex->def.num_components < 2 || tex->op == nir_texop_tg4 ||
-       tex->is_sparse)
+       nir_tex_instr_is_query(tex) || tex->def.num_components < 2 ||
+       tex->op == nir_texop_tg4 || tex->is_sparse)
       return false;
    const unsigned components = tex->def.num_components;
    tex->def.num_components = 1;
@@ -2748,6 +2763,27 @@ gex_wgpu_alu_target_width(const nir_instr *instr, const void *data)
    return 4;
 }
 
+static void
+gex_wgpu_tex_log(nir_shader *nir, const char *where)
+{
+   if (!getenv("GEX_WGPU_TEX_LOG"))
+      return;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *t = nir_instr_as_tex(instr);
+            fprintf(stderr, "gex-wgpu: tex[%s] op=%d dim=%d array=%d "
+                    "shadow=%d new=%d comps=%u want=%u\n", where, (int)t->op,
+                    (int)t->sampler_dim, (int)t->is_array, (int)t->is_shadow,
+                    (int)t->is_new_style_shadow, t->def.num_components,
+                    nir_tex_instr_result_size(t));
+         }
+      }
+   }
+}
+
 static WGPUShaderModule
 gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
                      enum mesa_shader_stage stage, bool flip_y,
@@ -2775,7 +2811,9 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
        * what that costs. */
       .lower_txp = ~0u,
    };
+   gex_wgpu_tex_log(nir, "entry");
    NIR_PASS(_, nir, nir_lower_tex, &texture_options);
+   gex_wgpu_tex_log(nir, "post-lower-tex");
    bool lowered_texture_declaration = false;
    nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
       const struct glsl_type *type = glsl_without_array(var->type);
@@ -2920,6 +2958,7 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
          ++saved_count;
       }
    }
+   gex_wgpu_tex_log(nir, "pre-ntv");
    ntv_shader_prepare(nir);
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       nir_foreach_shader_in_variable(var, nir) {
@@ -3427,53 +3466,93 @@ gex_wgpu_capture_drop_output(nir_builder *b, nir_intrinsic_instr *intr,
 static bool
 gex_wgpu_split_combined_samplers(nir_shader *nir)
 {
-   nir_variable *split_from[GEX_WGPU_MAX_SAMPLERS] = {0};
    nir_variable *split_texture[GEX_WGPU_MAX_SAMPLERS] = {0};
    nir_variable *split_sampler[GEX_WGPU_MAX_SAMPLERS] = {0};
+   nir_variable *retire[GEX_WGPU_MAX_SAMPLERS] = {0};
+   unsigned retire_count = 0;
    unsigned count = 0;
    unsigned rewrites = 0, tex_seen = 0;
    unsigned split_slot[GEX_WGPU_MAX_SAMPLERS] = {0};
+
+   /* A dynamically indexed array of samplers cannot be split at all: WGSL
+    * has no array of textures to index, and the unit is only known at run
+    * time. nir_lower_samplers leaves the varying part as a texture offset,
+    * so finding one means giving up before anything has been rewritten --
+    * a half-split shader is worse than a refused one. */
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (nir_tex_instr_src_index(tex, nir_tex_src_texture_offset) >= 0 ||
+                nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset) >= 0)
+               return false;
+         }
+      }
+   }
 
    nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
       const struct glsl_type *type = glsl_without_array(var->type);
       /* Combined only: a bare sampler or a texture is already split. */
       if (!glsl_type_is_sampler(type) || glsl_type_is_bare_sampler(type))
          continue;
-      if (var->type != type || count >= GEX_WGPU_MAX_SAMPLERS)
-         return false;   /* arrays of samplers are not handled here */
+      /* An array of samplers is a run of units, one pair each.
+       * `uniform sampler2D tex[8]` is ordinary GLSL -- mesa-demos'
+       * `samplers_array` is exactly that, and it used to be refused, which
+       * failed the link and then tripped the demo's own assert on the
+       * uniform location it could not find. Only a plain one-dimensional
+       * array of a sampler type is taken; anything else is refused as
+       * before. */
+      unsigned units = 1;
+      if (var->type != type) {
+         if (!glsl_type_is_array(var->type) ||
+             glsl_type_is_unsized_array(var->type) ||
+             glsl_get_length(var->type) < 1 ||
+             glsl_get_array_element(var->type) != type)
+            return false;
+         units = glsl_get_length(var->type);
+      }
       const unsigned slot = var->data.binding;
-      if (slot >= GEX_WGPU_MAX_SAMPLERS)
+      if (count + units > GEX_WGPU_MAX_SAMPLERS ||
+          slot + units > GEX_WGPU_MAX_SAMPLERS ||
+          retire_count >= GEX_WGPU_MAX_SAMPLERS)
          return false;
 
-      char name[32];
-      snprintf(name, sizeof(name), "gex_texture%u", slot);
-      nir_variable *texture = nir_variable_create(
-         nir, nir_var_uniform,
-         glsl_texture_type(glsl_get_sampler_dim(type),
-                           glsl_sampler_type_is_array(type),
-                           glsl_get_sampler_result_type(type)),
-         name);
       /* Set 3 for the vertex stage, 0 for the fragment stage. The two
        * shaders number their bindings independently, so they cannot share a
        * group; set 1 and set 2 are already the two stages' uniform blocks. */
       const unsigned texture_set =
          nir->info.stage == MESA_SHADER_VERTEX ? 3 : 0;
-      texture->data.descriptor_set = texture_set;
-      texture->data.driver_location = slot;
-      texture->data.binding = 2 * slot;
+      for (unsigned u = 0; u < units; ++u) {
+         const unsigned unit = slot + u;
+         char name[32];
+         snprintf(name, sizeof(name), "gex_texture%u", unit);
+         nir_variable *texture = nir_variable_create(
+            nir, nir_var_uniform,
+            glsl_texture_type(glsl_get_sampler_dim(type),
+                              glsl_sampler_type_is_array(type),
+                              glsl_get_sampler_result_type(type)),
+            name);
+         texture->data.descriptor_set = texture_set;
+         texture->data.driver_location = unit;
+         texture->data.binding = 2 * unit;
 
-      snprintf(name, sizeof(name), "gex_sampler%u", slot);
-      nir_variable *sampler = nir_variable_create(
-         nir, nir_var_uniform, glsl_bare_sampler_type(), name);
-      sampler->data.descriptor_set = texture_set;
-      sampler->data.driver_location = slot;
-      sampler->data.binding = 2 * slot + 1;
+         snprintf(name, sizeof(name), "gex_sampler%u", unit);
+         nir_variable *sampler = nir_variable_create(
+            nir, nir_var_uniform, glsl_bare_sampler_type(), name);
+         sampler->data.descriptor_set = texture_set;
+         sampler->data.driver_location = unit;
+         sampler->data.binding = 2 * unit + 1;
 
-      split_from[count] = var;
-      split_slot[count] = slot;
-      split_texture[count] = texture;
-      split_sampler[count] = sampler;
-      ++count;
+         split_slot[count] = unit;
+         split_texture[count] = texture;
+         split_sampler[count] = sampler;
+         ++count;
+      }
+      /* Once per variable, not once per unit: removing the same node twice
+       * corrupts the list. */
+      retire[retire_count++] = var;
    }
    if (!count)
       return true;
@@ -3514,8 +3593,8 @@ gex_wgpu_split_combined_samplers(nir_shader *nir)
       nir_progress(true, impl, nir_metadata_control_flow);
    }
 
-   for (unsigned k = 0; k < count; ++k)
-      exec_node_remove(&split_from[k]->node);
+   for (unsigned k = 0; k < retire_count; ++k)
+      exec_node_remove(&retire[k]->node);
    /* A blit that does not filter -- a 1:1 copy is one -- fetches texels and
     * needs no sampler, so the sampler half of the pair goes unused. The
     * driver rejects a declared sampler nothing samples with, which is right:
@@ -6262,7 +6341,24 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
        * texture_depth_multisampled_2d -- so there was never a reason for
        * depth to be the exception. */
       const unsigned depth_samples = MAX2(1, sample_count);
-      return target == PIPE_TEXTURE_2D &&
+      /* Targets beyond plain 2D. Only 2D was allowed, so
+       * `_mesa_choose_texture_format` found no format at all for a
+       * GL_TEXTURE_RECTANGLE depth texture and asserted -- st/mesa has no
+       * fallback for "no depth format exists" -- which is how
+       * `shadow_sampler` died once its shaders started linking. A rectangle
+       * texture *is* a 2D texture with unnormalised coordinates, which
+       * nir_lower_tex already normalises.
+       *
+       * Arrays and cube maps are here for the same reason they are for
+       * colour: WGSL has texture_depth_2d_array and texture_depth_cube, so a
+       * cascaded shadow map and a cube shadow map are both expressible.
+       * Multisampling stays 2D-only, which is also all WebGPU offers. */
+      const bool depth_target_ok =
+         target == PIPE_TEXTURE_2D ||
+         (depth_samples == 1 &&
+          (target == PIPE_TEXTURE_RECT || target == PIPE_TEXTURE_2D_ARRAY ||
+           target == PIPE_TEXTURE_CUBE || target == PIPE_TEXTURE_CUBE_ARRAY));
+      return depth_target_ok &&
              (depth_samples == 1 || depth_samples == 4) &&
              MAX2(1, storage_sample_count) == depth_samples &&
              bind && !(bind & ~allowed);
@@ -9345,8 +9441,20 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
       }
    }
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
+   /* The bound slice, not the whole texture. A NULL descriptor views every
+    * level and layer, and WebGPU refuses an attachment with more than one
+    * layer -- so clearing the depth of a framebuffer whose attachment is one
+    * layer of a depth array produced an invalid command buffer, and with it
+    * every later submit. */
+   WGPUTextureViewDescriptor clear_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   clear_desc.format = gex_wgpu_texture_format(resource->format);
+   clear_desc.dimension = WGPUTextureViewDimension_2D;
+   clear_desc.baseMipLevel = dst->level;
+   clear_desc.mipLevelCount = 1;
+   clear_desc.baseArrayLayer = dst->first_layer;
+   clear_desc.arrayLayerCount = 1;
    WGPUTextureView view =
-      wgpuTextureCreateView(gex_resource(resource)->texture, NULL);
+      wgpuTextureCreateView(gex_resource(resource)->texture, &clear_desc);
    WGPUCommandEncoder encoder =
       wgpuDeviceCreateCommandEncoder(screen->device, NULL);
    WGPURenderPassDepthStencilAttachment attachment =
@@ -11039,12 +11147,23 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
       util_format_is_depth_or_stencil(state->zsbuf.format) &&
       gex_wgpu_texture_format(state->zsbuf.format) !=
          WGPUTextureFormat_Undefined;
+   /* One level and one layer, but not necessarily the first of each. This
+    * used to insist on level 0 and layer 0 and fail the context otherwise,
+    * so a depth array -- which is what a cascaded shadow map is -- latched
+    * the context as soon as the second cascade was attached. WebGPU says the
+    * same thing as GL here through baseMipLevel and baseArrayLayer; the view
+    * built for the pass carries them. */
+   unsigned depth_level = 0, depth_layer = 0;
    if (zs_attachable &&
-       state->zsbuf.level == 0 && state->zsbuf.first_layer == 0 &&
-       state->zsbuf.last_layer == 0 &&
-       state->width <= state->zsbuf.texture->width0 &&
-       state->height <= state->zsbuf.texture->height0) {
+       state->zsbuf.first_layer == state->zsbuf.last_layer &&
+       state->zsbuf.level <= state->zsbuf.texture->last_level &&
+       state->width <= u_minify(state->zsbuf.texture->width0,
+                                state->zsbuf.level) &&
+       state->height <= u_minify(state->zsbuf.texture->height0,
+                                 state->zsbuf.level)) {
       depth = state->zsbuf.texture;
+      depth_level = state->zsbuf.level;
+      depth_layer = state->zsbuf.first_layer;
       /* Same as the colour targets above: attached, so it has contents. A
        * shadow map is written only by being rendered into, and counting that
        * as "nothing ever wrote it" made the unwritten-texture warning report
@@ -11063,6 +11182,8 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
    }
    ctx->color_count = color_count;
    pipe_resource_reference(&ctx->depth, depth);
+   ctx->depth_level = depth_level;
+   ctx->depth_layer = depth_layer;
    /* From the framebuffer, not from the colour count: a depth-only pass has
     * no colour attachment and still has a size, and taking zero here made
     * every viewport look out of bounds. */
@@ -15947,6 +16068,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       wanted_pass.layers[i] = ctx->color_layers[i];
    }
    wanted_pass.depth = ctx->depth;
+   wanted_pass.depth_level = ctx->depth_level;
+   wanted_pass.depth_layer = ctx->depth_layer;
    /* Depth is read-only when this draw samples the texture it is attached to
     * and does not write it; computed here rather than with the attachment
     * because the answer is part of the key. */
@@ -16007,9 +16130,26 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          gex_resource(ctx->colors[i])->texture, &color_view);
       missing_view |= !views[i];
    }
-   if (!reuse && ctx->depth)
+   if (!reuse && ctx->depth) {
+      /* Explicitly one level and one layer. A NULL descriptor gives a view of
+       * the whole texture, and WebGPU refuses an attachment whose layer count
+       * is more than one:
+       *
+       *   The layer count (2) of [TextureView of Texture (2x2 px, 2 layer,
+       *   Depth16Unorm)] used as attachment is greater than 1.
+       *
+       * which is every depth array there is -- and it silently rendered into
+       * level zero whenever a mip level other than the first was attached. */
+      WGPUTextureViewDescriptor view_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+      view_desc.format = gex_wgpu_texture_format(ctx->depth->format);
+      view_desc.dimension = WGPUTextureViewDimension_2D;
+      view_desc.baseMipLevel = ctx->depth_level;
+      view_desc.mipLevelCount = 1;
+      view_desc.baseArrayLayer = ctx->depth_layer;
+      view_desc.arrayLayerCount = 1;
       depth_view = wgpuTextureCreateView(gex_resource(ctx->depth)->texture,
-                                         NULL);
+                                         &view_desc);
+   }
    if (gex_timing) gex_wgpu_time_views += os_time_get_nano() - t_record_start;
    const int64_t t_encoder_start = gex_timing ? os_time_get_nano() : 0;
    /* Joins whatever draws are already recorded rather than starting its own
