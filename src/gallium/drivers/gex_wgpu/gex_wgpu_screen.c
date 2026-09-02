@@ -15970,6 +15970,23 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * @builtin(sample_index) and @builtin(sample_mask) through the emitter's
     * existing SpvBuiltInSampleId path, and 4x multisample targets already
     * work. */
+   /* gl_FrontFacing as an integer system value, which is what zink sets and
+    * what this driver's borrowed SPIR-V emitter expects.
+    *
+    * Left false, tgsi_to_nir represents TGSI_SEMANTIC_FACE as an ordinary
+    * fragment input variable instead of nir_load_front_face. The emitter then
+    * decorates that variable BuiltIn FrontFacing while giving it the
+    * variable's own uint type, and SPIR-V requires that builtin to be a bool
+    * scalar:
+    *
+    *   [VUID-FrontFacing-FrontFacing-04231] According to the Vulkan spec
+    *   BuiltIn FrontFacing variable needs to be a bool scalar.
+    *   %gl_FrontFacing = OpVariable %_ptr_Input_uint Input
+    *
+    * With it set, the same shader reaches emit_load_front_face, which builds
+    * the builtin as a bool. st/mesa builds two-sided lighting through ureg, so
+    * `twoside` could not link its fragment shader at all. */
+   caps->fs_face_is_integer_sysval = true;
    caps->sample_shading = true;
    /* ARB_texture_query_lod. WGSL has no textureQueryLod, so the value is
     * computed from the coordinate's derivatives instead; see

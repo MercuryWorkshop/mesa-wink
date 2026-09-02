@@ -1818,7 +1818,33 @@ get_alu_src(struct ntv_context *ctx, nir_alu_instr *alu, unsigned src, SpvId *ra
    else {
       switch (nir_alu_type_get_base_type(type)) {
       case nir_type_bool:
-         UNREACHABLE("bool should have bit-size 1");
+         /* A wide value where the op declares a boolean input. NIR's own
+          * bools are 1-bit, but a TGSI-derived shader carries 32-bit ones and
+          * converts with b2b1 -- and the emit_alu case for that op already
+          * knows how to read a wide source, comparing it against zero. It
+          * never got the chance, because this ran first and aborted.
+          *
+          * An abort here takes the whole application down over one shader:
+          * `twoside`, whose fixed-function two-sided lighting st/mesa builds
+          * through ureg, died on
+          *
+          *   get_alu_src: Assertion `!"bool should have bit-size 1"' failed
+          *
+          * Handing the raw value back lets the op decide. If some other op
+          * ever needs a conversion this does not do, the result is a shader
+          * Tint refuses -- which fails one program -- rather than a killed
+          * process. Said once, so that case is still findable. */
+         {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr,
+                       "gex-wgpu: ntv boolean source is %u-bit for %s src %u; "
+                       "passed through for the op to convert\n",
+                       bit_size, nir_op_infos[alu->op].name, src);
+            }
+         }
+         return *raw_value;
 
       case nir_type_int:
          return bitcast_to_ivec(ctx, *raw_value, bit_size, num_components);
