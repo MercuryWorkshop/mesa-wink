@@ -64,7 +64,7 @@ gex_replay = executable(
     '-sEXPORT_ES6=1',
     '-sEXPORT_NAME=createGexMesa',
     '-sENVIRONMENT=web,worker,node',
-    '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_gex_gl_attached_kind,_gex_gl_attached_id,_gex_gl_attached_token,_gex_gl_attached_generation,_malloc,_free',
+    '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_gex_gl_attached_kind,_gex_gl_attached_id,_gex_gl_attached_token,_gex_gl_attached_generation,_gex_gl_surface_count,_gex_gl_surface_kind,_gex_gl_surface_id,_gex_gl_surface_token,_gex_gl_surface_client,_gex_gl_surface_frame,_gex_gl_surface_width,_gex_gl_surface_height,_gex_gl_surface_generation,_gex_gl_forget_client,_gex_gl_reject_op,_gex_gl_reject_why,_gex_gl_reject_payload,_gex_gl_reject_client,_malloc,_free',
     '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
   ],
   install : false,
@@ -115,7 +115,7 @@ if host_machine.system() == 'emscripten'
       '-sEXPORT_ES6=1',
       '-sEXPORT_NAME=createGexMesa',
       '-sENVIRONMENT=web,worker,node',
-      '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_gex_gl_attached_kind,_gex_gl_attached_id,_gex_gl_attached_token,_gex_gl_attached_generation,_malloc,_free',
+      '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_gex_gl_attached_kind,_gex_gl_attached_id,_gex_gl_attached_token,_gex_gl_attached_generation,_gex_gl_surface_count,_gex_gl_surface_kind,_gex_gl_surface_id,_gex_gl_surface_token,_gex_gl_surface_client,_gex_gl_surface_frame,_gex_gl_surface_width,_gex_gl_surface_height,_gex_gl_surface_generation,_gex_gl_forget_client,_gex_gl_reject_op,_gex_gl_reject_why,_gex_gl_reject_payload,_gex_gl_reject_client,_malloc,_free',
       '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
     ],
     install : false,
@@ -222,7 +222,7 @@ if gex_emdawn_dir != ''
       # Keep the name section: st/mesa calling a hook this driver leaves NULL
       # is the expected failure here, and an index is not a diagnosis.
       '--profiling-funcs',
-      '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_gex_gl_attached_kind,_gex_gl_attached_id,_gex_gl_attached_token,_gex_gl_attached_generation,_malloc,_free',
+      '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_gex_gl_attached_kind,_gex_gl_attached_id,_gex_gl_attached_token,_gex_gl_attached_generation,_gex_gl_surface_count,_gex_gl_surface_kind,_gex_gl_surface_id,_gex_gl_surface_token,_gex_gl_surface_client,_gex_gl_surface_frame,_gex_gl_surface_width,_gex_gl_surface_height,_gex_gl_surface_generation,_gex_gl_forget_client,_gex_gl_reject_op,_gex_gl_reject_why,_gex_gl_reject_payload,_gex_gl_reject_client,_malloc,_free',
       '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
     ],
     install : false,
