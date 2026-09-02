@@ -4515,6 +4515,16 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
     * inverted and was culled away. SuperTuxKart drew its track and its
     * kart's shadow but never the kart. */
    supported.flatshade_first = state->flatshade_first;
+   /* User clip planes, which reach the shader rather than the rasterizer.
+    * caps->clip_planes = 0 has st/mesa run nir_lower_clip_vs, so the vertex
+    * shader writes gl_ClipDistance for each enabled plane and WebGPU's
+    * clip_distances does the clipping -- the same path clip_distance's own
+    * CTS cases already take. st sets these bits either way (they also mean
+    * "which of a shader's own clip distances are live"), so refusing them
+    * refused the whole rasterizer state: seven of the installed GL programs
+    * lost culling and the scissor over a clip plane the shader was already
+    * honouring. */
+   supported.clip_plane_enable = state->clip_plane_enable;
    /* A refused rasterizer state binds as NULL, and a NULL one reads as every
     * default -- no scissor, no culling, and no rasterizer discard. That is
     * silent and wrong rather than loud and wrong, so say which field did it.
@@ -7057,9 +7067,17 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
          texture->target == PIPE_TEXTURE_2D ||
          texture->target == PIPE_TEXTURE_RECT) &&
         (templ->u.tex.first_layer != 0 || templ->u.tex.last_layer != 0)) ||
+       /* A 3D texture's depth is not a layer range. st/mesa builds its view
+        * with first_layer = last_layer = 0 -- last_layer comes from
+        * array_size - 1, and a 3D texture's array_size is 1 -- so demanding
+        * depth0 - 1 refused every 3D texture there is: `tri-tex-3d`,
+        * `quad-tex-3d` and `stex3d` all drew nothing. The view covers the
+        * whole volume either way, which is the only thing GL can ask for, so
+        * both spellings are accepted. */
        (texture->target == PIPE_TEXTURE_3D &&
         (templ->u.tex.first_layer != 0 ||
-         templ->u.tex.last_layer != texture->depth0 - 1)) ||
+         (templ->u.tex.last_layer != 0 &&
+          templ->u.tex.last_layer != texture->depth0 - 1))) ||
        (texture->target == PIPE_TEXTURE_CUBE &&
         (templ->u.tex.first_layer != 0 || templ->u.tex.last_layer != 5))) {
       GEX_SAMPLER_VIEW_REFUSED("shape or format");
@@ -16814,13 +16832,24 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * for both, and create_rasterizer_state refuses a state that splits them. */
    caps->depth_clip_disable = screen->depth_clip_control;
    caps->depth_clip_disable_separate = false;
-   /* flatshade and two_sided_color are left at u_screen's true. Turning them
-    * off makes st lower both in NIR, and the lowering reaches an ALU opcode
-    * zink's SPIR-V emitter does not implement -- which aborts the module.
-    * Neither is reachable in a core profile anyway (glShadeModel and
-    * two-sided lighting are compatibility-only), so st never sets them; only
-    * u_blitter does, and create_rasterizer_state accepts and ignores its
-    * flatshade rather than refusing the whole state. */
+   /* flatshade is left at u_screen's true: st never asks for it in a core
+    * profile, and u_blitter's is accepted and ignored by
+    * create_rasterizer_state rather than refusing the whole state.
+    *
+    * two_sided_color is off, so st lowers two-sided lighting into the
+    * fragment shader with nir_lower_two_sided_color and stops setting
+    * light_twoside at all. It used to be left on because the lowering
+    * reached an ALU opcode zink's SPIR-V emitter did not implement; that gap
+    * -- the vector comparison reductions -- is closed, and leaving the cap
+    * on meant four compatibility-profile programs (morph3d, geartrain,
+    * projtex, long-fixed-func) had every rasterizer state refused, losing
+    * culling and the scissor along with the lighting. */
+   caps->two_sided_color = false;
+   /* User clip planes are lowered into the vertex shader as clip distances --
+    * see the rasterizer state's clip_plane_enable. Zero keeps
+    * consts->MaxClipPlanes at 8 and has st reserve the plane equations in
+    * the default uniform block. */
+   caps->clip_planes = 0;
    /* WebGPU cube sampling is seamless and cannot be turned off, which is what
     * every Vulkan-backed driver reports too. The per-texture form stays
     * unadvertised precisely because it cannot be turned off. */
