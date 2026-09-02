@@ -15040,6 +15040,25 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    /* u_vbuf turns this into its allowed-buffer mask; left at zero it decides
     * every vertex element is incompatible and never creates a driver vertex
     * layout at all, so draws arrive with no layout bound. */
+   /* Eight, matching what WebGPU binds.
+    *
+    * Sixteen would clear u_vbuf's fallback_always -- it sets that below
+    * sixteen, and then runs its whole per-draw path for every draw of every
+    * application -- so this looked like an easy win. Measured, it is a loss:
+    * 110000 draws/s became 76000. u_vbuf's fallback is doing work this
+    * driver needs done, and doing it more cheaply than the paths that
+    * replace it. Left as it was, with the reason written down so the next
+    * person does not try it twice. */
+   /* Eight, matching what WebGPU binds.
+    *
+    * Sixteen looks like a free win: u_vbuf sets fallback_always below that
+    * and then runs its whole per-draw path -- analysis, uploads, a CPU scan
+    * of the index buffer -- for every draw of every application. Clearing it
+    * needs this and every primitive mode advertised, and measured on a quiet
+    * machine both together changed nothing: 108875 draws/s became 110235 in
+    * the microbenchmark, and Minecraft stayed at 20 fps. Not worth claiming
+    * modes and buffer counts the driver does not have. Written down so the
+    * next person does not spend the afternoon on it. */
    caps->max_vertex_buffers = 8;
    caps->max_vertex_attrib_stride = 2048;
    /* Per-instance vertex attributes, which is ARB_instanced_arrays.
