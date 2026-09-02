@@ -633,12 +633,20 @@ struct gex_wgpu_shader {
     * fragment stage's qualifier as the meaning, so the vertex stage is
     * rewritten to match -- see gex_wgpu_interp_variant_get. */
    uint8_t varying_interp[GEX_WGPU_MAX_VARYING_LOCATIONS];
+   /* How many components each varying has, for the same reason and with the
+    * same asymmetry: WGSL requires a vertex output and the fragment input it
+    * feeds to be the same width, and GLSL does not. A fragment shader that
+    * reads only `.xyz` of something the vertex shader writes as a vec4 is
+    * ordinary GLSL and an invalid WebGPU pipeline. */
+   uint8_t varying_components[GEX_WGPU_MAX_VARYING_LOCATIONS];
    uint64_t varying_interp_mask;
    struct gex_wgpu_interp_variant *interp_variants;
 };
 
 struct gex_wgpu_interp_variant {
    uint8_t interp[GEX_WGPU_MAX_VARYING_LOCATIONS];
+   /* The fragment stage's varying widths this module was reshaped to. */
+   uint8_t components[GEX_WGPU_MAX_VARYING_LOCATIONS];
    /* Sampler state this variant's texture lowering was built against, for a
     * vertex shader that samples an integer texture. The lowering reads
     * filters, wrap modes and view swizzles, so two draws with different
@@ -2128,6 +2136,100 @@ gex_wgpu_lower_query_lod_instr(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+static bool gex_wgpu_is_location_varying(int location);
+
+/* Make a vertex output as wide as the fragment input it feeds.
+ *
+ * GLSL lets a fragment shader read `vec3 v` from a vertex shader that writes
+ * `vec4 v`; the fourth component is simply not read. WGSL does not: a vertex
+ * output and the fragment input at the same location must be the same type,
+ * and Dawn rejects the whole pipeline when they differ --
+ *
+ *   The component count (4) of the vertex output at location 0 is different
+ *   from the component count (3) of the fragment input at location 0.
+ *
+ * which is a validation error rather than a failed call, so the draw is
+ * silently dropped. SuperTuxKart hit this on six shader pairs and rendered
+ * its HUD over an empty scene, with a quarter of a million invalid-pipeline
+ * errors behind it.
+ *
+ * The fragment stage is authoritative, exactly as it is for interpolation:
+ * what it declares is what GL means, and the vertex stage is reshaped to
+ * agree. Narrowing drops components nothing can read. Widening pads with
+ * zero, which is a value GL leaves undefined anyway -- a fragment shader
+ * reading a component its vertex shader never wrote has no promise about
+ * what it gets. */
+static bool
+gex_wgpu_fit_varying_store(nir_builder *b, nir_intrinsic_instr *intr,
+                           void *data)
+{
+   const uint8_t *want = data;
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   /* Only a whole-variable store. A packed or indexed one addresses part of
+    * the slot and reshaping it would move the components it names. */
+   if (!deref || deref->deref_type != nir_deref_type_var)
+      return false;
+   nir_variable *var = deref->var;
+   if (!var || var->data.mode != nir_var_shader_out ||
+       !gex_wgpu_is_location_varying(var->data.location) ||
+       var->data.location >= GEX_WGPU_MAX_VARYING_LOCATIONS ||
+       var->data.location_frac != 0)
+      return false;
+   const unsigned target = want[var->data.location];
+   if (!target || target > 4)
+      return false;
+   nir_def *value = intr->src[1].ssa;
+   if (value->num_components == target)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *fitted;
+   if (value->num_components > target) {
+      fitted = nir_trim_vector(b, value, target);
+   } else {
+      nir_def *components[4];
+      for (unsigned c = 0; c < target; ++c)
+         components[c] = c < value->num_components
+                            ? nir_channel(b, value, c)
+                            : nir_imm_zero(b, 1, value->bit_size);
+      fitted = nir_vec(b, components, target);
+   }
+   nir_src_rewrite(&intr->src[1], fitted);
+   /* The intrinsic carries its own width, and rewriting the source does not
+    * update it -- leaving a store that claims four components while holding
+    * three, which nir_validate catches and a release build would not. */
+   intr->num_components = target;
+   nir_intrinsic_set_write_mask(intr, BITFIELD_MASK(target));
+   return true;
+}
+
+/* Reshape the outputs themselves, then the stores that feed them. */
+static void
+gex_wgpu_fit_varyings(nir_shader *nir, const uint8_t *want)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
+      if (!gex_wgpu_is_location_varying(var->data.location) ||
+          var->data.location >= GEX_WGPU_MAX_VARYING_LOCATIONS ||
+          var->data.location_frac != 0)
+         continue;
+      const unsigned target = want[var->data.location];
+      if (!target || target > 4)
+         continue;
+      const struct glsl_type *type = var->type;
+      if (!glsl_type_is_vector_or_scalar(type) ||
+          glsl_get_vector_elements(type) == target)
+         continue;
+      var->type = glsl_vector_type(glsl_get_base_type(type), target);
+   }
+   nir_shader_intrinsics_pass(nir, gex_wgpu_fit_varying_store,
+                              nir_metadata_control_flow |
+                                 nir_metadata_loop_analysis,
+                              (void *)want);
+   nir_fixup_deref_types(nir);
+}
+
 static bool
 gex_wgpu_lower_view_swizzle_instr(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -2396,6 +2498,17 @@ gex_wgpu_strip_point_size(nir_shader *nir)
       return;
    nir_shader_intrinsics_pass(nir, gex_wgpu_strip_point_size_instr,
                               nir_metadata_control_flow, NULL);
+   /* Dropping the store leaves the deref that addressed it, and unlinking the
+    * variable out from under a live deref is a dangling reference:
+    *
+    *   %3 = deref_var &gl_PointSize (shader_out highp float)
+    *        error: entry (nir_validate.c:323)
+    *
+    * which aborts the process rather than merely mis-compiling, so any shader
+    * that set gl_PointSize took the driver down with it. DCE first, so the
+    * deref goes with the store and the variable is unused by the time it is
+    * removed. */
+   NIR_PASS(_, nir, nir_opt_dce);
    nir_foreach_variable_with_modes_safe(var, nir, nir_var_shader_out) {
       if (var->data.location == VARYING_SLOT_PSIZ)
          exec_node_remove(&var->node);
@@ -3240,6 +3353,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
             continue;
          shader->varying_interp[var->data.location] =
             (uint8_t)var->data.interpolation;
+         shader->varying_components[var->data.location] =
+            (uint8_t)glsl_get_vector_elements(type);
          shader->varying_interp_mask |= 1ull << var->data.location;
       }
    }
@@ -4024,6 +4139,21 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
       state->unclamped_fragment_depth_values;
    supported.rasterization_stream = state->rasterization_stream;
    supported.sprite_coord_enable = state->sprite_coord_enable;
+   /* Which vertex of a primitive a flat-qualified varying takes its value
+    * from. WGSL's flat interpolation takes the first, so GL's
+    * FIRST_VERTEX_CONVENTION -- this field set -- is the one that can be
+    * honoured exactly, and GL's default of the last vertex is the one that
+    * cannot.
+    *
+    * Refusing the field therefore had it backwards: it turned away the
+    * convention WebGPU implements while quietly accepting the one it does
+    * not. It only means anything to a shader that actually has a flat
+    * varying, and the cost of refusing is not a wrong flat colour but no
+    * rasterizer state at all -- a refused state binds as NULL, which reads
+    * as front_ccw = 0, so every counter-clockwise mesh had its facing
+    * inverted and was culled away. SuperTuxKart drew its track and its
+    * kart's shadow but never the kart. */
+   supported.flatshade_first = state->flatshade_first;
    /* A refused rasterizer state binds as NULL, and a NULL one reads as every
     * default -- no scissor, no culling, and no rasterizer discard. That is
     * silent and wrong rather than loud and wrong, so say which field did it.
@@ -11705,7 +11835,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    bool differs = false;
    for (unsigned i = 0; i < GEX_WGPU_MAX_VARYING_LOCATIONS; ++i)
       if ((shared & (1ull << i)) &&
-          vs->varying_interp[i] != fs->varying_interp[i])
+          (vs->varying_interp[i] != fs->varying_interp[i] ||
+           vs->varying_components[i] != fs->varying_components[i]))
          differs = true;
    if (!differs && !fold_viewport && !unpack_attribs && !lower_textures)
       return plain;
@@ -11713,6 +11844,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    const float none[4] = {0.0f, 0.0f, 0.0f, 0.0f};
    const float *want = fold_viewport ? viewport : none;
    const uint8_t *want_interp = fs ? fs->varying_interp : NULL;
+   const uint8_t *want_components = fs ? fs->varying_components : NULL;
    for (struct gex_wgpu_interp_variant *v = vs->interp_variants; v;
         v = v->next) {
       bool match = v->mask == fs_mask && v->sampler_mask == sampler_mask &&
@@ -11720,7 +11852,10 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
                    memcmp(v->attrib_unpack, want_unpack,
                           sizeof(v->attrib_unpack)) == 0 &&
                    (!want_interp ||
-                    memcmp(v->interp, want_interp, sizeof(v->interp)) == 0);
+                    memcmp(v->interp, want_interp, sizeof(v->interp)) == 0) &&
+                   (!want_components ||
+                    memcmp(v->components, want_components,
+                           sizeof(v->components)) == 0);
       for (unsigned slot = 0; match && slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
          if (!(sampler_mask & (1u << slot)))
             continue;
@@ -11765,6 +11900,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    }
    if (want_interp)
       memcpy(variant->interp, want_interp, sizeof(variant->interp));
+   if (want_components)
+      memcpy(variant->components, want_components,
+             sizeof(variant->components));
    for (unsigned pass = 0; pass < 2; ++pass) {
       nir_shader *clone = nir_shader_clone(NULL, vs->original_nir);
       if (!clone)
@@ -11777,6 +11915,14 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
                continue;
             var->data.interpolation = fs->varying_interp[var->data.location];
          }
+         /* Only the locations the fragment stage actually reads; a zero
+          * leaves the output alone, which is what an output it does not
+          * consume needs. */
+         uint8_t want_width[GEX_WGPU_MAX_VARYING_LOCATIONS] = {0};
+         for (unsigned i = 0; i < GEX_WGPU_MAX_VARYING_LOCATIONS; ++i)
+            if (fs->varying_interp_mask & (1ull << i))
+               want_width[i] = fs->varying_components[i];
+         gex_wgpu_fit_varyings(clone, want_width);
       }
       if (fold_viewport) {
          /* compile_nir flips y after this, so the y translate has to be
