@@ -280,7 +280,7 @@ struct gex_wgpu_screen {
    unsigned retired_count;
    struct gex_wgpu_bg_cache_slot {
       bool used;
-      uint64_t pass_serial;
+      uint64_t epoch;
       uint32_t hash;
       WGPUBindGroupLayout layout;
       unsigned count;
@@ -6341,6 +6341,11 @@ static void
 gex_wgpu_sampler_view_destroy(struct pipe_context *pipe,
                               struct pipe_sampler_view *base)
 {
+   /* The bind group cache keys on the entry bytes, and those name
+    * this object by address -- which Dawn hands straight back for the
+    * next one. Retire every cached binding rather than let a key match
+    * a view that no longer exists. */
+   ++gex_screen(pipe->screen)->cache_epoch;
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
    (void)pipe;
@@ -6517,6 +6522,11 @@ gex_wgpu_bind_sampler_states(struct pipe_context *pipe,
 static void
 gex_wgpu_delete_sampler_state(struct pipe_context *pipe, void *state)
 {
+   /* The bind group cache keys on the entry bytes, and those name
+    * this object by address -- which Dawn hands straight back for the
+    * next one. Retire every cached binding rather than let a key match
+    * a sampler that no longer exists. */
+   ++gex_screen(pipe->screen)->cache_epoch;
    GEX_ENTRY_TIMER();
    (void)pipe;
    struct gex_wgpu_sampler *sampler = state;
@@ -12323,11 +12333,10 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    const size_t bytes = count * sizeof(*entries);
    uint32_t hash = gex_wgpu_cache_hash(entries, bytes);
    hash = gex_wgpu_cache_hash(&layout, sizeof(layout)) ^ hash ^ (count * 97u);
-   hash ^= gex_wgpu_cache_hash(&screen->pass_serial,
-                               sizeof(screen->pass_serial));
+
    struct gex_wgpu_bg_cache_slot *slot =
       &screen->bg_cache[hash % GEX_WGPU_BG_CACHE_SLOTS];
-   if (slot->used && slot->pass_serial == screen->pass_serial &&
+   if (slot->used && slot->epoch == screen->cache_epoch &&
        slot->hash == hash && slot->layout == layout &&
        slot->count == count && memcmp(slot->entries, entries, bytes) == 0) {
       ++screen->bg_cache_hits;
@@ -12354,7 +12363,7 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
          wgpuBindGroupRelease(slot->group);
    }
    slot->used = true;
-   slot->pass_serial = screen->pass_serial;
+   slot->epoch = screen->cache_epoch;
    slot->hash = hash;
    slot->layout = layout;
    slot->count = count;
