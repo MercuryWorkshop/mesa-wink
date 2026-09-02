@@ -21,6 +21,7 @@
 #include "util/format/u_format.h"
 #include "util/half_float.h"
 #include "util/u_inlines.h"
+#include "util/simple_mtx.h"
 #include "util/u_memory.h"
 #include "util/u_helpers.h"
 #include "util/u_prim.h"
@@ -296,6 +297,36 @@ struct gex_wgpu_screen {
     * presenting sixty frames a second. Evictions are rare next to draws, so
     * throwing the whole emitted state away on one costs nothing. */
    uint64_t cache_epoch;
+   /* Everything above this line that a context may write.
+    *
+    * GL contexts are per thread and Mesa lets an application drive several at
+    * once, but the caches, the retired list and the stand-in textures all
+    * live on the screen, which is shared. Two threads racing one cache slot
+    * free the object the other is about to bind, and the garbage reaches
+    * Vulkan: `glthreads` segfaults inside radv, several frames in, with a
+    * command buffer full of released handles. Nothing about it is visible
+    * from the GL side. */
+   simple_mtx_t cache_lock;
+   /* One device and one queue serve every GL context, and GL contexts are per
+    * thread. Recording into separate encoders concurrently is fine -- they are
+    * separate objects -- but handing the finished buffers to one queue from
+    * several threads at once is not, and lands in radv with a half-built
+    * render pass. Separate from cache_lock so a submit does not wait on a
+    * cache lookup, and so neither can be held while taking the other. */
+   simple_mtx_t queue_lock;
+   /* Held across anything that builds or submits Dawn commands.
+    *
+    * One device and one queue serve every GL context, and GL contexts are
+    * per thread: `glthreads` drives several at once and lands in radv with a
+    * half-recorded render pass. Recursive, because these paths call each
+    * other -- a blit submits, a snapshot copies, a map flushes the batch.
+    *
+    * Only taken once a second context exists. Almost every application has
+    * one, and an uncontended lock on every encoder and every map is still
+    * hundreds of nanoseconds a draw that those applications need not pay. */
+   mtx_t device_lock;
+   bool device_lock_needed;
+   unsigned context_count;
    /* Render pipelines, keyed on the bytes of their descriptor and everything
     * it points at. Serialising rather than enumerating the fields on purpose:
     * a field left out of an enumerated key returns the *wrong* pipeline,
@@ -1185,6 +1216,41 @@ static bool gex_wgpu_entry_timing_enabled(void);
       __attribute__((cleanup(gex_wgpu_entry_timer_end))) = {                  \
          gex_wgpu_entry_timing_enabled() ? os_time_get_nano() : 0 }
 
+/* Every submission goes through here; see gex_wgpu_screen::queue_lock. */
+static void
+gex_wgpu_queue_submit(struct gex_wgpu_screen *screen, size_t count,
+                      WGPUCommandBuffer const *buffers)
+{
+   simple_mtx_lock(&screen->queue_lock);
+   wgpuQueueSubmit(screen->queue, count, buffers);
+   simple_mtx_unlock(&screen->queue_lock);
+}
+
+/* Scoped device lock; see gex_wgpu_screen::device_lock. Nothing has to
+ * unlock on the way out, which matters because these functions return from a
+ * dozen places each. */
+struct gex_wgpu_device_guard {
+   struct gex_wgpu_screen *screen;
+};
+
+static inline void
+gex_wgpu_device_unguard(struct gex_wgpu_device_guard *guard)
+{
+   if (guard->screen)
+      mtx_unlock(&guard->screen->device_lock);
+}
+
+#define GEX_DEVICE_GUARD(scr)                                                 \
+   struct gex_wgpu_device_guard gex_device_guard                              \
+      __attribute__((cleanup(gex_wgpu_device_unguard))) = { NULL };            \
+   do {                                                                       \
+      struct gex_wgpu_screen *gex_guard_screen = (scr);                       \
+      if (gex_guard_screen && gex_guard_screen->device_lock_needed) {          \
+         mtx_lock(&gex_guard_screen->device_lock);                            \
+         gex_device_guard.screen = gex_guard_screen;                          \
+      }                                                                       \
+   } while (0)
+
 static void gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx,
                                           const char *why);
 static void gex_wgpu_end_pass(struct gex_wgpu_context *ctx);
@@ -1196,6 +1262,7 @@ gex_wgpu_buffer_readback(struct pipe_context *pipe,
                          struct gex_wgpu_resource *gex,
                          uint32_t offset, uint32_t size, void *dest)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    /* Submits its own command buffer, so anything already recorded has to
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
@@ -1213,7 +1280,7 @@ gex_wgpu_buffer_readback(struct pipe_context *pipe,
                                            staging, 0, size);
       WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
       if (commands) {
-         wgpuQueueSubmit(screen->queue, 1, &commands);
+         gex_wgpu_queue_submit(screen, 1, &commands);
          wgpuCommandBufferRelease(commands);
       }
    }
@@ -2976,6 +3043,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
                              const struct pipe_shader_state *state,
                              enum mesa_shader_stage expected_stage)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    struct pipe_shader_state *mutable_state = (struct pipe_shader_state *)state;
    /* TGSI as well as NIR. Mesa's own helpers -- u_blitter's blit shaders come
     * through ureg, which hands the driver TGSI with no conversion of its own
@@ -4841,6 +4909,7 @@ gex_wgpu_set_constant_buffer(struct pipe_context *pipe,
                              mesa_shader_stage shader, uint index,
                              const struct pipe_constant_buffer *buffer)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    /* An unbind has to succeed for every stage and every slot, including the
@@ -5570,6 +5639,7 @@ static struct pipe_resource *
 gex_wgpu_resource_create(struct pipe_screen *screen,
                          const struct pipe_resource *templ)
 {
+   GEX_DEVICE_GUARD(gex_screen(screen));
    if (templ->target == PIPE_BUFFER) {
       /* Render-target and sampler-view binds on a *buffer* are st/mesa asking
        * for the option of a texture-buffer path it may never take. Refusing
@@ -5813,6 +5883,7 @@ static void
 gex_wgpu_resource_destroy(struct pipe_screen *screen,
                           struct pipe_resource *resource)
 {
+   GEX_DEVICE_GUARD(gex_screen(screen));
    (void)screen;
    struct gex_wgpu_resource *gex = gex_resource(resource);
    if (gex->texture)
@@ -5836,6 +5907,7 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
                         struct pipe_resource *resource, unsigned usage,
                         unsigned offset, unsigned size, const void *data)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    /* A write reaches the queue where it is *called*, so anything already
     * recorded has to go first or it would read the new bytes. The constant
@@ -5913,6 +5985,7 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
                          const void *data, unsigned stride,
                          uintptr_t layer_stride)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
    if (gex_wgpu_batch_conflicts_usage((struct gex_wgpu_context *)pipe,
                                      resource, usage))
@@ -6102,6 +6175,7 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
                              struct pipe_resource *texture,
                              const struct pipe_sampler_view *templ)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
    /* A refused sampler view is returned as NULL, and not every caller checks:
     * u_blitter builds one for its blit source and dereferences it, which is a
@@ -6265,6 +6339,7 @@ static void
 gex_wgpu_sampler_view_destroy(struct pipe_context *pipe,
                               struct pipe_sampler_view *base)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
    (void)pipe;
    struct gex_wgpu_sampler_view *view = (struct gex_wgpu_sampler_view *)base;
@@ -6712,6 +6787,7 @@ static bool
 gex_wgpu_resolve_depth(struct pipe_context *pipe, struct pipe_resource *dst,
                        struct pipe_resource *src)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    /* Submits its own command buffer, so anything already recorded has to
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
@@ -6778,7 +6854,7 @@ gex_wgpu_resolve_depth(struct pipe_context *pipe, struct pipe_resource *dst,
       if (!commands)
          fprintf(stderr, "gex-wgpu: depth resolve command buffer failed\n");
       if (commands) {
-         wgpuQueueSubmit(screen->queue, 1, &commands);
+         gex_wgpu_queue_submit(screen, 1, &commands);
          wgpuCommandBufferRelease(commands);
       }
    }
@@ -6816,6 +6892,7 @@ gex_wgpu_write_depth(struct gex_wgpu_context *ctx,
                      const struct pipe_box *box, const uint8_t *src,
                      unsigned src_stride)
 {
+   GEX_DEVICE_GUARD(gex_screen(ctx->base.screen));
    /* Submits its own command buffer, so anything already recorded has to
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending(ctx);
@@ -6960,7 +7037,7 @@ gex_wgpu_write_depth(struct gex_wgpu_context *ctx,
 
       WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
       if (commands) {
-         wgpuQueueSubmit(screen->queue, 1, &commands);
+         gex_wgpu_queue_submit(screen, 1, &commands);
          wgpuCommandBufferRelease(commands);
       } else {
          ok = false;
@@ -7075,6 +7152,7 @@ gex_wgpu_read_depth(struct gex_wgpu_context *ctx,
                     const struct pipe_box *box, uint8_t *out,
                     unsigned out_stride)
 {
+   GEX_DEVICE_GUARD(gex_screen(ctx->base.screen));
    /* Submits its own command buffer, so anything already recorded has to
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending(ctx);
@@ -7197,7 +7275,7 @@ gex_wgpu_read_depth(struct gex_wgpu_context *ctx,
 
       WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
       if (commands) {
-         wgpuQueueSubmit(screen->queue, 1, &commands);
+         gex_wgpu_queue_submit(screen, 1, &commands);
          wgpuCommandBufferRelease(commands);
       } else {
          ok = false;
@@ -7298,6 +7376,7 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
                      const struct pipe_box *box,
                      struct pipe_transfer **out_transfer)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    if (gex_wgpu_batch_conflicts_usage((struct gex_wgpu_context *)pipe,
                                      resource, usage))
       gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
@@ -7574,7 +7653,7 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
       gex_fail(ctx);
       return NULL;
    }
-   wgpuQueueSubmit(screen->queue, 1, &command);
+   gex_wgpu_queue_submit(screen, 1, &command);
    wgpuCommandBufferRelease(command);
 
    struct gex_wgpu_map_state state = {0};
@@ -7691,6 +7770,7 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
                     const struct pipe_box *box,
                     struct pipe_transfer **out_transfer)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct gex_wgpu_resource *gex = gex_resource(resource);
@@ -7761,7 +7841,7 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
                                               staging, 0, size);
          WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
          if (commands) {
-            wgpuQueueSubmit(screen->queue, 1, &commands);
+            gex_wgpu_queue_submit(screen, 1, &commands);
             wgpuCommandBufferRelease(commands);
          }
       }
@@ -7892,6 +7972,7 @@ gex_wgpu_transfer_flush_region(struct pipe_context *pipe,
                                struct pipe_transfer *transfer,
                                const struct pipe_box *box)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
    if (transfer &&
        gex_wgpu_batch_conflicts_usage((struct gex_wgpu_context *)pipe,
@@ -7946,6 +8027,7 @@ static void
 gex_wgpu_buffer_unmap(struct pipe_context *pipe,
                       struct pipe_transfer *transfer)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
    if (transfer &&
        gex_wgpu_batch_conflicts_usage((struct gex_wgpu_context *)pipe,
@@ -8001,6 +8083,7 @@ static void
 gex_wgpu_texture_unmap(struct pipe_context *pipe,
                        struct pipe_transfer *transfer)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_transfer *gex = (struct gex_wgpu_transfer *)transfer;
    /* A write map only reaches the texture here: what the caller wrote is
@@ -8023,6 +8106,7 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
                              unsigned width, unsigned height,
                              bool render_condition_enabled)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct pipe_resource *resource = dst ? dst->texture : NULL;
@@ -8112,7 +8196,7 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
       gex_fail(ctx);
       return;
    }
-   wgpuQueueSubmit(screen->queue, 1, &command);
+   gex_wgpu_queue_submit(screen, 1, &command);
    wgpuCommandBufferRelease(command);
 }
 
@@ -8124,6 +8208,7 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
                              unsigned width, unsigned height,
                              bool render_condition_enabled)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct pipe_resource *resource = dst ? dst->texture : NULL;
@@ -8203,7 +8288,7 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
       gex_fail(ctx);
       return;
    }
-   wgpuQueueSubmit(screen->queue, 1, &command);
+   gex_wgpu_queue_submit(screen, 1, &command);
    wgpuCommandBufferRelease(command);
 }
 
@@ -8433,6 +8518,7 @@ static bool
 gex_wgpu_get_query_result(struct pipe_context *pipe, struct pipe_query *q,
                           bool wait, union pipe_query_result *result)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
@@ -8486,7 +8572,7 @@ gex_wgpu_get_query_result(struct pipe_context *pipe, struct pipe_query *q,
       wgpuCommandEncoderRelease(encoder);
       if (!commands)
          return false;
-      wgpuQueueSubmit(screen->queue, 1, &commands);
+      gex_wgpu_queue_submit(screen, 1, &commands);
       wgpuCommandBufferRelease(commands);
 
       struct gex_wgpu_map_state state = {WGPUMapAsyncStatus_Success, false};
@@ -8727,6 +8813,7 @@ static void
 gex_wgpu_launch_grid(struct pipe_context *pipe,
                      const struct pipe_grid_info *info)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
@@ -8804,7 +8891,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       }
       WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
       if (commands) {
-         wgpuQueueSubmit(screen->queue, 1, &commands);
+         gex_wgpu_queue_submit(screen, 1, &commands);
          wgpuCommandBufferRelease(commands);
       }
    } else {
@@ -8874,6 +8961,7 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
                              struct pipe_resource *src, unsigned src_level,
                              const struct pipe_box *box, bool flip_y)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    /* Submits its own command buffer, so anything already recorded has to
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
@@ -8963,7 +9051,7 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
    wgpuCommandEncoderRelease(encoder);
    if (!commands)
       return false;
-   wgpuQueueSubmit(screen->queue, 1, &commands);
+   gex_wgpu_queue_submit(screen, 1, &commands);
    wgpuCommandBufferRelease(commands);
    (void)ctx;
    return true;
@@ -9090,6 +9178,7 @@ gex_wgpu_resolve(struct pipe_context *pipe, struct pipe_resource *dst,
                  unsigned dst_level, struct pipe_resource *src,
                  unsigned src_level)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    /* Submits its own command buffer, so anything already recorded has to
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
@@ -9160,7 +9249,7 @@ gex_wgpu_resolve(struct pipe_context *pipe, struct pipe_resource *dst,
    wgpuTextureViewRelease(single);
    if (!commands || !pass)
       return false;
-   wgpuQueueSubmit(screen->queue, 1, &commands);
+   gex_wgpu_queue_submit(screen, 1, &commands);
    wgpuCommandBufferRelease(commands);
    return true;
 }
@@ -9391,6 +9480,7 @@ gex_wgpu_blit_by_transfer(struct pipe_context *pipe,
 static void
 gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    if (ctx->failed)
@@ -9582,6 +9672,7 @@ gex_wgpu_clear(struct pipe_context *pipe, unsigned buffers,
                const union pipe_color_union *color, double depth,
                unsigned stencil)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    /* A partial channel or stencil mask needs a masked clear, which the
@@ -10608,6 +10699,7 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
                           const struct pipe_draw_info *info,
                           const struct pipe_draw_start_count_bias *draw)
 {
+   GEX_DEVICE_GUARD(gex_screen(ctx->base.screen));
    /* Submits its own command buffer, so anything already recorded has to
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending(ctx);
@@ -10927,7 +11019,7 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       }
       WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
       if (commands) {
-         wgpuQueueSubmit(screen->queue, 1, &commands);
+         gex_wgpu_queue_submit(screen, 1, &commands);
          wgpuCommandBufferRelease(commands);
       } else {
          ok = false;
@@ -11036,6 +11128,7 @@ gex_wgpu_dispatch(struct gex_wgpu_context *ctx, WGPUShaderModule module,
                   const struct gex_wgpu_bindings *g1,
                   struct pipe_resource *zero, unsigned workgroups)
 {
+   GEX_DEVICE_GUARD(gex_screen(ctx->base.screen));
    /* Submits its own command buffer, so anything already recorded has to
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending(ctx);
@@ -11083,7 +11176,7 @@ gex_wgpu_dispatch(struct gex_wgpu_context *ctx, WGPUShaderModule module,
       }
       WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
       if (commands) {
-         wgpuQueueSubmit(screen->queue, 1, &commands);
+         gex_wgpu_queue_submit(screen, 1, &commands);
          wgpuCommandBufferRelease(commands);
       } else {
          ok = false;
@@ -11593,12 +11686,17 @@ gex_wgpu_default_texture_view(struct gex_wgpu_screen *screen,
                               WGPUTextureViewDimension dimension,
                               WGPUTextureSampleType sample_type)
 {
+   simple_mtx_lock(&screen->cache_lock);
    for (unsigned i = 0; i < screen->default_texture_count; ++i)
       if (screen->default_textures[i].dimension == dimension &&
           screen->default_textures[i].sample_type == sample_type)
-         return screen->default_textures[i].view;
+         { const WGPUTextureView gex_ret = screen->default_textures[i].view;
+           simple_mtx_unlock(&screen->cache_lock);
+           return gex_ret; }
    if (screen->default_texture_count >= ARRAY_SIZE(screen->default_textures))
-      return NULL;
+      { const WGPUTextureView gex_ret = NULL;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
 
    WGPUTextureFormat format;
    switch (sample_type) {
@@ -11629,7 +11727,9 @@ gex_wgpu_default_texture_view(struct gex_wgpu_screen *screen,
                    WGPUTextureUsage_RenderAttachment;
    WGPUTexture texture = wgpuDeviceCreateTexture(screen->device, &desc);
    if (!texture)
-      return NULL;
+      { const WGPUTextureView gex_ret = NULL;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
 
    if (sample_type != WGPUTextureSampleType_Depth) {
       /* Opaque black, which is what GL says an incomplete texture samples as.
@@ -11665,14 +11765,18 @@ gex_wgpu_default_texture_view(struct gex_wgpu_screen *screen,
    WGPUTextureView view = wgpuTextureCreateView(texture, &view_desc);
    if (!view) {
       wgpuTextureRelease(texture);
-      return NULL;
+      { const WGPUTextureView gex_ret = NULL;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    }
    const unsigned i = screen->default_texture_count++;
    screen->default_textures[i].dimension = dimension;
    screen->default_textures[i].sample_type = sample_type;
    screen->default_textures[i].texture = texture;
    screen->default_textures[i].view = view;
-   return view;
+   { const WGPUTextureView gex_ret = view;
+     simple_mtx_unlock(&screen->cache_lock);
+     return gex_ret; }
 }
 
 /* The sampler that goes with it, for a slot whose sampler state is also
@@ -11681,11 +11785,14 @@ static WGPUSampler
 gex_wgpu_default_sampler(struct gex_wgpu_screen *screen,
                          WGPUSamplerBindingType type)
 {
+   simple_mtx_lock(&screen->cache_lock);
    const unsigned index = type == WGPUSamplerBindingType_Comparison   ? 2u
                         : type == WGPUSamplerBindingType_NonFiltering ? 1u
                                                                       : 0u;
    if (screen->default_samplers[index])
-      return screen->default_samplers[index];
+      { const WGPUSampler gex_ret = screen->default_samplers[index];
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    WGPUSamplerDescriptor desc = WGPU_SAMPLER_DESCRIPTOR_INIT;
    desc.addressModeU = WGPUAddressMode_ClampToEdge;
    desc.addressModeV = WGPUAddressMode_ClampToEdge;
@@ -11698,7 +11805,9 @@ gex_wgpu_default_sampler(struct gex_wgpu_screen *screen,
       desc.compare = WGPUCompareFunction_Always;
    screen->default_samplers[index] =
       wgpuDeviceCreateSampler(screen->device, &desc);
-   return screen->default_samplers[index];
+   { const WGPUSampler gex_ret = screen->default_samplers[index];
+     simple_mtx_unlock(&screen->cache_lock);
+     return gex_ret; }
 }
 
 static int64_t gex_wgpu_time_pipeline;
@@ -11771,8 +11880,11 @@ gex_wgpu_cached_bind_group_layout(struct gex_wgpu_screen *screen,
                                   const WGPUBindGroupLayoutEntry *entries,
                                   unsigned count)
 {
+   simple_mtx_lock(&screen->cache_lock);
    if (count > GEX_WGPU_CACHE_MAX_ENTRIES)
-      return NULL;
+      { const WGPUBindGroupLayout gex_ret = NULL;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    const size_t bytes = count * sizeof(*entries);
    const uint32_t hash =
       gex_wgpu_cache_hash(entries, bytes) ^ (count * 2654435761u);
@@ -11780,7 +11892,9 @@ gex_wgpu_cached_bind_group_layout(struct gex_wgpu_screen *screen,
       if (screen->bgl_cache[i].hash == hash &&
           screen->bgl_cache[i].count == count &&
           memcmp(screen->bgl_cache[i].entries, entries, bytes) == 0)
-         return screen->bgl_cache[i].layout;
+         { const WGPUBindGroupLayout gex_ret = screen->bgl_cache[i].layout;
+           simple_mtx_unlock(&screen->cache_lock);
+           return gex_ret; }
 
    WGPUBindGroupLayoutDescriptor desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    desc.entryCount = count;
@@ -11788,7 +11902,9 @@ gex_wgpu_cached_bind_group_layout(struct gex_wgpu_screen *screen,
    WGPUBindGroupLayout layout =
       wgpuDeviceCreateBindGroupLayout(screen->device, &desc);
    if (!layout)
-      return NULL;
+      { const WGPUBindGroupLayout gex_ret = NULL;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    if (screen->bgl_cache_count < GEX_WGPU_BGL_CACHE_SLOTS) {
       struct gex_wgpu_bgl_cache_slot *slot =
          &screen->bgl_cache[screen->bgl_cache_count++];
@@ -11808,22 +11924,29 @@ gex_wgpu_cached_bind_group_layout(struct gex_wgpu_screen *screen,
                  GEX_WGPU_BGL_CACHE_SLOTS);
       }
    }
-   return layout;
+   { const WGPUBindGroupLayout gex_ret = layout;
+     simple_mtx_unlock(&screen->cache_lock);
+     return gex_ret; }
 }
 
 static WGPUPipelineLayout
 gex_wgpu_cached_pipeline_layout(struct gex_wgpu_screen *screen,
                                 WGPUBindGroupLayout *layouts, unsigned count)
 {
+   simple_mtx_lock(&screen->cache_lock);
    if (count > 4)
-      return NULL;
+      { const WGPUPipelineLayout gex_ret = NULL;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    const size_t bytes = count * sizeof(*layouts);
    const uint32_t hash = gex_wgpu_cache_hash(layouts, bytes) ^ (count * 40503u);
    for (unsigned i = 0; i < screen->pl_cache_count; ++i)
       if (screen->pl_cache[i].hash == hash &&
           screen->pl_cache[i].count == count &&
           memcmp(screen->pl_cache[i].layouts, layouts, bytes) == 0)
-         return screen->pl_cache[i].layout;
+         { const WGPUPipelineLayout gex_ret = screen->pl_cache[i].layout;
+           simple_mtx_unlock(&screen->cache_lock);
+           return gex_ret; }
 
    WGPUPipelineLayoutDescriptor desc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
    desc.bindGroupLayoutCount = count;
@@ -11831,7 +11954,9 @@ gex_wgpu_cached_pipeline_layout(struct gex_wgpu_screen *screen,
    WGPUPipelineLayout layout =
       wgpuDeviceCreatePipelineLayout(screen->device, &desc);
    if (!layout)
-      return NULL;
+      { const WGPUPipelineLayout gex_ret = NULL;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    if (screen->pl_cache_count < GEX_WGPU_PL_CACHE_SLOTS) {
       struct gex_wgpu_pl_cache_slot *slot =
          &screen->pl_cache[screen->pl_cache_count++];
@@ -11840,7 +11965,9 @@ gex_wgpu_cached_pipeline_layout(struct gex_wgpu_screen *screen,
       memcpy(slot->layouts, layouts, bytes);
       slot->layout = layout;
    }
-   return layout;
+   { const WGPUPipelineLayout gex_ret = layout;
+     simple_mtx_unlock(&screen->cache_lock);
+     return gex_ret; }
 }
 
 /* Draws recorded but not yet handed to the queue.
@@ -12004,7 +12131,7 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
    /* Every uniform these draws read, in one write. It has to go on the queue
     * before the submit, which is exactly here. */
    gex_wgpu_flush_constant_ring(ctx);
-   wgpuQueueSubmit(gex_screen(ctx->base.screen)->queue, 1, &command);
+   gex_wgpu_queue_submit(gex_screen(ctx->base.screen), 1, &command);
    wgpuCommandBufferRelease(command);
    gex_wgpu_batched_submits++;
    gex_wgpu_batched_draws += draws;
@@ -12116,11 +12243,14 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
                          const WGPURenderPipelineDescriptor *desc,
                          bool *cached)
 {
+   simple_mtx_lock(&screen->cache_lock);
    uint8_t key[GEX_WGPU_PIPELINE_KEY_MAX];
    const unsigned length = gex_wgpu_pipeline_key(desc, key, sizeof(key));
    *cached = false;
    if (!length)   /* too big to key: build it and let the caller own it */
-      return wgpuDeviceCreateRenderPipeline(screen->device, desc);
+      { const WGPURenderPipeline gex_ret = wgpuDeviceCreateRenderPipeline(screen->device, desc);
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
 
    const uint32_t hash = gex_wgpu_cache_hash(key, length);
    struct gex_wgpu_pipeline_cache_slot *slot =
@@ -12129,7 +12259,9 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
    if (slot->used && slot->hash == hash && slot->key_length == length &&
        memcmp(slot->key, key, length) == 0) {
       ++screen->pipeline_cache_hits;
-      return slot->pipeline;
+      { const WGPURenderPipeline gex_ret = slot->pipeline;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    }
    ++screen->pipeline_cache_misses;
 
@@ -12137,7 +12269,9 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
       wgpuDeviceCreateRenderPipeline(screen->device, desc);
    if (!pipeline) {
       *cached = false;
-      return NULL;
+      { const WGPURenderPipeline gex_ret = NULL;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    }
    /* Safe to release the evicted one now: it is a different key from the one
     * this draw just took, and Dawn keeps its own reference for any work
@@ -12151,7 +12285,9 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
    slot->key_length = length;
    memcpy(slot->key, key, length);
    slot->pipeline = pipeline;
-   return pipeline;
+   { const WGPURenderPipeline gex_ret = pipeline;
+     simple_mtx_unlock(&screen->cache_lock);
+     return gex_ret; }
 }
 
 /* Bind groups evicted while a draw was still assembling. Released here, one
@@ -12160,9 +12296,11 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
 static void
 gex_wgpu_release_retired_groups(struct gex_wgpu_screen *screen)
 {
+   simple_mtx_lock(&screen->cache_lock);
    for (unsigned i = 0; i < screen->retired_count; ++i)
       wgpuBindGroupRelease(screen->retired_groups[i]);
    screen->retired_count = 0;
+   simple_mtx_unlock(&screen->cache_lock);
 }
 
 /* Keying a bind group on the *handles* in its entries is safe only because
@@ -12175,8 +12313,11 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
                            WGPUBindGroupLayout layout,
                            const WGPUBindGroupEntry *entries, unsigned count)
 {
+   simple_mtx_lock(&screen->cache_lock);
    if (count > GEX_WGPU_CACHE_MAX_ENTRIES)
-      return NULL;
+      { const WGPUBindGroup gex_ret = NULL;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    const size_t bytes = count * sizeof(*entries);
    uint32_t hash = gex_wgpu_cache_hash(entries, bytes);
    hash = gex_wgpu_cache_hash(&layout, sizeof(layout)) ^ hash ^ (count * 97u);
@@ -12185,7 +12326,9 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    if (slot->used && slot->hash == hash && slot->layout == layout &&
        slot->count == count && memcmp(slot->entries, entries, bytes) == 0) {
       ++screen->bg_cache_hits;
-      return slot->group;
+      { const WGPUBindGroup gex_ret = slot->group;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    }
    ++screen->bg_cache_misses;
 
@@ -12195,7 +12338,9 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    desc.entries = entries;
    WGPUBindGroup group = wgpuDeviceCreateBindGroup(screen->device, &desc);
    if (!group)
-      return NULL;
+      { const WGPUBindGroup gex_ret = NULL;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    if (slot->used) {
       ++screen->cache_epoch;
       if (screen->retired_count < ARRAY_SIZE(screen->retired_groups))
@@ -12209,20 +12354,27 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    slot->count = count;
    memcpy(slot->entries, entries, bytes);
    slot->group = group;
-   return group;
+   { const WGPUBindGroup gex_ret = group;
+     simple_mtx_unlock(&screen->cache_lock);
+     return gex_ret; }
 }
 
 static WGPUBuffer
 gex_wgpu_default_attribute_buffer(struct gex_wgpu_screen *screen)
 {
+   simple_mtx_lock(&screen->cache_lock);
    if (screen->default_attributes)
-      return screen->default_attributes;
+      { const WGPUBuffer gex_ret = screen->default_attributes;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
    desc.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
    desc.size = 32;
    WGPUBuffer buffer = wgpuDeviceCreateBuffer(screen->device, &desc);
    if (!buffer)
-      return NULL;
+      { const WGPUBuffer gex_ret = NULL;
+        simple_mtx_unlock(&screen->cache_lock);
+        return gex_ret; }
    /* GL's *initial* current attribute value, not its current one.
     *
     * A disabled vertex array reads the value `glVertexAttrib*` last set for
@@ -12240,7 +12392,9 @@ gex_wgpu_default_attribute_buffer(struct gex_wgpu_screen *screen)
    };
    wgpuQueueWriteBuffer(screen->queue, buffer, 0, contents, sizeof(contents));
    screen->default_attributes = buffer;
-   return buffer;
+   { const WGPUBuffer gex_ret = buffer;
+     simple_mtx_unlock(&screen->cache_lock);
+     return gex_ret; }
 }
 
 static void
@@ -12436,6 +12590,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                         const struct pipe_draw_start_count_bias *draws,
                         unsigned num_draws)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    /* The whole call, so that the pipeline and submit figures below can be
     * read as fractions of the driver's own cost rather than of wall clock,
@@ -14595,6 +14750,7 @@ static void
 gex_wgpu_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
                unsigned flags)
 {
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    (void)pipe;
    (void)flags;
@@ -14653,6 +14809,16 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
 static struct pipe_context *
 gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
 {
+   /* The second context is the one that makes this a shared device; see
+    * gex_wgpu_screen::device_lock. Never turned off again: a context that
+    * went away may still have work in flight. */
+   {
+      struct gex_wgpu_screen *gex = gex_screen(screen);
+      simple_mtx_lock(&gex->cache_lock);
+      if (++gex->context_count > 1)
+         gex->device_lock_needed = true;
+      simple_mtx_unlock(&gex->cache_lock);
+   }
    (void)flags;
    struct gex_wgpu_context *ctx = CALLOC_STRUCT(gex_wgpu_context);
    if (!ctx)
@@ -14770,6 +14936,9 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
 static void
 gex_wgpu_screen_destroy(struct pipe_screen *base)
 {
+   simple_mtx_destroy(&gex_screen(base)->cache_lock);
+   simple_mtx_destroy(&gex_screen(base)->queue_lock);
+   mtx_destroy(&gex_screen(base)->device_lock);
    struct gex_wgpu_screen *screen = gex_screen(base);
    if (screen->queue)
       wgpuQueueRelease(screen->queue);
@@ -15337,6 +15506,9 @@ gex_wgpu_screen_create(WGPUDevice device)
       glsl_type_singleton_decref();
       return NULL;
    }
+   simple_mtx_init(&screen->cache_lock, mtx_plain);
+   simple_mtx_init(&screen->queue_lock, mtx_plain);
+   mtx_init(&screen->device_lock, mtx_plain | mtx_recursive);
    screen->base.destroy = gex_wgpu_screen_destroy;
    gex_wgpu_init_nir_options(screen);
    gex_wgpu_init_caps(screen);
