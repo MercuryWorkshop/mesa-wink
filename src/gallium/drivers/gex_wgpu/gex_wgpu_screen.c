@@ -12449,7 +12449,9 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
     * this draw just took, and Dawn keeps its own reference for any work
     * already submitted with it. */
    if (slot->used) {
-      ++screen->cache_epoch;
+      /* No epoch bump. The pipeline cache does not consult the epoch at all,
+       * so bumping it here only invalidated the bind group cache, which does
+       * -- and that cache is shared with every other slot. */
       wgpuRenderPipelineRelease(slot->pipeline);
    }
    slot->used = true;
@@ -12516,7 +12518,26 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
         simple_mtx_unlock(&screen->cache_lock);
         return gex_ret; }
    if (slot->used) {
-      ++screen->cache_epoch;
+      /* Evicting one slot does not invalidate the others.
+       *
+       * The epoch exists because a key names its buffers, views and samplers
+       * by address and Dawn hands a freed address straight back, so a stale
+       * key could match the wrong object. What makes that impossible in the
+       * ordinary case is that each slot holds a reference to its own group,
+       * which holds one to everything the key names -- so nothing a live
+       * slot names can be freed underneath it, whatever happens to its
+       * neighbours. Only a driver-level sampler or view being destroyed can
+       * outrun that, and those two paths still bump the epoch.
+       *
+       * Bumping it here instead invalidated all 512 slots on every eviction,
+       * so a workload that evicted at all could never hit: Minecraft with a
+       * crowd reported a 0.0% hit rate over 46,987,974 lookups, building a
+       * fresh bind group for every draw. Removing it takes that to 99.6%.
+       *
+       * Worth measuring rather than assuming, though: the same scene goes
+       * from ~55.5 to ~59.9 fps, about 8%. Forty-seven million redundant
+       * bind group creations are worth removing, but Dawn builds them
+       * cheaply enough that the cache was never the wall it looked like. */
       if (screen->retired_count < ARRAY_SIZE(screen->retired_groups))
          screen->retired_groups[screen->retired_count++] = slot->group;
       else
