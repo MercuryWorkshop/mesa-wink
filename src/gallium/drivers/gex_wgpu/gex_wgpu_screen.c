@@ -2368,6 +2368,60 @@ gex_wgpu_fit_varyings(nir_shader *nir, const uint8_t *want)
    nir_fixup_deref_types(nir);
 }
 
+/* GL's old-style shadow sampling, which returns a vec4.
+ *
+ * `shadow2D` and `shadow2DProj` are GLSL 1.20 functions and they return a
+ * vec4, not the scalar `texture(sampler2DShadow, ...)` returns. NIR carries
+ * the difference as `is_new_style_shadow`, and SPIR-V has only the new form:
+ * `OpImageSample*Dref*` produces a scalar, so emitting one with a vec4 result
+ * type is invalid and Tint says so --
+ *
+ *   error: line:73: Expected Result Type to be int or float scalar type
+ *
+ * -- which rejected `shadowtex`'s whole fragment shader. zink hits this too
+ * and answers it the same way (zink_compiler.c, lower_zs_swizzle_tex): sample
+ * as new-style and expand the scalar back out in the shader.
+ *
+ * The expansion is (r, r, r, 1), which is what GL_DEPTH_TEXTURE_MODE's
+ * default of GL_LUMINANCE asks for and what st/mesa's own view swizzle for a
+ * depth texture says. GL_INTENSITY would want alpha to be r as well; that
+ * needs the bound view, so it would have to move into the swizzle variant,
+ * and no installed program asks for it. */
+static bool
+gex_wgpu_lower_old_style_shadow(nir_builder *b, nir_instr *instr, void *data)
+{
+   (void)data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (!tex->is_shadow || tex->is_new_style_shadow ||
+       tex->def.num_components < 2 || tex->op == nir_texop_tg4 ||
+       tex->is_sparse)
+      return false;
+   const unsigned components = tex->def.num_components;
+   tex->def.num_components = 1;
+   tex->is_new_style_shadow = true;
+   b->cursor = nir_after_instr(instr);
+   nir_def *channels[4];
+   for (unsigned i = 0; i < components; ++i)
+      channels[i] = i == 3 ? nir_imm_float(b, 1.0f) : &tex->def;
+   nir_def *expanded = nir_vec(b, channels, components);
+   nir_def_rewrite_uses_after(&tex->def, expanded);
+   return true;
+}
+
+/* The sample type the module declared for one texture slot, or -1 where the
+ * shader does not use that slot. The decline diagnostic wants it. */
+static int
+gex_wgpu_shader_sample_type_for_slot(const struct gex_wgpu_shader *shader,
+                                     unsigned slot)
+{
+   for (unsigned i = 0; i < shader->texture_count; ++i)
+      if (shader->texture_slots[i] == slot)
+         return (int)shader->texture_sample_types[i];
+   return -1;
+}
+
 static bool
 gex_wgpu_lower_view_swizzle_instr(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -2703,6 +2757,23 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    const nir_lower_tex_options texture_options = {
       .lower_1d = true,
       .lower_rect = true,
+      /* Projective lookups, divided out in NIR rather than left to SPIR-V.
+       *
+       * SPIR-V's OpImageSample*Proj*Dref* does not project the depth
+       * reference -- the coordinate carries the divisor and D_ref is a
+       * separate operand that is used as it stands -- while GL's
+       * shadow2DProj compares against coord.p / coord.q. zink's emitter
+       * passes the reference straight through, so every projective shadow
+       * comparison used an undivided reference: `shadow2DProj` answered zero
+       * everywhere, which for a shadow map means fully shadowed and looks
+       * like a depth range or bias problem rather than a missing divide.
+       *
+       * nir_lower_tex's project_src divides the coordinate *and* the
+       * comparator, so lowering here removes the whole question. Non-shadow
+       * projection is lowered with it: WGSL has no projective sampling
+       * either, so Tint was undoing it again, and one frcp plus a multiply is
+       * what that costs. */
+      .lower_txp = ~0u,
    };
    NIR_PASS(_, nir, nir_lower_tex, &texture_options);
    bool lowered_texture_declaration = false;
@@ -2788,6 +2859,12 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
     * width check, so this lowers what the emitter cannot take while leaving
     * ordinary vec4 ALU alone. */
    NIR_PASS(_, nir, nir_lower_alu_width, gex_wgpu_alu_target_width, NULL);
+   /* Old-style (vec4) shadow sampling, which SPIR-V has no instruction for.
+    * Before ntv, and in the base shader rather than a variant: nothing about
+    * it depends on the bound view. */
+   NIR_PASS(_, nir, nir_shader_instructions_pass,
+            gex_wgpu_lower_old_style_shadow,
+            nir_metadata_control_flow | nir_metadata_loop_analysis, NULL);
    /* textureQueryLod, which WGSL has no form of at all.
     *
     * This belongs here rather than in gex_wgpu_lower_texture_variant, where
@@ -4253,7 +4330,14 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
        * gex_wgpu_lower_view_swizzle_instr owns that case; it takes the slot
        * from the texture deref when there is no sampler deref to take it
        * from. */
-      if (!uses_sampler && swizzled)
+      /* A swizzled view needs the lowering whether or not a sampler state is
+       * bound for the slot, and whether or not the shader takes a sampler
+       * deref: the swizzle belongs to the view. Requiring a bound sampler
+       * left `shadowtex`'s depth-texture display red instead of grey --
+       * WebGPU reads a depth aspect as (d, 0, 0, 1) and GL's
+       * GL_DEPTH_TEXTURE_MODE wants (d, d, d, 1), which is exactly a view
+       * swizzle -- because st/mesa binds no sampler state for that unit. */
+      if (swizzled)
          needs_sampler_variant = true;
       /* Every slot the lowering looks at belongs in the variant's key, not
        * just the ones with a sampler. This used to be set only inside the
@@ -12968,8 +13052,18 @@ gex_wgpu_default_sampler(struct gex_wgpu_screen *screen,
    desc.minFilter = WGPUFilterMode_Nearest;
    desc.mipmapFilter = WGPUMipmapFilterMode_Nearest;
    desc.maxAnisotropy = 1;
-   if (index == 2)
-      desc.compare = WGPUCompareFunction_Always;
+   if (index == 2) {
+      /* GL's default GL_TEXTURE_COMPARE_FUNC, not Always.
+       *
+       * A comparison sampler needs *some* function, and Always looks like the
+       * harmless choice -- until a shadow comparison lands on it, which
+       * returns "in front of everything" for every fragment and so lights the
+       * whole scene. `shadowtex` cast no shadow at all for exactly this: st
+       * binds a sampler view for its shadow map without binding sampler state
+       * for that unit, so every comparison went through this stand-in. GL's
+       * default is GL_LEQUAL, which is also what a shadow map wants. */
+      desc.compare = WGPUCompareFunction_LessEqual;
+   }
    screen->default_samplers[index] =
       wgpuDeviceCreateSampler(screen->device, &desc);
    { const WGPUSampler gex_ret = screen->default_samplers[index];
@@ -15433,71 +15527,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          if (!binding_why) { binding_why = (why); binding_slot = slot; }       \
       }                                                                       \
    } while (0)
-   /* Slots holding a depth texture that the shader declared as an ordinary
-    * float one. GL allows sampler2D on a depth texture -- that is how a depth
-    * buffer is read back through a shader -- and NIR hands this driver
-    * texture_2d<f32> for it, where WGSL would want texture_depth_2d. WebGPU
-    * also allows a depth-format view to be bound as `unfilterable-float`,
-    * which texture_2d<f32> accepts, provided the sampler is non-filtering --
-    * and a depth texture is not filterable in WebGPU at all, so a filtering
-    * sampler on one could not have been honoured either way. */
-   /* Slots holding a depth texture that the shader declared as an ordinary
-    * float one. GL allows sampler2D on a depth texture -- that is how a depth
-    * buffer is read back through a shader -- and NIR hands this driver
-    * texture_2d<f32> for it, where WGSL would want texture_depth_2d. WebGPU
-    * also allows a depth-format view to be bound as `unfilterable-float`,
-    * which texture_2d<f32> accepts, provided the sampler is non-filtering --
-    * and a depth texture is not filterable in WebGPU at all, so a filtering
-    * sampler on one could not have been honoured either way. */
-/* Slots holding a depth texture that the shader declared as an ordinary
-    * float one. GL allows sampler2D on a depth texture -- that is how a depth
-    * buffer is read back through a shader -- and NIR hands this driver
-    * texture_2d<f32> for it, where WGSL would want texture_depth_2d. WebGPU
-    * also allows a depth-format view to be bound as `unfilterable-float`,
-    * which texture_2d<f32> accepts, provided the sampler is non-filtering --
-    * and a depth texture is not filterable in WebGPU at all, so a filtering
-    * sampler on one could not have been honoured either way. */
-   /* Slots holding a depth texture that the shader declared as an ordinary
-    * float one. GL allows sampler2D on a depth texture -- that is how a depth
-    * buffer is read back through a shader -- and NIR hands this driver
-    * texture_2d<f32> for it, where WGSL would want texture_depth_2d. WebGPU
-    * also allows a depth-format view to be bound as `unfilterable-float`,
-    * which texture_2d<f32> accepts, provided the sampler is non-filtering --
-    * and a depth texture is not filterable in WebGPU at all, so a filtering
-    * sampler on one could not have been honoured either way. */
-/* Slots holding a depth texture that the shader declared as an ordinary
-    * float one. GL allows sampler2D on a depth texture -- that is how a depth
-    * buffer is read back through a shader -- and NIR hands this driver
-    * texture_2d<f32> for it, where WGSL would want texture_depth_2d. WebGPU
-    * also allows a depth-format view to be bound as `unfilterable-float`,
-    * which texture_2d<f32> accepts, provided the sampler is non-filtering --
-    * and a depth texture is not filterable in WebGPU at all, so a filtering
-    * sampler on one could not have been honoured either way. */
-   /* Slots holding a depth texture that the shader declared as an ordinary
-    * float one. GL allows sampler2D on a depth texture -- that is how a depth
-    * buffer is read back through a shader -- and NIR hands this driver
-    * texture_2d<f32> for it, where WGSL would want texture_depth_2d. WebGPU
-    * also allows a depth-format view to be bound as `unfilterable-float`,
-    * which texture_2d<f32> accepts, provided the sampler is non-filtering --
-    * and a depth texture is not filterable in WebGPU at all, so a filtering
-    * sampler on one could not have been honoured either way. */
-/* Slots holding a depth texture that the shader declared as an ordinary
-    * float one. GL allows sampler2D on a depth texture -- that is how a depth
-    * buffer is read back through a shader -- and NIR hands this driver
-    * texture_2d<f32> for it, where WGSL would want texture_depth_2d. WebGPU
-    * also allows a depth-format view to be bound as `unfilterable-float`,
-    * which texture_2d<f32> accepts, provided the sampler is non-filtering --
-    * and a depth texture is not filterable in WebGPU at all, so a filtering
-    * sampler on one could not have been honoured either way. */
-   /* Slots holding a depth texture that the shader declared as an ordinary
-    * float one. GL allows sampler2D on a depth texture -- that is how a depth
-    * buffer is read back through a shader -- and NIR hands this driver
-    * texture_2d<f32> for it, where WGSL would want texture_depth_2d. WebGPU
-    * also allows a depth-format view to be bound as `unfilterable-float`,
-    * which texture_2d<f32> accepts, provided the sampler is non-filtering --
-    * and a depth texture is not filterable in WebGPU at all, so a filtering
-    * sampler on one could not have been honoured either way. */
 
+   /* Slots holding a depth texture that the shader declared as an ordinary
+    * float one. GL allows sampler2D on a depth texture -- that is how a depth
+    * buffer is read back through a shader -- and NIR hands this driver
+    * texture_2d<f32> for it, where WGSL would want texture_depth_2d. WebGPU
+    * takes a depth-format view bound as `unfilterable-float`, which
+    * texture_2d<f32> accepts, provided the sampler is non-filtering; a
+    * filtering one is replaced by its nearest twin rather than declining the
+    * draw. */
    uint32_t depth_as_float = 0;
    /* Per draw: a snapshot bound for one draw must not leak into the next. */
    memset(ctx->feedback_view, 0, sizeof(ctx->feedback_view));
@@ -15571,15 +15609,47 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          if (multisampled && actual_type == WGPUTextureSampleType_Float)
             actual_type = WGPUTextureSampleType_UnfilterableFloat;
          const struct gex_wgpu_sampler *sampler = ctx->samplers[slot];
+         /* An unbound sampler counts: st/mesa leaves the slot's sampler
+          * state alone for a texture it only reads through a display path,
+          * and the driver serves that with a default sampler. Requiring a
+          * bound one here was what still declined `shadowtex`'s depth
+          * texture display -- compare=-1 filter=-1 in the message, meaning
+          * there was no sampler rather than a wrong one. */
          if (actual_type == WGPUTextureSampleType_Depth &&
              ctx->fs->texture_sample_types[i] == WGPUTextureSampleType_Float &&
-             sampler &&
-             sampler->state.compare_mode != PIPE_TEX_COMPARE_R_TO_TEXTURE &&
-             sampler->state.min_img_filter == PIPE_TEX_FILTER_NEAREST &&
-             sampler->state.mag_img_filter == PIPE_TEX_FILTER_NEAREST &&
-             sampler->state.min_mip_filter != PIPE_TEX_MIPFILTER_LINEAR) {
+             (!sampler ||
+              sampler->state.compare_mode != PIPE_TEX_COMPARE_R_TO_TEXTURE)) {
             actual_type = WGPUTextureSampleType_Float;
             depth_as_float |= 1u << slot;
+            /* Filtering is dropped rather than the draw.
+             *
+             * The pair WebGPU takes for a shader that declared float against
+             * a depth view is unfilterable-float with a non-filtering
+             * sampler, so a linear filter cannot be honoured -- and this used
+             * to require a nearest sampler and decline the draw otherwise,
+             * which is a black frame with a line in the log. `shadowtex`'s
+             * "show depth texture image" is that draw, and reading a depth
+             * attachment as an ordinary texture (a depth prepass feeding
+             * SSAO, soft particles, depth of field) is not a rare thing to
+             * do. A nearest-filtered depth read is a small error; a missing
+             * one is the whole surface.
+             *
+             * Honouring it properly means declaring the texture as
+             * texture_depth_2d in the module -- a variant, since it depends
+             * on the bound view -- and having the emitter sample a depth
+             * image without comparison. */
+            if (sampler &&
+                (sampler->state.min_img_filter != PIPE_TEX_FILTER_NEAREST ||
+                 sampler->state.mag_img_filter != PIPE_TEX_FILTER_NEAREST ||
+                 sampler->state.min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR)) {
+               static bool said;
+               if (!said) {
+                  said = true;
+                  fprintf(stderr,
+                          "gex-wgpu: depth texture read as an ordinary one on "
+                          "slot %u; filtering dropped to nearest\n", slot);
+               }
+            }
          }
          GEX_BINDING_BAD(actual_type != ctx->fs->texture_sample_types[i],
                          "sample type differs from the shader's");
@@ -15656,10 +15726,29 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       static bool said;
       if (!said) {
          said = true;
-         fprintf(stderr, "gex-wgpu: draw declined (%s) slot=%u\n",
+         const struct gex_wgpu_sampler *bad_sampler =
+            binding_slot < GEX_WGPU_MAX_SAMPLERS
+               ? ctx->samplers[binding_slot] : NULL;
+         const struct pipe_sampler_view *bad_view =
+            binding_slot < GEX_WGPU_MAX_SAMPLERS
+               ? ctx->sampler_views[binding_slot] : NULL;
+         /* Which two things disagreed, not just that they did: the slot
+          * number alone leaves the next reader to guess whether the shader,
+          * the view or the sampler is the odd one out. */
+         fprintf(stderr,
+                 "gex-wgpu: draw declined (%s) slot=%u shader_type=%d "
+                 "view_format=%d compare=%d filter=%d/%d/%d\n",
                  missing_constant ? "a constant buffer is not bound"
                                   : binding_why ? binding_why : "binding",
-                 binding_slot);
+                 binding_slot,
+                 ctx->fs ? gex_wgpu_shader_sample_type_for_slot(ctx->fs,
+                                                                binding_slot)
+                         : -1,
+                 bad_view ? (int)bad_view->format : -1,
+                 bad_sampler ? (int)bad_sampler->state.compare_mode : -1,
+                 bad_sampler ? (int)bad_sampler->state.min_img_filter : -1,
+                 bad_sampler ? (int)bad_sampler->state.mag_img_filter : -1,
+                 bad_sampler ? (int)bad_sampler->state.min_mip_filter : -1);
       }
       return;
    }
@@ -15961,9 +16050,18 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const unsigned entry = ctx->fs->texture_count + i;
          entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[entry].binding = ctx->fs->sampler_bindings[i];
+         /* A slot whose depth view is being read as float declares a
+          * non-filtering sampler in the layout above, so the nearest twin is
+          * what may be bound to it. */
          entries[entry].sampler = ctx->samplers[slot]
-            ? ctx->samplers[slot]->sampler
-            : gex_wgpu_default_sampler(screen, ctx->fs->sampler_types[i]);
+            ? ((depth_as_float & (1u << slot)) &&
+               ctx->samplers[slot]->nonfiltering
+                  ? ctx->samplers[slot]->nonfiltering
+                  : ctx->samplers[slot]->sampler)
+            : gex_wgpu_default_sampler(
+                 screen, (depth_as_float & (1u << slot))
+                            ? WGPUSamplerBindingType_NonFiltering
+                            : ctx->fs->sampler_types[i]);
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[0];
