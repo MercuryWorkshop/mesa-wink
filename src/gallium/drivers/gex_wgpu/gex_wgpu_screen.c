@@ -432,6 +432,37 @@ struct gex_wgpu_context {
     * map renders each cascade into one layer of a depth array. */
    unsigned depth_level;
    unsigned depth_layer;
+   /* Set while a provoking-vertex rewrite is re-issuing its draw, so the
+    * rewrite does not see its own output and recurse. */
+   bool provoking_rewritten;
+   /* Rewritten index lists, kept because the rewrite is per-draw and the
+    * source almost never changes: glxgears draws three gears from display
+    * lists every frame with glShadeModel(GL_FLAT), and rewriting them each
+    * time cost 28% of its frame rate -- mostly the index-buffer map, which
+    * breaks the pending batch whenever a recorded draw already read that
+    * buffer.
+    *
+    * Sixty-four slots, round-robin, because the working set is one entry per
+    * *draw*, not per buffer: a display list replays as many draws over one
+    * index buffer, each with its own start and count, and glxgears alone
+    * issues around eighteen a frame. Eight slots thrashed completely and
+    * recovered none of the cost. */
+   struct gex_wgpu_provoking_cache {
+      struct pipe_resource *source;
+      const void *user;
+      uint64_t source_writes;
+      unsigned start, count, index_size, mode, restart_index;
+      bool primitive_restart;
+      int index_bias;
+      enum mesa_prim out_prim;
+      unsigned out_index_size, out_nr;
+      void *indices;
+      /* Compared first, so a miss costs one integer compare rather than
+       * eleven. Sixty-four slots scanned per draw is otherwise most of what
+       * the cache was meant to save. */
+      uint32_t hash;
+   } provoking_cache[64];
+   unsigned provoking_next;
    /* glPolygonStipple's 32x32 pattern, and whether it is anything but all
     * ones. st/mesa sets it before every draw whether or not stippling is
     * enabled, so "not all ones" is the only useful signal here; whether it
@@ -764,6 +795,10 @@ struct gex_wgpu_rasterizer {
    unsigned fill_mode;
    /* Whether glPolygonStipple applies; the pattern itself is context state. */
    bool poly_stipple;
+   /* GL_FIRST_VERTEX_CONVENTION, which WGSL's flat interpolation implements
+    * directly. False is GL's default and needs the index rewrite -- see
+    * gex_wgpu_draw_provoking_last. */
+   bool flatshade_first;
 };
 
 /* Which varyings travel between two stages through a buffer, and in what
@@ -4694,8 +4729,8 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
     * fixes: a point is one pixel, so "rasterize points as quads" and the
     * sprite coordinate origin describe something that cannot happen, and the
     * line rules are not selectable. flatshade is fixed-function flat shading,
-    * which st no longer asks for (caps->flatshade is false, so it lowers it
-    * in NIR) and which only u_blitter still sets. multisample is a no-op on a
+    * which st lowers in NIR because caps->flatshade is false, so what arrives
+    * here is only u_blitter's. multisample is a no-op on a
     * single-sample framebuffer, which is all this driver creates.
     *
     * Everything not listed -- polygon mode, polygon offset, smoothing,
@@ -4853,6 +4888,7 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
          ? state->fill_front : PIPE_POLYGON_MODE_FILL;
       rasterizer->sprite_coord_enable = state->sprite_coord_enable;
       rasterizer->poly_stipple = state->poly_stipple_enable;
+      rasterizer->flatshade_first = state->flatshade_first;
       rasterizer->cull_face = state->cull_face;
       rasterizer->discard = state->rasterizer_discard;
       rasterizer->unclipped_depth = !state->depth_clip_near;
@@ -14205,6 +14241,224 @@ gex_wgpu_draw_adjacency(struct pipe_context *pipe,
    return true;
 }
 
+/* Whether any of a shader's inputs is flat-interpolated, which is what makes
+ * the provoking vertex observable. */
+static bool
+gex_wgpu_shader_has_flat_varying(const struct gex_wgpu_shader *shader)
+{
+   for (unsigned i = 0; i < GEX_WGPU_MAX_VARYING_LOCATIONS; ++i)
+      if ((shader->varying_interp_mask & BITFIELD64_BIT(i)) &&
+          shader->varying_interp[i] == INTERP_MODE_FLAT)
+         return true;
+   return false;
+}
+
+/* GL's default provoking vertex, which WGSL cannot name.
+ *
+ * A flat-shaded primitive takes its value from one vertex, and GL's default
+ * convention is the *last* of the primitive. WGSL's @interpolate(flat) always
+ * takes the first -- `first` and `either` are the only qualifiers it has -- so
+ * the convention cannot be declared, and a flat triangle came out with the
+ * wrong corner's colour: red where llvmpipe draws blue.
+ *
+ * The indices are rewritten instead, so that the vertex GL calls provoking
+ * comes first. Mesa's u_index_translator and u_index_generator exist for
+ * exactly this -- they take the API's provoking vertex and the hardware's as
+ * separate arguments -- and using them rather than rotating triples by hand is
+ * what makes strips and fans right, where the provoking vertex is a different
+ * offset per primitive and the winding alternates.
+ *
+ * Only for a draw that has a flat varying to get wrong. A shader with none is
+ * unaffected and pays nothing, which is nearly all of them: st/mesa sets flat
+ * interpolation from glShadeModel(GL_FLAT) (through nir_lower_flatshade) or
+ * from an explicit `flat` qualifier, and both are uncommon.
+ */
+static bool
+gex_wgpu_draw_provoking_last(struct pipe_context *pipe,
+                             const struct pipe_draw_info *info,
+                             unsigned drawid_offset,
+                             const struct pipe_draw_start_count_bias *draw)
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   /* A cache hit skips the whole rewrite, and with it the index-buffer map
+    * that is most of its cost. Keyed on everything the output depends on,
+    * including how many bytes have ever been written to the source buffer --
+    * a rewritten list is only valid for the bytes it was built from. */
+   const void *key_user = info->has_user_indices ? info->index.user : NULL;
+   struct pipe_resource *key_source =
+      info->index_size && !info->has_user_indices ? info->index.resource : NULL;
+   const uint64_t key_writes =
+      key_source ? gex_resource(key_source)->bytes_written : 0;
+   uint32_t key_hash = _mesa_hash_pointer(key_source);
+   key_hash = _mesa_hash_data_with_seed(&key_user, sizeof(key_user), key_hash);
+   const uint32_t key_scalars[6] = {
+      draw->start, draw->count, info->index_size, info->mode,
+      info->restart_index, (uint32_t)draw->index_bias,
+   };
+   key_hash = _mesa_hash_data_with_seed(key_scalars, sizeof(key_scalars),
+                                        key_hash);
+   key_hash = _mesa_hash_data_with_seed(&key_writes, sizeof(key_writes),
+                                        key_hash);
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->provoking_cache); ++i) {
+      const struct gex_wgpu_provoking_cache *hit = &ctx->provoking_cache[i];
+      if (hit->hash != key_hash)
+         continue;
+      if (!hit->indices || hit->source != key_source || hit->user != key_user ||
+          hit->source_writes != key_writes || hit->start != draw->start ||
+          hit->count != draw->count || hit->index_size != info->index_size ||
+          hit->mode != info->mode ||
+          hit->restart_index != info->restart_index ||
+          hit->primitive_restart != info->primitive_restart ||
+          hit->index_bias != draw->index_bias)
+         continue;
+      struct pipe_draw_info cached = *info;
+      cached.mode = hit->out_prim;
+      cached.index_size = hit->out_index_size;
+      cached.has_user_indices = true;
+      cached.index.user = hit->indices;
+      cached.primitive_restart = false;
+      cached.index_bounds_valid = false;
+      cached.min_index = 0;
+      cached.max_index = ~0u;
+      struct pipe_draw_start_count_bias cached_draw = *draw;
+      cached_draw.start = 0;
+      cached_draw.count = hit->out_nr;
+      cached_draw.index_bias = 0;
+      ctx->provoking_rewritten = true;
+      gex_wgpu_draw_vbo(pipe, &cached, drawid_offset, NULL, &cached_draw, 1);
+      ctx->provoking_rewritten = false;
+      return true;
+   }
+
+   /* What WebGPU rasterises directly. Anything else the translator converts,
+    * which is work the driver's own topology rewrite would otherwise do. */
+   const unsigned hw_mask = (1u << MESA_PRIM_POINTS) |
+                            (1u << MESA_PRIM_LINES) |
+                            (1u << MESA_PRIM_LINE_STRIP) |
+                            (1u << MESA_PRIM_TRIANGLES) |
+                            (1u << MESA_PRIM_TRIANGLE_STRIP);
+   enum mesa_prim out_prim = info->mode;
+   unsigned out_index_size = 0, out_nr = 0;
+   u_translate_func translate = NULL;
+   u_generate_func generate = NULL;
+   const void *src = NULL;
+   struct pipe_transfer *transfer = NULL;
+   unsigned start = draw->start;
+
+   if (info->index_size) {
+      if (info->index_size != 1 && info->index_size != 2 &&
+          info->index_size != 4)
+         return false;
+      if (u_index_translator(hw_mask, info->mode, info->index_size,
+                             draw->count, PV_LAST, PV_FIRST,
+                             info->primitive_restart ? PR_ENABLE : PR_DISABLE,
+                             &out_prim, &out_index_size, &out_nr,
+                             &translate) == U_TRANSLATE_ERROR)
+         return false;
+      if (info->has_user_indices) {
+         src = info->index.user;
+         if (!src)
+            return false;
+      } else {
+         src = pipe_buffer_map_range(pipe, info->index.resource,
+                                     start * info->index_size,
+                                     draw->count * info->index_size,
+                                     PIPE_MAP_READ, &transfer);
+         if (!src)
+            return false;
+         start = 0;
+      }
+   } else if (u_index_generator(hw_mask, info->mode, start, draw->count,
+                                PV_LAST, PV_FIRST, &out_prim, &out_index_size,
+                                &out_nr, &generate) == U_TRANSLATE_ERROR) {
+      return false;
+   }
+
+   if (!out_nr) {
+      if (transfer)
+         pipe_buffer_unmap(pipe, transfer);
+      return true;
+   }
+   if (out_index_size != 2 && out_index_size != 4) {
+      if (transfer)
+         pipe_buffer_unmap(pipe, transfer);
+      return false;
+   }
+   void *out = MALLOC((size_t)out_nr * out_index_size);
+   if (!out) {
+      if (transfer)
+         pipe_buffer_unmap(pipe, transfer);
+      return false;
+   }
+   if (translate)
+      translate(src, start, draw->count, out_nr, info->restart_index, out);
+   else
+      generate(start, out_nr, out);
+   if (transfer)
+      pipe_buffer_unmap(pipe, transfer);
+
+   struct pipe_draw_info rewritten = *info;
+   rewritten.mode = out_prim;
+   rewritten.index_size = out_index_size;
+   rewritten.has_user_indices = true;
+   rewritten.index.user = out;
+   rewritten.primitive_restart = false;
+   rewritten.index_bounds_valid = false;
+   rewritten.min_index = 0;
+   rewritten.max_index = ~0u;
+   struct pipe_draw_start_count_bias rewritten_draw = *draw;
+   rewritten_draw.start = 0;
+   rewritten_draw.count = out_nr;
+   /* The base vertex folds into the indices, for the reasons the unfilled
+    * rewrite gives: a non-indexed draw's stale index_bias would start
+    * applying, and a real one would otherwise be lost. */
+   if (info->index_size && draw->index_bias != 0) {
+      uint32_t *wide = MALLOC((size_t)out_nr * 4);
+      if (!wide) {
+         FREE(out);
+         return false;
+      }
+      for (unsigned i = 0; i < out_nr; ++i) {
+         const uint32_t index = out_index_size == 2 ? ((const uint16_t *)out)[i]
+                                                    : ((const uint32_t *)out)[i];
+         wide[i] = index + (uint32_t)draw->index_bias;
+      }
+      FREE(out);
+      out = wide;
+      rewritten.index_size = 4;
+      rewritten.index.user = out;
+   }
+   rewritten_draw.index_bias = 0;
+   /* The recursion has to be stopped explicitly: the rewritten draw is still
+    * flat-shaded, so the test that sent it here would send it here again. */
+   ctx->provoking_rewritten = true;
+   gex_wgpu_draw_vbo(pipe, &rewritten, drawid_offset, NULL, &rewritten_draw, 1);
+   ctx->provoking_rewritten = false;
+
+   /* Kept for the next draw of the same list rather than freed. */
+   struct gex_wgpu_provoking_cache *slot =
+      &ctx->provoking_cache[ctx->provoking_next];
+   ctx->provoking_next =
+      (ctx->provoking_next + 1) % ARRAY_SIZE(ctx->provoking_cache);
+   FREE(slot->indices);
+   pipe_resource_reference(&slot->source, key_source);
+   slot->user = key_user;
+   slot->source_writes = key_writes;
+   slot->start = draw->start;
+   slot->count = draw->count;
+   slot->index_size = info->index_size;
+   slot->mode = info->mode;
+   slot->restart_index = info->restart_index;
+   slot->primitive_restart = info->primitive_restart;
+   slot->index_bias = draw->index_bias;
+   slot->out_prim = rewritten.mode;
+   slot->out_index_size = rewritten.index_size;
+   slot->out_nr = out_nr;
+   slot->indices = out;
+   slot->hash = key_hash;
+   return true;
+}
+
 /* glPolygonMode(GL_LINE) and (GL_POINT), which WebGPU has no equivalent for:
  * the polygon is rewritten into the lines or points it would be drawn as.
  *
@@ -14486,6 +14740,22 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       FREE(wide);
       return;
    }
+
+   /* GL's default provoking vertex is the last of the primitive and WGSL's
+    * flat interpolation always takes the first, so the indices are rewritten
+    * to put the one GL calls provoking first. Only when the fragment shader
+    * has a flat varying at all -- otherwise there is nothing to get wrong and
+    * nothing to pay for. Before the unfilled rewrite and the topology
+    * rewrite, both of which come back through here. */
+   static int no_pv = -1;
+   if (no_pv < 0)
+      no_pv = getenv("GEX_WGPU_NO_PROVOKING") ? 1 : 0;
+   if (!no_pv && !ctx->failed && !ctx->provoking_rewritten && info && draws &&
+       num_draws == 1 && !indirect && ctx->fs && ctx->rasterizer &&
+       !ctx->rasterizer->flatshade_first &&
+       gex_wgpu_shader_has_flat_varying(ctx->fs) &&
+       gex_wgpu_draw_provoking_last(pipe, info, drawid_offset, &draws[0]))
+      return;
 
    /* An unfilled polygon becomes the lines or points it would be drawn as,
     * before the topology rewrite below, so that a quad's four edges are four
@@ -16826,6 +17096,11 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    pipe_resource_reference(&ctx->uploaded_indices, NULL);
       pipe_resource_reference(&ctx->shader_buffers[i].buffer, NULL);
    }
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->provoking_cache); ++i) {
+      FREE(ctx->provoking_cache[i].indices);
+      ctx->provoking_cache[i].indices = NULL;
+      pipe_resource_reference(&ctx->provoking_cache[i].source, NULL);
+   }
    if (ctx->blitter)
       util_blitter_destroy(ctx->blitter);
    if (ctx->primconvert)
@@ -17196,9 +17471,20 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * for both, and create_rasterizer_state refuses a state that splits them. */
    caps->depth_clip_disable = screen->depth_clip_control;
    caps->depth_clip_disable_separate = false;
-   /* flatshade is left at u_screen's true: st never asks for it in a core
-    * profile, and u_blitter's is accepted and ignored by
-    * create_rasterizer_state rather than refusing the whole state.
+   /* flatshade is off, so st lowers glShadeModel(GL_FLAT) into the shader
+    * with nir_lower_flatshade -- which sets INTERP_MODE_FLAT on the varyings,
+    * and this driver already emits WGSL's @interpolate(flat) and honours the
+    * provoking vertex through flatshade_first.
+    *
+    * It was left at u_screen's true on the reasoning that st never asks for
+    * it in a core profile. True, and beside the point: the profile here is a
+    * compatibility one, glShadeModel is real in it, and
+    * create_rasterizer_state *accepted and ignored* the bit -- so every
+    * flat-shaded triangle came out smooth. `dlist-tri-flat-tri` drew a
+    * gradient where llvmpipe draws flat red, and nothing refused, crashed or
+    * logged anything; the llvmpipe pixel comparison is what found it. A
+    * comment three thousand lines up already claimed the cap was false, which
+    * is how the inconsistency survived.
     *
     * two_sided_color is off, so st lowers two-sided lighting into the
     * fragment shader with nir_lower_two_sided_color and stops setting
@@ -17208,6 +17494,7 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * on meant four compatibility-profile programs (morph3d, geartrain,
     * projtex, long-fixed-func) had every rasterizer state refused, losing
     * culling and the scissor along with the lighting. */
+   caps->flatshade = false;
    caps->two_sided_color = false;
    /* User clip planes are lowered into the vertex shader as clip distances --
     * see the rasterizer state's clip_plane_enable. Zero keeps
