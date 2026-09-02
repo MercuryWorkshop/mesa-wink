@@ -517,7 +517,18 @@ struct gex_wgpu_context {
     * dawn::native::vulkan::Buffer::EnsureDataInitialized, a few seconds after
     * a world loaded. Holding a reference until the batch is submitted is both
     * the fix and exactly what the batch means. */
-   struct pipe_resource *batch_touched[256];
+   /* Every resource the pending batch reads, held by reference so nothing it
+    * names can be freed before the submit, and consulted to decide whether a
+    * write has to wait for that submit.
+    *
+    * Sized to cover a full batch rather than to be small. At 256 it
+    * overflowed constantly -- a batch runs to GEX_WGPU_MAX_BATCHED_DRAWS
+    * draws, each naming a framebuffer, an index buffer, up to eight vertex
+    * buffers, two stages' uniform buffers and its textures -- and overflow
+    * has to be treated as "everything conflicts", which broke the batch on
+    * every write and halved Minecraft's frame rate. Overflow is now the
+    * backstop it was meant to be rather than the common case. */
+   struct pipe_resource *batch_touched[4096];
    unsigned batch_touched_count;
    bool batch_touched_overflowed;
    /* Occlusion queries. WebGPU counts into a query set slot across a render
@@ -5117,8 +5128,16 @@ static bool
 gex_wgpu_batch_conflicts(struct gex_wgpu_context *ctx,
                          struct pipe_resource *resource)
 {
+   /* Once the touched-resource array is full, gex_wgpu_batch_touch returns
+    * without setting in_batch -- so a resource the batch really does read
+    * reports no conflict, and a write to it is allowed to reach the queue
+    * ahead of the draws that read it. The overflow flag was recorded and
+    * never consulted, which made this a bug that only appears in frames busy
+    * enough to overflow, and silently produces wrong pixels rather than an
+    * error. Overflow has to mean "assume everything conflicts". */
    return ctx->pending_encoder &&
-          (!resource || gex_resource(resource)->in_batch);
+          (!resource || ctx->batch_touched_overflowed ||
+           gex_resource(resource)->in_batch);
 }
 
 /* The same question for a transfer, which can answer it itself.
@@ -5133,8 +5152,36 @@ static bool
 gex_wgpu_batch_conflicts_usage(struct gex_wgpu_context *ctx,
                                struct pipe_resource *resource, unsigned usage)
 {
+   /* Kept: for u_upload_mgr's appends the promise really is about disjoint
+    * bytes, and this check can only see whole resources, so without it the
+    * batch breaks on every streamed upload -- 771623 times in a Minecraft
+    * run. The place that must not honour it is the write-map upload at
+    * unmap, which replaces the whole mapped range rather than appending to
+    * an unused part of it, and that path calls gex_wgpu_batch_conflicts
+    * directly.
+    *
+    * The note below is why that distinction matters. */
    if (usage & PIPE_MAP_UNSYNCHRONIZED)
       return false;
+   /* PIPE_MAP_UNSYNCHRONIZED skipping this check is unsound in general.
+    *
+    * The flag is the application promising it is not overwriting bytes that
+    * draws it has *already issued* still need -- so it may be served without
+    * waiting for the GPU. It says nothing about draws this driver has
+    * recorded into a pending batch and not yet submitted: from the
+    * application's side those were issued and are finished with, and the
+    * deferral is entirely this driver's own. Letting an unsynchronized write
+    * reach the queue ahead of them made it visible, because
+    * wgpuQueueWriteBuffer is ordered against the submit that follows it.
+    *
+    * SuperTuxKart rewrites one 180 KB vertex buffer per object --
+    * `WRITE DISCARD_WHOLE UNSYNC`, the buffer-renaming idiom -- and draws
+    * after each rewrite. With the batch holding those draws, every one of
+    * them read the last object's vertices, so the whole scene collapsed and
+    * only the skybox and the HUD, which are not rewritten, survived.
+    *
+    * Honouring the check costs nothing where the flag is used as intended:
+    * if no pending draw reads the resource, there is no conflict to find. */
    return gex_wgpu_batch_conflicts(ctx, resource);
 }
 
@@ -6160,8 +6207,18 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
     *
     * Index and constant buffers are excluded because the draw path reads an
     * index buffer's shadow directly, and both are small. */
+   /* GEX_WGPU_UBO_SHADOW=1 keeps a CPU copy of every constant buffer, purely
+    * so the per-shader dump can print the matrices a vertex stage actually
+    * read. The fast path below deliberately keeps no copy, which is right for
+    * shipping and leaves the one question worth asking about a scene that
+    * transforms itself out of the frame unanswerable. Off by default: the
+    * copies are the memory this path exists to recover. */
+   static int ubo_shadow = -1;
+   if (ubo_shadow < 0)
+      ubo_shadow = getenv("GEX_WGPU_UBO_SHADOW") ? 1 : 0;
    const bool subdata_direct =
       size && !gex->shadow && data && !(usage & PIPE_MAP_READ) &&
+      !(ubo_shadow && (resource->bind & PIPE_BIND_CONSTANT_BUFFER)) &&
       (offset & 3u) == 0 && (size & 3u) == 0 &&
       /* Index buffers only: the draw path scans an index buffer's shadow to
        * bound its vertex fetch. Constant buffers reach the GPU through
@@ -8141,7 +8198,59 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
     * path reads an index buffer's shadow directly to bound its vertex fetch,
     * and both are small. An unaligned map keeps it too -- there were ten of
     * those in 1.3 million. */
+   /* GEX_WGPU_NO_STAGED_MAP=1 sends every write map down the shadow path
+    * instead. Slower and far heavier on memory -- which is the whole reason
+    * the staged path exists -- but it is the only way to ask whether the
+    * staged upload itself is losing bytes, since a staged buffer keeps no
+    * copy for anything to inspect afterwards. */
+   static int no_staged = -1;
+   if (no_staged < 0)
+      no_staged = getenv("GEX_WGPU_NO_STAGED_MAP") ? 1 : 0;
+   /* The staged block starts out zeroed and the whole mapped range is
+    * uploaded out of it at unmap, so this path is only correct when the
+    * caller has undertaken to write every byte of that range -- which in
+    * Gallium is what the discard flags mean.
+    *
+    * Without that check a plain PIPE_MAP_WRITE, which promises nothing and
+    * may write as little as it likes, had the bytes it left alone uploaded
+    * as zeros on top of the buffer's existing contents. SuperTuxKart maps a
+    * mesh buffer and rewrites part of it: the rest became zeros, its
+    * positions collapsed onto the origin, and the scene rasterised nothing
+    * while the skybox and the HUD -- which do not take this path -- still
+    * landed. Everything in the frame looked correct at the API level, which
+    * is what made it expensive to find: the draws arrive, every attribute is
+    * supplied, the matrices are right, and there is no error anywhere.
+    *
+    * u_upload_mgr and the streaming paths that this optimisation was written
+    * for all pass a discard flag, so they keep it. */
+   /* DISCARD_RANGE only, deliberately not DISCARD_WHOLE_RESOURCE.
+    *
+    * DISCARD_RANGE is the streaming pattern this path was written for:
+    * u_upload_mgr hands out a fresh region of a big buffer and fills it, so a
+    * fresh block to fill is exactly the right thing to give it.
+    *
+    * DISCARD_WHOLE_RESOURCE is a different request. It is how an application
+    * asks for buffer *renaming* -- "I want this buffer again, do not make me
+    * wait for what is still reading the old one" -- and a driver honours it
+    * by handing over a new allocation while the old one lives on for the work
+    * that still reads it. This driver does not rename, and serving the map
+    * from a staged block instead is where the two diverge: SuperTuxKart
+    * rewrites one 180 KB vertex buffer this way per object and its whole
+    * scene fails to rasterise, while the skybox and HUD, which are not
+    * rewritten, still land.
+    *
+    * The block's *contents* are not the problem -- instrumented against the
+    * buffer's previous bytes, the caller leaves nothing behind that it needed
+    * (0 of 180640) -- so the mechanism is still not understood, and this is
+    * scoped to the request whose semantics this path was never written for
+    * rather than presented as a diagnosis. Measured either way: Minecraft's
+    * crowd scene is 66-70 fps with staging and 71-76 without, so restricting
+    * it costs nothing there. GEX_WGPU_NO_STAGED_MAP=1 disables it entirely,
+    * which is how this was found. */
+   const bool overwrites_whole_range =
+      (usage & PIPE_MAP_DISCARD_RANGE) != 0;
    const bool staged =
+      !no_staged && overwrites_whole_range &&
       !gex->shadow && !(usage & PIPE_MAP_READ) &&
       !(resource->bind & PIPE_BIND_INDEX_BUFFER) &&
       ((uint32_t)box->x & 3u) == 0 && ((uint32_t)box->width & 3u) == 0;
@@ -8155,6 +8264,31 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
          return NULL;
       }
       transfer->staged_write = true;
+      if (getenv("GEX_WGPU_MAP_FLAGS")) {
+         /* Which usage flags actually reach this path, once per distinct
+          * combination. Reasoning about Gallium's map contract from the
+          * outside is how two wrong fixes got written; this says what the
+          * application really asks for. */
+         static unsigned seen[32];
+         static unsigned seen_count;
+         bool fresh = true;
+         for (unsigned i = 0; i < seen_count; ++i)
+            if (seen[i] == usage) { fresh = false; break; }
+         if (fresh && seen_count < 32) {
+            seen[seen_count++] = usage;
+            fprintf(stderr,
+                    "gex-wgpu: staged map usage=0x%x%s%s%s%s%s%s bind=0x%x "
+                    "range=%d+%d width0=%u\n", usage,
+                    (usage & PIPE_MAP_READ) ? " READ" : "",
+                    (usage & PIPE_MAP_WRITE) ? " WRITE" : "",
+                    (usage & PIPE_MAP_DISCARD_RANGE) ? " DISCARD_RANGE" : "",
+                    (usage & PIPE_MAP_DISCARD_WHOLE_RESOURCE)
+                       ? " DISCARD_WHOLE" : "",
+                    (usage & PIPE_MAP_FLUSH_EXPLICIT) ? " FLUSH_EXPLICIT" : "",
+                    (usage & PIPE_MAP_UNSYNCHRONIZED) ? " UNSYNC" : "",
+                    resource->bind, box->x, box->width, resource->width0);
+         }
+      }
       ++gex_wgpu_maps_staged;
       ++gex_wgpu_buffer_maps;
       ++gex_wgpu_map_usage_total[usage % GEX_WGPU_MAP_USAGE_BUCKETS];
@@ -8292,6 +8426,25 @@ gex_wgpu_buffer_unmap(struct pipe_context *pipe,
     * range again here would be redundant, and for an unsynchronized map it
     * would also write back bytes another map may since have changed.
     */
+   if (getenv("GEX_WGPU_MAP_FLAGS") && gex_transfer->staged_write &&
+       gex_transfer->data && transfer->box.width > 0) {
+      /* How much of the block the caller actually wrote. The staged path
+       * uploads the whole mapped range out of a zeroed block, so anything it
+       * left alone is uploaded as zeros -- and whether that matters is a
+       * question about the caller, not about the contract. */
+      const uint8_t *b = gex_transfer->data;
+      unsigned nonzero = 0;
+      unsigned last = 0;
+      for (unsigned i = 0; i < (unsigned)transfer->box.width; ++i)
+         if (b[i]) { ++nonzero; last = i; }
+      static unsigned said;
+      if (said++ < 4)
+         fprintf(stderr,
+                 "gex-wgpu: staged unmap width=%d nonzero=%u (%.1f%%) "
+                 "last_written=%u\n",
+                 transfer->box.width, nonzero,
+                 100.0 * nonzero / (double)transfer->box.width, last);
+   }
    if (!ctx->failed && gex_transfer->staged_write &&
        !(transfer->usage & PIPE_MAP_FLUSH_EXPLICIT) && gex->buffer &&
        transfer->box.width > 0) {
@@ -13993,10 +14146,23 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                   continue;
                }
                const struct gex_wgpu_resource *r = gex_resource(pcb->buffer);
-               if (!r->shadow) {
+               /* A slot fed from a user pointer lives in the constant ring,
+                * whose resource has no shadow because the bytes are still in
+                * the ring's own staging copy -- which is the authority for
+                * what the next submit will write. Read it from there, or the
+                * default uniform block, which is where st/mesa puts every
+                * plain `uniform`, is the one thing the dump cannot show. */
+               const uint8_t *bytes = r->shadow;
+               unsigned base = pcb->buffer_offset;
+               if (!bytes && pcb->buffer == ctx->constant_ring &&
+                   ctx->constant_staging) {
+                  bytes = ctx->constant_staging;
+               }
+               if (!bytes) {
                   fprintf(stderr, "gex-wgpu:   vs cb%u no shadow\n", cb);
                   continue;
                }
+
                /* Four vec4 rows at a time, so several matrices are legible
                 * in sequence rather than one line of 146 numbers. */
                /* Out to byte 384: the shader reads its transform from
@@ -14009,8 +14175,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                for (unsigned f = 0; f < n; f += 4) {
                   float x[4] = {0, 0, 0, 0};
                   for (unsigned c = 0; c < 4 && f + c < n; ++c)
-                     memcpy(&x[c], r->shadow + pcb->buffer_offset + (f + c) * 4,
-                            4);
+                     memcpy(&x[c], bytes + base + (f + c) * 4, 4);
                   fprintf(stderr,
                           "gex-wgpu:     [%3u] %10.3f %10.3f %10.3f %10.3f\n",
                           f * 4, x[0], x[1], x[2], x[3]);
