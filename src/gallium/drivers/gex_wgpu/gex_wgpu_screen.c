@@ -8352,11 +8352,18 @@ gex_wgpu_set_polygon_stipple(struct pipe_context *pipe,
 static void
 gex_wgpu_set_min_samples(struct pipe_context *pipe, unsigned min_samples)
 {
-   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
-   /* Single-sample framebuffers only, so one sample per pixel is the only
-    * rate that exists. */
-   if (!ctx->failed && min_samples > 1)
-      gex_fail(ctx);
+   /* Nothing to do. WebGPU decides the shading rate from the shader, not from
+    * the pipeline: a fragment shader that reads @builtin(sample_index) is
+    * invoked per sample, and one that does not is invoked per fragment. So
+    * the rate GL asks for here is either already in force or is being asked
+    * for at a fraction, and GL explicitly permits rounding a fraction up.
+    *
+    * This used to latch the context for any rate above one, on the grounds
+    * that framebuffers were single-sample. They have not been for a while --
+    * 4x is supported and resolved -- so the refusal was outliving its
+    * reason. */
+   (void)pipe;
+   (void)min_samples;
 }
 
 static void
@@ -15079,6 +15086,12 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * ARB_gpu_shader_fp64, an application writes a double, and the draw dies
     * on `assert(softfp64 != NULL)` inside nir_lower_double_ops instead of
     * failing to compile. Measured, not guessed. */
+   /* ARB_sample_shading. The rate is the shader's business in WebGPU (see
+    * gex_wgpu_set_min_samples), gl_SampleID and gl_SampleMask reach WGSL as
+    * @builtin(sample_index) and @builtin(sample_mask) through the emitter's
+    * existing SpvBuiltInSampleId path, and 4x multisample targets already
+    * work. */
+   caps->sample_shading = true;
    caps->glsl_feature_level = 330;
    caps->glsl_feature_level_compatibility = 330;
 
