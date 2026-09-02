@@ -745,6 +745,32 @@ virgl_vtest_resource_cache_entry_release(struct virgl_resource_cache_entry *entr
    virgl_hw_res_destroy(vtws, res);
 }
 
+/* Export a resource by the only name this transport has for it: the handle
+ * the renderer was told to create it under.
+ *
+ * The vtest winsys left this hook null, which is right when the renderer is
+ * another process and the only sharable thing would be a dmabuf it has no
+ * way to send. It is wrong when the renderer is in this address space: an
+ * embedder that wants a finished frame has to name the resource, because the
+ * renderer's current context follows whichever connection submitted last and
+ * "whatever framebuffer is bound" is then the wrong client's picture as often
+ * as not.
+ *
+ * `virgl_renderer_resource_get_info` takes exactly this handle. */
+static bool virgl_vtest_resource_get_handle(struct virgl_winsys *vws,
+                                            struct virgl_hw_res *res,
+                                            uint32_t stride,
+                                            struct winsys_handle *whandle)
+{
+   (void)vws;
+   if (!res || !whandle)
+      return false;
+   whandle->handle = res->res_handle;
+   whandle->stride = stride ? stride : res->stride;
+   whandle->offset = 0;
+   return true;
+}
+
 struct virgl_winsys *
 virgl_vtest_winsys_wrap(struct sw_winsys *sws)
 {
@@ -768,6 +794,8 @@ virgl_vtest_winsys_wrap(struct sw_winsys *sws)
 
    vtws->base.transfer_put = virgl_vtest_transfer_put;
    vtws->base.transfer_get = virgl_vtest_transfer_get;
+
+   vtws->base.resource_get_handle = virgl_vtest_resource_get_handle;
 
    vtws->base.resource_create = virgl_vtest_winsys_resource_cache_create;
    vtws->base.resource_reference = virgl_vtest_resource_reference;
