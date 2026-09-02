@@ -432,6 +432,12 @@ struct gex_wgpu_context {
     * map renders each cascade into one layer of a depth array. */
    unsigned depth_level;
    unsigned depth_layer;
+   /* glPolygonStipple's 32x32 pattern, and whether it is anything but all
+    * ones. st/mesa sets it before every draw whether or not stippling is
+    * enabled, so "not all ones" is the only useful signal here; whether it
+    * applies is the rasterizer's poly_stipple_enable. */
+   uint32_t poly_stipple[32];
+   bool poly_stipple_set;
    uint32_t fb_width;
    uint32_t fb_height;
    /* Samples per pixel of the bound framebuffer. WebGPU requires the render
@@ -713,6 +719,11 @@ struct gex_wgpu_shader_variant {
    unsigned coord_replace;
    /* Which fragment inputs this variant zeroed for want of a producer. */
    uint64_t unproduced;
+   /* The polygon stipple this variant baked in as immediates. Not the
+    * framebuffer height: the row index does not depend on it, see
+    * gex_wgpu_lower_poly_stipple. */
+   bool poly_stipple;
+   uint32_t stipple[32];
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
    struct gex_wgpu_shader_variant *next;
@@ -741,9 +752,18 @@ struct gex_wgpu_rasterizer {
    unsigned sprite_coord_enable;
    /* glPolygonMode, as PIPE_POLYGON_MODE_*. FILL is the ordinary case; LINE
     * and POINT are drawn by rewriting the primitive, since WebGPU has no
-    * polygon mode. Only one mode for both faces is carried: GL lets the two
-    * differ and nothing here could express that. */
+    * polygon mode.
+    *
+    * Only one mode for both faces is carried, and the two differing cannot be
+    * done here. The obvious plan -- two draws, each culling the other face --
+    * fails because culling does not apply to lines or points, in WebGPU or in
+    * GL: once the triangles have been rewritten there is no facing left to
+    * cull by. It would need each triangle's facing before rasterisation,
+    * which means the transformed positions, which means running the vertex
+    * shader on the CPU or in a compute pass that writes two index lists. */
    unsigned fill_mode;
+   /* Whether glPolygonStipple applies; the pattern itself is context state. */
+   bool poly_stipple;
 };
 
 /* Which varyings travel between two stages through a buffer, and in what
@@ -2374,6 +2394,67 @@ gex_wgpu_fit_varyings(nir_shader *nir, const uint8_t *want)
                                  nir_metadata_loop_analysis,
                               (void *)want);
    nir_fixup_deref_types(nir);
+}
+
+/* glPolygonStipple, as a discard against the pattern.
+ *
+ * WebGPU has no stipple, and Mesa's own nir_lower_pstipple_fs answers this by
+ * sampling a 32x32 alpha texture -- which would need a texture binding this
+ * driver decides at shader-create time rather than per variant. The pattern is
+ * 32 words, so it goes in as immediates instead and the variant is keyed on
+ * it; applications set it once, so that costs one variant.
+ *
+ * The row is `y & 31`, and that is worth stating because it is not obvious:
+ * GL anchors the pattern at the window origin, which is the bottom, while
+ * WebGPU's fragment position counts from the top. They agree here because
+ * this driver already flips the geometry in the vertex shader (`flip=1` in
+ * the draw log, from a positive viewport scale y), so WebGPU's row zero *is*
+ * GL's row zero and a raw position load is already a GL window coordinate.
+ * The framebuffer height therefore does not enter into it -- which was worth
+ * measuring rather than assuming, since `(height - 1 - y) & 31` and `y & 31`
+ * differ only by an inversion on a 32-tall target and by an inversion plus a
+ * shift on a 48-tall one. `tests/gl44-probe.sh polygon-stipple` checks both.
+ */
+static bool
+gex_wgpu_lower_poly_stipple(nir_shader *nir, const uint32_t pattern[32])
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl)
+      return false;
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   /* No interpolation qualifier. nir_draw_helpers' own load_frag_coord sets
+    * INTERP_MODE_NOPERSPECTIVE here, and on this path that is fatal: the
+    * position input becomes @builtin(position) in WGSL, and Tint answers
+    * "'@interpolate' can only be used with '@location'". The variable may
+    * also already exist because the shader reads gl_FragCoord itself, in
+    * which case changing it would be changing the shader's own declaration. */
+   nir_variable *pos = nir_get_variable_with_location(
+      nir, nir_var_shader_in, VARYING_SLOT_POS, glsl_vec4_type());
+   nir_def *coord = nir_load_var(&b, pos);
+   nir_def *x = nir_iand_imm(&b, nir_f2i32(&b, nir_channel(&b, coord, 0)), 31);
+   nir_def *y = nir_iand_imm(&b, nir_f2i32(&b, nir_channel(&b, coord, 1)), 31);
+   nir_def *row = y;
+   /* A balanced select tree over the 32 words: five levels, not a chain, so
+    * the shader compiler sees a bounded expression rather than a 32-deep
+    * dependency. */
+   nir_def *level[32];
+   for (unsigned i = 0; i < 32; ++i)
+      level[i] = nir_imm_int(&b, (int)pattern[i]);
+   for (unsigned width = 32, bit = 0; width > 1; width /= 2, ++bit) {
+      nir_def *pick = nir_i2b(&b, nir_iand_imm(&b, row, 1u << bit));
+      for (unsigned i = 0; i < width / 2; ++i)
+         level[i] = nir_bcsel(&b, pick, level[2 * i + 1], level[2 * i]);
+   }
+   /* Bit 31 is the leftmost column, as glPolygonStipple defines it and as
+    * util_pstipple_update_stipple_texture writes it. */
+   nir_def *bit = nir_iand_imm(
+      &b, nir_ushr(&b, level[0], nir_isub(&b, nir_imm_int(&b, 31), x)), 1);
+   nir_discard_if(&b, nir_ieq_imm(&b, bit, 0));
+   nir->info.fs.uses_discard = true;
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
 }
 
 /* GL's old-style shadow sampling, which returns a vec4.
@@ -4379,7 +4460,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       }
    }
 
-   if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced)
+   /* glPolygonStipple, applied as a discard against the pattern. */
+   const bool want_stipple = ctx->rasterizer && ctx->rasterizer->poly_stipple &&
+                             ctx->poly_stipple_set;
+   if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
+       !want_stipple)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -4481,7 +4566,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
     * both. */
    const bool needs_variant =
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
-      unproduced != 0;
+      unproduced != 0 || want_stipple;
    if (!needs_variant)
       return fs->module;
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
@@ -4489,7 +4574,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       bool match = cached->sampler_mask == sampler_mask &&
                    cached->color_output_type == wanted_output &&
                    cached->coord_replace == coord_replace &&
-                   cached->unproduced == unproduced;
+                   cached->unproduced == unproduced &&
+                   cached->poly_stipple == want_stipple &&
+                   (!want_stipple ||
+                    memcmp(cached->stipple, ctx->poly_stipple,
+                           sizeof(cached->stipple)) == 0);
       for (unsigned slot = 0; match && slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
          if (!(sampler_mask & (1u << slot)))
             continue;
@@ -4533,6 +4622,10 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
     * substitutions on the form actually present. */
    if (unproduced)
       gex_wgpu_drop_unproduced_inputs(variant, produced, sprite_locations);
+   /* Before the texture lowering, which reads gl_FragCoord for nothing and
+    * would otherwise see the load this adds. */
+   if (want_stipple)
+      gex_wgpu_lower_poly_stipple(variant, ctx->poly_stipple);
    if (needs_sampler_variant && !gex_wgpu_lower_texture_variant(
           variant, fs, ctx->samplers, ctx->sampler_views)) {
       ralloc_free(variant);
@@ -4562,6 +4655,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    cached->color_output_type = wanted_output;
    cached->coord_replace = coord_replace;
    cached->unproduced = unproduced;
+   cached->poly_stipple = want_stipple;
+   memcpy(cached->stipple, ctx->poly_stipple, sizeof(cached->stipple));
    for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
       if (!(sampler_mask & (1u << slot)))
          continue;
@@ -4688,6 +4783,11 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
     * lost culling and the scissor over a clip plane the shader was already
     * honouring. */
    supported.clip_plane_enable = state->clip_plane_enable;
+   /* glPolygonStipple. WebGPU has no stipple, so the pattern is applied as a
+    * discard in a fragment variant; refusing the field refused the whole
+    * rasterizer state, which lost culling and the scissor as well as the
+    * stipple. Four of the installed GL programs ask for it. */
+   supported.poly_stipple_enable = state->poly_stipple_enable;
    /* A refused rasterizer state binds as NULL, and a NULL one reads as every
     * default -- no scissor, no culling, and no rasterizer discard. That is
     * silent and wrong rather than loud and wrong, so say which field did it.
@@ -4752,6 +4852,7 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
       rasterizer->fill_mode = state->fill_front == state->fill_back
          ? state->fill_front : PIPE_POLYGON_MODE_FILL;
       rasterizer->sprite_coord_enable = state->sprite_coord_enable;
+      rasterizer->poly_stipple = state->poly_stipple_enable;
       rasterizer->cull_face = state->cull_face;
       rasterizer->discard = state->rasterizer_discard;
       rasterizer->unclipped_depth = !state->depth_clip_near;
@@ -9525,15 +9626,20 @@ gex_wgpu_set_polygon_stipple(struct pipe_context *pipe,
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    if (ctx->failed || !stipple)
       return;
-   /* st/mesa calls this before every draw, with an all-ones pattern whenever
-    * GL_POLYGON_STIPPLE is disabled -- which is the only case WebGPU can
-    * render, as it has no stipple. */
-   for (unsigned i = 0; i < ARRAY_SIZE(stipple->stipple); ++i) {
-      if (stipple->stipple[i] != 0xffffffffu) {
-         gex_fail(ctx);
-         return;
-      }
-   }
+   /* Recorded, not refused. WebGPU has no stipple, so it is applied as a
+    * discard in a fragment variant -- see gex_wgpu_lower_poly_stipple. This
+    * used to fail the context on any pattern that was not all ones, which is
+    * every enabled stipple there is.
+    *
+    * st/mesa calls this before every draw whether or not GL_POLYGON_STIPPLE
+    * is enabled, so the pattern alone says nothing about whether it applies;
+    * the rasterizer state's poly_stipple_enable does. */
+   STATIC_ASSERT(sizeof(ctx->poly_stipple) == sizeof(stipple->stipple));
+   memcpy(ctx->poly_stipple, stipple->stipple, sizeof(ctx->poly_stipple));
+   ctx->poly_stipple_set = false;
+   for (unsigned i = 0; i < ARRAY_SIZE(stipple->stipple); ++i)
+      if (stipple->stipple[i] != 0xffffffffu)
+         ctx->poly_stipple_set = true;
 }
 
 static void
