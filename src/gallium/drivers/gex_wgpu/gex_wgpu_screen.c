@@ -710,6 +710,11 @@ struct gex_wgpu_rasterizer {
    int32_t depth_bias;
    float depth_bias_slope;
    float depth_bias_clamp;
+   /* glPolygonMode, as PIPE_POLYGON_MODE_*. FILL is the ordinary case; LINE
+    * and POINT are drawn by rewriting the primitive, since WebGPU has no
+    * polygon mode. Only one mode for both faces is carried: GL lets the two
+    * differ and nothing here could express that. */
+   unsigned fill_mode;
 };
 
 /* Which varyings travel between two stages through a buffer, and in what
@@ -4221,6 +4226,17 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
     * bound no rasterizer state at all, which cost culling and the scissor
     * too. Six of the installed GL programs set it, decals and shadow
     * volumes being what it is for. */
+   /* glPolygonMode, when both faces agree. WebGPU has no polygon mode, so the
+    * primitive is rewritten into lines or points -- see
+    * gex_wgpu_draw_unfilled. Refusing it bound no rasterizer state at all,
+    * which lost culling and the scissor along with the wireframe, so those
+    * programs drew filled *and* wrong. Ten of the installed GL programs ask
+    * for it. Front and back differing stays refused: GL allows it and nothing
+    * here could honour it. */
+   if (state->fill_front == state->fill_back) {
+      supported.fill_front = state->fill_front;
+      supported.fill_back = state->fill_back;
+   }
    supported.offset_point = state->offset_point;
    supported.offset_line = state->offset_line;
    supported.offset_tri = state->offset_tri;
@@ -4304,6 +4320,8 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
                                                                        : 2.0f));
       rasterizer->depth_bias_slope = state->offset_scale;
       rasterizer->depth_bias_clamp = state->offset_clamp;
+      rasterizer->fill_mode = state->fill_front == state->fill_back
+         ? state->fill_front : PIPE_POLYGON_MODE_FILL;
       rasterizer->cull_face = state->cull_face;
       rasterizer->discard = state->rasterizer_discard;
       rasterizer->unclipped_depth = !state->depth_clip_near;
@@ -13334,6 +13352,138 @@ gex_wgpu_draw_adjacency(struct pipe_context *pipe,
    return true;
 }
 
+/* glPolygonMode(GL_LINE) and (GL_POINT), which WebGPU has no equivalent for:
+ * the polygon is rewritten into the lines or points it would be drawn as.
+ *
+ * Mesa's own u_unfilled_translator/u_unfilled_generator do the rewriting, and
+ * using them rather than open-coding it is what makes quads and polygons come
+ * out right. Taking each triangle's three edges after converting a quad to two
+ * triangles would draw a diagonal across it that GL does not draw, so this has
+ * to run before the topology rewrite, on the primitive the application asked
+ * for.
+ *
+ * One fidelity gap, deliberately: GL culls before applying polygon mode, so a
+ * culled back face contributes no edges. Lines carry no winding, so a
+ * wireframe drawn with culling enabled shows back-facing polygons' edges too.
+ * That pairing is uncommon and the alternative is culling on the CPU.
+ */
+static bool
+gex_wgpu_draw_unfilled(struct pipe_context *pipe,
+                       const struct pipe_draw_info *info,
+                       unsigned drawid_offset,
+                       const struct pipe_draw_start_count_bias *draw,
+                       unsigned unfilled_mode)
+{
+   enum mesa_prim out_prim = MESA_PRIM_LINES;
+   unsigned out_index_size = 0, out_nr = 0;
+   u_translate_func translate = NULL;
+   u_generate_func generate = NULL;
+   const void *src = NULL;
+   struct pipe_transfer *transfer = NULL;
+   unsigned start = draw->start;
+
+   if (info->index_size) {
+      if (info->index_size != 1 && info->index_size != 2 &&
+          info->index_size != 4)
+         return false;
+      if (u_unfilled_translator(info->mode, info->index_size, draw->count,
+                                unfilled_mode, &out_prim, &out_index_size,
+                                &out_nr, &translate) == U_TRANSLATE_ERROR)
+         return false;
+      if (info->has_user_indices) {
+         src = info->index.user;
+         if (!src)
+            return false;
+      } else {
+         /* The mapped range begins at the draw, so the translator starts from
+          * zero -- the arrangement u_primconvert uses. */
+         src = pipe_buffer_map_range(pipe, info->index.resource,
+                                     start * info->index_size,
+                                     draw->count * info->index_size,
+                                     PIPE_MAP_READ, &transfer);
+         if (!src)
+            return false;
+         start = 0;
+      }
+   } else if (u_unfilled_generator(info->mode, start, draw->count,
+                                   unfilled_mode, &out_prim, &out_index_size,
+                                   &out_nr, &generate) == U_TRANSLATE_ERROR) {
+      return false;
+   }
+
+   /* Fewer vertices than one primitive draws nothing, which is not a
+    * failure. */
+   if (!out_nr) {
+      if (transfer)
+         pipe_buffer_unmap(pipe, transfer);
+      return true;
+   }
+   /* 16- and 32-bit indices only; WebGPU has no 8-bit form. */
+   if (out_index_size != 2 && out_index_size != 4) {
+      if (transfer)
+         pipe_buffer_unmap(pipe, transfer);
+      return false;
+   }
+
+   void *out = MALLOC((size_t)out_nr * out_index_size);
+   if (!out) {
+      if (transfer)
+         pipe_buffer_unmap(pipe, transfer);
+      return false;
+   }
+   if (translate)
+      translate(src, start, draw->count, out_nr, info->restart_index, out);
+   else
+      generate(start, out_nr, out);
+   if (transfer)
+      pipe_buffer_unmap(pipe, transfer);
+
+   struct pipe_draw_info rewritten = *info;
+   rewritten.mode = out_prim;
+   rewritten.index_size = out_index_size;
+   rewritten.has_user_indices = true;
+   rewritten.index.user = out;
+   rewritten.primitive_restart = false;
+   rewritten.index_bounds_valid = false;
+   rewritten.min_index = 0;
+   rewritten.max_index = ~0u;
+   struct pipe_draw_start_count_bias rewritten_draw = *draw;
+   rewritten_draw.start = 0;
+   rewritten_draw.count = out_nr;
+   /* The base vertex has to be folded into the indices rather than passed on.
+    *
+    * On a non-indexed draw index_bias means nothing, and st/mesa leaves it
+    * set from an earlier draw -- but this rewrite makes the draw indexed, at
+    * which point the same stale field would be applied for real. It is also
+    * what the driver refuses outright further down ("draw refused (index
+    * bias)"), so passing it through cost the whole context.
+    *
+    * A genuine base vertex on an indexed source still has to apply, and the
+    * translator copied the source indices without it, so it is added here and
+    * the field cleared. Widened to 32 bits first, since a biased index need
+    * not fit the width the generator chose. */
+   if (info->index_size && draw->index_bias != 0) {
+      uint32_t *wide = MALLOC((size_t)out_nr * 4);
+      if (!wide) {
+         FREE(out);
+         return false;
+      }
+      for (unsigned i = 0; i < out_nr; ++i) {
+         const uint32_t index = out_index_size == 2
+            ? ((const uint16_t *)out)[i] : ((const uint32_t *)out)[i];
+         wide[i] = (uint32_t)((int64_t)index + draw->index_bias);
+      }
+      FREE(out);
+      out = wide;
+      rewritten.index_size = 4;
+      rewritten.index.user = out;
+   }
+   rewritten_draw.index_bias = 0;
+   gex_wgpu_draw_vbo(pipe, &rewritten, drawid_offset, NULL, &rewritten_draw, 1);
+   FREE(out);
+   return true;
+}
+
 
 static void
 gex_wgpu_draw_vbo(struct pipe_context *pipe,
@@ -13414,6 +13564,30 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       return;
    }
    gex_wgpu_release_retired_groups(gex_screen(pipe->screen));
+
+   /* An unfilled polygon becomes the lines or points it would be drawn as,
+    * before the topology rewrite below, so that a quad's four edges are four
+    * edges and not two triangles' six. The rewrite comes back through here as
+    * LINES or POINTS, which are not polygons, so it does not recurse. */
+   static int no_unfilled = -1;
+   if (no_unfilled < 0)
+      no_unfilled = getenv("GEX_WGPU_NO_UNFILLED") ? 1 : 0;
+   if (!no_unfilled && !ctx->failed && info && draws && num_draws == 1 &&
+       !indirect && ctx->rasterizer &&
+       ctx->rasterizer->fill_mode != PIPE_POLYGON_MODE_FILL &&
+       u_reduced_prim(info->mode) == MESA_PRIM_TRIANGLES) {
+      if (gex_wgpu_draw_unfilled(pipe, info, drawid_offset, &draws[0],
+                                 ctx->rasterizer->fill_mode))
+         return;
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr,
+                 "gex-wgpu: unfilled draw declined (topology %u mode %u); "
+                 "drawn filled\n", info->mode, ctx->rasterizer->fill_mode);
+      }
+      /* Fall through and draw it filled rather than not at all. */
+   }
 
    /* A topology WebGPU does not have is rewritten into one it does, which
     * comes straight back here as a supported mode -- but only for the
