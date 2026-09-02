@@ -688,6 +688,13 @@ struct gex_wgpu_shader_variant {
     * the bound target's. */
    nir_alu_type color_output_type;
    uint16_t sampler_mask;
+   /* The GL_COORD_REPLACE mask this variant substituted, which is zero for
+    * every draw that is not points -- so a points variant and a triangles
+    * variant of the same shader are distinct and neither is reused for the
+    * other. */
+   unsigned coord_replace;
+   /* Which fragment inputs this variant zeroed for want of a producer. */
+   uint64_t unproduced;
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
    struct gex_wgpu_shader_variant *next;
@@ -710,6 +717,10 @@ struct gex_wgpu_rasterizer {
    int32_t depth_bias;
    float depth_bias_slope;
    float depth_bias_clamp;
+   /* Which fragment inputs GL_COORD_REPLACE feeds from the point sprite
+    * instead of from the vertex shader, as a mask of texcoord slots. Only
+    * meaningful while drawing points. */
+   unsigned sprite_coord_enable;
    /* glPolygonMode, as PIPE_POLYGON_MODE_*. FILL is the ordinary case; LINE
     * and POINT are drawn by rewriting the primitive, since WebGPU has no
     * polygon mode. Only one mode for both faces is carried: GL lets the two
@@ -2166,6 +2177,83 @@ gex_wgpu_lower_query_lod_instr(nir_builder *b, nir_instr *instr, void *data)
 
 static bool gex_wgpu_is_location_varying(int location);
 
+/* Drop fragment inputs the bound vertex shader does not write.
+ *
+ * GL leaves such a varying's value undefined -- it does not make the program
+ * invalid -- so reading zero from it is a conformant answer. WebGPU is
+ * stricter and refuses the pipeline outright:
+ *
+ *   The fragment input at location 4 doesn't have a corresponding vertex
+ *   output.
+ *
+ * which is not one lost draw but an invalid pipeline reused for every later
+ * one. The point-sprite demos reach this by reading a texcoord before
+ * enabling GL_COORD_REPLACE, so nothing produces it and nothing is meant to.
+ *
+ * Removing the input rather than inventing a producer is the right direction:
+ * WebGPU requires every fragment input to have a vertex output, not the
+ * reverse, so an unread vertex output is harmless while an unwritten fragment
+ * input is fatal.
+ */
+struct gex_wgpu_unproduced {
+   uint64_t produced;
+   /* Locations GL_COORD_REPLACE feeds from the point sprite. Those get the
+    * sprite coordinate rather than zero. */
+   uint64_t sprite;
+   bool dropped;
+};
+
+static bool
+gex_wgpu_zero_unproduced_input(nir_builder *b, nir_intrinsic_instr *intr,
+                               void *data)
+{
+   struct gex_wgpu_unproduced *state = data;
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+   if (!var || var->data.mode != nir_var_shader_in)
+      return false;
+   if (!gex_wgpu_is_location_varying(var->data.location) ||
+       var->data.location >= GEX_WGPU_MAX_VARYING_LOCATIONS)
+      return false;
+   if (state->produced & BITFIELD64_BIT(var->data.location))
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *value;
+   if (state->sprite & BITFIELD64_BIT(var->data.location)) {
+      /* GL_COORD_REPLACE substitutes (s, t) = gl_PointCoord, r = 0, q = 1,
+       * and WebGPU rasterises a point as one pixel, so the coordinate is
+       * that pixel's centre. */
+      nir_def *sprite = nir_imm_vec4(b, 0.5f, 0.5f, 0.0f, 1.0f);
+      value = intr->def.num_components >= 4
+         ? sprite : nir_trim_vector(b, sprite, intr->def.num_components);
+   } else {
+      value = nir_imm_zero(b, intr->def.num_components, intr->def.bit_size);
+   }
+   nir_def_replace(&intr->def, value);
+   state->dropped = true;
+   return true;
+}
+
+static bool
+gex_wgpu_drop_unproduced_inputs(nir_shader *nir, uint64_t produced,
+                                uint64_t sprite)
+{
+   struct gex_wgpu_unproduced state = {produced, sprite, false};
+   nir_shader_intrinsics_pass(nir, gex_wgpu_zero_unproduced_input,
+                              nir_metadata_control_flow |
+                                 nir_metadata_loop_analysis, &state);
+   if (!state.dropped)
+      return false;
+   /* The loads are gone; DCE takes their derefs, and the variables are then
+    * unused. Without this the emitter still declares the input and the
+    * pipeline is still invalid -- the same trap as gl_PointSize. */
+   NIR_PASS(_, nir, nir_opt_dce);
+   nir_remove_dead_variables(nir, nir_var_shader_in, NULL);
+   return true;
+}
+
 /* Make a vertex output as wide as the fragment input it feeds.
  *
  * GLSL lets a fragment shader read `vec3 v` from a vertex shader that writes
@@ -2519,6 +2607,35 @@ gex_wgpu_strip_point_size_instr(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* gl_PointCoord, which WGSL has no builtin for -- ntv would emit
+ * SpvBuiltInPointCoord and Tint refuses it.
+ *
+ * WebGPU rasterises a point as a single pixel, which this driver already
+ * accepts elsewhere: gex_wgpu_strip_point_size drops gl_PointSize for the same
+ * reason. Over one fragment the sprite coordinate is that fragment's centre,
+ * so the honest value is (0.5, 0.5) -- not an approximation of a wider point
+ * but the exact answer for the point WebGPU actually draws.
+ *
+ * Without this, st/mesa's point-sprite fragment shader declared an input the
+ * vertex stage does not write and the pipeline was invalid:
+ *
+ *   The fragment input at location 4 doesn't have a corresponding vertex
+ *   output.
+ */
+static bool
+gex_wgpu_lower_point_coord_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                                 void *data)
+{
+   (void)data;
+   if (intr->intrinsic != nir_intrinsic_load_point_coord &&
+       intr->intrinsic != nir_intrinsic_load_point_coord_maybe_flipped)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *centre = nir_imm_vec2(b, 0.5f, 0.5f);
+   nir_def_replace(&intr->def, centre);
+   return true;
+}
+
 static void
 gex_wgpu_strip_point_size(nir_shader *nir)
 {
@@ -2658,6 +2775,9 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
     * depends on the bound view, so the base shader is the right place. */
    NIR_PASS(_, nir, nir_shader_instructions_pass,
             gex_wgpu_lower_query_lod_instr,
+            nir_metadata_control_flow | nir_metadata_loop_analysis, NULL);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+            gex_wgpu_lower_point_coord_instr,
             nir_metadata_control_flow | nir_metadata_loop_analysis, NULL);
    /* Keep st/mesa's vertex input numbering across ntv_shader_prepare.
     *
@@ -3960,7 +4080,7 @@ gex_wgpu_retype_color_outputs(nir_shader *nir, nir_alu_type want)
 }
 
 static WGPUShaderModule
-gex_wgpu_fragment_module(struct gex_wgpu_context *ctx)
+gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
 {
    /* Declining, not latching. This returns NULL and draw_vbo checks it, so
     * the caller already learns of the failure -- latching on top ended the
@@ -3984,7 +4104,41 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx)
       : nir_type_float;
    const bool retype_outputs =
       wanted_output != nir_alu_type_get_base_type(fs->color_output_type);
-   if (!fs->texture_count && !retype_outputs)
+   /* GL_COORD_REPLACE: the rasteriser feeds these texcoords from the point
+    * sprite, so the vertex shader does not write them and the pipeline is
+    * invalid without the substitution --
+    *
+    *   The fragment input at location 4 doesn't have a corresponding vertex
+    *   output.
+    *
+    * Only while drawing points, which is the whole of what makes this a
+    * per-draw decision rather than shader state: the same rasterizer state
+    * stays bound across triangle draws that read the same texcoord from the
+    * vertex shader for real, and substituting there would replace their
+    * texture coordinates with a constant. */
+   const unsigned coord_replace =
+      drawing_points && ctx->rasterizer ? ctx->rasterizer->sprite_coord_enable
+                                        : 0u;
+   /* The varyings the vertex stage declares as outputs. Recorded at create
+    * time in the same loop that records interpolation and width, so the mask
+    * means "this location is produced". Coord-replaced texcoords count as
+    * produced, because the substitution above supplies them. */
+   const uint64_t sprite_locations =
+      coord_replace ? ((uint64_t)coord_replace << VARYING_SLOT_TEX0) : 0u;
+   const uint64_t produced =
+      ctx->vs ? ctx->vs->varying_interp_mask : ~(uint64_t)0;
+   uint64_t unproduced = 0;
+   if (ctx->vs && fs->original_nir) {
+      nir_foreach_shader_in_variable(var, fs->original_nir) {
+         if (!gex_wgpu_is_location_varying(var->data.location) ||
+             var->data.location >= GEX_WGPU_MAX_VARYING_LOCATIONS)
+            continue;
+         if (!(produced & BITFIELD64_BIT(var->data.location)))
+            unproduced |= BITFIELD64_BIT(var->data.location);
+      }
+   }
+
+   if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -4077,13 +4231,17 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx)
     * gl_FragCoord.y back as a colour from two shaders that differ only in
     * whether they also sample a texture, and requires the same answer from
     * both. */
-   const bool needs_variant = needs_sampler_variant || retype_outputs;
+   const bool needs_variant =
+      needs_sampler_variant || retype_outputs || coord_replace != 0 ||
+      unproduced != 0;
    if (!needs_variant)
       return fs->module;
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
         cached; cached = cached->next) {
       bool match = cached->sampler_mask == sampler_mask &&
-                   cached->color_output_type == wanted_output;
+                   cached->color_output_type == wanted_output &&
+                   cached->coord_replace == coord_replace &&
+                   cached->unproduced == unproduced;
       for (unsigned slot = 0; match && slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
          if (!(sampler_mask & (1u << slot)))
             continue;
@@ -4116,6 +4274,17 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx)
    }
    if (retype_outputs)
       gex_wgpu_retype_color_outputs(variant, wanted_output);
+   /* point_coord_is_sysval, so the substitution becomes nir_load_point_coord
+    * -- which gex_wgpu_lower_point_coord_instr then resolves to the centre of
+    * the single pixel WebGPU draws a point as. */
+   /* nir_lower_texcoord_replace is not usable here: it expects the io-lowered
+    * form and this NIR still addresses its inputs through derefs, so it
+    * reported progress while leaving both the loads and the variable in
+    * place -- and the emitter declares an input for every shader_in variable
+    * there is, so the pipeline stayed invalid. One pass does both
+    * substitutions on the form actually present. */
+   if (unproduced)
+      gex_wgpu_drop_unproduced_inputs(variant, produced, sprite_locations);
    if (needs_sampler_variant && !gex_wgpu_lower_texture_variant(
           variant, fs, ctx->samplers, ctx->sampler_views)) {
       ralloc_free(variant);
@@ -4143,6 +4312,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx)
    cached->module = module;
    cached->sampler_mask = sampler_mask;
    cached->color_output_type = wanted_output;
+   cached->coord_replace = coord_replace;
+   cached->unproduced = unproduced;
    for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
       if (!(sampler_mask & (1u << slot)))
          continue;
@@ -4322,6 +4493,7 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
       rasterizer->depth_bias_clamp = state->offset_clamp;
       rasterizer->fill_mode = state->fill_front == state->fill_back
          ? state->fill_front : PIPE_POLYGON_MODE_FILL;
+      rasterizer->sprite_coord_enable = state->sprite_coord_enable;
       rasterizer->cull_face = state->cull_face;
       rasterizer->discard = state->rasterizer_discard;
       rasterizer->unclipped_depth = !state->depth_clip_near;
@@ -10262,8 +10434,24 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
     * set_render_condition, so none can be active. st/mesa sets it on every
     * blit it issues, which was sending every same-format depth copy to
     * u_blitter instead of the texture-to-texture copy below. */
+   /* A copy cannot change the sample count, and WebGPU says so:
+    *
+    *   Source [...] sample count (1) and destination [...] sample count (4)
+    *   does not match.
+    *
+    * The other direction is handled above, by resolving. This one is a
+    * single-sampled image being replicated into a multisampled target, which
+    * only a draw can do -- so it belongs with u_blitter rather than in the
+    * copy below. Emitting the copy anyway produced an invalid command buffer,
+    * and an invalid command buffer is not one lost blit: every later submit
+    * fails with it. glpuzzle, pointblast and spriteblast all do this. */
+   const bool samples_match =
+      info->src.resource && info->dst.resource &&
+      MAX2(1, info->src.resource->nr_samples) ==
+         MAX2(1, info->dst.resource->nr_samples);
+
    if (!info->src.resource || !info->dst.resource ||
-       !srgb_compatible ||
+       !srgb_compatible || !samples_match ||
        !same_size || info->scissor_enable || info->swizzle_enable ||
        info->alpha_blend ||
        info->num_window_rectangles != 0 ||
@@ -13565,6 +13753,73 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    gex_wgpu_release_retired_groups(gex_screen(pipe->screen));
 
+   /* 8-bit indices, which GL has and WebGPU does not: widened to 16 before
+    * anything else looks at them, so the unfilled rewrite, the restart split
+    * and the draw itself all see a width WebGPU takes. glDrawElements with
+    * GL_UNSIGNED_BYTE is ordinary GL -- `muffin` draws that way -- and the
+    * draw was refused outright, which latched the context.
+    *
+    * A multi-draw is left alone here; the loop further down re-issues each of
+    * its draws through this same function, and they are converted then.
+    */
+   if (!ctx->failed && info && draws && num_draws == 1 && !indirect &&
+       info->index_size == 1) {
+      const unsigned count = draws[0].count;
+      const uint8_t *src = NULL;
+      struct pipe_transfer *transfer = NULL;
+      if (info->has_user_indices) {
+         src = info->index.user
+            ? (const uint8_t *)info->index.user + draws[0].start : NULL;
+      } else if (info->index.resource) {
+         src = pipe_buffer_map_range(pipe, info->index.resource,
+                                     draws[0].start, count, PIPE_MAP_READ,
+                                     &transfer);
+      }
+      if (!src || !count) {
+         if (transfer)
+            pipe_buffer_unmap(pipe, transfer);
+         if (!count)
+            return;              /* nothing to draw is not a failure */
+         gex_fail(ctx);
+         return;
+      }
+      /* A base vertex is folded in rather than passed on, for the same reason
+       * as in the unfilled rewrite: the driver refuses a non-zero index_bias,
+       * and a biased byte index need not fit sixteen bits. */
+      const bool rebase = draws[0].index_bias != 0;
+      const unsigned width = rebase ? 4u : 2u;
+      void *wide = MALLOC((size_t)count * width);
+      if (!wide) {
+         if (transfer)
+            pipe_buffer_unmap(pipe, transfer);
+         gex_fail(ctx);
+         return;
+      }
+      for (unsigned i = 0; i < count; ++i) {
+         if (rebase)
+            ((uint32_t *)wide)[i] =
+               (uint32_t)((int64_t)src[i] + draws[0].index_bias);
+         else
+            ((uint16_t *)wide)[i] = src[i];
+      }
+      if (transfer)
+         pipe_buffer_unmap(pipe, transfer);
+
+      struct pipe_draw_info widened = *info;
+      widened.index_size = width;
+      widened.has_user_indices = true;
+      widened.index.user = wide;
+      widened.index_bounds_valid = false;
+      widened.min_index = 0;
+      widened.max_index = ~0u;
+      struct pipe_draw_start_count_bias widened_draw = draws[0];
+      widened_draw.start = 0;
+      widened_draw.index_bias = 0;
+      gex_wgpu_draw_vbo(pipe, &widened, drawid_offset, NULL, &widened_draw, 1);
+      FREE(wide);
+      return;
+   }
+
    /* An unfilled polygon becomes the lines or points it would be drawn as,
     * before the topology rewrite below, so that a quad's four edges are four
     * edges and not two triangles' six. The rewrite comes back through here as
@@ -14271,7 +14526,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
    const int64_t t_fsmod_start = gex_timing ? os_time_get_nano() : 0;
-   fragment.module = gex_wgpu_fragment_module(ctx);
+   fragment.module = gex_wgpu_fragment_module(
+      ctx, gex_wgpu_topology(info->mode) == WGPUPrimitiveTopology_PointList);
    if (gex_timing) gex_wgpu_time_fsmod += os_time_get_nano() - t_fsmod_start;
    if (!fragment.module)
       return;
@@ -16161,6 +16417,12 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * the builtin as a bool. st/mesa builds two-sided lighting through ureg, so
     * `twoside` could not link its fragment shader at all. */
    caps->fs_face_is_integer_sysval = true;
+   /* gl_PointCoord as a system value, for the same reason as FrontFacing
+    * above: as a varying it has no producer, since GL's rasteriser generates
+    * it, and the pipeline is then invalid. As a system value it becomes
+    * nir_load_point_coord, which gex_wgpu_lower_point_coord_instr resolves to
+    * the single pixel WebGPU draws a point as. */
+   caps->fs_point_is_sysval = true;
    caps->sample_shading = true;
    /* ARB_texture_query_lod. WGSL has no textureQueryLod, so the value is
     * computed from the coordinate's derivatives instead; see
