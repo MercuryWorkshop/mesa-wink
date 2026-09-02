@@ -58,6 +58,14 @@ X11. That is the cost of using the software winsys, and it is per frame
 rather than per draw, but it is why a trivial program can spend a third of
 its time in present.
 
-The driver reports **GL 3.3**. GL 4.0 is not reachable on WebGPU: it requires
-`ARB_gpu_shader_fp64` and `ARB_tessellation_shader`, and WebGPU has neither.
-Applications that insist on 4.x -- Blender wants 4.3 -- will refuse to start.
+The driver reports **GL 3.3**, so applications that insist on 4.x -- Blender
+wants 4.3 -- refuse to start.
+
+That is where the work stopped, not a wall. WGSL has no `f64` and WebGPU has
+no tessellator, but neither settles it: Mesa lowers doubles in software
+(`src/compiler/glsl/float64.glsl` with `nir_lower_doubles`, which Intel ships
+in production), and a tessellator can be written in WGSL -- that one is the
+largest unbuilt item on the ladder, because there is no hardware tessellator
+to drive. See `docs/gl-ceiling-on-webgpu.md` in the gex repository for the
+rung-by-rung account; its conclusion is that GL 4.6 is reachable and nothing
+on the way is provably impossible.
