@@ -3244,7 +3244,7 @@ struct gex_wgpu_capture {
  * somewhere to put words. */
 static nir_variable *
 gex_wgpu_word_block(nir_shader *nir, const char *name, unsigned binding,
-                    unsigned driver_location)
+                    unsigned driver_location, bool read_only)
 {
    const struct glsl_type *words = glsl_array_type(glsl_uint_type(), 0, 4);
    struct glsl_struct_field field = {0};
@@ -3258,6 +3258,21 @@ gex_wgpu_word_block(nir_shader *nir, const char *name, unsigned binding,
    var->data.binding = binding;
    var->data.driver_location = driver_location;
    var->data.explicit_binding = true;
+   /* A read-only declaration is not decoration for its own sake: WebGPU
+    * forbids two *writable* storage bindings over the same range, and a
+    * vertex buffer feeding several attributes arrives as several Gallium
+    * slots pointing at one resource. `gsraytrace` binds one 4 MiB buffer to
+    * four slots, which the compute pass bound four times --
+    *
+    *   Writable storage buffer binding aliasing found between [BindGroup] set
+    *   at bind group index 0, binding index 0, and ... binding index 1, with
+    *   overlapping ranges
+    *
+    * -- and an invalid command buffer takes every later submit with it.
+    * NonWritable becomes `var<storage, read>` in WGSL, which may alias, and
+    * the layout entry has to say ReadOnlyStorage to match. */
+   if (read_only)
+      var->data.access |= ACCESS_NON_WRITEABLE;
    return var;
 }
 
@@ -3311,7 +3326,7 @@ gex_wgpu_capture_so_var(nir_shader *nir, struct gex_wgpu_capture *state,
       snprintf(name, sizeof(name), "gex_xfb%u", buffer);
       state->so[buffer] =
          gex_wgpu_word_block(nir, name, GEX_WGPU_SO_FIRST_BINDING + buffer,
-                             buffer);
+                             buffer, false);
       state->so_mask |= 1u << buffer;
    }
    return state->so[buffer];
@@ -3330,7 +3345,7 @@ gex_wgpu_capture_vb_var(nir_shader *nir, struct gex_wgpu_capture *state,
       snprintf(name, sizeof(name), "gex_vb%u", slot);
       state->vb[slot] =
          gex_wgpu_word_block(nir, name, GEX_WGPU_VB_FIRST_BINDING + slot,
-                             slot);
+                             slot, true);
       state->vb_mask |= 1u << slot;
    }
    return state->vb[slot];
@@ -4900,7 +4915,23 @@ static void
 gex_wgpu_bind_rasterizer_state(struct pipe_context *pipe, void *state)
 {
    GEX_ENTRY_TIMER();
-   ((struct gex_wgpu_context *)pipe)->rasterizer = state;
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   ctx->rasterizer = state;
+   /* u_primconvert has to be told the provoking vertex, and nothing was
+    * telling it: its api_pv defaults to zero, which is PV_FIRST, while GL's
+    * convention is the last vertex. Every driver that uses primconvert calls
+    * this from here.
+    *
+    * It decides the vertex order of a converted primitive, so a flat-shaded
+    * line loop or polygon took its value from the wrong end. It does *not*
+    * decide the diagonal of a GL_QUADS split, which is a question this
+    * driver never gets asked -- Mesa's own vbo_save converts quads first,
+    * against ctx->Const.DriverSupportedPrimMask. */
+   if (ctx->primconvert) {
+      const struct gex_wgpu_rasterizer *rasterizer = state;
+      util_primconvert_save_flatshade_first(
+         ctx->primconvert, rasterizer && rasterizer->flatshade_first);
+   }
 }
 
 static void
@@ -5730,12 +5761,16 @@ gex_wgpu_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
        * binding loop below already treats a null resource as an unbind. */
       if (!buffers[i].buffer.resource)
          continue;
+      /* The Gallium bind flags are no longer consulted. They record what the
+       * buffer was *created* for, and a GL buffer object may be bound to any
+       * target afterwards -- `gsraytrace` draws from the buffer its transform
+       * feedback wrote, which st/mesa created with PIPE_BIND_STREAM_OUTPUT
+       * alone. Every buffer this driver allocates now carries the whole union
+       * of WebGPU usages, so what the bind flags say is no longer what the
+       * buffer can do. */
       const char *why =
          buffers[i].is_user_buffer            ? "user buffer"
          : buffers[i].buffer.resource->target != PIPE_BUFFER ? "not a buffer"
-         : !(buffers[i].buffer.resource->bind &
-             (PIPE_BIND_VERTEX_BUFFER | PIPE_BIND_VERTEX_STATE))
-                                              ? "not bound as a vertex buffer"
          : buffers[i].buffer_offset > buffers[i].buffer.resource->width0
                                               ? "offset past the end" : NULL;
       if (why) {
@@ -5878,10 +5913,18 @@ gex_wgpu_set_constant_buffer(struct pipe_context *pipe,
     * Same defect and same discovery as set_sampler_views: refusing it latched
     * the context for an application that never used those stages, so every
     * later draw was dropped and SuperTuxKart rendered nothing while reporting
-    * no GL error. Binding real data outside vertex or fragment is still
-    * unimplemented and still refused. */
+    * no GL error.
+    *
+    * The geometry stage takes real data too. gs_draw already binds
+    * ctx->constant_buffers[MESA_SHADER_GEOMETRY] through
+    * gex_wgpu_bind_constants, and everything below is indexed by stage, so
+    * the only thing missing was permission to store them -- and refusing that
+    * failed the context, which is why `gsraytrace` rendered a black window
+    * with no other complaint. Stages beyond these three are still refused;
+    * nothing binds them. */
    const bool unbinding = !buffer || (!buffer->buffer && !buffer->user_buffer);
-   if (shader != MESA_SHADER_VERTEX && shader != MESA_SHADER_FRAGMENT) {
+   if (shader != MESA_SHADER_VERTEX && shader != MESA_SHADER_FRAGMENT &&
+       shader != MESA_SHADER_GEOMETRY) {
       if (!unbinding) {
          gex_fail(ctx);
          return;
@@ -6656,7 +6699,25 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
        * turns out to need it. */
       WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
       desc.size = resource->allocation_size;
-      desc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc;
+      /* Every usage a GL buffer object might come to need, not just the ones
+       * its creating target implies.
+       *
+       * A GL buffer is retargetable: glBufferData names one target and the
+       * application may bind the same object to any other afterwards, while
+       * a WebGPU buffer's usage is fixed at creation. `gsraytrace` writes a
+       * buffer with transform feedback and then draws from it, so st/mesa
+       * created it with PIPE_BIND_STREAM_OUTPUT alone and the vertex bind was
+       * refused ("not bound as a vertex buffer ... bind=0x400"). Reallocating
+       * on the first surprising use would mean copying and invalidating every
+       * binding that already names it; asking for the union up front costs
+       * nothing WebGPU charges for.
+       *
+       * MapRead and MapWrite are deliberately absent -- this driver keeps its
+       * own CPU shadow and never maps a WGPU buffer -- which is also what
+       * keeps this combination legal. */
+      desc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_CopySrc |
+                   WGPUBufferUsage_Vertex | WGPUBufferUsage_Index |
+                   WGPUBufferUsage_Uniform | WGPUBufferUsage_Storage;
       /* A vertex state *is* a vertex buffer with a layout attached, and
        * Mesa's display-list recorder tags its buffers with only that bind
        * even though it goes on to bind them through set_vertex_buffers when
@@ -11378,10 +11439,10 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
    struct gex_wgpu_capture state = {0};
    state.layout = layout;
    state.params = gex_wgpu_word_block(nir, "gex_capture_params",
-                                      GEX_WGPU_CAPTURE_PARAMS_BINDING, 0);
+                                      GEX_WGPU_CAPTURE_PARAMS_BINDING, 0, false);
    if (layout->index_table)
       state.index = gex_wgpu_word_block(nir, "gex_capture_index",
-                                        GEX_WGPU_CAPTURE_INDEX_BINDING, 0);
+                                        GEX_WGPU_CAPTURE_INDEX_BINDING, 0, false);
 
    /* Order matters. The attribute reads and the vertex-stage system values
     * have to become compute terms before anything else refers to them, the
@@ -11553,9 +11614,9 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    state.layout = vertex;
    state.varyings = varyings;
    state.params = gex_wgpu_word_block(nir, "gex_capture_params",
-                                      GEX_WGPU_CAPTURE_PARAMS_BINDING, 0);
+                                      GEX_WGPU_CAPTURE_PARAMS_BINDING, 0, false);
    state.varying_out = gex_wgpu_word_block(nir, "gex_varying_out",
-                                           GEX_WGPU_VARYING_OUT_BINDING, 0);
+                                           GEX_WGPU_VARYING_OUT_BINDING, 0, false);
 
    nir_shader_intrinsics_pass(nir, gex_wgpu_capture_input,
                               nir_metadata_control_flow, &state);
@@ -11912,13 +11973,13 @@ gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs)
    struct gex_wgpu_gs_lowering state = {0};
    state.gs = gs;
    state.params = gex_wgpu_word_block(nir, "gex_gs_params",
-                                      GEX_WGPU_GS_PARAMS_BINDING, 0);
+                                      GEX_WGPU_GS_PARAMS_BINDING, 0, false);
    state.vs_out = gex_wgpu_word_block(nir, "gex_gs_vsout",
-                                      GEX_WGPU_GS_VSOUT_BINDING, 1);
+                                      GEX_WGPU_GS_VSOUT_BINDING, 1, false);
    state.vertices = gex_wgpu_word_block(nir, "gex_gs_vertices",
-                                        GEX_WGPU_GS_VERTEX_BINDING, 2);
+                                        GEX_WGPU_GS_VERTEX_BINDING, 2, false);
    state.indices = gex_wgpu_word_block(nir, "gex_gs_indices",
-                                       GEX_WGPU_GS_INDEX_BINDING, 3);
+                                       GEX_WGPU_GS_INDEX_BINDING, 3, false);
 
    /* The shader's own constant buffers move to group one, so group zero is
     * this pass's buffers alone -- the same split the vertex compute pass
@@ -12358,10 +12419,11 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       entries[count] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       entries[count].binding = variant->vb_bindings[i];
       entries[count].visibility = WGPUShaderStage_Compute;
-      /* Writable, though the shader only reads it: the emitter declares every
-       * storage buffer read_write and a bind group layout that says otherwise
-       * is rejected as incompatible with the shader's own declaration. */
-      entries[count].buffer.type = WGPUBufferBindingType_Storage;
+      /* Read-only, matching the NonWritable declaration gex_wgpu_word_block
+       * gives a vertex-buffer block -- and it gives one because WebGPU
+       * forbids two *writable* storage bindings over the same range, which
+       * one vertex buffer feeding several attributes produces. */
+      entries[count].buffer.type = WGPUBufferBindingType_ReadOnlyStorage;
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       bindings[count].binding = variant->vb_bindings[i];
       bindings[count].buffer = gex_resource(ctx->vertex_buffers[i])->buffer;
@@ -12564,6 +12626,9 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
 struct gex_wgpu_bindings {
    unsigned count;
    uint32_t storage_mask;
+   /* Bindings whose shader declaration is `var<storage, read>`. The layout
+    * has to agree, and only these may alias one another. */
+   uint32_t readonly_mask;
    uint32_t binding[GEX_WGPU_MAX_GROUP_BINDINGS];
    WGPUBuffer buffer[GEX_WGPU_MAX_GROUP_BINDINGS];
    uint64_t offset[GEX_WGPU_MAX_GROUP_BINDINGS];
@@ -12571,8 +12636,8 @@ struct gex_wgpu_bindings {
 };
 
 static void
-gex_wgpu_bind_storage(struct gex_wgpu_bindings *group, uint32_t binding,
-                      struct pipe_resource *resource)
+gex_wgpu_bind_storage_access(struct gex_wgpu_bindings *group, uint32_t binding,
+                             struct pipe_resource *resource, bool read_only)
 {
    if (group->count >= GEX_WGPU_MAX_GROUP_BINDINGS || !resource)
       return;
@@ -12582,6 +12647,25 @@ gex_wgpu_bind_storage(struct gex_wgpu_bindings *group, uint32_t binding,
    group->offset[i] = 0;
    group->size[i] = gex_resource(resource)->allocation_size;
    group->storage_mask |= 1u << i;
+   if (read_only)
+      group->readonly_mask |= 1u << i;
+   static int log = -1;
+   if (log < 0) {
+      const char *value = getenv("GEX_WGPU_BIND_LOG");
+      log = value && *value && *value != '0';
+   }
+   if (log)
+      fprintf(stderr,
+              "gex-wgpu: bind_storage binding=%u buffer=%p size=%llu ro=%d\n",
+              binding, (void *)group->buffer[i],
+              (unsigned long long)group->size[i], (int)read_only);
+}
+
+static void
+gex_wgpu_bind_storage(struct gex_wgpu_bindings *group, uint32_t binding,
+                      struct pipe_resource *resource)
+{
+   gex_wgpu_bind_storage_access(group, binding, resource, false);
 }
 
 static WGPUBindGroupLayout
@@ -12592,11 +12676,17 @@ gex_wgpu_group_layout(WGPUDevice device, const struct gex_wgpu_bindings *group)
       entries[i] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       entries[i].binding = group->binding[i];
       entries[i].visibility = WGPUShaderStage_Compute;
-      /* Storage rather than ReadOnlyStorage even where the shader only reads:
-       * the emitter declares every storage buffer read_write and WebGPU
-       * rejects a layout that disagrees with the shader's declaration. */
-      entries[i].buffer.type = (group->storage_mask & (1u << i))
-         ? WGPUBufferBindingType_Storage : WGPUBufferBindingType_Uniform;
+      /* Storage rather than ReadOnlyStorage wherever the emitter declares the
+       * buffer read_write, which is everything not marked NonWritable --
+       * WebGPU rejects a layout that disagrees with the shader's declaration.
+       * The read-only ones are the vertex buffers, and they are read-only
+       * because WebGPU forbids two *writable* bindings over the same range
+       * and one vertex buffer routinely feeds several attributes. */
+      entries[i].buffer.type =
+         !(group->storage_mask & (1u << i)) ? WGPUBufferBindingType_Uniform
+         : (group->readonly_mask & (1u << i))
+            ? WGPUBufferBindingType_ReadOnlyStorage
+            : WGPUBufferBindingType_Storage;
    }
    WGPUBindGroupLayoutDescriptor desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    desc.entryCount = group->count;
@@ -12848,8 +12938,8 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
       if (i >= ctx->vertex_buffer_count || !ctx->vertex_buffers[i])
          GEX_GS_DECLINE("a vertex buffer the geometry pass reads is unbound");
       params[GEX_WGPU_PARAM_VB_OFFSET + i] = ctx->vertex_buffer_offsets[i];
-      gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_VB_FIRST_BINDING + i,
-                            ctx->vertex_buffers[i]);
+      gex_wgpu_bind_storage_access(&vs_group0, GEX_WGPU_VB_FIRST_BINDING + i,
+                                   ctx->vertex_buffers[i], true);
    }
    struct pipe_resource *vs_params =
       gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS);
@@ -12933,6 +13023,15 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    struct pipe_draw_start_count_bias raster_draw;
    memset(&raster_draw, 0, sizeof(raster_draw));
    raster_draw.count = index_count;
+   /* GEX_WGPU_GS_LOG=1 prints what the rasterizing pass was handed, which is
+    * what localised a crash inside it to this draw rather than to the compute
+    * passes above. */
+   if (getenv("GEX_WGPU_GS_LOG"))
+      fprintf(stderr, "gex-wgpu: gs pass3 vs=%p elements=%p verts=%p "
+              "indices=%p count=%u mode=%u fs=%p\n", (void *)gs->passthrough,
+              (void *)gs->passthrough_elements, (void *)ctx->gs_vertices,
+              (void *)ctx->gs_indices, index_count, (unsigned)raster.mode,
+              (void *)ctx->fs);
    gex_wgpu_draw_vbo(&ctx->base, &raster, drawid_offset, NULL, &raster_draw, 1);
 
    ctx->gs = gs;
@@ -14280,6 +14379,19 @@ gex_wgpu_draw_provoking_last(struct pipe_context *pipe,
                              const struct pipe_draw_start_count_bias *draw)
 {
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   /* Trimmed to whole primitives before anything else looks at it.
+    *
+    * u_indices' generated translators write one primitive per iteration and
+    * stop on `j < out_nr`, so a count that is not a multiple of the
+    * primitive's stride makes the last iteration write past the end -- for
+    * TRIANGLES with 3524 vertices, two uint16 beyond a 3524-entry buffer.
+    * That is heap corruption, and it surfaced as `malloc(): invalid next size`
+    * in `fire` and `fbo_firecube` rather than as anything to do with indices.
+    * u_primconvert trims for the same reason, one line before its own
+    * translator call. */
+   unsigned count = draw->count;
+   if (!u_trim_pipe_prim(info->mode, &count) || count == 0)
+      return true;   /* fewer vertices than one primitive: nothing to draw */
    /* A cache hit skips the whole rewrite, and with it the index-buffer map
     * that is most of its cost. Keyed on everything the output depends on,
     * including how many bytes have ever been written to the source buffer --
@@ -14292,7 +14404,7 @@ gex_wgpu_draw_provoking_last(struct pipe_context *pipe,
    uint32_t key_hash = _mesa_hash_pointer(key_source);
    key_hash = _mesa_hash_data_with_seed(&key_user, sizeof(key_user), key_hash);
    const uint32_t key_scalars[6] = {
-      draw->start, draw->count, info->index_size, info->mode,
+      draw->start, count, info->index_size, info->mode,
       info->restart_index, (uint32_t)draw->index_bias,
    };
    key_hash = _mesa_hash_data_with_seed(key_scalars, sizeof(key_scalars),
@@ -14305,7 +14417,7 @@ gex_wgpu_draw_provoking_last(struct pipe_context *pipe,
          continue;
       if (!hit->indices || hit->source != key_source || hit->user != key_user ||
           hit->source_writes != key_writes || hit->start != draw->start ||
-          hit->count != draw->count || hit->index_size != info->index_size ||
+          hit->count != count || hit->index_size != info->index_size ||
           hit->mode != info->mode ||
           hit->restart_index != info->restart_index ||
           hit->primitive_restart != info->primitive_restart ||
@@ -14350,7 +14462,7 @@ gex_wgpu_draw_provoking_last(struct pipe_context *pipe,
           info->index_size != 4)
          return false;
       if (u_index_translator(hw_mask, info->mode, info->index_size,
-                             draw->count, PV_LAST, PV_FIRST,
+                             count, PV_LAST, PV_FIRST,
                              info->primitive_restart ? PR_ENABLE : PR_DISABLE,
                              &out_prim, &out_index_size, &out_nr,
                              &translate) == U_TRANSLATE_ERROR)
@@ -14362,13 +14474,13 @@ gex_wgpu_draw_provoking_last(struct pipe_context *pipe,
       } else {
          src = pipe_buffer_map_range(pipe, info->index.resource,
                                      start * info->index_size,
-                                     draw->count * info->index_size,
+                                     count * info->index_size,
                                      PIPE_MAP_READ, &transfer);
          if (!src)
             return false;
          start = 0;
       }
-   } else if (u_index_generator(hw_mask, info->mode, start, draw->count,
+   } else if (u_index_generator(hw_mask, info->mode, start, count,
                                 PV_LAST, PV_FIRST, &out_prim, &out_index_size,
                                 &out_nr, &generate) == U_TRANSLATE_ERROR) {
       return false;
@@ -14391,7 +14503,7 @@ gex_wgpu_draw_provoking_last(struct pipe_context *pipe,
       return false;
    }
    if (translate)
-      translate(src, start, draw->count, out_nr, info->restart_index, out);
+      translate(src, start, count, out_nr, info->restart_index, out);
    else
       generate(start, out_nr, out);
    if (transfer)
@@ -14445,7 +14557,7 @@ gex_wgpu_draw_provoking_last(struct pipe_context *pipe,
    slot->user = key_user;
    slot->source_writes = key_writes;
    slot->start = draw->start;
-   slot->count = draw->count;
+   slot->count = count;
    slot->index_size = info->index_size;
    slot->mode = info->mode;
    slot->restart_index = info->restart_index;
@@ -14488,12 +14600,19 @@ gex_wgpu_draw_unfilled(struct pipe_context *pipe,
    const void *src = NULL;
    struct pipe_transfer *transfer = NULL;
    unsigned start = draw->start;
+   /* Whole primitives only, for the reason gex_wgpu_draw_provoking_last
+    * gives: u_indices' generated functions write one primitive per iteration
+    * against `j < out_nr` and overrun when the count is not a multiple of the
+    * stride. */
+   unsigned count = draw->count;
+   if (!u_trim_pipe_prim(info->mode, &count) || count == 0)
+      return true;
 
    if (info->index_size) {
       if (info->index_size != 1 && info->index_size != 2 &&
           info->index_size != 4)
          return false;
-      if (u_unfilled_translator(info->mode, info->index_size, draw->count,
+      if (u_unfilled_translator(info->mode, info->index_size, count,
                                 unfilled_mode, &out_prim, &out_index_size,
                                 &out_nr, &translate) == U_TRANSLATE_ERROR)
          return false;
@@ -14506,13 +14625,13 @@ gex_wgpu_draw_unfilled(struct pipe_context *pipe,
           * zero -- the arrangement u_primconvert uses. */
          src = pipe_buffer_map_range(pipe, info->index.resource,
                                      start * info->index_size,
-                                     draw->count * info->index_size,
+                                     count * info->index_size,
                                      PIPE_MAP_READ, &transfer);
          if (!src)
             return false;
          start = 0;
       }
-   } else if (u_unfilled_generator(info->mode, start, draw->count,
+   } else if (u_unfilled_generator(info->mode, start, count,
                                    unfilled_mode, &out_prim, &out_index_size,
                                    &out_nr, &generate) == U_TRANSLATE_ERROR) {
       return false;
@@ -14539,7 +14658,7 @@ gex_wgpu_draw_unfilled(struct pipe_context *pipe,
       return false;
    }
    if (translate)
-      translate(src, start, draw->count, out_nr, info->restart_index, out);
+      translate(src, start, count, out_nr, info->restart_index, out);
    else
       generate(start, out_nr, out);
    if (transfer)
@@ -14747,6 +14866,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * has a flat varying at all -- otherwise there is nothing to get wrong and
     * nothing to pay for. Before the unfilled rewrite and the topology
     * rewrite, both of which come back through here. */
+   /* GEX_WGPU_NO_PROVOKING=1 turns the rewrite off, which is how its cost was
+    * measured against a run that needs it. */
    static int no_pv = -1;
    if (no_pv < 0)
       no_pv = getenv("GEX_WGPU_NO_PROVOKING") ? 1 : 0;
@@ -14813,6 +14934,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       else {
       const enum mesa_prim converted = u_index_prim_type_convert(
          GEX_WGPU_PRIM_MODES, info->mode, info->index_size != 0);
+      if (getenv("GEX_WGPU_PRIM_LOG")) {
+         static unsigned told;
+         if (told < 6) { ++told;
+            fprintf(stderr, "gex-wgpu: primconvert mode=%u -> %u\n",
+                    info->mode, converted); }
+      }
       if (!ctx->primconvert ||
           !(GEX_WGPU_PRIM_MODES & BITFIELD_BIT(converted))) {
          static bool said;
@@ -15181,8 +15308,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       } else {
          index_resource = info->index.resource;
       }
+      /* Same as the vertex buffers: the bind flags say what it was created
+       * for, not what it can do. */
       if (!index_resource || index_resource->target != PIPE_BUFFER ||
-          !(index_resource->bind & PIPE_BIND_INDEX_BUFFER) ||
           (uint64_t)index_upload_offset +
              (uint64_t)(uploaded_index_resource ? 0 : draws[0].start) *
                 info->index_size +
@@ -15201,10 +15329,24 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    const int64_t t_bounds_start = gex_timing ? os_time_get_nano() : 0;
    if (ctx->vertex_elements) {
       uint64_t last_vertex = (uint64_t)draws[0].start + draws[0].count - 1;
+      /* Whether the highest index this draw reads is knowable at all. It is
+       * not when the index buffer has no CPU shadow, which is the case for
+       * one written only on the GPU: the geometry stage's compute pass writes
+       * ctx->gs_indices and nothing ever maps it, so `shadow` is NULL and
+       * this scan read from `NULL + offset`. `gsraytrace` segfaulted there as
+       * soon as it got far enough to rasterize what its geometry shader had
+       * written. The scan feeds a diagnostic overrun check and nothing else,
+       * so not knowing is only a lost warning. */
+      bool bounds_known = true;
       if (info->index_size) {
          last_vertex = 0;
+         const uint8_t *shadow = gex_resource(index_resource)->shadow;
+         if (!shadow) {
+            bounds_known = false;
+            goto bounds_done;
+         }
          gex_wgpu_mark_shadow_read(gex_resource(index_resource));
-         const uint8_t *indices = gex_resource(index_resource)->shadow +
+         const uint8_t *indices = shadow +
                                   index_byte_offset +
                                   (uint64_t)first_index * info->index_size;
          for (unsigned i = 0; i < draws[0].count; ++i) {
@@ -15218,7 +15360,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             last_vertex = MAX2(last_vertex, index);
          }
       }
-      for (unsigned i = 0; i < ctx->vertex_elements->count; ++i) {
+   bounds_done:
+      for (unsigned i = 0; bounds_known && i < ctx->vertex_elements->count;
+           ++i) {
          const struct pipe_vertex_element *element =
             &ctx->vertex_elements->elements[i];
          const unsigned buffer = element->vertex_buffer_index;

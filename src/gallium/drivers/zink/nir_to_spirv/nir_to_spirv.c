@@ -1505,6 +1505,16 @@ emit_bo(struct ntv_context *ctx, struct nir_variable *var, bool aliased)
    if (aliased)
       spirv_builder_emit_decoration(&ctx->builder, var_id, SpvDecorationAliased);
 
+   /* NonWritable, where the variable says so. emit_bo did not look at
+    * var->data.access at all, so a buffer a driver had marked read-only was
+    * still declared read_write -- and on WebGPU that is not cosmetic: two
+    * *writable* storage bindings may not cover the same range, which one
+    * vertex buffer feeding several attributes produces. Tint maps this
+    * decoration to `var<storage, read>`. */
+   if (var->data.access & ACCESS_NON_WRITEABLE)
+      spirv_builder_emit_decoration(&ctx->builder, var_id,
+                                    SpvDecorationNonWritable);
+
    unsigned idx = bitsize >> 4;
    assert(idx < ARRAY_SIZE(ctx->ssbos));
    if (ssbo && !ctx->sinfo->is_native_vulkan) {
