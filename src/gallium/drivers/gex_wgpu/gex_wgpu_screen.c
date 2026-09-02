@@ -5057,8 +5057,13 @@ gex_wgpu_set_viewport_states(struct pipe_context *pipe, unsigned start_slot,
        !isfinite(states[0].scale[0]) || !isfinite(states[0].scale[1]) ||
        !isfinite(states[0].scale[2]) || !isfinite(states[0].translate[0]) ||
        !isfinite(states[0].translate[1]) || !isfinite(states[0].translate[2]) ||
-       states[0].scale[0] <= 0.0f || states[0].scale[1] == 0.0f ||
-       states[0].scale[2] < 0.0f ||
+       /* Zero is allowed on either axis: glViewport(x, y, 0, h) is legal GL
+        * and draws nothing, and `wincopy` asks for it (scale=0,-0 with a
+        * non-zero translate, which the all-zero case above does not catch).
+        * Failing the context over it cost every later call in it. The draw
+        * path declines the draw instead. A *negative* width still cannot come
+        * from GL. */
+       states[0].scale[0] < 0.0f || states[0].scale[2] < 0.0f ||
        states[0].swizzle_x != PIPE_VIEWPORT_SWIZZLE_POSITIVE_X ||
        states[0].swizzle_y != PIPE_VIEWPORT_SWIZZLE_POSITIVE_Y ||
        states[0].swizzle_z != PIPE_VIEWPORT_SWIZZLE_POSITIVE_Z ||
@@ -12733,12 +12738,18 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       bool uses_sampler = false;
       for (unsigned j = 0; j < vs->sampler_count; ++j)
          uses_sampler |= vs->sampler_slots[j] == slot;
-      if (!view || (uses_sampler && !sampler)) {
+      /* A missing view still declines -- there is nothing to sample -- but a
+       * missing sampler *state* does not. st/mesa binds a sampler view
+       * without sampler state for a unit it only reads through a display
+       * path, and the fragment stage has always served that with a default
+       * sampler; declining here made the same situation cost the whole draw.
+       * See the depth-as-float relaxation in draw_vbo_inner. */
+      if (!view) {
          static bool said;
          if (!said) {
             said = true;
-            fprintf(stderr, "gex-wgpu: vertex shader declined (view or "
-                            "sampler missing for a sampled slot)\n");
+            fprintf(stderr, "gex-wgpu: vertex shader declined (no view for a "
+                            "sampled slot)\n");
          }
          return NULL;
       }
@@ -12750,7 +12761,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
          gex_wgpu_effective_view_swizzle(view, 3) != PIPE_SWIZZLE_W;
       lower_textures |= (vs->integer_sampled_slots & (1u << slot)) != 0 ||
                         swizzled;
-      if (uses_sampler)
+      if (uses_sampler && sampler)
          lower_textures |=
             sampler->state.wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
             sampler->state.wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
@@ -14839,24 +14850,28 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * poisons the device. The transform is affine, so it is folded into
        * gl_Position instead and WebGPU is given the whole framebuffer --
        * which is what a driver on a clipped-viewport API does. */
+      /* Ahead of the clipping fold, not inside it: a viewport with no area
+       * that happens to sit *within* the framebuffer never reached this and
+       * went to setViewport instead. Nothing can be drawn through a rectangle
+       * covering no pixels, which is exactly what GL means by it. */
+      if (viewport_width <= 0.0f || viewport_height <= 0.0f ||
+          ctx->fb_width == 0 || ctx->fb_height == 0) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr,
+                    "gex-wgpu: draw declined (viewport covers no pixels) "
+                    "%.1f,%.1f %.1fx%.1f fb=%ux%u\n", viewport_x, viewport_y,
+                    viewport_width, viewport_height, ctx->fb_width,
+                    ctx->fb_height);
+         }
+         return;
+      }
       if (viewport_x < 0.0f || viewport_y < 0.0f ||
           viewport_x + viewport_width > ctx->fb_width ||
           viewport_y + viewport_height > ctx->fb_height) {
          const float full_width = (float)ctx->fb_width;
          const float full_height = (float)ctx->fb_height;
-         if (full_width <= 0.0f || full_height <= 0.0f ||
-             viewport_width <= 0.0f || viewport_height <= 0.0f) {
-            static bool said;
-            if (!said) {
-               said = true;
-               fprintf(stderr,
-                       "gex-wgpu: draw declined (degenerate viewport) "
-                       "%.1f,%.1f %.1fx%.1f fb=%ux%u\n", viewport_x,
-                       viewport_y, viewport_width, viewport_height,
-                       ctx->fb_width, ctx->fb_height);
-            }
-            return;
-         }
          viewport_fold[0] = viewport_width / full_width;
          viewport_fold[1] = viewport_height / full_height;
          viewport_fold[2] =
@@ -16142,7 +16157,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           * vertex stage, and the application's own sampler may well be
           * LINEAR. */
          entries[entry].sampler = ctx->vertex_samplers[slot]
-            ? ctx->vertex_samplers[slot]->nonfiltering : NULL;
+            ? ctx->vertex_samplers[slot]->nonfiltering
+            : gex_wgpu_default_sampler(screen,
+                                       WGPUSamplerBindingType_NonFiltering);
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[3];
@@ -16158,7 +16175,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    const bool bind_failed =
       (needs_texture && !bind_groups[0]) ||
       (needs_vertex_constant && !bind_groups[1]) ||
-      (needs_fragment_constant && !bind_groups[2]);
+      (needs_fragment_constant && !bind_groups[2]) ||
+      /* Group 3 was left out, so a vertex-texture bind group that failed to
+       * build was bound as NULL and the draw went ahead reading nothing. */
+      (needs_vertex_texture && !bind_groups[3]);
    if (!pipeline || (!reuse && (missing_view || (ctx->depth && !depth_view))) ||
        !encoder || bind_failed) {
       fprintf(stderr,
