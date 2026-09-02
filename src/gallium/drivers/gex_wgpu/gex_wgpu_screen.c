@@ -6183,6 +6183,47 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
    FREE(gex);
 }
 
+/* A checksum of what an upload actually puts on the queue, so two runs that
+ * take different paths to the same buffer can be compared byte for byte
+ * without reading anything back. GEX_WGPU_UPLOAD_LOG=1. */
+static void
+gex_wgpu_log_upload(const char *via, unsigned width0, uint32_t offset,
+                    const void *data, size_t size)
+{
+   const char *want = getenv("GEX_WGPU_UPLOAD_LOG");
+   if (!want)
+      return;
+   /* Skipping matters: the first few hundred uploads are all loading, and
+    * comparing only those said the two paths were identical when the
+    * per-frame rewrites had never been looked at. GEX_WGPU_UPLOAD_LOG=<skip>
+    * logs sixty uploads starting after <skip> of them. */
+   static unsigned seq;
+   const unsigned skip = (unsigned)atoi(want);
+   const unsigned at = seq++;
+   if (at < skip || at >= skip + 60)
+      return;
+   uint32_t hash = 2166136261u;
+   const uint8_t *bytes = data;
+   for (size_t i = 0; i < size; ++i) {
+      hash ^= bytes[i];
+      hash *= 16777619u;
+   }
+   fprintf(stderr, "gex-upload[%u] %-6s width0=%u off=%u size=%zu sum=%08x",
+           at, via, width0, offset, size, hash);
+   /* A 44-byte upload is one object's per-instance block in SuperTuxKart --
+    * i_origin, i_rotation, i_scale, i_texture_trans, i_misc_data, the
+    * stride=44 divisor=1 attributes. The shader computes position from them,
+    * so their values are the whole question. */
+   if (size == 44) {
+      float f[11];
+      memcpy(f, bytes, sizeof(f));
+      fprintf(stderr, " =");
+      for (unsigned i = 0; i < 11; ++i)
+         fprintf(stderr, " %.2f", f[i]);
+   }
+   fprintf(stderr, "\n");
+}
+
 static void
 gex_wgpu_buffer_subdata(struct pipe_context *pipe,
                         struct pipe_resource *resource, unsigned usage,
@@ -8209,21 +8250,10 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    /* The staged block starts out zeroed and the whole mapped range is
     * uploaded out of it at unmap, so this path is only correct when the
     * caller has undertaken to write every byte of that range -- which in
-    * Gallium is what the discard flags mean.
+    * Gallium is what the discard flags mean. A plain PIPE_MAP_WRITE promises
+    * nothing of the kind and may write as little as it likes.
     *
-    * Without that check a plain PIPE_MAP_WRITE, which promises nothing and
-    * may write as little as it likes, had the bytes it left alone uploaded
-    * as zeros on top of the buffer's existing contents. SuperTuxKart maps a
-    * mesh buffer and rewrites part of it: the rest became zeros, its
-    * positions collapsed onto the origin, and the scene rasterised nothing
-    * while the skybox and the HUD -- which do not take this path -- still
-    * landed. Everything in the frame looked correct at the API level, which
-    * is what made it expensive to find: the draws arrive, every attribute is
-    * supplied, the matrices are right, and there is no error anywhere.
-    *
-    * u_upload_mgr and the streaming paths that this optimisation was written
-    * for all pass a discard flag, so they keep it. */
-   /* DISCARD_RANGE only, deliberately not DISCARD_WHOLE_RESOURCE.
+    * DISCARD_RANGE only, deliberately not DISCARD_WHOLE_RESOURCE.
     *
     * DISCARD_RANGE is the streaming pattern this path was written for:
     * u_upload_mgr hands out a fresh region of a big buffer and fills it, so a
@@ -8247,8 +8277,15 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
     * crowd scene is 66-70 fps with staging and 71-76 without, so restricting
     * it costs nothing there. GEX_WGPU_NO_STAGED_MAP=1 disables it entirely,
     * which is how this was found. */
+   /* GEX_WGPU_STAGE_WHOLE=1 restores the old behaviour of also staging a
+    * whole-resource discard, so the broken and correct paths are both
+    * reachable from one build and can be compared directly. */
+   static int stage_whole = -1;
+   if (stage_whole < 0)
+      stage_whole = getenv("GEX_WGPU_STAGE_WHOLE") ? 1 : 0;
    const bool overwrites_whole_range =
-      (usage & PIPE_MAP_DISCARD_RANGE) != 0;
+      (usage & (PIPE_MAP_DISCARD_RANGE |
+                (stage_whole ? PIPE_MAP_DISCARD_WHOLE_RESOURCE : 0))) != 0;
    const bool staged =
       !no_staged && overwrites_whole_range &&
       !gex->shadow && !(usage & PIPE_MAP_READ) &&
@@ -8450,6 +8487,9 @@ gex_wgpu_buffer_unmap(struct pipe_context *pipe,
        transfer->box.width > 0) {
       /* The staged block covers exactly the mapped range, and the range is
        * 4-aligned by construction, so it uploads as it stands. */
+      gex_wgpu_log_upload("staged", resource->width0,
+                          (uint32_t)transfer->box.x, gex_transfer->data,
+                          (size_t)transfer->box.width);
       wgpuQueueWriteBuffer(gex_screen(pipe->screen)->queue, gex->buffer,
                            (uint32_t)transfer->box.x, gex_transfer->data,
                            (size_t)transfer->box.width);
@@ -8460,6 +8500,9 @@ gex_wgpu_buffer_unmap(struct pipe_context *pipe,
       const uint32_t aligned_start = start & ~3u;
       const uint32_t aligned_end =
          ALIGN_POT(start + (uint32_t)transfer->box.width, 4);
+      gex_wgpu_log_upload("shadow", resource->width0, aligned_start,
+                          gex->shadow + aligned_start,
+                          aligned_end - aligned_start);
       wgpuQueueWriteBuffer(gex_screen(pipe->screen)->queue, gex->buffer,
                            aligned_start, gex->shadow + aligned_start,
                            aligned_end - aligned_start);
