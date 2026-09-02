@@ -358,6 +358,12 @@ struct gex_wgpu_resource {
    WGPUBuffer buffer;
    uint8_t *shadow;
    uint64_t allocation_size;
+   /* The WGPU buffer's real size and usage, which is allocation_size and the
+    * usage it was created with until a shader forces a bigger one -- see
+    * gex_wgpu_grow_buffer_for_block. Everything else keeps measuring the
+    * resource by allocation_size, which is what st/mesa asked for. */
+   uint64_t gpu_size;
+   WGPUBufferUsage buffer_usage;
    /* Set once a compute pass has written this buffer on the GPU, which makes
     * the CPU shadow stale. glMapBuffer of a transform feedback target is
     * exactly that case, and the bind flags do not always say so: a buffer
@@ -588,6 +594,10 @@ struct gex_wgpu_shader {
    uint32_t ubo_storage_mask;
    uint8_t ubo_slots[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    uint32_t ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   /* Bytes the emitted module declares for that block, or 0 where the block
+    * ends in a runtime-sized array and has no fixed size. Only the layout's
+    * minBindingSize wants it -- see gex_wgpu_min_binding_size. */
+   uint32_t ubo_required[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    unsigned texture_count;
    uint8_t texture_slots[GEX_WGPU_MAX_SAMPLERS];
    uint32_t texture_bindings[GEX_WGPU_MAX_SAMPLERS];
@@ -800,6 +810,7 @@ struct gex_wgpu_gs {
    unsigned ubo_count;
    uint8_t ubo_slots[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    uint32_t ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   uint32_t ubo_required[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    uint32_t ubo_storage_mask;
    WGPUShaderModule module;
    /* The rasterization half: a vertex shader that reads the geometry output
@@ -849,6 +860,17 @@ struct gex_wgpu_vertex_elements {
 
 struct gex_wgpu_sampler {
    WGPUSampler sampler;
+   /* The same sampler with the filters forced to nearest, for a vertex-stage
+    * fetch. WebGPU has no filtering sampler in the vertex stage -- there are
+    * no derivatives there -- so the layout names the binding non-filtering,
+    * and binding the application's LINEAR sampler into it is rejected:
+    *
+    *   Filtering sampler [Sampler] is incompatible with non-filtering
+    *   sampler binding.
+    *
+    * `vert-tex` samples a texture from its vertex shader with GL_LINEAR, and
+    * nearest is the closest thing WebGPU can do for it. */
+   WGPUSampler nonfiltering;
    struct pipe_sampler_state state;
 };
 
@@ -3455,6 +3477,67 @@ gex_wgpu_is_location_varying(int location)
    }
 }
 
+/* Bytes the emitted module will declare for one buffer block.
+ *
+ * zink's SPIR-V emitter gives every UBO and SSBO the same shape -- a struct
+ * holding one array of 32-bit words, sized from the block -- so the size
+ * WebGPU will measure the binding against is the array's, computed here the
+ * way get_bo_array_type() computes it. A block ending in a runtime-sized
+ * array has no fixed size and returns 0.
+ *
+ * Called after ntv_shader_prepare, which is what puts the variables into that
+ * shape; before it they still carry their GLSL types and this would measure
+ * something else. */
+static uint32_t
+gex_wgpu_block_declared_size(const nir_variable *var)
+{
+   const struct glsl_type *type = glsl_without_array(var->type);
+   /* An interface block, not a plain struct: glsl_type_is_struct() answers no
+    * for GLSL_TYPE_INTERFACE, which is what st/mesa hands over here. */
+   if (!glsl_type_is_struct_or_ifc(type) || glsl_get_length(type) < 1)
+      return 0;
+   const struct glsl_type *first = glsl_get_struct_field(type, 0);
+   uint32_t size;
+   if (glsl_type_is_array(first) && !glsl_type_is_unsized_array(first) &&
+       glsl_type_is_scalar(glsl_without_array(first))) {
+      /* The word-array shape zink's emitter gives a block it lowered. */
+      const unsigned bits = glsl_get_bit_size(glsl_get_array_element(first));
+      size = bits ? (uint32_t)glsl_get_length(first) * (bits / 8) : 0;
+   } else {
+      /* Still in its declared shape, so the block's own explicit size is
+       * what the emitter will lay out. */
+      size = (uint32_t)glsl_get_explicit_size(type, false);
+   }
+   if (getenv("GEX_WGPU_UBO_SIZE_LOG"))
+      fprintf(stderr, "gex-wgpu: block %s type=%s fields=%u size=%u\n",
+              var->name ? var->name : "(anon)", glsl_get_type_name(type),
+              glsl_get_length(type), size);
+   return size;
+}
+
+/* How many bytes of a constant buffer to bind.
+ *
+ * The obvious answer -- the size st/mesa bound -- is what this used to be,
+ * and WebGPU rejects it whenever a shader declares a bigger block than the
+ * application bound, which GL allows. See gex_wgpu_grow_buffer_for_block for
+ * the case and the two errors it produces; by the time this runs the buffer
+ * has been grown to hold the whole block, so the binding can name it.
+ *
+ * Clamped to what is actually there, because growing can fail. */
+static uint64_t
+gex_wgpu_constant_binding_size(const struct pipe_constant_buffer *constant,
+                               uint32_t required)
+{
+   const struct gex_wgpu_resource *gex = gex_resource(constant->buffer);
+   uint64_t size = ALIGN_POT((uint64_t)constant->buffer_size, 16);
+   if ((uint64_t)required > size)
+      size = required;
+   const uint64_t offset = constant->buffer_offset;
+   if (offset + size > gex->gpu_size)
+      size = gex->gpu_size > offset ? gex->gpu_size - offset : 0;
+   return size;
+}
+
 static struct gex_wgpu_shader *
 gex_wgpu_create_shader_state(struct pipe_context *pipe,
                              const struct pipe_shader_state *state,
@@ -3635,6 +3718,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       }
       shader->ubo_slots[shader->ubo_count] = slot;
       shader->ubo_bindings[shader->ubo_count] = var->data.binding;
+      shader->ubo_required[shader->ubo_count] =
+         gex_wgpu_block_declared_size(var);
       if (var->data.mode == nir_var_mem_ssbo)
          shader->ubo_storage_mask |= 1u << shader->ubo_count;
       ++shader->ubo_count;
@@ -6262,6 +6347,8 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
        * feedback compute pass, which has no fixed-function fetch. */
       if (templ->bind & (PIPE_BIND_VERTEX_BUFFER | PIPE_BIND_VERTEX_STATE))
          desc.usage |= WGPUBufferUsage_Storage;
+      resource->gpu_size = desc.size;
+      resource->buffer_usage = desc.usage;
       resource->buffer =
          wgpuDeviceCreateBuffer(gex_screen(screen)->device, &desc);
       if (!resource->buffer) {
@@ -6366,7 +6453,26 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
    if (templ->bind & PIPE_BIND_SAMPLER_VIEW)
       desc.usage |= WGPUTextureUsage_TextureBinding;
    if (templ->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL))
-      desc.usage |= WGPUTextureUsage_RenderAttachment;
+      desc.usage |= WGPUTextureUsage_RenderAttachment |
+                    /* Sampled as well as rendered into, whether or not
+                     * PIPE_BIND_SAMPLER_VIEW was asked for.
+                     *
+                     * WebGPU wants every usage declared at creation and this
+                     * driver cannot go back and add one later, while Gallium
+                     * lets an internal helper sample a resource the frontend
+                     * never said would be sampled: u_blitter reads its source
+                     * through a sampler view, and st/mesa creates a depth
+                     * attachment with PIPE_BIND_DEPTH_STENCIL alone
+                     * (bind=0x1, measured). The bind group was then rejected
+                     *
+                     *   [TextureView of Texture (Depth24PlusStencil8)] usage
+                     *   (CopySrc|CopyDst|RenderAttachment) ... While
+                     *   validating entries[0] as a Sampled Texture
+                     *
+                     * which `dissolve` and `tri-z-eq` both hit. Anything this
+                     * driver can render into is something a blit may later
+                     * read, so the usage belongs on all of them. */
+                    WGPUTextureUsage_TextureBinding;
    /* A drawable's front and back buffers carry only the window-system bind on
     * the way in, and rendering into them is the entire point. */
    if (templ->bind & (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT |
@@ -7182,6 +7288,17 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
       FREE(sampler);
       return NULL;
    }
+   /* Built alongside, so the vertex path never has to create one mid-draw. */
+   desc.magFilter = WGPUFilterMode_Nearest;
+   desc.minFilter = WGPUFilterMode_Nearest;
+   desc.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+   sampler->nonfiltering =
+      wgpuDeviceCreateSampler(gex_screen(pipe->screen)->device, &desc);
+   if (!sampler->nonfiltering) {
+      wgpuSamplerRelease(sampler->sampler);
+      FREE(sampler);
+      return NULL;
+   }
    sampler->state = *state;
    return sampler;
 }
@@ -7234,6 +7351,8 @@ gex_wgpu_delete_sampler_state(struct pipe_context *pipe, void *state)
    GEX_ENTRY_TIMER();
    (void)pipe;
    struct gex_wgpu_sampler *sampler = state;
+   if (sampler && sampler->nonfiltering)
+      wgpuSamplerRelease(sampler->nonfiltering);
    if (sampler && sampler->sampler)
       wgpuSamplerRelease(sampler->sampler);
    FREE(sampler);
@@ -7934,8 +8053,22 @@ gex_wgpu_read_depth(struct gex_wgpu_context *ctx,
    buffer_desc.size = depth_size;
    WGPUBuffer depth_buffer = wgpuDeviceCreateBuffer(screen->device, &buffer_desc);
 
-   const uint32_t stencil_row = ((uint32_t)box->width + 255u) & ~255u;
-   const uint64_t stencil_size = (uint64_t)stencil_row * box->height;
+   /* The stencil aspect has to be copied whole.
+    *
+    * WebGPU allows a partial texture-to-buffer copy for ordinary formats but
+    * not for a depth-stencil one:
+    *
+    *   Copy origin ([Origin3D x:125, y:125, z:0]) and size ([Extent3D
+    *   width:1, height:1 ...]) does not cover the entire subresource
+    *
+    * and `tri-z-eq` reads back a single pixel, which is as partial as it
+    * gets. So the whole level comes back and the wanted rectangle is taken
+    * out of it below. The depth aspect above is not affected: it is resolved
+    * into an ordinary colour texture first, and that copy may be partial. */
+   const unsigned stencil_level_width = u_minify(resource->width0, level);
+   const unsigned stencil_level_height = u_minify(resource->height0, level);
+   const uint32_t stencil_row = (stencil_level_width + 255u) & ~255u;
+   const uint64_t stencil_size = (uint64_t)stencil_row * stencil_level_height;
    WGPUBuffer stencil_buffer = NULL;
    if (has_stencil) {
       buffer_desc.size = stencil_size;
@@ -7979,14 +8112,15 @@ gex_wgpu_read_depth(struct gex_wgpu_context *ctx,
          WGPUTexelCopyTextureInfo sfrom = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
          sfrom.texture = gex_resource(resource)->texture;
          sfrom.mipLevel = level;
-         sfrom.origin.x = box->x;
-         sfrom.origin.y = box->y;
          sfrom.aspect = WGPUTextureAspect_StencilOnly;
          WGPUTexelCopyBufferInfo sto = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
          sto.buffer = stencil_buffer;
          sto.layout.bytesPerRow = stencil_row;
-         sto.layout.rowsPerImage = box->height;
-         wgpuCommandEncoderCopyTextureToBuffer(encoder, &sfrom, &sto, &extent);
+         sto.layout.rowsPerImage = stencil_level_height;
+         const WGPUExtent3D stencil_extent = {stencil_level_width,
+                                              stencil_level_height, 1};
+         wgpuCommandEncoderCopyTextureToBuffer(encoder, &sfrom, &sto,
+                                               &stencil_extent);
       }
 
       WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
@@ -8033,12 +8167,14 @@ gex_wgpu_read_depth(struct gex_wgpu_context *ctx,
       for (int y = 0; y < box->height; ++y) {
          const float *row =
             (const float *)((const uint8_t *)depth_mapped + (size_t)y * depth_row);
+         /* Indexed from the level's origin, since the stencil buffer holds
+          * the whole subresource rather than just the requested box. */
          const uint8_t *srow = stencil_mapped
-            ? stencil_mapped + (size_t)y * stencil_row : NULL;
+            ? stencil_mapped + (size_t)(box->y + y) * stencil_row : NULL;
          uint8_t *dst = out + (size_t)y * out_stride;
          for (int x = 0; x < box->width; ++x) {
             const float d = row[x];
-            const uint8_t st = srow ? srow[x] : 0;
+            const uint8_t st = srow ? srow[box->x + x] : 0;
             switch (format) {
             case PIPE_FORMAT_Z24_UNORM_S8_UINT: {
                /* Depth in the low 24 bits, stencil in the high 8: what
@@ -9883,12 +10019,78 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
    if (!encoder)
       return false;
 
+   /* A texture copied onto itself goes via a scratch copy.
+    *
+    * WebGPU refuses a copy whose source and destination subresources are the
+    * same, overlapping or not:
+    *
+    *   Copy source and destination are overlapping layer ranges ([0, 1) and
+    *   [0, 1)) of [Texture (750x250 px, BGRA8Unorm)]
+    *
+    * and it is an invalid command buffer, which fails every later submit
+    * rather than just this copy. GL has no such restriction and st/mesa's
+    * ReadPixels staging path asks for one, which is how `readpix` reached it.
+    *
+    * Two copies through a scratch texture of the requested size say the same
+    * thing, and both are ordered inside this one encoder. */
+   WGPUTexture scratch = NULL;
+   static int copy_log = -1;
+   if (copy_log < 0) {
+      const char *value = getenv("GEX_WGPU_COPY_LOG");
+      copy_log = value && *value && *value != '0';
+   }
+   if (copy_log)
+      fprintf(stderr, "gex-wgpu: copy_region src=%p dst=%p flip=%d\n",
+              (void *)gex_src->texture, (void *)gex_dst->texture, (int)flip_y);
+   if (gex_src->texture == gex_dst->texture) {
+      WGPUTextureDescriptor scratch_desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+      scratch_desc.usage = WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+      scratch_desc.dimension = WGPUTextureDimension_2D;
+      scratch_desc.size = (WGPUExtent3D){(uint32_t)box->width,
+                                         (uint32_t)abs(box->height),
+                                         (uint32_t)box->depth};
+      scratch_desc.format = gex_wgpu_texture_format(src->format);
+      scratch_desc.mipLevelCount = 1;
+      scratch_desc.sampleCount = 1;
+      scratch = wgpuDeviceCreateTexture(screen->device, &scratch_desc);
+      if (!scratch) {
+         wgpuCommandEncoderRelease(encoder);
+         return false;
+      }
+      /* A flipped box runs upward from box->y, so its lowest row is
+       * box->y - |height|, not box->y. */
+      const uint32_t rows = (uint32_t)abs(box->height);
+      WGPUTexelCopyTextureInfo aside = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+      aside.texture = gex_src->texture;
+      aside.mipLevel = src_level;
+      aside.origin = (WGPUOrigin3D){(uint32_t)box->x,
+                                    flip_y ? (uint32_t)box->y - rows
+                                           : (uint32_t)box->y,
+                                    (uint32_t)box->z};
+      WGPUTexelCopyTextureInfo into = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+      into.texture = scratch;
+      const WGPUExtent3D whole = {(uint32_t)box->width, rows,
+                                  (uint32_t)box->depth};
+      wgpuCommandEncoderCopyTextureToTexture(encoder, &aside, &into, &whole);
+   }
+
    WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
-   from.texture = gex_src->texture;
-   from.mipLevel = src_level;
+   from.texture = scratch ? scratch : gex_src->texture;
+   from.mipLevel = scratch ? 0 : src_level;
    WGPUTexelCopyTextureInfo to = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
    to.texture = gex_dst->texture;
    to.mipLevel = dst_level;
+   /* The scratch holds only the requested region, so it is read from its
+    * own origin rather than the source's. */
+   struct pipe_box scratch_box = *box;
+   if (scratch) {
+      scratch_box.x = 0;
+      /* The flip loop below reads rows box->y-1 down to box->y-|height|, so
+       * the rebased origin is the row count rather than zero. */
+      scratch_box.y = flip_y ? abs(box->height) : 0;
+      scratch_box.z = 0;
+      box = &scratch_box;
+   }
 
    const uint32_t height = (uint32_t)abs(box->height);
    /* Before the branch: the flipping path below writes the destination just
@@ -9899,6 +10101,12 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
     * "samples a texture nothing ever wrote" while the copy was in fact
     * happening. */
    gex_resource(dst)->texture_written = true;
+#define GEX_COPY_DONE(result)                                                 \
+   do {                                                                       \
+      if (scratch)                                                            \
+         wgpuTextureRelease(scratch);                                         \
+      return (result);                                                        \
+   } while (0)
    if (!flip_y) {
       from.origin =
          (WGPUOrigin3D){(uint32_t)box->x, (uint32_t)box->y, (uint32_t)box->z};
@@ -9927,11 +10135,12 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
    WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
    wgpuCommandEncoderRelease(encoder);
    if (!commands)
-      return false;
+      GEX_COPY_DONE(false);
    gex_wgpu_queue_submit(screen, 1, &commands);
    wgpuCommandBufferRelease(commands);
    (void)ctx;
-   return true;
+   GEX_COPY_DONE(true);
+#undef GEX_COPY_DONE
 }
 
 /* Snapshot a colour attachment so a draw that also samples it can read the
@@ -11489,6 +11698,7 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
          continue;
       gs->ubo_slots[gs->ubo_count] = var->data.driver_location;
       gs->ubo_bindings[gs->ubo_count] = var->data.binding;
+      gs->ubo_required[gs->ubo_count] = gex_wgpu_block_declared_size(var);
       if (var->data.mode == nir_var_mem_ssbo)
          gs->ubo_storage_mask |= 1u << gs->ubo_count;
       ++gs->ubo_count;
@@ -11873,12 +12083,13 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       ubo_entries[i].visibility = WGPUShaderStage_Compute;
       ubo_entries[i].buffer.type = WGPUBufferBindingType_Uniform;
       ubo_entries[i].buffer.minBindingSize =
-         ALIGN_POT(constant->buffer_size, 16);
+         gex_wgpu_constant_binding_size(constant, ctx->vs->ubo_required[i]);
       ubo_bindings[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       ubo_bindings[i].binding = ctx->vs->ubo_bindings[i];
       ubo_bindings[i].buffer = gex_resource(constant->buffer)->buffer;
       ubo_bindings[i].offset = constant->buffer_offset;
-      ubo_bindings[i].size = ALIGN_POT(constant->buffer_size, 16);
+      ubo_bindings[i].size =
+         gex_wgpu_constant_binding_size(constant, ctx->vs->ubo_required[i]);
    }
 
    WGPUBindGroupLayoutDescriptor layout_desc =
@@ -13394,6 +13605,110 @@ gex_wgpu_default_attribute_buffer(struct gex_wgpu_screen *screen)
      return gex_ret; }
 }
 
+
+/* Grow a buffer's GPU allocation so a shader's whole block fits in it.
+ *
+ * GL lets glBindBufferRange bind less than the block a shader declares --
+ * reads past the end are undefined, not an error -- and applications do it
+ * whenever the tail of a block goes unused. `blinking-teapot` declares
+ *
+ *   layout(std140) uniform colors0 { ... vec4 some[8]; };
+ *
+ * which std140 lays out at 192 bytes, never reads `some`, and uploads 80.
+ *
+ * WebGPU has no equivalent latitude. It checks the binding against the size
+ * the *module* declares, at pipeline creation through minBindingSize and
+ * again at draw time against the pipeline, and a relaxed minBindingSize only
+ * moves the failure from the first check to the second:
+ *
+ *   [Buffer] bound with size 80 at group 2, binding 1 is too small. The
+ *   pipeline requires a buffer binding which is at least 192 bytes.
+ *
+ * So the binding has to be big enough, which means the buffer does. The
+ * resource keeps the size st/mesa gave it -- uploads, maps and the shadow all
+ * still measure it by allocation_size -- and only the WGPU buffer behind it
+ * grows, once, carrying its old contents over. The bytes past the end read as
+ * zero, which is one of the values GL's "undefined" allows.
+ *
+ * Returns false if the buffer could not be grown, in which case the caller
+ * leaves the binding as it was and the draw fails as it did before. */
+static bool
+gex_wgpu_grow_buffer_for_block(struct gex_wgpu_context *ctx,
+                               struct gex_wgpu_resource *gex, uint64_t need)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   if (need <= gex->gpu_size || !gex->buffer)
+      return true;
+   const uint64_t want = ALIGN_POT(need, 16);
+   /* Anything already recorded reads the old buffer, and the copy below is
+    * submitted before it would be. Getting the recorded work out first keeps
+    * the two in the order the application wrote them. */
+   gex_wgpu_submit_pending(ctx);
+   WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+   desc.size = want;
+   desc.usage = gex->buffer_usage;
+   WGPUBuffer grown = wgpuDeviceCreateBuffer(screen->device, &desc);
+   if (!grown)
+      return false;
+   /* Carry the old contents across. Copy sizes have to be a multiple of four,
+    * which the old size already is: buffer allocations are rounded to 4 and
+    * constant buffers to 16. */
+   const uint64_t carry = gex->gpu_size & ~(uint64_t)3;
+   if (carry) {
+      WGPUCommandEncoder encoder =
+         wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+      if (!encoder) {
+         wgpuBufferRelease(grown);
+         return false;
+      }
+      wgpuCommandEncoderCopyBufferToBuffer(encoder, gex->buffer, 0, grown, 0,
+                                           carry);
+      WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
+      wgpuCommandEncoderRelease(encoder);
+      if (!commands) {
+         wgpuBufferRelease(grown);
+         return false;
+      }
+      gex_wgpu_queue_submit(screen, 1, &commands);
+      wgpuCommandBufferRelease(commands);
+   }
+   wgpuBufferRelease(gex->buffer);
+   gex->buffer = grown;
+   gex->gpu_size = want;
+   /* Cached bind groups hold the buffer that is now gone. They would keep it
+    * alive rather than fault, but they would also keep binding the old
+    * contents, so the cache has to forget them. Growing happens once per
+    * resource, so the epoch bump costs nothing measurable. */
+   ++screen->cache_epoch;
+   return true;
+}
+
+/* Make room for every block the bound shaders declare, before anything reads
+ * a buffer size for a layout or a bind group. */
+static void
+gex_wgpu_fit_constant_blocks(struct gex_wgpu_context *ctx)
+{
+   const struct gex_wgpu_shader *stages[] = {ctx->vs, ctx->fs};
+   const enum mesa_shader_stage which[] = {MESA_SHADER_VERTEX,
+                                           MESA_SHADER_FRAGMENT};
+   for (unsigned s = 0; s < ARRAY_SIZE(stages); ++s) {
+      if (!stages[s])
+         continue;
+      for (unsigned i = 0; i < stages[s]->ubo_count; ++i) {
+         const uint32_t required = stages[s]->ubo_required[i];
+         if (!required)
+            continue;
+         const struct pipe_constant_buffer *constant =
+            &ctx->constant_buffers[which[s]][stages[s]->ubo_slots[i]];
+         if (!constant->buffer)
+            continue;
+         gex_wgpu_grow_buffer_for_block(
+            ctx, gex_resource(constant->buffer),
+            (uint64_t)constant->buffer_offset + required);
+      }
+   }
+}
+
 static void
 gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                         const struct pipe_draw_info *info,
@@ -13752,6 +14067,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       return;
    }
    gex_wgpu_release_retired_groups(gex_screen(pipe->screen));
+   /* Before any layout or bind group reads a buffer size. */
+   gex_wgpu_fit_constant_blocks(ctx);
 
    /* 8-bit indices, which GL has and WebGPU does not: widened to 16 before
     * anything else looks at them, so the unfilled rewrite, the restart split
@@ -15388,7 +15705,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * group per draw and there would be nothing left to cache. */
       vertex_layout_entries[i].buffer.hasDynamicOffset = true;
       vertex_layout_entries[i].buffer.minBindingSize =
-         ALIGN_POT(ctx->constant_buffers[MESA_SHADER_VERTEX][slot].buffer_size, 16);
+         gex_wgpu_constant_binding_size(
+            &ctx->constant_buffers[MESA_SHADER_VERTEX][slot],
+            ctx->vs->ubo_required[i]);
    }
    for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
       const unsigned slot = ctx->fs->ubo_slots[i];
@@ -15408,7 +15727,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * group per draw and there would be nothing left to cache. */
       fragment_layout_entries[i].buffer.hasDynamicOffset = true;
       fragment_layout_entries[i].buffer.minBindingSize =
-         ALIGN_POT(ctx->constant_buffers[MESA_SHADER_FRAGMENT][slot].buffer_size, 16);
+         gex_wgpu_constant_binding_size(
+            &ctx->constant_buffers[MESA_SHADER_FRAGMENT][slot],
+            ctx->fs->ubo_required[i]);
    }
    /* The vertex stage's textures, in group 3. */
    WGPUBindGroupLayoutEntry
@@ -15647,7 +15968,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[i].binding = ctx->vs->ubo_bindings[i];
          entries[i].buffer = gex_resource(constant->buffer)->buffer;
          entries[i].offset = 0;
-         entries[i].size = ALIGN_POT(constant->buffer_size, 16);
+         entries[i].size =
+            gex_wgpu_constant_binding_size(constant, ctx->vs->ubo_required[i]);
          gex_wgpu_add_dynamic_offset(&dynamic[1],
                                      ctx->vs->ubo_bindings[i],
                                      constant->buffer_offset);
@@ -15670,7 +15992,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[i].binding = ctx->fs->ubo_bindings[i];
          entries[i].buffer = gex_resource(constant->buffer)->buffer;
          entries[i].offset = 0;
-         entries[i].size = ALIGN_POT(constant->buffer_size, 16);
+         entries[i].size =
+            gex_wgpu_constant_binding_size(constant, ctx->fs->ubo_required[i]);
          gex_wgpu_add_dynamic_offset(&dynamic[2],
                                      ctx->fs->ubo_bindings[i],
                                      constant->buffer_offset);
@@ -15698,8 +16021,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const unsigned entry = ctx->vs->texture_count + i;
          entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[entry].binding = ctx->vs->sampler_bindings[i];
+         /* The non-filtering twin: the layout above names this binding
+          * non-filtering because WebGPU has no filtering sampler in the
+          * vertex stage, and the application's own sampler may well be
+          * LINEAR. */
          entries[entry].sampler = ctx->vertex_samplers[slot]
-            ? ctx->vertex_samplers[slot]->sampler : NULL;
+            ? ctx->vertex_samplers[slot]->nonfiltering : NULL;
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[3];
