@@ -21,6 +21,7 @@
 #include "util/format/u_format.h"
 #include "util/half_float.h"
 #include "util/u_inlines.h"
+#include "compiler/nir/nir_builtin_builder.h"
 #include "util/simple_mtx.h"
 #include "util/u_memory.h"
 #include "util/u_helpers.h"
@@ -2061,6 +2062,72 @@ gex_wgpu_swizzle_constant(nir_builder *b, const nir_tex_instr *tex,
    return is_float ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1);
 }
 
+/* textureQueryLod, computed rather than asked for.
+ *
+ * WGSL has no textureQueryLod and SPIR-V's OpImageQueryLod would only move
+ * the failure into Tint, so the value is worked out from the coordinate the
+ * way the GL specification defines it: scale the texture coordinate by the
+ * texture's size, take its screen-space derivatives, and the larger of the
+ * two lengths is the scale factor whose log2 is the level of detail.
+ *
+ * Returns what GL asks for -- x the level that would actually be accessed,
+ * clamped into the mip chain, and y the unclamped computed value.
+ *
+ * Derivatives only exist in a fragment shader, which is where GL allows this
+ * to be called; anywhere else it is left alone and refused later rather than
+ * quietly given a wrong answer.
+ */
+static bool
+gex_wgpu_lower_query_lod_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   (void)data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->op != nir_texop_lod)
+      return false;
+   if (b->shader->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+
+   const int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_index < 0)
+      return false;
+   nir_def *coord = tex->src[coord_index].src.ssa;
+   /* The array layer is not a coordinate for this purpose: it does not
+    * participate in the scale factor. */
+   const unsigned dims = glsl_get_sampler_dim_coordinate_components(
+      (enum glsl_sampler_dim)tex->sampler_dim);
+   if (coord->num_components < dims)
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+   coord = nir_trim_vector(b, coord, dims);
+
+   /* Texture size at the base level, as floats, to scale the coordinate into
+    * texels -- the derivative of a normalised coordinate says nothing on its
+    * own. */
+   nir_def *size = nir_i2f32(
+      b, nir_build_texture_query(b, tex, nir_texop_txs, dims, nir_type_int32,
+                                 false, true));
+   nir_def *scaled = nir_fmul(b, coord, size);
+   nir_def *ddx = nir_ddx(b, scaled);
+   nir_def *ddy = nir_ddy(b, scaled);
+   nir_def *rho = nir_fmax(b, nir_fast_length(b, ddx),
+                           nir_fast_length(b, ddy));
+   /* log2(0) is negative infinity, and a derivative of zero is ordinary --
+    * a fragment where the coordinate does not move wants the base level. */
+   nir_def *lambda = nir_flog2(b, nir_fmax(b, rho, nir_imm_float(b, 1e-20f)));
+
+   nir_def *levels = nir_i2f32(
+      b, nir_build_texture_query(b, tex, nir_texop_query_levels, 1,
+                                 nir_type_int32, false, false));
+   nir_def *top = nir_fadd_imm(b, levels, -1.0f);
+   nir_def *clamped = nir_fclamp(b, lambda, nir_imm_float(b, 0.0f), top);
+
+   nir_def_replace(&tex->def, nir_vec2(b, clamped, lambda));
+   return true;
+}
+
 static bool
 gex_wgpu_lower_view_swizzle_instr(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -2441,6 +2508,16 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
     * width check, so this lowers what the emitter cannot take while leaving
     * ordinary vec4 ALU alone. */
    NIR_PASS(_, nir, nir_lower_alu_width, gex_wgpu_alu_target_width, NULL);
+   /* textureQueryLod, which WGSL has no form of at all.
+    *
+    * This belongs here rather than in gex_wgpu_lower_texture_variant, where
+    * it started: that pass only runs for shaders needing a sampler variant,
+    * so a shader whose only unusual feature was the query went straight to
+    * SPIR-V and Tint refused its OpImageQueryLod. Nothing in the lowering
+    * depends on the bound view, so the base shader is the right place. */
+   NIR_PASS(_, nir, nir_shader_instructions_pass,
+            gex_wgpu_lower_query_lod_instr,
+            nir_metadata_control_flow | nir_metadata_loop_analysis, NULL);
    ntv_shader_prepare(nir);
    /* No deref may outlive the block it is used in.
     *
@@ -2832,10 +2909,27 @@ gex_wgpu_capture_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    if (!var || var->data.mode != nir_var_shader_out)
       return false;
 
+   nir_def *value = intr->src[1].ssa;
+   /* Which components of the varying slot this variable actually occupies.
+    *
+    * The linker packs several small varyings into one slot, so `a` and `b`
+    * both arrive here as location 32 and are told apart only by
+    * location_frac. Matching on the location alone made every store find the
+    * first output written to that slot, so a capture split across two buffers
+    * with gl_NextBuffer wrote one of them twice and the other not at all --
+    * and because a single-varying capture has nothing to collide with, it
+    * looked correct everywhere else. */
+   const unsigned frac = var->data.location_frac;
+   const unsigned var_mask =
+      (unsigned)BITFIELD_MASK(value->num_components) << frac;
+
    const nir_xfb_info *xfb = b->shader->xfb_info;
+   bool captured = false;
    for (unsigned o = 0; o < xfb->output_count; ++o) {
       const nir_xfb_output_info *out = &xfb->outputs[o];
       if (out->location != var->data.location)
+         continue;
+      if (!(out->component_mask & var_mask))
          continue;
 
       nir_variable *buffer =
@@ -2861,22 +2955,30 @@ gex_wgpu_capture_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_def *word = nir_ushr_imm(b, byte, 2);
       nir_deref_instr *data_deref = gex_wgpu_block_words(b, buffer);
 
-      nir_def *value = intr->src[1].ssa;
       /* One word per component: the captured stream is untyped bytes whose
        * layout GL already fixed, and a vector store would impose an alignment
-       * it never promised. */
-      unsigned written = 0;
+       * it never promised.
+       *
+       * out->offset is the byte offset of the lowest component in the output's
+       * mask, so a component's own offset is that plus its rank among the set
+       * bits below it -- not its index within the variable, which is the same
+       * number only when the variable starts at component zero and the output
+       * covers all of it. */
       for (unsigned c = 0; c < value->num_components; ++c) {
-         if (!(out->component_mask & (1u << c)))
+         const unsigned component = frac + c;
+         if (component > 3)
+            break;
+         if (!(out->component_mask & (1u << component)))
             continue;
+         const unsigned rank =
+            util_bitcount(out->component_mask & BITFIELD_MASK(component));
          nir_deref_instr *word_deref = nir_build_deref_array(
-            b, data_deref, nir_iadd_imm(b, word, written));
+            b, data_deref, nir_iadd_imm(b, word, rank));
          nir_store_deref(b, word_deref, nir_channel(b, value, c), 0x1);
-         ++written;
       }
-      return true;
+      captured = true;
    }
-   return false;
+   return captured;
 }
 
 /* A compute shader has no outputs; the captures above replaced the only ones
@@ -8651,6 +8753,25 @@ gex_wgpu_set_debug_callback(struct pipe_context *pipe,
  */
 struct gex_wgpu_so_target {
    struct pipe_stream_output_target base;
+   /* Bytes already recorded into this target, counted from buffer_offset.
+    *
+    * GL's pause/resume and its explicit append offset are the same state seen
+    * from two directions, and Gallium expresses both through the offsets
+    * argument of set_stream_output_targets: a byte count starts the capture
+    * there, and ~0 means carry on from wherever the last one stopped. Keeping
+    * the running total on the target rather than on the context is what makes
+    * pause work at all, because pausing unbinds every target and resuming
+    * binds them back with ~0. */
+   unsigned written;
+   /* Bytes per captured vertex, learnt from the shader's xfb info the first
+    * time this target records anything.
+    *
+    * DrawTransformFeedback needs a vertex count, and on real hardware that
+    * count lives on the GPU because only the GPU knows how much fitted. Here
+    * the driver decides the capture size itself, on the CPU, before the
+    * dispatch runs -- so the count is simply `written / stride` and no
+    * counter buffer or readback is involved. */
+   unsigned stride;
 };
 
 static struct pipe_stream_output_target *
@@ -8704,11 +8825,14 @@ gex_wgpu_set_stream_output_targets(struct pipe_context *pipe,
       pipe_so_target_reference(&ctx->so_targets[i], target);
    }
    ctx->so_target_count = num_targets;
-   /* Appending to a previous capture needs the offsets these carry; nothing
-    * reads them yet, so refuse rather than silently overwrite from zero. */
+   /* ~0 is "append": leave the target's running total alone so the next
+    * capture continues after the last one. Any other value is where GL wants
+    * writing to start, which for glBeginTransformFeedback is zero. */
    for (unsigned i = 0; offsets && i < num_targets; ++i) {
-      if (offsets[i] != 0 && offsets[i] != (unsigned)-1)
-         gex_fail(ctx);
+      struct gex_wgpu_so_target *target =
+         (struct gex_wgpu_so_target *)ctx->so_targets[i];
+      if (target && offsets[i] != (unsigned)-1)
+         target->written = offsets[i];
    }
 }
 
@@ -9942,6 +10066,18 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
                               nir_metadata_control_flow, &state);
    nir_shader_intrinsics_pass(nir, gex_wgpu_capture_drop_output,
                               nir_metadata_control_flow, &state);
+   if (getenv("GEX_WGPU_XFB_DEBUG")) {
+      const nir_xfb_info *dbg = nir->xfb_info;
+      fprintf(stderr, "gex-xfb: so_mask=0x%x failed=%d outputs=%u written=0x%x\n",
+              state.so_mask, (int)state.failed,
+              dbg ? dbg->output_count : 0u,
+              dbg ? dbg->buffers_written : 0u);
+      for (unsigned o = 0; dbg && o < dbg->output_count; ++o)
+         fprintf(stderr, "gex-xfb:   out[%u] loc=%u buffer=%u offset=%u mask=0x%x stride=%u\n",
+                 o, dbg->outputs[o].location, dbg->outputs[o].buffer,
+                 dbg->outputs[o].offset, dbg->outputs[o].component_mask,
+                 dbg->buffers[dbg->outputs[o].buffer].stride);
+   }
    if (state.failed || !state.so_mask) {
       ralloc_free(nir);
       return NULL;
@@ -10851,7 +10987,8 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       }
       /* Bound whole and offset in the parameters, because a storage binding
        * offset must be 256-byte aligned and GL promises only four. */
-      params[GEX_WGPU_PARAM_SO_OFFSET + i] = target->buffer_offset;
+      struct gex_wgpu_so_target *so = (struct gex_wgpu_so_target *)target;
+      params[GEX_WGPU_PARAM_SO_OFFSET + i] = target->buffer_offset + so->written;
       /* The dispatch below writes it, so a later map has to read it back. */
       gex_resource(target->buffer)->gpu_written = true;
       /* GL stops capturing when a bound buffer would overflow, and it stops
@@ -10861,9 +10998,11 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
        * discard cases size their buffers to make the difference visible. */
       if (xfb && (xfb->buffers_written & (1u << i))) {
          const unsigned stride = xfb->buffers[i].stride;
-         const unsigned room = stride ? (unsigned)(target->buffer_size /
-                                                   (stride * verts_per_prim))
-                                      : 0u;
+         /* Room is what is left after an append, not the whole buffer. */
+         const unsigned left = target->buffer_size > so->written
+                                  ? (unsigned)(target->buffer_size - so->written)
+                                  : 0u;
+         const unsigned room = stride ? left / (stride * verts_per_prim) : 0u;
          writable_prims = MIN2(writable_prims, room);
       }
       entries[count] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
@@ -10904,6 +11043,20 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
 
    const uint32_t written = writable_prims * verts_per_prim;
    params[GEX_WGPU_PARAM_COUNT] = written;
+   /* Now that the count is known, move each target on by what this capture
+    * will record, so a resumed or appended capture starts after it and
+    * DrawTransformFeedback can read the total back. */
+   for (unsigned i = 0; xfb && i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
+      if (!(variant->so_mask & (1u << i)) ||
+          !(xfb->buffers_written & (1u << i)))
+         continue;
+      struct gex_wgpu_so_target *so =
+         (struct gex_wgpu_so_target *)ctx->so_targets[i];
+      if (!so)
+         continue;
+      so->stride = xfb->buffers[i].stride;
+      so->written += written * so->stride;
+   }
    /* PRIMITIVES_GENERATED counts what the vertex stage produced;
     * PRIMITIVES_EMITTED counts what transform feedback recorded. */
    if (ctx->active_query) {
@@ -12712,9 +12865,28 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * and the native one is a later optimisation.
     *
     * count_from_stream_output is a different feature (DrawTransformFeedback)
-    * that util_draw_indirect explicitly asserts against, so it stays refused
-    * below rather than arriving here. */
-   if (indirect && info && !indirect->count_from_stream_output && !ctx->failed) {
+    * that util_draw_indirect explicitly asserts against, so it is handled
+    * just below rather than being passed on. */
+   if (indirect && info && indirect->count_from_stream_output && !ctx->failed) {
+      /* glDrawTransformFeedback: draw as many vertices as a previous capture
+       * recorded. The target carries that total in bytes, and it is exact
+       * because this driver sized the capture on the CPU -- so unlike a
+       * hardware driver there is no counter buffer to read back and no stall
+       * here at all. */
+      const struct gex_wgpu_so_target *so =
+         (const struct gex_wgpu_so_target *)indirect->count_from_stream_output;
+      struct pipe_draw_info counted = *info;
+      struct pipe_draw_start_count_bias counted_draw = {0};
+      counted.index_size = 0;
+      counted.index_bounds_valid = false;
+      counted_draw.start = 0;
+      counted_draw.count = so->stride ? so->written / so->stride : 0u;
+      if (counted_draw.count)
+         gex_wgpu_draw_vbo(pipe, &counted, drawid_offset, NULL, &counted_draw,
+                           1);
+      return;
+   }
+   if (indirect && info && !ctx->failed) {
       util_draw_indirect(pipe, info, drawid_offset, indirect);
       return;
    }
@@ -15092,6 +15264,10 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * existing SpvBuiltInSampleId path, and 4x multisample targets already
     * work. */
    caps->sample_shading = true;
+   /* ARB_texture_query_lod. WGSL has no textureQueryLod, so the value is
+    * computed from the coordinate's derivatives instead; see
+    * gex_wgpu_lower_query_lod_instr. */
+   caps->texture_query_lod = true;
    caps->glsl_feature_level = 330;
    caps->glsl_feature_level_compatibility = 330;
 
@@ -15226,6 +15402,10 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * checks the captured buffer component by component.
     */
    caps->max_stream_output_buffers = GEX_WGPU_MAX_SO_BUFFERS;
+   /* ARB_transform_feedback2: pause/resume, append offsets and
+    * DrawTransformFeedback, all of which ride on the per-target byte total
+    * kept in gex_wgpu_so_target. */
+   caps->stream_output_pause_resume = true;
    /* Both of these defaulted to zero, which st/mesa reports verbatim as
     * MAX_TRANSFORM_FEEDBACK_*_COMPONENTS -- so every program declaring a
     * feedback varying failed to link, however few it declared. GL 3.2 asks
@@ -15235,6 +15415,12 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * so this claims what the buffer can actually hold rather than a minimum
     * borrowed from the specification. */
    caps->max_stream_output_interleaved_components = GEX_WGPU_MAX_VARYINGS * 4;
+   /* ARB_transform_feedback3: gl_NextBuffer and gl_SkipComponents, which let
+    * one interleaved capture be split across several buffers. The linker
+    * expresses that entirely in the xfb info the capture pass already walks
+    * -- a buffer per entry, each with its own stride -- so it needs no new
+    * machinery here, only the admission that it works. */
+   caps->stream_output_interleave_buffers = true;
    caps->max_stream_output_separate_components = 4;
    /* rgba16float is filterable in core WebGPU; the 32-bit float formats are
     * only filterable with the float32-filterable feature, which this driver
