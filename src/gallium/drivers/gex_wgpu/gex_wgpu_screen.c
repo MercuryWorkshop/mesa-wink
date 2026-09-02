@@ -280,6 +280,7 @@ struct gex_wgpu_screen {
    unsigned retired_count;
    struct gex_wgpu_bg_cache_slot {
       bool used;
+      uint64_t pass_serial;
       uint32_t hash;
       WGPUBindGroupLayout layout;
       unsigned count;
@@ -297,6 +298,7 @@ struct gex_wgpu_screen {
     * presenting sixty frames a second. Evictions are rare next to draws, so
     * throwing the whole emitted state away on one costs nothing. */
    uint64_t cache_epoch;
+   uint64_t pass_serial;
    /* Everything above this line that a context may write.
     *
     * GL contexts are per thread and Mesa lets an application drive several at
@@ -12321,9 +12323,12 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    const size_t bytes = count * sizeof(*entries);
    uint32_t hash = gex_wgpu_cache_hash(entries, bytes);
    hash = gex_wgpu_cache_hash(&layout, sizeof(layout)) ^ hash ^ (count * 97u);
+   hash ^= gex_wgpu_cache_hash(&screen->pass_serial,
+                               sizeof(screen->pass_serial));
    struct gex_wgpu_bg_cache_slot *slot =
       &screen->bg_cache[hash % GEX_WGPU_BG_CACHE_SLOTS];
-   if (slot->used && slot->hash == hash && slot->layout == layout &&
+   if (slot->used && slot->pass_serial == screen->pass_serial &&
+       slot->hash == hash && slot->layout == layout &&
        slot->count == count && memcmp(slot->entries, entries, bytes) == 0) {
       ++screen->bg_cache_hits;
       { const WGPUBindGroup gex_ret = slot->group;
@@ -12349,6 +12354,7 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
          wgpuBindGroupRelease(slot->group);
    }
    slot->used = true;
+   slot->pass_serial = screen->pass_serial;
    slot->hash = hash;
    slot->layout = layout;
    slot->count = count;
@@ -14538,6 +14544,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       gex_wgpu_end_pass(ctx);
       ctx->pending_pass =
          wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+      ++screen->pass_serial;
       memset(&ctx->emitted, 0, sizeof(ctx->emitted));
       if (!counting && ctx->pending_pass)
          ctx->pending_pass_key = wanted_pass;
