@@ -11566,11 +11566,23 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
    WGPURenderPassDepthStencilAttachment attachment =
       WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
    attachment.view = view;
+   /* Unconditionally finite, and outside the branch below -- the same defect
+    * and the same one-line fix as the render pass's depth attachment.
+    * `..._INIT` leaves depthClearValue NaN, and the *browser* reads it off the
+    * dictionary and validates it as a float whatever the load op says:
+    *
+    *   Failed to read the 'depthClearValue' property from
+    *   'GPURenderPassDepthStencilAttachment': The provided float value is
+    *   non-finite.
+    *
+    * Native Dawn accepts it, so this only appeared when the stencil8 clear
+    * ran in a browser -- `gl44-stencil-texture-probe` was 4/4 natively and
+    * 3/4 there, which is the whole reason the browser gate exists. */
+   attachment.depthClearValue = has_depth ? (float)depth : 1.0f;
    if (has_depth) {
       attachment.depthLoadOp = clear_flags & PIPE_CLEAR_DEPTH
          ? WGPULoadOp_Clear : WGPULoadOp_Load;
       attachment.depthStoreOp = WGPUStoreOp_Store;
-      attachment.depthClearValue = depth;
    }
    if (has_stencil) {
       attachment.stencilLoadOp = clear_flags & PIPE_CLEAR_STENCIL
