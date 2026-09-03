@@ -10403,6 +10403,28 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
       desc.arrayLayerCount = 1;
       desc.aspect = WGPUTextureAspect_All;
    }
+   /* A view whose format differs from its texture's is the interesting case
+    * and there are only a handful per program, so say what was built. An
+    * sRGB view of a linear texture reads zero in the browser and 55
+    * natively, with no refusal and no WebGPU error, and this is the line
+    * that distinguishes "the wrong view was built" from "the right view
+    * samples wrong". It said the latter: the two builds print an identical
+    * line, over a resource that is written in both. */
+   if (templ->format != texture->format) {
+      static unsigned told;
+      if (told++ < 8)
+         fprintf(stderr,
+                 "gex-wgpu: view %s of %s texture (target %u->%u levels "
+                 "%u..%u layers %u..%u) reinterpreting=%d wgpu=%d/%d\n",
+                 util_format_short_name(templ->format),
+                 util_format_short_name(texture->format),
+                 texture->target, templ->target,
+                 templ->u.tex.first_level, templ->u.tex.last_level,
+                 templ->u.tex.first_layer, templ->u.tex.last_layer,
+                 (int)reinterpreting,
+                 (int)gex_wgpu_texture_format(templ->format),
+                 (int)gex_wgpu_texture_format(texture->format));
+   }
    view->view = wgpuTextureCreateView(view_source, &desc);
    if (!view->view) {
       if (view->reinterpret) wgpuTextureRelease(view->reinterpret);
