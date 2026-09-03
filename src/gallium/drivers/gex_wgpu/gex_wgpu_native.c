@@ -52,7 +52,27 @@ struct gex_wgpu_sw_screen {
    void (*wrapped_destroy)(struct pipe_screen *);
 };
 
-static struct gex_wgpu_sw_screen *sw_state;
+/* Per screen, not one global.
+ *
+ * Mesa builds a screen per X display connection and a toolkit on more than
+ * one thread opens several, so this used to be whichever screen was created
+ * last -- every other screen then presented through that one's winsys and
+ * displaytarget, at that one's size. The device is shared (see create_device)
+ * but the drawable is not. */
+#define GEX_WGPU_SW_SCREENS 8
+static struct {
+   struct pipe_screen *screen;
+   struct gex_wgpu_sw_screen *state;
+} sw_screens[GEX_WGPU_SW_SCREENS];
+
+static struct gex_wgpu_sw_screen *
+sw_state_for(struct pipe_screen *screen)
+{
+   for (unsigned i = 0; i < GEX_WGPU_SW_SCREENS; ++i)
+      if (sw_screens[i].screen == screen)
+         return sw_screens[i].state;
+   return NULL;
+}
 
 /* The instance the device came from. Kept because the driver's blocking
  * readbacks need something to pump; see gex_wgpu_jspi_wait below. */
@@ -122,6 +142,23 @@ wait_for(WGPUInstance instance, WGPUFuture future)
 static WGPUDevice
 create_device(void)
 {
+   /* One device for the whole process, however many screens ask.
+    *
+    * Mesa builds a screen per X display connection, and a toolkit that
+    * renders on more than one thread opens more than one: Krita reaches five.
+    * Each was given a WebGPU device of its own, which costs seconds of
+    * adapter and device creation each -- and, worse, made resource sharing
+    * across them impossible. Qt shares GL contexts (QOpenGLWidget requires
+    * it, and composites the whole window through the shared one), and a
+    * texture created on one WebGPU device does not exist on another. Nothing
+    * reports that: the sharing simply yields nothing, and Krita's window was
+    * black while every draw it did issue succeeded.
+    *
+    * Nothing releases the device, so there is no reference counting to do
+    * here; the process keeps it until it exits. */
+   static WGPUDevice cached;
+   if (cached)
+      return cached;
    WGPUInstanceDescriptor instance_desc = WGPU_INSTANCE_DESCRIPTOR_INIT;
    /* WaitAny is what the two requests below are answered through, and it is
     * off unless asked for. */
@@ -247,7 +284,8 @@ create_device(void)
    if (!wait_for(instance, wgpuAdapterRequestDevice(adapter_result.adapter,
                                                     &device_desc, device_cb)))
       return NULL;
-   return device_result.device;
+   cached = device_result.device;
+   return cached;
 }
 
 /* --- blocking readback ---------------------------------------------------
@@ -308,7 +346,7 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
                               void *context_private, unsigned nboxes,
                               struct pipe_box *sub_box)
 {
-   struct gex_wgpu_sw_screen *state = sw_state;
+   struct gex_wgpu_sw_screen *state = sw_state_for(screen);
    if (!state || !state->winsys || !resource || !pipe) return;
    extern uint64_t gex_wgpu_present_nanos;
    const int64_t present_start = os_time_get_nano();
@@ -461,13 +499,17 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
 static void
 gex_wgpu_sw_destroy(struct pipe_screen *screen)
 {
-   struct gex_wgpu_sw_screen *state = sw_state;
+   struct gex_wgpu_sw_screen *state = sw_state_for(screen);
    if (state) {
       if (state->target && state->winsys)
          state->winsys->displaytarget_destroy(state->winsys, state->target);
       void (*wrapped)(struct pipe_screen *) = state->wrapped_destroy;
+      for (unsigned i = 0; i < GEX_WGPU_SW_SCREENS; ++i)
+         if (sw_screens[i].screen == screen) {
+            sw_screens[i].screen = NULL;
+            sw_screens[i].state = NULL;
+         }
       FREE(state);
-      sw_state = NULL;
       if (wrapped) wrapped(screen);
    }
 }
@@ -488,7 +530,20 @@ gex_wgpu_sw_screen_create(struct sw_winsys *winsys)
    if (!state) return screen;
    state->winsys = winsys;
    state->wrapped_destroy = screen->destroy;
-   sw_state = state;
+   unsigned slot = GEX_WGPU_SW_SCREENS;
+   for (unsigned i = 0; i < GEX_WGPU_SW_SCREENS; ++i)
+      if (!sw_screens[i].screen) { slot = i; break; }
+   if (slot == GEX_WGPU_SW_SCREENS) {
+      /* Eight display connections is already more than any toolkit seen
+       * here opens; a ninth would present through a stale drawable, so say
+       * so rather than do that. */
+      fprintf(stderr, "gex-wgpu: more than %u screens; not presenting for "
+                      "this one\n", (unsigned)GEX_WGPU_SW_SCREENS);
+      FREE(state);
+      return screen;
+   }
+   sw_screens[slot].screen = screen;
+   sw_screens[slot].state = state;
    screen->flush_frontbuffer = gex_wgpu_sw_flush_frontbuffer;
    screen->destroy = gex_wgpu_sw_destroy;
    fprintf(stderr, "gex-wgpu: native screen on Dawn\n");
