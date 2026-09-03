@@ -21452,6 +21452,22 @@ gex_wgpu_screen_create(WGPUDevice device)
            "storage/stage %u\n", got_limits ? "" : " (query failed)",
            screen->max_uniform_buffers, screen->max_storage_buffers_vertex,
            limits.maxStorageBuffersPerShaderStage);
+   /* The compute limits, reported because they decide a GL capability that
+    * cannot be inferred from anything else: st_extensions gates
+    * ARB_compute_shader behind max_threads_per_block >= 1024, and WebGPU's
+    * *guaranteed* maxComputeInvocationsPerWorkgroup is only 256. Whether GL
+    * compute can be advertised at all is therefore a property of the device,
+    * not of this driver. */
+   fprintf(stderr,
+           "gex-wgpu: compute limits invocations/workgroup %u "
+           "workgroup %ux%ux%u grid %ux%ux%u storage/compute %u\n",
+           limits.maxComputeInvocationsPerWorkgroup,
+           limits.maxComputeWorkgroupSizeX, limits.maxComputeWorkgroupSizeY,
+           limits.maxComputeWorkgroupSizeZ,
+           limits.maxComputeWorkgroupsPerDimension,
+           limits.maxComputeWorkgroupsPerDimension,
+           limits.maxComputeWorkgroupsPerDimension,
+           limits.maxStorageBuffersInFragmentStage);
    screen->depth32_stencil8 =
       wgpuDeviceHasFeature(device, WGPUFeatureName_Depth32FloatStencil8);
    /* ARB_depth_clamp: WebGPU calls it unclippedDepth, and it is optional. */
