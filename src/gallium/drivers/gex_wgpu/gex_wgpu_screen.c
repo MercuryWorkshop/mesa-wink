@@ -5257,6 +5257,35 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    const bool dump_wgsl = nir->info.stage == MESA_SHADER_VERTEX &&
       util_bitcount64(nir->info.inputs_read) >= 9;
    const double t_start = os_time_get_nano() / 1000000.0;
+   /* A tex instruction with no texture deref aborts the emitter --
+    *
+    *   nir_to_spirv.c: emit_tex: Assertion `var' failed.
+    *
+    * -- which takes the application with it, and an abort is never an
+    * acceptable answer to a shader this driver cannot translate. st/mesa
+    * lowers the derefs away and gex_wgpu_split_combined_samplers rebuilds
+    * them, so reaching here without one means that pass did not run for this
+    * shader: it was the compute path once and the geometry path after that.
+    * Refuse by name instead, and say which stage, so the next one is a
+    * message rather than a core dump. */
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            if (nir_tex_instr_src_index(nir_instr_as_tex(instr),
+                                        nir_tex_src_texture_deref) >= 0)
+               continue;
+            char *detail = NULL;
+            asprintf(&detail,
+                     "a texture instruction in the %s stage has no texture "
+                     "deref, so the combined-sampler split did not run for it",
+                     mesa_shader_stage_name(nir->info.stage));
+            *error_out = detail;
+            return NULL;
+         }
+      }
+   }
    struct spirv_shader *spirv = nir_to_spirv(nir, &info);
    ralloc_free(nir);
    if (!spirv) {
@@ -18210,8 +18239,6 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       refusal = "gex_wgpu geometry shaders must output points or a triangle strip";
    else if (!points_in && nir->info.gs.input_primitive != MESA_PRIM_TRIANGLES)
       refusal = "gex_wgpu geometry shaders must take points or triangles";
-   else if (points_in != points_out)
-      refusal = "gex_wgpu geometry shaders cannot change between points and triangles";
    else if (nir->info.gs.invocations > 1)
       refusal = "gex_wgpu does not implement geometry shader instancing";
    else if (nir->info.gs.active_stream_mask & ~1u)
@@ -18237,14 +18264,24 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
    }
    gs->max_vertices = nir->info.gs.vertices_out;
    gs->output_prim = nir->info.gs.output_primitive;
-   if (gs->output_prim == MESA_PRIM_POINTS) {
+   /* The output primitive decides how many indices each emitted primitive
+    * takes and how many of them a strip of `vertices_out` closes; the *input*
+    * primitive decides how many vertices one invocation reads. Deriving both
+    * from the output was a latent bug the refusal above hid: a shader taking
+    * points and emitting triangles -- point expansion, which is how a
+    * billboard or a particle is drawn, and what
+    * KHR-GL44.texture_view.view_sampling uses -- would have read three
+    * vertices per point. Now that they are separate the two can differ, and
+    * `verts_per_input_prim` means what its two other readers already assume:
+    * the draw's topology (POINTS or TRIANGLES) and the divisor that turns a
+    * vertex count into an invocation count. */
+   gs->verts_per_input_prim = points_in ? 1 : 3;
+   if (points_out) {
       gs->max_output_prims = gs->max_vertices;
       gs->indices_per_prim = 1;
-      gs->verts_per_input_prim = 1;
    } else {
       gs->max_output_prims = gs->max_vertices - 2;
       gs->indices_per_prim = 3;
-      gs->verts_per_input_prim = 3;
    }
    gs->max_triangles = gs->max_output_prims;
 
