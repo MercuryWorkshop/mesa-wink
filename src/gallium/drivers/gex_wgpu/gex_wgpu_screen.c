@@ -121,6 +121,22 @@ extern void gex_wgpu_jspi_signal(void);
 #define GEX_WGPU_GATHER_PARAM_WORDS 4
 #define GEX_WGPU_GATHER_GROUP 64
 
+/* Bindings of the line stipple's prefix pass, which has its own group 0. See
+ * gex_wgpu_line_prefix_module. */
+#define GEX_WGPU_PREFIX_PARAMS_BINDING 0
+#define GEX_WGPU_PREFIX_POSITIONS_BINDING 1
+#define GEX_WGPU_PREFIX_OUT_BINDING 2
+/* Words of its parameter buffer: how many dwords one captured vertex takes,
+ * how many of those a segment advances, how many segments there are, and the
+ * two window-space scales -- as float bit patterns, which NIR reads as floats
+ * because a NIR value carries no type of its own. */
+#define GEX_WGPU_PREFIX_PARAM_RECORD 0
+#define GEX_WGPU_PREFIX_PARAM_SEGMENT 1
+#define GEX_WGPU_PREFIX_PARAM_COUNT 2
+#define GEX_WGPU_PREFIX_PARAM_ASPECT 3
+#define GEX_WGPU_PREFIX_PARAM_HALF_HEIGHT 4
+#define GEX_WGPU_PREFIX_PARAM_WORDS 8
+
 /* Bindings of the geometry stage's own compute pipeline, which is a separate
  * pipeline and so has its own group 0. */
 #define GEX_WGPU_GS_PARAMS_BINDING 0
@@ -191,6 +207,9 @@ struct gex_wgpu_screen {
     * module for every layout, because the copy is by dword rather than by
     * attribute. See gex_wgpu_gather_indexed_vertices. */
    WGPUShaderModule gather_module;
+   /* The prefix pass a stippled line strip needs; see
+    * gex_wgpu_line_prefix_module. */
+   WGPUShaderModule line_prefix_module;
    WGPUDevice device;
    WGPUQueue queue;
    /* Reading depth back.
@@ -468,10 +487,14 @@ struct gex_wgpu_context {
     * pass writes for them. See gex_wgpu_line_draw. */
    struct gex_wgpu_line_quad *line_quads;
    struct pipe_resource *line_vs_out;
-   /* The varying a smooth line's coverage rides on while one is being drawn,
-    * or ~0u. Both stages are given the same number, which is what makes the
-    * quad shader's output and the fragment variant's input one @location. */
-   unsigned line_smooth_location;
+   /* The varying a line's coverage and along-the-line distance ride on while
+    * one is being drawn, or ~0u. Both stages are given the same number, which
+    * is what makes the quad shader's output and the fragment variant's input
+    * one @location. */
+   unsigned line_edge_location;
+   /* Where each segment of a stippled strip starts along its line, in
+    * pixels, from the prefix pass. */
+   struct pipe_resource *line_starts;
    /* De-indexed vertex buffers, kept across draws and grown as needed: an
     * indexed point draw gathers the vertices it references into these and is
     * then bound to them instead of to the application's. The mask says which
@@ -836,8 +859,11 @@ struct gex_wgpu_shader_variant {
    /* Whether this variant discards the corners of the point, for
     * GL_POINT_SMOOTH. */
    bool point_smooth;
-   /* The varying this variant reads a smooth line's coverage from, or ~0u. */
-   unsigned line_smooth_location;
+   /* The varying this variant reads a line's coverage and distance from, or
+    * ~0u, and the stipple pattern it baked in. */
+   unsigned line_edge_location;
+   uint16_t line_stipple_pattern;
+   uint8_t line_stipple_factor;
    /* The polygon stipple this variant baked in as immediates. Not the
     * framebuffer height: the row index does not depend on it, see
     * gex_wgpu_lower_poly_stipple. */
@@ -883,6 +909,12 @@ struct gex_wgpu_rasterizer {
     * see gex_wgpu_line_draw. */
    float line_width;
    bool line_smooth;
+   /* GL_LINE_STIPPLE. The pattern is sixteen bits and the factor repeats each
+    * of them; both are baked into a fragment variant, like the polygon
+    * stipple's thirty-two words. */
+   bool line_stipple;
+   uint16_t line_stipple_pattern;
+   uint8_t line_stipple_factor;
    /* glPolygonMode, as PIPE_POLYGON_MODE_*. FILL is the ordinary case; LINE
     * and POINT are drawn by rewriting the primitive, since WebGPU has no
     * polygon mode.
@@ -1018,8 +1050,11 @@ struct gex_wgpu_capture_variant {
 struct gex_wgpu_line_quad {
    struct gex_wgpu_varying_layout layout;
    unsigned segment_records;
-   /* The varying this shader emits the smooth-line coverage on, or ~0u. */
-   unsigned smooth_location;
+   /* The varying this shader emits the coverage-and-distance vector on, or
+    * ~0u when neither smoothing nor stippling asked for it, and whether its
+    * offset is perpendicular (smooth) rather than axis-aligned. */
+   unsigned edge_location;
+   bool perpendicular;
    struct gex_wgpu_shader *shader;
    struct gex_wgpu_vertex_elements *elements;
    struct gex_wgpu_line_quad *next;
@@ -3268,19 +3303,74 @@ gex_wgpu_lower_line_smooth_instr(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* The one varying a wide line's fragment stage reads: coverage across the
+ * line in .xy and the distance along it in .z. Found or created, because
+ * smoothing and stippling both want it and either may run alone. */
+static nir_variable *
+gex_wgpu_line_edge_input(nir_shader *nir, unsigned location)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in)
+      if (var->data.location == (int)(VARYING_SLOT_VAR0 + location))
+         return var;
+   nir_variable *edge = nir_variable_create(nir, nir_var_shader_in,
+                                            glsl_vec4_type(),
+                                            "gex_line_edge");
+   edge->data.location = VARYING_SLOT_VAR0 + location;
+   edge->data.driver_location = location;
+   edge->data.interpolation = INTERP_MODE_NONE;
+   return edge;
+}
+
 static bool
 gex_wgpu_lower_line_smooth(nir_shader *nir, unsigned location)
 {
    struct gex_wgpu_line_smooth state = {0};
-   state.coverage = nir_variable_create(nir, nir_var_shader_in,
-                                        glsl_vec2_type(), "gex_line_edge");
-   state.coverage->data.location = VARYING_SLOT_VAR0 + location;
-   state.coverage->data.driver_location = location;
-   state.coverage->data.interpolation = INTERP_MODE_NONE;
+   state.coverage = gex_wgpu_line_edge_input(nir, location);
    nir_shader_intrinsics_pass(nir, gex_wgpu_lower_line_smooth_instr,
                               nir_metadata_control_flow, &state);
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    return state.any;
+}
+
+/* GL_LINE_STIPPLE: fragments masked off by a sixteen-bit pattern that repeats
+ * along the line.
+ *
+ * The counter is the distance from the start of the line in pixels, which the
+ * quad shader emits as the third component of the same varying the smooth
+ * coverage rides on -- one varying rather than two, because the two features
+ * are usually not both on and the inter-stage budget is small.
+ *
+ * GL resets the counter at every `glBegin` and, for GL_LINES, before every
+ * segment; for a strip or a loop it runs on. That is why a strip needs the
+ * prefix pass in gex_wgpu_line_draw and independent segments do not.
+ *
+ * The pattern and the repeat factor are baked in as immediates, so a variant
+ * is keyed on them -- the same choice gex_wgpu_lower_poly_stipple makes for
+ * its thirty-two words, and for the same reason: they change rarely and a
+ * uniform would cost a binding on every fragment shader in the driver.
+ */
+static bool
+gex_wgpu_lower_line_stipple(nir_shader *nir, unsigned location,
+                            uint16_t pattern, uint8_t factor)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl)
+      return false;
+   nir_variable *edge = gex_wgpu_line_edge_input(nir, location);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *along = nir_channel(&b, nir_load_var(&b, edge), 2);
+   /* floor, not truncation: a negative distance cannot happen, but the
+    * conversion has to round the same way GL's counter counts. */
+   nir_def *counter = nir_f2u32(&b, nir_ffloor(&b, along));
+   if (factor > 1)
+      counter = nir_udiv_imm(&b, counter, factor);
+   nir_def *bit = nir_iand_imm(&b, counter, 15);
+   nir_def *mask =
+      nir_iand_imm(&b, nir_ushr(&b, nir_imm_int(&b, pattern), bit), 1);
+   nir_discard_if(&b, nir_ieq_imm(&b, mask, 0));
+   nir->info.fs.uses_discard = true;
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
 }
 
 /* The @location to give the corner attribute: the lowest one this shader does
@@ -5123,9 +5213,20 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    const unsigned point_coord_location =
       drawing_points && ctx->point_expand.active
          ? ctx->point_expand.coord_location : ~0u;
-   /* GL_LINE_SMOOTH's coverage varying, written by the wide-line quad shader
-    * and read here. */
-   const unsigned line_smooth_location = ctx->line_smooth_location;
+   /* The wide-line varying, written by the quad shader and read here: the
+    * smooth coverage in its first two components and the distance along the
+    * line in its third. */
+   const unsigned line_edge_location = ctx->line_edge_location;
+   const bool want_line_smooth =
+      line_edge_location != ~0u && ctx->rasterizer &&
+      ctx->rasterizer->line_smooth;
+   const bool want_line_stipple =
+      line_edge_location != ~0u && ctx->rasterizer &&
+      ctx->rasterizer->line_stipple;
+   const uint16_t line_stipple_pattern =
+      want_line_stipple ? ctx->rasterizer->line_stipple_pattern : 0xffffu;
+   const uint8_t line_stipple_factor =
+      want_line_stipple ? MAX2(ctx->rasterizer->line_stipple_factor, 1) : 1;
    /* GL_POINT_SMOOTH, which needs the sprite coordinate whether or not the
     * shader itself reads it -- the decision in draw_vbo_inner asks for the
     * varying on its behalf. */
@@ -5146,8 +5247,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    /* And the quad shader writes the smooth-line coverage, for the same
     * reason: the unproduced-input pass cannot tell one shader_in from
     * another and would zero it. */
-   if (line_smooth_location != ~0u)
-      produced |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + line_smooth_location);
+   if (line_edge_location != ~0u)
+      produced |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + line_edge_location);
    uint64_t unproduced = 0;
    if (ctx->vs && fs->original_nir) {
       nir_foreach_shader_in_variable(var, fs->original_nir) {
@@ -5171,7 +5272,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
     * claims. */
    if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
-       line_smooth_location == ~0u)
+       line_edge_location == ~0u)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -5274,7 +5375,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    const bool needs_variant =
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
-      want_point_smooth || line_smooth_location != ~0u;
+      want_point_smooth || line_edge_location != ~0u;
    if (!needs_variant)
       return fs->module;
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
@@ -5284,7 +5385,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
                    cached->coord_replace == coord_replace &&
                    cached->point_coord_location == point_coord_location &&
                    cached->point_smooth == want_point_smooth &&
-                   cached->line_smooth_location == line_smooth_location &&
+                   cached->line_edge_location == line_edge_location &&
+                   cached->line_stipple_pattern == line_stipple_pattern &&
+                   cached->line_stipple_factor == line_stipple_factor &&
                    cached->unproduced == unproduced &&
                    cached->poly_stipple == want_stipple &&
                    (!want_stipple ||
@@ -5352,8 +5455,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       gex_wgpu_drop_unproduced_inputs(variant, produced, sprite_locations);
    if (want_point_smooth)
       gex_wgpu_lower_point_smooth(variant, point_coord_location);
-   if (line_smooth_location != ~0u)
-      gex_wgpu_lower_line_smooth(variant, line_smooth_location);
+   if (want_line_smooth)
+      gex_wgpu_lower_line_smooth(variant, line_edge_location);
+   if (want_line_stipple)
+      gex_wgpu_lower_line_stipple(variant, line_edge_location,
+                                  line_stipple_pattern, line_stipple_factor);
    if (point_coord_location != ~0u && getenv("GEX_WGPU_POINT_NIR")) {
       static unsigned told;
       if (told < 6) { ++told;
@@ -5394,7 +5500,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    cached->coord_replace = coord_replace;
    cached->point_coord_location = point_coord_location;
    cached->point_smooth = want_point_smooth;
-   cached->line_smooth_location = line_smooth_location;
+   cached->line_edge_location = line_edge_location;
+   cached->line_stipple_pattern = line_stipple_pattern;
+   cached->line_stipple_factor = line_stipple_factor;
    cached->unproduced = unproduced;
    cached->poly_stipple = want_stipple;
    memcpy(cached->stipple, ctx->poly_stipple, sizeof(cached->stipple));
@@ -5457,6 +5565,10 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
     * fragment's coverage of the line's rectangle. See
     * gex_wgpu_lower_line_smooth. */
    supported.line_smooth = state->line_smooth;
+   /* GL_LINE_STIPPLE, which the wide-line expansion answers as well: the quad
+    * shader emits the distance along the line and the fragment stage discards
+    * against the pattern. See gex_wgpu_lower_line_stipple. */
+   supported.line_stipple_enable = state->line_stipple_enable;
    supported.sprite_coord_mode = state->sprite_coord_mode;
    supported.point_quad_rasterization = state->point_quad_rasterization;
    supported.point_line_tri_clip = state->point_line_tri_clip;
@@ -5603,6 +5715,9 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
       rasterizer->point_smooth = state->point_smooth;
       rasterizer->line_width = state->line_width;
       rasterizer->line_smooth = state->line_smooth;
+      rasterizer->line_stipple = state->line_stipple_enable;
+      rasterizer->line_stipple_pattern = state->line_stipple_pattern;
+      rasterizer->line_stipple_factor = state->line_stipple_factor;
       rasterizer->sprite_coord_mode = state->sprite_coord_mode;
       rasterizer->poly_stipple = state->poly_stipple_enable;
       rasterizer->flatshade_first = state->flatshade_first;
@@ -12665,6 +12780,122 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
    return b.shader;
 }
 
+/* Where each segment of a line strip starts, in pixels along the strip.
+ *
+ * GL's stipple counter resets at every glBegin and, for GL_LINES, before
+ * every segment -- but a strip or a loop runs on, so segment *i* starts at
+ * the summed length of segments 0..i-1. That sum depends on the transformed
+ * positions, so it cannot be computed on the CPU, and one quad shader
+ * invocation sees only its own segment.
+ *
+ * One invocation walking the whole strip is enough. A draw has at most a few
+ * thousand segments and this is gated on stippling being on, so a serial loop
+ * costs microseconds; a parallel scan would be more code for nothing. The
+ * result is bound as an ordinary per-instance vertex attribute, which is why
+ * the quad shader needs no storage bindings of its own.
+ */
+static WGPUShaderModule
+gex_wgpu_line_prefix_module(struct gex_wgpu_context *ctx)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   if (screen->line_prefix_module)
+      return screen->line_prefix_module;
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, screen->base.nir_options[MESA_SHADER_COMPUTE],
+      "gex-line-prefix");
+   nir_variable *params =
+      gex_wgpu_word_block(b.shader, "gex_prefix_params",
+                          GEX_WGPU_PREFIX_PARAMS_BINDING, 0, true);
+   nir_variable *positions =
+      gex_wgpu_word_block(b.shader, "gex_prefix_positions",
+                          GEX_WGPU_PREFIX_POSITIONS_BINDING, 1, true);
+   nir_variable *out = gex_wgpu_word_block(b.shader, "gex_prefix_out",
+                                           GEX_WGPU_PREFIX_OUT_BINDING, 2,
+                                           false);
+   nir_deref_instr *param_words = gex_wgpu_block_words(&b, params);
+#define GEX_PREFIX_PARAM(index)                                               \
+   nir_load_deref(&b, nir_build_deref_array(&b, param_words,                  \
+                                            nir_imm_int(&b, (index))))
+   nir_def *record = GEX_PREFIX_PARAM(GEX_WGPU_PREFIX_PARAM_RECORD);
+   nir_def *segment = GEX_PREFIX_PARAM(GEX_WGPU_PREFIX_PARAM_SEGMENT);
+   nir_def *count = GEX_PREFIX_PARAM(GEX_WGPU_PREFIX_PARAM_COUNT);
+   /* Read as integers and used as floats: a NIR value is a bit pattern and
+    * the operation decides how to read it, so no bitcast is needed. */
+   nir_def *aspect = GEX_PREFIX_PARAM(GEX_WGPU_PREFIX_PARAM_ASPECT);
+   nir_def *half_height = GEX_PREFIX_PARAM(GEX_WGPU_PREFIX_PARAM_HALF_HEIGHT);
+#undef GEX_PREFIX_PARAM
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+   nir_variable *at = nir_local_variable_create(impl, glsl_uint_type(),
+                                                "gex_prefix_at");
+   nir_variable *sum = nir_local_variable_create(impl, glsl_float_type(),
+                                                 "gex_prefix_sum");
+   nir_store_var(&b, at, nir_imm_int(&b, 0), 0x1);
+   nir_store_var(&b, sum, nir_imm_float(&b, 0.0f), 0x1);
+
+   nir_deref_instr *position_words = gex_wgpu_block_words(&b, positions);
+   nir_deref_instr *out_words = gex_wgpu_block_words(&b, out);
+   nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, at);
+      nir_push_if(&b, nir_uge(&b, i, count));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+
+      nir_store_deref(&b, nir_build_deref_array(&b, out_words, i),
+                      nir_load_var(&b, sum), 0x1);
+
+      /* Both endpoints' clip positions, at the first vec4 of their records. */
+      nir_def *base = nir_imul(&b, i, segment);
+      nir_def *end = nir_iadd(&b, base, record);
+      nir_def *values[8];
+      for (unsigned c = 0; c < 4; ++c) {
+         values[c] = nir_load_deref(
+            &b, nir_build_deref_array(&b, position_words,
+                                      nir_iadd_imm(&b, base, c)));
+         values[4 + c] = nir_load_deref(
+            &b, nir_build_deref_array(&b, position_words,
+                                      nir_iadd_imm(&b, end, c)));
+      }
+      nir_def *tiny = nir_imm_float(&b, 1e-6f);
+      nir_def *wa = nir_fmax(&b, nir_fabs(&b, values[3]), tiny);
+      nir_def *wb = nir_fmax(&b, nir_fabs(&b, values[7]), tiny);
+      nir_def *dx = nir_fsub(&b, nir_fdiv(&b, values[4], wb),
+                             nir_fdiv(&b, values[0], wa));
+      nir_def *dy = nir_fsub(&b, nir_fdiv(&b, values[5], wb),
+                             nir_fdiv(&b, values[1], wa));
+      nir_def *ux = nir_fmul(&b, dx, aspect);
+      nir_def *length = nir_fmul(
+         &b, half_height,
+         nir_fsqrt(&b, nir_fadd(&b, nir_fmul(&b, ux, ux),
+                                nir_fmul(&b, dy, dy))));
+      nir_store_var(&b, sum, nir_fadd(&b, nir_load_var(&b, sum), length),
+                    0x1);
+      nir_store_var(&b, at, nir_iadd_imm(&b, i, 1), 0x1);
+   }
+   nir_pop_loop(&b, NULL);
+
+   nir_shader *nir = b.shader;
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_lower_returns);
+   nir->info.workgroup_size[0] = 1;
+   nir->info.workgroup_size[1] = 1;
+   nir->info.workgroup_size[2] = 1;
+   nir->info.workgroup_size_variable = false;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+   char *error = NULL;
+   screen->line_prefix_module =
+      gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false,
+                           &error);
+   if (!screen->line_prefix_module)
+      fprintf(stderr, "gex-wgpu: line prefix shader failed to compile: %s\n",
+              error ? error : "unknown");
+   FREE(error);
+   return screen->line_prefix_module;
+}
+
 /* The vertex shader a wide line's quad is drawn with.
  *
  * WebGPU draws every line one pixel wide and has no line antialiasing, so
@@ -12691,7 +12922,7 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
 static nir_shader *
 gex_wgpu_line_quad_nir(struct pipe_context *pipe,
                        const struct gex_wgpu_varying_layout *layout,
-                       unsigned smooth_location)
+                       unsigned edge_location, bool perpendicular)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_VERTEX, pipe->screen->nir_options[MESA_SHADER_VERTEX],
@@ -12723,6 +12954,13 @@ gex_wgpu_line_quad_nir(struct pipe_context *pipe,
                                               "gex_line_params");
    params->data.location = VERT_ATTRIB_GENERIC0 + 2 * n + 1;
    params->data.driver_location = 2 * n + 1;
+   /* Where this segment starts along its line, in pixels. Zero for
+    * independent segments, and the prefix pass's answer for a strip. */
+   nir_variable *start = nir_variable_create(b.shader, nir_var_shader_in,
+                                             glsl_float_type(),
+                                             "gex_line_start");
+   start->data.location = VERT_ATTRIB_GENERIC0 + 2 * n + 2;
+   start->data.driver_location = 2 * n + 2;
 
    nir_def *c = nir_load_var(&b, corner);
    nir_def *p = nir_load_var(&b, params);
@@ -12731,20 +12969,13 @@ gex_wgpu_line_quad_nir(struct pipe_context *pipe,
    nir_def *half_x = nir_channel(&b, c, 2);
    nir_def *half_y = nir_channel(&b, c, 3);
    nir_def *aspect = nir_channel(&b, p, 0);
-   /* GL_LINE_SMOOTH: how far across the line this corner is, in pixels, and
-    * the half-width the coverage falls off around. Both endpoints carry the
-    * same second component, so interpolating it leaves a constant the
-    * fragment stage can use. */
-   if (smooth_location != ~0u) {
-      nir_variable *edge = nir_variable_create(b.shader, nir_var_shader_out,
-                                               glsl_vec2_type(),
-                                               "gex_line_edge");
-      edge->data.location = VARYING_SLOT_VAR0 + smooth_location;
-      edge->data.driver_location = smooth_location;
+   nir_variable *edge = NULL;
+   if (edge_location != ~0u) {
+      edge = nir_variable_create(b.shader, nir_var_shader_out,
+                                 glsl_vec4_type(), "gex_line_edge");
+      edge->data.location = VARYING_SLOT_VAR0 + edge_location;
+      edge->data.driver_location = edge_location;
       edge->data.interpolation = INTERP_MODE_NONE;
-      nir_store_var(&b, edge,
-                    nir_vec2(&b, nir_fmul(&b, side, nir_channel(&b, p, 1)),
-                             nir_channel(&b, p, 2)), 0x3);
    }
 
    nir_def *position_a = nir_load_var(&b, ends[0][0]);
@@ -12762,7 +12993,7 @@ gex_wgpu_line_quad_nir(struct pipe_context *pipe,
    nir_def *dy = nir_fsub(&b, nir_fdiv(&b, nir_channel(&b, position_b, 1), w_b),
                           nir_fdiv(&b, nir_channel(&b, position_a, 1), w_a));
    nir_def *offset_x, *offset_y;
-   if (smooth_location != ~0u) {
+   if (perpendicular) {
       /* An *antialiased* wide line is a rectangle of width w centred on the
        * segment -- GL says so, and it is a different rule from the aliased
        * one below. So this offset is perpendicular rather than axis-aligned,
@@ -12789,6 +13020,25 @@ gex_wgpu_line_quad_nir(struct pipe_context *pipe,
       nir_def *zero = nir_imm_float(&b, 0.0f);
       offset_x = nir_bcsel(&b, major_x, zero, nir_fmul(&b, side, half_x));
       offset_y = nir_bcsel(&b, major_x, nir_fmul(&b, side, half_y), zero);
+   }
+
+   if (edge) {
+      /* Across the line, the half-width the coverage falls off around, and
+       * how far along the line this corner is -- the last one summed from
+       * the segment's own start, which the prefix pass provides for a strip
+       * and which is zero for independent segments. */
+      nir_def *ux = nir_fmul(&b, dx, aspect);
+      nir_def *length =
+         nir_fmul(&b, nir_channel(&b, p, 3),
+                  nir_fsqrt(&b, nir_fadd(&b, nir_fmul(&b, ux, ux),
+                                         nir_fmul(&b, dy, dy))));
+      nir_def *along =
+         nir_fadd(&b, nir_load_var(&b, start),
+                  nir_bcsel(&b, is_b, length, nir_imm_float(&b, 0.0f)));
+      nir_store_var(&b, edge,
+                    nir_vec4(&b, nir_fmul(&b, side, nir_channel(&b, p, 1)),
+                             nir_channel(&b, p, 2), along,
+                             nir_imm_float(&b, 0.0f)), 0xf);
    }
 
    nir_def *position = nir_bcsel(&b, is_b, position_b, position_a);
@@ -12832,11 +13082,13 @@ gex_wgpu_line_quad_nir(struct pipe_context *pipe,
 static struct gex_wgpu_line_quad *
 gex_wgpu_line_quad_get(struct gex_wgpu_context *ctx,
                        const struct gex_wgpu_varying_layout *layout,
-                       unsigned segment_records, unsigned smooth_location)
+                       unsigned segment_records, unsigned edge_location,
+                       bool perpendicular)
 {
    for (struct gex_wgpu_line_quad *q = ctx->line_quads; q; q = q->next)
       if (q->segment_records == segment_records &&
-          q->smooth_location == smooth_location &&
+          q->edge_location == edge_location &&
+          q->perpendicular == perpendicular &&
           !memcmp(&q->layout, layout, sizeof(*layout)))
          return q;
 
@@ -12844,7 +13096,7 @@ gex_wgpu_line_quad_get(struct gex_wgpu_context *ctx,
    /* Two attributes per varying plus the corner pair, against WebGPU's
     * sixteen. A shader with more varyings than that draws its lines one pixel
     * wide, which is what every shader did before this existed. */
-   if (!n || 2 * n + 2 > GEX_WGPU_MAX_VERTEX_ELEMENTS)
+   if (!n || 2 * n + 3 > GEX_WGPU_MAX_VERTEX_ELEMENTS)
       return NULL;
 
    struct gex_wgpu_line_quad *quad = CALLOC_STRUCT(gex_wgpu_line_quad);
@@ -12852,11 +13104,13 @@ gex_wgpu_line_quad_get(struct gex_wgpu_context *ctx,
       return NULL;
    quad->layout = *layout;
    quad->segment_records = segment_records;
-   quad->smooth_location = smooth_location;
+   quad->edge_location = edge_location;
+   quad->perpendicular = perpendicular;
 
    struct pipe_shader_state state = {0};
    state.type = PIPE_SHADER_IR_NIR;
-   state.ir.nir = gex_wgpu_line_quad_nir(&ctx->base, layout, smooth_location);
+   state.ir.nir = gex_wgpu_line_quad_nir(&ctx->base, layout, edge_location,
+                                         perpendicular);
    state.report_compile_error = true;
    quad->shader = state.ir.nir
       ? gex_wgpu_create_shader_state(&ctx->base, &state, MESA_SHADER_VERTEX)
@@ -12880,14 +13134,29 @@ gex_wgpu_line_quad_get(struct gex_wgpu_context *ctx,
       }
    }
    elements[at].src_offset = 0;
-   elements[at].src_stride = 32;
+   elements[at].src_stride = 48;
    elements[at].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
    elements[at].vertex_buffer_index = 2;
    ++at;
    elements[at].src_offset = 16;
-   elements[at].src_stride = 32;
+   elements[at].src_stride = 48;
    elements[at].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
    elements[at].vertex_buffer_index = 2;
+   ++at;
+   /* Where the segment starts along its line. A strip reads one float per
+    * instance from the prefix pass's output; independent segments read the
+    * same zero every time, out of the corner buffer's spare component, which
+    * saves a buffer and a dispatch. */
+   elements[at].src_format = PIPE_FORMAT_R32_FLOAT;
+   elements[at].vertex_buffer_index = 3;
+   if (segment_records == 1) {
+      elements[at].src_offset = 0;
+      elements[at].src_stride = 4;
+      elements[at].instance_divisor = 1;
+   } else {
+      elements[at].src_offset = 32;
+      elements[at].src_stride = 0;
+   }
    ++at;
    quad->elements = ctx->base.create_vertex_elements_state(&ctx->base, at,
                                                            elements);
@@ -14116,17 +14385,21 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
 
    struct gex_wgpu_varying_layout varyings;
    gex_wgpu_line_varyings(ctx, &varyings);
-   /* A smooth line needs one varying for its coverage, on a location neither
-    * stage uses -- the same search the sprite coordinate makes. Without one
-    * the line is still drawn, just aliased. */
+   /* Smoothing and stippling both want one varying, on a location neither
+    * stage uses -- the same search the sprite coordinate makes. They share
+    * it: the coverage is its first two components and the distance along the
+    * line its third. Without a free location the line is still drawn, just
+    * aliased and unstippled. */
    const bool smooth = ctx->rasterizer->line_smooth;
-   unsigned smooth_location = ~0u;
-   if (smooth) {
-      smooth_location = gex_wgpu_point_coord_location(ctx);
-      if (smooth_location != ~0u &&
-          varyings.count + 1 > GEX_WGPU_MAX_VARYINGS)
-         smooth_location = ~0u;
+   const bool stipple = ctx->rasterizer->line_stipple &&
+                        ctx->rasterizer->line_stipple_pattern != 0xffffu;
+   unsigned edge_location = ~0u;
+   if (smooth || stipple) {
+      edge_location = gex_wgpu_point_coord_location(ctx);
+      if (edge_location != ~0u && varyings.count + 1 > GEX_WGPU_MAX_VARYINGS)
+         edge_location = ~0u;
    }
+   const bool perpendicular = smooth && edge_location != ~0u;
    if (getenv("GEX_WGPU_LINE_LOG")) {
       static unsigned told;
       if (told < 8) { ++told;
@@ -14137,8 +14410,8 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
                  varyings.count); }
    }
    struct gex_wgpu_line_quad *quad =
-      gex_wgpu_line_quad_get(ctx, &varyings, segment_records,
-                             smooth_location);
+      gex_wgpu_line_quad_get(ctx, &varyings, segment_records, edge_location,
+                             perpendicular);
    if (!quad)
       GEX_LINE_DECLINE("no quad shader for this varying layout");
 
@@ -14242,18 +14515,60 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
       ? fabsf(2.0f * ctx->viewport.scale[1]) : (float)ctx->fb_height;
    if (vp_width <= 0.0f || vp_height <= 0.0f)
       GEX_LINE_DECLINE("empty viewport");
+
+   /* A stippled strip needs each segment's starting distance, which depends
+    * on the transformed positions and so has to be computed on the GPU. One
+    * invocation walks the strip; see gex_wgpu_line_prefix_module. Independent
+    * segments restart the counter and read a constant zero instead. */
+   bool have_starts = false;
+   if (stipple && edge_location != ~0u && segment_records == 1) {
+      WGPUShaderModule prefix = gex_wgpu_line_prefix_module(ctx);
+      if (prefix &&
+          gex_wgpu_ensure_buffer(ctx, &ctx->line_starts, segments * 4,
+                                 PIPE_BIND_VERTEX_BUFFER |
+                                 PIPE_BIND_SHADER_BUFFER)) {
+         const float aspect_value = vp_width / vp_height;
+         const float half_height_value = 0.5f * vp_height;
+         uint32_t prefix_params[GEX_WGPU_PREFIX_PARAM_WORDS] = {0};
+         prefix_params[GEX_WGPU_PREFIX_PARAM_RECORD] = record / 4;
+         prefix_params[GEX_WGPU_PREFIX_PARAM_SEGMENT] =
+            segment_records * record / 4;
+         prefix_params[GEX_WGPU_PREFIX_PARAM_COUNT] = segments;
+         memcpy(&prefix_params[GEX_WGPU_PREFIX_PARAM_ASPECT], &aspect_value,
+                sizeof(aspect_value));
+         memcpy(&prefix_params[GEX_WGPU_PREFIX_PARAM_HALF_HEIGHT],
+                &half_height_value, sizeof(half_height_value));
+         struct pipe_resource *prefix_buffer =
+            gex_wgpu_params_buffer(ctx, prefix_params,
+                                   GEX_WGPU_PREFIX_PARAM_WORDS);
+         struct gex_wgpu_bindings prefix_group0 = {0}, prefix_group1 = {0};
+         gex_wgpu_bind_storage_access(&prefix_group0,
+                                      GEX_WGPU_PREFIX_PARAMS_BINDING,
+                                      prefix_buffer, true);
+         gex_wgpu_bind_storage_access(&prefix_group0,
+                                      GEX_WGPU_PREFIX_POSITIONS_BINDING,
+                                      ctx->line_vs_out, true);
+         gex_wgpu_bind_storage(&prefix_group0, GEX_WGPU_PREFIX_OUT_BINDING,
+                               ctx->line_starts);
+         have_starts = prefix_buffer &&
+                       gex_wgpu_dispatch(ctx, prefix, &prefix_group0,
+                                         &prefix_group1, NULL, 1);
+         pipe_resource_reference(&prefix_buffer, NULL);
+      }
+   }
+
    const float half = 0.5f * MAX2(ctx->rasterizer->line_width, 1.0f);
    /* A smooth line is drawn a pixel wider, and the fragment stage fades the
     * outer half-pixel out. Without the widening there would be nothing for
     * the coverage to fall off across. */
-   const float widened = smooth_location != ~0u ? half + 0.5f : half;
+   const float widened = perpendicular ? half + 0.5f : half;
    const float half_x = widened * 2.0f / vp_width;
    const float half_y = widened * 2.0f / vp_height;
    /* Triangle one is (A,-) (B,-) (B,+); triangle two is (A,-) (B,+) (A,+). */
    static const int8_t corners[6][2] = {
       {0, -1}, {1, -1}, {1, 1}, {0, -1}, {1, 1}, {0, 1},
    };
-   float corner_data[6][8];
+   float corner_data[6][12];
    for (unsigned i = 0; i < 6; ++i) {
       corner_data[i][0] = (float)corners[i][0];
       corner_data[i][1] = (float)corners[i][1];
@@ -14262,11 +14577,20 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
       corner_data[i][4] = vp_width / vp_height;
       corner_data[i][5] = widened;
       corner_data[i][6] = half;
-      corner_data[i][7] = 0.0f;
+      /* Half the viewport height in pixels, which turns the shader's
+       * normalised direction into a length. */
+      corner_data[i][7] = 0.5f * vp_height;
+      /* And a zero, which is what a non-strip draw reads as its segment
+       * start: GL restarts the stipple counter at every independent segment,
+       * so there is nothing to sum and no prefix pass to run. */
+      corner_data[i][8] = 0.0f;
+      corner_data[i][9] = 0.0f;
+      corner_data[i][10] = 0.0f;
+      corner_data[i][11] = 0.0f;
    }
    unsigned corner_offset = 0;
    struct pipe_resource *corner_buffer = NULL, *released = NULL;
-   u_upload_data(ctx->base.stream_uploader, 0, sizeof(corner_data), 32,
+   u_upload_data(ctx->base.stream_uploader, 0, sizeof(corner_data), 16,
                  corner_data, &corner_offset, &corner_buffer, &released);
    pipe_resource_reference(&released, NULL);
    if (!corner_buffer)
@@ -14279,15 +14603,21 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
     * bind groups, pipelines or render passes. */
    struct gex_wgpu_shader *saved_vs = ctx->vs;
    struct gex_wgpu_vertex_elements *saved_elements = ctx->vertex_elements;
-   struct pipe_resource *saved_buffers[3];
-   uint32_t saved_offsets[3];
-   for (unsigned i = 0; i < 3; ++i) {
+   struct pipe_resource *saved_buffers[4];
+   uint32_t saved_offsets[4];
+   for (unsigned i = 0; i < 4; ++i) {
       saved_buffers[i] = ctx->vertex_buffers[i];
       saved_offsets[i] = ctx->vertex_buffer_offsets[i];
    }
    const unsigned saved_count = ctx->vertex_buffer_count;
 
-   ctx->line_smooth_location = smooth_location;
+   /* A strip whose prefix pass did not run would restart the pattern at
+    * every segment, which is a wrong stipple rather than a missing line --
+    * but wrong is what this driver refuses, so it draws thin instead. */
+   if (segment_records == 1 && stipple && edge_location != ~0u &&
+       !have_starts)
+      GEX_LINE_DECLINE("the stipple prefix pass did not run");
+   ctx->line_edge_location = edge_location;
    ctx->vs = quad->shader;
    ctx->vertex_elements = quad->elements;
    ctx->vertex_buffers[0] = ctx->line_vs_out;
@@ -14296,7 +14626,11 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
    ctx->vertex_buffer_offsets[1] = record;
    ctx->vertex_buffers[2] = corner_buffer;
    ctx->vertex_buffer_offsets[2] = corner_offset;
-   ctx->vertex_buffer_count = 3;
+   ctx->vertex_buffers[3] = segment_records == 1 && have_starts
+      ? ctx->line_starts : corner_buffer;
+   ctx->vertex_buffer_offsets[3] =
+      segment_records == 1 && have_starts ? 0u : corner_offset;
+   ctx->vertex_buffer_count = 4;
 
    struct pipe_draw_info raster = *info;
    raster.mode = MESA_PRIM_TRIANGLES;
@@ -14313,10 +14647,10 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
    gex_wgpu_draw_vbo(&ctx->base, &raster, drawid_offset, NULL, &raster_draw, 1);
    ctx->line_rewritten = false;
 
-   ctx->line_smooth_location = ~0u;
+   ctx->line_edge_location = ~0u;
    ctx->vs = saved_vs;
    ctx->vertex_elements = saved_elements;
-   for (unsigned i = 0; i < 3; ++i) {
+   for (unsigned i = 0; i < 4; ++i) {
       ctx->vertex_buffers[i] = saved_buffers[i];
       ctx->vertex_buffer_offsets[i] = saved_offsets[i];
    }
@@ -16423,7 +16757,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        (info->mode == MESA_PRIM_LINES ||
         info->mode == MESA_PRIM_LINE_STRIP) &&
        (ctx->rasterizer->line_width > 1.0f ||
-        ctx->rasterizer->line_smooth) &&
+        ctx->rasterizer->line_smooth ||
+        (ctx->rasterizer->line_stipple &&
+         ctx->rasterizer->line_stipple_pattern != 0xffffu)) &&
        gex_wgpu_line_draw(ctx, info, drawid_offset, &draws[0]))
       return;
 
@@ -19105,6 +19441,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    for (unsigned i = 0; i < GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS; ++i)
       pipe_resource_reference(&ctx->point_gathered[i], NULL);
    pipe_resource_reference(&ctx->line_vs_out, NULL);
+   pipe_resource_reference(&ctx->line_starts, NULL);
    for (struct gex_wgpu_line_quad *q = ctx->line_quads; q;) {
       struct gex_wgpu_line_quad *next = q->next;
       FREE(q);
@@ -19246,7 +19583,7 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
     * marking that slot produced, and multiplying alpha by whatever was there.
     * Nineteen of the native probes went from identical-to-llvmpipe to failing
     * in one build. */
-   ctx->line_smooth_location = ~0u;
+   ctx->line_edge_location = ~0u;
    ctx->base.stream_uploader = u_upload_create_default(&ctx->base);
    if (!ctx->base.stream_uploader) {
       ctx->base.destroy(&ctx->base);
@@ -19279,6 +19616,8 @@ gex_wgpu_screen_destroy(struct pipe_screen *base)
    struct gex_wgpu_screen *screen = gex_screen(base);
    if (screen->gather_module)
       wgpuShaderModuleRelease(screen->gather_module);
+   if (screen->line_prefix_module)
+      wgpuShaderModuleRelease(screen->line_prefix_module);
    if (screen->queue)
       wgpuQueueRelease(screen->queue);
    FREE(screen);
