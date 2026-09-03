@@ -11070,6 +11070,19 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
    desc.magFilter = WGPUFilterMode_Nearest;
    desc.minFilter = WGPUFilterMode_Nearest;
    desc.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+   /* And without the anisotropy, which WebGPU allows only when all three
+    * filters are linear -- the three lines above have just made sure they are
+    * not:
+    *
+    *   One of minFilter (FilterMode::Nearest), magFilter
+    *   (FilterMode::Nearest) or mipmapFilter (MipmapFilterMode::Nearest) is
+    *   not FilterMode::Linear while using anisotropic filter (maxAnisotropy
+    *   is 4.000000)
+    *
+    * FreeCAD found this the day anisotropy stopped being refused: it asks for
+    * 4x on a texture it samples unfiltered, so the twin inherited an
+    * anisotropy its own filters contradict. */
+   desc.maxAnisotropy = 1;
    sampler->nonfiltering =
       wgpuDeviceCreateSampler(gex_screen(pipe->screen)->device, &desc);
    if (!sampler->nonfiltering) {
