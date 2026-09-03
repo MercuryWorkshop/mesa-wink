@@ -21444,6 +21444,38 @@ gex_wgpu_screen_create(WGPUDevice device)
             ? 0 : (uint32_t)MIN2(limits.maxStorageBufferBindingSize,
                                  (uint64_t)UINT32_MAX);
    }
+   /* Compute, from what the device actually granted.
+    *
+    * st_extensions gates ARB_compute_shader behind max_threads_per_block >=
+    * 1024, because GL 4.3 requires MAX_COMPUTE_WORK_GROUP_INVOCATIONS to be
+    * at least that. WebGPU's *default* is 256 -- but the adapter here offers
+    * 1024 and requestDevice may ask for it, which gex_wgpu_native.c now does.
+    * Reporting the granted figure rather than a hopeful constant is what
+    * keeps the GL limit honest on a device that grants less. */
+   {
+      struct pipe_compute_caps *compute =
+         (struct pipe_compute_caps *)&screen->base.compute_caps;
+      const uint32_t invocations =
+         limits.maxComputeInvocationsPerWorkgroup == WGPU_LIMIT_U32_UNDEFINED
+            ? 0 : limits.maxComputeInvocationsPerWorkgroup;
+      compute->grid_dimension = 3;
+      compute->max_threads_per_block = invocations;
+      compute->max_variable_threads_per_block = invocations;
+      compute->max_block_size[0] = limits.maxComputeWorkgroupSizeX;
+      compute->max_block_size[1] = limits.maxComputeWorkgroupSizeY;
+      compute->max_block_size[2] = limits.maxComputeWorkgroupSizeZ;
+      compute->max_grid_size[0] =
+      compute->max_grid_size[1] =
+      compute->max_grid_size[2] = limits.maxComputeWorkgroupsPerDimension;
+      compute->max_local_size = limits.maxComputeWorkgroupStorageSize;
+      compute->address_bits = 32;
+      compute->max_mem_alloc_size = limits.maxStorageBufferBindingSize;
+      compute->max_global_size = limits.maxStorageBufferBindingSize;
+      compute->max_compute_units = 1;
+      compute->max_clock_frequency = 0;
+      compute->subgroup_sizes = 0;
+      compute->max_subgroups = 0;
+   }
    /* The caps are sized from these, so a limit the device did not grant is a
     * GL feature the frontend will not enable. Report them rather than leaving
     * a capability shortfall to be inferred from a missing extension. */

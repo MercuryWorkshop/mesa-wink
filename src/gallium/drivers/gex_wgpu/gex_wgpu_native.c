@@ -198,7 +198,27 @@ create_device(void)
        * sample, so GL 3.2's eight draw buffers of any wider format fails on
        * it. */
       GEX_WANT(maxColorAttachmentBytesPerSample, 64);
+      /* Compute, because a *granted* limit of 256 is what st/mesa reads and
+       * ARB_compute_shader wants 1024 -- GL 4.3 requires
+       * MAX_COMPUTE_WORK_GROUP_INVOCATIONS to be at least that. WebGPU's
+       * default is 256, but requestDevice may ask for more and the adapter
+       * decides; asking is the difference between "the device cannot" and
+       * "nobody asked it to". */
+      GEX_WANT(maxComputeInvocationsPerWorkgroup, 1024);
+      GEX_WANT(maxComputeWorkgroupSizeX, 1024);
+      GEX_WANT(maxComputeWorkgroupSizeY, 1024);
+      GEX_WANT(maxComputeWorkgroupSizeZ, 64);
+      GEX_WANT(maxComputeWorkgroupStorageSize, 32768);
 #undef GEX_WANT
+      fprintf(stderr,
+              "gex-wgpu: adapter compute limits invocations/workgroup %u "
+              "workgroup %ux%ux%u shared %uB (asking for %u)\n",
+              adapter_limits.maxComputeInvocationsPerWorkgroup,
+              adapter_limits.maxComputeWorkgroupSizeX,
+              adapter_limits.maxComputeWorkgroupSizeY,
+              adapter_limits.maxComputeWorkgroupSizeZ,
+              adapter_limits.maxComputeWorkgroupStorageSize,
+              limits.maxComputeInvocationsPerWorkgroup);
    }
 
    struct request_result device_result = { 0 };
