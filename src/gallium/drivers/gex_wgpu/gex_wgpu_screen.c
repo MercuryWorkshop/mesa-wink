@@ -785,6 +785,25 @@ struct gex_wgpu_context {
     * applies is the rasterizer's poly_stipple_enable. */
    uint32_t poly_stipple[32];
    bool poly_stipple_set;
+   /* ARB_buffer_storage: buffers with a live PERSISTENT|COHERENT mapping.
+    *
+    * WebGPU has no persistent mapping at all -- a mapped GPUBuffer is
+    * unusable by the GPU until it is unmapped -- so "coherent" is a promise
+    * this driver keeps rather than one the hardware does: the application
+    * writes into the buffer's CPU shadow, and every submit uploads the shadow
+    * of every buffer on this list first. Writes made before a draw are
+    * therefore visible to it, which is all GL requires of a coherent mapping
+    * without a barrier.
+    *
+    * Eight is far above what a renderer maps this way: one streaming vertex
+    * buffer and one uniform ring is the usual shape. */
+   /* De-interleaved copies for ARB_instanced_arrays divisors above one, one
+    * per vertex buffer slot, grown as draws need them. */
+   struct pipe_resource
+      *divisor_expanded[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
+   uint32_t divisor_saved_offset[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
+   struct pipe_resource *persistent[8];
+   unsigned persistent_count;
    /* ARB_shader_draw_parameters, captured at the outermost draw_vbo before
     * any rewrite can fold the base vertex into an index list. */
    uint32_t draw_base_vertex;
@@ -2436,6 +2455,9 @@ gex_wgpu_device_unguard(struct gex_wgpu_device_guard *guard)
       }                                                                       \
    } while (0)
 
+static void gex_wgpu_track_persistent_map(struct gex_wgpu_context *ctx,
+                                          struct pipe_resource *resource,
+                                          bool add);
 static void gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx,
                                           const char *why);
 static void gex_wgpu_end_pass(struct gex_wgpu_context *ctx);
@@ -3163,6 +3185,28 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
    }
    const struct gex_wgpu_border_lowering *lower =
       &table->slots[sampler_slot];
+   if (getenv("GEX_WGPU_BORDER_LOG")) {
+      /* Per distinct combination, not once: printing only the first variant
+       * showed s=0 t=0 for a shader that had no border at all and said
+       * nothing about the one that did. */
+      static uint32_t seen[16];
+      static unsigned seen_count;
+      const uint32_t key = (uint32_t)lower->s | ((uint32_t)lower->t << 1) |
+                           ((uint32_t)lower->linear << 2) |
+                           (sampler_slot << 3) |
+                           ((uint32_t)(lower->color[2] != 0.0f) << 8);
+      bool said = false;
+      for (unsigned i = 0; i < seen_count; ++i)
+         if (seen[i] == key) { said = true; break; }
+      if (!said && seen_count < 16) {
+         seen[seen_count++] = key;
+         fprintf(stderr, "gex-wgpu: border lowering slot=%u s=%d t=%d "
+                 "linear=%d colour=%g,%g,%g,%g\n", sampler_slot,
+                 (int)lower->s, (int)lower->t, (int)lower->linear,
+                 lower->color[0], lower->color[1], lower->color[2],
+                 lower->color[3]);
+      }
+   }
    b->cursor = nir_after_instr(instr);
    nir_def *coord = tex->src[coord_index].src.ssa;
    nir_def *border = nir_imm_vec4(b, lower->color[0], lower->color[1],
@@ -7843,7 +7887,11 @@ gex_wgpu_create_vertex_elements_state(struct pipe_context *pipe,
       const bool packed = elements[i].src_stride == 0;
       if (elements[i].vertex_buffer_index >=
              GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS || elements[i].dual_slot ||
-          elements[i].instance_divisor > 1 ||
+          /* A divisor above one is served by de-interleaving the buffer at
+           * draw time -- see gex_wgpu_expand_instance_divisors. WebGPU's
+           * stepMode advances once per instance and has no divisor, so the
+           * *layout* for a divisor of two is already the right one; what has
+           * to change is the data. */
           elements[i].src_stride % 4 ||
           elements[i].src_offset % alignment ||
           (!packed &&
@@ -10095,6 +10143,44 @@ gex_wgpu_sampler_view_release(struct pipe_context *pipe,
    pipe_sampler_view_reference(&base, NULL);
 }
 
+/* A refused sampler state is not an error the application ever sees: the draw
+ * path serves an unbound slot with a default sampler, so the texture is
+ * sampled with the wrong wrap mode and filter and the picture is quietly
+ * wrong. That is the worst outcome available, so say which field did it.
+ *
+ * Four of gl44-sampling-matrix-probe's cases were failing on exactly this and
+ * the log said nothing at all -- and they had been invisible until a GL 4.4
+ * context let that probe run. */
+static void *
+gex_wgpu_sampler_refused(const struct pipe_sampler_state *state,
+                         const char *why)
+{
+   static bool said[8];
+   static const char *seen[8];
+   static unsigned count;
+   bool fresh = true;
+   for (unsigned i = 0; i < count; ++i)
+      if (seen[i] == why) { fresh = false; break; }
+   if (fresh && count < 8) {
+      seen[count] = why;
+      said[count++] = true;
+      fprintf(stderr,
+              "gex-wgpu: sampler state refused (%s): wrap=%u,%u,%u "
+              "filter=%u/%u mip=%u lod=%g..%g bias=%g aniso=%u compare=%u/%u "
+              "border=%g,%g,%g,%g int=%d unnorm=%d\n", why,
+              state->wrap_s, state->wrap_t, state->wrap_r,
+              state->min_img_filter, state->mag_img_filter,
+              state->min_mip_filter, state->min_lod, state->max_lod,
+              state->lod_bias, state->max_anisotropy, state->compare_mode,
+              state->compare_func, state->border_color.f[0],
+              state->border_color.f[1], state->border_color.f[2],
+              state->border_color.f[3],
+              (int)state->border_color_is_integer,
+              (int)state->unnormalized_coords);
+   }
+   return NULL;
+}
+
 static void *
 gex_wgpu_create_sampler_state(struct pipe_context *pipe,
                               const struct pipe_sampler_state *state)
@@ -10130,22 +10216,38 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
        state->min_lod < 0.0f || state->max_lod < state->min_lod ||
        !isfinite(state->lod_bias) || state->lod_bias < -15.0f ||
        state->lod_bias > 15.0f)
-      return NULL;
+      return gex_wgpu_sampler_refused(state, "filter, wrap or lod range");
    if (state->compare_mode != PIPE_TEX_COMPARE_NONE && !comparison)
-      return NULL;
+      return gex_wgpu_sampler_refused(state, "compare mode");
    if (comparison && (state->compare_func < PIPE_FUNC_NEVER ||
                       state->compare_func > PIPE_FUNC_ALWAYS))
-      return NULL;
+      return gex_wgpu_sampler_refused(state, "compare function");
+   /* What the *lowering* needs, not more.
+    *
+    * GL_CLAMP_TO_BORDER is served by a shader pass that tests the coordinate
+    * and substitutes the border colour, so it needs one filter for both
+    * directions and no mip filtering -- with MIPFILTER_NONE only the base
+    * level is ever sampled and the lod *range* is irrelevant, which is where
+    * this was over-strict: it also demanded min_lod == max_lod == 0, and
+    * st/mesa gives a texture with GL_TEXTURE_MAX_LEVEL of 1 a non-zero range
+    * whatever the filter. So an ordinary NEAREST clamp-to-border sample of a
+    * two-level texture had its sampler *refused* -- and a refused sampler is
+    * served by the default one, which clamps to edge, so the picture was
+    * quietly wrong with nothing in the log. Four of
+    * gl44-sampling-matrix-probe's cases were exactly that, invisible until a
+    * GL 4.4 context let the probe run. */
    if (border && (comparison ||
                   state->min_img_filter != state->mag_img_filter ||
                   state->min_mip_filter != PIPE_TEX_MIPFILTER_NONE ||
-                  state->min_lod != 0.0f || state->max_lod != 0.0f ||
                   (!state->border_color_is_integer &&
                    (!isfinite(state->border_color.f[0]) ||
                     !isfinite(state->border_color.f[1]) ||
                     !isfinite(state->border_color.f[2]) ||
                     !isfinite(state->border_color.f[3])))))
-      return NULL;
+      return gex_wgpu_sampler_refused(state,
+                                      "clamp-to-border with comparison, "
+                                      "mismatched filters, mip filtering or "
+                                      "a non-finite border colour");
    struct pipe_sampler_state supported = {0};
    supported.wrap_s = state->wrap_s;
    supported.wrap_t = state->wrap_t;
@@ -10168,7 +10270,11 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
    supported.unnormalized_coords = state->unnormalized_coords;
    if (state->max_anisotropy > 1 ||
        memcmp(state, &supported, sizeof(supported)) != 0)
-      return NULL;
+      return gex_wgpu_sampler_refused(state,
+                                      state->max_anisotropy > 1
+                                         ? "anisotropy"
+                                         : "a sampler field this driver does "
+                                           "not model");
    WGPUSamplerDescriptor desc = WGPU_SAMPLER_DESCRIPTOR_INIT;
    desc.addressModeU = state->wrap_s == PIPE_TEX_WRAP_REPEAT
       ? WGPUAddressMode_Repeat
@@ -11706,6 +11812,11 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
                 PIPE_MAP_DISCARD_WHOLE_RESOURCE)) != 0;
    const bool staged =
       !no_staged && overwrites_whole_range &&
+      /* ARB_buffer_storage: a persistent mapping outlives this call and is
+       * written without telling the driver, so it has to be the buffer's own
+       * shadow -- a staged block is uploaded at unmap, and a persistent
+       * mapping is not unmapped. */
+      !(usage & PIPE_MAP_PERSISTENT) &&
       !gex->shadow && !(usage & PIPE_MAP_READ) &&
       !(resource->bind & PIPE_BIND_INDEX_BUFFER) &&
       ((uint32_t)box->x & 3u) == 0 && ((uint32_t)box->width & 3u) == 0;
@@ -11790,6 +11901,11 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    transfer->data = NULL;
    if (usage & PIPE_MAP_READ)
       gex_wgpu_mark_shadow_read(gex);
+   /* ARB_buffer_storage: the mapping outlives this call, and nothing will
+    * tell the driver when it is written -- so the buffer joins the list every
+    * submit uploads. */
+   if (usage & PIPE_MAP_PERSISTENT)
+      gex_wgpu_track_persistent_map(ctx, resource, true);
    *out_transfer = &transfer->base;
    return gex->shadow + box->x;
 }
@@ -11884,6 +12000,10 @@ gex_wgpu_buffer_unmap(struct pipe_context *pipe,
    ++gex_wgpu_buffer_unmaps;
    --gex_wgpu_map_usage_live[transfer->usage % GEX_WGPU_MAP_USAGE_BUCKETS];
    --gex_wgpu_map_bind_live[resource->bind % GEX_WGPU_MAP_USAGE_BUCKETS];
+   /* ARB_buffer_storage: the mapping is gone, so the buffer no longer needs
+    * uploading at every submit. */
+   if (transfer->usage & PIPE_MAP_PERSISTENT)
+      gex_wgpu_track_persistent_map(ctx, resource, false);
 
    /* A write map is only visible to the GPU once the range is uploaded.
     * With PIPE_MAP_FLUSH_EXPLICIT the frontend already named the dirty
@@ -14244,6 +14364,8 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
           ctx->fb_scratch->height0 < state->height ||
           MAX2(1u, (uint32_t)ctx->fb_scratch->nr_samples) != want_samples) {
          pipe_resource_reference(&ctx->fb_scratch, NULL);
+   for (unsigned i = 0; i < GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS; ++i)
+      pipe_resource_reference(&ctx->divisor_expanded[i], NULL);
          struct pipe_resource templ;
          memset(&templ, 0, sizeof(templ));
          templ.target = PIPE_TEXTURE_2D;
@@ -18079,6 +18201,126 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
 }
 
 
+/* ARB_instanced_arrays with a divisor above one, which WebGPU has no form of.
+ *
+ * `glVertexAttribDivisor(loc, d)` makes an attribute advance once every `d`
+ * instances -- a particle system giving four particles one shared transform,
+ * a mesh instanced per light with two lights per shadow slice. WebGPU's
+ * `stepMode: "instance"` advances once per instance and takes no divisor, so
+ * the *layout* for a divisor of two is already correct and it is the data that
+ * is wrong: record `i` has to be the source's record `i / d`.
+ *
+ * So the buffer is de-interleaved on the CPU for the length of the draw. That
+ * costs `instances * stride` bytes of copy, which for the draws that use a
+ * divisor at all is small -- a divisor exists precisely because the per-
+ * instance data is *shared*, so there is little of it. A buffer's elements
+ * all carry the same divisor (create_vertex_elements_state refuses a mixture),
+ * so the decision is per buffer.
+ *
+ * Returns the mask of buffers it replaced; the caller restores them.
+ */
+static unsigned
+gex_wgpu_expand_instance_divisors(struct gex_wgpu_context *ctx,
+                                  const struct pipe_draw_info *info,
+                                  struct pipe_resource **saved)
+{
+   if (!ctx->vertex_elements || !info || info->instance_count <= 1)
+      return 0;
+   unsigned divisor[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS] = {0};
+   unsigned stride[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS] = {0};
+   bool any = false;
+   for (unsigned i = 0; i < ctx->vertex_elements->count; ++i) {
+      const struct pipe_vertex_element *ve = &ctx->vertex_elements->elements[i];
+      if (ve->instance_divisor <= 1 ||
+          ve->vertex_buffer_index >= GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS)
+         continue;
+      divisor[ve->vertex_buffer_index] = ve->instance_divisor;
+      stride[ve->vertex_buffer_index] = ve->src_stride;
+      any = true;
+   }
+   if (!any)
+      return 0;
+
+   unsigned replaced = 0;
+   for (unsigned b = 0; b < GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS; ++b) {
+      if (!divisor[b] || !stride[b] || b >= ctx->vertex_buffer_count ||
+          !ctx->vertex_buffers[b])
+         continue;
+      /* Records for instances 0..start+count, so the base-instance fold in
+       * the bind path -- offset += start_instance * stride -- keeps working
+       * unchanged against the de-interleaved buffer. */
+      const uint64_t records =
+         (uint64_t)info->start_instance + info->instance_count;
+      const uint64_t bytes = records * stride[b];
+      if (bytes > (64u << 20)) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: instance divisor expansion of %llu "
+                    "bytes declined\n", (unsigned long long)bytes);
+         }
+         continue;
+      }
+      struct pipe_transfer *transfer = NULL;
+      const uint32_t base = ctx->vertex_buffer_offsets[b];
+      const uint64_t source_records = records / divisor[b] + 1;
+      const uint64_t source_bytes = source_records * stride[b];
+      const uint64_t available = ctx->vertex_buffers[b]->width0 > base
+         ? ctx->vertex_buffers[b]->width0 - base : 0;
+      const uint64_t readable = MIN2(source_bytes, available);
+      if (!readable)
+         continue;
+      const uint8_t *source = pipe_buffer_map_range(
+         &ctx->base, ctx->vertex_buffers[b], base, (unsigned)readable,
+         PIPE_MAP_READ, &transfer);
+      if (!source)
+         continue;
+      uint8_t *expanded = MALLOC((size_t)bytes);
+      if (!expanded) {
+         pipe_buffer_unmap(&ctx->base, transfer);
+         continue;
+      }
+      for (uint64_t i = 0; i < records; ++i) {
+         const uint64_t from = (i / divisor[b]) * stride[b];
+         if (from + stride[b] <= readable)
+            memcpy(expanded + i * stride[b], source + from, stride[b]);
+         else
+            memset(expanded + i * stride[b], 0, stride[b]);
+      }
+      pipe_buffer_unmap(&ctx->base, transfer);
+      if (!gex_wgpu_ensure_buffer(ctx, &ctx->divisor_expanded[b],
+                                  (unsigned)bytes,
+                                  PIPE_BIND_VERTEX_BUFFER)) {
+         FREE(expanded);
+         continue;
+      }
+      gex_wgpu_buffer_subdata(&ctx->base, ctx->divisor_expanded[b],
+                              PIPE_MAP_WRITE, 0, (unsigned)bytes, expanded);
+      FREE(expanded);
+      saved[b] = ctx->vertex_buffers[b];
+      ctx->vertex_buffers[b] = ctx->divisor_expanded[b];
+      /* The de-interleaved buffer starts at record zero, so the binding's
+       * own offset is gone -- it was already applied while reading. */
+      ctx->divisor_saved_offset[b] = ctx->vertex_buffer_offsets[b];
+      ctx->vertex_buffer_offsets[b] = 0;
+      replaced |= 1u << b;
+   }
+   return replaced;
+}
+
+static void
+gex_wgpu_restore_instance_divisors(struct gex_wgpu_context *ctx,
+                                   struct pipe_resource **saved,
+                                   unsigned replaced)
+{
+   for (unsigned b = 0; b < GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS; ++b) {
+      if (!(replaced & (1u << b)))
+         continue;
+      ctx->vertex_buffers[b] = saved[b];
+      ctx->vertex_buffer_offsets[b] = ctx->divisor_saved_offset[b];
+   }
+}
+
 /* The five-pass tessellated draw. See the tessellation comment above the
  * binding numbers for the shape; this is where the CPU tessellator sits. */
 static bool
@@ -19193,6 +19435,64 @@ gex_wgpu_end_pass(struct gex_wgpu_context *ctx)
    memset(&ctx->emitted, 0, sizeof(ctx->emitted));
 }
 
+/* ARB_buffer_storage: hand the device whatever has been written into a
+ * persistently mapped buffer.
+ *
+ * wgpuQueueWriteBuffer is ordered on the queue against submits, so writing
+ * here -- before the command buffer is submitted -- makes the bytes visible
+ * to every draw in it. That is *more* visible than GL promises: a coherent
+ * mapping written between two draws leaves the first draw's view undefined
+ * without a barrier, and this gives it the newer value. Undefined is
+ * undefined, and the alternative is a per-draw upload of the whole buffer.
+ *
+ * The whole buffer, not a dirty range: a coherent mapping is written without
+ * telling the driver anything, so there is no range to know. */
+static void
+gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   for (unsigned i = 0; i < ctx->persistent_count; ++i) {
+      struct gex_wgpu_resource *gex = gex_resource(ctx->persistent[i]);
+      if (!gex->buffer || !gex->shadow)
+         continue;
+      const uint32_t size = (uint32_t)(gex->allocation_size & ~3u);
+      if (!size)
+         continue;
+      wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow, size);
+      /* So a later read map knows the buffer holds something. */
+      if (gex->bytes_written < size)
+         gex->bytes_written = size;
+   }
+}
+
+static void
+gex_wgpu_track_persistent_map(struct gex_wgpu_context *ctx,
+                              struct pipe_resource *resource, bool add)
+{
+   for (unsigned i = 0; i < ctx->persistent_count; ++i) {
+      if (ctx->persistent[i] != resource)
+         continue;
+      if (add)
+         return;                       /* already tracked */
+      ctx->persistent[i] = ctx->persistent[ctx->persistent_count - 1];
+      ctx->persistent[--ctx->persistent_count] = NULL;
+      return;
+   }
+   if (!add)
+      return;
+   if (ctx->persistent_count >= ARRAY_SIZE(ctx->persistent)) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: more than %u persistent buffer mappings; "
+                 "the rest are not kept coherent\n",
+                 (unsigned)ARRAY_SIZE(ctx->persistent));
+      }
+      return;
+   }
+   ctx->persistent[ctx->persistent_count++] = resource;
+}
+
 static void
 gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
 {
@@ -19207,6 +19507,11 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
     * zero modelview-projection matrix and drew nothing, while every later one
     * was right because an ordinary draw had flushed the ring by then. */
    gex_wgpu_flush_constant_ring(ctx);
+   /* ARB_buffer_storage's coherent mappings, for the same reason the constant
+    * ring is flushed above: whatever the application has written into a
+    * persistently mapped buffer has to reach the device before the work that
+    * reads it. */
+   gex_wgpu_flush_persistent_maps(ctx);
    if (!ctx->pending_encoder)
       return;
    for (unsigned i = 0; i < GEX_WGPU_SUBMIT_CAUSES; ++i) {
@@ -20589,10 +20894,21 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
    }
    if (ctx->draw_depth == 0 && info)
       ctx->draw_base_instance = info->start_instance;
+   /* A divisor above one is de-interleaved for the length of the draw, at
+    * the outermost level only: the restart and multi-draw splits re-enter
+    * here, and expanding an already-expanded buffer would index it by
+    * i / divisor a second time. */
+   struct pipe_resource *saved_divisor[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
+   memset(saved_divisor, 0, sizeof(saved_divisor));
+   const unsigned expanded_divisors = ctx->draw_depth == 0
+      ? gex_wgpu_expand_instance_divisors(ctx, info, saved_divisor) : 0;
    ctx->draw_depth++;
    gex_wgpu_draw_vbo_inner(pipe, info, drawid_offset, indirect, draws,
                            num_draws);
    ctx->draw_depth--;
+   if (expanded_divisors)
+      gex_wgpu_restore_instance_divisors(ctx, saved_divisor,
+                                         expanded_divisors);
 }
 
 
@@ -24443,7 +24759,7 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * than a choice; a per-patch varying costs a slot in the patch buffer and
     * nothing more. */
    caps->max_shader_patch_varyings = 30;
-   /* GLSL 4.30, which is what the rungs up to GL 4.3 test.
+   /* GLSL 4.40, which is what the rungs up to GL 4.4 test.
     *
     * It is read *before* Mesa clamps the usable level to the granted GL
     * version (`_mesa_compute_version`, version.c), so raising it cannot let a
@@ -24454,12 +24770,13 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     *
     * Every GLSL feature it promises is served: viewport arrays (4.10),
     * fp64 in every stage (4.00), atomic counters and image load/store (4.20),
-    * compute shaders, storage buffers and shader image size (4.30). Atomic
+    * compute shaders, storage buffers and shader image size (4.30), and the
+    * component and offset qualifiers of ARB_enhanced_layouts (4.40). Atomic
     * counters were the last hole and they were *already advertised* through
     * ARB_shader_atomic_counters, so the cap did not create that risk -- it
     * only made it worth closing, which gl44-ssbo-atomic-probe now gates. */
-   caps->glsl_feature_level = 430;
-   caps->glsl_feature_level_compatibility = 430;
+   caps->glsl_feature_level = 440;
+   caps->glsl_feature_level_compatibility = 440;
 
    /* ARB_texture_gather, exposed below its GL 4.0 core version.
     *
@@ -24746,6 +25063,18 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * so this is now supported. A divisor above 1 has no WebGPU equivalent and
     * is still refused at `create_vertex_elements_state` -- out loud. */
    caps->vertex_element_instance_divisor = true;
+   /* WebGPU requires a vertex attribute's offset to be a multiple of
+    * min(4, its byte size) and an array stride to be a multiple of four, and
+    * create_vertex_elements_state above enforces exactly that -- by refusing
+    * the whole state, which leaves nothing bound and latches the next draw.
+    *
+    * Leaving this at the default NONE told u_vbuf that unaligned attributes
+    * were fine, so it passed them straight through to be refused. Saying
+    * 4BYTE makes u_vbuf translate them on the CPU instead, which is what it
+    * is for: `gl44-vertex-fetch-matrix-probe`'s five odd-offset and
+    * odd-stride cases went from refused to correct, and they had been
+    * invisible until the GL 4.4 context let that probe run at all. */
+   caps->vertex_input_alignment = PIPE_VERTEX_INPUT_ALIGNMENT_4BYTE;
    caps->user_vertex_buffers = false;
    /* gl_InstanceID reaches WGSL as @builtin(instance_index), proven by the
     * vertex-gl-instance-id corpus case. SPIR-V's InstanceIndex counts from
@@ -24795,6 +25124,24 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * a readback plus a buffer write, so it is the extension without its
     * performance point. */
    caps->query_buffer_object = true;
+   /* ARB_enhanced_layouts. Four features under one name, and the driver
+    * already serves all four: the GLSL linker packs small varyings into a
+    * shared location with or without the extension (this driver's transform
+    * feedback capture reads location_frac for exactly that reason), an
+    * explicit block member offset is a byte offset the UBO lowering already
+    * addresses, and the shader's xfb_buffer/xfb_offset qualifiers produce the
+    * same nir_xfb_info the capture pass already walks. What the cap adds is
+    * permission for the *application* to ask for a specific packing rather
+    * than accept the linker's. */
+   caps->shader_array_components = true;
+   /* ARB_buffer_storage. WebGPU has no persistent mapping -- a mapped
+    * GPUBuffer is unusable by the GPU until unmapped -- so the mapping is the
+    * buffer's CPU shadow and every submit uploads it. See
+    * gex_wgpu_flush_persistent_maps for what "coherent" means here. */
+   caps->buffer_map_persistent_coherent = true;
+   /* And so st/mesa does not unmap around every draw, which would defeat the
+    * whole point of a persistent mapping. */
+   caps->allow_mapped_buffers_during_execution = true;
    caps->clip_halfz = true;
    caps->fs_coord_origin_upper_left = true;
    caps->fs_coord_pixel_center_half_integer = true;
