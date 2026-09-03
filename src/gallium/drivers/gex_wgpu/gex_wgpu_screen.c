@@ -26685,6 +26685,26 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * refusing it used to cost. */
    caps->anisotropic_filter = true;
    caps->max_texture_anisotropy = 16.0f;
+   /* ARB_polygon_offset_clamp is deliberately *not* claimed, and the reason is
+    * worth keeping: every part of it is already here.
+    * pipe_rasterizer_state::offset_clamp is carried through to
+    * WGPUDepthStencilState::depthBiasClamp, which means the same thing, the
+    * value arrives intact, and the pipeline key covers it -- but the clamp has
+    * no effect on this Dawn. Measured with a case in
+    * gl44-polygon-offset-probe: two coplanar quads under GL_LESS with a pull
+    * of -8 units, which the second wins, and a clamp of -1e-9, which is a
+    * sixtieth of a 24-bit depth unit and so should round the pull away and
+    * make it lose. llvmpipe loses it; this driver still wins it, with the same
+    * clamp reaching the descriptor. The depth bias itself works, so it is the
+    * clamp alone that is ignored -- Vulkan gates a non-zero depthBiasClamp on
+    * a device feature, which is the likeliest place for it to be dropped.
+    *
+    * Claiming an extension whose effect is silently absent is worse than not
+    * having it: an application asking for a clamp would get an unclamped
+    * offset and no way to know. So the cap stays off until the platform
+    * honours it, and the browser side is untested besides -- the guest
+    * exports no glPolygonOffsetClampEXT, and adding one shifts the opcode
+    * numbering the guest and host share. */
    /* NV_texture_barrier, another of the five. glTextureBarrier promises that
     * writes to a texture are visible to later reads of it, and
     * gex_wgpu_texture_barrier submits everything recorded so far -- which on
