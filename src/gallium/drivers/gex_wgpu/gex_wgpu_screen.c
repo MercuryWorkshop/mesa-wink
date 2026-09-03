@@ -18361,6 +18361,38 @@ gex_wgpu_bind_tes_state(struct pipe_context *pipe, void *state)
  * parameter, and the control shader's input patch size is the only thing that
  * reads it -- its *output* size is `layout(vertices = N) out` and comes from
  * the shader. */
+/* How many primitives a vertex count is, including the one u_prims_for_vertices
+ * refuses to answer.
+ *
+ * A patch has no fixed vertex count -- glPatchParameteri sets it, and it
+ * reaches this driver through set_patch_vertices rather than in the draw info
+ * -- so u_prim.h's table has an increment of zero for it and
+ * u_prims_for_vertices *asserts*, aborting the application:
+ *
+ *   u_prim.h:105: u_prims_for_vertices: Assertion `info->incr != 0' failed.
+ *
+ * KHR-GL44.tessellation_shader died there. Every draw with an occlusion or
+ * transform-feedback query active and a patch topology reaches it, which is
+ * ordinary for a tessellating program.
+ *
+ * The count returned for patches is the number of *patches*. GL asks
+ * PRIMITIVES_GENERATED for what the last pre-rasterization stage produced,
+ * which with a tessellation evaluation shader is what the tessellator emitted
+ * and is not this -- so the query is approximate for such a draw, and said so
+ * here rather than left as an abort. */
+static unsigned
+gex_wgpu_primitive_count(const struct gex_wgpu_context *ctx,
+                         enum mesa_prim mode, unsigned count)
+{
+   if (mode == MESA_PRIM_PATCHES) {
+      const unsigned per_patch = MAX2(1u, (unsigned)ctx->patch_vertices);
+      return count / per_patch;
+   }
+   if (mode > MESA_PRIM_PATCHES)
+      return 0;
+   return u_prims_for_vertices(mode, count);
+}
+
 static void
 gex_wgpu_set_patch_vertices(struct pipe_context *pipe, uint8_t vertices)
 {
@@ -18642,7 +18674,8 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    /* The slot table: one entry per captured vertex, resolved through the
     * index buffer and through the primitive topology. */
    const unsigned verts_per_prim = mesa_vertices_per_prim(info->mode);
-   const unsigned prims = u_prims_for_vertices(info->mode, draw->count);
+   const unsigned prims =
+      gex_wgpu_primitive_count(ctx, info->mode, draw->count);
    const uint64_t captured = (uint64_t)prims * verts_per_prim;
    if (!prims || !verts_per_prim || verts_per_prim > 3 ||
        captured > (1u << 22) ||
@@ -23644,7 +23677,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * stage produced whether or not this backend could render it. */
    if (ctx->active_query && draws) {
       const unsigned prims =
-         u_prims_for_vertices(info->mode, draws[0].count) *
+         gex_wgpu_primitive_count(ctx, info->mode, draws[0].count) *
          MAX2(1u, info->instance_count);
       switch (ctx->active_query->type) {
       case PIPE_QUERY_PRIMITIVES_GENERATED:
