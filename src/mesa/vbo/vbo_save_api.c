@@ -631,6 +631,11 @@ compile_vertex_list(struct gl_context *ctx)
       unsigned verts_per_primitive = outputting_quads ? 4 : 3;
 
       int vertex_count = original_prims[i].count;
+      if (getenv("GEX_DLIST_LOG"))
+         fprintf(stderr, "dlist: prim %u mode=0x%x count=%d start=%u "
+                 "supported=%d\n", i, mode, vertex_count,
+                 original_prims[i].start,
+                 !!(ctx->Const.DriverSupportedPrimMask & BITFIELD_BIT(mode)));
       if (!vertex_count) {
          continue;
       }
@@ -657,6 +662,9 @@ compile_vertex_list(struct gl_context *ctx)
                            &trans_func);
          if (new_count > 0)
             trans_func(original_prims[i].start, new_count, tmp_indices);
+         if (getenv("GEX_DLIST_LOG"))
+            fprintf(stderr, "dlist:   converted -> mode=0x%x count=%u "
+                    "index_size=%u\n", pmode, new_count, index_size);
          vertex_count = new_count;
          mode = (GLubyte)pmode;
          converted_prim = true;
@@ -840,6 +848,11 @@ compile_vertex_list(struct gl_context *ctx)
          indices[i] += start_offset;
       max_index += start_offset;
    }
+
+   if (getenv("GEX_DLIST_LOG"))
+      fprintf(stderr, "dlist: totals idx=%d total_vert_count=%d "
+              "merged_prims=%d current_bo=%s\n", idx, total_vert_count,
+              merged_prim_count, save->current_bo ? "yes" : "NULL");
 
    _mesa_reference_buffer_object(ctx, &node->cold->ib.obj, save->current_bo);
 

@@ -508,6 +508,15 @@ struct gex_wgpu_context {
    uint32_t point_gather_mask;
    bool point_gather_wanted[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
    unsigned point_gather_stride[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
+   /* One pass of a facing split, and the flag that stops it recursing. Kept
+    * on the context rather than on the stack because
+    * util_blitter_save_rasterizer can stash ctx->rasterizer, and a blit
+    * reached from inside the split would then hold a pointer into a dead
+    * frame. A pointer rather than a member because gex_wgpu_rasterizer is
+    * defined below this struct -- and the first member here must stay
+    * pipe_context, which is why it is not simply moved up. */
+   struct gex_wgpu_rasterizer *facing_pass;
+   bool facing_split;
    /* Set while a provoking-vertex rewrite is re-issuing its draw, so the
     * rewrite does not see its own output and recurse. */
    bool provoking_rewritten;
@@ -881,6 +890,12 @@ struct gex_wgpu_shader_variant {
 struct gex_wgpu_rasterizer {
    bool scissor;
    bool front_ccw;
+   /* glPolygonMode per face. fill_mode is the one the draw path acts on and
+    * is only meaningful when the two agree; when they differ the draw is
+    * split into one pass per facing, each with its own fill_mode -- see the
+    * facing split in gex_wgpu_draw_vbo_inner. */
+   unsigned fill_front;
+   unsigned fill_back;
    unsigned cull_face;
    bool discard;
    bool unclipped_depth;
@@ -5602,17 +5617,22 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
     * bound no rasterizer state at all, which cost culling and the scissor
     * too. Six of the installed GL programs set it, decals and shadow
     * volumes being what it is for. */
-   /* glPolygonMode, when both faces agree. WebGPU has no polygon mode, so the
-    * primitive is rewritten into lines or points -- see
+   /* glPolygonMode. WebGPU has no polygon mode, so the primitive is rewritten
+    * into the lines or points it would be drawn as -- see
     * gex_wgpu_draw_unfilled. Refusing it bound no rasterizer state at all,
     * which lost culling and the scissor along with the wireframe, so those
     * programs drew filled *and* wrong. Ten of the installed GL programs ask
-    * for it. Front and back differing stays refused: GL allows it and nothing
-    * here could honour it. */
-   if (state->fill_front == state->fill_back) {
-      supported.fill_front = state->fill_front;
-      supported.fill_back = state->fill_back;
-   }
+    * for it.
+    *
+    * The two faces differing used to stay refused, on the grounds that
+    * nothing here could honour it. WebGPU's cullMode can: a draw whose front
+    * and back modes differ is two draws, each with a single fill mode and the
+    * opposite face culled, which needs no knowledge of any triangle's
+    * winding because the rasterizer already has it. That was the last
+    * rasterizer state this driver refused, and the only one left in the whole
+    * app sweep -- eight programs, all of them this. */
+   supported.fill_front = state->fill_front;
+   supported.fill_back = state->fill_back;
    supported.offset_point = state->offset_point;
    supported.offset_line = state->offset_line;
    supported.offset_tri = state->offset_tri;
@@ -5711,6 +5731,8 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
                                                                        : 2.0f));
       rasterizer->depth_bias_slope = state->offset_scale;
       rasterizer->depth_bias_clamp = state->offset_clamp;
+      rasterizer->fill_front = state->fill_front;
+      rasterizer->fill_back = state->fill_back;
       rasterizer->fill_mode = state->fill_front == state->fill_back
          ? state->fill_front : PIPE_POLYGON_MODE_FILL;
       rasterizer->sprite_coord_enable = state->sprite_coord_enable;
@@ -16783,6 +16805,62 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        gex_wgpu_draw_provoking_last(pipe, info, drawid_offset, &draws[0]))
       return;
 
+   /* glPolygonMode with the faces set differently -- GL_LINE in front and
+    * GL_POINT behind, say -- drawn as one pass per facing.
+    *
+    * Each pass has a single fill mode, which is what everything downstream
+    * already knows how to do, and culls the other face so that only the
+    * triangles that facing applies to survive. WebGPU's cullMode does the
+    * facing test in the rasterizer, so nothing here has to compute a
+    * winding, and the state's own front_ccw keeps deciding what "front"
+    * means.
+    *
+    * The application's own cull state composes rather than being overwritten:
+    * a pass whose face the application already culls draws nothing and is
+    * skipped, and PIPE_FACE_FRONT_AND_BACK skips both (the whole-draw
+    * discard for that case is further down and would not be reached from
+    * here). Culling FRONT_AND_BACK is not expressible in WebGPU at all,
+    * which is why composing has to be done by skipping.
+    *
+    * This is the last rasterizer state the driver refused: eight programs in
+    * the app sweep, every one of them a differing pair. */
+   if (!ctx->failed && info && draws && ctx->rasterizer &&
+       !ctx->facing_split &&
+       ctx->rasterizer->fill_front != ctx->rasterizer->fill_back &&
+       u_reduced_prim(info->mode) == MESA_PRIM_TRIANGLES) {
+      struct gex_wgpu_rasterizer *const saved = ctx->rasterizer;
+      const unsigned cull = saved->cull_face;
+      if (!ctx->facing_pass)
+         ctx->facing_pass = CALLOC_STRUCT(gex_wgpu_rasterizer);
+      if (!ctx->facing_pass) {
+         gex_fail(ctx);
+         return;
+      }
+      ctx->facing_split = true;
+      for (unsigned face = 0; face < 2; ++face) {
+         /* face 0 draws the front faces by culling the back, and face 1 the
+          * other way round. */
+         const unsigned skip = face == 0 ? PIPE_FACE_FRONT : PIPE_FACE_BACK;
+         const unsigned hide = face == 0 ? PIPE_FACE_BACK : PIPE_FACE_FRONT;
+         if (cull == skip || cull == PIPE_FACE_FRONT_AND_BACK)
+            continue;
+         *ctx->facing_pass = *saved;
+         ctx->facing_pass->fill_mode =
+            face == 0 ? saved->fill_front : saved->fill_back;
+         ctx->facing_pass->fill_front = ctx->facing_pass->fill_mode;
+         ctx->facing_pass->fill_back = ctx->facing_pass->fill_mode;
+         ctx->facing_pass->cull_face = hide;
+         /* Polygon offset follows the fill mode it was enabled for, and the
+          * state object resolved that against fill_front alone. */
+         ctx->rasterizer = ctx->facing_pass;
+         gex_wgpu_draw_vbo(pipe, info, drawid_offset, indirect, draws,
+                           num_draws);
+      }
+      ctx->rasterizer = saved;
+      ctx->facing_split = false;
+      return;
+   }
+
    /* An unfilled polygon becomes the lines or points it would be drawn as,
     * before the topology rewrite below, so that a quad's four edges are four
     * edges and not two triangles' six. The rewrite comes back through here as
@@ -19557,6 +19635,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
       util_blitter_destroy(ctx->blitter);
    if (ctx->primconvert)
       util_primconvert_destroy(ctx->primconvert);
+   FREE(ctx->facing_pass);
    util_copy_framebuffer_state(&ctx->framebuffer, NULL);
    for (unsigned i = 0; i < ARRAY_SIZE(ctx->vertex_buffer_state); ++i)
       pipe_vertex_buffer_unreference(&ctx->vertex_buffer_state[i]);
