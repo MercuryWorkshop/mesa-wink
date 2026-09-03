@@ -7824,8 +7824,36 @@ gex_wgpu_texture_format(enum pipe_format format)
    case PIPE_FORMAT_Z16_UNORM: return WGPUTextureFormat_Depth16Unorm;
    case PIPE_FORMAT_Z24_UNORM_S8_UINT:
       return WGPUTextureFormat_Depth24PlusStencil8;
+   /* Stencil, as data. `stencil8` is a real WebGPU format, so a
+    * GL_STENCIL_INDEX8 texture is one directly -- and the two X-padded
+    * spellings are how Gallium names the *stencil aspect* of a combined
+    * depth-stencil texture, which is the same format seen through a
+    * stencil-only view. st/mesa lights both ARB_stencil_texturing and
+    * ARB_texture_stencil8 from one is_format_supported question about the
+    * padded pair, so they arrive together or not at all. */
+   case PIPE_FORMAT_S8_UINT:
+   case PIPE_FORMAT_X24S8_UINT:
+   case PIPE_FORMAT_S8X24_UINT:
+      return WGPUTextureFormat_Stencil8;
    default: return WGPUTextureFormat_Undefined;
    }
+}
+
+/* A view format that reads the stencil aspect rather than the depth one.
+ *
+ * These are not "depth formats that happen to hold stencil": the whole
+ * difference between them and Z24_UNORM_S8_UINT is which aspect a view of the
+ * same texture exposes, and every place that asks "is this depth or stencil?"
+ * has to distinguish them. util_format_is_depth_or_stencil says yes to all
+ * four, which is why asking it alone gave a stencil view the Depth sample
+ * type and a depth aspect -- the shader declared usampler2D and the draw was
+ * refused for a sample type that differed from the shader's. */
+static bool
+gex_wgpu_is_stencil_only_format(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_S8_UINT ||
+          format == PIPE_FORMAT_X24S8_UINT ||
+          format == PIPE_FORMAT_S8X24_UINT;
 }
 
 static bool
@@ -7880,6 +7908,11 @@ gex_wgpu_format_bytes(enum pipe_format format)
 static WGPUTextureSampleType
 gex_wgpu_format_sample_type(enum pipe_format format)
 {
+   /* Before the depth question, because a stencil aspect is an unsigned
+    * integer texture and not a depth one: WGSL reads it through
+    * texture_2d<u32>, GL through a usampler2D. */
+   if (gex_wgpu_is_stencil_only_format(format))
+      return WGPUTextureSampleType_Uint;
    if (util_format_is_depth_or_stencil(format))
       return WGPUTextureSampleType_Depth;
    if (util_format_is_pure_uint(format))
@@ -8083,6 +8116,30 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
              bind == PIPE_BIND_SAMPLER_VIEW &&
              MAX2(1, sample_count) == 1 &&
              MAX2(1, storage_sample_count) == 1;
+   }
+   /* Stencil as data. The two padded spellings are *view* formats -- st/mesa
+    * never allocates one, it asks for a stencil-aspect view of a combined
+    * texture it already has -- so they take the sampler bind only, while
+    * S8_UINT is a texture in its own right and takes the attachment bind too.
+    *
+    * S8X24_UINT rides the same optional WebGPU feature as its depth half: a
+    * stencil-aspect view of a depth32float-stencil8 texture cannot exist
+    * where the texture cannot. Claiming only X24S8_UINT is enough, because
+    * st_extensions asks for either one. */
+   if (gex_wgpu_is_stencil_only_format(format)) {
+      if (format == PIPE_FORMAT_S8X24_UINT &&
+          !gex_screen(screen)->depth32_stencil8)
+         return false;
+      const unsigned allowed = format == PIPE_FORMAT_S8_UINT
+         ? (PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SAMPLER_VIEW)
+         : PIPE_BIND_SAMPLER_VIEW;
+      const bool target_ok =
+         target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_RECT ||
+         target == PIPE_TEXTURE_2D_ARRAY || target == PIPE_TEXTURE_CUBE ||
+         target == PIPE_TEXTURE_CUBE_ARRAY;
+      return target_ok && MAX2(1, sample_count) == 1 &&
+             MAX2(1, storage_sample_count) == 1 &&
+             bind && !(bind & ~allowed);
    }
    if (format == PIPE_FORMAT_Z32_FLOAT ||
        format == PIPE_FORMAT_Z16_UNORM ||
@@ -8899,7 +8956,13 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
     * see gex_wgpu_read_depth, which resolves through a render pass. Writing
     * would need the mirror of that -- a depth-writing draw -- which is not
     * built. */
-   if (depth_stencil && wgpu_format != WGPUTextureFormat_Depth16Unorm) {
+   /* `stencil8` is the other depth-stencil format WebGPU lets a buffer copy
+    * into -- the spec's table gives it CopySrc and CopyDst, unlike
+    * depth24plus and depth32float -- so a GL_STENCIL_INDEX8 upload is an
+    * ordinary texel copy and does not need the render-pass detour below. Its
+    * only aspect is stencil, so `All` names it. */
+   if (depth_stencil && wgpu_format != WGPUTextureFormat_Depth16Unorm &&
+       wgpu_format != WGPUTextureFormat_Stencil8) {
       struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
       if (!gex_wgpu_write_depth(ctx, resource, level, box, data, stride)) {
          static bool said;
@@ -8919,8 +8982,9 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
    destination.origin.x = box->x;
    destination.origin.y = one_d_array ? 0 : box->y;
    destination.origin.z = one_d_array ? box->y : box->z;
-   destination.aspect = depth_stencil ? WGPUTextureAspect_DepthOnly
-                                      : WGPUTextureAspect_All;
+   destination.aspect =
+      (depth_stencil && wgpu_format != WGPUTextureFormat_Stencil8)
+         ? WGPUTextureAspect_DepthOnly : WGPUTextureAspect_All;
    /* A format with a wider backing is uploaded through a conversion: the
     * caller's bytes are laid out for the format GL asked for, and the texture
     * holds the backing one. util_format_translate does it from Mesa's own
@@ -9050,8 +9114,14 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
         * faults the module, leaves Mesa's context-texture lock held, and
         * every later glReadPixels then deadlocks on it. One refused view,
         * and the rest of the run is gone. */
-       util_format_linear(templ->format) !=
-          util_format_linear(texture->format) ||
+       (util_format_linear(templ->format) !=
+           util_format_linear(texture->format) &&
+        /* A stencil-aspect view names a different format from its texture by
+         * construction -- X24S8_UINT of a Z24_UNORM_S8_UINT texture -- so the
+         * sRGB pairing rule above cannot be the only exception. It is still a
+         * view of the *same bytes*: only the aspect differs. */
+        !(gex_wgpu_is_stencil_only_format(templ->format) &&
+          util_format_is_depth_or_stencil(texture->format))) ||
        templ->swizzle_r > PIPE_SWIZZLE_1 ||
        templ->swizzle_g > PIPE_SWIZZLE_1 ||
        templ->swizzle_b > PIPE_SWIZZLE_1 ||
@@ -9123,9 +9193,18 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
       desc.arrayLayerCount =
          templ->u.tex.last_layer - templ->u.tex.first_layer + 1;
    }
+   /* The stencil aspect, which is what ARB_stencil_texturing asks for: the
+    * view names `stencil8` whatever the texture's packing is, and the aspect
+    * selects the half. A stencil-only *texture* is already stencil8, so its
+    * view takes the whole thing. */
+   if (gex_wgpu_is_stencil_only_format(templ->format)) {
+      desc.format = WGPUTextureFormat_Stencil8;
+      desc.aspect = texture->format == PIPE_FORMAT_S8_UINT
+         ? WGPUTextureAspect_All : WGPUTextureAspect_StencilOnly;
+   }
    /* Same rule as the depth resolve: a depth-only view of a combined format
     * must name the depth-only format, or WebGPU rejects the pair. */
-   if (util_format_is_depth_or_stencil(texture->format)) {
+   else if (util_format_is_depth_or_stencil(texture->format)) {
       const WGPUTextureFormat packed = gex_wgpu_texture_format(texture->format);
       desc.aspect = WGPUTextureAspect_DepthOnly;
       desc.format = packed == WGPUTextureFormat_Depth24PlusStencil8
@@ -11222,6 +11301,13 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
    struct pipe_resource *resource = dst ? dst->texture : NULL;
    const bool has_stencil = dst &&
       util_format_has_stencil(util_format_description(dst->format));
+   /* A stencil-only attachment has no depth half to load, store or clear, and
+    * WebGPU says so as a validation error rather than ignoring the ops:
+    * "Both depthLoadOp and depthStoreOp must not be set if the attachment has
+    * no depth aspect". Every attachment here had a depth aspect until
+    * GL_STENCIL_INDEX8 became a texture. */
+   const bool has_depth = dst &&
+      util_format_has_depth(util_format_description(dst->format));
    /* Every depth format the driver can name, not a list that has to be kept
     * in step with one: this refusal latches, so a depth format added to the
     * table and forgotten here turns a new capability into a dead run. That is
@@ -11230,8 +11316,9 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
    const bool clearable_depth = dst &&
       util_format_is_depth_or_stencil(dst->format) &&
       gex_wgpu_texture_format(dst->format) != WGPUTextureFormat_Undefined;
-   const unsigned allowed_flags = has_stencil
-      ? PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL : PIPE_CLEAR_DEPTH;
+   const unsigned allowed_flags =
+      (has_depth ? PIPE_CLEAR_DEPTH : 0) |
+      (has_stencil ? PIPE_CLEAR_STENCIL : 0);
    /* Whatever level and layer the surface names, at that level's own size --
     * the same rule as gex_wgpu_clear_render_target.
     *
@@ -11296,10 +11383,12 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
    WGPURenderPassDepthStencilAttachment attachment =
       WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
    attachment.view = view;
-   attachment.depthLoadOp = clear_flags & PIPE_CLEAR_DEPTH
-      ? WGPULoadOp_Clear : WGPULoadOp_Load;
-   attachment.depthStoreOp = WGPUStoreOp_Store;
-   attachment.depthClearValue = depth;
+   if (has_depth) {
+      attachment.depthLoadOp = clear_flags & PIPE_CLEAR_DEPTH
+         ? WGPULoadOp_Clear : WGPULoadOp_Load;
+      attachment.depthStoreOp = WGPUStoreOp_Store;
+      attachment.depthClearValue = depth;
+   }
    if (has_stencil) {
       attachment.stencilLoadOp = clear_flags & PIPE_CLEAR_STENCIL
          ? WGPULoadOp_Clear : WGPULoadOp_Load;
@@ -20943,7 +21032,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * Every draw in that pass was lost. Same defect, and the same one-line
        * fix, as the depth upload path above. */
       depth_attachment.depthClearValue = 1.0f;
-      if (!read_only) {
+      /* Only where there is a depth aspect to load: a GL_STENCIL_INDEX8
+       * attachment is stencil8, and WebGPU rejects depth ops on it. */
+      if (!read_only &&
+          util_format_has_depth(
+             util_format_description(ctx->depth->format))) {
          depth_attachment.depthLoadOp = WGPULoadOp_Load;
          depth_attachment.depthStoreOp = WGPUStoreOp_Store;
       }
