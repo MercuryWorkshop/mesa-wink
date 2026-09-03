@@ -2852,18 +2852,23 @@ const char *gex_wgpu_declined_last_why;
 static void
 gex_wgpu_mark_failed(struct gex_wgpu_context *ctx, const char *fn, int line)
 {
-   if (!ctx->failed)
+   /* One table for both messages, so the first site is not also reported as
+    * an "also" later -- Blender's log named set_framebuffer_state twice. */
+   static struct { const char *fn; int line; } seen[24];
+   static unsigned seen_count;
+   static bool capped;
+   if (!ctx->failed) {
       fprintf(stderr, "gex-wgpu: first refusal at %s:%d\n", fn, line);
-   else {
+      seen[0].fn = fn;
+      seen[0].line = line;
+      seen_count = 1;
+   } else {
       /* Every *distinct* site after the first, once each. Printing only the
        * first hid a fatal refusal behind a harmless one: Blender's run
        * reported the colour-target reinterpretation it survives, while the
        * buffer map failure that actually killed it -- Mesa turns a NULL map
        * into GL_OUT_OF_MEMORY and the application dereferences it -- said
        * nothing at all. The cap keeps a per-draw refusal from filling a log. */
-      static struct { const char *fn; int line; } seen[24];
-      static unsigned seen_count;
-      static bool capped;
       for (unsigned i = 0; i < seen_count; ++i)
          if (seen[i].line == line && seen[i].fn == fn)
             return;
@@ -15447,8 +15452,7 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
                                                     ? "surface reinterprets the format at another texel size"
                : !gex_wgpu_color_renderable(pipe->screen, surface->format)
                                                     ? "format is not renderable"
-               : surface->first_layer != surface->last_layer
-                                                    ? "more than one layer" : NULL;
+                                                    : NULL;
             if (why) {
                if (!ctx->failed)
                   fprintf(stderr,
@@ -15478,12 +15482,42 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
                 *
                 * A latch is a bad outcome. A crash with no diagnostic is a
                 * worse one, and the application cannot render this pass
-                * either way. Revisit if an application turns up that
-                * reinterprets *one* of several attachments and would keep
-                * working without it. */
+                * either way.
+                *
+                * Since superseded for the case it was written about: a
+                * reinterpretation that preserves the texel size now renders
+                * through a scratch texture instead, and Blender's three
+                * targets are all of that kind. What still reaches here is a
+                * target larger than its texture, a reinterpretation that
+                * changes the texel size, and a format WebGPU cannot render
+                * to at all. */
                gex_fail(ctx);
                color_count = 0;
                break;
+            }
+            /* A layered attachment -- glFramebufferTexture of an array or a
+             * cube map, which is how a shader renders every face or cascade
+             * in one pass. WebGPU attaches one layer at a time, so this
+             * rasterizes the first of them, which is what GL specifies when
+             * nothing writes gl_Layer: "if the last vertex processing stage
+             * does not write gl_Layer, the value is zero". A shader that does
+             * write it already says so once, from the geometry path.
+             *
+             * This used to be refused, which latched the context and so
+             * stopped every later draw. Blender's EEVEE attaches a two-layer
+             * 1x1 r32_float target early in its setup, so the refusal cost
+             * everything after it. */
+            if (surface->first_layer != surface->last_layer) {
+               static bool said;
+               if (!said) {
+                  said = true;
+                  fprintf(stderr,
+                          "gex-wgpu: colour target %u is layered (%u..%u of "
+                          "%s); rasterizing layer %u only\n", i,
+                          surface->first_layer, surface->last_layer,
+                          util_format_short_name(surface->format),
+                          surface->first_layer);
+               }
             }
             colors[i] = surface->texture;
             color_formats[i] = surface->format;
