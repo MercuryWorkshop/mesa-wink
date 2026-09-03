@@ -2814,6 +2814,29 @@ gex_wgpu_mark_failed(struct gex_wgpu_context *ctx, const char *fn, int line)
 {
    if (!ctx->failed)
       fprintf(stderr, "gex-wgpu: first refusal at %s:%d\n", fn, line);
+   else {
+      /* Every *distinct* site after the first, once each. Printing only the
+       * first hid a fatal refusal behind a harmless one: Blender's run
+       * reported the colour-target reinterpretation it survives, while the
+       * buffer map failure that actually killed it -- Mesa turns a NULL map
+       * into GL_OUT_OF_MEMORY and the application dereferences it -- said
+       * nothing at all. The cap keeps a per-draw refusal from filling a log. */
+      static struct { const char *fn; int line; } seen[24];
+      static unsigned seen_count;
+      static bool capped;
+      for (unsigned i = 0; i < seen_count; ++i)
+         if (seen[i].line == line && seen[i].fn == fn)
+            return;
+      if (seen_count < ARRAY_SIZE(seen)) {
+         seen[seen_count].fn = fn;
+         seen[seen_count].line = line;
+         ++seen_count;
+         fprintf(stderr, "gex-wgpu: also refused at %s:%d\n", fn, line);
+      } else if (!capped) {
+         capped = true;
+         fprintf(stderr, "gex-wgpu: further refusal sites not listed\n");
+      }
+   }
    ctx->failed = true;
 }
 
@@ -9890,7 +9913,7 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
        * `gex->buffer` and nothing reads their shadow, and u_upload's constant
        * pages are megabyte-sized -- which is where the memory is. */
       !(resource->bind & PIPE_BIND_INDEX_BUFFER) &&
-      resource->target == PIPE_BUFFER && gex->buffer && !ctx->failed &&
+      resource->target == PIPE_BUFFER && gex->buffer &&
       (uint64_t)offset + size <= resource->width0;
    if (subdata_direct) {
       gex->bytes_written += size;
@@ -9905,9 +9928,21 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
    if (size && !gex->shadow) {
       ++gex_wgpu_shadow_cause_subdata;
 
-      if (!gex_wgpu_shadow_for_read(pipe, gex)) { gex_fail(ctx); return; }
+      /* A failed context cannot wait on a readback -- see the note in
+       * gex_wgpu_buffer_map -- and an empty shadow is the right starting
+       * point anyway, since the write below fills the part that matters. */
+      if (!(ctx->failed ? gex_wgpu_shadow_ensure(gex)
+                        : gex_wgpu_shadow_for_read(pipe, gex))) {
+         gex_fail(ctx);
+         return;
+      }
    }
-   if (ctx->failed || resource->target != PIPE_BUFFER || !gex->buffer ||
+   /* Not gated on ctx->failed: an upload is a queue write, and dropping it
+    * corrupts the resource for the rest of the run rather than for one frame.
+    * Blender lost the leading glyphs of half its labels that way -- its font
+    * atlas is filled by subdata, and the refusal latch had been set by an
+    * unrelated colour target. */
+   if (resource->target != PIPE_BUFFER || !gex->buffer ||
        (size && !gex->shadow) || (!data && size) || (usage & PIPE_MAP_READ) ||
        (uint64_t)offset + size > resource->width0) {
       gex_fail(ctx);
@@ -9976,8 +10011,9 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
       ? u_minify(resource->width0, level) : 0;
    const unsigned level_height = resource
       ? u_minify(resource->height0, level) : 0;
-   if (ctx->failed ||
-      (resource->target != PIPE_TEXTURE_1D &&
+   /* Not gated on ctx->failed, for the reason in gex_wgpu_buffer_subdata: a
+    * dropped texture upload is permanent. */
+   if ((resource->target != PIPE_TEXTURE_1D &&
         resource->target != PIPE_TEXTURE_1D_ARRAY &&
         resource->target != PIPE_TEXTURE_2D &&
         resource->target != PIPE_TEXTURE_RECT &&
@@ -12074,10 +12110,18 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct gex_wgpu_resource *gex = gex_resource(resource);
    *out_transfer = NULL;
-   if (ctx->failed || resource->target != PIPE_BUFFER || level != 0 ||
+   /* Deliberately *not* gated on ctx->failed. Mesa turns a NULL map into
+    * GL_OUT_OF_MEMORY and applications dereference the result: Blender is
+    * killed that way by a colour-target refusal it would otherwise have
+    * survived with one wrong panel, and the crash lands in application code
+    * with nothing of this driver's in the backtrace. The refusal latch is
+    * meant to stop this driver producing GPU work it cannot get right, not
+    * to take the process down -- so a map still returns memory, and the two
+    * paths below skip anything that would need a queue to complete. */
+   if (resource->target != PIPE_BUFFER || level != 0 ||
        !gex->buffer || box->x < 0 || box->width <= 0 ||
        (uint64_t)(unsigned)box->x + (unsigned)box->width > resource->width0) {
-      /* Eight conditions, one latch. Say which, once: after the first the
+      /* Seven conditions, one latch. Say which, once: after the first the
        * context is failed and every later map reports the same thing. */
       if (!ctx->failed)
          fprintf(stderr,
@@ -12114,8 +12158,13 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
     * shaders and transform feedback write the WebGPU buffer directly, so a
     * read has to come back from it. Everything else is still CPU-authored,
     * and the shadow is both correct and free. */
-   const bool gpu_written = gex->gpu_written ||
-      (resource->bind & (PIPE_BIND_STREAM_OUTPUT | PIPE_BIND_SHADER_BUFFER));
+   /* ...and a failed context reads from the shadow whatever the buffer's
+    * history, because the readback below waits on a queue that may have
+    * nothing left to submit it. Stale bytes are what a dropped frame looks
+    * like; a hang is not. */
+   const bool gpu_written = !ctx->failed &&
+      (gex->gpu_written ||
+       (resource->bind & (PIPE_BIND_STREAM_OUTPUT | PIPE_BIND_SHADER_BUFFER)));
    /* Only a map that actually reads the GPU has to wait for the recorded
     * draws. A write map is served from the shadow and reaches the device at
     * unmap, so flushing here would break the batch for every streamed vertex
@@ -12290,7 +12339,7 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
       return transfer->data;
    }
    ++gex_wgpu_maps_shadowed;
-   if (!gex->shadow && !gex_wgpu_shadow_for_read(pipe, gex)) {
+   if (!gex->shadow && !ctx->failed && !gex_wgpu_shadow_for_read(pipe, gex)) {
       pipe_resource_reference(&transfer->base.resource, NULL);
       --gex_wgpu_transfers_live;
       FREE(transfer);
@@ -12457,7 +12506,14 @@ gex_wgpu_buffer_unmap(struct pipe_context *pipe,
                  transfer->box.width, nonzero,
                  100.0 * nonzero / (double)transfer->box.width, last);
    }
-   if (!ctx->failed && gex_transfer->staged_write &&
+   /* Neither upload below is gated on ctx->failed. A write map that never
+    * reaches the buffer is data the application believes it wrote, and it is
+    * lost for the rest of the run: Blender batches each text label into a
+    * mapped vertex buffer, so a latch set by an unrelated colour target left
+    * half its labels missing their leading glyphs. An upload is a queue
+    * write; it costs nothing to honour and the alternative is silent
+    * corruption. See gex_wgpu_buffer_map for the same argument. */
+   if (gex_transfer->staged_write &&
        !(transfer->usage & PIPE_MAP_FLUSH_EXPLICIT) && gex->buffer &&
        transfer->box.width > 0) {
       /* The staged block covers exactly the mapped range, and the range is
@@ -12498,7 +12554,7 @@ gex_wgpu_buffer_unmap(struct pipe_context *pipe,
       wgpuQueueWriteBuffer(gex_screen(pipe->screen)->queue, gex->buffer,
                            (uint32_t)transfer->box.x, gex_transfer->data,
                            (size_t)transfer->box.width);
-   } else if (!ctx->failed && (transfer->usage & PIPE_MAP_WRITE) &&
+   } else if ((transfer->usage & PIPE_MAP_WRITE) &&
        !(transfer->usage & PIPE_MAP_FLUSH_EXPLICIT) && gex->buffer &&
        gex->shadow && transfer->box.width > 0) {
       const uint32_t start = (uint32_t)transfer->box.x;
