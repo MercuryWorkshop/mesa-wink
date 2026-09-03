@@ -25667,6 +25667,51 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    for (unsigned i = 0; i < ctx->so_target_count; ++i)
       if (ctx->so_targets[i])
          gex_wgpu_batch_touch(ctx, ctx->so_targets[i]->buffer);
+   /* Storage blocks, buffer textures and shader images, which were all
+    * missing from this list. A resource that is never touched reports no
+    * conflict, so buffer_subdata and the write-map upload at unmap were free
+    * to replace its bytes while draws that read them were still sitting in
+    * the batch unsubmitted -- and wgpuQueueWriteBuffer is ordered against the
+    * submit that follows, so the *last* write is what every batched draw
+    * reads.
+    *
+    * Blender draws each interface label as six indices by one instance per
+    * glyph, out of a 128-glyph storage buffer it rewrites whole before every
+    * draw. So each frame kept only the final label's glyphs: earlier labels
+    * indexed positions belonging to text drawn later, collapsed to degenerate
+    * quads, and simply vanished -- "Delta Transform" rendered as "orm", the
+    * outliner's "Scene Collection" as "tion", and half the interface as
+    * nothing at all. This is the same failure the note on
+    * gex_wgpu_batch_conflicts_usage describes for SuperTuxKart's vertex
+    * buffers, reached through a resource class the list did not cover. */
+   for (unsigned i = 0; i < ctx->vs->ssbo_count; ++i)
+      gex_wgpu_batch_touch(
+         ctx,
+         ctx->shader_buffers[MESA_SHADER_VERTEX][ctx->vs->ssbo_slots[i]].buffer);
+   for (unsigned i = 0; i < ctx->fs->ssbo_count; ++i)
+      gex_wgpu_batch_touch(
+         ctx,
+         ctx->shader_buffers[MESA_SHADER_FRAGMENT][ctx->fs->ssbo_slots[i]].buffer);
+   for (unsigned i = 0; i < ctx->vs->buftex_count; ++i) {
+      const struct pipe_sampler_view *view =
+         ctx->vertex_sampler_views[ctx->vs->buftex_slots[i]];
+      if (view)
+         gex_wgpu_batch_touch(ctx, view->texture);
+   }
+   for (unsigned i = 0; i < ctx->fs->buftex_count; ++i) {
+      const struct pipe_sampler_view *view =
+         ctx->sampler_views[ctx->fs->buftex_slots[i]];
+      if (view)
+         gex_wgpu_batch_touch(ctx, view->texture);
+   }
+   for (unsigned i = 0; i < ctx->vs->image_count; ++i)
+      gex_wgpu_batch_touch(
+         ctx,
+         ctx->shader_images[MESA_SHADER_VERTEX][ctx->vs->image_slots[i]].resource);
+   for (unsigned i = 0; i < ctx->fs->image_count; ++i)
+      gex_wgpu_batch_touch(
+         ctx,
+         ctx->shader_images[MESA_SHADER_FRAGMENT][ctx->fs->image_slots[i]].resource);
    /* Bounded, so one command buffer cannot grow without limit and the GPU
     * always has something to be getting on with -- and submitted at once if
     * the batch ran out of room to keep this draw's resources alive. */
