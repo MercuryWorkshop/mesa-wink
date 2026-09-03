@@ -3936,14 +3936,17 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
            (state->wrap_s != PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
             state->wrap_s != PIPE_TEX_WRAP_REPEAT &&
             state->wrap_s != PIPE_TEX_WRAP_MIRROR_REPEAT &&
+            state->wrap_s != PIPE_TEX_WRAP_CLAMP &&
             state->wrap_s != PIPE_TEX_WRAP_CLAMP_TO_BORDER) ||
            (state->wrap_t != PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
             state->wrap_t != PIPE_TEX_WRAP_REPEAT &&
             state->wrap_t != PIPE_TEX_WRAP_MIRROR_REPEAT &&
+            state->wrap_t != PIPE_TEX_WRAP_CLAMP &&
             state->wrap_t != PIPE_TEX_WRAP_CLAMP_TO_BORDER) ||
            (state->wrap_r != PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
             state->wrap_r != PIPE_TEX_WRAP_REPEAT &&
             state->wrap_r != PIPE_TEX_WRAP_MIRROR_REPEAT &&
+            state->wrap_r != PIPE_TEX_WRAP_CLAMP &&
             state->wrap_r != PIPE_TEX_WRAP_CLAMP_TO_BORDER) ||
            ((state->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
              state->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
@@ -10336,20 +10339,36 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
         state->min_img_filter != PIPE_TEX_FILTER_LINEAR) ||
        (state->mag_img_filter != PIPE_TEX_FILTER_NEAREST &&
         state->mag_img_filter != PIPE_TEX_FILTER_LINEAR) ||
+       /* PIPE_TEX_WRAP_CLAMP is GL 1.x's GL_CLAMP, which clamps to the
+        * *border* for NEAREST and blends texels with the border colour at
+        * the edge for LINEAR. WebGPU has no such mode, and neither does any
+        * modern GPU -- GL_CLAMP was removed in the core profile and every
+        * current driver serves it as clamp-to-edge, which is therefore what
+        * these applications already see everywhere else.
+        *
+        * Accepting it is strictly better than refusing it, because a refused
+        * sampler is silently served by the default one: the filters, the LOD
+        * range and the comparison mode went with it, not just the wrap. Four
+        * of the installed GL programs ask for it -- convolutions, projtex,
+        * shadowtex and texenv -- and were losing their whole sampler state
+        * over a mode whose difference is one half-texel at the edge. */
        (state->wrap_s != PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
         state->wrap_s != PIPE_TEX_WRAP_REPEAT &&
         state->wrap_s != PIPE_TEX_WRAP_MIRROR_REPEAT &&
         state->wrap_s != PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE &&
+        state->wrap_s != PIPE_TEX_WRAP_CLAMP &&
         state->wrap_s != PIPE_TEX_WRAP_CLAMP_TO_BORDER) ||
        (state->wrap_t != PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
         state->wrap_t != PIPE_TEX_WRAP_REPEAT &&
         state->wrap_t != PIPE_TEX_WRAP_MIRROR_REPEAT &&
         state->wrap_t != PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE &&
+        state->wrap_t != PIPE_TEX_WRAP_CLAMP &&
         state->wrap_t != PIPE_TEX_WRAP_CLAMP_TO_BORDER) ||
        (state->wrap_r != PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
         state->wrap_r != PIPE_TEX_WRAP_REPEAT &&
         state->wrap_r != PIPE_TEX_WRAP_MIRROR_REPEAT &&
         state->wrap_r != PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE &&
+        state->wrap_r != PIPE_TEX_WRAP_CLAMP &&
         state->wrap_r != PIPE_TEX_WRAP_CLAMP_TO_BORDER) ||
        (state->min_mip_filter != PIPE_TEX_MIPFILTER_NONE &&
         state->min_mip_filter != PIPE_TEX_MIPFILTER_NEAREST &&
