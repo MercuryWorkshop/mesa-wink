@@ -10471,6 +10471,73 @@ gex_wgpu_write_depth(struct gex_wgpu_context *ctx,
                      const struct pipe_box *box, const uint8_t *src,
                      unsigned src_stride);
 
+static void gex_wgpu_texture_subdata(struct pipe_context *pipe,
+                                     struct pipe_resource *resource,
+                                     unsigned level, unsigned usage,
+                                     const struct pipe_box *box,
+                                     const void *data, unsigned stride,
+                                     uintptr_t layer_stride);
+
+/* glClearTexImage and glClearTexSubImage -- ARB_clear_texture, core in GL 4.4.
+ *
+ * Without this hook st/mesa falls back to u_default_clear_texture, which
+ * clears by *rendering* into the texture. That needs the format and target to
+ * be a render target, and a 1D texture cannot be one in WebGPU -- so the
+ * fallback called clear_render_target for a shape this driver refuses, the
+ * refusal latched the context, and the rest of the run collapsed: every later
+ * map declined and st turned each into GL_OUT_OF_MEMORY. Ten of
+ * KHR-GL44.clear_tex_image's 78 cases passed, and the other sixty-eight were
+ * mostly that cascade rather than the clear itself.
+ *
+ * Filling a texture with one colour needs no rendering at all here: the value
+ * arrives in the resource's own format, so repeating it across the box and
+ * handing that to texture_subdata is the whole operation. That path already
+ * knows about the wider backing formats, the block sizes and the row
+ * alignment, so this stays a few lines and inherits all of it -- and it works
+ * for every target and every format, which is what the render path could not
+ * do.
+ *
+ * Depth, stencil and compressed formats go to util_clear_texture_sw instead
+ * of to u_default_clear_texture. WebGPU has no write into a depth aspect and a
+ * compressed texel is not a value to repeat, so neither can take the path
+ * above -- but the default would clear them by *rendering*, and this driver's
+ * depth clear only does a whole level, so glClearTexSubImage of a region
+ * refused and latched the context, costing 56 of the 78 cases as a cascade of
+ * GL_OUT_OF_MEMORY rather than as clears. The software path maps and fills,
+ * which works for any box and any format. */
+static void
+gex_wgpu_clear_texture(struct pipe_context *pipe, struct pipe_resource *res,
+                       unsigned level, const struct pipe_box *box,
+                       const void *data)
+{
+   if (!res || !box || !data) {
+      u_default_clear_texture(pipe, res, level, box, data);
+      return;
+   }
+   if (util_format_is_depth_or_stencil(res->format) ||
+       util_format_is_compressed(res->format)) {
+      util_clear_texture_sw(pipe, res, level, box, data);
+      return;
+   }
+   const unsigned texel = util_format_get_blocksize(res->format);
+   const uint64_t texels = (uint64_t)box->width * box->height * box->depth;
+   if (!texel || !texels || texels > (64u << 20) / MAX2(1u, texel)) {
+      util_clear_texture_sw(pipe, res, level, box, data);
+      return;
+   }
+   uint8_t *fill = MALLOC((size_t)(texels * texel));
+   if (!fill) {
+      util_clear_texture_sw(pipe, res, level, box, data);
+      return;
+   }
+   for (uint64_t i = 0; i < texels; ++i)
+      memcpy(fill + i * texel, data, texel);
+   const unsigned row = box->width * texel;
+   gex_wgpu_texture_subdata(pipe, res, level, PIPE_MAP_WRITE, box, fill, row,
+                            (uintptr_t)row * box->height);
+   FREE(fill);
+}
+
 static void
 gex_wgpu_texture_subdata(struct pipe_context *pipe,
                          struct pipe_resource *resource, unsigned level,
@@ -26652,6 +26719,7 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.texture_barrier = gex_wgpu_texture_barrier;
    ctx->base.render_condition = gex_wgpu_render_condition;
    ctx->base.texture_subdata = gex_wgpu_texture_subdata;
+   ctx->base.clear_texture = gex_wgpu_clear_texture;
    ctx->base.clear_render_target = gex_wgpu_clear_render_target;
    ctx->base.clear_depth_stencil = gex_wgpu_clear_depth_stencil;
    ctx->base.texture_map = gex_wgpu_texture_map;
