@@ -106,6 +106,12 @@ extern void gex_wgpu_jspi_signal(void);
 #define GEX_WGPU_DRAW_PARAM_WORDS 4
 #define GEX_WGPU_BUFTEX_FIRST_BINDING \
    (GEX_WGPU_IMAGE_FIRST_BINDING + GEX_WGPU_MAX_SHADER_IMAGES)
+/* Textures and samplers for a *compute* shader. The graphics stages number
+ * theirs 2*unit and 2*unit+1 in a descriptor set of their own; everything a
+ * dispatch binds shares set 0, so these take a range above the buffer
+ * textures instead of colliding with the blocks below them. */
+#define GEX_WGPU_COMPUTE_TEXTURE_FIRST_BINDING \
+   (GEX_WGPU_BUFTEX_FIRST_BINDING + GEX_WGPU_MAX_BUFFER_TEXTURES)
 
 /* How many 32-bit words a texel of a buffer-texture format occupies, or 0 for
  * a format this driver cannot serve as one.
@@ -232,6 +238,16 @@ gex_wgpu_buffer_texture_words(enum pipe_format format)
 #define GEX_WGPU_GS_PARAM_PRIMITIVES 0
 #define GEX_WGPU_GS_PARAM_WORDS 4
 #define GEX_WGPU_GS_GROUP 32
+
+/* Defined with the format tables far below, and used by the shader fixups
+ * that come first: a format this driver stores in a wider one, so that the
+ * shader, the bind group layout and the texture all name the same thing. */
+static enum pipe_format gex_wgpu_format_backing(enum pipe_format format);
+
+/* Defined with the sampler views; a compute dispatch binds them too. */
+struct gex_wgpu_sampler_view;
+static void gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
+                                          struct gex_wgpu_sampler_view *view);
 
 /* Viewports, scissor boxes and depth ranges. ARB_viewport_array requires
  * sixteen and WebGPU has one per render pass -- which is not the
@@ -1035,6 +1051,11 @@ struct gex_wgpu_context {
     * independently; the vertex stage's textures live in bind group 3. */
    struct gex_wgpu_sampler *vertex_samplers[GEX_WGPU_MAX_SAMPLERS];
    struct pipe_sampler_view *vertex_sampler_views[GEX_WGPU_MAX_SAMPLERS];
+   /* And the compute stage's, which used to be refused outright: binding a
+    * real view there latched the context. A compute shader samples like any
+    * other stage -- see the note on gex_wgpu_compute_state::texture_count. */
+   struct gex_wgpu_sampler *compute_samplers[GEX_WGPU_MAX_SAMPLERS];
+   struct pipe_sampler_view *compute_sampler_views[GEX_WGPU_MAX_SAMPLERS];
 };
 
 /* How one draw expands its points into quads. Kept here rather than beside
@@ -2357,6 +2378,20 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
       if ((var->data.access & ACCESS_NON_WRITEABLE) &&
           (var->data.access & ACCESS_NON_READABLE))
          var->data.access &= ~ACCESS_NON_READABLE;
+      /* A promoted format has to be promoted *here*, before ntv reads it, or
+       * the three things that must agree do not: the WGSL declares the
+       * format, the bind group layout repeats it, and the view carries it.
+       * The texture is already the wider format (gex_wgpu_texture_format
+       * applies the same backing), so rewriting the variable is what lines
+       * the shader up with its own storage. Naming the narrow format in WGSL
+       * would not even compile -- r16float is not a WGSL storage format,
+       * which is the whole reason for the promotion. */
+      {
+         const enum pipe_format promoted =
+            gex_wgpu_format_backing(var->data.image.format);
+         if (promoted != PIPE_FORMAT_NONE)
+            var->data.image.format = promoted;
+      }
       var->data.driver_location = slot;
       var->data.descriptor_set = stage == MESA_SHADER_VERTEX ? 1 : 2;
       var->data.binding = GEX_WGPU_IMAGE_FIRST_BINDING + slot;
@@ -5522,6 +5557,11 @@ gex_wgpu_split_combined_samplers(nir_shader *nir)
 {
    nir_variable *split_texture[GEX_WGPU_MAX_SAMPLERS] = {0};
    nir_variable *split_sampler[GEX_WGPU_MAX_SAMPLERS] = {0};
+   /* Which combined variable, and which element of it, each pair replaces --
+    * needed to repoint a deref that survived st/mesa rather than to build a
+    * new one from the unit. */
+   nir_variable *split_origin[GEX_WGPU_MAX_SAMPLERS] = {0};
+   unsigned split_origin_elem[GEX_WGPU_MAX_SAMPLERS] = {0};
    nir_variable *retire[GEX_WGPU_MAX_SAMPLERS] = {0};
    unsigned retire_count = 0;
    unsigned count = 0;
@@ -5575,9 +5615,14 @@ gex_wgpu_split_combined_samplers(nir_shader *nir)
 
       /* Set 3 for the vertex stage, 0 for the fragment stage. The two
        * shaders number their bindings independently, so they cannot share a
-       * group; set 1 and set 2 are already the two stages' uniform blocks. */
+       * group; set 1 and set 2 are already the two stages' uniform blocks.
+       * A compute shader has one group for everything, so its pair is
+       * numbered above the ranges the blocks and images already use. */
       const unsigned texture_set =
          nir->info.stage == MESA_SHADER_VERTEX ? 3 : 0;
+      const unsigned binding_base =
+         nir->info.stage == MESA_SHADER_COMPUTE
+            ? GEX_WGPU_COMPUTE_TEXTURE_FIRST_BINDING : 0;
       for (unsigned u = 0; u < units; ++u) {
          const unsigned unit = slot + u;
          char name[32];
@@ -5590,18 +5635,20 @@ gex_wgpu_split_combined_samplers(nir_shader *nir)
             name);
          texture->data.descriptor_set = texture_set;
          texture->data.driver_location = unit;
-         texture->data.binding = 2 * unit;
+         texture->data.binding = binding_base + 2 * unit;
 
          snprintf(name, sizeof(name), "gex_sampler%u", unit);
          nir_variable *sampler = nir_variable_create(
             nir, nir_var_uniform, glsl_bare_sampler_type(), name);
          sampler->data.descriptor_set = texture_set;
          sampler->data.driver_location = unit;
-         sampler->data.binding = 2 * unit + 1;
+         sampler->data.binding = binding_base + 2 * unit + 1;
 
          split_slot[count] = unit;
          split_texture[count] = texture;
          split_sampler[count] = sampler;
+         split_origin[count] = var;
+         split_origin_elem[count] = u;
          ++count;
       }
       /* Once per variable, not once per unit: removing the same node twice
@@ -5622,9 +5669,55 @@ gex_wgpu_split_combined_samplers(nir_shader *nir)
             /* tgsi_to_nir ends with nir_lower_samplers, which replaces the
              * derefs it built with plain indices. The emitter wants derefs
              * back, so they are rebuilt here against the split pair for the
-             * unit the index names. */
-            if (nir_tex_instr_src_index(tex, nir_tex_src_texture_deref) >= 0)
+             * unit the index names.
+             *
+             * A deref that *survived* is a different case, and skipping it
+             * was wrong: st/mesa does not always lower them away -- a compute
+             * shader keeps them -- and the one it left names the combined
+             * variable this pass is about to retire. Left alone it dangles,
+             * which NIR validation catches after nir_remove_dead_variables
+             * as "deref_var &combined_tx (uniform sampler2D) error: entry"
+             * and aborts. Blender's EEVEE has five such samplers in one
+             * compute shader. So repoint it at the texture half. */
+            const int have_deref =
+               nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+            if (have_deref >= 0) {
+               nir_deref_instr *deref =
+                  nir_def_as_deref(tex->src[have_deref].src.ssa);
+               unsigned elem = 0;
+               if (deref->deref_type == nir_deref_type_array) {
+                  if (!nir_src_is_const(deref->arr.index))
+                     return false;   /* dynamic: give up whole, as above */
+                  elem = nir_src_as_uint(deref->arr.index);
+                  deref = nir_deref_instr_parent(deref);
+               }
+               if (deref->deref_type != nir_deref_type_var)
+                  return false;
+               nir_variable *origin = deref->var;
+               unsigned k = 0;
+               while (k < count && !(split_origin[k] == origin &&
+                                     split_origin_elem[k] == elem))
+                  ++k;
+               if (k == count)
+                  continue;          /* not one of the pairs made here */
+               b.cursor = nir_before_instr(instr);
+               nir_src_rewrite(&tex->src[have_deref].src,
+                               &nir_build_deref_var(&b, split_texture[k])->def);
+               const int have_sampler =
+                  nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+               if (have_sampler >= 0)
+                  nir_src_rewrite(&tex->src[have_sampler].src,
+                                  &nir_build_deref_var(&b,
+                                                       split_sampler[k])->def);
+               else if (tex->op != nir_texop_txf && tex->op != nir_texop_txf_ms &&
+                        tex->op != nir_texop_txs &&
+                        tex->op != nir_texop_query_levels)
+                  nir_tex_instr_add_src(
+                     tex, nir_tex_src_sampler_deref,
+                     &nir_build_deref_var(&b, split_sampler[k])->def);
+               ++rewrites;
                continue;
+            }
             unsigned slot = tex->texture_index;
             unsigned k = 0;
             while (k < count && split_slot[k] != slot)
@@ -5647,6 +5740,9 @@ gex_wgpu_split_combined_samplers(nir_shader *nir)
       nir_progress(true, impl, nir_metadata_control_flow);
    }
 
+   /* The derefs repointed above have no users left, and they still name the
+    * variables about to be retired -- so they go first. */
+   nir_opt_dce(nir);
    for (unsigned k = 0; k < retire_count; ++k)
       exec_node_remove(&retire[k]->node);
    /* A blit that does not filter -- a 1:1 copy is one -- fetches texels and
@@ -8763,6 +8859,40 @@ gex_wgpu_get_device_vendor(struct pipe_screen *screen)
  * float32-filterable and float32-blendable, which is why is_format_supported
  * gates on them. The cost is twice the memory and a conversion on transfer.
  */
+/* GEX_WGPU_PROMOTE_STORAGE=1 widens two more formats, for the same reason and
+ * at the same cost, so that they can be *storage* textures.
+ *
+ * WebGPU's base storage formats are a short list, and neither r16float nor
+ * rg11b10ufloat is on it; the optional feature that would add them
+ * (texture-formats-tier1) is not in the emdawnwebgpu package this is pinned
+ * to. Blender's EEVEE declares storage images in exactly those two formats,
+ * its shaders fail to *link* without them, and it dumps core on the null
+ * program -- so the cost of not having them is the whole renderer.
+ *
+ * r32float and rgba16float *are* base storage formats, and both are wider
+ * than what they stand in for, so the round trip gains precision rather than
+ * losing it. The cost is twice the memory on two formats a renderer uses
+ * heavily for HDR, which is why this is a switch and not a default: measure a
+ * real run both ways before making it one.
+ *
+ * The three-channel case is not exact. GL samples a format with no alpha as
+ * alpha = 1, and rgba16float has an alpha to store, so a shader that writes
+ * one through an image or an attachment can read it back instead of 1.
+ * util_format_translate gets uploads right (it unpacks the missing channel as
+ * 1.0), and every EEVEE use here reads .rgb; a view swizzle would fix
+ * sampling but not imageLoad, which takes no swizzle. Named rather than
+ * hidden. */
+static bool
+gex_wgpu_promote_storage(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *value = getenv("GEX_WGPU_PROMOTE_STORAGE");
+      enabled = value && *value != '0';
+   }
+   return enabled != 0;
+}
+
 static enum pipe_format
 gex_wgpu_format_backing(enum pipe_format format)
 {
@@ -8776,9 +8906,27 @@ gex_wgpu_format_backing(enum pipe_format format)
    case PIPE_FORMAT_R16G16B16A16_UNORM:
    case PIPE_FORMAT_R16G16B16A16_SNORM:
       return PIPE_FORMAT_R32G32B32A32_FLOAT;
+   case PIPE_FORMAT_R16_FLOAT:
+      return gex_wgpu_promote_storage() ? PIPE_FORMAT_R32_FLOAT
+                                        : PIPE_FORMAT_NONE;
+   case PIPE_FORMAT_R11G11B10_FLOAT:
+      return gex_wgpu_promote_storage() ? PIPE_FORMAT_R16G16B16A16_FLOAT
+                                        : PIPE_FORMAT_NONE;
    default:
       return PIPE_FORMAT_NONE;
    }
+}
+
+/* Whether the *backing* is float32, which is the only case the
+ * float32-filterable/blendable gate below has anything to say about:
+ * rgba16float is filterable and blendable with no feature at all. */
+static bool
+gex_wgpu_backing_is_float32(enum pipe_format format)
+{
+   const enum pipe_format backing = gex_wgpu_format_backing(format);
+   return backing == PIPE_FORMAT_R32_FLOAT ||
+          backing == PIPE_FORMAT_R32G32_FLOAT ||
+          backing == PIPE_FORMAT_R32G32B32A32_FLOAT;
 }
 
 static WGPUTextureFormat
@@ -9318,7 +9466,7 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
     * would otherwise pick it for GL_R16, and the first sample or blend would
     * be a validation error -- which poisons the device for every later
     * command, where a "no" here only sends st/mesa to its next fallback. */
-   if (gex_wgpu_format_backing(format) != PIPE_FORMAT_NONE &&
+   if (gex_wgpu_backing_is_float32(format) &&
        !(gex_screen(screen)->float32_filterable &&
          gex_screen(screen)->float32_blendable))
       return false;
@@ -10859,7 +11007,8 @@ gex_wgpu_bind_sampler_states(struct pipe_context *pipe,
       return;
    }
 
-   if (shader != MESA_SHADER_FRAGMENT && shader != MESA_SHADER_VERTEX) {
+   if (shader != MESA_SHADER_FRAGMENT && shader != MESA_SHADER_VERTEX &&
+       shader != MESA_SHADER_COMPUTE) {
       /* Clearing another stage's samplers still has to succeed: cso_context
        * unbinds every stage whenever a context is bound or torn down, and
        * refusing that would fail contexts that never sample outside the
@@ -10874,7 +11023,9 @@ gex_wgpu_bind_sampler_states(struct pipe_context *pipe,
       return;
    }
    struct gex_wgpu_sampler **slots = shader == MESA_SHADER_VERTEX
-      ? ctx->vertex_samplers : ctx->samplers;
+      ? ctx->vertex_samplers
+      : shader == MESA_SHADER_COMPUTE ? ctx->compute_samplers
+                                      : ctx->samplers;
 
    /* A null array means "unbind this range", which is how Gallium spells it. */
    for (unsigned i = 0; i < num_samplers; ++i)
@@ -10909,7 +11060,8 @@ gex_wgpu_set_sampler_views(struct pipe_context *pipe,
 {
    GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
-   if (shader != MESA_SHADER_FRAGMENT && shader != MESA_SHADER_VERTEX) {
+   if (shader != MESA_SHADER_FRAGMENT && shader != MESA_SHADER_VERTEX &&
+       shader != MESA_SHADER_COMPUTE) {
       /* Clearing another stage has to succeed, for the same reason
        * bind_sampler_states above says: cso_context unbinds every stage
        * whenever a context is bound or torn down, so refusing an unbind
@@ -10928,7 +11080,9 @@ gex_wgpu_set_sampler_views(struct pipe_context *pipe,
       return;
    }
    struct pipe_sampler_view **slots = shader == MESA_SHADER_VERTEX
-      ? ctx->vertex_sampler_views : ctx->sampler_views;
+      ? ctx->vertex_sampler_views
+      : shader == MESA_SHADER_COMPUTE ? ctx->compute_sampler_views
+                                      : ctx->sampler_views;
    if (start_slot > GEX_WGPU_MAX_SAMPLERS ||
        num_views > GEX_WGPU_MAX_SAMPLERS - start_slot ||
        unbind_num_trailing_slots >
@@ -13511,6 +13665,24 @@ struct gex_wgpu_compute_state {
    enum pipe_format image_formats[GEX_WGPU_MAX_SHADER_IMAGES];
    WGPUStorageTextureAccess image_access[GEX_WGPU_MAX_SHADER_IMAGES];
    WGPUTextureViewDimension image_dimensions[GEX_WGPU_MAX_SHADER_IMAGES];
+   /* Sampled textures, which a compute shader may have like any other stage.
+    * GL 4.3's compute shaders sample as freely as a fragment shader does, and
+    * a renderer doing its post-processing in compute does little else. This
+    * path had no tables for them at all, so the derefs the split pass rebuilds
+    * were never rebuilt here and the SPIR-V emitter asserted --
+    *
+    *   nir_to_spirv.c:4702: emit_tex: Assertion `var' failed.
+    *
+    * -- which takes the application with it. Blender's EEVEE reaches it. */
+   unsigned texture_count;
+   uint8_t texture_slots[GEX_WGPU_MAX_SAMPLERS];
+   uint32_t texture_bindings[GEX_WGPU_MAX_SAMPLERS];
+   WGPUTextureViewDimension texture_dimensions[GEX_WGPU_MAX_SAMPLERS];
+   WGPUTextureSampleType texture_sample_types[GEX_WGPU_MAX_SAMPLERS];
+   unsigned sampler_count;
+   uint8_t sampler_slots[GEX_WGPU_MAX_SAMPLERS];
+   uint32_t sampler_bindings[GEX_WGPU_MAX_SAMPLERS];
+   WGPUSamplerBindingType sampler_types[GEX_WGPU_MAX_SAMPLERS];
    unsigned block[3];
 };
 
@@ -13557,6 +13729,19 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
     * which nir_src_is_const does not see through. */
    NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_constant_folding);
+   /* Also the same lowering, and for the same reason: a GLSL `sampler2D` is a
+    * combined sampler, WebGPU wants a texture and a sampler separately, and
+    * st/mesa has already replaced the derefs with plain indices by the time
+    * the shader arrives. Only the graphics path ran this, so a compute shader
+    * that samples anything reached the emitter with no texture deref on its
+    * tex instructions and asserted there, killing the application. */
+   if (!gex_wgpu_split_combined_samplers(nir)) {
+      fprintf(stderr, "gex-wgpu: compute shader rejected: could not split a "
+                      "combined sampler\n");
+      ralloc_free(nir);
+      FREE(compute);
+      return NULL;
+   }
    {
       char why[160] = "";
       if (!gex_wgpu_lower_gallium_ubos(nir, MESA_SHADER_COMPUTE,
@@ -13673,6 +13858,78 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
          : dim == GLSL_SAMPLER_DIM_1D ? WGPUTextureViewDimension_1D
                                       : WGPUTextureViewDimension_2D;
       ++compute->image_count;
+   }
+
+   /* The texture and sampler halves the split pass just created. The same
+    * collection the graphics stages do, minus the cases a compute shader
+    * cannot reach here: a samplerBuffer becomes a storage buffer through
+    * gex_wgpu_lower_buffer_texture, which this path does not run, so one is
+    * refused by name rather than mistaken for a texture. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      if (glsl_type_is_texture(type)) {
+         const unsigned slot = var->data.driver_location;
+         const enum glsl_sampler_dim dim = glsl_get_sampler_dim(type);
+         const bool is_array = glsl_sampler_type_is_array(type);
+         const bool multisampled = dim == GLSL_SAMPLER_DIM_MS;
+         const WGPUTextureViewDimension view_dimension =
+            multisampled && !is_array ? WGPUTextureViewDimension_2D
+            : dim == GLSL_SAMPLER_DIM_1D || dim == GLSL_SAMPLER_DIM_2D ||
+              dim == GLSL_SAMPLER_DIM_RECT
+               ? (is_array ? WGPUTextureViewDimension_2DArray
+                           : WGPUTextureViewDimension_2D)
+            : dim == GLSL_SAMPLER_DIM_3D && !is_array
+               ? WGPUTextureViewDimension_3D
+            : dim == GLSL_SAMPLER_DIM_CUBE
+               ? (is_array ? WGPUTextureViewDimension_CubeArray
+                           : WGPUTextureViewDimension_Cube)
+               : WGPUTextureViewDimension_Undefined;
+         bool duplicate = false;
+         for (unsigned i = 0; i < compute->texture_count; ++i)
+            duplicate |= compute->texture_slots[i] == slot;
+         if (duplicate)
+            continue;
+         if (compute->texture_count >= GEX_WGPU_MAX_SAMPLERS ||
+             slot >= GEX_WGPU_MAX_SAMPLERS ||
+             view_dimension == WGPUTextureViewDimension_Undefined) {
+            fprintf(stderr, "gex-wgpu: compute shader rejected: texture slot "
+                    "%u dim %u is not one this driver can bind\n", slot,
+                    (unsigned)dim);
+            ralloc_free(nir);
+            FREE(compute);
+            return NULL;
+         }
+         const unsigned at = compute->texture_count;
+         compute->texture_slots[at] = (uint8_t)slot;
+         compute->texture_bindings[at] = var->data.binding;
+         compute->texture_dimensions[at] = view_dimension;
+         /* A multisampled texture is reached with textureLoad and a sample
+          * index rather than a sampler, and the layout has to say so. */
+         compute->texture_sample_types[at] =
+            multisampled ? WGPUTextureSampleType_UnfilterableFloat
+                         : WGPUTextureSampleType_Float;
+         ++compute->texture_count;
+      } else if (glsl_type_is_bare_sampler(type)) {
+         const unsigned slot = var->data.driver_location;
+         bool duplicate = false;
+         for (unsigned i = 0; i < compute->sampler_count; ++i)
+            duplicate |= compute->sampler_slots[i] == slot;
+         if (duplicate)
+            continue;
+         if (compute->sampler_count >= GEX_WGPU_MAX_SAMPLERS ||
+             slot >= GEX_WGPU_MAX_SAMPLERS) {
+            fprintf(stderr, "gex-wgpu: compute shader rejected: sampler slot "
+                    "%u above max\n", slot);
+            ralloc_free(nir);
+            FREE(compute);
+            return NULL;
+         }
+         const unsigned at = compute->sampler_count;
+         compute->sampler_slots[at] = (uint8_t)slot;
+         compute->sampler_bindings[at] = var->data.binding;
+         compute->sampler_types[at] = WGPUSamplerBindingType_Filtering;
+         ++compute->sampler_count;
+      }
    }
 
    char *error = NULL;
@@ -13820,10 +14077,10 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
 
    WGPUBindGroupLayoutEntry
       entries[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS +
-              GEX_WGPU_MAX_SHADER_IMAGES];
+              GEX_WGPU_MAX_SHADER_IMAGES + 2 * GEX_WGPU_MAX_SAMPLERS];
    WGPUBindGroupEntry
       bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS +
-               GEX_WGPU_MAX_SHADER_IMAGES];
+               GEX_WGPU_MAX_SHADER_IMAGES + 2 * GEX_WGPU_MAX_SAMPLERS];
    WGPUTextureView image_views[GEX_WGPU_MAX_SHADER_IMAGES] = {0};
    unsigned image_view_count = 0;
    unsigned count = 0;
@@ -13961,6 +14218,62 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       bindings[count].binding = compute->image_bindings[i];
       bindings[count].textureView = image_view;
+      ++count;
+   }
+
+   /* Sampled textures and their samplers. The view is the one the sampler
+    * view already holds, as in the graphics stages -- nothing is created per
+    * dispatch, so nothing is released below. A slot the shader declares and
+    * the application never bound gets a null view, which is a validation
+    * error naming the binding rather than a wrong picture. */
+   for (unsigned i = 0; i < compute->texture_count; ++i) {
+      const unsigned slot = compute->texture_slots[i];
+      struct gex_wgpu_sampler_view *view =
+         (struct gex_wgpu_sampler_view *)ctx->compute_sampler_views[slot];
+      if (!view) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: compute texture %u has no view bound; "
+                    "the dispatch will be dropped\n", slot);
+         }
+         gex_fail(ctx);
+         goto release_views;
+      }
+      gex_wgpu_sampler_view_refresh(pipe, view);
+      entries[count] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entries[count].binding = compute->texture_bindings[i];
+      entries[count].visibility = WGPUShaderStage_Compute;
+      entries[count].texture.sampleType = compute->texture_sample_types[i];
+      entries[count].texture.viewDimension = compute->texture_dimensions[i];
+      bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      bindings[count].binding = compute->texture_bindings[i];
+      bindings[count].textureView = view->view;
+      ++count;
+   }
+   for (unsigned i = 0; i < compute->sampler_count; ++i) {
+      const unsigned slot = compute->sampler_slots[i];
+      struct gex_wgpu_sampler *sampler = ctx->compute_samplers[slot];
+      entries[count] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entries[count].binding = compute->sampler_bindings[i];
+      entries[count].visibility = WGPUShaderStage_Compute;
+      entries[count].sampler.type = compute->sampler_types[i];
+      bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      bindings[count].binding = compute->sampler_bindings[i];
+      /* A slot with no sampler state bound still needs one, and the
+       * texture's own is the only defensible choice: GL's default sampler
+       * state is what st/mesa would have sent. */
+      bindings[count].sampler = sampler ? sampler->sampler : NULL;
+      if (!sampler) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: compute sampler %u has no state "
+                    "bound\n", slot);
+         }
+         gex_fail(ctx);
+         goto release_views;
+      }
       ++count;
    }
 
