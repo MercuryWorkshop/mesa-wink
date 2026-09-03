@@ -2892,7 +2892,15 @@ gex_wgpu_effective_view_swizzle(const struct pipe_sampler_view *view,
     * must be one even though the physical BC1 texel contains alpha zero. */
    if (requested == PIPE_SWIZZLE_W &&
        (view->format == PIPE_FORMAT_DXT1_RGB ||
-        view->format == PIPE_FORMAT_DXT1_SRGB))
+        view->format == PIPE_FORMAT_DXT1_SRGB ||
+        /* An X format is the same bytes as its A sibling and is mapped to the
+         * same WebGPU format, because WebGPU has no ignored-alpha format.
+         * GL says the alpha channel of an RGBX texture reads as one, so the
+         * promise is kept here rather than by the storage. */
+        view->format == PIPE_FORMAT_B8G8R8X8_UNORM ||
+        view->format == PIPE_FORMAT_B8G8R8X8_SRGB ||
+        view->format == PIPE_FORMAT_R8G8B8X8_UNORM ||
+        view->format == PIPE_FORMAT_R8G8B8X8_SRGB))
       return PIPE_SWIZZLE_1;
    return requested;
 }
@@ -8630,6 +8638,25 @@ gex_wgpu_texture_format(enum pipe_format format)
     * advertising a format without telling the renderable check about it is
     * how the depth16 attempt turned a new capability into a latch. */
    case PIPE_FORMAT_B8G8R8A8_SRGB: return WGPUTextureFormat_BGRA8UnormSrgb;
+   /* The opaque siblings of the four above: same bytes, with GL promising the
+    * alpha channel reads as one. WebGPU has no ignored-alpha format, so they
+    * map to the same texture format and the promise is kept by the view
+    * swizzle (gex_wgpu_effective_view_swizzle).
+    *
+    * These were unmapped, and the cost was not a missing texture format. Mesa
+    * builds its GLX fbconfig list from the formats the driver accepts, so
+    * without B8G8R8X8 there was no 8,8,8,0 config -- every config had an
+    * alpha channel, and 24 of them carried a *depth 32* visual. Qt then chose
+    * one of those for a window it had created at depth 24, drisw took the
+    * XImage depth from the config's visual, and every present became a
+    * depth-32 image put into a depth-24 drawable: BadMatch, which X reports
+    * asynchronously, so XShmPutImage returned success and drew nothing.
+    * Krita presented six correct frames of its interface into a window that
+    * stayed black, with no error anywhere in the driver or the API. */
+   case PIPE_FORMAT_B8G8R8X8_UNORM: return WGPUTextureFormat_BGRA8Unorm;
+   case PIPE_FORMAT_B8G8R8X8_SRGB: return WGPUTextureFormat_BGRA8UnormSrgb;
+   case PIPE_FORMAT_R8G8B8X8_UNORM: return WGPUTextureFormat_RGBA8Unorm;
+   case PIPE_FORMAT_R8G8B8X8_SRGB: return WGPUTextureFormat_RGBA8UnormSrgb;
    case PIPE_FORMAT_DXT1_RGB:
    case PIPE_FORMAT_DXT1_RGBA: return WGPUTextureFormat_BC1RGBAUnorm;
    case PIPE_FORMAT_DXT1_SRGB:
@@ -8836,6 +8863,11 @@ gex_wgpu_color_renderable(struct pipe_screen *screen, enum pipe_format format)
    case PIPE_FORMAT_R8G8B8A8_SRGB:
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8A8_SRGB:
+   /* The opaque siblings, which is what a window's fbconfig wants. */
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_SRGB:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_SRGB:
    case PIPE_FORMAT_R8_UINT:
    case PIPE_FORMAT_R8_SINT:
    case PIPE_FORMAT_R8G8_UINT:
