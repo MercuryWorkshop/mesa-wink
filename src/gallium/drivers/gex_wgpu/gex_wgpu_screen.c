@@ -11009,13 +11009,10 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
     * EXT_texture_filter_minmax, which WebGPU has no equivalent for and this
     * driver does not advertise. It stays a refusal -- now a named one, since
     * it is printed above. */
-   if (state->max_anisotropy > 1 ||
-       memcmp(state, &supported, sizeof(supported)) != 0)
+   if (memcmp(state, &supported, sizeof(supported)) != 0)
       return gex_wgpu_sampler_refused(state,
-                                      state->max_anisotropy > 1
-                                         ? "anisotropy"
-                                         : state->reduction_mode !=
-                                           PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE
+                                      state->reduction_mode !=
+                                      PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE
                                          ? "min/max reduction"
                                          : "a sampler field this driver does "
                                            "not model");
@@ -11040,7 +11037,24 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
       ? WGPUMipmapFilterMode_Linear : WGPUMipmapFilterMode_Nearest;
    desc.lodMinClamp = state->min_lod;
    desc.lodMaxClamp = state->max_lod;
-   desc.maxAnisotropy = 1;
+   /* EXT_texture_filter_anisotropic, which WebGPU has as a sampler field and
+    * this driver used to refuse outright. That refusal was expensive out of
+    * proportion to the feature: a refused sampler binds as NULL, so an
+    * application that turns anisotropy on -- which most games do by default --
+    * lost its wrap modes and filters with it. SuperTuxKart is run here with
+    * --anisotropic=0 for exactly that reason.
+    *
+    * WebGPU requires all three filters to be linear when maxAnisotropy is
+    * above one, and GL treats anisotropy as a quality hint rather than a
+    * promise, so a sampler that is not fully linear takes one instead of
+    * being turned away. 16 is what the cap advertises and what Dawn allows;
+    * clamping keeps a larger request from being a validation error. */
+   const bool fully_linear =
+      state->mag_img_filter == PIPE_TEX_FILTER_LINEAR &&
+      state->min_img_filter == PIPE_TEX_FILTER_LINEAR &&
+      state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR;
+   desc.maxAnisotropy = fully_linear && state->max_anisotropy > 1
+      ? (uint16_t)MIN2(16u, (unsigned)state->max_anisotropy) : 1;
    if (comparison)
       desc.compare = gex_wgpu_compare(state->compare_func);
    struct gex_wgpu_sampler *sampler = CALLOC_STRUCT(gex_wgpu_sampler);
@@ -26664,6 +26678,13 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * gex_wgpu_render_cond_passes already tests against, so the inverted modes
     * need nothing the plain ones did not. */
    caps->conditional_render_inverted = true;
+   /* EXT_texture_filter_anisotropic, and with a maximum of 16 also
+    * ARB_texture_filter_anisotropic -- one of GL 4.6's ten. st gates the ARB
+    * form on the maximum being at least 16, which is what WebGPU's sampler
+    * takes and what Dawn allows. See gex_wgpu_create_sampler_state for what
+    * refusing it used to cost. */
+   caps->anisotropic_filter = true;
+   caps->max_texture_anisotropy = 16.0f;
    /* NV_texture_barrier, another of the five. glTextureBarrier promises that
     * writes to a texture are visible to later reads of it, and
     * gex_wgpu_texture_barrier submits everything recorded so far -- which on
