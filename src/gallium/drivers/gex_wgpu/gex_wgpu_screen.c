@@ -25577,6 +25577,15 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * a driver that orders every command on the WebGPU queue is exactly that
     * guarantee, not an approximation of it. */
    caps->texture_barrier = true;
+   /* ARB_derivative_control, a third of the five. zink's emitter has
+    * SpvOpDPdxFine/Coarse and declares the DerivativeControl capability for
+    * them, and Tint takes those as WGSL's dpdxFine/dpdxCoarse -- so the whole
+    * chain already existed and only the cap was missing. */
+   caps->fs_fine_derivative = true;
+   /* ARB_shader_texture_image_samples, a fourth. textureSamples() and
+    * imageSamples() reach the emitter as nir_texop_texture_samples and
+    * become OpImageQuerySamples, which Tint takes as textureNumSamples. */
+   caps->texture_query_samples = true;
    /* Geometry shaders, run as a compute pass. The output is allocated
     * worst-case per input primitive, so these are what bound that allocation
     * rather than a hardware limit. GL 3.2 asks for 256 and 1024. */
