@@ -421,6 +421,10 @@ struct gex_wgpu_resource {
     * shape changes. See gex_wgpu_feedback_snapshot. */
    struct pipe_resource *feedback_copy;
    WGPUTextureView feedback_copy_view;
+   /* Which mip level feedback_copy holds. The snapshot is one level, and it
+    * used to be level zero unconditionally -- correct for the case it was
+    * written for and wrong for any view whose base level is not zero. */
+   unsigned feedback_copy_level;
    /* Bytes ever written into this buffer from the CPU -- subdata and the
     * upload half of a write map. A constant buffer that is bound repeatedly
     * and reads as all zeros is either an application uploading zeros or an
@@ -10426,12 +10430,27 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
       gex_wgpu_texture_format(dst->format) != WGPUTextureFormat_Undefined;
    const unsigned allowed_flags = has_stencil
       ? PIPE_CLEAR_DEPTH | PIPE_CLEAR_STENCIL : PIPE_CLEAR_DEPTH;
+   /* Whatever level and layer the surface names, at that level's own size --
+    * the same rule as gex_wgpu_clear_render_target.
+    *
+    * The guard used to demand level zero and layer zero while the body below
+    * built its view from dst->level and dst->first_layer, and the body's own
+    * comment says why it must: one layer of a depth array is exactly what a
+    * cascaded shadow map attaches. Nothing reached the mismatch while the
+    * whole-framebuffer clear reconstructed the surface as level zero layer
+    * zero, and making *that* honest turned a silent clear of the wrong
+    * cascade into a latched context -- `depth-array` went from 8/8 to 4/8
+    * with GL_OUT_OF_MEMORY, which is what gex_fail becomes in st/mesa. */
+   const unsigned zs_level = dst ? dst->level : 0;
+   const unsigned zs_width = resource ? u_minify(resource->width0, zs_level) : 0;
+   const unsigned zs_height = resource ? u_minify(resource->height0, zs_level) : 0;
    if (ctx->failed || !resource || !clear_flags ||
        (clear_flags & ~allowed_flags) ||
        !clearable_depth ||
-       dst->level != 0 || dst->first_layer != 0 || dst->last_layer != 0 ||
-       dstx != 0 || dsty != 0 || width != resource->width0 ||
-       height != resource->height0 ||
+       zs_level > resource->last_level ||
+       dst->first_layer != dst->last_layer ||
+       dstx != 0 || dsty != 0 || width != zs_width ||
+       height != zs_height ||
        /* `!(depth >= 0.0 && depth <= 1.0)`, not `depth < 0.0 || depth > 1.0`:
         * NaN compares false against both bounds, so the second form lets it
         * through to depthClearValue, where the browser rejects the pass. */
@@ -11402,16 +11421,20 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
  */
 static WGPUTextureView
 gex_wgpu_feedback_snapshot(struct gex_wgpu_context *ctx,
-                           struct pipe_resource *attachment)
+                           struct pipe_resource *attachment,
+                           unsigned level)
 {
    struct pipe_context *pipe = &ctx->base;
    struct pipe_screen *screen = pipe->screen;
    struct gex_wgpu_resource *source = gex_resource(attachment);
+   const unsigned level_width = u_minify(attachment->width0, level);
+   const unsigned level_height = u_minify(attachment->height0, level);
 
-   /* Reuse the copy unless the shape moved under it. */
+   /* Reuse the copy unless the shape -- or the level -- moved under it. */
    if (source->feedback_copy &&
-       (source->feedback_copy->width0 != attachment->width0 ||
-        source->feedback_copy->height0 != attachment->height0 ||
+       (source->feedback_copy->width0 != level_width ||
+        source->feedback_copy->height0 != level_height ||
+        source->feedback_copy_level != level ||
         source->feedback_copy->format != attachment->format)) {
       if (source->feedback_copy_view)
          wgpuTextureViewRelease(source->feedback_copy_view);
@@ -11423,6 +11446,8 @@ gex_wgpu_feedback_snapshot(struct gex_wgpu_context *ctx,
       struct pipe_resource templ = *attachment;
       templ.bind = PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_RENDER_TARGET;
       templ.target = PIPE_TEXTURE_2D;
+      templ.width0 = level_width;
+      templ.height0 = level_height;
       templ.depth0 = 1;
       templ.array_size = 1;
       templ.last_level = 0;
@@ -11430,16 +11455,17 @@ gex_wgpu_feedback_snapshot(struct gex_wgpu_context *ctx,
       templ.nr_storage_samples = 0;
       source->feedback_copy = screen->resource_create(screen, &templ);
       if (!source->feedback_copy) return NULL;
+      source->feedback_copy_level = level;
    }
 
    struct pipe_box box = {
       .x = 0, .y = 0, .z = 0,
-      .width = (int)attachment->width0,
-      .height = (int)attachment->height0,
+      .width = (int)level_width,
+      .height = (int)level_height,
       .depth = 1,
    };
    if (!gex_wgpu_copy_texture_region(pipe, source->feedback_copy, 0, 0, 0, 0,
-                                     attachment, 0, &box, false))
+                                     attachment, level, &box, false))
       return NULL;
 
    if (!source->feedback_copy_view) {
@@ -11806,6 +11832,21 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    if (ctx->failed)
       return;
+   /* GEX_WGPU_BLIT_LOG names the *levels*, which the existing "sent to
+    * u_blitter" line does not. util_gen_mipmap is a chain of blits from one
+    * level to the next, so a mip chain that comes out holding the base
+    * level's content everywhere is a question about src.level and nothing
+    * else, and no other log here answers it. */
+   if (info && getenv("GEX_WGPU_BLIT_LOG"))
+      fprintf(stderr,
+              "gex-wgpu: blit src l%u %ux%u+%d,%d %s -> dst l%u %ux%u+%d,%d %s "
+              "filter=%d mask=0x%x\n",
+              info->src.level, info->src.box.width, info->src.box.height,
+              info->src.box.x, info->src.box.y,
+              util_format_short_name(info->src.format), info->dst.level,
+              info->dst.box.width, info->dst.box.height, info->dst.box.x,
+              info->dst.box.y, util_format_short_name(info->dst.format),
+              (int)info->filter, info->mask);
 
    /* A multisampled source is a resolve, not a copy. */
    if (info->src.resource && info->dst.resource &&
@@ -12032,33 +12073,53 @@ gex_wgpu_clear(struct pipe_context *pipe, unsigned buffers,
             gex_fail(ctx);
             return;
          }
-         /* set_framebuffer_state already required level zero, layer zero and
-          * a surface format matching the texture, so the surface it validated
-          * is reconstructible from the resource alone. */
+         /* The attached level and layer, at that level's own size.
+          *
+          * This used to reconstruct the surface as level zero, layer zero at
+          * the resource's full dimensions, on a comment saying
+          * set_framebuffer_state had required exactly that. It stopped being
+          * true once the framebuffer path learned to render into any level
+          * and layer (it keeps color_levels/color_layers for the pass view),
+          * and the two disagreeing is worse than either: a glClear on a
+          * framebuffer whose attachment is mip level 4 of a 512x512 texture
+          * cleared *level 0* at 512x512 -- wiping the base level and leaving
+          * the level being drawn into untouched. It did not fail, because
+          * clearing level zero at its own full size is a perfectly valid
+          * clear of the wrong thing. That is the whole of the
+          * tri-fbo-tex-mip divergence, where both software references agree
+          * and this driver drew a black background. */
+         const unsigned level = ctx->color_levels[i];
          struct pipe_surface surface = {0};
          surface.texture = resource;
-         surface.format = resource->format;
-         surface.level = 0;
-         surface.first_layer = 0;
-         surface.last_layer = 0;
+         surface.format = ctx->color_formats[i];
+         surface.level = level;
+         surface.first_layer = ctx->color_layers[i];
+         surface.last_layer = ctx->color_layers[i];
          gex_wgpu_clear_render_target(pipe, &surface, color, 0, 0,
-                                      resource->width0, resource->height0,
+                                      u_minify(resource->width0, level),
+                                      u_minify(resource->height0, level),
                                       false);
       }
    }
 
    const unsigned depth_stencil = buffers & PIPE_CLEAR_DEPTHSTENCIL;
    if (depth_stencil && ctx->depth) {
+      /* Same as the colour targets: the attached level and layer, at that
+       * level's size. A depth attachment can be a mip level or an array
+       * slice too -- a cascaded shadow map is exactly that -- and clearing
+       * level zero instead cleared a cascade nobody was drawing into. */
       struct pipe_resource *resource = ctx->depth;
       struct pipe_surface surface = {0};
       surface.texture = resource;
       surface.format = resource->format;
-      surface.level = 0;
-      surface.first_layer = 0;
-      surface.last_layer = 0;
+      surface.level = ctx->depth_level;
+      surface.first_layer = ctx->depth_layer;
+      surface.last_layer = ctx->depth_layer;
       gex_wgpu_clear_depth_stencil(pipe, &surface, depth_stencil, depth,
-                                   stencil, 0, 0, resource->width0,
-                                   resource->height0, false);
+                                   stencil, 0, 0,
+                                   u_minify(resource->width0, ctx->depth_level),
+                                   u_minify(resource->height0, ctx->depth_level),
+                                   false);
    }
 }
 
@@ -18363,26 +18424,55 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * correct can depend on it -- and the binding that reaches here is
        * usually just stale, left over from a pass that really did sample it.
        * Declining this one draw is the narrow reading of "undefined". */
-      if (ctx->sampler_views[slot]) {
+      if (ctx->sampler_views[slot] &&
+          ctx->sampler_views[slot]->target != PIPE_BUFFER) {
+         const struct pipe_sampler_view *sv = ctx->sampler_views[slot];
          for (unsigned c = 0; c < ctx->color_count; ++c) {
-            if (ctx->colors[c] &&
-                ctx->sampler_views[slot]->texture == ctx->colors[c]) {
-               WGPUTextureView snapshot =
-                  gex_wgpu_feedback_snapshot(ctx, ctx->colors[c]);
-               static bool said;
-               if (!said) {
-                  said = true;
-                  fprintf(stderr,
-                          "gex-wgpu: slot %u samples colour attachment %u -- "
-                          "a GL feedback loop; sampling a snapshot of it%s\n",
-                          slot, c, snapshot ? "" : " FAILED");
-               }
-               if (!snapshot)
-                  GEX_BINDING_BAD(true, "samples a colour attachment");
-               else if (slot < GEX_WGPU_MAX_SAMPLERS)
-                  ctx->feedback_view[slot] = snapshot;
-               break;
+            if (!ctx->colors[c] || sv->texture != ctx->colors[c])
+               continue;
+            /* The same *texture* is not yet a feedback loop. WebGPU's usage
+             * scope is per subresource and so is GL's rule, so sampling one
+             * mip level while rendering into another is legal and needs no
+             * snapshot -- and taking one anyway was wrong, not merely
+             * wasteful, because the snapshot is a single level.
+             *
+             * util_gen_mipmap generates a chain as a run of blits from level
+             * n to level n+1 of one texture, which is exactly this shape.
+             * Every one of them was diverted to a copy of level 0, so a
+             * chain generated from a non-zero GL_TEXTURE_BASE_LEVEL came out
+             * holding level 0 everywhere. It went unnoticed because the
+             * ordinary case generates from level 0, where the wrong source
+             * and the right one are the same texels: `tri-fbo-tex-mip` is
+             * the one program in the sweep that does it the other way. */
+            const unsigned level = ctx->color_levels[c];
+            const unsigned layer = ctx->color_layers[c];
+            const bool level_overlaps = level >= sv->u.tex.first_level &&
+                                        level <= sv->u.tex.last_level;
+            /* A 3D texture's attachment "layer" is a depth slice of the one
+             * volume the view covers, so any of them overlaps it. */
+            const bool layer_overlaps =
+               sv->texture->target == PIPE_TEXTURE_3D ||
+               (layer >= sv->u.tex.first_layer &&
+                layer <= sv->u.tex.last_layer);
+            if (!level_overlaps || !layer_overlaps)
+               continue;
+            WGPUTextureView snapshot =
+               gex_wgpu_feedback_snapshot(ctx, ctx->colors[c],
+                                          sv->u.tex.first_level);
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr,
+                       "gex-wgpu: slot %u samples colour attachment %u at "
+                       "level %u -- a GL feedback loop; sampling a snapshot "
+                       "of it%s\n", slot, c, level,
+                       snapshot ? "" : " FAILED");
             }
+            if (!snapshot)
+               GEX_BINDING_BAD(true, "samples a colour attachment");
+            else if (slot < GEX_WGPU_MAX_SAMPLERS)
+               ctx->feedback_view[slot] = snapshot;
+            break;
          }
       }
       if (ctx->sampler_views[slot] && ctx->sampler_views[slot]->texture &&
