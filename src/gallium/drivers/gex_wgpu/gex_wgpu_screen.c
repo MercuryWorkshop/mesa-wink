@@ -668,6 +668,10 @@ struct gex_wgpu_resource {
     * whereas a mapped one hands the shadow out as the mapping. Which of the
     * two holds the memory decides how much a lazy shadow can recover. */
    bool ever_mapped;
+   /* The usage the WGPU texture was created with. A view's legality depends on
+    * it -- see the StorageBinding note in gex_wgpu_create_sampler_view -- and
+    * the descriptor is not readable back from the object. */
+   WGPUTextureUsage texture_usage;
 };
 
 struct gex_wgpu_query;
@@ -9648,6 +9652,7 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
          desc.viewFormats = view_formats;
       }
    }
+   resource->texture_usage = desc.usage;
    desc.dimension = templ->target == PIPE_TEXTURE_3D
       ? WGPUTextureDimension_3D : WGPUTextureDimension_2D;
    /* WebGPU sizes a compressed texture in whole blocks; GL does not. A 7x3
@@ -10356,8 +10361,35 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
     * layer of a 2D texture, so the scratch is a plain 2D texture and the view
     * over it starts at level zero. */
    WGPUTexture view_source = gex_resource(texture)->texture;
+   /* The sRGB pair is the same format class, so the test above does not catch
+    * it -- resource_create declares the counterpart in viewFormats precisely
+    * so the view can be made directly. WebGPU then refuses to *use* it:
+    *
+    *   The texture usage (CopySrc|CopyDst|TextureBinding|StorageBinding|
+    *   RenderAttachment) includes TextureUsage::StorageBinding, which is
+    *   incompatible with the format (TextureFormat::RGBA8UnormSrgb).
+    *
+    * No sRGB format is storage-compatible, and this driver gives
+    * StorageBinding to every storage-capable texture because st/mesa never
+    * asks for PIPE_BIND_SHADER_IMAGE up front (see resource_create) -- so on
+    * an 8-bit texture the declared counterpart could never actually be used.
+    *
+    * Native Dawn does not enforce this, which is why it failed only in the
+    * browser, and it failed *silently*: the view was invalid, so its bind
+    * group was invalid, so the draw was dropped and the probe read the clear
+    * colour. Nothing in the GL error path said a word.
+    *
+    * The scratch copy a cross-class view already uses serves this exactly:
+    * the bytes are the same either way, since an sRGB view differs from a
+    * linear one only in how the sampler decodes what is there. */
+   const bool storage_forbids_view =
+      templ->format != texture->format &&
+      (gex_resource(texture)->texture_usage & WGPUTextureUsage_StorageBinding) &&
+      gex_wgpu_storage_texture_format(templ->format) ==
+         WGPUTextureFormat_Undefined;
    const bool reinterpreting =
-      util_format_linear(templ->format) != util_format_linear(texture->format) &&
+      (util_format_linear(templ->format) != util_format_linear(texture->format) ||
+       storage_forbids_view) &&
       !gex_wgpu_is_stencil_only_format(templ->format) &&
       !util_format_is_depth_or_stencil(texture->format);
    if (reinterpreting) {
