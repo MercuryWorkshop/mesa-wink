@@ -104,8 +104,17 @@ extern void gex_wgpu_jspi_signal(void);
 #define GEX_WGPU_PARAM_WORDS (GEX_WGPU_PARAM_INDEX_BIAS + 1)
 #define GEX_WGPU_CAPTURE_GROUP 64
 /* Where a vertex shader run as compute writes its varyings when a geometry
- * shader is going to consume them. */
-#define GEX_WGPU_VARYING_OUT_BINDING (GEX_WGPU_CAPTURE_PARAMS_BINDING + 1)
+ * shader is going to consume them.
+ *
+ * Deliberately *not* CAPTURE_PARAMS + 1: that is
+ * GEX_WGPU_CAPTURE_INDEX_BINDING, and the two used to be the same number.
+ * Nothing noticed while no pass declared both -- the transform-feedback
+ * capture has an index table and no varying output, the varying capture had a
+ * varying output and no index table. Teaching the wide-line rewrite to take
+ * indexed draws made one shader declare both, and two blocks at binding 29
+ * meant the capture read its vertex numbers out of the buffer it was writing
+ * varyings into: every captured position came back (0,0,0,0). */
+#define GEX_WGPU_VARYING_OUT_BINDING (GEX_WGPU_CAPTURE_PARAMS_BINDING + 2)
 
 /* Bindings of the de-indexing gather pass, which has its own group 0. See
  * gex_wgpu_gather_indexed_vertices. */
@@ -12545,6 +12554,16 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    state.varyings = varyings;
    state.params = gex_wgpu_word_block(nir, "gex_capture_params",
                                       GEX_WGPU_CAPTURE_PARAMS_BINDING, 0, false);
+   /* An indexed draw captures through a slot table -- one already-resolved
+    * vertex number per captured slot -- exactly as the transform-feedback
+    * capture does. Without it this builder could only capture consecutive
+    * vertices, which is why the wide-line rewrite took non-indexed draws
+    * only, and so why glLineWidth and GL_LINE_SMOOTH did nothing for any
+    * indexed line draw. */
+   if (vertex->index_table)
+      state.index = gex_wgpu_word_block(nir, "gex_capture_index",
+                                        GEX_WGPU_CAPTURE_INDEX_BINDING, 0,
+                                        false);
    state.varying_out = gex_wgpu_word_block(nir, "gex_varying_out",
                                            GEX_WGPU_VARYING_OUT_BINDING, 0, false);
 
@@ -12580,6 +12599,10 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    nir->info.workgroup_size[1] = 1;
    nir->info.workgroup_size[2] = 1;
    nir->info.workgroup_size_variable = false;
+   /* Wide enough to cover every block this builder declares, as the
+    * transform-feedback capture does. */
+   nir->info.num_ssbos = MAX2(nir->info.num_ssbos,
+                              GEX_WGPU_CAPTURE_INDEX_BINDING + 1);
    nir->xfb_info = NULL;
    /* The outputs stay live -- the varying writes read them at the end -- so
     * they cannot simply be dropped, and a compute shader may not declare
@@ -14540,6 +14563,7 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
 
    struct gex_wgpu_capture_layout layout;
    memset(&layout, 0, sizeof(layout));
+   layout.index_table = info->index_size ? 1 : 0;
    if (ctx->vertex_elements) {
       layout.count = ctx->vertex_elements->count;
       for (unsigned i = 0; i < layout.count; ++i) {
@@ -14552,6 +14576,65 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
          layout.stride[i] = ve->src_stride;
          layout.format[i] = ve->src_format;
       }
+   }
+
+   /* An indexed draw is captured through a slot table: one resolved vertex
+    * number per captured slot, so the capture buffer comes out in *draw*
+    * order and a segment's two endpoints are a fixed distance apart in it --
+    * which is the whole premise of binding it twice as instance-step vertex
+    * buffers below.
+    *
+    * Without this the rewrite took non-indexed draws only, so glLineWidth,
+    * GL_LINE_SMOOTH and GL_LINE_STIPPLE silently did nothing for any indexed
+    * line draw. glPolygonMode's unfilled rewrite emits exactly such a draw,
+    * which is how tri-unfilled-smooth ended up with aliased edges where every
+    * reference antialiases them. */
+   struct pipe_resource *slot_table = NULL;
+   if (info->index_size) {
+      if (info->primitive_restart)
+         GEX_LINE_DECLINE("primitive restart");
+      if (info->index_size != 1 && info->index_size != 2 &&
+          info->index_size != 4)
+         GEX_LINE_DECLINE("index width");
+      struct pipe_transfer *index_transfer = NULL;
+      const void *raw = info->has_user_indices
+         ? (const void *)((const char *)info->index.user +
+                          (size_t)draw->start * info->index_size)
+         : pipe_buffer_map_range(&ctx->base, info->index.resource,
+                                 (size_t)draw->start * info->index_size,
+                                 (size_t)draw->count * info->index_size,
+                                 PIPE_MAP_READ, &index_transfer);
+      if (!raw)
+         GEX_LINE_DECLINE("the index buffer could not be read");
+      uint32_t *table = MALLOC(draw->count * sizeof(*table));
+      if (!table) {
+         if (index_transfer)
+            pipe_buffer_unmap(&ctx->base, index_transfer);
+         GEX_LINE_DECLINE("the slot table could not be allocated");
+      }
+      for (unsigned i = 0; i < draw->count; ++i) {
+         uint32_t vertex;
+         if (info->index_size == 1)
+            vertex = ((const uint8_t *)raw)[i];
+         else if (info->index_size == 2)
+            vertex = ((const uint16_t *)raw)[i];
+         else
+            vertex = ((const uint32_t *)raw)[i];
+         table[i] = (uint32_t)((int64_t)vertex + draw->index_bias);
+      }
+      if (index_transfer)
+         pipe_buffer_unmap(&ctx->base, index_transfer);
+      /* Through the same helper the capture parameters use: a
+       * PIPE_BIND_SHADER_BUFFER resource written with wgpuQueueWriteBuffer.
+       * A pipe_buffer_create(PIPE_USAGE_IMMUTABLE) followed by
+       * pipe_buffer_write left the buffer reading as zeros, and a slot table
+       * of zeros captures vertex 0's attributes for every slot -- which,
+       * multiplied by a modelview-projection matrix, is the (0,0,0,0)
+       * position GEX_WGPU_LINE_LOG prints. */
+      slot_table = gex_wgpu_params_buffer(ctx, table, draw->count);
+      FREE(table);
+      if (!slot_table)
+         GEX_LINE_DECLINE("the slot table could not be uploaded");
    }
    /* The capture pass binds vertex buffers, its output and the constant
     * buffers, and nothing else. A vertex shader that samples a texture would
@@ -14597,6 +14680,13 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
                          ctx->line_vs_out);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
                          vs_params);
+   /* Bound writable to match the declaration -- gex_wgpu_word_block was asked
+    * for a writable block, and the layout entry has to agree or the binding
+    * does not match the shader at all. The transform-feedback capture binds
+    * its slot table the same way. */
+   if (slot_table)
+      gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_INDEX_BINDING,
+                            slot_table);
    bool ok = vs_params &&
              gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
                                      ctx->vs->ubo_count, ctx->vs->ubo_slots,
@@ -14608,6 +14698,7 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
                              DIV_ROUND_UP(draw->count,
                                           GEX_WGPU_CAPTURE_GROUP));
    pipe_resource_reference(&vs_params, NULL);
+   pipe_resource_reference(&slot_table, NULL);
    if (!ok)
       GEX_LINE_DECLINE("the capture pass did not run");
    if (getenv("GEX_WGPU_LINE_LOG")) {
@@ -17398,7 +17489,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * many of those. */
    if (!ctx->failed && !ctx->line_rewritten && info && draws &&
        num_draws == 1 && !indirect && ctx->vs && ctx->rasterizer &&
-       !info->index_size && info->instance_count <= 1 &&
+       info->instance_count <= 1 &&
        (info->mode == MESA_PRIM_LINES ||
         info->mode == MESA_PRIM_LINE_STRIP) &&
        (ctx->rasterizer->line_width > 1.0f ||
