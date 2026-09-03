@@ -993,6 +993,11 @@ struct gex_wgpu_context {
                                             ? GEX_WGPU_MAX_SHADER_BUFFERS
                                             : GEX_WGPU_MAX_SO_BUFFERS];
    struct gex_wgpu_query *active_query;
+   /* glBeginConditionalRender. The query is owned by st/mesa, which keeps it
+    * alive until EndConditionalRender clears the condition. */
+   struct pipe_query *render_cond_query;
+   bool render_cond_cond;
+   enum pipe_render_cond_flag render_cond_mode;
    WGPUQuerySet occlusion_set;
    WGPUBuffer occlusion_resolve;
    WGPUBuffer occlusion_readback;
@@ -1545,6 +1550,17 @@ struct gex_wgpu_query {
    unsigned type;
    bool active;
    bool have_result;
+   /* Whether a render pass carrying the occlusion query actually began while
+    * this query was active.
+    *
+    * The result is resolved from slot 0 of one WGPUQuerySet, which holds
+    * whatever the *last* pass wrote -- so a query with no draws in it read
+    * back the previous query's count. glBeginQuery/glEndQuery around nothing
+    * must answer zero, and an occlusion query used as a conditional-render
+    * predicate is exactly that case: the draw it was measuring was scissored
+    * away, and a stale 64 made every conditional draw take the wrong
+    * branch. */
+   bool counted;
    uint64_t result;
    /* TIME_ELAPSED only: CPU nanoseconds at begin_query. */
    uint64_t start;
@@ -12838,6 +12854,7 @@ gex_wgpu_begin_query(struct pipe_context *pipe, struct pipe_query *q)
        query->type == PIPE_QUERY_TIMESTAMP_DISJOINT) {
       query->active = true;
       query->have_result = false;
+      query->counted = false;
       query->result = 0;
       query->start = os_time_get_nano();
       return true;
@@ -12846,6 +12863,7 @@ gex_wgpu_begin_query(struct pipe_context *pipe, struct pipe_query *q)
       return false;
    query->active = true;
    query->have_result = false;
+   query->counted = false;
    query->result = 0;
    ctx->active_query = query;
    return true;
@@ -12918,6 +12936,12 @@ gex_wgpu_get_query_result(struct pipe_context *pipe, struct pipe_query *q,
       return true;
    }
 
+   if (!query->have_result && !query->counted) {
+      /* No pass carried this query, so nothing was counted. Resolving the
+       * shared slot would report the previous query's total. */
+      query->result = 0;
+      query->have_result = true;
+   }
    if (!query->have_result) {
       if (!ctx->occlusion_set)
          return false;
@@ -13737,12 +13761,62 @@ gex_wgpu_render_condition(struct pipe_context *pipe, struct pipe_query *query,
                           bool condition, enum pipe_render_cond_flag mode)
 {
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
-   (void)condition;
-   (void)mode;
-   /* Conditional rendering needs queries, which do not exist here.  Clearing
-    * the condition is the only supported call. */
-   if (!ctx->failed && query)
-      gex_fail(ctx);
+   /* This used to fail the context for any query, on the grounds that
+    * "queries do not exist here" -- true when it was written and not since
+    * occlusion queries landed. caps->conditional_render was set the whole
+    * time, so the driver advertised ARB_conditional_render (GL 3.0) and then
+    * turned glBeginConditionalRender into GL_OUT_OF_MEMORY from every later
+    * call. */
+   ctx->render_cond_query = query;
+   ctx->render_cond_cond = condition;
+   ctx->render_cond_mode = mode;
+}
+
+/* Whether rendering should happen, given an active conditional render.
+ *
+ * The shape is softpipe's, because the convention is not obvious: st passes
+ * `condition` true for GL's *_INVERTED modes, and the test is against the
+ * *negation* of the result being non-zero. A query whose result is not ready
+ * draws -- GL's NO_WAIT modes explicitly allow that, and for the WAIT modes
+ * this driver's queries resolve synchronously anyway. */
+static bool
+gex_wgpu_render_cond_passes(struct gex_wgpu_context *ctx)
+{
+   if (!ctx->render_cond_query)
+      return true;
+   struct pipe_context *pipe = &ctx->base;
+   const struct gex_wgpu_query *query =
+      (const struct gex_wgpu_query *)ctx->render_cond_query;
+   union pipe_query_result result;
+   memset(&result, 0, sizeof(result));
+   const bool wait = ctx->render_cond_mode == PIPE_RENDER_COND_WAIT ||
+                     ctx->render_cond_mode == PIPE_RENDER_COND_BY_REGION_WAIT;
+   if (!pipe->get_query_result(pipe, ctx->render_cond_query, wait, &result))
+      return true;
+   bool nonzero;
+   switch (query->type) {
+   case PIPE_QUERY_OCCLUSION_PREDICATE:
+   case PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE:
+   case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
+   case PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE:
+   case PIPE_QUERY_GPU_FINISHED:
+      nonzero = result.b;
+      break;
+   default:
+      nonzero = result.u64 != 0;
+      break;
+   }
+   const bool passes = !nonzero == ctx->render_cond_cond;
+   /* The convention is easy to get backwards and the symptom is every
+    * conditional draw inverted, which looks like an application bug.
+    * GEX_WGPU_CONDRENDER_LOG=1. */
+   if (getenv("GEX_WGPU_CONDRENDER_LOG"))
+      fprintf(stderr,
+              "gex-wgpu: render condition type=%u u64=%llu b=%d nonzero=%d "
+              "inverted=%d -> %s\n", query->type,
+              (unsigned long long)result.u64, (int)result.b, (int)nonzero,
+              (int)ctx->render_cond_cond, passes ? "draw" : "skip");
+   return passes;
 }
 
 /* Copy a rectangle of one texture into another.
@@ -14514,6 +14588,10 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
               info->dst.box.y, util_format_short_name(info->dst.format),
               (int)info->filter, info->mask);
 
+   if (info && info->render_condition_enable &&
+       !gex_wgpu_render_cond_passes(ctx))
+      return;
+
    /* A multisampled source is a resolve, not a copy. */
    if (info->src.resource && info->dst.resource &&
        MAX2(1, info->src.resource->nr_samples) > 1 &&
@@ -14580,11 +14658,12 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
       !util_format_is_depth_or_stencil(info->dst.format) ? PIPE_MASK_RGBA
       : util_format_has_stencil(util_format_description(info->dst.format))
          ? PIPE_MASK_ZS : PIPE_MASK_Z;
-   /* render_condition_enable is not a refusal: it asks the blit to respect an
-    * active conditional render, and this driver implements no
-    * set_render_condition, so none can be active. st/mesa sets it on every
-    * blit it issues, which was sending every same-format depth copy to
-    * u_blitter instead of the texture-to-texture copy below. */
+   /* render_condition_enable asks the blit to respect an active conditional
+    * render. It is not a refusal -- st/mesa sets it on every blit it issues,
+    * and treating it as one sent every same-format depth copy to u_blitter
+    * instead of the texture-to-texture copy below -- but it is no longer
+    * vacuous either: render_condition is implemented now, so an enabled blit
+    * under a failing condition has to be skipped. */
    /* A copy cannot change the sample count, and WebGPU says so:
     *
     *   Source [...] sample count (1) and destination [...] sample count (4)
@@ -21456,6 +21535,11 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
 {
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
 
+   /* glBeginConditionalRender, tested at the outermost level so a draw the
+    * rewrite paths split into several is skipped as one. */
+   if (ctx->draw_depth == 0 && !gex_wgpu_render_cond_passes(ctx))
+      return;
+
    /* Bisection over a frame's draws; see gex_wgpu_frame_draw. Counted only at
     * the outermost level, so a draw split into several by the restart or
     * indirect paths stays one draw as the application issued it. */
@@ -22749,14 +22833,23 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    bool scissor_enabled = ctx->rasterizer && ctx->rasterizer->scissor;
    uint32_t scissor_x = 0, scissor_y = 0;
    uint32_t scissor_width = ctx->fb_width, scissor_height = ctx->fb_height;
+   /* No scissor_set check, and deliberately not a refusal either.
+    *
+    * st's update_scissor pushes a rectangle only when the one it computes
+    * differs from its own cache, and that cache is zero-initialised -- so an
+    * all-zero (empty) scissor is indistinguishable from one never sent, and
+    * set_scissor_states is simply not called for it. "Enabled and never
+    * pushed" therefore means an *empty* box, not GL's default whole-window
+    * one: an application that enables the test without ever calling glScissor
+    * gets the window dimensions from Mesa, which differ from the zero cache
+    * and are pushed normally.
+    *
+    * ctx->scissor is zero-initialised to match, so the empty-box path below
+    * skips the draw, which is the right answer. Refusing here failed the
+    * context, and treating it as no-scissoring drew the whole framebuffer --
+    * gl44-conditional-render-probe scissors to nothing to make an occlusion
+    * query count zero samples, and got 64. */
    if (scissor_enabled) {
-      if (!ctx->scissor_set) {
-         if (!ctx->failed)
-            fprintf(stderr, "gex-wgpu: draw refused (scissor enabled, "
-                            "no scissor set)\n");
-         gex_fail(ctx);
-         return;
-      }
       scissor_x = MIN2(ctx->scissor.minx, ctx->fb_width);
       scissor_y = MIN2(ctx->scissor.miny, ctx->fb_height);
       const uint32_t maxx = MIN2(ctx->scissor.maxx, ctx->fb_width);
@@ -24610,6 +24703,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (pass) {
       if (counting)
          wgpuRenderPassEncoderBeginOcclusionQuery(pass, 0);
+         if (ctx->active_query)
+            ctx->active_query->counted = true;
       /* The pipeline by the state that built it, not by its handle: depth,
        * cull, topology and target format are what decide whether geometry
        * appears at all, and a handle normalised away for cross-run comparison
@@ -25471,6 +25566,17 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    caps->query_timestamp = true;
    caps->query_time_elapsed = true;
    caps->conditional_render = true;
+   /* ARB_conditional_render_inverted, one of GL 4.5's five. st passes the
+    * inverted sense as render_condition's `condition` argument, which
+    * gex_wgpu_render_cond_passes already tests against, so the inverted modes
+    * need nothing the plain ones did not. */
+   caps->conditional_render_inverted = true;
+   /* NV_texture_barrier, another of the five. glTextureBarrier promises that
+    * writes to a texture are visible to later reads of it, and
+    * gex_wgpu_texture_barrier submits everything recorded so far -- which on
+    * a driver that orders every command on the WebGPU queue is exactly that
+    * guarantee, not an approximation of it. */
+   caps->texture_barrier = true;
    /* Geometry shaders, run as a compute pass. The output is allocated
     * worst-case per input primitive, so these are what bound that allocation
     * rather than a hardware limit. GL 3.2 asks for 256 and 1024. */
