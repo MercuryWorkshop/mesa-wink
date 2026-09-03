@@ -19482,6 +19482,14 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    pipe_resource_reference(&ctx->line_starts, NULL);
    for (struct gex_wgpu_line_quad *q = ctx->line_quads; q;) {
       struct gex_wgpu_line_quad *next = q->next;
+      /* The shader and the element state are real driver objects, made the
+       * same way the geometry stage makes its passthrough, and they have to
+       * be unmade the same way -- freeing the cache entry alone leaked a
+       * shader module per varying layout. */
+      if (q->shader)
+         gex_wgpu_delete_shader_state(&ctx->base, q->shader);
+      if (q->elements)
+         ctx->base.delete_vertex_elements_state(&ctx->base, q->elements);
       FREE(q);
       q = next;
    }
