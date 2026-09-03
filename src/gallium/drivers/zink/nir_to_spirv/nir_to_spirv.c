@@ -22,6 +22,7 @@
  */
 
 #include "nir_to_spirv.h"
+#include <math.h>
 #include "spirv_builder.h"
 
 #include "nir.h"
@@ -91,6 +92,10 @@ struct ntv_context {
    bool block_started;
    SpvId loop_break, loop_cont;
 
+   /* A function-local zero, created on demand, whose only purpose is to be a
+    * value the WGSL translator cannot constant-fold. See
+    * emit_unfoldable_zero. */
+   SpvId nonfinite_zero_var[5]; //8, 16, 32, unused, 64
    SpvId shared_block_var[5]; //8, 16, 32, unused, 64
    SpvId shared_block_arr_type[5]; //8, 16, 32, unused, 64
    SpvId scratch_block_var[5]; //8, 16, 32, unused, 64
@@ -457,6 +462,46 @@ emit_uint_const(struct ntv_context *ctx, int bit_size, uint64_t value)
 {
    assert(bit_size == 8 || bit_size == 16 || bit_size == 32 || bit_size == 64);
    return spirv_builder_const_uint(&ctx->builder, bit_size, value);
+}
+
+/* A zero of the given width that no constant folder can see through.
+ *
+ * This exists for one reason: WGSL has no non-finite literal, and Tint's
+ * SPIR-V reader rejects any *constant expression* that evaluates to one --
+ *
+ *   error: value nan cannot be represented as 'f32'
+ *
+ * -- including OpBitcast of an integer constant, which it folds. Blender
+ * writes `gl_Position = vec4(uintBitsToFloat(0x7FC00000u))` to discard a
+ * primitive (a NaN position fails every clip comparison), so this is not a
+ * corner: without it every shader in Blender's polyline family fails to link,
+ * and before the constant was moved off the float type it crashed Tint
+ * outright.
+ *
+ * A NaN produced at *run time* is perfectly legal in WGSL. So the bit pattern
+ * is OR-ed with a zero loaded from a function-local variable, which is a
+ * `var` in WGSL and therefore not a constant expression. The store makes the
+ * value defined in SPIR-V too, rather than relying on WGSL's
+ * zero-initialisation of an uninitialised OpVariable.
+ *
+ * Cost: one variable, one store and one load per non-finite constant, in the
+ * handful of shaders that have any. */
+static SpvId
+emit_unfoldable_zero(struct ntv_context *ctx, unsigned bit_size)
+{
+   const unsigned idx = bit_size >> 4;
+   SpvId uint_type = spirv_builder_type_uint(&ctx->builder, bit_size);
+   if (!ctx->nonfinite_zero_var[idx]) {
+      SpvId ptr_type = spirv_builder_type_pointer(
+         &ctx->builder, SpvStorageClassFunction, uint_type);
+      ctx->nonfinite_zero_var[idx] =
+         spirv_builder_emit_var(&ctx->builder, ptr_type,
+                                SpvStorageClassFunction);
+   }
+   spirv_builder_emit_store(&ctx->builder, ctx->nonfinite_zero_var[idx],
+                            emit_uint_const(ctx, bit_size, 0), false);
+   return spirv_builder_emit_load(&ctx->builder, uint_type,
+                                  ctx->nonfinite_zero_var[idx], false);
 }
 
 static SpvId
@@ -2449,6 +2494,10 @@ emit_load_const(struct ntv_context *ctx, nir_load_const_instr *load_const)
 
    SpvId components[NIR_MAX_VEC_COMPONENTS];
    nir_alu_type atype;
+   /* Set by the float case below when a component is an infinity or a NaN;
+    * every component is then emitted as an integer and the composite is
+    * bitcast back. See the comment there. */
+   bool nonfinite = false;
    if (bit_size == 1) {
       atype = nir_type_bool;
       for (int i = 0; i < num_components; i++)
@@ -2473,6 +2522,34 @@ emit_load_const(struct ntv_context *ctx, nir_load_const_instr *load_const)
          }
          case nir_type_float: {
             double tmp = nir_const_value_as_float(load_const->value[i], bit_size);
+            /* A non-finite float constant cannot be *emitted* as a float
+             * constant when the consumer is WebGPU: Tint's SPIR-V reader
+             * asserts on it outright --
+             *
+             *   tint/lang/core/constant/scalar.h:59 internal compiler error:
+             *   TINT_ASSERT(std::isfinite(v.value))
+             *
+             * -- and WGSL has no non-finite literal to translate it into.
+             * Blender's shaders carry infinities (a depth or distance
+             * initialised to 1.0/0.0), and this crashed the whole process
+             * during its shader compilation rather than failing one shader.
+             *
+             * WGSL *can* express the value, as a bitcast of the integer
+             * pattern, so the constant is emitted as an integer and the whole
+             * vector reinterpreted below. Doing it per component would not
+             * work: spirv_builder_const_composite takes constant ids and an
+             * OpBitcast is an instruction, so the cast has to be applied once
+             * to the assembled composite. */
+            if (!isfinite(tmp)) {
+               /* Left for the second pass below, which needs every component
+                * of the vector to be an integer at once. Emitting the float
+                * constant here would put a non-finite OpConstant in the
+                * module even if nothing used it, and Tint rejects the module
+                * rather than the value. */
+               nonfinite = true;
+               components[i] = 0;
+               break;
+            }
             components[i] = emit_float_const(ctx, bit_size, tmp);
             break;
          }
@@ -2482,15 +2559,44 @@ emit_load_const(struct ntv_context *ctx, nir_load_const_instr *load_const)
       }
    }
 
+   /* A vector with any non-finite component has *every* component re-emitted
+    * as an integer OR-ed with an unfoldable zero -- one composite has one
+    * type, and one constant component would let the whole thing be folded
+    * back into a constant and rejected. The composite then has to be built at
+    * run time (OpCompositeConstruct) rather than as OpConstantComposite,
+    * which takes constant ids only. */
+   if (nonfinite) {
+      SpvId uint_type = spirv_builder_type_uint(&ctx->builder, bit_size);
+      SpvId zero = emit_unfoldable_zero(ctx, bit_size);
+      for (int i = 0; i < num_components; i++) {
+         SpvId bits =
+            emit_uint_const(ctx, bit_size,
+                            nir_const_value_as_uint(load_const->value[i],
+                                                    bit_size));
+         components[i] = emit_binop(ctx, SpvOpBitwiseOr, uint_type, bits,
+                                    zero);
+      }
+   }
+
    if (num_components > 1) {
-      SpvId type = get_alu_type(ctx, atype, num_components, bit_size);
-      SpvId value = spirv_builder_const_composite(&ctx->builder,
-                                                  type, components,
-                                                  num_components);
+      SpvId type = get_alu_type(ctx, nonfinite ? nir_type_uint : atype,
+                                num_components, bit_size);
+      SpvId value = nonfinite
+         ? spirv_builder_emit_composite_construct(&ctx->builder, type,
+                                                  components, num_components)
+         : spirv_builder_const_composite(&ctx->builder, type, components,
+                                         num_components);
+      if (nonfinite)
+         value = emit_bitcast(
+            ctx, get_alu_type(ctx, atype, num_components, bit_size), value);
       store_def(ctx, load_const->def.index, value, atype);
    } else {
       assert(num_components == 1);
-      store_def(ctx, load_const->def.index, components[0], atype);
+      SpvId value = components[0];
+      if (nonfinite)
+         value = emit_bitcast(ctx, get_alu_type(ctx, atype, 1, bit_size),
+                              value);
+      store_def(ctx, load_const->def.index, value, atype);
    }
 }
 

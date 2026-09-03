@@ -66,7 +66,7 @@ extern void gex_wgpu_jspi_signal(void);
  * GEX_WGPU_STORAGE_UBO_FIRST_BINDING. The range also *identifies* them later:
  * a spilled uniform block and a real storage block are both nir_var_mem_ssbo
  * by the time the shader is walked, and only the binding tells them apart. */
-#define GEX_WGPU_MAX_SHADER_BUFFERS 8
+#define GEX_WGPU_MAX_SHADER_BUFFERS 16
 #define GEX_WGPU_SSBO_FIRST_BINDING \
    (GEX_WGPU_STORAGE_UBO_FIRST_BINDING + GEX_WGPU_MAX_CONSTANT_BUFFERS)
 /* Application shader images, again in a range of their own. */
@@ -205,6 +205,18 @@ gex_wgpu_buffer_texture_words(enum pipe_format format)
 #define GEX_WGPU_GS_PARAM_PRIMITIVES 0
 #define GEX_WGPU_GS_PARAM_WORDS 4
 #define GEX_WGPU_GS_GROUP 32
+
+/* Viewports, scissor boxes and depth ranges. ARB_viewport_array requires
+ * sixteen and WebGPU has one per render pass -- which is not the
+ * approximation it looks like: GL rasterizes a primitive with no
+ * shader-written gl_ViewportIndex through viewport *zero*, so one viewport is
+ * exactly right for every program that does not route. What it cannot do is
+ * route, and gex_wgpu_gs_draw declines that by name.
+ *
+ * The other fifteen slots still have to be *stored*: st/mesa sets every slot
+ * at context setup once the extension is on, and refusing them is not a
+ * missing feature but a dead context. */
+#define GEX_WGPU_MAX_VIEWPORTS 16
 
 /* Varyings carried between stages through a buffer, one vec4 each. Sixteen is
  * what the driver advertises as max_inputs/max_outputs. */
@@ -555,6 +567,16 @@ struct gex_wgpu_screen {
     * what the driver was compiled to hold. Advertising more than the device
     * allows does not fail here -- it fails later, at pipeline creation, on
     * whichever shader happens to use the extra slot. */
+   /* Texture limits, as the *device* granted them rather than as WebGPU
+    * guarantees them. GL 4.1 requires a 16384 texture and 2048 array layers,
+    * where WebGPU's floor is 8192 and 256 -- so a driver that reports the
+    * floor can never advertise GL 4.1, and with it 4.2 and 4.3. Asking the
+    * adapter for more is the difference between "the device cannot" and
+    * "nobody asked it to", and it makes the reported GL version
+    * device-dependent, which is what every other Mesa driver does. */
+   uint32_t max_texture_2d;
+   uint32_t max_texture_3d;
+   uint32_t max_texture_layers;
    uint32_t max_uniform_buffers;
    uint32_t max_storage_buffers_vertex;
    /* Storage buffers a single stage may bind, for application shader storage
@@ -750,6 +772,13 @@ struct gex_wgpu_context {
     * pipeline's sample count to match its attachments exactly. */
    uint32_t fb_samples;
    bool viewport_set;
+   /* Slots one and above of the viewport and scissor arrays. Slot zero lives
+    * in ctx->viewport / ctx->scissor above, because every draw uses it and
+    * nothing downstream should have to index for the common case. */
+   struct pipe_viewport_state viewports[GEX_WGPU_MAX_VIEWPORTS];
+   struct pipe_scissor_state scissors[GEX_WGPU_MAX_VIEWPORTS];
+   uint32_t viewport_slots_set;
+   uint32_t scissor_slots_set;
    struct pipe_viewport_state viewport;
    bool scissor_set;
    struct pipe_scissor_state scissor;
@@ -1269,6 +1298,21 @@ struct gex_wgpu_gs {
     * A triangle strip of N vertices is N-2 triangles of 3 indices; a point
     * stream is N points of 1. Keeping both as fields is what lets the emitter
     * and the draw agree without either of them naming a topology. */
+   /* Output slots the rasterizer must not carry, as indices into `outputs`.
+    *
+    * gl_ViewportIndex and gl_Layer are shader outputs like any other as far
+    * as the compute pass is concerned -- they are written into the vertex
+    * buffer with the rest -- but they are *not* varyings. Handing them to the
+    * passthrough vertex shader fails outright: ntv recomputes each varying's
+    * @location as `location - VARYING_SLOT_VAR0` only for generic slots, so
+    * VARYING_SLOT_VIEWPORT becomes @location(23), past WebGPU's sixteen
+    * inter-stage locations, and the module is rejected. That is the same trap
+    * gl_PointCoord hit at VARYING_SLOT_PNTC.
+    *
+    * -1 when the shader does not write it. */
+   int viewport_slot;
+   int layer_slot;
+   uint32_t passthrough_skip;
    unsigned max_output_prims;
    unsigned indices_per_prim;
    unsigned verts_per_input_prim;
@@ -1823,23 +1867,80 @@ gex_wgpu_lower_ssbo_access(nir_builder *b, nir_instr *instr, void *data)
    nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
    const bool is_load = intr->intrinsic == nir_intrinsic_load_ssbo;
    const bool is_store = intr->intrinsic == nir_intrinsic_store_ssbo;
-   if (!is_load && !is_store) {
-      /* Anything else that names a storage block -- an atomic, a size query
-       * -- is not served, and saying which is the whole diagnosis. */
+   const bool is_atomic = intr->intrinsic == nir_intrinsic_ssbo_atomic;
+   const bool is_atomic_swap =
+      intr->intrinsic == nir_intrinsic_ssbo_atomic_swap;
+   if (!is_load && !is_store && !is_atomic && !is_atomic_swap) {
+      /* Anything else that names a storage block is not served, and saying
+       * which is the whole diagnosis. */
       switch (intr->intrinsic) {
-      case nir_intrinsic_ssbo_atomic:
-      case nir_intrinsic_ssbo_atomic_swap:
       case nir_intrinsic_get_ssbo_size:
          state->failed = true;
          if (!state->why[0])
             snprintf(state->why, sizeof(state->why),
-                     "shader storage %s is not implemented",
-                     intr->intrinsic == nir_intrinsic_get_ssbo_size
-                        ? "length()" : "atomics");
+                     "shader storage length() is not implemented");
          return false;
       default:
          return false;
       }
+   }
+
+   /* An atomic becomes the *deref* form of itself on the flattened word
+    * array. ntv already emits those -- emit_deref_atomic_intrinsic takes a
+    * pointer and hands it to OpAtomic* -- and Tint's SPIR-V reader turns a
+    * variable an OpAtomic addresses into `atomic<u32>`, which is the only
+    * shape WGSL has. Nothing here has to know which operation it is: the
+    * ATOMIC_OP index travels across unchanged.
+    *
+    * ARB_shader_atomic_counters has been advertised since storage buffers
+    * landed -- st/mesa derives it from them -- so this was a hole in a claim
+    * already made rather than a missing feature. GL's atomic counters lower
+    * onto exactly these intrinsics, and so did the obvious way to count
+    * fragments, which is how gl44-fbo-no-attachments-probe came to report
+    * zero for a framebuffer that was working. */
+   if (is_atomic || is_atomic_swap) {
+      if (!nir_src_is_const(intr->src[0])) {
+         state->failed = true;
+         if (!state->why[0])
+            snprintf(state->why, sizeof(state->why),
+                     "an atomic on a storage block chosen at run time");
+         return false;
+      }
+      const unsigned atomic_slot = nir_src_as_uint(intr->src[0]);
+      nir_variable *atomic_block =
+         gex_wgpu_ssbo_block(b->shader, atomic_slot);
+      if (!atomic_block || intr->def.bit_size != 32) {
+         state->failed = true;
+         if (!state->why[0])
+            snprintf(state->why, sizeof(state->why),
+                     "a %u-bit atomic on storage block %u, which this shader "
+                     "%s", intr->def.bit_size, atomic_slot,
+                     atomic_block ? "declares" : "does not declare");
+         return false;
+      }
+      b->cursor = nir_before_instr(instr);
+      nir_def *atomic_word = nir_src_is_const(intr->src[1])
+         ? nir_imm_int(b, nir_src_as_uint(intr->src[1]) / 4)
+         : nir_ushr_imm(b, intr->src[1].ssa, 2);
+      nir_deref_instr *element = nir_build_deref_array(
+         b, nir_build_deref_struct(
+               b, nir_build_deref_var(b, atomic_block), 0),
+         atomic_word);
+      nir_intrinsic_instr *lowered = nir_intrinsic_instr_create(
+         b->shader, is_atomic_swap ? nir_intrinsic_deref_atomic_swap
+                                   : nir_intrinsic_deref_atomic);
+      lowered->src[0] = nir_src_for_ssa(&element->def);
+      lowered->src[1] = nir_src_for_ssa(intr->src[2].ssa);
+      if (is_atomic_swap)
+         lowered->src[2] = nir_src_for_ssa(intr->src[3].ssa);
+      lowered->num_components = 1;
+      nir_intrinsic_set_atomic_op(lowered, nir_intrinsic_atomic_op(intr));
+      nir_intrinsic_set_access(lowered, nir_intrinsic_access(intr));
+      nir_def_init(&lowered->instr, &lowered->def, 1, 32);
+      nir_builder_instr_insert(b, &lowered->instr);
+      nir_def_rewrite_uses(&intr->def, &lowered->def);
+      nir_instr_remove(instr);
+      return true;
    }
 
    /* src[0] is the value for a store and the block index for a load. */
@@ -7021,7 +7122,28 @@ gex_wgpu_set_viewport_states(struct pipe_context *pipe, unsigned start_slot,
       ctx->viewport_set = false;
       return;
    }
-   if (start_slot != 0 || num_viewports != 1 || !states ||
+   /* Slots above zero, which ARB_viewport_array introduced. They are stored
+    * and not otherwise used: a draw is rasterized through slot zero unless a
+    * geometry shader writes gl_ViewportIndex, which gex_wgpu_gs_draw declines
+    * by name. st/mesa sets all sixteen at context setup, so the alternative
+    * to storing them is a context that dies before its first draw. */
+   if (states && start_slot + num_viewports <= GEX_WGPU_MAX_VIEWPORTS) {
+      for (unsigned i = 0; i < num_viewports; ++i) {
+         ctx->viewports[start_slot + i] = states[i];
+         ctx->viewport_slots_set |= 1u << (start_slot + i);
+      }
+   }
+   if (start_slot != 0) {
+      if (start_slot + num_viewports > GEX_WGPU_MAX_VIEWPORTS) {
+         if (!ctx->failed)
+            fprintf(stderr, "gex-wgpu: viewport slots %u..%u past the %u this "
+                            "driver has\n", start_slot,
+                    start_slot + num_viewports - 1, GEX_WGPU_MAX_VIEWPORTS);
+         gex_fail(ctx);
+      }
+      return;
+   }
+   if (!num_viewports || !states ||
        !isfinite(states[0].scale[0]) || !isfinite(states[0].scale[1]) ||
        !isfinite(states[0].scale[2]) || !isfinite(states[0].translate[0]) ||
        !isfinite(states[0].translate[1]) || !isfinite(states[0].translate[2]) ||
@@ -7060,13 +7182,24 @@ gex_wgpu_set_scissor_states(struct pipe_context *pipe, unsigned start_slot,
 {
    GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
-   if (start_slot != 0 || num_scissors != 1 || !states ||
-       states[0].minx > states[0].maxx || states[0].miny > states[0].maxy) {
+   if (!states || start_slot + num_scissors > GEX_WGPU_MAX_VIEWPORTS) {
       gex_fail(ctx);
       return;
    }
-   ctx->scissor = states[0];
-   ctx->scissor_set = true;
+   for (unsigned i = 0; i < num_scissors; ++i) {
+      if (states[i].minx > states[i].maxx || states[i].miny > states[i].maxy) {
+         gex_fail(ctx);
+         return;
+      }
+      ctx->scissors[start_slot + i] = states[i];
+      ctx->scissor_slots_set |= 1u << (start_slot + i);
+   }
+   /* Slot zero is the one every draw scissors against; the rest are stored
+    * for the same reason the viewports are. */
+   if (start_slot == 0 && num_scissors >= 1) {
+      ctx->scissor = states[0];
+      ctx->scissor_set = true;
+   }
 }
 
 static WGPUVertexFormat
@@ -8089,6 +8222,41 @@ gex_wgpu_format_sample_type(enum pipe_format format)
    if (util_format_is_pure_sint(format))
       return WGPUTextureSampleType_Sint;
    return WGPUTextureSampleType_Float;
+}
+
+/* Whether a sampler view may see this texture through a different target.
+ *
+ * ARB_texture_view's whole point beyond level and layer ranges: the layers of
+ * an array read as a cube map, one layer of an array read as a plain 2D
+ * texture, a cube map's faces read as an array. WebGPU expresses all of them
+ * -- a GPUTextureView takes its own `dimension` plus a base layer and count --
+ * so the pairs below are a straight mapping and everything else is refused.
+ *
+ * A 3D texture is not in here: WebGPU has no way to view a slice of one as a
+ * 2D texture, and GL does not ask (glTextureView forbids 3D as either side). */
+static bool
+gex_wgpu_view_target_ok(enum pipe_texture_target view,
+                        enum pipe_texture_target texture)
+{
+   if (view == texture)
+      return true;
+   switch (texture) {
+   case PIPE_TEXTURE_2D_ARRAY:
+      return view == PIPE_TEXTURE_2D || view == PIPE_TEXTURE_CUBE ||
+             view == PIPE_TEXTURE_CUBE_ARRAY;
+   case PIPE_TEXTURE_CUBE:
+   case PIPE_TEXTURE_CUBE_ARRAY:
+      return view == PIPE_TEXTURE_2D || view == PIPE_TEXTURE_2D_ARRAY ||
+             view == PIPE_TEXTURE_CUBE || view == PIPE_TEXTURE_CUBE_ARRAY;
+   case PIPE_TEXTURE_1D_ARRAY:
+      return view == PIPE_TEXTURE_1D;
+   case PIPE_TEXTURE_2D:
+      /* A single-layer array view of a 2D texture, which is how st spells a
+       * one-layer view of an immutable texture. */
+      return view == PIPE_TEXTURE_2D_ARRAY;
+   default:
+      return false;
+   }
 }
 
 static WGPUTextureViewDimension
@@ -9284,7 +9452,7 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
         !gex_wgpu_is_bc_format(texture->format) &&
         texture->format != PIPE_FORMAT_Z32_FLOAT &&
         texture->format != PIPE_FORMAT_Z24_UNORM_S8_UINT) ||
-       templ->target != texture->target ||
+       !gex_wgpu_view_target_ok(templ->target, texture->target) ||
        /* sRGB and its linear counterpart are the same bytes seen through a
         * different transfer function, and GL uses exactly that view to read
         * sRGB data undecoded. WebGPU allows it too, provided the alternative
@@ -9322,10 +9490,15 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
        templ->u.tex.last_layer >=
           (texture->target == PIPE_TEXTURE_3D
              ? texture->depth0 : texture->array_size) ||
-       ((texture->target == PIPE_TEXTURE_1D ||
-         texture->target == PIPE_TEXTURE_2D ||
-         texture->target == PIPE_TEXTURE_RECT) &&
-        (templ->u.tex.first_layer != 0 || templ->u.tex.last_layer != 0)) ||
+       /* On the *view's* target, not the texture's: a one-layer view of an
+        * array is a 2D view whose single layer is whichever one it names, and
+        * demanding layer zero of it refused exactly the case
+        * ARB_texture_view exists for. A 2D texture still has only layer
+        * zero, which the range check above already enforces. */
+       ((templ->target == PIPE_TEXTURE_1D ||
+         templ->target == PIPE_TEXTURE_2D ||
+         templ->target == PIPE_TEXTURE_RECT) &&
+        templ->u.tex.first_layer != templ->u.tex.last_layer) ||
        /* A 3D texture's depth is not a layer range. st/mesa builds its view
         * with first_layer = last_layer = 0 -- last_layer comes from
         * array_size - 1, and a 3D texture's array_size is 1 -- so demanding
@@ -9337,12 +9510,15 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
         (templ->u.tex.first_layer != 0 ||
          (templ->u.tex.last_layer != 0 &&
           templ->u.tex.last_layer != texture->depth0 - 1))) ||
-       (texture->target == PIPE_TEXTURE_CUBE &&
+       /* A *cube* view must cover six faces; an array or 2D view of a cube
+        * texture may cover any range of them, which is how a shader filters a
+        * cube map by hand. */
+       (templ->target == PIPE_TEXTURE_CUBE &&
         (templ->u.tex.first_layer != 0 || templ->u.tex.last_layer != 5))) {
       GEX_SAMPLER_VIEW_REFUSED("shape or format");
       return NULL;
    }
-   if (texture->target == PIPE_TEXTURE_CUBE_ARRAY &&
+   if (templ->target == PIPE_TEXTURE_CUBE_ARRAY &&
        (templ->u.tex.first_layer % 6 != 0 ||
         (templ->u.tex.last_layer + 1) % 6 != 0)) {
       GEX_SAMPLER_VIEW_REFUSED("cube-array layer range");
@@ -9359,19 +9535,16 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
     * already permits exactly that pair, and resource_create already declared
     * it in viewFormats, so the only thing missing was using it. */
    desc.format = gex_wgpu_texture_format(templ->format);
-   desc.dimension = texture->target == PIPE_TEXTURE_1D_ARRAY ||
-                    texture->target == PIPE_TEXTURE_2D_ARRAY
-      ? WGPUTextureViewDimension_2DArray
-      : texture->target == PIPE_TEXTURE_3D
-      ? WGPUTextureViewDimension_3D
-      : texture->target == PIPE_TEXTURE_CUBE
-      ? WGPUTextureViewDimension_Cube
-      : texture->target == PIPE_TEXTURE_CUBE_ARRAY
-      ? WGPUTextureViewDimension_CubeArray
-      : WGPUTextureViewDimension_2D;
+   /* The *view's* target. It used to be the texture's, which is the same
+    * thing until ARB_texture_view lets them differ -- and then a 2D view of
+    * one array layer would have been declared 2DArray, which is a different
+    * WGSL type from the sampler2D the shader declared and a rejected bind
+    * group. */
+   desc.dimension = gex_wgpu_target_view_dimension(templ->target);
    desc.baseMipLevel = templ->u.tex.first_level;
    desc.mipLevelCount = templ->u.tex.last_level - templ->u.tex.first_level + 1;
-   if (texture->target != PIPE_TEXTURE_3D) {
+   if (templ->target != PIPE_TEXTURE_3D &&
+       texture->target != PIPE_TEXTURE_3D) {
       desc.baseArrayLayer = templ->u.tex.first_layer;
       desc.arrayLayerCount =
          templ->u.tex.last_layer - templ->u.tex.first_layer + 1;
@@ -14127,7 +14300,8 @@ gex_wgpu_collect_varyings(nir_shader *nir, nir_variable_mode mode,
  * stride, which is exactly a vertex layout. */
 static nir_shader *
 gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
-                            const struct gex_wgpu_varying_layout *outputs)
+                            const struct gex_wgpu_varying_layout *outputs,
+                            uint32_t skip)
 {
    /* Built with this driver's own compiler options rather than none. A shader
     * created with NULL options has `nir->options` null, and NIR dereferences
@@ -14139,6 +14313,10 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
       MESA_SHADER_VERTEX, pipe->screen->nir_options[MESA_SHADER_VERTEX],
       "gex-gs-passthrough");
    for (unsigned i = 0; i < outputs->count; ++i) {
+      /* A skipped slot keeps its place in the buffer -- the stride and every
+       * other slot's offset depend on it -- and simply is not forwarded. */
+      if (skip & (1u << i))
+         continue;
       char name[24];
       snprintf(name, sizeof(name), "gex_gs_varying%u", i);
       nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in,
@@ -15400,7 +15578,7 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct pipe_shader_state passthrough_state = {0};
    passthrough_state.type = PIPE_SHADER_IR_NIR;
-   passthrough_state.ir.nir = gex_wgpu_gs_passthrough_nir(pipe, &tes->outputs);
+   passthrough_state.ir.nir = gex_wgpu_gs_passthrough_nir(pipe, &tes->outputs, 0);
    passthrough_state.report_compile_error = true;
    tes->passthrough = gex_wgpu_create_shader_state(pipe, &passthrough_state,
                                                    MESA_SHADER_VERTEX);
@@ -15557,13 +15735,35 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       ++gs->ubo_count;
    }
 
+   /* Which output slots are gl_ViewportIndex and gl_Layer, if either is
+    * written. They stay in the buffer layout -- the compute pass writes them
+    * and, for the viewport, the routing below reads them back -- and are kept
+    * out of the passthrough. */
+   gs->viewport_slot =
+      gex_wgpu_varying_slot(&gs->outputs, VARYING_SLOT_VIEWPORT);
+   gs->layer_slot = gex_wgpu_varying_slot(&gs->outputs, VARYING_SLOT_LAYER);
+   if (gs->viewport_slot >= 0)
+      gs->passthrough_skip |= 1u << gs->viewport_slot;
+   if (gs->layer_slot >= 0) {
+      gs->passthrough_skip |= 1u << gs->layer_slot;
+      /* Layered rendering is a separate thing this driver does not do: WebGPU
+       * attaches one layer at a time, so everything lands on the framebuffer's
+       * bound layer. Saying so once is better than a link failure (which is
+       * what forwarding the slot produced) and better than silence. */
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: a geometry shader writes gl_Layer; this "
+                         "driver rasterizes the bound layer only\n");
+      }
+   }
    NIR_PASS(_, nir, nir_lower_gs_intrinsics, 0);
    gs->nir = nir;
    gs->module = gex_wgpu_gs_build_module(pipe, gs);
 
    struct pipe_shader_state passthrough_state = {0};
    passthrough_state.type = PIPE_SHADER_IR_NIR;
-   passthrough_state.ir.nir = gex_wgpu_gs_passthrough_nir(pipe, &gs->outputs);
+   passthrough_state.ir.nir = gex_wgpu_gs_passthrough_nir(pipe, &gs->outputs, gs->passthrough_skip);
    passthrough_state.report_compile_error = true;
    gs->passthrough = gex_wgpu_create_shader_state(pipe, &passthrough_state,
                                                   MESA_SHADER_VERTEX);
@@ -15571,14 +15771,22 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
 
    struct pipe_vertex_element elements[GEX_WGPU_MAX_VARYINGS];
    memset(elements, 0, sizeof(elements));
+   unsigned element_count = 0;
    for (unsigned i = 0; i < gs->outputs.count; ++i) {
-      elements[i].src_offset = i * 16;
-      elements[i].src_stride = gex_wgpu_varying_stride(&gs->outputs);
-      elements[i].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
-      elements[i].vertex_buffer_index = 0;
+      /* Skipped slots are absent from the layout too, and the ones that
+       * remain keep their *original* offset: the buffer's stride and every
+       * other slot's place in it are set by the full output list. */
+      if (gs->passthrough_skip & (1u << i))
+         continue;
+      elements[element_count].src_offset = i * 16;
+      elements[element_count].src_stride =
+         gex_wgpu_varying_stride(&gs->outputs);
+      elements[element_count].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      elements[element_count].vertex_buffer_index = 0;
+      ++element_count;
    }
    gs->passthrough_elements = ctx->base.create_vertex_elements_state(
-      &ctx->base, gs->outputs.count, elements);
+      &ctx->base, element_count, elements);
 
    if (!gs->module || !gs->passthrough || !gs->passthrough_elements) {
       /* Named, because all three failures reach the application as an empty
@@ -16279,6 +16487,158 @@ gex_wgpu_bind_constants(struct gex_wgpu_context *ctx,
       if (storage_mask & (1u << i))
          group->storage_mask |= 1u << at;
    }
+   return true;
+}
+
+/* Sort the geometry shader's output triangles by the viewport each one asked
+ * for, and draw them in runs.
+ *
+ * Returns false having drawn nothing, in which case the caller draws the whole
+ * list through viewport zero -- which is what GL says an unrouted primitive
+ * gets, so a failure here is a fallback rather than a wrong picture.
+ *
+ * The viewport index is read from the *first* index of each triangle. GL takes
+ * it from the primitive's provoking vertex, whose convention is settable, so a
+ * shader that writes different indices on different vertices of one triangle
+ * can disagree with this by one vertex. Every real use writes the same value
+ * for the whole primitive, and the alternative -- threading the provoking
+ * convention through -- buys nothing measurable. */
+static bool
+gex_wgpu_gs_route_viewports(struct gex_wgpu_context *ctx,
+                            struct gex_wgpu_gs *gs, unsigned index_count,
+                            struct pipe_draw_info *raster,
+                            unsigned drawid_offset)
+{
+   const unsigned stride = gex_wgpu_varying_stride(&gs->outputs);
+   const unsigned triangles = index_count / 3;
+   if (!triangles || !stride)
+      return false;
+
+   uint32_t *indices = MALLOC(index_count * 4);
+   uint8_t *which = MALLOC(triangles);
+   if (!indices || !which) {
+      FREE(indices);
+      FREE(which);
+      return false;
+   }
+
+   /* The index list and the viewport each triangle asked for, both off the
+    * GPU. One map each: the viewport slot is interleaved with the varyings,
+    * so the vertex buffer is read where the triangle's first index lands. */
+   struct pipe_transfer *transfer = NULL;
+   const uint32_t *mapped = pipe_buffer_map_range(
+      &ctx->base, ctx->gs_indices, 0, index_count * 4, PIPE_MAP_READ,
+      &transfer);
+   if (!mapped) {
+      FREE(indices);
+      FREE(which);
+      return false;
+   }
+   memcpy(indices, mapped, index_count * 4);
+   pipe_buffer_unmap(&ctx->base, transfer);
+
+   const unsigned vertex_bytes =
+      gex_resource(ctx->gs_vertices)->allocation_size;
+   transfer = NULL;
+   const uint8_t *vertices = pipe_buffer_map_range(
+      &ctx->base, ctx->gs_vertices, 0, vertex_bytes, PIPE_MAP_READ, &transfer);
+   if (!vertices) {
+      FREE(indices);
+      FREE(which);
+      return false;
+   }
+   const unsigned slot_byte = (unsigned)gs->viewport_slot * 16;
+   unsigned counts[GEX_WGPU_MAX_VIEWPORTS] = {0};
+   /* 0xff marks a triangle to drop: three equal indices, which is how the
+    * emit path fills a slot no primitive reached, or a first index that would
+    * read past the buffer. Neither draws anything through any viewport. */
+   for (unsigned t = 0; t < triangles; ++t) {
+      const uint32_t first = indices[t * 3];
+      const uint64_t at = (uint64_t)first * stride + slot_byte;
+      if ((first == indices[t * 3 + 1] && first == indices[t * 3 + 2]) ||
+          at + 4 > vertex_bytes) {
+         which[t] = 0xff;
+         continue;
+      }
+      uint32_t index;
+      memcpy(&index, vertices + at, sizeof(index));
+      /* GL clamps an out-of-range gl_ViewportIndex to the implementation's
+       * count rather than making it undefined behaviour. */
+      which[t] = (uint8_t)MIN2(index, (uint32_t)GEX_WGPU_MAX_VIEWPORTS - 1);
+      ++counts[which[t]];
+   }
+   pipe_buffer_unmap(&ctx->base, transfer);
+
+   unsigned starts[GEX_WGPU_MAX_VIEWPORTS];
+   unsigned at = 0;
+   for (unsigned v = 0; v < GEX_WGPU_MAX_VIEWPORTS; ++v) {
+      starts[v] = at;
+      at += counts[v] * 3;
+   }
+   const unsigned kept = at;
+   if (!kept) {
+      FREE(indices);
+      FREE(which);
+      /* Every triangle was degenerate, which is a legitimate outcome and
+       * already drawn -- by drawing nothing. */
+      return true;
+   }
+
+   uint32_t *sorted = MALLOC(kept * 4);
+   if (!sorted) {
+      FREE(indices);
+      FREE(which);
+      return false;
+   }
+   unsigned fill[GEX_WGPU_MAX_VIEWPORTS];
+   memcpy(fill, starts, sizeof(fill));
+   for (unsigned t = 0; t < triangles; ++t) {
+      if (which[t] == 0xff)
+         continue;
+      unsigned *slot = &fill[which[t]];
+      memcpy(sorted + *slot, indices + t * 3, 3 * sizeof(uint32_t));
+      *slot += 3;
+   }
+   gex_wgpu_buffer_subdata(&ctx->base, ctx->gs_indices, PIPE_MAP_WRITE, 0,
+                           kept * 4, sorted);
+   FREE(sorted);
+   FREE(indices);
+   FREE(which);
+
+   /* One draw per viewport that got any triangles, with that viewport
+    * installed for the length of it. */
+   const struct pipe_viewport_state saved = ctx->viewport;
+   const bool saved_set = ctx->viewport_set;
+   const struct pipe_scissor_state saved_scissor = ctx->scissor;
+   const bool saved_scissor_set = ctx->scissor_set;
+   unsigned passes = 0;
+   for (unsigned v = 0; v < GEX_WGPU_MAX_VIEWPORTS; ++v) {
+      if (!counts[v])
+         continue;
+      if (ctx->viewport_slots_set & (1u << v)) {
+         ctx->viewport = ctx->viewports[v];
+         ctx->viewport_set = true;
+      }
+      /* The scissor array is indexed the same way, and GL applies the
+       * viewport's own scissor box to a routed primitive. */
+      if (ctx->scissor_slots_set & (1u << v)) {
+         ctx->scissor = ctx->scissors[v];
+         ctx->scissor_set = true;
+      }
+      struct pipe_draw_start_count_bias run;
+      memset(&run, 0, sizeof(run));
+      run.start = starts[v];
+      run.count = counts[v] * 3;
+      gex_wgpu_draw_vbo(&ctx->base, raster, drawid_offset, NULL, &run, 1);
+      ++passes;
+      ctx->viewport = saved;
+      ctx->viewport_set = saved_set;
+      ctx->scissor = saved_scissor;
+      ctx->scissor_set = saved_scissor_set;
+   }
+   if (getenv("GEX_WGPU_GS_LOG"))
+      fprintf(stderr, "gex-wgpu: gs routed %u triangles through %u "
+              "viewport(s)\n", kept / 3, passes);
    return true;
 }
 
@@ -17086,7 +17446,26 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
               (void *)gs->passthrough_elements, (void *)ctx->gs_vertices,
               (void *)ctx->gs_indices, index_count, (unsigned)raster.mode,
               (void *)ctx->fs);
-   gex_wgpu_draw_vbo(&ctx->base, &raster, drawid_offset, NULL, &raster_draw, 1);
+   /* ARB_viewport_array's routing: a geometry shader that writes
+    * gl_ViewportIndex sends each primitive through a viewport of its own, and
+    * WebGPU has one viewport per render pass. So the primitives are *sorted*
+    * by the index the shader wrote and drawn in runs, one pass per viewport
+    * -- which is what a shadow-map atlas or a single-pass cube render
+    * actually asks for.
+    *
+    * Both the index list and the viewport slot come back off the GPU, which
+    * is a stall on this draw only: it is conditioned on the shader writing
+    * the index, and a shader that does not is untouched. The same trade the
+    * tessellator's level readback makes, for the same reason -- the grouping
+    * depends on numbers a shader computed. */
+   bool routed = false;
+   if (gs->viewport_slot >= 0 && raster.mode == MESA_PRIM_TRIANGLES &&
+       index_count % 3 == 0)
+      routed = gex_wgpu_gs_route_viewports(ctx, gs, index_count,
+                                           &raster, drawid_offset);
+   if (!routed)
+      gex_wgpu_draw_vbo(&ctx->base, &raster, drawid_offset, NULL, &raster_draw,
+                        1);
 
    ctx->gs = gs;
    ctx->vs = saved_vs;
@@ -23358,8 +23737,23 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * than a choice; a per-patch varying costs a slot in the patch buffer and
     * nothing more. */
    caps->max_shader_patch_varyings = 30;
-   caps->glsl_feature_level = 400;
-   caps->glsl_feature_level_compatibility = 400;
+   /* GLSL 4.30, which is what the rungs up to GL 4.3 test.
+    *
+    * It is read *before* Mesa clamps the usable level to the granted GL
+    * version (`_mesa_compute_version`, version.c), so raising it cannot let a
+    * shader declare above whatever version the driver actually reaches -- it
+    * is a precondition declaration, not a lever. What it does is let GL 4.1,
+    * 4.2 and 4.3 be granted once their extensions are in place, and light
+    * ARB_shader_precision, which is gated on this alone.
+    *
+    * Every GLSL feature it promises is served: viewport arrays (4.10),
+    * fp64 in every stage (4.00), atomic counters and image load/store (4.20),
+    * compute shaders, storage buffers and shader image size (4.30). Atomic
+    * counters were the last hole and they were *already advertised* through
+    * ARB_shader_atomic_counters, so the cap did not create that risk -- it
+    * only made it worth closing, which gl44-ssbo-atomic-probe now gates. */
+   caps->glsl_feature_level = 430;
+   caps->glsl_feature_level_compatibility = 430;
 
    /* ARB_texture_gather, exposed below its GL 4.0 core version.
     *
@@ -23571,12 +23965,27 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    caps->fragment_color_clamped = false;
    caps->vertex_color_clamped = false;
 
-   /* WebGPU's guaranteed minimums, which is what a portable page may assume.
-    * maxTextureDimension2D 8192, maxTextureArrayLayers 256. */
-   caps->max_texture_2d_size = 8192;
-   caps->max_texture_3d_levels = 12;    /* 2048 */
-   caps->max_texture_cube_levels = 14;  /* 8192 */
-   caps->max_texture_array_layers = 256;
+   /* From the device, not from WebGPU's floor.
+    *
+    * These used to be the guaranteed minimums -- 8192 and 256 layers -- on
+    * the grounds that a portable page may assume no more. The cost of that is
+    * the *GL version*: `_mesa_compute_version`'s 4.1 rung requires
+    * MaxTextureSize >= 16384, MaxRenderbufferSize >= 16384,
+    * MaxCubeTextureLevels >= 15 and MaxArrayTextureLayers >= 2048, none of
+    * which is an extension and all of which the ladder script now prints. So
+    * a driver reporting the floor is capped at GL 4.0 however many extensions
+    * it implements, and Blender's 4.3 floor is unreachable.
+    *
+    * The device is asked for more at creation (see the limit requests in
+    * gex_wgpu_native.c and web/src/mesa-gl.js) and these follow whatever it
+    * granted, so a machine that can do 16384x2048 reports GL 4.3 and one that
+    * cannot reports 4.0. The version being device-dependent is correct rather
+    * than unfortunate: it is what every hardware Mesa driver does, and the
+    * alternative is claiming a size the device will reject at allocation. */
+   caps->max_texture_2d_size = screen->max_texture_2d;
+   caps->max_texture_3d_levels = util_logbase2(screen->max_texture_3d) + 1;
+   caps->max_texture_cube_levels = util_logbase2(screen->max_texture_2d) + 1;
+   caps->max_texture_array_layers = screen->max_texture_layers;
 
    /* One WebGPU render pass can hold eight colour attachments; this driver
     * validates and binds up to its own maximum. */
@@ -23653,7 +24062,20 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    caps->min_map_buffer_alignment = 64;
 
    caps->max_varyings = 16;
-   caps->max_viewports = 1;
+   /* ARB_viewport_array, and with it ARB_fragment_layer_viewport -- st turns
+    * both on from this one number reaching sixteen. Fifteen of the sixteen
+    * are storage only; see GEX_WGPU_MAX_VIEWPORTS for why that is correct
+    * rather than approximate, and gex_wgpu_gs_draw for the case it is not.
+    *
+    * It belongs *here*, with the other viewport caps, and not in the block
+    * above: this assignment runs later and would silently put it back to one.
+    * The same ordering hazard as compute_caps against gex_wgpu_init_caps. */
+   caps->max_viewports = GEX_WGPU_MAX_VIEWPORTS;
+   /* ARB_texture_view. A GPUTextureView carries its own dimension, base layer
+    * and layer count, so the level, layer and *target* reinterpretations map
+    * straight across; what WebGPU has no form of is a view format outside the
+    * texture's own sRGB pair, which create_sampler_view refuses by name. */
+   caps->sampler_view_target = true;
    caps->clip_halfz = true;
    caps->fs_coord_origin_upper_left = true;
    caps->fs_coord_pixel_center_half_integer = true;
@@ -23767,11 +24189,28 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
        * cannot be used by vertex pipeline stage"), so its bindings are
        * declared read-only. GL allows a vertex-stage write and this cannot
        * serve one. */
+      /* Twice the device's budget, because st/mesa immediately halves it.
+       *
+       * st reserves half of max_shader_buffers for *atomic counter* buffers
+       * and reports the other half as MAX_*_SHADER_STORAGE_BLOCKS
+       * (st_extensions.c: `MaxAtomicBuffers = MaxShaderStorageBlocks / 2`).
+       * Here the two are the same pool -- GL's atomic counters are lowered
+       * onto storage-buffer atomics -- so claiming the device's ten gave
+       * applications five, and Blender refuses to start below eight:
+       *
+       *   Unsupported platform as it supports max 4 SSBO binding locations
+       *
+       * Doubling it means a program using the maximum of *both* halves at
+       * once would ask for more bindings than the device has, and WebGPU
+       * would reject the bind group -- which the draw path reports as
+       * "bind=failed" rather than mis-rendering. Understating the driver by
+       * half to avoid a combination nothing does is the worse trade. */
       caps->max_shader_buffers =
          stages[i] == MESA_SHADER_FRAGMENT ||
          stages[i] == MESA_SHADER_VERTEX ||
          stages[i] == MESA_SHADER_COMPUTE
-            ? MIN2(GEX_WGPU_MAX_SHADER_BUFFERS, screen->max_storage_buffers)
+            ? MIN2(GEX_WGPU_MAX_SHADER_BUFFERS,
+                   screen->max_storage_buffers * 2)
             : 0;
       /* Shader images, the last gate before ARB_compute_shader:
        * st_extensions turns on ARB_shader_image_load_store when the *fragment*
@@ -23910,6 +24349,11 @@ gex_wgpu_screen_create(WGPUDevice device)
    }
    screen->device = device;
    WGPULimits limits = WGPU_LIMITS_INIT;
+   /* WebGPU's guaranteed minimums, which is what the device is assumed to
+    * have until it says otherwise. */
+   screen->max_texture_2d = 8192;
+   screen->max_texture_3d = 2048;
+   screen->max_texture_layers = 256;
    screen->max_uniform_buffers = 12;      /* WebGPU's guaranteed minimum */
    screen->max_storage_buffers_vertex = 0;
    screen->max_storage_buffers = 0;
@@ -23918,6 +24362,15 @@ gex_wgpu_screen_create(WGPUDevice device)
       wgpuDeviceGetLimits(device, &limits) == WGPUStatus_Success;
    if (got_limits) {
       screen->max_uniform_buffers = limits.maxUniformBuffersPerShaderStage;
+      if (limits.maxTextureDimension2D != WGPU_LIMIT_U32_UNDEFINED &&
+          limits.maxTextureDimension2D >= 8192)
+         screen->max_texture_2d = limits.maxTextureDimension2D;
+      if (limits.maxTextureDimension3D != WGPU_LIMIT_U32_UNDEFINED &&
+          limits.maxTextureDimension3D >= 2048)
+         screen->max_texture_3d = limits.maxTextureDimension3D;
+      if (limits.maxTextureArrayLayers != WGPU_LIMIT_U32_UNDEFINED &&
+          limits.maxTextureArrayLayers >= 256)
+         screen->max_texture_layers = limits.maxTextureArrayLayers;
       /* The per-stage storage limits are newer than the single
        * maxStorageBuffersPerShaderStage, and an implementation that does not
        * report one leaves WGPU_LIMIT_U32_UNDEFINED there rather than a value.

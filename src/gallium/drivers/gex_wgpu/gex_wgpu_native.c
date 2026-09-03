@@ -209,6 +209,15 @@ create_device(void)
       GEX_WANT(maxComputeWorkgroupSizeY, 1024);
       GEX_WANT(maxComputeWorkgroupSizeZ, 64);
       GEX_WANT(maxComputeWorkgroupStorageSize, 32768);
+      /* Textures, because the *GL version* depends on them and nothing else
+       * does: the 4.1 rung of _mesa_compute_version requires a 16384 texture
+       * and 2048 array layers where WebGPU guarantees 8192 and 256. A device
+       * that can do more will say so; one that cannot leaves the caps at the
+       * floor and the driver reports GL 4.0. */
+      GEX_WANT(maxTextureDimension1D, 16384);
+      GEX_WANT(maxTextureDimension2D, 16384);
+      GEX_WANT(maxTextureDimension3D, 2048);
+      GEX_WANT(maxTextureArrayLayers, 2048);
 #undef GEX_WANT
       fprintf(stderr,
               "gex-wgpu: adapter compute limits invocations/workgroup %u "
