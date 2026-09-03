@@ -21244,19 +21244,21 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * renderer cuts out its font glyphs and foliage -- and nothing in the
     * browser had reached it, core profile having removed the feature. */
    caps->alpha_test = false;
-   /* Doubles are deliberately not advertised, and the reason is circular.
+   /* Doubles, in software. WGSL has no f64, so every double operation becomes
+    * a pair of 32-bit ones through nir_lower_doubles against float64.glsl --
+    * the same implementation Intel ships -- which lower_doubles_options below
+    * asks for.
     *
-    * Mesa can lower fp64 in software -- float64.glsl and nir_lower_doubles,
-    * which st runs by itself once lower_doubles_options asks for it. But st
-    * only *builds* that shader when GLSL is 4.00 or better, and Mesa clamps
-    * the GLSL version to the GL version, which stays at 3.3 until the whole
-    * GL 4.0 extension set is present -- fp64 among it. So fp64 cannot be
-    * delivered on its own; it arrives with the rung or not at all.
-    *
-    * Setting caps.doubles anyway is worse than leaving it: st advertises
-    * ARB_gpu_shader_fp64, an application writes a double, and the draw dies
-    * on `assert(softfp64 != NULL)` inside nir_lower_double_ops instead of
-    * failing to compile. Measured, not guessed. */
+    * This was previously left off on the grounds that the requirement was
+    * circular: st only builds float64.glsl when GLSLVersion >= 400, and the
+    * note here said Mesa clamps GLSL to the GL version, which needs fp64. The
+    * clamp does not exist -- st_extensions assigns
+    * `consts->GLSLVersion = screen->caps.glsl_feature_level` and nothing
+    * lowers it -- so raising the GLSL level breaks the circle, and the two
+    * caps simply have to move together. Getting that wrong is not a soft
+    * failure: without the support shader, nir_lower_double_ops hits
+    * `assert(softfp64 != NULL)` and takes the process with it. */
+   caps->doubles = true;
    /* ARB_sample_shading. The rate is the shader's business in WebGPU (see
     * gex_wgpu_set_min_samples), gl_SampleID and gl_SampleMask reach WGSL as
     * @builtin(sample_index) and @builtin(sample_mask) through the emitter's
@@ -21290,8 +21292,18 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * computed from the coordinate's derivatives instead; see
     * gex_wgpu_lower_query_lod_instr. */
    caps->texture_query_lod = true;
-   caps->glsl_feature_level = 330;
-   caps->glsl_feature_level_compatibility = 330;
+   /* GLSL 4.00, which is a lever rather than a claim about the GL version.
+    *
+    * st_extensions takes consts->GLSLVersion straight from this cap and does
+    * *not* clamp it to the GL version, and three of the extensions the
+    * version ladder still wants are gated on the GLSL level alone:
+    * ARB_gpu_shader5 at 400, ARB_shader_precision at 410, and
+    * ARB_enhanced_layouts. It is also what makes software fp64 deliverable --
+    * st only builds float64.glsl when GLSLVersion >= 400, and
+    * nir_lower_double_ops asserts on its absence -- so caps.doubles and this
+    * have to move together. */
+   caps->glsl_feature_level = 400;
+   caps->glsl_feature_level_compatibility = 400;
 
    /* ARB_texture_gather, exposed below its GL 4.0 core version.
     *
