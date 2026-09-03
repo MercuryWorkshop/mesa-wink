@@ -2777,6 +2777,13 @@ gex_wgpu_lower_viewport_transform(nir_builder *b, nir_intrinsic_instr *intr,
 struct gex_wgpu_border_lowering {
    bool s;
    bool t;
+   /* GL_MIRROR_CLAMP_TO_EDGE, per axis. WebGPU has three address modes and
+    * this is not one of them -- but the mode *is* "take the absolute value,
+    * then clamp to edge", so the sampler is a clamp-to-edge one and the
+    * absolute value is taken in the shader. */
+   bool mirror_s;
+   bool mirror_t;
+   bool mirror_r;
    bool linear;
    bool integer_sampled;
    bool integer_array;
@@ -3700,6 +3707,76 @@ gex_wgpu_lower_view_swizzle_instr(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+/* GL_MIRROR_CLAMP_TO_EDGE, which is one instruction.
+ *
+ * The mode mirrors the coordinate about zero and then clamps to the edge, so
+ * what is sampled is |coord| through a clamp-to-edge sampler -- and that is
+ * the whole of it. WebGPU offers clamp-to-edge, repeat and mirror-repeat and
+ * nothing else, so without this the mode would have to be refused, and
+ * refusing a wrap mode means refusing the sampler state, which latches.
+ *
+ * Only the axes the sampler names are touched: a driver that abs()es the
+ * whole coordinate vector would break a texture wrapping one axis and
+ * mirroring the other, which is exactly what the probe's `t-axis` case
+ * checks from the other side.
+ *
+ * Not applied to a texelFetch: an integer texel coordinate is not wrapped at
+ * all in GL, so the mode does not reach it. */
+static bool
+gex_wgpu_lower_mirror_clamp_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms ||
+       tex->op == nir_texop_txs || tex->op == nir_texop_query_levels ||
+       tex->op == nir_texop_texture_samples)
+      return false;
+   int slot_src = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   if (slot_src < 0)
+      slot_src = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   if (slot_src < 0)
+      return false;
+   nir_variable *slot_var = nir_deref_instr_get_variable(
+      nir_src_as_deref(tex->src[slot_src].src));
+   const unsigned slot = slot_var ? slot_var->data.driver_location
+                                  : GEX_WGPU_MAX_SAMPLERS;
+   struct gex_wgpu_texture_lowering *table = data;
+   if (slot >= GEX_WGPU_MAX_SAMPLERS || !table->active[slot])
+      return false;
+   const struct gex_wgpu_border_lowering *lower = &table->slots[slot];
+   if (!lower->mirror_s && !lower->mirror_t && !lower->mirror_r)
+      return false;
+   const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_src < 0)
+      return false;
+   nir_def *coord = tex->src[coord_src].src.ssa;
+   const unsigned components = coord->num_components;
+   /* An array layer is not a texture coordinate and is never wrapped, so the
+    * last component of an array sample is left alone. */
+   const unsigned wrapped = tex->is_array && components > 1
+      ? components - 1 : components;
+   const bool mirror[3] = {lower->mirror_s, lower->mirror_t,
+                           lower->mirror_r};
+   bool any = false;
+   for (unsigned i = 0; i < wrapped && i < 3; ++i)
+      any |= mirror[i];
+   if (!any)
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+   nir_def *channels[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < components; ++i) {
+      nir_def *value = nir_channel(b, coord, i);
+      if (i < wrapped && i < 3 && mirror[i])
+         value = nir_fabs(b, value);
+      channels[i] = value;
+   }
+   nir_src_rewrite(&tex->src[coord_src].src,
+                   nir_vec(b, channels, components));
+   return true;
+}
+
 /* textureGrad on an integer texture.
  *
  * gex_wgpu_lower_integer_sample_instr emits only `tex` and `txl`; anything
@@ -3789,6 +3866,9 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
       table.slots[slot] = (struct gex_wgpu_border_lowering) {
          .s = state->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER,
          .t = state->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER,
+         .mirror_s = state->wrap_s == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE,
+         .mirror_t = state->wrap_t == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE,
+         .mirror_r = state->wrap_r == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE,
          .linear = state->min_img_filter == PIPE_TEX_FILTER_LINEAR,
          .integer_sampled = integer_sampled,
          .integer_array = view->target == PIPE_TEXTURE_1D_ARRAY ||
@@ -3830,6 +3910,9 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
       nir_metadata_control_flow | nir_metadata_loop_analysis, &table);
    progress |= nir_shader_instructions_pass(
       nir, gex_wgpu_lower_sampler_lod_bias_instr,
+      nir_metadata_control_flow | nir_metadata_loop_analysis, &table);
+   progress |= nir_shader_instructions_pass(
+      nir, gex_wgpu_lower_mirror_clamp_instr,
       nir_metadata_control_flow | nir_metadata_loop_analysis, &table);
    progress |= nir_shader_instructions_pass(
       nir, gex_wgpu_lower_nearest_border_instr,
@@ -6538,6 +6621,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
          }
          needs_sampler_variant |=
             (fs->integer_sampled_slots & (1u << slot)) ||
+            sampler->state.wrap_s == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE ||
+            sampler->state.wrap_t == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE ||
+            sampler->state.wrap_r == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE ||
             sampler->state.wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
             sampler->state.wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
             sampler->state.wrap_r == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
@@ -7506,6 +7592,10 @@ gex_wgpu_vertex_format(enum pipe_format format, unsigned *size,
    case PIPE_FORMAT_B10G10R10A2_USCALED:
    case PIPE_FORMAT_R10G10B10A2_SSCALED:
    case PIPE_FORMAT_B10G10R10A2_SSCALED:
+   /* ARB_vertex_type_10f_11f_11f_rev, on the same terms: three unsigned
+    * floats in one dword -- eleven bits, eleven bits, ten -- which WebGPU
+    * has no vertex format for and which the shader can unpack. */
+   case PIPE_FORMAT_R11G11B10_FLOAT:
       *size = 4; *alignment = 4; return WGPUVertexFormat_Uint32;
    default:
       *size = 0; *alignment = 0; return (WGPUVertexFormat)0;
@@ -7521,6 +7611,9 @@ enum {
    GEX_WGPU_UNPACK_SNORM,
    GEX_WGPU_UNPACK_USCALED,
    GEX_WGPU_UNPACK_SSCALED,
+   /* Three unsigned floats rather than a normalised or scaled integer, so it
+    * shares nothing with the four above but the fetch. */
+   GEX_WGPU_UNPACK_R11G11B10F,
    GEX_WGPU_UNPACK_KIND_MASK = 0x0f,
    GEX_WGPU_UNPACK_BGR = 0x10,
 };
@@ -7542,8 +7635,45 @@ gex_wgpu_vertex_unpack_kind(enum pipe_format format)
    case PIPE_FORMAT_R10G10B10A2_SSCALED: return GEX_WGPU_UNPACK_SSCALED;
    case PIPE_FORMAT_B10G10R10A2_SSCALED:
       return GEX_WGPU_UNPACK_SSCALED | GEX_WGPU_UNPACK_BGR;
+   case PIPE_FORMAT_R11G11B10_FLOAT:     return GEX_WGPU_UNPACK_R11G11B10F;
    default:                              return GEX_WGPU_UNPACK_NONE;
    }
+}
+
+/* One unsigned float of an R11G11B10 vertex attribute, as float32.
+ *
+ * Five exponent bits with a bias of fifteen, `mantissa_bits` of mantissa, no
+ * sign -- so 11f is 5+6 and 10f is 5+5.
+ *
+ * Written out rather than calling nir_format_unpack_11f11f10f, which reaches
+ * for `unpack_half_2x16_split_x`: ntv emits that as a 16-bit float type and
+ * does *not* declare the Float16 capability, so the module is rejected --
+ *
+ *   OpTypeFloat 16 with capabilities [Int16, Matrix, Int8]
+ *
+ * -- and even declaring it would need WebGPU's optional shader-f16 feature
+ * for something that is only ever a bit-field extraction. Everything here is
+ * integer arithmetic plus ldexp, which is exact by definition, so the
+ * reconstructed value is bit-identical to the reference rather than within
+ * some tolerance of it.
+ *
+ * An exponent of all ones is Inf or NaN in the format and comes out here as a
+ * large finite number instead. WGSL cannot hold a non-finite *constant* (see
+ * the ntv comment on emit_unfoldable_zero) and no content puts an infinity in
+ * a packed normal, so the select it would cost is not spent. */
+static nir_def *
+gex_wgpu_ufloat11_to_f32(nir_builder *b, nir_def *bits, unsigned mantissa_bits)
+{
+   nir_def *mantissa = nir_iand_imm(b, bits, (1u << mantissa_bits) - 1u);
+   nir_def *exponent = nir_ushr_imm(b, bits, mantissa_bits);
+   nir_def *fraction = nir_fmul_imm(b, nir_u2f32(b, mantissa),
+                                    1.0 / (double)(1u << mantissa_bits));
+   /* exponent zero is the denormal range: no implicit leading one, and the
+    * scale fixed at 2^-14. */
+   nir_def *denormal = nir_ldexp(b, fraction, nir_imm_int(b, -14));
+   nir_def *normal = nir_ldexp(b, nir_fadd_imm(b, fraction, 1.0),
+                               nir_iadd_imm(b, exponent, -15));
+   return nir_bcsel(b, nir_ieq_imm(b, exponent, 0), denormal, normal);
 }
 
 /* Rewrite the flagged vertex inputs from a fetched vec4 into the raw dword
@@ -7615,6 +7745,29 @@ gex_wgpu_lower_vertex_attrib_unpack(nir_shader *nir, const uint8_t *kinds)
 
          b.cursor = nir_after_instr(instr);
          nir_def *packed = &load->def;
+         /* Three unsigned floats, which NIR already knows how to take apart
+          * -- and which is not a bit-field extraction of integers at all, so
+          * it cannot share the unpack below. It yields a vec3; the fourth
+          * component of a vertex attribute is 1.0 by GL's rule. */
+         if (kind == GEX_WGPU_UNPACK_R11G11B10F) {
+            /* x in bits 0..10, y in 11..21, z in 22..31 -- which is what the
+             * _REV in GL_UNSIGNED_INT_10F_11F_11F_REV names. */
+            nir_def *value = nir_vec4(
+               &b,
+               gex_wgpu_ufloat11_to_f32(
+                  &b, nir_iand_imm(&b, packed, 0x7ffu), 6),
+               gex_wgpu_ufloat11_to_f32(
+                  &b, nir_iand_imm(&b, nir_ushr_imm(&b, packed, 11), 0x7ffu),
+                  6),
+               gex_wgpu_ufloat11_to_f32(
+                  &b, nir_ushr_imm(&b, packed, 22), 5),
+               nir_imm_float(&b, 1.0f));
+            if (wanted != 4)
+               value = nir_trim_vector(&b, value, wanted);
+            nir_def_rewrite_uses_after(&load->def, value);
+            progress = true;
+            continue;
+         }
          nir_def *parts = is_signed
             ? nir_format_unpack_sint(&b, packed, bits, 4)
             : nir_format_unpack_uint(&b, packed, bits, 4);
@@ -8665,6 +8818,10 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
                                 * driver leaves that false, so the buffer is
                                 * an ordinary vertex and index buffer. */
                                PIPE_BIND_VERTEX_STATE |
+                               /* ARB_query_buffer_object. Nothing is promised
+                                * by accepting it: the result is written with
+                                * an ordinary buffer subdata. */
+                               PIPE_BIND_QUERY_BUFFER |
                                /* glTexBuffer: a sampler view of a buffer,
                                 * narrowed to the decodable formats above. */
                                PIPE_BIND_SAMPLER_VIEW;
@@ -8930,6 +9087,11 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
                                PIPE_BIND_COMMAND_ARGS_BUFFER |
                                /* Display lists; see is_format_supported. */
                                PIPE_BIND_VERTEX_STATE |
+                               /* ARB_query_buffer_object: a query's result is
+                                * written into this with an ordinary buffer
+                                * subdata, so it needs no WebGPU usage of its
+                                * own -- only permission to exist. */
+                               PIPE_BIND_QUERY_BUFFER |
                                PIPE_BIND_RENDER_TARGET |
                                PIPE_BIND_SAMPLER_VIEW;
       if (templ->width0 == 0 || templ->width0 > (1u << 30) ||
@@ -9950,14 +10112,17 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
        (state->wrap_s != PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
         state->wrap_s != PIPE_TEX_WRAP_REPEAT &&
         state->wrap_s != PIPE_TEX_WRAP_MIRROR_REPEAT &&
+        state->wrap_s != PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE &&
         state->wrap_s != PIPE_TEX_WRAP_CLAMP_TO_BORDER) ||
        (state->wrap_t != PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
         state->wrap_t != PIPE_TEX_WRAP_REPEAT &&
         state->wrap_t != PIPE_TEX_WRAP_MIRROR_REPEAT &&
+        state->wrap_t != PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE &&
         state->wrap_t != PIPE_TEX_WRAP_CLAMP_TO_BORDER) ||
        (state->wrap_r != PIPE_TEX_WRAP_CLAMP_TO_EDGE &&
         state->wrap_r != PIPE_TEX_WRAP_REPEAT &&
         state->wrap_r != PIPE_TEX_WRAP_MIRROR_REPEAT &&
+        state->wrap_r != PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE &&
         state->wrap_r != PIPE_TEX_WRAP_CLAMP_TO_BORDER) ||
        (state->min_mip_filter != PIPE_TEX_MIPFILTER_NONE &&
         state->min_mip_filter != PIPE_TEX_MIPFILTER_NEAREST &&
@@ -12420,6 +12585,62 @@ gex_wgpu_get_query_result(struct pipe_context *pipe, struct pipe_query *q,
       result->b = query->result != 0;
    (void)wait;
    return true;
+}
+
+/* ARB_query_buffer_object: a query's result written into a buffer.
+ *
+ * The point of the extension is to avoid the stall -- a GPU-driven renderer
+ * has the result land in a buffer and feeds it to a shader or an indirect
+ * draw without the CPU seeing it. This driver resolves queries on the CPU, so
+ * what happens here is a readback followed by a buffer write: correct, and
+ * without the benefit. Saying so is better than implying otherwise, and it is
+ * what GL 4.4 requires either way.
+ *
+ * `index < 0` asks for availability rather than the result, which Mesa passes
+ * through this same call (queryobj.c). GL does not require a query to have
+ * finished for that, so an unfinished one reports zero rather than waiting.
+ */
+static void
+gex_wgpu_get_query_result_resource(struct pipe_context *pipe,
+                                   struct pipe_query *q,
+                                   enum pipe_query_flags flags,
+                                   enum pipe_query_value_type result_type,
+                                   int index,
+                                   struct pipe_resource *resource,
+                                   unsigned offset)
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   struct gex_wgpu_query *query = (struct gex_wgpu_query *)q;
+   if (!query || !resource)
+      return;
+   const bool wide = result_type == PIPE_QUERY_TYPE_I64 ||
+                     result_type == PIPE_QUERY_TYPE_U64;
+   union pipe_query_result result = {0};
+   uint64_t value = 0;
+   if (index < 0) {
+      /* Availability. Asked without waiting, so a query still in flight
+       * answers zero -- which is a legal answer and the reason a program
+       * polls it. */
+      value = gex_wgpu_get_query_result(pipe, q, false, &result) ? 1 : 0;
+   } else {
+      if (!gex_wgpu_get_query_result(pipe, q, (flags & PIPE_QUERY_WAIT) != 0,
+                                     &result)) {
+         /* Nothing is written, which is what GL says happens when the result
+          * is unavailable and no wait was asked for: the buffer keeps
+          * whatever it held. */
+         return;
+      }
+      value = query->type == PIPE_QUERY_OCCLUSION_COUNTER
+         ? result.u64 : (result.b ? 1u : 0u);
+   }
+   if (ctx->failed)
+      return;
+   const uint64_t wide_value = value;
+   const uint32_t narrow_value = (uint32_t)value;
+   gex_wgpu_buffer_subdata(pipe, resource, PIPE_MAP_WRITE, offset,
+                           wide ? sizeof(wide_value) : sizeof(narrow_value),
+                           wide ? (const void *)&wide_value
+                                : (const void *)&narrow_value);
 }
 
 static void
@@ -18293,6 +18514,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
             sampler->state.wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
             sampler->state.wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
             sampler->state.wrap_r == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
+            sampler->state.wrap_s == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE ||
+            sampler->state.wrap_t == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE ||
+            sampler->state.wrap_r == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE ||
             sampler->state.lod_bias != 0.0f;
    }
    if (!lower_textures)
@@ -23959,6 +24183,8 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.begin_query = gex_wgpu_begin_query;
    ctx->base.end_query = gex_wgpu_end_query;
    ctx->base.get_query_result = gex_wgpu_get_query_result;
+   ctx->base.get_query_result_resource =
+      gex_wgpu_get_query_result_resource;
    ctx->base.set_debug_callback = gex_wgpu_set_debug_callback;
    ctx->base.create_stream_output_target = gex_wgpu_create_stream_output_target;
    ctx->base.stream_output_target_destroy = gex_wgpu_stream_output_target_destroy;
@@ -24561,6 +24787,14 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * see GEX_WGPU_DRAW_PARAMS_BINDING. Blender 5.2 refuses to start without
     * it, and it is the last thing it named. */
    caps->draw_parameters = true;
+   /* ARB_texture_mirror_clamp_to_edge. WebGPU has no such address mode, but
+    * the mode is exactly abs() followed by clamp-to-edge, which
+    * gex_wgpu_lower_mirror_clamp_instr does in one instruction. */
+   caps->texture_mirror_clamp_to_edge = true;
+   /* ARB_query_buffer_object. See gex_wgpu_get_query_result_resource: this is
+    * a readback plus a buffer write, so it is the extension without its
+    * performance point. */
+   caps->query_buffer_object = true;
    caps->clip_halfz = true;
    caps->fs_coord_origin_upper_left = true;
    caps->fs_coord_pixel_center_half_integer = true;
