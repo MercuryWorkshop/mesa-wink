@@ -2617,6 +2617,54 @@ gex_wgpu_count_draw_vs(const void *vs)
    }
 }
 
+/* Every operation that touches the texture the window is made of, in order,
+ * printed at present. A frame can be busy, target the right texture and still
+ * present black -- Minecraft 26.2 did all three -- and the only thing that
+ * separates "nothing wrote it" from "something wrote it and then something
+ * else wiped it" is the sequence. GEX_WGPU_PRESENT_LOG=1. */
+static char gex_wgpu_presented_trace[512];
+static unsigned gex_wgpu_presented_used;
+
+bool gex_wgpu_present_logging(void);
+bool
+gex_wgpu_present_logging(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *value = getenv("GEX_WGPU_PRESENT_LOG");
+      on = value && *value ? 1 : 0;
+   }
+   return on != 0;
+}
+
+static void
+gex_wgpu_presented_note(const char *format, ...)
+{
+   if (!gex_wgpu_present_logging() ||
+       gex_wgpu_presented_used + 48 > sizeof(gex_wgpu_presented_trace))
+      return;
+   va_list args;
+   va_start(args, format);
+   const int wrote =
+      vsnprintf(gex_wgpu_presented_trace + gex_wgpu_presented_used,
+                sizeof(gex_wgpu_presented_trace) - gex_wgpu_presented_used,
+                format, args);
+   va_end(args);
+   if (wrote > 0)
+      gex_wgpu_presented_used += (unsigned)wrote;
+}
+
+const char *gex_wgpu_presented_trace_take(void);
+const char *
+gex_wgpu_presented_trace_take(void)
+{
+   static char out[512];
+   memcpy(out, gex_wgpu_presented_trace, sizeof(out));
+   gex_wgpu_presented_trace[0] = 0;
+   gex_wgpu_presented_used = 0;
+   return out;
+}
+
 void gex_wgpu_report_draw_targets(void);
 void
 gex_wgpu_report_draw_targets(void)
@@ -4640,6 +4688,18 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
        * either, so Tint was undoing it again, and one frcp plus a multiply is
        * what that costs. */
       .lower_txp = ~0u,
+      /* texelFetchOffset. SPIR-V allows ConstOffset on OpImageFetch and Tint
+       * does not:
+       *
+       *   error: ConstOffset is only permitted for sampling, gather, or
+       *   depth-reference gather operations:
+       *     %41 = OpImageFetch %38 %40 %18 Lod|ConstOffset %16 %20
+       *
+       * and a rejected module means the program does not link at all -- the
+       * integer-texture probe died at glLinkProgram, not at a wrong texel.
+       * Adding the offset to the coordinate is what the offset means for a
+       * fetch, since a fetch takes texels and never wraps or filters. */
+      .lower_txf_offset = true,
    };
    gex_wgpu_tex_log(nir, "entry");
    NIR_PASS(_, nir, nir_lower_tex, &texture_options);
@@ -8352,9 +8412,19 @@ gex_wgpu_set_constant_buffer(struct pipe_context *pipe,
       }
       return;
    }
+   /* PIPE_BIND_CONSTANT_BUFFER used to be demanded here. It is not what
+    * decides whether a WebGPU uniform binding is legal: resource_create asks
+    * for the union of every usage a GL buffer might need, precisely because
+    * the target named at allocation does not predict what the object is bound
+    * to later. Minecraft 26.2 allocates its uniform ring with glBufferStorage
+    * on an object with no GL usage yet, so st/mesa gives it bind == 0, and
+    * every one of its uniform binds was refused -- which latches the context
+    * and turns every later draw into a no-op. Ask the buffer what it can
+    * actually do. */
    if (!buffer->buffer || buffer->user_buffer || buffer->buffer_size == 0 ||
        buffer->buffer->target != PIPE_BUFFER ||
-       !(buffer->buffer->bind & PIPE_BIND_CONSTANT_BUFFER) ||
+       !(gex_resource(buffer->buffer)->buffer_usage &
+         WGPUBufferUsage_Uniform) ||
        (buffer->buffer_offset & 255u) ||
        (uint64_t)buffer->buffer_offset + buffer->buffer_size >
           buffer->buffer->width0) {
@@ -8369,8 +8439,9 @@ gex_wgpu_set_constant_buffer(struct pipe_context *pipe,
                  : buffer->user_buffer ? "user pointer with a resource"
                  : buffer->buffer_size == 0 ? "zero size"
                  : buffer->buffer->target != PIPE_BUFFER ? "not a buffer"
-                 : !(buffer->buffer->bind & PIPE_BIND_CONSTANT_BUFFER)
-                    ? "missing PIPE_BIND_CONSTANT_BUFFER"
+                 : !(gex_resource(buffer->buffer)->buffer_usage &
+                     WGPUBufferUsage_Uniform)
+                    ? "no WebGPU uniform usage"
                  : (buffer->buffer_offset & 255u) ? "offset not 256-aligned"
                  : "range past the end of the buffer",
               shader, index, (void *)buffer->buffer,
@@ -9142,11 +9213,25 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
                                PIPE_BIND_QUERY_BUFFER |
                                PIPE_BIND_RENDER_TARGET |
                                PIPE_BIND_SAMPLER_VIEW;
+      /* bind == 0 is legal and must be allowed. st/mesa derives a buffer's
+       * binds from the GL target named at allocation, and glBufferStorage on
+       * an object bound to a target it does not map -- which is how
+       * ARB_buffer_storage is normally used, the object having no usage yet --
+       * yields no bind flags at all. Minecraft 26.2 allocates its uniform ring
+       * buffer that way and got a refusal, which glBufferStorage reports as a
+       * failed glMapBufferRange:
+       *
+       *   java.lang.IllegalStateException: Failed to map buffer
+       *     at com.mojang.blaze3d.opengl.GlBuffer$Direct.map
+       *
+       * Nothing below depends on a bind flag being present: desc.usage is the
+       * union of every usage a GL buffer might later be bound for, precisely
+       * because the creating target does not predict it. Only an *unsupported*
+       * bind is worth refusing. */
       if (templ->width0 == 0 || templ->width0 > (1u << 30) ||
           templ->height0 != 1 || templ->depth0 != 1 || templ->array_size != 1 ||
           templ->last_level != 0 || templ->nr_samples > 1 ||
-          templ->nr_storage_samples > 1 || !(templ->bind & allowed) ||
-          (templ->bind & ~allowed)) {
+          templ->nr_storage_samples > 1 || (templ->bind & ~allowed)) {
          /* u_upload does not check for a NULL resource, so a refusal here
           * surfaces as an out-of-bounds access inside it. */
          fprintf(stderr,
@@ -9161,7 +9246,8 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
          return NULL;
       resource->allocation_size =
          ALIGN_POT((uint64_t)templ->width0,
-                   (templ->bind & PIPE_BIND_CONSTANT_BUFFER) ? 16 : 4);
+                   (templ->bind & PIPE_BIND_CONSTANT_BUFFER) || !templ->bind
+                      ? 16 : 4);
       /* No shadow yet -- gex_wgpu_shadow_ensure allocates one if anything
        * turns out to need it. */
       WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
@@ -9760,7 +9846,18 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
          (((unsigned)box->height % block_height) &&
           (unsigned)box->y + (unsigned)box->height != level_height))) ||
        stride < row_bytes || required_data > SIZE_MAX ||
-       layer_pitch < required_layer || layer_pitch % stride != 0) {
+       /* A layer stride only means anything when there is more than one
+        * layer. st/mesa derives it from GL_UNPACK_IMAGE_HEIGHT, which a 2D
+        * upload never sets, and passed 2048 for a 32-row 128-byte-stride
+        * upload of Minecraft 26.2's 32x32 texture -- half of the 4096 the
+        * rows occupy. Nothing reads past layer zero at depth 1 (required_data
+        * multiplies it by depth - 1), so demanding consistency there refused a
+        * correct upload, and the refusal latched the context: every later map
+        * returned NULL, which Mesa reports as
+        * "GL_INVALID_OPERATION in glTexSubImage2D(PBO is mapped)" from an
+        * internal map of a PBO that was never the problem. */
+       (box->depth > 1 &&
+        (layer_pitch < required_layer || layer_pitch % stride != 0))) {
       /* Named for the same reason texture_map's refusals are: a refusal ends
        * the run, so the next thing to implement has to be readable from the
        * log rather than deduced from a line number. */
@@ -9768,7 +9865,8 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
          fprintf(stderr,
                  "gex-wgpu: texture_subdata refused level=%u/%u usage=0x%x "
                  "box=%d,%d,%d %dx%dx%d target=%u format=%u bpp=%u "
-                 "compressed=%d texture=%d stride=%u row=%llu\n",
+                 "compressed=%d texture=%d stride=%u row=%llu data=%p "
+                 "size=%ux%ux%u layers=%u layer_stride=%llu\n",
                  level, resource ? resource->last_level : 0, usage,
                  box ? box->x : -1, box ? box->y : -1, box ? box->z : -1,
                  box ? box->width : -1, box ? box->height : -1,
@@ -9776,7 +9874,12 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
                  resource ? resource->format : 0, bytes_per_pixel,
                  (int)compressed,
                  resource && gex_resource(resource)->texture ? 1 : 0,
-                 stride, (unsigned long long)row_bytes);
+                 stride, (unsigned long long)row_bytes, data,
+                 resource ? resource->width0 : 0,
+                 resource ? resource->height0 : 0,
+                 resource ? resource->depth0 : 0,
+                 resource ? resource->array_size : 0,
+                 (unsigned long long)layer_stride);
       gex_fail(ctx);
       return;
    }
@@ -9844,7 +9947,11 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
    const enum pipe_format backing = gex_wgpu_format_backing(resource->format);
    const void *upload = data;
    unsigned upload_stride = stride;
-   uint64_t upload_layer = layer_pitch;
+   /* With one layer the stride st handed over may be smaller than the rows
+    * occupy (see the guard above), and rowsPerImage is derived from it below,
+    * so use what the box actually covers. */
+   uint64_t upload_layer =
+      box->depth > 1 ? layer_pitch : MAX2(layer_pitch, required_layer);
    size_t upload_size = (size_t)required_data;
    uint8_t *converted = NULL;
    if (backing != PIPE_FORMAT_NONE) {
@@ -10167,7 +10274,8 @@ gex_wgpu_sampler_refused(const struct pipe_sampler_state *state,
       fprintf(stderr,
               "gex-wgpu: sampler state refused (%s): wrap=%u,%u,%u "
               "filter=%u/%u mip=%u lod=%g..%g bias=%g aniso=%u compare=%u/%u "
-              "border=%g,%g,%g,%g int=%d unnorm=%d\n", why,
+              "border=%g,%g,%g,%g int=%d unnorm=%d seamless=%u "
+              "reduction=%u\n", why,
               state->wrap_s, state->wrap_t, state->wrap_r,
               state->min_img_filter, state->mag_img_filter,
               state->min_mip_filter, state->min_lod, state->max_lod,
@@ -10176,7 +10284,8 @@ gex_wgpu_sampler_refused(const struct pipe_sampler_state *state,
               state->border_color.f[1], state->border_color.f[2],
               state->border_color.f[3],
               (int)state->border_color_is_integer,
-              (int)state->unnormalized_coords);
+              (int)state->unnormalized_coords,
+              state->seamless_cube_map, state->reduction_mode);
    }
    return NULL;
 }
@@ -10268,11 +10377,27 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
     * this Gallium bit participates in validation/variant identity but does
     * not change the physical WebGPU sampler descriptor. */
    supported.unnormalized_coords = state->unnormalized_coords;
+   /* WebGPU filters across cube face edges unconditionally, so seamless is
+    * what this driver does whatever the bit says. Leaving it out of the
+    * whitelist refused it, and st/mesa sets it for every sampler in a core
+    * profile (st_atom_sampler.c: seamless unless the API is compatibility) --
+    * which is every context this driver hands out in the browser. Minecraft
+    * 26.2's terrain sampler was refused for it, and a refused sampler is
+    * served by the default one, so the refusal is silent and the picture is
+    * wrong. */
+   supported.seamless_cube_map = state->seamless_cube_map;
+   /* reduction_mode is deliberately *not* whitelisted: MIN and MAX are
+    * EXT_texture_filter_minmax, which WebGPU has no equivalent for and this
+    * driver does not advertise. It stays a refusal -- now a named one, since
+    * it is printed above. */
    if (state->max_anisotropy > 1 ||
        memcmp(state, &supported, sizeof(supported)) != 0)
       return gex_wgpu_sampler_refused(state,
                                       state->max_anisotropy > 1
                                          ? "anisotropy"
+                                         : state->reduction_mode !=
+                                           PIPE_TEX_REDUCTION_WEIGHTED_AVERAGE
+                                         ? "min/max reduction"
                                          : "a sampler field this driver does "
                                            "not model");
    WGPUSamplerDescriptor desc = WGPU_SAMPLER_DESCRIPTOR_INIT;
@@ -13532,6 +13657,78 @@ gex_wgpu_feedback_snapshot(struct gex_wgpu_context *ctx,
 
 
 
+/* Buffer to buffer -- glCopyBufferSubData, and st/mesa's own buffer moves.
+ *
+ * gex_wgpu_copy_texture_region cannot do this: it needs a WGPUTexture on both
+ * sides and a buffer has none, so the copy was refused. A refusal latches the
+ * context, and a latched context reports GL_OUT_OF_MEMORY from the next
+ * unrelated call -- Minecraft 26.2's was
+ *
+ *   OpenGL debug message: GL_OUT_OF_MEMORY in glMapBufferRange(map failed)
+ *
+ * from a map of a buffer that had nothing wrong with it.
+ *
+ * WebGPU has the command; it only asks that both offsets and the size be
+ * multiples of four. When they are not -- glCopyBufferSubData has no
+ * alignment rule -- the copy goes through the CPU, where the source's shadow
+ * already holds the bytes and buffer_subdata already knows how to write an
+ * unaligned range. */
+static bool
+gex_wgpu_copy_buffer_region(struct pipe_context *pipe,
+                            struct pipe_resource *dst, unsigned dstx,
+                            struct pipe_resource *src,
+                            const struct pipe_box *box)
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
+   struct gex_wgpu_resource *gex_dst = gex_resource(dst);
+   struct gex_wgpu_resource *gex_src = gex_resource(src);
+   if (box->width <= 0)
+      return true;
+   const uint64_t size = (uint64_t)box->width;
+   const uint64_t src_offset = (uint64_t)box->x;
+   const uint64_t dst_offset = (uint64_t)dstx;
+   if (!gex_dst->buffer || !gex_src->buffer ||
+       src_offset + size > gex_src->allocation_size ||
+       dst_offset + size > gex_dst->allocation_size) {
+      fprintf(stderr,
+              "gex-wgpu: buffer copy refused: %u bytes %u -> %u of %u/%u\n",
+              (unsigned)size, (unsigned)src_offset, (unsigned)dst_offset,
+              (unsigned)gex_src->allocation_size,
+              (unsigned)gex_dst->allocation_size);
+      return false;
+   }
+
+   if (((src_offset | dst_offset | size) & 3u) == 0) {
+      WGPUCommandEncoder encoder =
+         wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+      if (!encoder)
+         return false;
+      wgpuCommandEncoderCopyBufferToBuffer(encoder, gex_src->buffer,
+                                           src_offset, gex_dst->buffer,
+                                           dst_offset, size);
+      WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
+      wgpuCommandEncoderRelease(encoder);
+      if (!commands)
+         return false;
+      gex_wgpu_queue_submit(screen, 1, &commands);
+      wgpuCommandBufferRelease(commands);
+      /* The destination's shadow, if it has one, no longer mirrors it. A read
+       * map of a gpu_written buffer skips the shadow and reads the device, so
+       * this is the whole invalidation. */
+      gex_dst->gpu_written = true;
+      return true;
+   }
+
+   const uint8_t *bytes = gex_wgpu_shadow_for_read(pipe, gex_src);
+   if (!bytes)
+      return false;
+   gex_wgpu_buffer_subdata(pipe, dst, PIPE_MAP_WRITE, (unsigned)dst_offset,
+                           (unsigned)size, bytes + src_offset);
+   (void)ctx;
+   return true;
+}
+
 static void
 gex_wgpu_resource_copy_region(struct pipe_context *pipe,
                               struct pipe_resource *dst, unsigned dst_level,
@@ -13571,6 +13768,11 @@ gex_wgpu_resource_copy_region(struct pipe_context *pipe,
           util_format_get_blocksize(src->format)) {
       util_resource_copy_region(pipe, dst, dst_level, dstx, dsty, dstz, src,
                                 src_level, box);
+      return;
+   }
+   if (dst && src && dst->target == PIPE_BUFFER && src->target == PIPE_BUFFER) {
+      if (!gex_wgpu_copy_buffer_region(pipe, dst, dstx, src, box))
+         gex_fail(ctx);
       return;
    }
    if (!gex_wgpu_copy_texture_region(pipe, dst, dst_level, dstx, dsty, dstz,
@@ -13864,11 +14066,32 @@ gex_wgpu_blit_by_transfer(struct pipe_context *pipe,
    struct pipe_transfer *read = NULL, *write = NULL;
    struct pipe_box src_box = info->src.box;
    struct pipe_box dst_box = info->dst.box;
-   const unsigned height = (unsigned)abs(src_box.height);
-   src_box.height = (int)height;
-   dst_box.height = (int)height;
-   if (src_box.height < 0 || dst_box.height < 0)
+   /* A negative height is Gallium's vertical flip, and it means the box runs
+    * *upward* from y: the rows it covers are [y - |height|, y). u_blitter
+    * normalises it as `box.y += box.height; box.height *= -1`, and
+    * gex_wgpu_copy_texture_region does the same by hand -- this path took the
+    * absolute value and left y alone, which moved the whole box off the end
+    * of the texture.
+    *
+    * Minecraft 26.2's frame ends with exactly this blit: its 854x480 render
+    * target flipped onto the window, arriving as y=480, height=-480. Reading
+    * rows 480..959 of a 480-row texture is a WebGPU validation error, which
+    * costs the copy but raises nothing here, so the window presented pure
+    * black at 30 fps with 148 draws a frame behind it and not one refusal in
+    * the log. */
+   if (src_box.height < 0) {
+      src_box.y += src_box.height;
+      src_box.height = -src_box.height;
+   }
+   if (dst_box.height < 0) {
+      dst_box.y += dst_box.height;
+      dst_box.height = -dst_box.height;
+   }
+   if (src_box.y < 0 || dst_box.y < 0)
       return false;
+   const unsigned height = (unsigned)src_box.height;
+   /* same_size holds by the time this is reached, so the two agree. */
+   dst_box.height = (int)height;
    void *src = gex_wgpu_texture_map(pipe, info->src.resource, info->src.level,
                                     PIPE_MAP_READ, &src_box, &read);
    if (!src)
@@ -13907,6 +14130,12 @@ gex_wgpu_blit_by_transfer(struct pipe_context *pipe,
 static void
 gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 {
+   if (gex_wgpu_presented_texture && info && info->dst.resource &&
+       gex_resource(info->dst.resource)->texture ==
+          gex_wgpu_presented_texture)
+      gex_wgpu_presented_note("blit(%dx%d->%dx%d) ",
+                              info->src.box.width, info->src.box.height,
+                              info->dst.box.width, info->dst.box.height);
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
@@ -14147,6 +14376,13 @@ gex_wgpu_clear(struct pipe_context *pipe, unsigned buffers,
          struct pipe_resource *resource = ctx->colors[i];
          if (!resource || !(buffers & (PIPE_CLEAR_COLOR0 << i)))
             continue;
+         if (gex_wgpu_presented_texture &&
+             gex_resource(resource)->texture == gex_wgpu_presented_texture)
+            gex_wgpu_presented_note("clear(%.2f,%.2f,%.2f,%.2f) ",
+                                    color ? color->f[0] : 0.0f,
+                                    color ? color->f[1] : 0.0f,
+                                    color ? color->f[2] : 0.0f,
+                                    color ? color->f[3] : 0.0f);
          /* Four colormask bits per draw buffer; anything but all four is a
           * masked clear. */
          if (((color_clear_mask >> (4 * i)) & 0xf) != 0xf) {
@@ -21397,11 +21633,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       : (info->index_size != 0 && info->index_size != 2 &&
          info->index_size != 4)                     ? "index size"
       : info->primitive_restart                     ? "primitive restart"
-      /* Only an indexed draw has a base vertex. st/mesa leaves index_bias set
-       * from a previous draw on a non-indexed one, where it means nothing --
-       * and refusing on it latched the context, which cost draw_buffers its
-       * case through GL_OUT_OF_MEMORY. */
-      : (info->index_size && draws[0].index_bias != 0) ? "index bias"
+      /* index_bias is *not* a refusal. WebGPU's drawIndexed takes a signed
+       * baseVertex and the call below passes it, so a glDrawElementsBaseVertex
+       * needs nothing more; the guard that used to sit here refused a draw the
+       * code already handled. Minecraft 26.2's terrain is drawn that way, and
+       * the refusal latched the context -- which surfaced two calls later as
+       * "GL_OUT_OF_MEMORY in glMapBufferRange". The rewrite paths above still
+       * fold the bias into a fresh index list, which stays correct. */
       : NULL;
 
    /* A draw of no vertices, or of no instances, is legal in GL and draws
@@ -24197,8 +24435,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             ctx->color_count ? ctx->color_formats[0] : PIPE_FORMAT_NONE);
          if (ctx->color_count && ctx->colors[0] &&
              gex_resource(ctx->colors[0])->texture ==
-                gex_wgpu_presented_texture)
+                gex_wgpu_presented_texture) {
             ++gex_wgpu_draws_to_presented;
+            gex_wgpu_presented_note("draw ");
+         }
          gex_wgpu_cmd_note("drawIndexed count=%u inst=%u first=%u bias=%d",
                            draws[0].count, info->instance_count, first_index,
                            draws[0].index_bias);

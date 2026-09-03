@@ -348,6 +348,76 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
                                      &box, &transfer);
    if (!from) return;
 
+   /* What actually reached the front buffer, as opposed to what the driver
+    * believes it drew. Minecraft 26.2 rendered 148 draws a frame at 30 fps
+    * into a window that screenshotted pure black, and no counter in the
+    * driver could tell "the draws went somewhere else" from "the copy to X
+    * is broken". GEX_WGPU_PRESENT_LOG=1 prints the presented pixels; set it
+    * to a path prefix to also write the first frame and every 300th as a
+    * PPM. */
+   {
+      static int present_log = -1;
+      static const char *prefix;
+      if (present_log < 0) {
+         const char *value = getenv("GEX_WGPU_PRESENT_LOG");
+         present_log = value && *value ? 1 : 0;
+         prefix = value && *value != '1' ? value : NULL;
+      }
+      if (present_log) {
+         static uint64_t seen;
+         const unsigned bpp = util_format_get_blocksize(resource->format);
+         uint64_t sum = 0, nonzero = 0;
+         for (unsigned y = 0; y < resource->height0; ++y) {
+            const uint8_t *row = from + (size_t)y * transfer->stride;
+            for (unsigned x = 0; x < resource->width0 * bpp; ++x) {
+               sum += row[x];
+               nonzero += row[x] != 0;
+            }
+         }
+         const double bytes =
+            (double)resource->width0 * resource->height0 * bpp;
+         if (seen % 30 == 0) {
+            /* Which colour targets the frame's draws actually went to. A
+             * black present with a busy driver is either "the draws landed
+             * elsewhere" or "the copy to X is broken", and the histogram is
+             * what separates them. */
+            extern void gex_wgpu_report_draw_targets(void);
+            gex_wgpu_report_draw_targets();
+         }
+         if (seen % 30 == 0)
+            fprintf(stderr,
+                    "gex-wgpu: present %llu %ux%u fmt=%d stride=%u "
+                    "mean=%.1f nonzero=%.1f%%\n",
+                    (unsigned long long)seen, resource->width0,
+                    resource->height0, (int)resource->format,
+                    transfer->stride, sum / bytes, 100.0 * nonzero / bytes);
+         {
+            extern const char *gex_wgpu_presented_trace_take(void);
+            const char *trace = gex_wgpu_presented_trace_take();
+            if (seen % 30 == 0)
+               fprintf(stderr, "gex-wgpu: on the window this frame: %s\n",
+                       trace[0] ? trace : "nothing");
+         }
+         if (prefix && (seen == 0 || seen % 300 == 0) && bpp == 4) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s-%llu.ppm", prefix,
+                     (unsigned long long)seen);
+            FILE *out = fopen(path, "wb");
+            if (out) {
+               fprintf(out, "P6\n%u %u\n255\n", resource->width0,
+                       resource->height0);
+               for (unsigned y = 0; y < resource->height0; ++y) {
+                  const uint8_t *row = from + (size_t)y * transfer->stride;
+                  for (unsigned x = 0; x < resource->width0; ++x)
+                     fwrite(row + (size_t)x * 4, 1, 3, out);
+               }
+               fclose(out);
+            }
+         }
+         ++seen;
+      }
+   }
+
    uint8_t *to = winsys->displaytarget_map(winsys, state->target,
                                            PIPE_MAP_WRITE);
    if (to) {
@@ -365,6 +435,17 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
    }
    pipe->texture_unmap(pipe, transfer);
    (void)layer;
+
+   /* Name the texture the window is actually made of, so the per-draw
+    * counter that has always been reported as "presented buffer: N" means
+    * something. It was never assigned, so it read 0 whatever happened --
+    * which is indistinguishable from a frame whose draws all went elsewhere,
+    * the exact question Minecraft 26.2 raised. */
+   {
+      extern WGPUTexture gex_wgpu_presented_texture;
+      extern WGPUTexture gex_wgpu_resource_texture(struct pipe_resource *);
+      gex_wgpu_presented_texture = gex_wgpu_resource_texture(resource);
+   }
 
    extern uint64_t gex_wgpu_presents;
    ++gex_wgpu_presents;
