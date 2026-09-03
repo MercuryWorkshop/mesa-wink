@@ -384,6 +384,37 @@ gex_wgpu_storage_texture_format(enum pipe_format format)
  * everything else is one direction at a time. A shader that reads *and*
  * writes any other format cannot be served, and saying so beats a validation
  * error with no GL context attached to it. */
+/* The view dimension a storage texture may have, or Undefined for one WGSL
+ * has no storage texture type for.
+ *
+ * WGSL has exactly four: texture_storage_1d, _2d, _2d_array and _3d. GLSL has
+ * more -- imageCube, imageBuffer, image2DRect, image1DArray, image2DMS -- and
+ * this driver used to map every one of them to 2D in its own tables while
+ * leaving the *shader* declaring the real dimension. The layout and the module
+ * then disagreed, and Tint did not report that: it raised an internal
+ * compiler error building the storage_texture type, which aborts the process
+ * with SIGILL from inside its own destructor, with nothing in the backtrace
+ * naming the image. KHR-GL44.shader_image_load_store dies there on
+ * imageCube, imageBuffer and image1DArray. */
+static WGPUTextureViewDimension
+gex_wgpu_image_view_dimension(enum glsl_sampler_dim dim, bool is_array)
+{
+   switch (dim) {
+   case GLSL_SAMPLER_DIM_1D:
+      return is_array ? WGPUTextureViewDimension_Undefined
+                      : WGPUTextureViewDimension_1D;
+   case GLSL_SAMPLER_DIM_2D:
+      return is_array ? WGPUTextureViewDimension_2DArray
+                      : WGPUTextureViewDimension_2D;
+   case GLSL_SAMPLER_DIM_3D:
+      return is_array ? WGPUTextureViewDimension_Undefined
+                      : WGPUTextureViewDimension_3D;
+   default:
+      /* Cube, buffer, rectangle, multisampled, subpass: none of them. */
+      return WGPUTextureViewDimension_Undefined;
+   }
+}
+
 static bool
 gex_wgpu_storage_format_is_read_write(enum pipe_format format)
 {
@@ -5286,6 +5317,20 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
          }
       }
    }
+   if (getenv("GEX_WGPU_IMAGE_TRACE")) {
+      nir_foreach_variable_with_modes(var, nir, nir_var_image) {
+         const struct glsl_type *t = glsl_without_array(var->type);
+         fprintf(stderr, "gex-imgvar: stage=%u '%s' fmt=%s dim=%u array=%d "
+                 "ms=%d access=%s%s\n", (unsigned)nir->info.stage,
+                 var->name ? var->name : "(anon)",
+                 util_format_short_name(var->data.image.format),
+                 (unsigned)glsl_get_sampler_dim(t),
+                 (int)glsl_sampler_type_is_array(t),
+                 (int)(glsl_get_sampler_dim(t) == GLSL_SAMPLER_DIM_MS),
+                 (var->data.access & ACCESS_NON_READABLE) ? "W" : "",
+                 (var->data.access & ACCESS_NON_WRITEABLE) ? "R" : "");
+      }
+   }
    struct spirv_shader *spirv = nir_to_spirv(nir, &info);
    ralloc_free(nir);
    if (!spirv) {
@@ -6426,6 +6471,25 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          gex_wgpu_set_compile_error(mutable_state, detail);
          return NULL;
       }
+      {
+         const struct glsl_type *image_glsl = glsl_without_array(var->type);
+         if (gex_wgpu_image_view_dimension(
+                glsl_get_sampler_dim(image_glsl),
+                glsl_sampler_type_is_array(image_glsl)) ==
+             WGPUTextureViewDimension_Undefined) {
+            char detail[176];
+            snprintf(detail, sizeof(detail),
+                     "gex_wgpu image '%s' is a shape WGSL has no storage "
+                     "texture for (dim %u%s); only 1d, 2d, 2d array and 3d "
+                     "exist", var->name ? var->name : "(anon)",
+                     (unsigned)glsl_get_sampler_dim(image_glsl),
+                     glsl_sampler_type_is_array(image_glsl) ? " array" : "");
+            ralloc_free(nir);
+            FREE(shader);
+            gex_wgpu_set_compile_error(mutable_state, detail);
+            return NULL;
+         }
+      }
       const unsigned at = shader->image_count;
       shader->image_slots[at] = (uint8_t)var->data.driver_location;
       shader->image_bindings[at] = var->data.binding;
@@ -6435,10 +6499,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
                                           : WGPUStorageTextureAccess_ReadWrite;
       const enum glsl_sampler_dim dim = glsl_get_sampler_dim(type);
       shader->image_dimensions[at] =
-         glsl_sampler_type_is_array(type) ? WGPUTextureViewDimension_2DArray
-         : dim == GLSL_SAMPLER_DIM_3D ? WGPUTextureViewDimension_3D
-         : dim == GLSL_SAMPLER_DIM_1D ? WGPUTextureViewDimension_1D
-                                      : WGPUTextureViewDimension_2D;
+         gex_wgpu_image_view_dimension(dim, glsl_sampler_type_is_array(type));
       ++shader->image_count;
    }
    nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
@@ -14110,11 +14171,17 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
                                            : WGPUStorageTextureAccess_ReadWrite;
       const enum glsl_sampler_dim dim = glsl_get_sampler_dim(image_type);
       compute->image_dimensions[at] =
-         glsl_sampler_type_is_array(image_type)
-            ? WGPUTextureViewDimension_2DArray
-         : dim == GLSL_SAMPLER_DIM_3D ? WGPUTextureViewDimension_3D
-         : dim == GLSL_SAMPLER_DIM_1D ? WGPUTextureViewDimension_1D
-                                      : WGPUTextureViewDimension_2D;
+         gex_wgpu_image_view_dimension(dim,
+                                       glsl_sampler_type_is_array(image_type));
+      if (compute->image_dimensions[at] == WGPUTextureViewDimension_Undefined) {
+         fprintf(stderr, "gex-wgpu: compute image '%s' is a shape WGSL has no "
+                 "storage texture for (dim %u%s); only 1d, 2d, 2d array and "
+                 "3d exist\n", var->name ? var->name : "(anon)", (unsigned)dim,
+                 glsl_sampler_type_is_array(image_type) ? " array" : "");
+         ralloc_free(nir);
+         FREE(compute);
+         return NULL;
+      }
       ++compute->image_count;
    }
 
@@ -26745,6 +26812,25 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * failure: without the support shader, nir_lower_double_ops hits
     * `assert(softfp64 != NULL)` and takes the process with it. */
    caps->doubles = true;
+   /* ARB_gpu_shader_int64, which the software fp64 above cannot do without.
+    * Mesa implements doubles with src/compiler/glsl/float64.glsl, and that
+    * source begins `#extension GL_ARB_gpu_shader_int64 : require` -- it
+    * builds a double out of 64-bit integers. Claiming doubles and not int64
+    * therefore asked Mesa for an emulation it could not compile:
+    *
+    *   fp64 software impl compile failed:
+    *   warning: extension `GL_ARB_gpu_shader_int64' unsupported in vertex shader
+    *   error: syntax error, unexpected NEW_IDENTIFIER, expecting end of file
+    *
+    * and Mesa cloned the null shader before checking, so it arrived as a
+    * segmentation fault inside nir_shader_clone with nothing naming fp64 in
+    * the backtrace. KHR-GL44.vertex_attrib_binding crashed there.
+    *
+    * The claim is honest: lower_int64_options below asks for every 64-bit
+    * integer operation to be expanded into 32-bit pairs, which is exactly
+    * what a driver with no native int64 does, and it is the same machinery
+    * the fp64 lowering then runs on. */
+   caps->int64 = true;
    /* ARB_sample_shading. The rate is the shader's business in WebGPU (see
     * gex_wgpu_set_min_samples), gl_SampleID and gl_SampleMask reach WGSL as
     * @builtin(sample_index) and @builtin(sample_mask) through the emitter's

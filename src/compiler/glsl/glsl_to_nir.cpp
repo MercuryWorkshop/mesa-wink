@@ -2970,9 +2970,14 @@ glsl_float64_funcs_to_nir(struct gl_context *ctx,
    sh->Source = float64_source;
    sh->CompileStatus = COMPILE_FAILURE;
    _mesa_glsl_compile_shader(ctx, sh, NULL, false, false, true);
-   nir_shader *nir = nir_shader_clone(NULL, sh->nir);
 
-   if (!sh->CompileStatus) {
+   /* Report the failure *before* touching sh->nir, which a failed compile
+    * leaves null: cloning it first turns a diagnosable "the built-in fp64
+    * source did not compile for this driver's GLSL environment" into a
+    * segmentation fault inside nir_shader_clone, several frames from
+    * anything that names fp64. KHR-GL44.vertex_attrib_binding crashed there
+    * on the gex_wgpu driver, which is how this was found. */
+   if (!sh->CompileStatus || !sh->nir) {
       if (sh->InfoLog) {
          _mesa_problem(ctx,
                        "fp64 software impl compile failed:\n%s\nsource:\n%s\n",
@@ -2980,6 +2985,7 @@ glsl_float64_funcs_to_nir(struct gl_context *ctx,
       }
       return NULL;
    }
+   nir_shader *nir = nir_shader_clone(NULL, sh->nir);
 
    /* _mesa_delete_shader will try to free sh->Source but it's static const */
    sh->Source = NULL;
