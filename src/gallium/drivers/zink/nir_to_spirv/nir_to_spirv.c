@@ -1000,6 +1000,25 @@ emit_input(struct ntv_context *ctx, struct nir_variable *var)
          spirv_builder_emit_location(&ctx->builder, var_id,
                                      var->data.driver_location);
       }
+      /* Centroid and sample on an *output* as well as on a fragment input.
+       * Vulkan tolerates the two stages disagreeing, so this had never been
+       * needed; WebGPU does not, and rejects the pipeline outright --
+       *
+       *   The interpolation sampling (Center) of the vertex output at
+       *   location 0 is different from the interpolation sampling (Centroid)
+       *   of the fragment input at location 0
+       *
+       * -- which invalidates the command buffer and loses every draw batched
+       * with it. GL only puts the qualifier on the fragment input, so the
+       * gex_wgpu driver copies it onto the vertex output in the variant it
+       * already builds to make the interpolation modes agree; without this
+       * the copy had nothing to travel on. */
+      if (var->data.centroid)
+         spirv_builder_emit_decoration(&ctx->builder, var_id,
+                                       SpvDecorationCentroid);
+      else if (var->data.sample)
+         spirv_builder_emit_decoration(&ctx->builder, var_id,
+                                       SpvDecorationSample);
    }
 
    if (var->data.location_frac)

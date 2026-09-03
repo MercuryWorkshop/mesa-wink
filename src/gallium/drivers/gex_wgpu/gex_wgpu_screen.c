@@ -1213,6 +1213,9 @@ struct gex_wgpu_shader {
     * fragment stage's qualifier as the meaning, so the vertex stage is
     * rewritten to match -- see gex_wgpu_interp_variant_get. */
    uint8_t varying_interp[GEX_WGPU_MAX_VARYING_LOCATIONS];
+   /* Bit 0 centroid, bit 1 sample, which the interpolation mode does not
+    * carry and which WebGPU requires both stages to agree on. */
+   uint8_t varying_aux[GEX_WGPU_MAX_VARYING_LOCATIONS];
    /* How many components each varying has, for the same reason and with the
     * same asymmetry: WGSL requires a vertex output and the fragment input it
     * feeds to be the same width, and GLSL does not. A fragment shader that
@@ -1225,6 +1228,7 @@ struct gex_wgpu_shader {
 
 struct gex_wgpu_interp_variant {
    uint8_t interp[GEX_WGPU_MAX_VARYING_LOCATIONS];
+   uint8_t aux[GEX_WGPU_MAX_VARYING_LOCATIONS];
    /* The fragment stage's varying widths this module was reshaped to. */
    uint8_t components[GEX_WGPU_MAX_VARYING_LOCATIONS];
    /* Sampler state this variant's texture lowering was built against, for a
@@ -6292,6 +6296,21 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
             continue;
          shader->varying_interp[var->data.location] =
             (uint8_t)var->data.interpolation;
+         /* Centroid and sample are *not* part of the interpolation mode --
+          * they are separate bits on the variable -- and WebGPU insists the
+          * two stages agree on them as much as on the mode:
+          *
+          *   The interpolation sampling (Center) of the vertex output at
+          *   location 0 is different from the interpolation sampling
+          *   (Centroid) of the fragment input at location 0
+          *
+          * GL puts the qualifier on the *fragment* input alone, so a vertex
+          * shader never carries it and every `centroid in` mismatched. An
+          * invalid render pipeline invalidates the command buffer, so the
+          * draw and everything batched with it was lost. */
+         shader->varying_aux[var->data.location] =
+            (uint8_t)((var->data.centroid ? 1u : 0u) |
+                      (var->data.sample ? 2u : 0u));
          shader->varying_components[var->data.location] =
             (uint8_t)glsl_get_vector_elements(type);
          shader->varying_interp_mask |= 1ull << var->data.location;
@@ -20890,10 +20909,25 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
 
    const uint64_t fs_mask = fs ? fs->varying_interp_mask : 0;
    const uint64_t shared = vs->varying_interp_mask & fs_mask;
+   if (getenv("GEX_WGPU_INTERP_TRACE")) {
+      static unsigned told;
+      if (told < 8) {
+         ++told;
+         fprintf(stderr, "gex-interp: vs_mask=%llx fs_mask=%llx shared=%llx "
+                 "orig_nir=%d vs_aux0=%u fs_aux0=%u\n",
+                 (unsigned long long)vs->varying_interp_mask,
+                 (unsigned long long)fs_mask, (unsigned long long)shared,
+                 (int)(vs->original_nir != NULL),
+                 shared ? vs->varying_aux[ffsll((long long)shared) - 1] : 99u,
+                 (fs && shared)
+                    ? fs->varying_aux[ffsll((long long)shared) - 1] : 99u);
+      }
+   }
    bool differs = false;
    for (unsigned i = 0; i < GEX_WGPU_MAX_VARYING_LOCATIONS; ++i)
       if ((shared & (1ull << i)) &&
           (vs->varying_interp[i] != fs->varying_interp[i] ||
+           vs->varying_aux[i] != fs->varying_aux[i] ||
            vs->varying_components[i] != fs->varying_components[i]))
          differs = true;
    if (!differs && !fold_viewport && !unpack_attribs && !lower_textures &&
@@ -20903,6 +20937,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    const float none[4] = {0.0f, 0.0f, 0.0f, 0.0f};
    const float *want = fold_viewport ? viewport : none;
    const uint8_t *want_interp = fs ? fs->varying_interp : NULL;
+   const uint8_t *want_aux = fs ? fs->varying_aux : NULL;
    const uint8_t *want_components = fs ? fs->varying_components : NULL;
    uint8_t want_buftex[GEX_WGPU_MAX_BUFFER_TEXTURES];
    gex_wgpu_buftex_words(vs, ctx->vertex_sampler_views, want_buftex);
@@ -20916,7 +20951,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
                    memcmp(v->attrib_unpack, want_unpack,
                           sizeof(v->attrib_unpack)) == 0 &&
                    (!want_interp ||
-                    memcmp(v->interp, want_interp, sizeof(v->interp)) == 0) &&
+                    (memcmp(v->interp, want_interp, sizeof(v->interp)) == 0 &&
+                     memcmp(v->aux, want_aux, sizeof(v->aux)) == 0)) &&
                    (!want_components ||
                     memcmp(v->components, want_components,
                            sizeof(v->components)) == 0);
@@ -20965,8 +21001,10 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
          variant->swizzles[slot][channel] = gex_wgpu_effective_view_swizzle(
             ctx->vertex_sampler_views[slot], channel);
    }
-   if (want_interp)
+   if (want_interp) {
       memcpy(variant->interp, want_interp, sizeof(variant->interp));
+      memcpy(variant->aux, want_aux, sizeof(variant->aux));
+   }
    if (want_components)
       memcpy(variant->components, want_components,
              sizeof(variant->components));
@@ -20981,6 +21019,10 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
                 !(fs->varying_interp_mask & (1ull << var->data.location)))
                continue;
             var->data.interpolation = fs->varying_interp[var->data.location];
+            var->data.centroid =
+               (fs->varying_aux[var->data.location] & 1u) != 0;
+            var->data.sample =
+               (fs->varying_aux[var->data.location] & 2u) != 0;
          }
          /* Only the locations the fragment stage actually reads; a zero
           * leaves the output alone, which is what an output it does not
