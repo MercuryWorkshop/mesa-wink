@@ -25703,9 +25703,12 @@ gex_wgpu_screen_create(WGPUDevice device)
     * a capability shortfall to be inferred from a missing extension. */
    fprintf(stderr,
            "gex-wgpu: device limits%s uniform/stage %u storage/vertex %u "
-           "storage/stage %u\n", got_limits ? "" : " (query failed)",
+           "storage/stage %u tex2d %u tex3d %u layers %u\n",
+           got_limits ? "" : " (query failed)",
            screen->max_uniform_buffers, screen->max_storage_buffers_vertex,
-           limits.maxStorageBuffersPerShaderStage);
+           limits.maxStorageBuffersPerShaderStage,
+           screen->max_texture_2d, screen->max_texture_3d,
+           screen->max_texture_layers);
    /* The compute limits, reported because they decide a GL capability that
     * cannot be inferred from anything else: st_extensions gates
     * ARB_compute_shader behind max_threads_per_block >= 1024, and WebGPU's
