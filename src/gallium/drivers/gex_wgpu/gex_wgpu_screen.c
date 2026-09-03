@@ -2089,6 +2089,16 @@ gex_wgpu_ssbo_block(nir_shader *nir, unsigned slot)
           var->data.driver_location == slot)
          return var;
    }
+   if (getenv("GEX_WGPU_SSBO_LOG")) {
+      fprintf(stderr, "gex-ssbovar: no block for slot=%u (num_ssbos=%u); "
+              "variables:\n", slot, nir->info.num_ssbos);
+      nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo)
+         fprintf(stderr, "gex-ssbovar:   '%s' loc=%u binding=%u iface=%s "
+                 "type='%s'\n", var->name ? var->name : "(anon)",
+                 var->data.driver_location, var->data.binding,
+                 var->interface_type ? "yes" : "no",
+                 glsl_get_type_name(var->type));
+   }
    return NULL;
 }
 
