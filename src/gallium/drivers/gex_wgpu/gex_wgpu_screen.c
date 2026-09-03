@@ -24434,6 +24434,36 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          color_view.baseArrayLayer = ctx->color_layers[i];
          color_view.arrayLayerCount = 1;
       }
+      /* A view whose format is not storage-compatible is rejected on a
+       * texture that carries StorageBinding usage, and wgpuTextureCreateView
+       * hands back a non-null *invalid* view rather than NULL -- so
+       * missing_view cannot see it and the entire pass is dropped with
+       * nothing said. The same rule cost a whole pass to find on the sampler
+       * side, where it presented as a black quad; see the StorageBinding note
+       * in gex_wgpu_create_sampler_view.
+       *
+       * Reaching it here needs a *linear* storage-capable texture given an
+       * sRGB surface, which is what st/mesa does to force encoding on a blit
+       * destination (an sRGB texture is not storage-capable, so it never
+       * carries the usage and viewing it linearly is always fine). No probe
+       * in the suite reaches it and no browser run has produced the
+       * validation line, so this names itself rather than growing the
+       * scratch-copy machinery the sampler side needed. */
+      if (ctx->color_formats[i] != ctx->colors[i]->format &&
+          (gex_resource(ctx->colors[i])->texture_usage &
+           WGPUTextureUsage_StorageBinding) &&
+          gex_wgpu_storage_texture_format(ctx->color_formats[i]) ==
+             WGPUTextureFormat_Undefined) {
+         static bool said = false;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: colour target %u wants a %s view of a "
+                    "%s texture carrying storage usage; WebGPU refuses that "
+                    "view and the pass will be dropped\n", i,
+                    util_format_short_name(ctx->color_formats[i]),
+                    util_format_short_name(ctx->colors[i]->format));
+         }
+      }
       views[i] = wgpuTextureCreateView(
          gex_resource(ctx->colors[i])->texture, &color_view);
       missing_view |= !views[i];
