@@ -1732,6 +1732,64 @@ gex_wgpu_lower_ubo_load(nir_builder *b, nir_instr *instr, void *data)
          }
       }
    }
+   /* An *array* of uniform blocks is one variable covering a run of slots.
+    * `uniform InputBuffer { ... } g_in_buffer[12]` gives Gallium twelve
+    * constant buffers -- one per element, since each is bound separately --
+    * and NIR a single variable at the first of them, whose type is the
+    * *element* struct with no array left in it. So there is no length to read
+    * anywhere, and an exact match finds nothing for the other eleven:
+    * KHR-GL44.compute_shader.resource-ubo declares exactly that and refused
+    * the shader on its load of slot 2.
+    *
+    * The block whose driver_location is the greatest one at or below the slot
+    * is the one that owns it, which needs no length and stays right when a
+    * shader has several arrays: with blocks at 1 and 5, slot 6 belongs to the
+    * one at 5. Every element of an array shares the element layout, so the
+    * offset arithmetic below is the same for all of them -- which is why one
+    * variable can answer for the whole run. */
+   /* Bounded by what the shader says it has: a slot at or above num_ubos is
+    * not an array element, it is a load this driver cannot account for, and
+    * that stays a named refusal. Without the bound the search below would
+    * answer *every* slot with the nearest block and read the wrong buffer
+    * silently, which is worse than the refusal it replaced. */
+   if (!block && slot < b->shader->info.num_ubos) {
+      nir_foreach_variable_with_modes(var, b->shader, nir_var_mem_ubo) {
+         if (var->data.driver_location <= slot &&
+             (!block || var->data.driver_location > block->data.driver_location))
+            block = var;
+      }
+      /* Found by range, so this load is a *different element* of the array
+       * than the variable represents -- and each element is its own bound
+       * buffer, so it needs a variable of its own or every element would
+       * deref the first one's binding and read the first one's data. Silently:
+       * that is what the range match alone produced.
+       *
+       * Only driver_location has to be right. The fixup after this pass reads
+       * it to assign the descriptor set and the binding, including the spill
+       * to a storage binding for slots above the device's uniform-buffer
+       * count -- which this case needs, since twelve blocks plus the default
+       * one is more than the twelve WebGPU guarantees. */
+      if (block && block->data.driver_location != slot) {
+         char name[96];
+         snprintf(name, sizeof(name), "%s_element%u",
+                  block->name ? block->name : "ubo", slot);
+         nir_variable *element =
+            nir_variable_create(b->shader, nir_var_mem_ubo,
+                                block->interface_type, name);
+         if (!element) {
+            state->failed = true;
+            if (!state->why[0])
+               snprintf(state->why, sizeof(state->why),
+                        "load_ubo slot=%u needs a block variable and one "
+                        "could not be made", slot);
+            return false;
+         }
+         element->interface_type = block->interface_type;
+         element->data.driver_location = slot;
+         element->data.binding = slot;
+         block = element;
+      }
+   }
    if (!block || !block->interface_type ||
        !glsl_type_is_interface(block->interface_type) ||
        glsl_get_length(block->interface_type) != 1) {
@@ -1743,6 +1801,25 @@ gex_wgpu_lower_ubo_load(nir_builder *b, nir_instr *instr, void *data)
                   block && block->interface_type ? "yes" : "no",
                   block && block->interface_type
                      ? (int)glsl_get_length(block->interface_type) : -1);
+      if (getenv("GEX_WGPU_UBO_TRACE")) {
+         fprintf(stderr, "gex-ubo: stage=%u trust=%d wanted slot=%u; "
+                 "variables:\n", (unsigned)b->shader->info.stage,
+                 (int)state->trust_driver_location, slot);
+         nir_foreach_variable_with_modes(var, b->shader, nir_var_mem_ubo)
+            fprintf(stderr, "gex-ubo:   '%s' loc=%u binding=%u iface=%s "
+                    "fields=%d type='%s' array=%d len=%u ifacetype='%s'\n",
+                    var->name ? var->name : "(anon)",
+                    var->data.driver_location, var->data.binding,
+                    var->interface_type ? "yes" : "no",
+                    var->interface_type
+                       ? (int)glsl_get_length(var->interface_type) : -1,
+                    glsl_get_type_name(var->type),
+                    (int)glsl_type_is_array(var->type),
+                    glsl_type_is_array(var->type)
+                       ? glsl_get_length(var->type) : 0u,
+                    var->interface_type
+                       ? glsl_get_type_name(var->interface_type) : "(none)");
+      }
       return false;
    }
    const struct glsl_type *values =
@@ -4277,10 +4354,52 @@ gex_wgpu_narrow_barrier_instr(nir_builder *b, nir_intrinsic_instr *intr,
       !modes ? (nir_var_mem_shared | nir_var_mem_ssbo | nir_var_image)
              : ((modes & ~nir_var_mem_global) |
                 ((modes & nir_var_mem_global) ? nir_var_mem_ssbo : 0));
-   if (wanted == modes)
-      return false;
-   nir_intrinsic_set_memory_modes(intr, wanted);
-   return true;
+   bool progress = false;
+   if (wanted != modes) {
+      nir_intrinsic_set_memory_modes(intr, wanted);
+      progress = true;
+   }
+   /* A barrier with no *execution* scope is GLSL's memoryBarrier() family,
+    * which zink emits as OpMemoryBarrier -- and Tint's SPIR-V reader does not
+    * implement that instruction at all:
+    *
+    *   error: unhandled instruction with opcode 225: OpMemoryBarrier
+    *
+    * WGSL has no standalone memory barrier; storageBarrier() and
+    * workgroupBarrier() are control barriers. Giving the barrier the workgroup
+    * execution scope makes zink emit OpControlBarrier instead, which Tint
+    * takes -- and a control barrier is *stronger* than the memory barrier it
+    * replaces, so the ordering the shader asked for still holds.
+    *
+    * Only in compute: WGSL has no barrier of any kind in the other stages, so
+    * one there stays a named refusal rather than becoming an illegal module.
+    * Three of KHR-GL44.compute_shader's shaders are rejected for this. */
+   if (b->shader->info.stage == MESA_SHADER_COMPUTE &&
+       nir_intrinsic_execution_scope(intr) == SCOPE_NONE) {
+      nir_intrinsic_set_execution_scope(intr, SCOPE_WORKGROUP);
+      progress = true;
+   }
+   /* And the *memory* scope has to be the workgroup as well:
+    *
+    *   error: storageBarrier requires workgroup memory scope
+    *
+    * GLSL's memoryBarrierBuffer() asks for device scope, and WGSL has no
+    * barrier of any scope wider than a workgroup -- storageBarrier() and
+    * workgroupBarrier() are both workgroup-scoped. So the widest thing
+    * available is taken. That is weaker than what the shader wrote, and it is
+    * the same ceiling as the cross-workgroup semantics folded away above:
+    * nothing here can order writes between workgroups, because WebGPU has no
+    * way to express it. Within a workgroup -- which is what a compute shader's
+    * shared memory and its own storage writes need -- it is exact. */
+   if (b->shader->info.stage == MESA_SHADER_COMPUTE &&
+       nir_intrinsic_memory_scope(intr) != SCOPE_NONE &&
+       nir_intrinsic_memory_scope(intr) != SCOPE_WORKGROUP &&
+       nir_intrinsic_memory_scope(intr) != SCOPE_SUBGROUP &&
+       nir_intrinsic_memory_scope(intr) != SCOPE_INVOCATION) {
+      nir_intrinsic_set_memory_scope(intr, SCOPE_WORKGROUP);
+      progress = true;
+   }
+   return progress;
 }
 
 static bool
