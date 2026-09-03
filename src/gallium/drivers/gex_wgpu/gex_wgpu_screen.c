@@ -672,6 +672,15 @@ struct gex_wgpu_resource {
     * it -- see the StorageBinding note in gex_wgpu_create_sampler_view -- and
     * the descriptor is not readable back from the object. */
    WGPUTextureUsage texture_usage;
+   /* A render target in another format, for a surface that reinterprets this
+    * texture's format; see gex_wgpu_color_needs_scratch. One level of one
+    * layer, with a staging buffer to move the bytes either way. */
+   WGPUTexture rt_scratch;
+   WGPUBuffer rt_scratch_staging;
+   enum pipe_format rt_scratch_format;
+   unsigned rt_scratch_level;
+   uint32_t rt_scratch_width, rt_scratch_height, rt_scratch_row_bytes;
+   uint64_t rt_scratch_bytes;
 };
 
 struct gex_wgpu_query;
@@ -2278,9 +2287,28 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
     *
     * Done *before* the spill, because after it a spilled uniform block is
     * indistinguishable from a storage block by mode alone. */
+   unsigned ssbo_index = 0;
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
+      /* st/mesa binds storage buffers at consecutive slots in block-index
+       * order -- set_shader_buffers(stage, 0, num_ssbos, ...) -- so the slot
+       * is the block index, which Mesa leaves in driver_location.
+       *
+       * It does not always fill it in. The *fragment* halves of Blender's
+       * shaders arrive with driver_location = UINT_MAX while their vertex
+       * halves carry 0, 1, 2, and the fallback here took var->data.binding
+       * instead: the GLSL `binding =` qualifier, which Blender numbers 0, 1
+       * and 7. So its third storage block was looked for at slot 7 while st
+       * had bound it at slot 2. The block read the zero placeholder, every
+       * glyph it positioned collapsed to a degenerate quad, and half of
+       * Blender's labels lost their leading characters with nothing reported
+       * anywhere -- the placeholder exists precisely so that reads a driver
+       * cannot satisfy return zeros instead of failing.
+       *
+       * The enumeration order of the variable list *is* the block order: the
+       * vertex halves, which do carry driver_location, agree with it. */
       const unsigned slot = var->data.driver_location == UINT_MAX
-         ? var->data.binding : var->data.driver_location;
+         ? ssbo_index : var->data.driver_location;
+      ++ssbo_index;
       if (slot >= GEX_WGPU_MAX_SHADER_BUFFERS) {
          if (why)
             snprintf(why, why_len, "ssbo block slot=%u above max=%u", slot,
@@ -2515,6 +2543,18 @@ gex_wgpu_device_unguard(struct gex_wgpu_device_guard *guard)
 static void gex_wgpu_track_persistent_map(struct gex_wgpu_context *ctx,
                                           struct pipe_resource *resource,
                                           bool add);
+/* Defined next to the sampler-view reinterpretation they share their
+ * reasoning with; used by the clear paths, which come first. */
+static bool gex_wgpu_color_needs_scratch(enum pipe_format surface_format,
+                                         struct pipe_resource *texture);
+static WGPUTexture gex_wgpu_rt_scratch_ensure(struct gex_wgpu_context *ctx,
+                                              struct pipe_resource *resource,
+                                              enum pipe_format format,
+                                              unsigned level);
+static void gex_wgpu_rt_scratch_copy(struct gex_wgpu_context *ctx,
+                                     struct pipe_resource *resource,
+                                     unsigned layer, bool into_scratch);
+
 static void gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx,
                                           const char *why);
 static void gex_wgpu_end_pass(struct gex_wgpu_context *ctx);
@@ -7153,6 +7193,17 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
     * rasterizer state, which lost culling and the scissor as well as the
     * stipple. Four of the installed GL programs ask for it. */
    supported.poly_stipple_enable = state->poly_stipple_enable;
+   /* glEnable(GL_POLYGON_SMOOTH): coverage-based antialiasing of polygon
+    * edges. WebGPU has no equivalent -- multisampling is the modern answer
+    * and st/mesa does not turn one into the other -- so this is ignored
+    * rather than honoured, and the polygon is drawn with hard edges.
+    *
+    * Ignoring beats refusing by a long way here. A refused rasterizer state
+    * binds as NULL, which reads as no culling and no scissor, and Blender
+    * enables polygon smoothing while drawing its interface: every draw after
+    * that point was lost, so its window froze on a half-painted frame with
+    * no viewport, no grid and half its labels missing. */
+   supported.poly_smooth = state->poly_smooth;
    /* A refused rasterizer state binds as NULL, and a NULL one reads as every
     * default -- no scissor, no culling, and no rasterizer discard. That is
     * silent and wrong rather than loud and wrong, so say which field did it.
@@ -9721,6 +9772,10 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
    struct gex_wgpu_resource *gex = gex_resource(resource);
    if (gex->texture)
       wgpuTextureRelease(gex->texture);
+   if (gex->rt_scratch)
+      wgpuTextureRelease(gex->rt_scratch);
+   if (gex->rt_scratch_staging)
+      wgpuBufferRelease(gex->rt_scratch_staging);
    if (gex->buffer)
       wgpuBufferRelease(gex->buffer);
    if (gex->shadow) {
@@ -12408,8 +12463,10 @@ gex_wgpu_transfer_flush_region(struct pipe_context *pipe,
    struct gex_wgpu_resource *gex = gex_resource(resource);
    struct gex_wgpu_transfer *gex_transfer =
       (struct gex_wgpu_transfer *)transfer;
-   if (ctx->failed || resource->target != PIPE_BUFFER || !gex->buffer ||
-       box->width <= 0)
+   /* Not gated on ctx->failed, for the reason in gex_wgpu_buffer_map: an
+    * upload the application believes it made is lost for the rest of the
+    * run. */
+   if (resource->target != PIPE_BUFFER || !gex->buffer || box->width <= 0)
       return;
 
    /* A staged write map has no shadow: the bytes live in the block handed to
@@ -12668,8 +12725,26 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
       clear_view.baseArrayLayer = dst->first_layer;
       clear_view.arrayLayerCount = 1;
    }
+   /* Into the scratch, when the surface reinterprets the format: draws go
+    * there, so clearing the texture instead would be undone by the copy back
+    * at the next submit. The scratch's own format is the surface's, which is
+    * also what makes the clear value land under the right interpretation.
+    * See gex_wgpu_color_needs_scratch. */
+   const bool clear_scratch =
+      gex_wgpu_color_needs_scratch(dst->format, resource) &&
+      gex_wgpu_rt_scratch_ensure(ctx, resource, dst->format, level) != NULL;
+   if (clear_scratch) {
+      clear_view.baseMipLevel = 0;
+      clear_view.mipLevelCount = 1;
+      if (!clear_three_d) {
+         clear_view.baseArrayLayer = 0;
+         clear_view.arrayLayerCount = 1;
+      }
+   }
    WGPUTextureView view =
-      wgpuTextureCreateView(gex_resource(resource)->texture, &clear_view);
+      wgpuTextureCreateView(clear_scratch ? gex_resource(resource)->rt_scratch
+                                          : gex_resource(resource)->texture,
+                            &clear_view);
    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(screen->device, NULL);
    if (!view || !encoder) {
       if (view) wgpuTextureViewRelease(view);
@@ -12725,6 +12800,10 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
    }
    gex_wgpu_queue_submit(screen, 1, &command);
    wgpuCommandBufferRelease(command);
+   /* This surface may not be the bound framebuffer's, in which case no submit
+    * would ever copy the cleared bytes out of the scratch. */
+   if (clear_scratch)
+      gex_wgpu_rt_scratch_copy(ctx, resource, dst->first_layer, false);
 }
 
 static void
@@ -13784,7 +13863,17 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
             return;
          }
          offset = 0;
-         size = 0;
+         /* The placeholder's whole extent, not zero: WebGPU reads an explicit
+          * size of 0 as a zero-byte binding and rejects it --
+          *
+          *   Binding size for [Buffer (unlabeled)] is zero.
+          *   While validating entries[1] as a Buffer.
+          *
+          * -- which makes the bind group invalid, then the command buffer,
+          * then the whole submit. Every draw batched with it is lost, and
+          * because an invalid object is non-null nothing here notices. It
+          * cost Blender its viewport contents and scattered labels. */
+         size = ctx->placeholder_storage->width0;
       } else {
          wgpu_buffer = gex_resource(buffer)->buffer;
       }
@@ -14026,6 +14115,157 @@ gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
    gex_wgpu_queue_submit(screen, 1, &commands);
    wgpuCommandBufferRelease(commands);
    view->reinterpret_serial = source->write_serial;
+}
+
+/* ---- A colour target whose surface format is not the texture's ----
+ *
+ * GL attaches a texture through a *surface* that may name another format, and
+ * applications use that in earnest: Blender renders object ids as r16_uint
+ * into an r16_float texture, and two more of its targets reinterpret across a
+ * format class as well. WebGPU has no view across a class, so there is
+ * nothing to attach.
+ *
+ * The bytes are the same, though. Every pair asked for here is equal in bytes
+ * per texel, and a copy through a buffer is format-agnostic -- the same
+ * reasoning the cross-class sampler views rest on. So the pass renders into a
+ * scratch texture of the *surface's* format; the texture's bytes are copied
+ * in when the framebuffer is bound, and the scratch's bytes are copied back
+ * at every submit.
+ *
+ * This used to latch the context, which stopped every draw that came after:
+ * Blender's window froze on a half-painted frame with no viewport and half
+ * its labels missing their glyphs. Dropping the attachment instead was tried
+ * and segfaulted, because an application that reinterprets three of its
+ * targets has nothing left to draw into.
+ */
+static bool
+gex_wgpu_color_needs_scratch(enum pipe_format surface_format,
+                             struct pipe_resource *texture)
+{
+   if (!texture || surface_format == texture->format)
+      return false;
+   /* A copy through a buffer preserves bytes, not texels: an unequal texel
+    * size is a different picture, and stays refused. */
+   if (util_format_get_blocksize(surface_format) !=
+       util_format_get_blocksize(texture->format))
+      return false;
+   if (util_format_linear(surface_format) !=
+       util_format_linear(texture->format))
+      return true;
+   /* Same class, so the counterpart resource_create declared in viewFormats
+    * covers it -- unless the texture carries storage usage, which no sRGB
+    * format is compatible with. */
+   return (gex_resource(texture)->texture_usage &
+              WGPUTextureUsage_StorageBinding) &&
+          gex_wgpu_storage_texture_format(surface_format) ==
+             WGPUTextureFormat_Undefined;
+}
+
+static WGPUTexture
+gex_wgpu_rt_scratch_ensure(struct gex_wgpu_context *ctx,
+                           struct pipe_resource *resource,
+                           enum pipe_format format, unsigned level)
+{
+   struct gex_wgpu_resource *gex = gex_resource(resource);
+   const uint32_t width = u_minify(resource->width0, level);
+   const uint32_t height = u_minify(resource->height0, level);
+   if (gex->rt_scratch && gex->rt_scratch_format == format &&
+       gex->rt_scratch_level == level &&
+       gex->rt_scratch_width == width && gex->rt_scratch_height == height)
+      return gex->rt_scratch;
+   if (gex->rt_scratch)
+      wgpuTextureRelease(gex->rt_scratch);
+   if (gex->rt_scratch_staging)
+      wgpuBufferRelease(gex->rt_scratch_staging);
+   gex->rt_scratch = NULL;
+   gex->rt_scratch_staging = NULL;
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+   desc.dimension = WGPUTextureDimension_2D;
+   desc.size = (WGPUExtent3D){width, height, 1};
+   desc.format = gex_wgpu_texture_format(format);
+   desc.mipLevelCount = 1;
+   desc.sampleCount = 1;
+   /* No StorageBinding: it would forbid an sRGB scratch, which is one of the
+    * cases this exists to serve. */
+   desc.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc |
+                WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding;
+   gex->rt_scratch = wgpuDeviceCreateTexture(screen->device, &desc);
+   /* copyTextureToBuffer wants a 256-byte row pitch. */
+   gex->rt_scratch_row_bytes =
+      ALIGN_POT(width * util_format_get_blocksize(format), 256u);
+   gex->rt_scratch_bytes = (uint64_t)gex->rt_scratch_row_bytes * height;
+   WGPUBufferDescriptor staging_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+   staging_desc.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+   staging_desc.size = gex->rt_scratch_bytes;
+   gex->rt_scratch_staging =
+      wgpuDeviceCreateBuffer(screen->device, &staging_desc);
+   if (!gex->rt_scratch || !gex->rt_scratch_staging) {
+      if (gex->rt_scratch)
+         wgpuTextureRelease(gex->rt_scratch);
+      if (gex->rt_scratch_staging)
+         wgpuBufferRelease(gex->rt_scratch_staging);
+      gex->rt_scratch = NULL;
+      gex->rt_scratch_staging = NULL;
+      return NULL;
+   }
+   gex->rt_scratch_format = format;
+   gex->rt_scratch_level = level;
+   gex->rt_scratch_width = width;
+   gex->rt_scratch_height = height;
+   return gex->rt_scratch;
+}
+
+/* Moves one level of one layer between the texture and its scratch. The two
+ * are equal in bytes per texel, so the buffer in between needs no conversion.
+ * Recorded on its own command buffer and submitted, which is what orders it:
+ * the caller submits the work that produced the bytes first. */
+static void
+gex_wgpu_rt_scratch_copy(struct gex_wgpu_context *ctx,
+                         struct pipe_resource *resource, unsigned layer,
+                         bool into_scratch)
+{
+   struct gex_wgpu_resource *gex = gex_resource(resource);
+   if (!gex->texture || !gex->rt_scratch || !gex->rt_scratch_staging)
+      return;
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   WGPUCommandEncoder encoder =
+      wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+   if (!encoder)
+      return;
+   WGPUTexelCopyTextureInfo real = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+   real.texture = gex->texture;
+   real.mipLevel = gex->rt_scratch_level;
+   real.origin = (WGPUOrigin3D){0, 0, layer};
+   real.aspect = WGPUTextureAspect_All;
+   WGPUTexelCopyTextureInfo scratch = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+   scratch.texture = gex->rt_scratch;
+   scratch.mipLevel = 0;
+   scratch.origin = (WGPUOrigin3D){0, 0, 0};
+   scratch.aspect = WGPUTextureAspect_All;
+   WGPUTexelCopyBufferInfo staging = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+   staging.buffer = gex->rt_scratch_staging;
+   staging.layout.offset = 0;
+   staging.layout.bytesPerRow = gex->rt_scratch_row_bytes;
+   staging.layout.rowsPerImage = gex->rt_scratch_height;
+   const WGPUExtent3D extent = {gex->rt_scratch_width,
+                                gex->rt_scratch_height, 1};
+   wgpuCommandEncoderCopyTextureToBuffer(
+      encoder, into_scratch ? &real : &scratch, &staging, &extent);
+   wgpuCommandEncoderCopyBufferToTexture(
+      encoder, &staging, into_scratch ? &scratch : &real, &extent);
+   WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
+   wgpuCommandEncoderRelease(encoder);
+   if (!commands)
+      return;
+   gex_wgpu_queue_submit(screen, 1, &commands);
+   wgpuCommandBufferRelease(commands);
+   if (!into_scratch) {
+      /* The texture has new bytes, so a reinterpreting sampler view of it
+       * has to copy them again. */
+      gex->texture_written = true;
+      gex->write_serial++;
+   }
 }
 
 static void
@@ -15154,6 +15394,16 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
 {
    GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   /* A colour target rendered through a scratch texture is copied back at
+    * submit, and that reads ctx->colors -- so anything still pending for the
+    * *outgoing* framebuffer has to be submitted while those still name it. */
+   for (unsigned i = 0; i < ctx->color_count; ++i) {
+      if (ctx->colors[i] &&
+          gex_wgpu_color_needs_scratch(ctx->color_formats[i], ctx->colors[i])) {
+         gex_wgpu_submit_pending(ctx);
+         break;
+      }
+   }
    /* Kept whole for u_blitter, as above. */
    util_copy_framebuffer_state(&ctx->framebuffer, state);
    struct pipe_resource *colors[GEX_WGPU_MAX_COLOR_TARGETS] = {0};
@@ -15186,10 +15436,15 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
             const char *why =
                state->width > surface->texture->width0 ||
                  state->height > surface->texture->height0 ? "larger than the texture"
+               /* A reinterpretation this driver can serve through a scratch
+                * texture is no longer refused; only one that changes the
+                * texel size is, because the copy preserves bytes. */
                : (surface->format != surface->texture->format &&
                   util_format_linear(surface->format) !=
-                     util_format_linear(surface->texture->format))
-                                                    ? "surface reinterprets the format"
+                     util_format_linear(surface->texture->format) &&
+                  util_format_get_blocksize(surface->format) !=
+                     util_format_get_blocksize(surface->texture->format))
+                                                    ? "surface reinterprets the format at another texel size"
                : !gex_wgpu_color_renderable(pipe->screen, surface->format)
                                                     ? "format is not renderable"
                : surface->first_layer != surface->last_layer
@@ -15384,6 +15639,19 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
       ctx->color_layers[i] = i < color_count ? color_layers[i] : 0;
    }
    ctx->color_count = color_count;
+   /* The pass loads what is already there (loadOp is always Load), so the
+    * scratch has to start as a copy of the texture. Done here rather than per
+    * pass: between binds the scratch stays authoritative, and the copy back
+    * at each submit leaves the two agreeing. */
+   for (unsigned i = 0; i < ctx->color_count; ++i) {
+      if (!ctx->colors[i] ||
+          !gex_wgpu_color_needs_scratch(ctx->color_formats[i], ctx->colors[i]))
+         continue;
+      if (gex_wgpu_rt_scratch_ensure(ctx, ctx->colors[i], ctx->color_formats[i],
+                                     ctx->color_levels[i]))
+         gex_wgpu_rt_scratch_copy(ctx, ctx->colors[i], ctx->color_layers[i],
+                                  true);
+   }
    pipe_resource_reference(&ctx->depth, depth);
    ctx->depth_level = depth_level;
    ctx->depth_layer = depth_layer;
@@ -20512,6 +20780,15 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
    wgpuCommandBufferRelease(command);
    gex_wgpu_batched_submits++;
    gex_wgpu_batched_draws += draws;
+   /* After the submit, so the copy reads what these draws wrote. A colour
+    * target whose surface reinterprets its format was rendered into a scratch
+    * texture; this is where the bytes go back. */
+   for (unsigned i = 0; i < ctx->color_count; ++i) {
+      if (ctx->colors[i] &&
+          gex_wgpu_color_needs_scratch(ctx->color_formats[i], ctx->colors[i]))
+         gex_wgpu_rt_scratch_copy(ctx, ctx->colors[i], ctx->color_layers[i],
+                                  false);
+   }
 }
 
 /* Dynamic offsets, which WebGPU takes as one array per bind group in
@@ -24490,38 +24767,39 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          color_view.baseArrayLayer = ctx->color_layers[i];
          color_view.arrayLayerCount = 1;
       }
-      /* A view whose format is not storage-compatible is rejected on a
-       * texture that carries StorageBinding usage, and wgpuTextureCreateView
-       * hands back a non-null *invalid* view rather than NULL -- so
-       * missing_view cannot see it and the entire pass is dropped with
-       * nothing said. The same rule cost a whole pass to find on the sampler
-       * side, where it presented as a black quad; see the StorageBinding note
-       * in gex_wgpu_create_sampler_view.
-       *
-       * Reaching it here needs a *linear* storage-capable texture given an
-       * sRGB surface, which is what st/mesa does to force encoding on a blit
-       * destination (an sRGB texture is not storage-capable, so it never
-       * carries the usage and viewing it linearly is always fine). No probe
-       * in the suite reaches it and no browser run has produced the
-       * validation line, so this names itself rather than growing the
-       * scratch-copy machinery the sampler side needed. */
-      if (ctx->color_formats[i] != ctx->colors[i]->format &&
-          (gex_resource(ctx->colors[i])->texture_usage &
-           WGPUTextureUsage_StorageBinding) &&
-          gex_wgpu_storage_texture_format(ctx->color_formats[i]) ==
-             WGPUTextureFormat_Undefined) {
-         static bool said = false;
-         if (!said) {
-            said = true;
-            fprintf(stderr, "gex-wgpu: colour target %u wants a %s view of a "
-                    "%s texture carrying storage usage; WebGPU refuses that "
-                    "view and the pass will be dropped\n", i,
-                    util_format_short_name(ctx->color_formats[i]),
-                    util_format_short_name(ctx->colors[i]->format));
+      /* A surface naming another format renders into a scratch texture of
+       * that format, which is one level of one layer -- so the view over it
+       * starts at zero whatever the attachment names. Attaching the texture
+       * itself would build an *invalid* view, and wgpuTextureCreateView hands
+       * back a non-null one, so missing_view below cannot even see it: the
+       * whole pass would be dropped with nothing said. */
+      WGPUTexture attach = gex_resource(ctx->colors[i])->texture;
+      if (gex_wgpu_color_needs_scratch(ctx->color_formats[i],
+                                       ctx->colors[i])) {
+         WGPUTexture scratch =
+            gex_wgpu_rt_scratch_ensure(ctx, ctx->colors[i],
+                                       ctx->color_formats[i],
+                                       ctx->color_levels[i]);
+         if (scratch) {
+            attach = scratch;
+            color_view.baseMipLevel = 0;
+            color_view.mipLevelCount = 1;
+            if (!three_d) {
+               color_view.baseArrayLayer = 0;
+               color_view.arrayLayerCount = 1;
+            }
+         } else {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: colour target %u could not get a "
+                       "%s scratch for its %s texture\n", i,
+                       util_format_short_name(ctx->color_formats[i]),
+                       util_format_short_name(ctx->colors[i]->format));
+            }
          }
       }
-      views[i] = wgpuTextureCreateView(
-         gex_resource(ctx->colors[i])->texture, &color_view);
+      views[i] = wgpuTextureCreateView(attach, &color_view);
       missing_view |= !views[i];
    }
    if (!reuse && ctx->depth) {
@@ -24670,15 +24948,26 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             /* Zeros, which is what robust_buffer_access_behavior promises for
                a block nothing is bound to; failing the context instead cost
                every later call. */
-            static bool said;
-            if (!said) {
-               said = true;
-               fprintf(stderr, "gex-wgpu: vertex storage block %u has no buffer "
-                       "bound; reading zeros\n", slot);
+            {
+               static unsigned told;
+               if (told < 12) {
+                  ++told;
+                  unsigned bound = 0;
+                  for (unsigned b = 0;
+                       b < ARRAY_SIZE(ctx->shader_buffers[MESA_SHADER_VERTEX]);
+                       ++b)
+                     if (ctx->shader_buffers[MESA_SHADER_VERTEX][b].buffer)
+                        bound |= 1u << b;
+                  fprintf(stderr, "gex-wgpu: vertex storage block %u (of %u) "
+                          "has no buffer bound; bound mask 0x%x\n", slot,
+                          ctx->vs->ssbo_count, bound);
+               }
             }
             sb_buffer = gex_wgpu_placeholder_storage(ctx, 0);
             sb_offset = 0;
-            sb_size = 0;
+            /* The whole placeholder; an explicit zero is a rejected binding.
+             * See the note in gex_wgpu_launch_grid. */
+            sb_size = ctx->placeholder_storage->width0;
             if (!sb_buffer) {
                gex_fail(ctx);
                return;
@@ -24770,15 +25059,26 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             /* Zeros, which is what robust_buffer_access_behavior promises for
                a block nothing is bound to; failing the context instead cost
                every later call. */
-            static bool said;
-            if (!said) {
-               said = true;
-               fprintf(stderr, "gex-wgpu: fragment storage block %u has no buffer "
-                       "bound; reading zeros\n", slot);
+            {
+               static unsigned told;
+               if (told < 12) {
+                  ++told;
+                  unsigned bound = 0;
+                  for (unsigned b = 0;
+                       b < ARRAY_SIZE(ctx->shader_buffers[MESA_SHADER_FRAGMENT]);
+                       ++b)
+                     if (ctx->shader_buffers[MESA_SHADER_FRAGMENT][b].buffer)
+                        bound |= 1u << b;
+                  fprintf(stderr, "gex-wgpu: fragment storage block %u (of %u) "
+                          "has no buffer bound; bound mask 0x%x\n", slot,
+                          ctx->fs->ssbo_count, bound);
+               }
             }
             sb_buffer = gex_wgpu_placeholder_storage(ctx, 0);
             sb_offset = 0;
-            sb_size = 0;
+            /* The whole placeholder; an explicit zero is a rejected binding.
+             * See the note in gex_wgpu_launch_grid. */
+            sb_size = ctx->placeholder_storage->width0;
             if (!sb_buffer) {
                gex_fail(ctx);
                return;
