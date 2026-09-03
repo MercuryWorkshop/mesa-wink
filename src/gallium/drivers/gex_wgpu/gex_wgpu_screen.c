@@ -16889,6 +16889,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * no colour target and no fragment shader is legal -- and is exactly the
     * shape a transform feedback pass takes. */
    const bool discard = ctx->rasterizer && ctx->rasterizer->discard;
+   /* glCullFace(GL_FRONT_AND_BACK) culls every polygon, and WebGPU's cullMode
+    * has no name for that -- it offers None, Front and Back, so the state
+    * mapped to None and the triangles were drawn. `tri-cull-both` renders an
+    * empty window on every other driver and a full-screen triangle here.
+    *
+    * GL culls *polygons*, so points and lines are untouched, which is why
+    * this tests the reduced primitive rather than the mode. */
+   if (info && ctx->rasterizer &&
+       ctx->rasterizer->cull_face == PIPE_FACE_FRONT_AND_BACK &&
+       u_reduced_prim(info->mode) == MESA_PRIM_TRIANGLES)
+      return;
    const char *refusal =
       ctx->failed                                   ? "context already failed"
       : !ctx->vs                                    ? "no vertex shader"
