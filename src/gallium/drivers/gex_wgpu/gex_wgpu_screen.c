@@ -26691,6 +26691,34 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * gex_wgpu_render_cond_passes already tests against, so the inverted modes
     * need nothing the plain ones did not. */
    caps->conditional_render_inverted = true;
+   /* ARB_cull_distance is the one extension between this driver and GL 4.5,
+    * and it is deliberately withheld. Turning it on grants 4.5 immediately --
+    * measured -- and silently eats geometry, which is worse than not having
+    * it.
+    *
+    * Why: gl_CullDistance is not gl_ClipDistance. A clip distance cuts a
+    * primitive along the plane where it reaches zero; a cull distance
+    * discards the primitive entirely and only when *every* vertex is
+    * negative, so one with mixed signs is drawn whole. Mesa's GLSL linker
+    * runs nir_merge_clip_cull_distance_vars unconditionally, which packs the
+    * cull values into the clip array after the clip ones, and zink's emitter
+    * hands that whole array to WebGPU's clip_distances. So the cull values
+    * clip.
+    *
+    * gl44-cull-distance-probe measures exactly that: with the cap on, the
+    * all-negative triangle disappears (right), the all-positive one is drawn
+    * (right), and the mixed one loses the corner at its negative vertex
+    * (wrong -- GL keeps it). Two of three, with the failure being the case
+    * that distinguishes the two features.
+    *
+    * Implementing it means splitting the merged array before ntv so only the
+    * clip part reaches clip_distances, and culling per primitive from the
+    * cull part -- which the CPU cull in gex_wgpu_cull_polygons is already the
+    * shape of, capture and index rewrite included. What makes that more than
+    * a morning's work is where the split has to happen: on the path user
+    * clip planes take (caps->clip_planes = 0 has st run nir_lower_clip_vs, so
+    * every application clip plane is a gl_ClipDistance write), which real
+    * applications here depend on. No target application asks for 4.5. */
    /* EXT_texture_filter_anisotropic, and with a maximum of 16 also
     * ARB_texture_filter_anisotropic -- one of GL 4.6's ten. st gates the ARB
     * form on the maximum being at least 16, which is what WebGPU's sampler
