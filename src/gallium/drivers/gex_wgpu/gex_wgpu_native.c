@@ -347,7 +347,22 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
                               struct pipe_box *sub_box)
 {
    struct gex_wgpu_sw_screen *state = sw_state_for(screen);
-   if (!state || !state->winsys || !resource || !pipe) return;
+   /* Every early return here is a dropped frame, and a dropped frame is
+    * indistinguishable from an application that did not draw. Krita swaps its
+    * window six times and one present came out, so say which of these it
+    * was. */
+   if (!state || !state->winsys || !resource || !pipe) {
+      extern bool gex_wgpu_present_logging(void);
+      static unsigned dropped;
+      if (gex_wgpu_present_logging() && dropped++ < 8)
+         fprintf(stderr,
+                 "gex-wgpu: present dropped (%s) screen=%p resource=%p\n",
+                 !state ? "no state for this screen"
+                    : !state->winsys ? "no winsys"
+                    : !resource ? "no resource" : "no current context",
+                 (void *)screen, (void *)resource);
+      return;
+   }
    extern uint64_t gex_wgpu_present_nanos;
    const int64_t present_start = os_time_get_nano();
    struct sw_winsys *winsys = state->winsys;
@@ -414,7 +429,8 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
          }
          const double bytes =
             (double)resource->width0 * resource->height0 * bpp;
-         if (seen % 30 == 0) {
+         const bool report = seen < 8 || seen % 30 == 0;
+         if (report) {
             /* Which colour targets the frame's draws actually went to. A
              * black present with a busy driver is either "the draws landed
              * elsewhere" or "the copy to X is broken", and the histogram is
@@ -422,7 +438,7 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
             extern void gex_wgpu_report_draw_targets(void);
             gex_wgpu_report_draw_targets();
          }
-         if (seen % 30 == 0)
+         if (report)
             fprintf(stderr,
                     "gex-wgpu: present %llu %ux%u fmt=%d stride=%u "
                     "mean=%.1f nonzero=%.1f%%\n",
@@ -432,11 +448,11 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
          {
             extern const char *gex_wgpu_presented_trace_take(void);
             const char *trace = gex_wgpu_presented_trace_take();
-            if (seen % 30 == 0)
+            if (report)
                fprintf(stderr, "gex-wgpu: on the window this frame: %s\n",
                        trace[0] ? trace : "nothing");
          }
-         if (prefix && (seen == 0 || seen % 300 == 0) && bpp == 4) {
+         if (prefix && report && bpp == 4) {
             char path[512];
             snprintf(path, sizeof(path), "%s-%llu.ppm", prefix,
                      (unsigned long long)seen);
@@ -444,10 +460,27 @@ gex_wgpu_sw_flush_frontbuffer(struct pipe_screen *screen,
             if (out) {
                fprintf(out, "P6\n%u %u\n255\n", resource->width0,
                        resource->height0);
+               /* A window is usually BGRA here, and writing its first three
+                * bytes as RGB swaps red and blue -- which read as a driver
+                * colour bug in a dump that was otherwise correct. Ask the
+                * format which way round it is. */
+               const bool bgr =
+                  util_format_get_component_bits(resource->format,
+                                                 UTIL_FORMAT_COLORSPACE_RGB,
+                                                 0) &&
+                  (resource->format == PIPE_FORMAT_B8G8R8A8_UNORM ||
+                   resource->format == PIPE_FORMAT_B8G8R8X8_UNORM ||
+                   resource->format == PIPE_FORMAT_B8G8R8A8_SRGB ||
+                   resource->format == PIPE_FORMAT_B8G8R8X8_SRGB);
                for (unsigned y = 0; y < resource->height0; ++y) {
                   const uint8_t *row = from + (size_t)y * transfer->stride;
-                  for (unsigned x = 0; x < resource->width0; ++x)
-                     fwrite(row + (size_t)x * 4, 1, 3, out);
+                  for (unsigned x = 0; x < resource->width0; ++x) {
+                     const uint8_t *texel = row + (size_t)x * 4;
+                     const uint8_t rgb[3] = {
+                        texel[bgr ? 2 : 0], texel[1], texel[bgr ? 0 : 2],
+                     };
+                     fwrite(rgb, 1, 3, out);
+                  }
                }
                fclose(out);
             }
