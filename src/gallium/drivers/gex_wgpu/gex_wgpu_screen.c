@@ -463,6 +463,11 @@ struct gex_wgpu_context {
       struct pipe_resource *corners;
       unsigned corner_offset;
    } point_expand;
+   /* The generated quad shaders wide lines are drawn with, one per varying
+    * layout and segment stride, and the buffer the vertex shader's compute
+    * pass writes for them. See gex_wgpu_line_draw. */
+   struct gex_wgpu_line_quad *line_quads;
+   struct pipe_resource *line_vs_out;
    /* De-indexed vertex buffers, kept across draws and grown as needed: an
     * indexed point draw gathers the vertices it references into these and is
     * then bound to them instead of to the application's. The mask says which
@@ -475,6 +480,10 @@ struct gex_wgpu_context {
    /* Set while a provoking-vertex rewrite is re-issuing its draw, so the
     * rewrite does not see its own output and recurse. */
    bool provoking_rewritten;
+   /* The same, for the wide-line rewrite, whose own draw is triangles and so
+    * could not recurse -- but the flag also keeps the point expansion and
+    * every other rewrite from second-guessing a draw this one built. */
+   bool line_rewritten;
    /* Rewritten index lists, kept because the rewrite is per-draw and the
     * source almost never changes: glxgears draws three gears from display
     * lists every frame with glShadeModel(GL_FLAT), and rewriting them each
@@ -863,6 +872,11 @@ struct gex_wgpu_rasterizer {
    bool point_size_per_vertex;
    bool point_smooth;
    unsigned sprite_coord_mode;
+   /* glLineWidth and GL_LINE_SMOOTH. WebGPU draws every line one pixel wide
+    * and has no line antialiasing, so a wider line is expanded into a quad --
+    * see gex_wgpu_line_draw. */
+   float line_width;
+   bool line_smooth;
    /* glPolygonMode, as PIPE_POLYGON_MODE_*. FILL is the ordinary case; LINE
     * and POINT are drawn by rewriting the primitive, since WebGPU has no
     * polygon mode.
@@ -991,6 +1005,17 @@ struct gex_wgpu_capture_variant {
  * refusing more than eight elements here contradicted that, and the geometry
  * passthrough (one element per geometry output) hit it as soon as the
  * geometry stage was allowed its full varying count. */
+
+/* One generated quad shader, with the vertex layout that feeds it. Keyed on
+ * the varyings it forwards and on how far apart a segment's two endpoints sit
+ * in the capture buffer -- two records for LINES, one for LINE_STRIP. */
+struct gex_wgpu_line_quad {
+   struct gex_wgpu_varying_layout layout;
+   unsigned segment_records;
+   struct gex_wgpu_shader *shader;
+   struct gex_wgpu_vertex_elements *elements;
+   struct gex_wgpu_line_quad *next;
+};
 
 struct gex_wgpu_vertex_elements {
    unsigned count;
@@ -3112,6 +3137,14 @@ gex_wgpu_lower_wide_point(nir_shader *nir,
    }
    stash.position = nir_local_variable_create(impl, glsl_vec4_type(),
                                               "gex_point_position");
+   {
+      /* Initialised, because a shader that stores gl_Position on only one
+       * side of a branch would otherwise have this read undefined. Every
+       * vertex shader writes it, but "every" is doing a lot of work in a pass
+       * that runs on whatever st/mesa hands over. */
+      nir_builder b = nir_builder_at(nir_before_impl(impl));
+      nir_store_var(&b, stash.position, nir_imm_zero(&b, 4, 32), 0xf);
+   }
    if (how->per_vertex_size) {
       stash.size = nir_local_variable_create(impl, glsl_float_type(),
                                              "gex_point_size");
@@ -5472,6 +5505,8 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
       rasterizer->point_size = state->point_size;
       rasterizer->point_size_per_vertex = state->point_size_per_vertex;
       rasterizer->point_smooth = state->point_smooth;
+      rasterizer->line_width = state->line_width;
+      rasterizer->line_smooth = state->line_smooth;
       rasterizer->sprite_coord_mode = state->sprite_coord_mode;
       rasterizer->poly_stipple = state->poly_stipple_enable;
       rasterizer->flatshade_first = state->flatshade_first;
@@ -12534,6 +12569,228 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
    return b.shader;
 }
 
+/* The vertex shader a wide line's quad is drawn with.
+ *
+ * WebGPU draws every line one pixel wide and has no line antialiasing, so
+ * glLineWidth did nothing -- `caps->max_line_width` was 1.0, which has
+ * st/mesa clamp the width before the driver ever sees it, exactly as it
+ * clamped point size.
+ *
+ * A line becomes a quad, and unlike a point it needs *both* endpoints: the
+ * offset direction depends on which way the line runs. The endpoints arrive
+ * as two sets of vertex attributes, both fed from the buffer a compute pass
+ * has already filled with the application's own vertex shader output -- the
+ * same machinery a geometry shader uses (gex_wgpu_gs_draw's first pass). One
+ * instance per segment, with the buffer bound twice: at offset 0 with a
+ * two-record stride for endpoint A, and one record further in for endpoint B.
+ *
+ * **The quad is axis-aligned, not perpendicular.** GL rasterises a
+ * non-antialiased wide line as *w copies of the line offset along its minor
+ * axis*, so a five-pixel diagonal lights five pixels per row rather than the
+ * seven a rotated quad would; llvmpipe agrees, and tests/gl44-probe.sh line
+ * checks it. That makes the shader simpler as well as more faithful -- and it
+ * degrades gracefully when an endpoint is behind the eye, where a
+ * perpendicular computed from a divided w would fly apart.
+ */
+static nir_shader *
+gex_wgpu_line_quad_nir(struct pipe_context *pipe,
+                       const struct gex_wgpu_varying_layout *layout)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, pipe->screen->nir_options[MESA_SHADER_VERTEX],
+      "gex-line-quad");
+   const unsigned n = layout->count;
+   nir_variable *ends[2][GEX_WGPU_MAX_VARYINGS];
+   for (unsigned which = 0; which < 2; ++which) {
+      for (unsigned i = 0; i < n; ++i) {
+         char name[32];
+         snprintf(name, sizeof(name), "gex_line_%c%u", which ? 'b' : 'a', i);
+         nir_variable *var = nir_variable_create(b.shader, nir_var_shader_in,
+                                                 glsl_vec4_type(), name);
+         var->data.location = VERT_ATTRIB_GENERIC0 + which * n + i;
+         var->data.driver_location = which * n + i;
+         ends[which][i] = var;
+      }
+   }
+   /* Two more attributes out of one six-entry buffer: which end and which
+    * side this corner is, and the draw's own numbers. The parameters are the
+    * same for all six corners, so carrying them here costs nothing and saves
+    * a binding. */
+   nir_variable *corner = nir_variable_create(b.shader, nir_var_shader_in,
+                                              glsl_vec4_type(),
+                                              "gex_line_corner");
+   corner->data.location = VERT_ATTRIB_GENERIC0 + 2 * n;
+   corner->data.driver_location = 2 * n;
+   nir_variable *params = nir_variable_create(b.shader, nir_var_shader_in,
+                                              glsl_vec4_type(),
+                                              "gex_line_params");
+   params->data.location = VERT_ATTRIB_GENERIC0 + 2 * n + 1;
+   params->data.driver_location = 2 * n + 1;
+
+   nir_def *c = nir_load_var(&b, corner);
+   nir_def *p = nir_load_var(&b, params);
+   nir_def *is_b = nir_fneu_imm(&b, nir_channel(&b, c, 0), 0.0f);
+   nir_def *side = nir_channel(&b, c, 1);
+   nir_def *half_x = nir_channel(&b, c, 2);
+   nir_def *half_y = nir_channel(&b, c, 3);
+   nir_def *aspect = nir_channel(&b, p, 0);
+
+   nir_def *position_a = nir_load_var(&b, ends[0][0]);
+   nir_def *position_b = nir_load_var(&b, ends[1][0]);
+   /* Which axis the line is major in, measured in pixels. The w guard keeps
+    * an endpoint on or behind the eye plane from turning the comparison into
+    * a NaN; it can only pick the wrong axis, which is a wrong thickness
+    * direction rather than a primitive flying off the screen. */
+   nir_def *w_a = nir_fmax(&b, nir_fabs(&b, nir_channel(&b, position_a, 3)),
+                           nir_imm_float(&b, 1e-6f));
+   nir_def *w_b = nir_fmax(&b, nir_fabs(&b, nir_channel(&b, position_b, 3)),
+                           nir_imm_float(&b, 1e-6f));
+   nir_def *dx = nir_fsub(&b, nir_fdiv(&b, nir_channel(&b, position_b, 0), w_b),
+                          nir_fdiv(&b, nir_channel(&b, position_a, 0), w_a));
+   nir_def *dy = nir_fsub(&b, nir_fdiv(&b, nir_channel(&b, position_b, 1), w_b),
+                          nir_fdiv(&b, nir_channel(&b, position_a, 1), w_a));
+   nir_def *major_x = nir_fge(&b, nir_fmul(&b, nir_fabs(&b, dx), aspect),
+                              nir_fabs(&b, dy));
+   nir_def *zero = nir_imm_float(&b, 0.0f);
+   nir_def *offset_x =
+      nir_bcsel(&b, major_x, zero, nir_fmul(&b, side, half_x));
+   nir_def *offset_y =
+      nir_bcsel(&b, major_x, nir_fmul(&b, side, half_y), zero);
+
+   nir_def *position = nir_bcsel(&b, is_b, position_b, position_a);
+   nir_def *w = nir_channel(&b, position, 3);
+   nir_variable *out_position =
+      nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(),
+                          "gl_Position");
+   out_position->data.location = VARYING_SLOT_POS;
+   out_position->data.driver_location = 0;
+   nir_store_var(&b, out_position,
+                 nir_vec4(&b,
+                          nir_ffma(&b, offset_x, w, nir_channel(&b, position, 0)),
+                          nir_ffma(&b, offset_y, w, nir_channel(&b, position, 1)),
+                          nir_channel(&b, position, 2), w), 0xf);
+
+   /* Every other varying comes from whichever endpoint this corner belongs
+    * to, and the rasteriser interpolates along the line for free -- which is
+    * the whole reason the two ends have to be kept apart rather than one
+    * endpoint's values being used for all four corners. */
+   for (unsigned i = 1; i < n; ++i) {
+      char name[32];
+      snprintf(name, sizeof(name), "gex_line_varying%u", i);
+      nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                              glsl_vec4_type(), name);
+      out->data.location = layout->location[i];
+      out->data.driver_location = i;
+      nir_store_var(&b, out,
+                    nir_bcsel(&b, is_b, nir_load_var(&b, ends[1][i]),
+                              nir_load_var(&b, ends[0][i])), 0xf);
+   }
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   if (getenv("GEX_WGPU_LINE_NIR"))
+      nir_print_shader(b.shader, stderr);
+   return b.shader;
+}
+
+/* The quad shader and the vertex layout that feeds it, built once per varying
+ * layout and kept. Two buffer bindings of one capture buffer, a record apart,
+ * give each instance both of its segment's endpoints; the third buffer is the
+ * six corners, which are per *vertex* rather than per instance. */
+static struct gex_wgpu_line_quad *
+gex_wgpu_line_quad_get(struct gex_wgpu_context *ctx,
+                       const struct gex_wgpu_varying_layout *layout,
+                       unsigned segment_records)
+{
+   for (struct gex_wgpu_line_quad *q = ctx->line_quads; q; q = q->next)
+      if (q->segment_records == segment_records &&
+          !memcmp(&q->layout, layout, sizeof(*layout)))
+         return q;
+
+   const unsigned n = layout->count;
+   /* Two attributes per varying plus the corner pair, against WebGPU's
+    * sixteen. A shader with more varyings than that draws its lines one pixel
+    * wide, which is what every shader did before this existed. */
+   if (!n || 2 * n + 2 > GEX_WGPU_MAX_VERTEX_ELEMENTS)
+      return NULL;
+
+   struct gex_wgpu_line_quad *quad = CALLOC_STRUCT(gex_wgpu_line_quad);
+   if (!quad)
+      return NULL;
+   quad->layout = *layout;
+   quad->segment_records = segment_records;
+
+   struct pipe_shader_state state = {0};
+   state.type = PIPE_SHADER_IR_NIR;
+   state.ir.nir = gex_wgpu_line_quad_nir(&ctx->base, layout);
+   state.report_compile_error = true;
+   quad->shader = state.ir.nir
+      ? gex_wgpu_create_shader_state(&ctx->base, &state, MESA_SHADER_VERTEX)
+      : NULL;
+   free(state.error_message);
+
+   const unsigned record = gex_wgpu_varying_stride(layout);
+   struct pipe_vertex_element elements[GEX_WGPU_MAX_VERTEX_ELEMENTS];
+   memset(elements, 0, sizeof(elements));
+   unsigned at = 0;
+   for (unsigned which = 0; which < 2; ++which) {
+      for (unsigned i = 0; i < n; ++i, ++at) {
+         elements[at].src_offset = i * 16;
+         elements[at].src_stride = segment_records * record;
+         elements[at].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+         elements[at].vertex_buffer_index = which;
+         /* One segment per instance, which is what puts the two endpoints in
+          * one invocation: the corners have to vary along the vertex index,
+          * so everything else has to vary along the instance one. */
+         elements[at].instance_divisor = 1;
+      }
+   }
+   elements[at].src_offset = 0;
+   elements[at].src_stride = 32;
+   elements[at].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   elements[at].vertex_buffer_index = 2;
+   ++at;
+   elements[at].src_offset = 16;
+   elements[at].src_stride = 32;
+   elements[at].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+   elements[at].vertex_buffer_index = 2;
+   ++at;
+   quad->elements = ctx->base.create_vertex_elements_state(&ctx->base, at,
+                                                           elements);
+   if (!quad->shader || !quad->elements) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: could not build the wide-line quad "
+                         "shader; lines stay one pixel wide\n");
+      }
+      FREE(quad);
+      return NULL;
+   }
+   quad->next = ctx->line_quads;
+   ctx->line_quads = quad;
+   return quad;
+}
+
+/* The varyings a line's two endpoints have to carry: gl_Position first,
+ * because the quad shader reads it by slot zero, then everything the fragment
+ * stage reads. A varying the vertex shader does not write is captured as
+ * zero, which is what GL says an unwritten input is worth. */
+static void
+gex_wgpu_line_varyings(struct gex_wgpu_context *ctx,
+                       struct gex_wgpu_varying_layout *layout)
+{
+   memset(layout, 0, sizeof(*layout));
+   layout->location[layout->count++] = VARYING_SLOT_POS;
+   if (!ctx->fs)
+      return;
+   for (unsigned i = 0; i < GEX_WGPU_MAX_VARYING_LOCATIONS; ++i) {
+      if (!(ctx->fs->varying_interp_mask & BITFIELD64_BIT(i)))
+         continue;
+      if (layout->count >= GEX_WGPU_MAX_VARYINGS)
+         break;
+      layout->location[layout->count++] = i;
+   }
+}
+
 static WGPUShaderModule
 gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs)
 {
@@ -13615,6 +13872,15 @@ gex_wgpu_gather_indexed_vertices(struct gex_wgpu_context *ctx,
       if (!stride)
          continue;
       const unsigned dwords = stride / 4;
+      /* A gathered copy is `count` whole vertices, and a particle system can
+       * have a great many of them. Refusing above a cap costs the expansion
+       * for that draw -- it falls back to one-pixel points, which is what it
+       * did before any of this existed -- where overflowing the size would
+       * cost a wrong allocation and an out-of-bounds fetch. */
+      if ((uint64_t)count * stride > (64u << 20)) {
+         ok = false;
+         break;
+      }
       const unsigned total = count * dwords;
       if (!gex_wgpu_ensure_buffer(ctx, &ctx->point_gathered[buffer],
                                   count * stride,
@@ -13658,6 +13924,251 @@ gex_wgpu_gather_indexed_vertices(struct gex_wgpu_context *ctx,
    }
    pipe_resource_reference(&table, NULL);
    return ok;
+}
+
+/* Draw a wide, or smooth, line as quads.
+ *
+ * Three steps, and the first two are the geometry-shader path's first pass
+ * with the geometry stage taken out: run the application's vertex shader as
+ * compute so that every transformed vertex is in a buffer, then rasterise
+ * quads that read two of those vertices per instance.
+ *
+ * Only non-indexed LINES and LINE_STRIP for now, and that is a real
+ * restriction rather than an oversight: with the capture written in vertex
+ * order, a segment's two endpoints are a fixed distance apart in the buffer
+ * -- two records for LINES, one for LINE_STRIP -- which is exactly what a
+ * vertex buffer binding can express. LINE_LOOP wraps and an indexed draw
+ * permutes, and both would need the index table the capture pass already
+ * supports but this does not yet build.
+ */
+static bool
+gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
+                   const struct pipe_draw_info *info, unsigned drawid_offset,
+                   const struct pipe_draw_start_count_bias *draw)
+{
+#define GEX_LINE_DECLINE(why)                                                 \
+   do {                                                                       \
+      static const char *said[6];                                             \
+      bool told = false;                                                      \
+      unsigned free_slot = 6;                                                 \
+      for (unsigned i = 0; i < 6; ++i) {                                       \
+         if (said[i] == (why)) told = true;                                    \
+         else if (!said[i] && free_slot == 6) free_slot = i;                   \
+      }                                                                       \
+      if (!told && free_slot < 6) {                                            \
+         said[free_slot] = (why);                                              \
+         fprintf(stderr, "gex-wgpu: lines drawn one pixel wide (%s)\n",        \
+                 (why));                                                       \
+      }                                                                       \
+      return false;                                                            \
+   } while (0)
+
+   unsigned segments = 0, segment_records = 0;
+   if (info->mode == MESA_PRIM_LINES) {
+      segments = draw->count / 2;
+      segment_records = 2;
+   } else if (info->mode == MESA_PRIM_LINE_STRIP) {
+      segments = draw->count >= 2 ? draw->count - 1 : 0;
+      segment_records = 1;
+   } else {
+      GEX_LINE_DECLINE("topology");
+   }
+   if (!segments)
+      return false;
+   if (segments > (1u << 20))
+      GEX_LINE_DECLINE("too many segments");
+
+   struct gex_wgpu_varying_layout varyings;
+   gex_wgpu_line_varyings(ctx, &varyings);
+   if (getenv("GEX_WGPU_LINE_LOG")) {
+      static unsigned told;
+      if (told < 8) { ++told;
+         fprintf(stderr, "gex-wgpu: line segments=%u records=%u fs=%p "
+                 "mask=0x%llx n=%u\n", segments, segment_records,
+                 (void *)ctx->fs,
+                 ctx->fs ? (unsigned long long)ctx->fs->varying_interp_mask : 0,
+                 varyings.count); }
+   }
+   struct gex_wgpu_line_quad *quad =
+      gex_wgpu_line_quad_get(ctx, &varyings, segment_records);
+   if (!quad)
+      GEX_LINE_DECLINE("no quad shader for this varying layout");
+
+   struct gex_wgpu_capture_layout layout;
+   memset(&layout, 0, sizeof(layout));
+   if (ctx->vertex_elements) {
+      layout.count = ctx->vertex_elements->count;
+      for (unsigned i = 0; i < layout.count; ++i) {
+         const struct pipe_vertex_element *ve =
+            &ctx->vertex_elements->elements[i];
+         if (ve->instance_divisor)
+            GEX_LINE_DECLINE("per-instance attributes");
+         layout.buffer[i] = ve->vertex_buffer_index;
+         layout.offset[i] = ve->src_offset;
+         layout.stride[i] = ve->src_stride;
+         layout.format[i] = ve->src_format;
+      }
+   }
+   /* The capture pass binds vertex buffers, its output and the constant
+    * buffers, and nothing else. A vertex shader that samples a texture would
+    * compile into a compute module declaring bindings the dispatch does not
+    * provide, and a pipeline WebGPU rejects poisons the device -- so it draws
+    * its lines one pixel wide instead. */
+   if (ctx->vs->texture_count || ctx->vs->sampler_count)
+      GEX_LINE_DECLINE("the vertex shader samples a texture");
+   struct gex_wgpu_varying_variant *variant =
+      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &varyings);
+   const unsigned record = gex_wgpu_varying_stride(&varyings);
+   if (!variant)
+      GEX_LINE_DECLINE("the vertex shader has no compute variant");
+   if (!gex_wgpu_ensure_buffer(ctx, &ctx->line_vs_out,
+                               (draw->count + 1) * record,
+                               PIPE_BIND_VERTEX_BUFFER |
+                               PIPE_BIND_SHADER_BUFFER))
+      GEX_LINE_DECLINE("the capture buffer could not be allocated");
+
+   /* Pass one: the vertex shader, as compute, writing its varyings.
+    *
+    * The stream uploader is flushed first. An immediate-mode draw's vertices
+    * are staged through it, and this pass reads them on the GPU rather than
+    * through the ordinary vertex fetch -- so anything still sitting in an
+    * open mapping is not there yet. */
+   u_upload_unmap(ctx->base.stream_uploader);
+   uint32_t params[GEX_WGPU_PARAM_WORDS] = {0};
+   params[GEX_WGPU_PARAM_FIRST_VERTEX] = draw->start;
+   params[GEX_WGPU_PARAM_COUNT] = draw->count;
+   struct gex_wgpu_bindings vs_group0 = {0}, vs_group1 = {0};
+   for (unsigned i = 0; i < GEX_WGPU_MAX_VERTEX_BUFFERS; ++i) {
+      if (!(variant->vb_mask & (1u << i)))
+         continue;
+      if (i >= ctx->vertex_buffer_count || !ctx->vertex_buffers[i])
+         GEX_LINE_DECLINE("a vertex buffer the capture reads is unbound");
+      params[GEX_WGPU_PARAM_VB_OFFSET + i] = ctx->vertex_buffer_offsets[i];
+      gex_wgpu_bind_storage_access(&vs_group0, GEX_WGPU_VB_FIRST_BINDING + i,
+                                   ctx->vertex_buffers[i], true);
+   }
+   struct pipe_resource *vs_params =
+      gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS);
+   gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_VARYING_OUT_BINDING,
+                         ctx->line_vs_out);
+   gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
+                         vs_params);
+   bool ok = vs_params &&
+             gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
+                                     ctx->vs->ubo_count, ctx->vs->ubo_slots,
+                                     ctx->vs->ubo_bindings,
+                                     ctx->vs->ubo_storage_mask);
+   if (ok)
+      ok = gex_wgpu_dispatch(ctx, variant->module, &vs_group0, &vs_group1,
+                             NULL,
+                             DIV_ROUND_UP(draw->count,
+                                          GEX_WGPU_CAPTURE_GROUP));
+   pipe_resource_reference(&vs_params, NULL);
+   if (!ok)
+      GEX_LINE_DECLINE("the capture pass did not run");
+   if (getenv("GEX_WGPU_LINE_LOG")) {
+      static unsigned told;
+      if (told < 4) { ++told;
+         struct pipe_transfer *transfer = NULL;
+         const float *v = pipe_buffer_map_range(&ctx->base, ctx->line_vs_out,
+                                                0, 2 * record, PIPE_MAP_READ,
+                                                &transfer);
+         if (v)
+            fprintf(stderr, "gex-wgpu: line captured A=%.3f,%.3f,%.3f,%.3f "
+                    "B=%.3f,%.3f,%.3f,%.3f\n", v[0], v[1], v[2], v[3],
+                    v[record / 4], v[record / 4 + 1], v[record / 4 + 2],
+                    v[record / 4 + 3]);
+         else
+            fprintf(stderr, "gex-wgpu: line capture unreadable\n");
+         if (transfer)
+            pipe_buffer_unmap(&ctx->base, transfer);
+      }
+   }
+
+   /* The six corners, and the draw's numbers alongside them. Half the width
+    * in clip space is `width * 2 / viewport / 2`, and the aspect ratio is
+    * what lets the shader compare the two axes in pixels. */
+   const float vp_width = ctx->viewport_set
+      ? fabsf(2.0f * ctx->viewport.scale[0]) : (float)ctx->fb_width;
+   const float vp_height = ctx->viewport_set
+      ? fabsf(2.0f * ctx->viewport.scale[1]) : (float)ctx->fb_height;
+   if (vp_width <= 0.0f || vp_height <= 0.0f)
+      GEX_LINE_DECLINE("empty viewport");
+   const float half = 0.5f * MAX2(ctx->rasterizer->line_width, 1.0f);
+   const float half_x = half * 2.0f / vp_width;
+   const float half_y = half * 2.0f / vp_height;
+   /* Triangle one is (A,-) (B,-) (B,+); triangle two is (A,-) (B,+) (A,+). */
+   static const int8_t corners[6][2] = {
+      {0, -1}, {1, -1}, {1, 1}, {0, -1}, {1, 1}, {0, 1},
+   };
+   float corner_data[6][8];
+   for (unsigned i = 0; i < 6; ++i) {
+      corner_data[i][0] = (float)corners[i][0];
+      corner_data[i][1] = (float)corners[i][1];
+      corner_data[i][2] = half_x;
+      corner_data[i][3] = half_y;
+      corner_data[i][4] = vp_width / vp_height;
+      corner_data[i][5] = 0.0f;
+      corner_data[i][6] = 0.0f;
+      corner_data[i][7] = 0.0f;
+   }
+   unsigned corner_offset = 0;
+   struct pipe_resource *corner_buffer = NULL, *released = NULL;
+   u_upload_data(ctx->base.stream_uploader, 0, sizeof(corner_data), 32,
+                 corner_data, &corner_offset, &corner_buffer, &released);
+   pipe_resource_reference(&released, NULL);
+   if (!corner_buffer)
+      GEX_LINE_DECLINE("the corner buffer could not be uploaded");
+   u_upload_unmap(ctx->base.stream_uploader);
+
+   /* Pass two: ordinary triangles, through the ordinary draw path. Swapping
+    * the vertex shader and the vertex layout is how the geometry path
+    * rasterises its own output, and it means nothing here has to know about
+    * bind groups, pipelines or render passes. */
+   struct gex_wgpu_shader *saved_vs = ctx->vs;
+   struct gex_wgpu_vertex_elements *saved_elements = ctx->vertex_elements;
+   struct pipe_resource *saved_buffers[3];
+   uint32_t saved_offsets[3];
+   for (unsigned i = 0; i < 3; ++i) {
+      saved_buffers[i] = ctx->vertex_buffers[i];
+      saved_offsets[i] = ctx->vertex_buffer_offsets[i];
+   }
+   const unsigned saved_count = ctx->vertex_buffer_count;
+
+   ctx->vs = quad->shader;
+   ctx->vertex_elements = quad->elements;
+   ctx->vertex_buffers[0] = ctx->line_vs_out;
+   ctx->vertex_buffer_offsets[0] = 0;
+   ctx->vertex_buffers[1] = ctx->line_vs_out;
+   ctx->vertex_buffer_offsets[1] = record;
+   ctx->vertex_buffers[2] = corner_buffer;
+   ctx->vertex_buffer_offsets[2] = corner_offset;
+   ctx->vertex_buffer_count = 3;
+
+   struct pipe_draw_info raster = *info;
+   raster.mode = MESA_PRIM_TRIANGLES;
+   raster.index_size = 0;
+   raster.has_user_indices = false;
+   raster.index.resource = NULL;
+   raster.instance_count = segments;
+   raster.start_instance = 0;
+   raster.primitive_restart = false;
+   raster.index_bounds_valid = false;
+   struct pipe_draw_start_count_bias raster_draw = {0};
+   raster_draw.count = 6;
+   ctx->line_rewritten = true;
+   gex_wgpu_draw_vbo(&ctx->base, &raster, drawid_offset, NULL, &raster_draw, 1);
+   ctx->line_rewritten = false;
+
+   ctx->vs = saved_vs;
+   ctx->vertex_elements = saved_elements;
+   for (unsigned i = 0; i < 3; ++i) {
+      ctx->vertex_buffers[i] = saved_buffers[i];
+      ctx->vertex_buffer_offsets[i] = saved_offsets[i];
+   }
+   ctx->vertex_buffer_count = saved_count;
+   return true;
+#undef GEX_LINE_DECLINE
 }
 
 static bool
@@ -14598,6 +15109,16 @@ static void
 gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
 {
    gex_wgpu_end_pass(ctx);
+   /* Before the early return, not after it. Uniforms are staged into a ring
+    * and written to the GPU in one go here, and a compute pass -- a transform
+    * feedback capture, a geometry stage, a wide line's vertex capture --
+    * submits its own command buffer through gex_wgpu_dispatch, which calls
+    * this first. With nothing else pending, this returned without flushing,
+    * so that dispatch read a constant ring the GPU had never been given: the
+    * first wide line of a program captured gl_Position = (0,0,0,0) from a
+    * zero modelview-projection matrix and drew nothing, while every later one
+    * was right because an ordinary draw had flushed the ring by then. */
+   gex_wgpu_flush_constant_ring(ctx);
    if (!ctx->pending_encoder)
       return;
    for (unsigned i = 0; i < GEX_WGPU_SUBMIT_CAUSES; ++i) {
@@ -14625,9 +15146,9 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
    }
    if (gex_wgpu_cmd_logging())
       fprintf(stderr, "gex-cmd SUBMIT %s draws=%u\n", why ? why : "?", draws);
-   /* Every uniform these draws read, in one write. It has to go on the queue
-    * before the submit, which is exactly here. */
-   gex_wgpu_flush_constant_ring(ctx);
+   /* Every uniform these draws read went on the queue above, before the
+    * early return, which is what makes it true for a compute dispatch as
+    * well as for this submit. */
    gex_wgpu_queue_submit(gex_screen(ctx->base.screen), 1, &command);
    wgpuCommandBufferRelease(command);
    gex_wgpu_batched_submits++;
@@ -15737,6 +16258,21 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       /* Fall through and draw it filled rather than not at all. */
    }
 
+   /* A wide, smooth or otherwise un-drawable line becomes quads, before the
+    * topology rewrite below so that it sees the application's own topology.
+    * Only when there is something to gain: an ordinary one-pixel line is
+    * what WebGPU draws anyway, and glPolygonMode's rewrite produces a great
+    * many of those. */
+   if (!ctx->failed && !ctx->line_rewritten && info && draws &&
+       num_draws == 1 && !indirect && ctx->vs && ctx->rasterizer &&
+       !info->index_size && info->instance_count <= 1 &&
+       (info->mode == MESA_PRIM_LINES ||
+        info->mode == MESA_PRIM_LINE_STRIP) &&
+       (ctx->rasterizer->line_width > 1.0f ||
+        ctx->rasterizer->line_smooth) &&
+       gex_wgpu_line_draw(ctx, info, drawid_offset, &draws[0]))
+      return;
+
    /* A topology WebGPU does not have is rewritten into one it does, which
     * comes straight back here as a supported mode -- but only for the
     * topologies u_index_translator actually converts. */
@@ -16322,6 +16858,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                     (int)ctx->point_expand.coord_location,
                     why ? why : (want ? "expanded" : "not wide")); }
       }
+      /* A gather that ran but whose draw did not end up expanded must not
+       * redirect anything: the gathered buffers hold the vertices in draw
+       * order, which is only right for a draw that has stopped being
+       * indexed. */
+      if (!ctx->point_expand.active)
+         ctx->point_gather_mask = 0;
       /* Once per distinct reason, so a program that draws indexed points
        * every frame says so once. Keyed on the pointer because every reason
        * above is a string literal, which makes the identity stable and the
@@ -18406,6 +18948,15 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    pipe_resource_reference(&ctx->gs_vs_out, NULL);
    pipe_resource_reference(&ctx->gs_vertices, NULL);
    pipe_resource_reference(&ctx->gs_indices, NULL);
+   for (unsigned i = 0; i < GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS; ++i)
+      pipe_resource_reference(&ctx->point_gathered[i], NULL);
+   pipe_resource_reference(&ctx->line_vs_out, NULL);
+   for (struct gex_wgpu_line_quad *q = ctx->line_quads; q;) {
+      struct gex_wgpu_line_quad *next = q->next;
+      FREE(q);
+      q = next;
+   }
+   ctx->line_quads = NULL;
    if (ctx->occlusion_set) wgpuQuerySetRelease(ctx->occlusion_set);
    if (ctx->occlusion_resolve) wgpuBufferRelease(ctx->occlusion_resolve);
    if (ctx->occlusion_readback) wgpuBufferRelease(ctx->occlusion_readback);
@@ -18984,7 +19535,11 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * llvmpipe's, which is what the pixel comparison measures against. */
    caps->max_point_size = 255.0f;
    caps->min_line_width = 1.0f;
-   caps->max_line_width = 1.0f;
+   /* Wide lines are expanded into quads -- see gex_wgpu_line_draw -- so the
+    * range is a real one rather than WebGPU's single pixel. At 1.0 st/mesa
+    * clamped every glLineWidth before the driver saw it, exactly as it
+    * clamped point size. */
+   caps->max_line_width = 255.0f;
    caps->point_size_granularity = 0.1f;
    caps->line_width_granularity = 0.1f;
 
