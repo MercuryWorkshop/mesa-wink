@@ -59,6 +59,14 @@ extern void gex_wgpu_jspi_signal(void);
 #define GEX_WGPU_MAX_SO_BUFFERS 4
 /* Capture buffers bind above the constant buffers so the two cannot collide. */
 #define GEX_WGPU_SO_FIRST_BINDING GEX_WGPU_MAX_CONSTANT_BUFFERS
+/* Application shader storage blocks, in their own binding range so they cannot
+ * be confused with the uniform blocks that spill into storage bindings above
+ * GEX_WGPU_STORAGE_UBO_FIRST_BINDING. The range also *identifies* them later:
+ * a spilled uniform block and a real storage block are both nir_var_mem_ssbo
+ * by the time the shader is walked, and only the binding tells them apart. */
+#define GEX_WGPU_MAX_SHADER_BUFFERS 8
+#define GEX_WGPU_SSBO_FIRST_BINDING \
+   (GEX_WGPU_STORAGE_UBO_FIRST_BINDING + GEX_WGPU_MAX_CONSTANT_BUFFERS)
 /* Two different limits, deliberately.
  *
  * GEX_WGPU_MAX_VERTEX_BUFFERS is a WebGPU limit: how many vertex buffers one
@@ -396,6 +404,11 @@ struct gex_wgpu_screen {
     * whichever shader happens to use the extra slot. */
    uint32_t max_uniform_buffers;
    uint32_t max_storage_buffers_vertex;
+   /* Storage buffers a single stage may bind, for application shader storage
+    * blocks. The vertex figure above is counted separately because WGSL
+    * allows only the read-only kind there. */
+   uint32_t max_storage_buffers;
+   uint32_t max_storage_buffer_size;
 };
 
 struct gex_wgpu_resource {
@@ -708,7 +721,14 @@ struct gex_wgpu_context {
    struct pipe_resource *gs_indices;
    /* Shader storage buffers, which only the compute stage may write on
     * WebGPU. Indexed by slot, as Gallium binds them. */
-   struct pipe_shader_buffer shader_buffers[GEX_WGPU_MAX_SO_BUFFERS];
+   /* Per stage, because GL numbers shader storage blocks per program stage
+    * and the graphics stages bind their own. Sized for the larger of the two
+    * uses: the compute path indexes it by transform-feedback slot. */
+   struct pipe_shader_buffer
+      shader_buffers[MESA_SHADER_STAGES][GEX_WGPU_MAX_SHADER_BUFFERS >
+                                         GEX_WGPU_MAX_SO_BUFFERS
+                                            ? GEX_WGPU_MAX_SHADER_BUFFERS
+                                            : GEX_WGPU_MAX_SO_BUFFERS];
    struct gex_wgpu_query *active_query;
    WGPUQuerySet occlusion_set;
    WGPUBuffer occlusion_resolve;
@@ -756,6 +776,18 @@ struct gex_wgpu_shader {
    uint32_t ubo_storage_mask;
    uint8_t ubo_slots[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    uint32_t ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   /* Application shader storage blocks, which are bound from
+    * ctx->shader_buffers rather than from the constant buffers. Kept apart
+    * from the ubo table because a slot number means a different thing in
+    * each: block 0 of one is not block 0 of the other. */
+   unsigned ssbo_count;
+   uint8_t ssbo_slots[GEX_WGPU_MAX_SHADER_BUFFERS];
+   uint32_t ssbo_bindings[GEX_WGPU_MAX_SHADER_BUFFERS];
+   /* Bit per entry: the shader never writes that block, so the emitter
+    * declares it `var<storage, read>` and the layout has to say
+    * ReadOnlyStorage. Getting this backwards is not an error anyone sees --
+    * the bind group simply fails to build and the draw reads zeros. */
+   uint32_t ssbo_readonly_mask;
    /* Bytes the emitted module declares for that block, or 0 where the block
     * ends in a runtime-sized array and has no fixed size. Only the layout's
     * minBindingSize wants it -- see gex_wgpu_min_binding_size. */
@@ -1276,6 +1308,154 @@ gex_wgpu_lower_ubo_load(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+/* Application shader storage blocks, rewritten from intrinsics into derefs.
+ *
+ * st/mesa hands SSBO access over as `load_ssbo`/`store_ssbo`, which name the
+ * block by index and carry a byte offset. zink's SPIR-V emitter -- the one
+ * this driver borrows -- does not implement those intrinsics at all; it
+ * asserts on them:
+ *
+ *     emit_intrinsic: not implemented (load_ssbo)
+ *     Assertion `!"unsupported intrinsic"' failed.
+ *
+ * What it *does* support is a storage block declared as a variable and reached
+ * by deref, which is how this driver's own capture buffers are written. So the
+ * block is flattened to a runtime-sized `uint` array and the intrinsics become
+ * word-indexed derefs of it -- exactly the shape gex_wgpu_lower_ubo_load gives
+ * uniform blocks, one element size down because std430 packs to words rather
+ * than to vec4s.
+ *
+ * 32-bit access only for now, and no atomics: both are refused by name rather
+ * than mis-lowered, because a wrong answer here is a silently corrupt buffer.
+ */
+struct gex_wgpu_ssbo_lowering {
+   bool failed;
+   char why[192];
+};
+
+/* The block's single member, as an array of words. Flattening loses the
+ * declared field structure, which is safe because every access arrives as a
+ * byte offset and is resolved here rather than by name. */
+static void
+gex_wgpu_flatten_ssbo_blocks(nir_shader *nir)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
+      if (var->data.binding < GEX_WGPU_SSBO_FIRST_BINDING)
+         continue;
+      struct glsl_struct_field field = {0};
+      field.type = glsl_array_type(glsl_uint_type(), 0, 4);
+      field.name = "words";
+      field.location = -1;
+      const struct glsl_type *flat = glsl_interface_type(
+         &field, 1, GLSL_INTERFACE_PACKING_STD430, false,
+         var->interface_type ? glsl_get_type_name(var->interface_type)
+                             : (var->name ? var->name : "ssbo"));
+      var->interface_type = flat;
+      var->type = flat;
+   }
+}
+
+static nir_variable *
+gex_wgpu_ssbo_block(nir_shader *nir, unsigned slot)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
+      if (var->data.binding >= GEX_WGPU_SSBO_FIRST_BINDING &&
+          var->data.driver_location == slot)
+         return var;
+   }
+   return NULL;
+}
+
+static bool
+gex_wgpu_lower_ssbo_access(nir_builder *b, nir_instr *instr, void *data)
+{
+   struct gex_wgpu_ssbo_lowering *state = data;
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   const bool is_load = intr->intrinsic == nir_intrinsic_load_ssbo;
+   const bool is_store = intr->intrinsic == nir_intrinsic_store_ssbo;
+   if (!is_load && !is_store) {
+      /* Anything else that names a storage block -- an atomic, a size query
+       * -- is not served, and saying which is the whole diagnosis. */
+      switch (intr->intrinsic) {
+      case nir_intrinsic_ssbo_atomic:
+      case nir_intrinsic_ssbo_atomic_swap:
+      case nir_intrinsic_get_ssbo_size:
+         state->failed = true;
+         if (!state->why[0])
+            snprintf(state->why, sizeof(state->why),
+                     "shader storage %s is not implemented",
+                     intr->intrinsic == nir_intrinsic_get_ssbo_size
+                        ? "length()" : "atomics");
+         return false;
+      default:
+         return false;
+      }
+   }
+
+   /* src[0] is the value for a store and the block index for a load. */
+   nir_src *block_src = is_store ? &intr->src[1] : &intr->src[0];
+   nir_src *offset_src = is_store ? &intr->src[2] : &intr->src[1];
+   nir_def *value = is_store ? intr->src[0].ssa : NULL;
+   const unsigned bit_size = is_store ? value->bit_size : intr->def.bit_size;
+   const unsigned components =
+      is_store ? value->num_components : intr->def.num_components;
+
+   if (bit_size != 32 || !nir_src_is_const(*block_src)) {
+      state->failed = true;
+      if (!state->why[0])
+         snprintf(state->why, sizeof(state->why),
+                  "%s_ssbo bit_size=%u block-index-const=%d",
+                  is_load ? "load" : "store", bit_size,
+                  (int)nir_src_is_const(*block_src));
+      return false;
+   }
+   const unsigned slot = nir_src_as_uint(*block_src);
+   nir_variable *block = gex_wgpu_ssbo_block(b->shader, slot);
+   if (!block) {
+      state->failed = true;
+      if (!state->why[0])
+         snprintf(state->why, sizeof(state->why),
+                  "%s_ssbo names block %u, which this shader does not declare",
+                  is_load ? "load" : "store", slot);
+      return false;
+   }
+
+   b->cursor = nir_before_instr(instr);
+   /* Byte offset to word index. A dynamic offset is shifted at run time; the
+    * four-byte alignment std430 gives a word member is what makes the shift
+    * exact either way. */
+   nir_def *word = nir_src_is_const(*offset_src)
+      ? nir_imm_int(b, nir_src_as_uint(*offset_src) / 4)
+      : nir_ushr_imm(b, offset_src->ssa, 2);
+   /* The block's word array. Spelled out rather than calling
+    * gex_wgpu_block_words, which is defined further down with the capture
+    * passes. */
+   nir_deref_instr *words =
+      nir_build_deref_struct(b, nir_build_deref_var(b, block), 0);
+
+   if (is_load) {
+      nir_def *channels[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned i = 0; i < components; ++i)
+         channels[i] = nir_load_deref(
+            b, nir_build_deref_array(b, words, nir_iadd_imm(b, word, i)));
+      nir_def_rewrite_uses(&intr->def, nir_vec(b, channels, components));
+   } else {
+      const unsigned mask = nir_intrinsic_write_mask(intr);
+      for (unsigned i = 0; i < components; ++i) {
+         if (!(mask & (1u << i)))
+            continue;
+         nir_store_deref(b,
+                         nir_build_deref_array(b, words,
+                                               nir_iadd_imm(b, word, i)),
+                         nir_channel(b, value, i), 0x1);
+      }
+   }
+   nir_instr_remove(instr);
+   return true;
+}
+
 /* `uniform_slots` is how many constant buffers WebGPU will take as uniform
  * buffers on this device. st/mesa reserves slot zero for the default uniform
  * block and reports MaxUniformBlocks as one less, so ARB_uniform_buffer_object
@@ -1403,6 +1583,46 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
          : GEX_WGPU_STORAGE_UBO_FIRST_BINDING + (slot - uniform_slots);
       var->data.explicit_binding = 1;
    }
+   /* Application shader storage blocks.
+    *
+    * These arrive as nir_var_mem_ssbo already and are never touched by the
+    * loop above, so without this they reach the shader walk with descriptor
+    * set 0 and are rejected for being in the wrong group. They are numbered
+    * by `gl_nir_lower_buffers` exactly as uniform blocks are -- the block
+    * index in driver_location, or the binding when the linker left the
+    * location alone -- and they get a binding range of their own so that the
+    * spill below cannot land on top of one.
+    *
+    * Done *before* the spill, because after it a spilled uniform block is
+    * indistinguishable from a storage block by mode alone. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
+      const unsigned slot = var->data.driver_location == UINT_MAX
+         ? var->data.binding : var->data.driver_location;
+      if (slot >= GEX_WGPU_MAX_SHADER_BUFFERS) {
+         if (why)
+            snprintf(why, why_len, "ssbo block slot=%u above max=%u", slot,
+                     (unsigned)GEX_WGPU_MAX_SHADER_BUFFERS);
+         return false;
+      }
+      var->data.driver_location = slot;
+      var->data.descriptor_set = stage == MESA_SHADER_VERTEX ? 1 : 2;
+      var->data.binding = GEX_WGPU_SSBO_FIRST_BINDING + slot;
+      var->data.explicit_binding = 1;
+   }
+
+   /* Now that the storage blocks carry their bindings, flatten them and turn
+    * their intrinsics into derefs the SPIR-V emitter can take. */
+   gex_wgpu_flatten_ssbo_blocks(nir);
+   {
+      struct gex_wgpu_ssbo_lowering ssbo_state = {0};
+      nir_shader_instructions_pass(nir, gex_wgpu_lower_ssbo_access,
+                                   nir_metadata_control_flow, &ssbo_state);
+      if (ssbo_state.failed) {
+         if (why) snprintf(why, why_len, "%s", ssbo_state.why);
+         return false;
+      }
+   }
+
    bool moved = false;
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo) {
       if (var->data.driver_location < uniform_slots)
@@ -4671,6 +4891,40 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
        * recording it once and ignoring the repeats is what the binding code
        * already assumes. Only a genuine disagreement -- one slot claimed by
        * two bindings, or one binding by two slots -- is a conflict. */
+      /* A real storage block goes in its own table: it is bound from
+       * ctx->shader_buffers, and its slot numbering is independent of the
+       * uniform blocks'. The binding range is what identifies it -- by this
+       * point a spilled uniform block has the same nir_var_mem_ssbo mode. */
+      if (var->data.binding >= GEX_WGPU_SSBO_FIRST_BINDING) {
+         const unsigned ssbo_slot = var->data.driver_location;
+         bool seen = false;
+         for (unsigned i = 0; i < shader->ssbo_count; ++i)
+            if (shader->ssbo_slots[i] == ssbo_slot) { seen = true; break; }
+         if (seen)
+            continue;
+         if (shader->ssbo_count >= GEX_WGPU_MAX_SHADER_BUFFERS ||
+             ssbo_slot >= GEX_WGPU_MAX_SHADER_BUFFERS) {
+            char detail[160];
+            snprintf(detail, sizeof(detail),
+                     "gex_wgpu shader storage block rejected: slot=%u "
+                     "binding=%u count=%u max=%u", ssbo_slot,
+                     var->data.binding, shader->ssbo_count,
+                     (unsigned)GEX_WGPU_MAX_SHADER_BUFFERS);
+            ralloc_free(nir);
+            FREE(shader);
+            gex_wgpu_set_compile_error(mutable_state, detail);
+            return NULL;
+         }
+         shader->ssbo_slots[shader->ssbo_count] = (uint8_t)ssbo_slot;
+         shader->ssbo_bindings[shader->ssbo_count] = var->data.binding;
+         /* nir_opt_access marks a block the shader only reads, and the
+          * SPIR-V emitter turns that into a read-only declaration. */
+         if (var->data.access & ACCESS_NON_WRITEABLE)
+            shader->ssbo_readonly_mask |= 1u << shader->ssbo_count;
+         ++shader->ssbo_count;
+         continue;
+      }
+
       bool duplicate = false, same_buffer = false;
       unsigned clash = ~0u;
       for (unsigned i = 0; i < shader->ubo_count; ++i) {
@@ -11066,23 +11320,15 @@ gex_wgpu_set_shader_buffers(struct pipe_context *pipe, mesa_shader_stage shader,
 {
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    (void)writable_bitmask;
-   if (start_slot + count > GEX_WGPU_MAX_SO_BUFFERS) {
+   if (shader >= MESA_SHADER_STAGES ||
+       start_slot + count > ARRAY_SIZE(ctx->shader_buffers[0])) {
       gex_fail(ctx);
       return;
    }
-   /* Only the compute stage can write one; a storage buffer bound to any
-    * other stage would be silently unused, so refuse it rather than pretend. */
-   if (shader != MESA_SHADER_COMPUTE) {
-      for (unsigned i = 0; buffers && i < count; ++i) {
-         if (buffers[i].buffer) {
-            gex_fail(ctx);
-            return;
-         }
-      }
-      return;
-   }
+   /* Every stage keeps its own, now that the graphics stages have shader
+    * storage blocks of their own rather than only the compute one. */
    for (unsigned i = 0; i < count; ++i) {
-      struct pipe_shader_buffer *slot = &ctx->shader_buffers[start_slot + i];
+      struct pipe_shader_buffer *slot = &ctx->shader_buffers[shader][start_slot + i];
       pipe_resource_reference(&slot->buffer, NULL);
       if (buffers && buffers[i].buffer) {
          pipe_resource_reference(&slot->buffer, buffers[i].buffer);
@@ -11130,7 +11376,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
       if (!(compute->so_mask & (1u << i)))
          continue;
-      const struct pipe_shader_buffer *slot = &ctx->shader_buffers[i];
+      const struct pipe_shader_buffer *slot =
+         &ctx->shader_buffers[MESA_SHADER_COMPUTE][i];
       if (!slot->buffer) {
          gex_fail(ctx);
          return;
@@ -18988,9 +19235,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    WGPUPipelineLayout explicit_pipeline_layout = NULL;
    /* The vertex group also carries the transform feedback capture buffers, so
     * a shader that captures needs it even with no uniform blocks. */
-   const bool needs_vertex_constant =
-      ctx->vs->ubo_count != 0;
-   const bool needs_fragment_constant = ctx->fs->ubo_count != 0;
+   /* Shader storage blocks ride in the same group as the stage's uniform
+    * blocks -- they were given the stage's descriptor set -- so a stage with
+    * storage blocks and no uniform blocks still needs the group. */
+   const unsigned vertex_group_count =
+      ctx->vs->ubo_count + ctx->vs->ssbo_count;
+   const unsigned fragment_group_count =
+      ctx->fs->ubo_count + ctx->fs->ssbo_count;
+   const bool needs_vertex_constant = vertex_group_count != 0;
+   const bool needs_fragment_constant = fragment_group_count != 0;
    const bool needs_texture = ctx->fs->texture_count != 0;
    bool missing_constant = false;
    static bool told_which;
@@ -19330,9 +19583,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * shader that declares enough uniform blocks. */
    WGPUBindGroupLayoutEntry
       vertex_layout_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
-                            GEX_WGPU_MAX_SO_BUFFERS];
+                            GEX_WGPU_MAX_SO_BUFFERS +
+                            GEX_WGPU_MAX_SHADER_BUFFERS];
    WGPUBindGroupLayoutEntry
-      fragment_layout_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+      fragment_layout_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
+                              GEX_WGPU_MAX_SHADER_BUFFERS];
    if (needs_texture) {
       for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
          texture_layout_entries[i] =
@@ -19387,6 +19642,36 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             &ctx->constant_buffers[MESA_SHADER_VERTEX][slot],
             ctx->vs->ubo_required[i]);
    }
+   /* The vertex stage's application storage blocks. Declared read-only:
+    * WGSL forbids a read_write storage variable in the vertex stage, so a
+    * shader that writes one cannot be served here at all -- but reading is
+    * both legal and common, and the layout has to say which it is. */
+   for (unsigned i = 0; i < ctx->vs->ssbo_count; ++i) {
+      const unsigned at = ctx->vs->ubo_count + i;
+      vertex_layout_entries[at] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      vertex_layout_entries[at].binding = ctx->vs->ssbo_bindings[i];
+      vertex_layout_entries[at].visibility = WGPUShaderStage_Vertex;
+      /* WGSL forbids a read_write storage variable in the vertex stage, so a
+       * shader that writes one cannot be served at all -- but the layout
+       * still has to agree with what the emitter declared, and a vertex block
+       * that is written would have been declared read_write. Say so rather
+       * than build a layout the device will reject without explanation. */
+      if (!(ctx->vs->ssbo_readonly_mask & (1u << i))) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: vertex storage block %u is written; "
+                    "WGSL has no writable storage in the vertex stage\n",
+                    ctx->vs->ssbo_slots[i]);
+         }
+         gex_fail(ctx);
+         return;
+      }
+      vertex_layout_entries[at].buffer.type =
+         WGPUBufferBindingType_ReadOnlyStorage;
+      vertex_layout_entries[at].buffer.hasDynamicOffset = false;
+   }
    for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
       const unsigned slot = ctx->fs->ubo_slots[i];
       const bool storage = ctx->fs->ubo_storage_mask & (1u << i);
@@ -19438,6 +19723,19 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             WGPUSamplerBindingType_NonFiltering;
       }
    }
+   /* The fragment stage's, which may be written. */
+   for (unsigned i = 0; i < ctx->fs->ssbo_count; ++i) {
+      const unsigned at = ctx->fs->ubo_count + i;
+      fragment_layout_entries[at] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      fragment_layout_entries[at].binding = ctx->fs->ssbo_bindings[i];
+      fragment_layout_entries[at].visibility = WGPUShaderStage_Fragment;
+      fragment_layout_entries[at].buffer.type =
+         (ctx->fs->ssbo_readonly_mask & (1u << i))
+            ? WGPUBufferBindingType_ReadOnlyStorage
+            : WGPUBufferBindingType_Storage;
+      fragment_layout_entries[at].buffer.hasDynamicOffset = false;
+   }
    const unsigned group_count = needs_vertex_texture ? 4
       : needs_fragment_constant ? 3
       : needs_vertex_constant ? 2 : needs_texture ? 1 : 0;
@@ -19449,10 +19747,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          desc.entryCount = ctx->fs->texture_count + ctx->fs->sampler_count;
          desc.entries = texture_layout_entries;
       } else if (group == 1 && needs_vertex_constant) {
-         desc.entryCount = ctx->vs->ubo_count;
+         desc.entryCount = vertex_group_count;
          desc.entries = vertex_layout_entries;
       } else if (group == 2 && needs_fragment_constant) {
-         desc.entryCount = ctx->fs->ubo_count;
+         desc.entryCount = fragment_group_count;
          desc.entries = fragment_layout_entries;
       } else if (group == 3 && needs_vertex_texture) {
          desc.entryCount = ctx->vs->texture_count + ctx->vs->sampler_count;
@@ -19665,7 +19963,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       /* Uniform blocks plus the transform feedback capture buffers, which
        * are written by the vertex stage and so live in this group. */
       WGPUBindGroupEntry
-         entries[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SO_BUFFERS];
+         entries[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SO_BUFFERS +
+                 GEX_WGPU_MAX_SHADER_BUFFERS];
       for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
          const unsigned slot = ctx->vs->ubo_slots[i];
          const struct pipe_constant_buffer *constant =
@@ -19680,16 +19979,43 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                      ctx->vs->ubo_bindings[i],
                                      constant->buffer_offset);
       }
+      /* The vertex stage's storage blocks, from ctx->shader_buffers rather
+       * than from the constant buffers: GL numbers them separately and binds
+       * them through set_shader_buffers. A block the shader declares with no
+       * buffer bound is a draw WebGPU would reject, so it is refused here
+       * where the reason can still be named. */
+      for (unsigned i = 0; i < ctx->vs->ssbo_count; ++i) {
+         const unsigned at = ctx->vs->ubo_count + i;
+         const unsigned slot = ctx->vs->ssbo_slots[i];
+         const struct pipe_shader_buffer *sb =
+            &ctx->shader_buffers[MESA_SHADER_VERTEX][slot];
+         if (!sb->buffer) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: vertex storage block %u has no "
+                       "buffer bound\n", slot);
+            }
+            gex_fail(ctx);
+            return;
+         }
+         entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[at].binding = ctx->vs->ssbo_bindings[i];
+         entries[at].buffer = gex_resource(sb->buffer)->buffer;
+         entries[at].offset = sb->buffer_offset;
+         entries[at].size = sb->buffer_size;
+      }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[1];
-      bind_desc.entryCount = ctx->vs->ubo_count;
+      bind_desc.entryCount = vertex_group_count;
       bind_desc.entries = entries;
       bind_groups[1] = gex_wgpu_cached_bind_group(
          screen, bind_desc.layout, bind_desc.entries,
          bind_desc.entryCount);
    }
    if (pipeline && needs_fragment_constant) {
-      WGPUBindGroupEntry entries[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+      WGPUBindGroupEntry entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
+                                 GEX_WGPU_MAX_SHADER_BUFFERS];
       for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
          const unsigned slot = ctx->fs->ubo_slots[i];
          const struct pipe_constant_buffer *constant =
@@ -19704,9 +20030,31 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                      ctx->fs->ubo_bindings[i],
                                      constant->buffer_offset);
       }
+      /* Same for the fragment stage, which may also write them. */
+      for (unsigned i = 0; i < ctx->fs->ssbo_count; ++i) {
+         const unsigned at = ctx->fs->ubo_count + i;
+         const unsigned slot = ctx->fs->ssbo_slots[i];
+         const struct pipe_shader_buffer *sb =
+            &ctx->shader_buffers[MESA_SHADER_FRAGMENT][slot];
+         if (!sb->buffer) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: fragment storage block %u has no "
+                       "buffer bound\n", slot);
+            }
+            gex_fail(ctx);
+            return;
+         }
+         entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[at].binding = ctx->fs->ssbo_bindings[i];
+         entries[at].buffer = gex_resource(sb->buffer)->buffer;
+         entries[at].offset = sb->buffer_offset;
+         entries[at].size = sb->buffer_size;
+      }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[2];
-      bind_desc.entryCount = ctx->fs->ubo_count;
+      bind_desc.entryCount = fragment_group_count;
       bind_desc.entries = entries;
       bind_groups[2] = gex_wgpu_cached_bind_group(
          screen, bind_desc.layout, bind_desc.entries,
@@ -20221,7 +20569,8 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
       pipe_so_target_reference(&ctx->so_targets[i], NULL);
    pipe_resource_reference(&ctx->uploaded_indices, NULL);
-      pipe_resource_reference(&ctx->shader_buffers[i].buffer, NULL);
+      for (unsigned st = 0; st < MESA_SHADER_STAGES; ++st)
+         pipe_resource_reference(&ctx->shader_buffers[st][i].buffer, NULL);
    }
    for (unsigned i = 0; i < ARRAY_SIZE(ctx->provoking_cache); ++i) {
       FREE(ctx->provoking_cache[i].indices);
@@ -20704,6 +21053,10 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    caps->supported_prim_modes = GEX_WGPU_PRIM_MODES;
    /* Restart is resolved on the CPU by splitting the draw, which works for
     * every topology the driver takes. */
+   /* WebGPU requires a storage binding offset to be 256-byte aligned, and
+    * st/mesa honours this when it sub-allocates a shader storage block. */
+   caps->shader_buffer_offset_alignment = 256;
+   caps->max_shader_buffer_size = screen->max_storage_buffer_size;
    caps->supported_prim_modes_with_restart = GEX_WGPU_PRIM_MODES;
    caps->primitive_restart = true;
    caps->primitive_restart_fixed_index = true;
@@ -20919,7 +21272,23 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
               screen->max_uniform_buffers + screen->max_storage_buffers_vertex);
       caps->max_texture_samplers = GEX_WGPU_MAX_SAMPLERS;
       caps->max_sampler_views = GEX_WGPU_MAX_SAMPLERS;
-      caps->max_shader_buffers = 0;
+      /* Shader storage buffers, the first rung above GL 3.3: st_extensions
+       * exposes ARB_shader_storage_buffer_object on the strength of the
+       * fragment stage's count alone, and gates image load/store and compute
+       * behind storage of their own. WebGPU has storage buffers natively --
+       * unlike polygon mode or logic ops, this is a feature the target has.
+       *
+       * The vertex stage gets them too, but WGSL forbids the *writable* kind
+       * there ("var with 'storage' address space and 'read_write' access mode
+       * cannot be used by vertex pipeline stage"), so its bindings are
+       * declared read-only. GL allows a vertex-stage write and this cannot
+       * serve one. */
+      caps->max_shader_buffers =
+         stages[i] == MESA_SHADER_FRAGMENT ||
+         stages[i] == MESA_SHADER_VERTEX ||
+         stages[i] == MESA_SHADER_COMPUTE
+            ? MIN2(GEX_WGPU_MAX_SHADER_BUFFERS, screen->max_storage_buffers)
+            : 0;
       caps->max_shader_images = 0;
       caps->max_hw_atomic_counters = 0;
       caps->max_hw_atomic_counter_buffers = 0;
@@ -21048,6 +21417,8 @@ gex_wgpu_screen_create(WGPUDevice device)
    WGPULimits limits = WGPU_LIMITS_INIT;
    screen->max_uniform_buffers = 12;      /* WebGPU's guaranteed minimum */
    screen->max_storage_buffers_vertex = 0;
+   screen->max_storage_buffers = 0;
+   screen->max_storage_buffer_size = 0;
    const bool got_limits =
       wgpuDeviceGetLimits(device, &limits) == WGPUStatus_Success;
    if (got_limits) {
@@ -21064,6 +21435,14 @@ gex_wgpu_screen_create(WGPUDevice device)
             : limits.maxStorageBuffersInVertexStage;
       if (screen->max_storage_buffers_vertex == WGPU_LIMIT_U32_UNDEFINED)
          screen->max_storage_buffers_vertex = 0;
+      /* Same undefined-means-absent rule as the vertex figure above. */
+      screen->max_storage_buffers =
+         limits.maxStorageBuffersPerShaderStage == WGPU_LIMIT_U32_UNDEFINED
+            ? 0 : limits.maxStorageBuffersPerShaderStage;
+      screen->max_storage_buffer_size =
+         limits.maxStorageBufferBindingSize == WGPU_LIMIT_U64_UNDEFINED
+            ? 0 : (uint32_t)MIN2(limits.maxStorageBufferBindingSize,
+                                 (uint64_t)UINT32_MAX);
    }
    /* The caps are sized from these, so a limit the device did not grant is a
     * GL feature the frontend will not enable. Report them rather than leaving
