@@ -2426,7 +2426,8 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
     *
     * Done *before* the spill, because after it a spilled uniform block is
     * indistinguishable from a storage block by mode alone. */
-   unsigned ssbo_index = 0;
+   const struct glsl_type *ssbo_blocks[GEX_WGPU_MAX_SHADER_BUFFERS] = {0};
+   unsigned ssbo_seen = 0;
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
       /* st/mesa binds storage buffers at consecutive slots in block-index
        * order -- set_shader_buffers(stage, 0, num_ssbos, ...) -- so the slot
@@ -2443,11 +2444,38 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
        * anywhere -- the placeholder exists precisely so that reads a driver
        * cannot satisfy return zeros instead of failing.
        *
-       * The enumeration order of the variable list *is* the block order: the
-       * vertex halves, which do carry driver_location, agree with it. */
+       * The enumeration order of the variable list is the block order -- the
+       * vertex halves, which do carry driver_location, agree with it -- but
+       * it has to be counted in *blocks*, not in variables. A block declared
+       * without an instance name gets one variable per member:
+       * KHR-GL44.shader_bitfield_operation's single `buffer Data { ... }` of
+       * fourteen members arrives as fourteen variables, all with binding 0 and
+       * the same interface type, and counting them gave thirteen storage
+       * buffers that do not exist. WebGPU then refused the layout outright --
+       * "the number of storage buffers (12) in the Compute stage exceeds the
+       * maximum per-stage limit (10)" -- so the pipeline was invalid, the
+       * dispatch never ran, and every case whose inputs were not already zero
+       * failed. 273 of that family's 324.
+       *
+       * The interface type is what says which block a member belongs to, so
+       * distinct interface types are what get counted. */
+      unsigned block_index = ssbo_seen;
+      if (var->interface_type) {
+         bool found = false;
+         for (unsigned i = 0; i < ssbo_seen; ++i)
+            if (ssbo_blocks[i] == var->interface_type) {
+               block_index = i;
+               found = true;
+               break;
+            }
+         if (!found && ssbo_seen < ARRAY_SIZE(ssbo_blocks))
+            ssbo_blocks[ssbo_seen++] = var->interface_type;
+      } else if (ssbo_seen < ARRAY_SIZE(ssbo_blocks)) {
+         /* No interface type to group by, so it can only be its own block. */
+         ssbo_blocks[ssbo_seen++] = NULL;
+      }
       const unsigned slot = var->data.driver_location == UINT_MAX
-         ? ssbo_index : var->data.driver_location;
-      ++ssbo_index;
+         ? block_index : var->data.driver_location;
       if (slot >= GEX_WGPU_MAX_SHADER_BUFFERS) {
          if (why)
             snprintf(why, why_len, "ssbo block slot=%u above max=%u", slot,
@@ -14252,6 +14280,17 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
       ++compute->image_count;
    }
 
+   if (getenv("GEX_WGPU_COMPUTE_LAYOUT_TRACE")) {
+      fprintf(stderr, "gex-cvars: num_ubos=%u num_ssbos=%u\n",
+              nir->info.num_ubos, nir->info.num_ssbos);
+      nir_foreach_variable_with_modes(var, nir,
+                                      nir_var_mem_ubo | nir_var_mem_ssbo)
+         fprintf(stderr, "gex-cvars:   %s '%s' loc=%u binding=%u set=%u\n",
+                 var->data.mode == nir_var_mem_ssbo ? "ssbo" : "ubo ",
+                 var->name ? var->name : "(anon)", var->data.driver_location,
+                 var->data.binding, var->data.descriptor_set);
+   }
+
    /* The texture and sampler halves the split pass just created. The same
     * collection the graphics stages do, minus the cases a compute shader
     * cannot reach here: a samplerBuffer becomes a storage buffer through
@@ -14669,6 +14708,26 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       ++count;
    }
 
+   if (getenv("GEX_WGPU_COMPUTE_LAYOUT_TRACE")) {
+      unsigned storage = 0, uniform = 0;
+      for (unsigned i = 0; i < count; ++i) {
+         if (entries[i].buffer.type == WGPUBufferBindingType_Storage ||
+             entries[i].buffer.type == WGPUBufferBindingType_ReadOnlyStorage)
+            ++storage;
+         else if (entries[i].buffer.type == WGPUBufferBindingType_Uniform)
+            ++uniform;
+      }
+      fprintf(stderr, "gex-clayout: entries=%u storage=%u uniform=%u "
+              "(blocks=%u images=%u textures=%u)\n", count, storage, uniform,
+              compute->binding_count, compute->image_count,
+              compute->texture_count);
+      for (unsigned i = 0; i < compute->binding_count; ++i)
+         fprintf(stderr, "gex-clayout:   block[%u] binding=%u slot=%u kind=%u "
+                 "readonly=%d required=%u\n", i,
+                 compute->bindings[i].binding, compute->bindings[i].slot,
+                 compute->bindings[i].kind, (int)compute->bindings[i].readonly,
+                 compute->bindings[i].required);
+   }
    WGPUBindGroupLayoutDescriptor layout_desc =
       WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    layout_desc.entryCount = count;
@@ -27695,7 +27754,17 @@ gex_wgpu_init_nir_options(struct gex_wgpu_screen *screen)
          nir_lower_imul_2x32_64 | nir_lower_extract64 | nir_lower_ufind_msb64 |
          nir_lower_bit_count64 | nir_lower_find_lsb64 | nir_lower_conv64 |
          nir_lower_uadd_sat64 | nir_lower_usub_sat64 | nir_lower_iadd_sat64 |
-         nir_lower_bitfield_reverse64 | nir_lower_bitfield_extract64),
+         nir_lower_bitfield_reverse64 | nir_lower_bitfield_extract64 |
+         /* The rest of the enum, because "any 64-bit operation" has to mean
+          * all of them: one that survives reaches Tint as a 64-bit integer
+          * and is refused there ("unhandled integer width: 64"), which is a
+          * whole shader lost for one instruction. The subgroup and scan
+          * entries cannot arise while this driver advertises no subgroup
+          * extension, and are set for the same reason: the list should not
+          * need revisiting when one is added. */
+         nir_lower_iadd3_64 | nir_lower_scan_reduce_bitwise64 |
+         nir_lower_scan_reduce_iadd64 | nir_lower_subgroup_shuffle64 |
+         nir_lower_vote_ieq64),
       .lower_scmp = true,
       .lower_hadd = true,
       .lower_iadd_sat = true,
