@@ -16310,6 +16310,19 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
                              struct gex_wgpu_shader *vs,
                              const struct gex_wgpu_capture_layout *layout)
 {
+   /* The same reason the varying variant declines one: a vertex stage's
+    * texture and sampler live in descriptor set 3, and a compute dispatch has
+    * only group zero, so the pipeline is invalid and takes the command buffer
+    * with it. Transform feedback reaches this one. */
+   if (vs->texture_count || vs->sampler_count) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: no capture variant for a vertex shader "
+                         "that samples a texture (transform feedback)\n");
+      }
+      return NULL;
+   }
    for (struct gex_wgpu_capture_variant *v = vs->captures; v; v = v->next)
       if (!memcmp(&v->layout, layout, sizeof(*layout)))
          return v;
@@ -16501,6 +16514,36 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
                              const struct gex_wgpu_capture_layout *vertex,
                              const struct gex_wgpu_varying_layout *varyings)
 {
+   /* A vertex shader that samples a texture cannot be run as compute here:
+    * the split pass puts a vertex stage's texture and sampler in descriptor
+    * set 3 -- the graphics stages each have a set of their own -- and a
+    * compute dispatch has one bind group, number zero, which is why the
+    * pipeline comes out invalid:
+    *
+    *   The entry-point uses bindings in group 3 but [PipelineLayout] doesn't
+    *   have a BindGroupLayout for this index
+    *
+    * An invalid compute pipeline makes the command buffer invalid, so the
+    * submit fails and *everything recorded with it* is lost -- far worse than
+    * the path declining. Two of this function's four callers already checked
+    * this; the geometry and tessellation paths did not, which is how three
+    * KHR-GL44.texture_view cases reached it. Checking here covers all of
+    * them, including whichever is added next.
+    *
+    * Lifting this needs what the compute path got: the variant's textures
+    * remapped into group zero and bound by the dispatch. Until then a
+    * geometry or tessellation draw whose vertex shader samples is declined
+    * rather than mis-submitted. */
+   if (vs->texture_count || vs->sampler_count) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: no capture variant for a vertex shader "
+                         "that samples a texture (%u textures, %u samplers)\n",
+                 vs->texture_count, vs->sampler_count);
+      }
+      return NULL;
+   }
    for (struct gex_wgpu_varying_variant *v = vs->varyings; v; v = v->next) {
       if (!memcmp(&v->vertex_layout, vertex, sizeof(*vertex)) &&
           !memcmp(&v->varyings, varyings, sizeof(*varyings)))
