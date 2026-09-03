@@ -468,6 +468,10 @@ struct gex_wgpu_context {
     * pass writes for them. See gex_wgpu_line_draw. */
    struct gex_wgpu_line_quad *line_quads;
    struct pipe_resource *line_vs_out;
+   /* The varying a smooth line's coverage rides on while one is being drawn,
+    * or ~0u. Both stages are given the same number, which is what makes the
+    * quad shader's output and the fragment variant's input one @location. */
+   unsigned line_smooth_location;
    /* De-indexed vertex buffers, kept across draws and grown as needed: an
     * indexed point draw gathers the vertices it references into these and is
     * then bound to them instead of to the application's. The mask says which
@@ -832,6 +836,8 @@ struct gex_wgpu_shader_variant {
    /* Whether this variant discards the corners of the point, for
     * GL_POINT_SMOOTH. */
    bool point_smooth;
+   /* The varying this variant reads a smooth line's coverage from, or ~0u. */
+   unsigned line_smooth_location;
    /* The polygon stipple this variant baked in as immediates. Not the
     * framebuffer height: the row index does not depend on it, see
     * gex_wgpu_lower_poly_stipple. */
@@ -1012,6 +1018,8 @@ struct gex_wgpu_capture_variant {
 struct gex_wgpu_line_quad {
    struct gex_wgpu_varying_layout layout;
    unsigned segment_records;
+   /* The varying this shader emits the smooth-line coverage on, or ~0u. */
+   unsigned smooth_location;
    struct gex_wgpu_shader *shader;
    struct gex_wgpu_vertex_elements *elements;
    struct gex_wgpu_line_quad *next;
@@ -3205,6 +3213,76 @@ gex_wgpu_lower_point_smooth(nir_shader *nir, unsigned location)
    return true;
 }
 
+/* GL_LINE_SMOOTH: alpha multiplied by the fragment's coverage of the line.
+ *
+ * GL antialiases a line by taking the fraction of the fragment square covered
+ * by the line's rectangle and multiplying it into alpha. The quad expansion
+ * gives that away almost for free: the corner attribute's `side` runs from -1
+ * to +1 across the line, so an interpolated varying carrying `side` scaled by
+ * the *widened* half-width is the fragment's distance from the line's centre
+ * in pixels, and the coverage falls off over the last pixel of the original
+ * half-width.
+ *
+ * The varying's second component carries that original half-width, which is a
+ * per-draw scalar the fragment stage would otherwise have no way to see --
+ * both endpoints get the same value, so interpolating it is a constant.
+ * Baking it into the module instead would key a shader variant on the line
+ * width, and applications change that.
+ *
+ * Only alpha, and only the colour outputs: this is what GL specifies, and it
+ * is visible only where the program also blends -- which is exactly when it
+ * asked for GL_LINE_SMOOTH. The *shape* still changes without blending,
+ * because the quad is a pixel wider, which is what llvmpipe does too.
+ */
+struct gex_wgpu_line_smooth {
+   nir_variable *coverage;
+   bool any;
+};
+
+static bool
+gex_wgpu_lower_line_smooth_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                                 void *data)
+{
+   struct gex_wgpu_line_smooth *state = data;
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_shader_out ||
+       var->data.location < FRAG_RESULT_DATA0 ||
+       intr->src[1].ssa->num_components < 4)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *value = intr->src[1].ssa;
+   nir_def *edge = nir_load_var(b, state->coverage);
+   nir_def *distance = nir_fabs(b, nir_channel(b, edge, 0));
+   nir_def *half = nir_channel(b, edge, 1);
+   /* One pixel of falloff at the edge, clamped: fully covered inside
+    * `half - 0.5`, empty beyond `half + 0.5`. */
+   nir_def *coverage =
+      nir_fsat(b, nir_fadd_imm(b, nir_fsub(b, half, distance), 0.5f));
+   nir_src_rewrite(&intr->src[1],
+                   nir_vector_insert_imm(
+                      b, value,
+                      nir_fmul(b, nir_channel(b, value, 3), coverage), 3));
+   state->any = true;
+   return true;
+}
+
+static bool
+gex_wgpu_lower_line_smooth(nir_shader *nir, unsigned location)
+{
+   struct gex_wgpu_line_smooth state = {0};
+   state.coverage = nir_variable_create(nir, nir_var_shader_in,
+                                        glsl_vec2_type(), "gex_line_edge");
+   state.coverage->data.location = VARYING_SLOT_VAR0 + location;
+   state.coverage->data.driver_location = location;
+   state.coverage->data.interpolation = INTERP_MODE_NONE;
+   nir_shader_intrinsics_pass(nir, gex_wgpu_lower_line_smooth_instr,
+                              nir_metadata_control_flow, &state);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   return state.any;
+}
+
 /* The @location to give the corner attribute: the lowest one this shader does
  * not already declare. WebGPU takes sixteen vertex attributes, so a shader
  * using all of them cannot have another and the draw goes unexpanded. */
@@ -5045,6 +5123,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    const unsigned point_coord_location =
       drawing_points && ctx->point_expand.active
          ? ctx->point_expand.coord_location : ~0u;
+   /* GL_LINE_SMOOTH's coverage varying, written by the wide-line quad shader
+    * and read here. */
+   const unsigned line_smooth_location = ctx->line_smooth_location;
    /* GL_POINT_SMOOTH, which needs the sprite coordinate whether or not the
     * shader itself reads it -- the decision in draw_vbo_inner asks for the
     * varying on its behalf. */
@@ -5062,6 +5143,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
     * reading gl_PointCoord and nothing else was already right. */
    if (point_coord_location != ~0u)
       produced |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + point_coord_location);
+   /* And the quad shader writes the smooth-line coverage, for the same
+    * reason: the unproduced-input pass cannot tell one shader_in from
+    * another and would zero it. */
+   if (line_smooth_location != ~0u)
+      produced |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + line_smooth_location);
    uint64_t unproduced = 0;
    if (ctx->vs && fs->original_nir) {
       nir_foreach_shader_in_variable(var, fs->original_nir) {
@@ -5084,7 +5170,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
     * "the variant is built" and "the variant is reached" are separate
     * claims. */
    if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
-       !want_stipple && point_coord_location == ~0u && !want_point_smooth)
+       !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
+       line_smooth_location == ~0u)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -5187,7 +5274,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    const bool needs_variant =
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
-      want_point_smooth;
+      want_point_smooth || line_smooth_location != ~0u;
    if (!needs_variant)
       return fs->module;
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
@@ -5197,6 +5284,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
                    cached->coord_replace == coord_replace &&
                    cached->point_coord_location == point_coord_location &&
                    cached->point_smooth == want_point_smooth &&
+                   cached->line_smooth_location == line_smooth_location &&
                    cached->unproduced == unproduced &&
                    cached->poly_stipple == want_stipple &&
                    (!want_stipple ||
@@ -5264,6 +5352,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       gex_wgpu_drop_unproduced_inputs(variant, produced, sprite_locations);
    if (want_point_smooth)
       gex_wgpu_lower_point_smooth(variant, point_coord_location);
+   if (line_smooth_location != ~0u)
+      gex_wgpu_lower_line_smooth(variant, line_smooth_location);
    if (point_coord_location != ~0u && getenv("GEX_WGPU_POINT_NIR")) {
       static unsigned told;
       if (told < 6) { ++told;
@@ -5304,6 +5394,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    cached->coord_replace = coord_replace;
    cached->point_coord_location = point_coord_location;
    cached->point_smooth = want_point_smooth;
+   cached->line_smooth_location = line_smooth_location;
    cached->unproduced = unproduced;
    cached->poly_stipple = want_stipple;
    memcpy(cached->stipple, ctx->poly_stipple, sizeof(cached->stipple));
@@ -5361,6 +5452,11 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
    supported.depth_clip_far = state->depth_clip_far;
    supported.flatshade = state->flatshade;
    supported.point_smooth = state->point_smooth;
+   /* GL_LINE_SMOOTH, which the wide-line expansion answers: the quad is
+    * widened by a pixel and the fragment stage multiplies alpha by the
+    * fragment's coverage of the line's rectangle. See
+    * gex_wgpu_lower_line_smooth. */
+   supported.line_smooth = state->line_smooth;
    supported.sprite_coord_mode = state->sprite_coord_mode;
    supported.point_quad_rasterization = state->point_quad_rasterization;
    supported.point_line_tri_clip = state->point_line_tri_clip;
@@ -12594,7 +12690,8 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
  */
 static nir_shader *
 gex_wgpu_line_quad_nir(struct pipe_context *pipe,
-                       const struct gex_wgpu_varying_layout *layout)
+                       const struct gex_wgpu_varying_layout *layout,
+                       unsigned smooth_location)
 {
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_VERTEX, pipe->screen->nir_options[MESA_SHADER_VERTEX],
@@ -12634,6 +12731,21 @@ gex_wgpu_line_quad_nir(struct pipe_context *pipe,
    nir_def *half_x = nir_channel(&b, c, 2);
    nir_def *half_y = nir_channel(&b, c, 3);
    nir_def *aspect = nir_channel(&b, p, 0);
+   /* GL_LINE_SMOOTH: how far across the line this corner is, in pixels, and
+    * the half-width the coverage falls off around. Both endpoints carry the
+    * same second component, so interpolating it leaves a constant the
+    * fragment stage can use. */
+   if (smooth_location != ~0u) {
+      nir_variable *edge = nir_variable_create(b.shader, nir_var_shader_out,
+                                               glsl_vec2_type(),
+                                               "gex_line_edge");
+      edge->data.location = VARYING_SLOT_VAR0 + smooth_location;
+      edge->data.driver_location = smooth_location;
+      edge->data.interpolation = INTERP_MODE_NONE;
+      nir_store_var(&b, edge,
+                    nir_vec2(&b, nir_fmul(&b, side, nir_channel(&b, p, 1)),
+                             nir_channel(&b, p, 2)), 0x3);
+   }
 
    nir_def *position_a = nir_load_var(&b, ends[0][0]);
    nir_def *position_b = nir_load_var(&b, ends[1][0]);
@@ -12649,13 +12761,35 @@ gex_wgpu_line_quad_nir(struct pipe_context *pipe,
                           nir_fdiv(&b, nir_channel(&b, position_a, 0), w_a));
    nir_def *dy = nir_fsub(&b, nir_fdiv(&b, nir_channel(&b, position_b, 1), w_b),
                           nir_fdiv(&b, nir_channel(&b, position_a, 1), w_a));
-   nir_def *major_x = nir_fge(&b, nir_fmul(&b, nir_fabs(&b, dx), aspect),
-                              nir_fabs(&b, dy));
-   nir_def *zero = nir_imm_float(&b, 0.0f);
-   nir_def *offset_x =
-      nir_bcsel(&b, major_x, zero, nir_fmul(&b, side, half_x));
-   nir_def *offset_y =
-      nir_bcsel(&b, major_x, nir_fmul(&b, side, half_y), zero);
+   nir_def *offset_x, *offset_y;
+   if (smooth_location != ~0u) {
+      /* An *antialiased* wide line is a rectangle of width w centred on the
+       * segment -- GL says so, and it is a different rule from the aliased
+       * one below. So this offset is perpendicular rather than axis-aligned,
+       * and llvmpipe's footprint says the same: a smooth five-pixel diagonal
+       * reaches wider in x than an aliased one does.
+       *
+       * The perpendicular is taken in pixel space. (dx*aspect, dy) is
+       * proportional to the pixel-space direction, so its normal is the one
+       * wanted; scaling each component by that axis's half-width converts
+       * back to clip space. */
+      nir_def *ux = nir_fmul(&b, dx, aspect);
+      nir_def *length = nir_fmax(&b,
+                                 nir_fsqrt(&b, nir_fadd(&b,
+                                                        nir_fmul(&b, ux, ux),
+                                                        nir_fmul(&b, dy, dy))),
+                                 nir_imm_float(&b, 1e-6f));
+      nir_def *nx = nir_fdiv(&b, nir_fneg(&b, dy), length);
+      nir_def *ny = nir_fdiv(&b, ux, length);
+      offset_x = nir_fmul(&b, side, nir_fmul(&b, nx, half_x));
+      offset_y = nir_fmul(&b, side, nir_fmul(&b, ny, half_y));
+   } else {
+      nir_def *major_x = nir_fge(&b, nir_fmul(&b, nir_fabs(&b, dx), aspect),
+                                 nir_fabs(&b, dy));
+      nir_def *zero = nir_imm_float(&b, 0.0f);
+      offset_x = nir_bcsel(&b, major_x, zero, nir_fmul(&b, side, half_x));
+      offset_y = nir_bcsel(&b, major_x, nir_fmul(&b, side, half_y), zero);
+   }
 
    nir_def *position = nir_bcsel(&b, is_b, position_b, position_a);
    nir_def *w = nir_channel(&b, position, 3);
@@ -12698,10 +12832,11 @@ gex_wgpu_line_quad_nir(struct pipe_context *pipe,
 static struct gex_wgpu_line_quad *
 gex_wgpu_line_quad_get(struct gex_wgpu_context *ctx,
                        const struct gex_wgpu_varying_layout *layout,
-                       unsigned segment_records)
+                       unsigned segment_records, unsigned smooth_location)
 {
    for (struct gex_wgpu_line_quad *q = ctx->line_quads; q; q = q->next)
       if (q->segment_records == segment_records &&
+          q->smooth_location == smooth_location &&
           !memcmp(&q->layout, layout, sizeof(*layout)))
          return q;
 
@@ -12717,10 +12852,11 @@ gex_wgpu_line_quad_get(struct gex_wgpu_context *ctx,
       return NULL;
    quad->layout = *layout;
    quad->segment_records = segment_records;
+   quad->smooth_location = smooth_location;
 
    struct pipe_shader_state state = {0};
    state.type = PIPE_SHADER_IR_NIR;
-   state.ir.nir = gex_wgpu_line_quad_nir(&ctx->base, layout);
+   state.ir.nir = gex_wgpu_line_quad_nir(&ctx->base, layout, smooth_location);
    state.report_compile_error = true;
    quad->shader = state.ir.nir
       ? gex_wgpu_create_shader_state(&ctx->base, &state, MESA_SHADER_VERTEX)
@@ -13980,6 +14116,17 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
 
    struct gex_wgpu_varying_layout varyings;
    gex_wgpu_line_varyings(ctx, &varyings);
+   /* A smooth line needs one varying for its coverage, on a location neither
+    * stage uses -- the same search the sprite coordinate makes. Without one
+    * the line is still drawn, just aliased. */
+   const bool smooth = ctx->rasterizer->line_smooth;
+   unsigned smooth_location = ~0u;
+   if (smooth) {
+      smooth_location = gex_wgpu_point_coord_location(ctx);
+      if (smooth_location != ~0u &&
+          varyings.count + 1 > GEX_WGPU_MAX_VARYINGS)
+         smooth_location = ~0u;
+   }
    if (getenv("GEX_WGPU_LINE_LOG")) {
       static unsigned told;
       if (told < 8) { ++told;
@@ -13990,7 +14137,8 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
                  varyings.count); }
    }
    struct gex_wgpu_line_quad *quad =
-      gex_wgpu_line_quad_get(ctx, &varyings, segment_records);
+      gex_wgpu_line_quad_get(ctx, &varyings, segment_records,
+                             smooth_location);
    if (!quad)
       GEX_LINE_DECLINE("no quad shader for this varying layout");
 
@@ -14095,8 +14243,12 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
    if (vp_width <= 0.0f || vp_height <= 0.0f)
       GEX_LINE_DECLINE("empty viewport");
    const float half = 0.5f * MAX2(ctx->rasterizer->line_width, 1.0f);
-   const float half_x = half * 2.0f / vp_width;
-   const float half_y = half * 2.0f / vp_height;
+   /* A smooth line is drawn a pixel wider, and the fragment stage fades the
+    * outer half-pixel out. Without the widening there would be nothing for
+    * the coverage to fall off across. */
+   const float widened = smooth_location != ~0u ? half + 0.5f : half;
+   const float half_x = widened * 2.0f / vp_width;
+   const float half_y = widened * 2.0f / vp_height;
    /* Triangle one is (A,-) (B,-) (B,+); triangle two is (A,-) (B,+) (A,+). */
    static const int8_t corners[6][2] = {
       {0, -1}, {1, -1}, {1, 1}, {0, -1}, {1, 1}, {0, 1},
@@ -14108,8 +14260,8 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
       corner_data[i][2] = half_x;
       corner_data[i][3] = half_y;
       corner_data[i][4] = vp_width / vp_height;
-      corner_data[i][5] = 0.0f;
-      corner_data[i][6] = 0.0f;
+      corner_data[i][5] = widened;
+      corner_data[i][6] = half;
       corner_data[i][7] = 0.0f;
    }
    unsigned corner_offset = 0;
@@ -14135,6 +14287,7 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
    }
    const unsigned saved_count = ctx->vertex_buffer_count;
 
+   ctx->line_smooth_location = smooth_location;
    ctx->vs = quad->shader;
    ctx->vertex_elements = quad->elements;
    ctx->vertex_buffers[0] = ctx->line_vs_out;
@@ -14160,6 +14313,7 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
    gex_wgpu_draw_vbo(&ctx->base, &raster, drawid_offset, NULL, &raster_draw, 1);
    ctx->line_rewritten = false;
 
+   ctx->line_smooth_location = ~0u;
    ctx->vs = saved_vs;
    ctx->vertex_elements = saved_elements;
    for (unsigned i = 0; i < 3; ++i) {
@@ -19086,6 +19240,13 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
     * data, without checking it, so leaving it null faults inside u_upload
     * rather than anywhere near this driver.
     */
+   /* ~0u, not the zero CALLOC leaves: zero is a *valid* varying location, so
+    * an uninitialised value had every fragment variant believe a smooth
+    * line's coverage varying was in play -- declaring an input at location 0,
+    * marking that slot produced, and multiplying alpha by whatever was there.
+    * Nineteen of the native probes went from identical-to-llvmpipe to failing
+    * in one build. */
+   ctx->line_smooth_location = ~0u;
    ctx->base.stream_uploader = u_upload_create_default(&ctx->base);
    if (!ctx->base.stream_uploader) {
       ctx->base.destroy(&ctx->base);
@@ -19534,12 +19695,19 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * so the range is a real one rather than WebGPU's single pixel. 255 is
     * llvmpipe's, which is what the pixel comparison measures against. */
    caps->max_point_size = 255.0f;
+   /* And the antialiased ranges, which GL keeps separate and st/mesa clamps
+    * against separately. Leaving these at their default had GL_LINE_SMOOTH
+    * clamp a five-pixel line back to one, so a smooth line came out two
+    * pixels wide where an aliased one came out five -- the expansion was
+    * working and being handed a width of 1. */
+   caps->max_point_size_aa = 255.0f;
    caps->min_line_width = 1.0f;
    /* Wide lines are expanded into quads -- see gex_wgpu_line_draw -- so the
     * range is a real one rather than WebGPU's single pixel. At 1.0 st/mesa
     * clamped every glLineWidth before the driver saw it, exactly as it
     * clamped point size. */
    caps->max_line_width = 255.0f;
+   caps->max_line_width_aa = 255.0f;
    caps->point_size_granularity = 0.1f;
    caps->line_width_granularity = 0.1f;
 
