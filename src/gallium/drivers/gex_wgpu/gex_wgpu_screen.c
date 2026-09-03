@@ -18312,6 +18312,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    int8_t vb_slot[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS][2];
    uint8_t vb_buffer[GEX_WGPU_MAX_VERTEX_BUFFERS] = {0};
    bool vb_instanced[GEX_WGPU_MAX_VERTEX_BUFFERS] = {0};
+   /* Per-slot stride, kept for the base-instance offset below: an
+    * instance-stepped slot is advanced by base * stride rather than the base
+    * being passed to the draw. */
+   uint32_t vb_stride[GEX_WGPU_MAX_VERTEX_BUFFERS] = {0};
    unsigned vb_slot_count = 0;
    memset(vb_slot, -1, sizeof(vb_slot));
    if (ctx->vertex_elements) {
@@ -18351,6 +18355,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          }
          vb_buffer[vb_slot_count] = (uint8_t)buffer;
          vb_instanced[vb_slot_count] = step != 0;
+         vb_stride[vb_slot_count] = ctx->vertex_elements->elements[i].src_stride;
          vb_slot[buffer][step] = (int8_t)vb_slot_count++;
       }
    }
@@ -20733,8 +20738,23 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const bool gathered = (ctx->point_gather_mask & (1u << which)) != 0;
          struct pipe_resource *buffer = gathered
             ? ctx->point_gathered[which] : ctx->vertex_buffers[which];
-         const uint32_t offset =
+         uint32_t offset =
             gathered ? 0u : ctx->vertex_buffer_offsets[which];
+         /* glDrawArraysInstancedBaseInstance, and the reason ARB_base_instance
+          * can be advertised at all.
+          *
+          * WebGPU's draw takes a firstInstance and this used to pass GL's
+          * base through it -- which fetches the right attributes and gets
+          * gl_InstanceID wrong, because SPIR-V's InstanceIndex *counts from*
+          * firstInstance while GL's gl_InstanceID counts from zero. Moving
+          * the base onto the instance-stepped buffers' offsets satisfies both
+          * with no shader change: the fetch starts where GL says and the
+          * builtin still starts at zero.
+          *
+          * A gathered slot is left alone: the de-indexing gather has already
+          * resolved the draw's addressing. */
+         if (!gathered && vb_instanced[slot] && info->start_instance)
+            offset += info->start_instance * vb_stride[slot];
          WGPUBuffer handle = gex_resource(buffer)->buffer;
          if (ctx->emitted.vertex[slot] == handle &&
              ctx->emitted.vertex_offset[slot] == offset) {
@@ -20806,9 +20826,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                            draws[0].count, info->instance_count, first_index,
                            draws[0].index_bias);
          gex_wgpu_cmd_end();
+         /* Instance zero: the base has been folded into the
+          * instance-stepped buffers' offsets above, and passing it here as
+          * well would both double it and shift gl_InstanceID. */
          wgpuRenderPassEncoderDrawIndexed(
             pass, draws[0].count, info->instance_count, first_index,
-            draws[0].index_bias, info->start_instance);
+            draws[0].index_bias, 0u);
       } else {
          ++gex_wgpu_draws_issued;
          gex_wgpu_count_draw_vs(ctx->vs);
@@ -20839,7 +20862,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           * with it and the second half of every restart-split point draw
           * vanished. tests/gl44-probe.sh primrestart caught it. */
          const uint32_t first_instance = !ctx->point_expand.active
-            ? info->start_instance
+            ? 0u   /* folded into the vertex buffer offsets; see above */
             : info->index_size ? 0u : draws[0].start;
          gex_wgpu_cmd_note("draw count=%u inst=%u first=%u", vertices,
                            instances, first_vertex);
@@ -21565,11 +21588,15 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    caps->vertex_element_instance_divisor = true;
    caps->user_vertex_buffers = false;
    /* gl_InstanceID reaches WGSL as @builtin(instance_index), proven by the
-    * vertex-gl-instance-id corpus case.  SPIR-V's InstanceIndex counts from
+    * vertex-gl-instance-id corpus case. SPIR-V's InstanceIndex counts from
     * the draw's base instance while GL's gl_InstanceID counts from zero, so
-    * these two must move together: advertising start_instance without
-    * subtracting the base would make gl_InstanceID wrong. */
-   caps->start_instance = false;
+    * the base is *not* passed to the draw: it is folded into the offsets of
+    * the instance-stepped vertex buffers instead, which puts the fetch where
+    * GL says it should be and leaves the builtin counting from zero. See the
+    * vertex-buffer bind loop in draw_vbo_inner, and
+    * gl44-base-instance-probe, which reads the two halves separately
+    * because they fail in opposite directions. */
+   caps->start_instance = true;
    caps->vs_instanceid = true;
 
    /* Uniforms reach the shader as uniform buffers; 256 is WebGPU's required
