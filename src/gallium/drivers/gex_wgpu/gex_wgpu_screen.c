@@ -2265,8 +2265,20 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
     * It is made read-only instead, which is what a size query needs and what
     * the layout can then agree with. */
    nir_foreach_variable_with_modes(var, nir, nir_var_image) {
-      const unsigned slot = var->data.driver_location == UINT_MAX
-         ? var->data.binding : var->data.driver_location;
+      /* The GL image unit, which is what glBindImageTexture names and what
+       * ctx->shader_images is indexed by.
+       *
+       * An explicit `layout(binding = N)` is authoritative and is checked
+       * first, because driver_location is not reliable across stages: st
+       * gives a *fragment* image UINT_MAX there (so the binding was used)
+       * and a *compute* image 0, whatever the GLSL said. Taking
+       * driver_location in that case sent every compute image to unit 0 --
+       * gl44-compute-probe binds its uimage2D at unit 4 and the driver looked
+       * for unit 0, found nothing, and failed the context. */
+      const unsigned slot =
+         var->data.explicit_binding ? var->data.binding
+         : var->data.driver_location == UINT_MAX ? var->data.binding
+                                                 : var->data.driver_location;
       if (slot >= GEX_WGPU_MAX_SHADER_IMAGES) {
          if (why)
             snprintf(why, why_len, "image slot=%u above max=%u", slot,
@@ -13170,6 +13182,18 @@ struct gex_wgpu_compute_state {
    unsigned binding_count;
    struct gex_wgpu_compute_binding
       bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS];
+   /* Shader images, carried with their format, access and dimension for the
+    * same reason the graphics stages carry them: WGSL puts all three in the
+    * storage texture's type and the bind group layout has to name the same
+    * ones. launch_grid used to bind storage buffers and nothing else, so
+    * max_shader_images was fragment-only and ARB_shader_image_load_store
+    * stopped at the fragment stage. */
+   unsigned image_count;
+   uint8_t image_slots[GEX_WGPU_MAX_SHADER_IMAGES];
+   uint32_t image_bindings[GEX_WGPU_MAX_SHADER_IMAGES];
+   enum pipe_format image_formats[GEX_WGPU_MAX_SHADER_IMAGES];
+   WGPUStorageTextureAccess image_access[GEX_WGPU_MAX_SHADER_IMAGES];
+   WGPUTextureViewDimension image_dimensions[GEX_WGPU_MAX_SHADER_IMAGES];
    unsigned block[3];
 };
 
@@ -13230,9 +13254,19 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
       }
    }
    /* launch_grid binds one group at index 0; the lowering above puts a
-    * non-vertex stage's blocks in set 2. */
+    * non-vertex stage's blocks in set 2.
+    *
+    * Images too, which they were not: they kept set 2 and the pipeline layout
+    * has only group 0, so Dawn refused the pipeline by name --
+    *
+    *   The entry-point uses bindings in group 2 but [PipelineLayout] doesn't
+    *   have a BindGroupLayout for this index
+    *
+    * -- and an invalid compute pipeline invalidates the command buffer, so the
+    * dispatch wrote nothing and the storage image read back as zeros. */
    nir_foreach_variable_with_modes(var, nir,
-                                   nir_var_mem_ubo | nir_var_mem_ssbo)
+                                   nir_var_mem_ubo | nir_var_mem_ssbo |
+                                   nir_var_image)
       var->data.descriptor_set = 0;
 
    nir_foreach_variable_with_modes(var, nir,
@@ -13268,6 +13302,60 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
       /* nir_opt_access marks a block the shader only reads. */
       entry->readonly = (var->data.access & ACCESS_NON_WRITEABLE) != 0;
       ++compute->binding_count;
+   }
+
+   /* The same collection the graphics stages do, with the same two refusals:
+    * WebGPU allows read_write storage only on the 32-bit single-channel
+    * formats, and not every GL image format is a WebGPU storage texture. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_image) {
+      const struct glsl_type *image_type = glsl_without_array(var->type);
+      if (!glsl_type_is_image(image_type))
+         continue;
+      if (compute->image_count >= GEX_WGPU_MAX_SHADER_IMAGES) {
+         fprintf(stderr, "gex-wgpu: compute shader rejected: more than %u "
+                 "images\n", (unsigned)GEX_WGPU_MAX_SHADER_IMAGES);
+         ralloc_free(nir);
+         FREE(compute);
+         return NULL;
+      }
+      const enum pipe_format image_format = var->data.image.format;
+      const bool no_write = (var->data.access & ACCESS_NON_WRITEABLE) != 0;
+      const bool no_read = (var->data.access & ACCESS_NON_READABLE) != 0;
+      if (!no_write && !no_read &&
+          !gex_wgpu_storage_format_is_read_write(image_format)) {
+         fprintf(stderr, "gex-wgpu: compute image '%s' is read *and* written, "
+                 "which WebGPU allows only for r32ui/r32i/r32f (this is %s)\n",
+                 var->name ? var->name : "(anon)",
+                 util_format_short_name(image_format));
+         ralloc_free(nir);
+         FREE(compute);
+         return NULL;
+      }
+      if (gex_wgpu_storage_texture_format(image_format) ==
+          WGPUTextureFormat_Undefined) {
+         fprintf(stderr, "gex-wgpu: compute image '%s' has format %s, which "
+                 "WebGPU cannot take as a storage texture\n",
+                 var->name ? var->name : "(anon)",
+                 util_format_short_name(image_format));
+         ralloc_free(nir);
+         FREE(compute);
+         return NULL;
+      }
+      const unsigned at = compute->image_count;
+      compute->image_slots[at] = (uint8_t)var->data.driver_location;
+      compute->image_bindings[at] = var->data.binding;
+      compute->image_formats[at] = image_format;
+      compute->image_access[at] = no_read ? WGPUStorageTextureAccess_WriteOnly
+                                : no_write ? WGPUStorageTextureAccess_ReadOnly
+                                           : WGPUStorageTextureAccess_ReadWrite;
+      const enum glsl_sampler_dim dim = glsl_get_sampler_dim(image_type);
+      compute->image_dimensions[at] =
+         glsl_sampler_type_is_array(image_type)
+            ? WGPUTextureViewDimension_2DArray
+         : dim == GLSL_SAMPLER_DIM_3D ? WGPUTextureViewDimension_3D
+         : dim == GLSL_SAMPLER_DIM_1D ? WGPUTextureViewDimension_1D
+                                      : WGPUTextureViewDimension_2D;
+      ++compute->image_count;
    }
 
    char *error = NULL;
@@ -13369,15 +13457,58 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
    struct gex_wgpu_compute_state *compute = ctx->compute;
-   if (ctx->failed || !compute || info->indirect) {
+   if (ctx->failed || !compute) {
       gex_fail(ctx);
       return;
    }
 
+   /* glDispatchComputeIndirect: the workgroup counts live in a buffer.
+    *
+    * Read on the CPU and re-issued as an ordinary dispatch, which is the same
+    * choice the draw path makes for ARB_draw_indirect -- util_draw_indirect
+    * maps the buffer, pulls the arguments out and re-issues. WebGPU could take
+    * these natively with dispatchWorkgroupsIndirect, but that needs the buffer
+    * to carry WGPUBufferUsage_Indirect, which resource_create does not ask
+    * for; matching the draw path keeps one story for both and costs a
+    * readback that a compute dispatch is not issued often enough to notice.
+    *
+    * Refusing it cost more than the stall: gl44-compute-probe's indirect case
+    * is the fourth of its cases, so everything after it went untested too. */
+   struct pipe_grid_info resolved;
+   if (info->indirect) {
+      uint32_t counts[3] = {0};
+      struct pipe_transfer *transfer = NULL;
+      struct pipe_box box;
+      u_box_1d((int)info->indirect_offset, (int)sizeof(counts), &box);
+      const void *map = pipe->buffer_map(pipe, info->indirect, 0,
+                                         PIPE_MAP_READ, &box, &transfer);
+      if (!map) {
+         fprintf(stderr, "gex-wgpu: indirect dispatch could not read its "
+                         "argument buffer\n");
+         gex_fail(ctx);
+         return;
+      }
+      memcpy(counts, map, sizeof(counts));
+      pipe->buffer_unmap(pipe, transfer);
+      resolved = *info;
+      resolved.indirect = NULL;
+      resolved.grid[0] = counts[0];
+      resolved.grid[1] = counts[1];
+      resolved.grid[2] = counts[2];
+      info = &resolved;
+      /* A zero in any dimension launches nothing, which is legal. */
+      if (!counts[0] || !counts[1] || !counts[2])
+         return;
+   }
+
    WGPUBindGroupLayoutEntry
-      entries[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS];
+      entries[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS +
+              GEX_WGPU_MAX_SHADER_IMAGES];
    WGPUBindGroupEntry
-      bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS];
+      bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS +
+               GEX_WGPU_MAX_SHADER_IMAGES];
+   WGPUTextureView image_views[GEX_WGPU_MAX_SHADER_IMAGES] = {0};
+   unsigned image_view_count = 0;
    unsigned count = 0;
    for (unsigned i = 0; i < compute->binding_count; ++i) {
       const struct gex_wgpu_compute_binding *block = &compute->bindings[i];
@@ -13440,6 +13571,72 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       ++count;
    }
 
+   /* One view per image, built here rather than cached on the resource:
+    * glBindImageTexture names a level and a layer, and the same texture may
+    * be bound at different ones by successive dispatches. */
+   for (unsigned i = 0; i < compute->image_count; ++i) {
+      const unsigned slot = compute->image_slots[i];
+      const struct pipe_image_view *iv =
+         &ctx->shader_images[MESA_SHADER_COMPUTE][slot];
+      if (!iv->resource || !gex_resource(iv->resource)->texture) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: compute image %u has no texture "
+                    "bound\n", slot);
+         }
+         gex_fail(ctx);
+         goto release_views;
+      }
+      WGPUTextureViewDescriptor view_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+      view_desc.format =
+         gex_wgpu_storage_texture_format(compute->image_formats[i]);
+      view_desc.dimension = compute->image_dimensions[i];
+      view_desc.baseMipLevel = iv->u.tex.level;
+      view_desc.mipLevelCount = 1;
+      if (view_desc.dimension != WGPUTextureViewDimension_3D) {
+         view_desc.baseArrayLayer = iv->u.tex.first_layer;
+         view_desc.arrayLayerCount =
+            iv->u.tex.last_layer - iv->u.tex.first_layer + 1;
+      }
+      WGPUTextureView image_view =
+         wgpuTextureCreateView(gex_resource(iv->resource)->texture,
+                               &view_desc);
+      if (!image_view) {
+         gex_fail(ctx);
+         goto release_views;
+      }
+      image_views[image_view_count++] = image_view;
+      entries[count] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entries[count].binding = compute->image_bindings[i];
+      entries[count].visibility = WGPUShaderStage_Compute;
+      /* A read-only image is a *sampled* texture binding, not a storage one:
+       * Tint lowers a SPIR-V storage image that is only read to a plain
+       * texture_2d<T>, and WebGPU rejects a storageTexture layout against
+       * that by name. The graphics path carries the same note. */
+      if (compute->image_access[i] == WGPUStorageTextureAccess_ReadOnly) {
+         const enum pipe_format image_format = compute->image_formats[i];
+         entries[count].texture.sampleType =
+            util_format_is_pure_uint(image_format) ? WGPUTextureSampleType_Uint
+            : util_format_is_pure_sint(image_format)
+                 ? WGPUTextureSampleType_Sint
+                 : WGPUTextureSampleType_UnfilterableFloat;
+         entries[count].texture.viewDimension = compute->image_dimensions[i];
+         entries[count].texture.multisampled = false;
+      } else {
+         entries[count].storageTexture.access = compute->image_access[i];
+         entries[count].storageTexture.format =
+            gex_wgpu_storage_texture_format(compute->image_formats[i]);
+         entries[count].storageTexture.viewDimension =
+            compute->image_dimensions[i];
+      }
+      bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      bindings[count].binding = compute->image_bindings[i];
+      bindings[count].textureView = image_view;
+      ++count;
+   }
+
    WGPUBindGroupLayoutDescriptor layout_desc =
       WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    layout_desc.entryCount = count;
@@ -13497,6 +13694,12 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    if (pipeline) wgpuComputePipelineRelease(pipeline);
    if (pipeline_layout) wgpuPipelineLayoutRelease(pipeline_layout);
    if (layout) wgpuBindGroupLayoutRelease(layout);
+
+release_views:
+   /* The image views are built per dispatch, because glBindImageTexture
+    * names a level and a layer that the next dispatch may change. */
+   for (unsigned i = 0; i < image_view_count; ++i)
+      wgpuTextureViewRelease(image_views[i]);
 }
 
 static void
@@ -25727,11 +25930,14 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
        *
        * Not the vertex stage: WGSL forbids a writable storage *texture* there
        * for the same reason it forbids a writable storage buffer. */
-      /* Fragment only: launch_grid binds storage buffers and nothing else, so
-       * a compute image would be declared with no entry behind it. The
-       * fragment count is all st_extensions reads to turn the extension on. */
+      /* Fragment and compute. It was fragment-only because launch_grid bound
+       * storage buffers and nothing else, so a compute image would have been
+       * declared with no entry behind it; launch_grid now builds a view and a
+       * layout entry per image the way the graphics stages do. The fragment
+       * count is still all st_extensions reads to turn the extension on. */
       caps->max_shader_images =
-         stages[i] == MESA_SHADER_FRAGMENT ? GEX_WGPU_MAX_SHADER_IMAGES : 0;
+         stages[i] == MESA_SHADER_FRAGMENT ||
+         stages[i] == MESA_SHADER_COMPUTE ? GEX_WGPU_MAX_SHADER_IMAGES : 0;
       caps->max_hw_atomic_counters = 0;
       caps->max_hw_atomic_counter_buffers = 0;
       caps->supported_irs = 1 << PIPE_SHADER_IR_NIR;
