@@ -1586,8 +1586,23 @@ gex_wgpu_lower_ubo_load(nir_builder *b, nir_instr *instr, void *data)
    const unsigned alignment = constant_offset
       ? NIR_ALIGN_MUL_MAX : nir_intrinsic_align_mul(intr);
    const unsigned first_component = (offset & 15u) / 4;
-   if ((offset & 3u) || alignment < 16 ||
-       first_component + intr->def.num_components > 4) {
+   /* A load whose *offset* is dynamic and only word-aligned lands at a
+    * component this pass cannot name statically -- std140 pads an array of
+    * vec4 so the element index is offset/16, but a scalar array indexed at
+    * run time gives NIR align_mul = 4 and the component has to be computed
+    * too. Blender's overlay_grid shader is exactly that shape, and refusing
+    * it cost the whole shader:
+    *
+    *   load_ubo slot=1 offset=0 align=4 comps=1 first=0 (dynamic)
+    *
+    * The one thing that must still hold is that the load cannot *straddle*
+    * two vec4s, which is what the alignment guarantees: at align_mul 4 a
+    * single word never does, at 8 a vec2 never does. */
+   const bool dynamic_component = alignment < 16;
+   if ((offset & 3u) || alignment < 4 ||
+       (dynamic_component
+           ? intr->def.num_components * 4u > alignment
+           : first_component + intr->def.num_components > 4)) {
       state->failed = true;
       if (!state->why[0])
          snprintf(state->why, sizeof(state->why),
@@ -1656,8 +1671,21 @@ gex_wgpu_lower_ubo_load(nir_builder *b, nir_instr *instr, void *data)
       : nir_ushr_imm(b, intr->src[1].ssa, 4);
    deref = nir_build_deref_array(b, deref, array_index);
    nir_def *loaded = nir_load_deref(b, deref);
-   nir_def *replacement = nir_channels(
-      b, loaded, BITFIELD_RANGE(first_component, intr->def.num_components));
+   nir_def *replacement;
+   if (dynamic_component) {
+      /* Which word of the vec4 the offset lands on, at run time. */
+      nir_def *component =
+         nir_iand_imm(b, nir_ushr_imm(b, intr->src[1].ssa, 2), 3);
+      nir_def *channels[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned i = 0; i < intr->def.num_components; ++i)
+         channels[i] = nir_vector_extract(
+            b, loaded, nir_iadd_imm(b, component, i));
+      replacement = nir_vec(b, channels, intr->def.num_components);
+   } else {
+      replacement = nir_channels(
+         b, loaded, BITFIELD_RANGE(first_component,
+                                   intr->def.num_components));
+   }
    nir_def_rewrite_uses(&intr->def, replacement);
    nir_instr_remove(instr);
    return true;
@@ -5971,6 +5999,21 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
                descriptors_valid = false;
                continue;
             }
+            /* A *query* about the texture is not a sample of it, and its
+             * result type says nothing about the texture's. textureSize()
+             * returns an ivec2, which classified the slot as
+             * signed-integer-sampled -- so a shader that both samples a float
+             * texture and asks its size reported the slot as float and sint
+             * at once and was refused for an inconsistency it did not have.
+             * Blender's whole workbench_resolve family does exactly that, and
+             * a shader that fails to link takes Blender with it.
+             *
+             * The masks exist to pick the bind group's sample type, which
+             * only a sampling op constrains. */
+            if (tex->op == nir_texop_txs ||
+                tex->op == nir_texop_query_levels ||
+                tex->op == nir_texop_texture_samples)
+               continue;
             if (tex->is_shadow)
                shadow_slots |= 1u << texture_slot;
             else if (nir_alu_type_get_base_type(tex->dest_type) ==
@@ -8007,7 +8050,7 @@ gex_wgpu_set_constant_buffer(struct pipe_context *pipe,
    const bool unbinding = !buffer || (!buffer->buffer && !buffer->user_buffer);
    if (shader != MESA_SHADER_VERTEX && shader != MESA_SHADER_FRAGMENT &&
        shader != MESA_SHADER_GEOMETRY && shader != MESA_SHADER_TESS_CTRL &&
-       shader != MESA_SHADER_TESS_EVAL) {
+       shader != MESA_SHADER_TESS_EVAL && shader != MESA_SHADER_COMPUTE) {
       if (!unbinding) {
          gex_fail(ctx);
          return;
@@ -12502,10 +12545,31 @@ gex_wgpu_set_stream_output_targets(struct pipe_context *pipe,
  * bind group. That is what a capture pass needs, and anything else would be
  * advertised before it was written.
  */
+/* What one compute dispatch has to bind.
+ *
+ * launch_grid builds a single bind group, so every block -- uniform,
+ * spilled-uniform and storage -- lands in set 0 and is described here rather
+ * than in separate notions of "slot". The three differ only in where the
+ * buffer comes from and what WebGPU calls the binding type, which is what
+ * `kind` records. */
+enum gex_wgpu_compute_binding_kind {
+   GEX_WGPU_COMPUTE_UNIFORM,        /* constant_buffers[], uniform binding */
+   GEX_WGPU_COMPUTE_UNIFORM_SPILL,  /* constant_buffers[], storage binding */
+   GEX_WGPU_COMPUTE_STORAGE,        /* shader_buffers[], storage binding */
+};
+
+struct gex_wgpu_compute_binding {
+   uint32_t binding;
+   uint32_t required;
+   uint8_t slot;
+   uint8_t kind;
+};
+
 struct gex_wgpu_compute_state {
    WGPUShaderModule module;
-   unsigned so_mask;
-   uint32_t so_bindings[GEX_WGPU_MAX_SO_BUFFERS];
+   unsigned binding_count;
+   struct gex_wgpu_compute_binding
+      bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS];
    unsigned block[3];
 };
 
@@ -12531,60 +12595,77 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
    for (unsigned i = 0; i < 3; ++i)
       compute->block[i] = MAX2(1, nir->info.workgroup_size[i]);
 
-   /* The storage blocks get their bindings and their access lowering here,
-    * exactly as the graphics stages do in gex_wgpu_lower_gallium_ubos --
-    * which this path does not go through, so without it a compute shader
-    * reached the SPIR-V emitter with raw store_ssbo intrinsics and asserted:
+   /* The same lowering the graphics stages get.
     *
-    *   emit_intrinsic: not implemented (store_ssbo)
+    * This path used to hand-roll the storage half and skip the uniform half
+    * entirely, so a compute shader with a uniform block reached the SPIR-V
+    * emitter with a raw load_ubo and asserted --
     *
-    * Descriptor set 0, because launch_grid builds one bind group and binds it
-    * at group 0. */
-   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
-      const unsigned slot = var->data.driver_location == UINT_MAX
-         ? var->data.binding : var->data.driver_location;
-      if (slot >= GEX_WGPU_MAX_SO_BUFFERS) {
-         fprintf(stderr, "gex-wgpu: compute storage block slot=%u above "
-                 "max=%u\n", slot, (unsigned)GEX_WGPU_MAX_SO_BUFFERS);
-         ralloc_free(nir);
-         FREE(compute);
-         return NULL;
-      }
-      var->data.driver_location = slot;
-      var->data.descriptor_set = 0;
-      var->data.binding = GEX_WGPU_SSBO_FIRST_BINDING + slot;
-      var->data.explicit_binding = 1;
-   }
-   gex_wgpu_flatten_ssbo_blocks(nir);
-   /* Copy-propagate and fold first: the lowering needs the block index as a
-    * constant, and a compute shader arrives here without the optimisation
-    * the graphics path gets on the way. The index was a `mov` of a constant
-    * -- `%21 = mov %19.x` -- which nir_src_is_const does not see through, so
-    * the lowering refused a shader that was perfectly ordinary. */
+    *   emit_intrinsic: not implemented (load_ubo)
+    *
+    * -- and once that was patched in separately it grew its own, lower
+    * limits: "compute uniform block slot=12 above max=12" and "compute
+    * storage block slot=4 above max=4" on shaders the graphics path takes
+    * without complaint. Blender's overlay compute shaders hit all three. One
+    * implementation, so the limits and the spill to storage above the
+    * device's uniform count come for free.
+    *
+    * Copy-propagate and fold first: the lowering needs each block index as a
+    * constant and a compute shader arrives without the optimisation the
+    * graphics path gets on the way -- the index was a `mov` of a constant,
+    * which nir_src_is_const does not see through. */
    NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    {
-      struct gex_wgpu_ssbo_lowering ssbo_state = {0};
-      nir_shader_instructions_pass(nir, gex_wgpu_lower_ssbo_access,
-                                   nir_metadata_control_flow, &ssbo_state);
-      if (ssbo_state.failed) {
+      char why[160] = "";
+      if (!gex_wgpu_lower_gallium_ubos(nir, MESA_SHADER_COMPUTE,
+                                       gex_screen(pipe->screen)
+                                          ->max_uniform_buffers,
+                                       why, sizeof(why))) {
          fprintf(stderr, "gex-wgpu: compute shader rejected: %s\n",
-                 ssbo_state.why);
+                 why[0] ? why : "(no reason recorded)");
          ralloc_free(nir);
          FREE(compute);
          return NULL;
       }
    }
+   /* launch_grid binds one group at index 0; the lowering above puts a
+    * non-vertex stage's blocks in set 2. */
+   nir_foreach_variable_with_modes(var, nir,
+                                   nir_var_mem_ubo | nir_var_mem_ssbo)
+      var->data.descriptor_set = 0;
 
-   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
-      const unsigned slot = var->data.driver_location;
-      if (slot >= GEX_WGPU_MAX_SO_BUFFERS) {
+   nir_foreach_variable_with_modes(var, nir,
+                                   nir_var_mem_ubo | nir_var_mem_ssbo) {
+      const unsigned binding = var->data.binding;
+      bool seen = false;
+      for (unsigned i = 0; i < compute->binding_count; ++i)
+         seen |= compute->bindings[i].binding == binding;
+      if (seen)
+         continue;
+      if (compute->binding_count >= ARRAY_SIZE(compute->bindings)) {
+         fprintf(stderr, "gex-wgpu: compute shader rejected: more than %u "
+                 "blocks\n", (unsigned)ARRAY_SIZE(compute->bindings));
          ralloc_free(nir);
          FREE(compute);
          return NULL;
       }
-      compute->so_bindings[slot] = var->data.binding;
-      compute->so_mask |= 1u << slot;
+      /* Which range the binding fell in is what says where its buffer comes
+       * from. gex_wgpu_lower_gallium_ubos numbers them: a uniform slot keeps
+       * its own number, a slot past the device's uniform count moves to
+       * GEX_WGPU_STORAGE_UBO_FIRST_BINDING + slot, and a real storage block
+       * to GEX_WGPU_SSBO_FIRST_BINDING + slot. */
+      struct gex_wgpu_compute_binding *entry =
+         &compute->bindings[compute->binding_count];
+      entry->binding = binding;
+      entry->required = gex_wgpu_block_declared_size(var);
+      entry->slot = (uint8_t)var->data.driver_location;
+      entry->kind = binding >= GEX_WGPU_SSBO_FIRST_BINDING
+         ? GEX_WGPU_COMPUTE_STORAGE
+         : binding >= GEX_WGPU_STORAGE_UBO_FIRST_BINDING
+            ? GEX_WGPU_COMPUTE_UNIFORM_SPILL
+            : GEX_WGPU_COMPUTE_UNIFORM;
+      ++compute->binding_count;
    }
 
    char *error = NULL;
@@ -12691,27 +12772,51 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       return;
    }
 
-   WGPUBindGroupLayoutEntry entries[GEX_WGPU_MAX_SO_BUFFERS];
-   WGPUBindGroupEntry bindings[GEX_WGPU_MAX_SO_BUFFERS];
+   WGPUBindGroupLayoutEntry
+      entries[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS];
+   WGPUBindGroupEntry
+      bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS];
    unsigned count = 0;
-   for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
-      if (!(compute->so_mask & (1u << i)))
-         continue;
-      const struct pipe_shader_buffer *slot =
-         &ctx->shader_buffers[MESA_SHADER_COMPUTE][i];
-      if (!slot->buffer) {
+   for (unsigned i = 0; i < compute->binding_count; ++i) {
+      const struct gex_wgpu_compute_binding *block = &compute->bindings[i];
+      const bool from_constants = block->kind != GEX_WGPU_COMPUTE_STORAGE;
+      struct pipe_resource *buffer = NULL;
+      uint64_t offset = 0, size = 0;
+      if (from_constants) {
+         const struct pipe_constant_buffer *slot =
+            &ctx->constant_buffers[MESA_SHADER_COMPUTE][block->slot];
+         buffer = slot->buffer;
+         offset = slot->buffer_offset;
+         size = gex_wgpu_constant_binding_size(slot, block->required);
+      } else {
+         const struct pipe_shader_buffer *slot =
+            &ctx->shader_buffers[MESA_SHADER_COMPUTE][block->slot];
+         buffer = slot->buffer;
+         offset = slot->buffer_offset;
+         size = slot->buffer_size;
+      }
+      if (!buffer) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: compute %s block %u has no buffer "
+                    "bound\n", from_constants ? "uniform" : "storage",
+                    block->slot);
+         }
          gex_fail(ctx);
          return;
       }
-      entries[count] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
-      entries[count].binding = compute->so_bindings[i];
+      entries[count] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entries[count].binding = block->binding;
       entries[count].visibility = WGPUShaderStage_Compute;
-      entries[count].buffer.type = WGPUBufferBindingType_Storage;
+      entries[count].buffer.type = block->kind == GEX_WGPU_COMPUTE_UNIFORM
+         ? WGPUBufferBindingType_Uniform : WGPUBufferBindingType_Storage;
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
-      bindings[count].binding = compute->so_bindings[i];
-      bindings[count].buffer = gex_resource(slot->buffer)->buffer;
-      bindings[count].offset = slot->buffer_offset;
-      bindings[count].size = slot->buffer_size;
+      bindings[count].binding = block->binding;
+      bindings[count].buffer = gex_resource(buffer)->buffer;
+      bindings[count].offset = offset;
+      bindings[count].size = size;
       ++count;
    }
 
@@ -13807,10 +13912,13 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
                if (!ctx->failed)
                   fprintf(stderr,
                           "gex-wgpu: colour target %u refused (%s) fb=%ux%u "
-                          "surface=%u texture=%u level=%u layers=%u..%u\n",
+                          "surface=%s texture=%s %ux%u level=%u "
+                          "layers=%u..%u\n",
                           i, why, state->width, state->height,
-                          surface->format,
-                          surface->texture ? surface->texture->format : 0,
+                          util_format_short_name(surface->format),
+                          util_format_short_name(surface->texture->format),
+                          surface->texture->width0,
+                          surface->texture->height0,
                           surface->level, surface->first_layer,
                           surface->last_layer);
                gex_fail(ctx);

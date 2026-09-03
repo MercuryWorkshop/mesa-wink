@@ -464,6 +464,20 @@ emit_uint_const(struct ntv_context *ctx, int bit_size, uint64_t value)
    return spirv_builder_const_uint(&ctx->builder, bit_size, value);
 }
 
+/* Whether a 32-bit pattern is a finite float.
+ *
+ * Asked of *integer* constants as well as float ones: WGSL has no non-finite
+ * literal and Tint rejects any constant expression that evaluates to one, and
+ * an integer constant reached by an implicit bitcast is such an expression.
+ * See emit_unfoldable_zero. */
+static bool
+gex_bits_are_finite_float(uint32_t bits)
+{
+   float value;
+   memcpy(&value, &bits, sizeof(value));
+   return isfinite(value);
+}
+
 /* A zero of the given width that no constant folder can see through.
  *
  * This exists for one reason: WGSL has no non-finite literal, and Tint's
@@ -2512,11 +2526,22 @@ emit_load_const(struct ntv_context *ctx, nir_load_const_instr *load_const)
          switch (atype) {
          case nir_type_uint: {
             uint64_t tmp = nir_const_value_as_uint(load_const->value[i], bit_size);
+            /* An *integer* constant whose bits are a non-finite float has to
+             * be unfoldable too, because nothing here knows whether a later
+             * consumer will bitcast it. `uintBitsToFloat(0x7FC00000u)` --
+             * which is how Blender spells NaN -- reaches NIR as a uint
+             * constant and an implicit bitcast, so ntv emitted
+             * `OpBitcast %float %const` at the use site and Tint folded that
+             * straight back into the constant it rejects. */
+            if (bit_size == 32 && !gex_bits_are_finite_float((uint32_t)tmp))
+               nonfinite = true;
             components[i] = emit_uint_const(ctx, bit_size, tmp);
             break;
          }
          case nir_type_int: {
             int64_t tmp = nir_const_value_as_int(load_const->value[i], bit_size);
+            if (bit_size == 32 && !gex_bits_are_finite_float((uint32_t)tmp))
+               nonfinite = true;
             components[i] = emit_int_const(ctx, bit_size, tmp);
             break;
          }
@@ -2578,6 +2603,15 @@ emit_load_const(struct ntv_context *ctx, nir_load_const_instr *load_const)
       }
    }
 
+   /* The composite has to be built at run time when any component is: an
+    * OpConstantComposite takes constant ids, and one constant component
+    * would let the whole thing fold back to the value Tint rejects. And the
+    * The OR produces an *unsigned* result whatever the constant was, so
+    * anything else has to be bitcast back -- storing a uint-typed id against
+    * a signed atype made a later OpCompositeConstruct mix the two:
+    * "Expected Constituents to be scalars or vectors of the same type as
+    * Result Type components". */
+   const bool retype = nonfinite && atype != nir_type_uint;
    if (num_components > 1) {
       SpvId type = get_alu_type(ctx, nonfinite ? nir_type_uint : atype,
                                 num_components, bit_size);
@@ -2586,14 +2620,14 @@ emit_load_const(struct ntv_context *ctx, nir_load_const_instr *load_const)
                                                   components, num_components)
          : spirv_builder_const_composite(&ctx->builder, type, components,
                                          num_components);
-      if (nonfinite)
+      if (retype)
          value = emit_bitcast(
             ctx, get_alu_type(ctx, atype, num_components, bit_size), value);
       store_def(ctx, load_const->def.index, value, atype);
    } else {
       assert(num_components == 1);
       SpvId value = components[0];
-      if (nonfinite)
+      if (retype)
          value = emit_bitcast(ctx, get_alu_type(ctx, atype, 1, bit_size),
                               value);
       store_def(ctx, load_const->def.index, value, atype);
