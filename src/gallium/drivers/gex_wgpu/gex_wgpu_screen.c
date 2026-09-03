@@ -17289,7 +17289,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
              * is baked here rather than in the shader because the y-flipped
              * module negates what it is given, and the corner buffer belongs
              * to one draw, which uses one module. */
-            const float nudge = 1.0f / 512.0f;
+            const float nudge = 1.0f / 64.0f;
             const bool flipped =
                ctx->viewport_set && ctx->viewport.scale[1] > 0.0f;
             const float nudge_x = 2.0f * nudge / vp_width;
@@ -19137,6 +19137,33 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          };
          wgpuRenderPassEncoderSetBlendConstant(pass, &blend_color);
       }
+      /* A one-pixel difference this driver does not correct, measured and
+       * left alone.
+       *
+       * GL measures window y from the bottom and WebGPU from the top, so a
+       * rasterisation tie that resolves one way in one API resolves the other
+       * way in the other -- and geometry exactly on a pixel boundary is
+       * exactly a tie. `tri-viewport` draws a grid every 25 pixels of a
+       * 250-pixel window: every *horizontal* line of it lands one row from
+       * where llvmpipe puts it and every vertical one is exact, which is 0.16
+       * RMSE with nothing animated behind it. A one-pixel point at an
+       * integral coordinate does the same in both axes (gl44-point-probe's
+       * `single` case reads 15,15 where llvmpipe reads 16,16).
+       *
+       * The obvious lever is the viewport, and it does not work: WebGPU
+       * requires the rectangle to lie inside the attachment, so it cannot be
+       * *translated* when it already fills the framebuffer -- only shrunk,
+       * which gives a shift that fades linearly to nothing at the far edge.
+       * Tried: it moved some of `tri-viewport`'s lines and not others (0.162
+       * -> 0.073 at a 64th of a pixel, 0.053 at half a pixel), which is worse
+       * than a consistent tie-break because it makes the answer depend on
+       * where on the screen the geometry is.
+       *
+       * A uniform translation has to happen in the shader, which means either
+       * a vertex variant keyed on the framebuffer height -- recompiled on
+       * every resize, for every shader -- or a uniform read by every vertex
+       * shader in the driver. Both are real costs for one pixel, and neither
+       * has been shown to be worth it. */
       const float wanted_viewport[6] = { viewport_x, viewport_y,
                                          viewport_width, viewport_height,
                                          min_depth, max_depth };
