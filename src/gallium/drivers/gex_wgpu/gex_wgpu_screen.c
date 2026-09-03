@@ -66,7 +66,7 @@ extern void gex_wgpu_jspi_signal(void);
  * GEX_WGPU_STORAGE_UBO_FIRST_BINDING. The range also *identifies* them later:
  * a spilled uniform block and a real storage block are both nir_var_mem_ssbo
  * by the time the shader is walked, and only the binding tells them apart. */
-#define GEX_WGPU_MAX_SHADER_BUFFERS 16
+#define GEX_WGPU_MAX_SHADER_BUFFERS 24
 #define GEX_WGPU_SSBO_FIRST_BINDING \
    (GEX_WGPU_STORAGE_UBO_FIRST_BINDING + GEX_WGPU_MAX_CONSTANT_BUFFERS)
 /* Application shader images, again in a range of their own. */
@@ -77,6 +77,33 @@ extern void gex_wgpu_jspi_signal(void);
  * texel buffer, so each one is bound as a read-only storage buffer and
  * texelFetch becomes word loads; see gex_wgpu_lower_buffer_texture. */
 #define GEX_WGPU_MAX_BUFFER_TEXTURES 4
+/* ARB_shader_draw_parameters: gl_BaseVertexARB, gl_BaseInstanceARB and
+ * gl_DrawIDARB, which WGSL has no builtin for.
+ *
+ * `instance_index` counts from firstInstance and this driver folds the base
+ * into the vertex buffer offsets, so the base is not recoverable in the
+ * shader; all three are per-draw scalars the driver already knows. They
+ * travel in a driver-owned block in the vertex stage's group, suballocated
+ * from the same constant ring the uniforms use -- so the *binding* is stable
+ * and only the dynamic offset changes per draw, which is what lets the bind
+ * group stay cached.
+ *
+ * Blender 5.2 refuses to start without this extension. */
+#define GEX_WGPU_DRAW_PARAMS_BINDING \
+   (GEX_WGPU_BUFTEX_FIRST_BINDING + GEX_WGPU_MAX_BUFFER_TEXTURES)
+/* Words of that block: base vertex, base instance, draw id, and a pad to the
+ * vec4 the emitter gives a word array. */
+#define GEX_WGPU_DRAW_PARAM_BASE_VERTEX 0
+#define GEX_WGPU_DRAW_PARAM_BASE_INSTANCE 1
+#define GEX_WGPU_DRAW_PARAM_DRAW_ID 2
+/* Not the same word as the base vertex, however alike they look.
+ * gl_BaseVertexARB is *zero* for a command with no basevertex parameter --
+ * glDrawArrays' `first` does not appear in it -- while NIR's
+ * load_first_vertex is the internal "where does vertex zero start" value that
+ * gl_VertexID is computed from, and that one *is* `first`. Folding them
+ * together made glDrawArrays report its first vertex as the base vertex. */
+#define GEX_WGPU_DRAW_PARAM_FIRST_VERTEX 3
+#define GEX_WGPU_DRAW_PARAM_WORDS 4
 #define GEX_WGPU_BUFTEX_FIRST_BINDING \
    (GEX_WGPU_IMAGE_FIRST_BINDING + GEX_WGPU_MAX_SHADER_IMAGES)
 
@@ -758,6 +785,11 @@ struct gex_wgpu_context {
     * applies is the rasterizer's poly_stipple_enable. */
    uint32_t poly_stipple[32];
    bool poly_stipple_set;
+   /* ARB_shader_draw_parameters, captured at the outermost draw_vbo before
+    * any rewrite can fold the base vertex into an index list. */
+   uint32_t draw_base_vertex;
+   uint32_t draw_first_vertex;
+   uint32_t draw_base_instance;
    uint32_t fb_width;
    uint32_t fb_height;
    /* ARB_framebuffer_no_attachments: a framebuffer with nothing attached,
@@ -1049,6 +1081,9 @@ struct gex_wgpu_shader {
    /* Whether the shader reads gl_DrawID. Only then does a non-zero
     * drawid_offset change what it computes. */
    bool reads_draw_id;
+   /* ARB_shader_draw_parameters. Vertex stage only; the block is declared
+    * only when the shader reads one of the three values. */
+   bool reads_draw_params;
    /* Whether the fragment stage reads gl_PointCoord. An expanded wide point
     * feeds it from the corner attribute through a varying, which costs a
     * varying slot, so it is only added where something reads it. */
@@ -5349,6 +5384,84 @@ gex_wgpu_constant_binding_size(const struct pipe_constant_buffer *constant,
    return size;
 }
 
+/* ARB_shader_draw_parameters, lowered to a read of a driver-owned block.
+ *
+ * gl_BaseVertexARB, gl_BaseInstanceARB and gl_DrawIDARB reach NIR as
+ * load_base_vertex / load_first_vertex, load_base_instance and load_draw_id.
+ * ntv maps them onto SPIR-V's BaseVertex, BaseInstance and DrawIndex
+ * builtins, which need SPV_KHR_shader_draw_parameters and which WGSL does not
+ * have at all -- so left alone they are a rejected module, and this driver
+ * previously refused any draw whose shader read gl_DrawID.
+ *
+ * They are constants for the length of a draw, and the driver knows all
+ * three, so the answer is one block of words rather than a shader variant
+ * keyed on the values -- a variant per (base vertex, base instance, draw id)
+ * would recompile for every draw of a batched renderer, which is exactly the
+ * kind of renderer that reads them.
+ */
+struct gex_wgpu_draw_params_lowering {
+   nir_variable *block;
+   bool used;
+};
+
+static bool
+gex_wgpu_lower_draw_params(nir_builder *b, nir_intrinsic_instr *intr,
+                           void *data)
+{
+   struct gex_wgpu_draw_params_lowering *state = data;
+   unsigned word;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_first_vertex:
+      word = GEX_WGPU_DRAW_PARAM_FIRST_VERTEX;
+      break;
+   case nir_intrinsic_load_base_vertex:
+      word = GEX_WGPU_DRAW_PARAM_BASE_VERTEX;
+      break;
+   case nir_intrinsic_load_base_instance:
+      word = GEX_WGPU_DRAW_PARAM_BASE_INSTANCE;
+      break;
+   case nir_intrinsic_load_draw_id:
+      word = GEX_WGPU_DRAW_PARAM_DRAW_ID;
+      break;
+   default:
+      return false;
+   }
+   state->used = true;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_deref_instr *words = gex_wgpu_block_words(b, state->block);
+   nir_def *value = nir_load_deref(
+      b, nir_build_deref_array(b, words, nir_imm_int(b, word)));
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
+/* Whether this shader reads any of the three. Scanned rather than read off
+ * info.system_values_read, for the reason gl_PointCoord was: the bits are not
+ * reliable for every one of them, and a missed read is a rejected module
+ * rather than a wrong number. */
+static bool
+gex_wgpu_reads_draw_params(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_load_first_vertex:
+            case nir_intrinsic_load_base_vertex:
+            case nir_intrinsic_load_base_instance:
+            case nir_intrinsic_load_draw_id:
+               return true;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
 static struct gex_wgpu_shader *
 gex_wgpu_create_shader_state(struct pipe_context *pipe,
                              const struct pipe_shader_state *state,
@@ -5465,6 +5578,34 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    if (expected_stage == MESA_SHADER_VERTEX)
       shader->varying_nir = nir_shader_clone(NULL, nir);
 
+   /* ARB_shader_draw_parameters, *after* the UBO lowering.
+    *
+    * Before it, gex_wgpu_flatten_ssbo_blocks -- which runs inside that
+    * lowering and rewrites every storage block above
+    * GEX_WGPU_SSBO_FIRST_BINDING -- replaced this block's type with an
+    * equivalent-looking but differently interned one, and every deref built
+    * against the old type failed NIR validation inside ntv:
+    *
+    *   deref_var &gex_draw_params (ssbo gex_draw_params#1)
+    *   error: instr->type == instr->var->type
+    *
+    * Declaring it afterwards means nothing reshapes it -- and after the
+    * capture and varying clones above, because those become *compute*
+    * variants that bind their own groups and would otherwise carry a storage
+    * block at this binding that nothing fills. */
+   if (expected_stage == MESA_SHADER_VERTEX &&
+       gex_wgpu_reads_draw_params(nir)) {
+      struct gex_wgpu_draw_params_lowering draw_params = {0};
+      draw_params.block =
+         gex_wgpu_word_block(nir, "gex_draw_params",
+                             GEX_WGPU_DRAW_PARAMS_BINDING, 0, true);
+      draw_params.block->data.descriptor_set = 1;
+      nir_shader_intrinsics_pass(nir, gex_wgpu_lower_draw_params,
+                                 nir_metadata_control_flow, &draw_params);
+      shader->reads_draw_params = draw_params.used;
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   }
+
    nir_foreach_variable_with_modes(var, nir,
                                    nir_var_mem_ubo | nir_var_mem_ssbo) {
       const unsigned expected_set =
@@ -5481,6 +5622,13 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
        * ctx->shader_buffers, and its slot numbering is independent of the
        * uniform blocks'. The binding range is what identifies it -- by this
        * point a spilled uniform block has the same nir_var_mem_ssbo mode. */
+      /* The driver's own draw-parameter block is not an application storage
+       * block: it is bound from the constant ring by the draw path, not from
+       * ctx->shader_buffers. Collecting it here gave the bind group two
+       * entries at the same binding -- "binding index (60) was specified by a
+       * previous entry" -- and a storage block with no buffer bound. */
+      if (var->data.binding == GEX_WGPU_DRAW_PARAMS_BINDING)
+         continue;
       if (var->data.binding >= GEX_WGPU_SSBO_FIRST_BINDING) {
          const unsigned ssbo_slot = var->data.driver_location;
          bool seen = false;
@@ -5762,6 +5910,11 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    }
    uint16_t texture_slots_used = 0, sampler_slots_used = 0;
    uint8_t shadow_slots = 0, float_slots = 0, uint_slots = 0, sint_slots = 0;
+   /* Which texture op made the metadata invalid, if one did. The masks alone
+    * cannot say: the refusals below happen before a slot is recorded, so a
+    * rejected shader printed three perfectly consistent masks. Numeric
+    * because NIR has no public name table for nir_texop. */
+   int descriptors_valid_op = -1;
    nir_foreach_function(function, nir) {
       if (!function->impl)
          continue;
@@ -5799,9 +5952,22 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
                }
                sampler_slots_used |= 1u << sampler_slot;
             } else if (tex->op != nir_texop_txf &&
-                       tex->op != nir_texop_txf_ms) {
-               /* A plain fetch needs no sampler, and neither does a
-                * multisampled one: WGSL reaches both with textureLoad. */
+                       tex->op != nir_texop_txf_ms &&
+                       /* Queries about the texture itself, which need no
+                        * sampler in GLSL and none in WGSL either:
+                        * textureDimensions, textureNumLevels and
+                        * textureNumSamples. Refusing them here rejected any
+                        * shader calling textureSize() -- Blender's
+                        * workbench_resolve family does, and a shader that
+                        * fails to link takes Blender down with it. The masks
+                        * in the diagnostic all looked consistent because this
+                        * `continue` runs before they are set, which is why the
+                        * op is now named. */
+                       tex->op != nir_texop_txs &&
+                       tex->op != nir_texop_query_levels &&
+                       tex->op != nir_texop_texture_samples) {
+               if (descriptors_valid_op < 0)
+                  descriptors_valid_op = (int)tex->op;
                descriptors_valid = false;
                continue;
             }
@@ -5868,9 +6034,10 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    }
    if (!descriptors_valid) {
       fprintf(stderr,
-              "gex-wgpu: texture metadata invalid textures=%u samplers=%u "
+              "gex-wgpu: texture metadata invalid (texop=%d) textures=%u samplers=%u "
               "texture-used=0x%02x sampler-used=0x%02x shadow=0x%02x "
               "float=0x%02x uint=0x%02x sint=0x%02x\n",
+              descriptors_valid_op,
               shader->texture_count, shader->sampler_count,
               texture_slots_used, sampler_slots_used, shadow_slots,
               float_slots, uint_slots, sint_slots);
@@ -7666,6 +7833,61 @@ gex_wgpu_flush_constant_ring(struct gex_wgpu_context *ctx)
    ctx->constant_dirty_hi = 0;
 }
 
+/* Put a few words in the constant ring and return the dynamic offset they
+ * landed at, or ~0u on failure.
+ *
+ * Same mechanism as set_constant_buffer's user-buffer path and for the same
+ * reason: the *binding* has to be one stable buffer or every draw builds a
+ * new bind group, so the values ride in the ring and only the dynamic offset
+ * changes. ARB_shader_draw_parameters is the caller.
+ *
+ * The 256-byte alignment is WebGPU's guaranteed
+ * minUniformBufferOffsetAlignment, which is also its storage-buffer one --
+ * a dynamic offset must be a multiple of it whichever binding type is used. */
+static unsigned
+gex_wgpu_stage_ring_words(struct gex_wgpu_context *ctx, const uint32_t *words,
+                          unsigned count)
+{
+   struct pipe_context *pipe = &ctx->base;
+   const unsigned bytes = count * 4;
+   if (bytes > GEX_WGPU_CONSTANT_RING_BYTES)
+      return ~0u;
+   if (!ctx->constant_ring) {
+      struct pipe_resource templ = {0};
+      templ.target = PIPE_BUFFER;
+      templ.format = PIPE_FORMAT_R8_UNORM;
+      templ.width0 = GEX_WGPU_CONSTANT_RING_BYTES;
+      templ.height0 = 1;
+      templ.depth0 = 1;
+      templ.array_size = 1;
+      /* Both binds, because the ring now backs a read-only storage binding
+       * as well as the uniform ones. */
+      templ.bind = PIPE_BIND_CONSTANT_BUFFER | PIPE_BIND_SHADER_BUFFER;
+      ctx->constant_ring = pipe->screen->resource_create(pipe->screen, &templ);
+      if (!ctx->constant_ring)
+         return ~0u;
+   }
+   unsigned offset = ALIGN_POT(ctx->constant_ring_offset, 256u);
+   if (offset + bytes > GEX_WGPU_CONSTANT_RING_BYTES) {
+      /* Wrapping reuses bytes earlier draws may still be reading. */
+      gex_wgpu_submit_pending(ctx);
+      gex_wgpu_flush_constant_ring(ctx);
+      offset = 0;
+   }
+   ctx->constant_ring_offset = offset + bytes;
+   if (!ctx->constant_staging) {
+      ctx->constant_staging = MALLOC(GEX_WGPU_CONSTANT_RING_BYTES);
+      if (!ctx->constant_staging)
+         return ~0u;
+   }
+   memcpy(ctx->constant_staging + offset, words, bytes);
+   if (ctx->constant_dirty_hi == 0 || offset < ctx->constant_dirty_lo)
+      ctx->constant_dirty_lo = offset;
+   if (offset + bytes > ctx->constant_dirty_hi)
+      ctx->constant_dirty_hi = offset + bytes;
+   return offset;
+}
+
 static void
 gex_wgpu_batch_touch(struct gex_wgpu_context *ctx,
                      struct pipe_resource *resource)
@@ -8761,6 +8983,7 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
     * shape WebGPU accepts, and a sample count it can honour. The binds the
     * texture cannot serve are simply left out of desc.usage below. */
    const unsigned requested_samples = MAX2(1, templ->nr_samples);
+   const struct gex_wgpu_screen *screen_limits = gex_screen(screen);
    if ((gex_wgpu_texture_format(templ->format) == WGPUTextureFormat_Undefined &&
         !gex_wgpu_is_bc_format(templ->format)) ||
        (requested_samples != 1 &&
@@ -8769,14 +8992,22 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
                                       templ->nr_storage_samples,
                                       templ->bind)) ||
        templ->width0 == 0 || templ->height0 == 0 || templ->depth0 == 0 ||
-       templ->width0 > 8192 || templ->height0 > 8192 ||
-       templ->depth0 > 2048 ||
+       /* From the device, not from WebGPU's floor. These were 8192 and 2048
+        * while the caps advertised the floor too, so they agreed; once the
+        * caps started following the device (for GL 4.1's 16384 requirement)
+        * a hardcoded limit here refused an allocation st/mesa had every right
+        * to make, and a refused allocation is GL_OUT_OF_MEMORY from whatever
+        * call happened to make it. */
+       templ->width0 > screen_limits->max_texture_2d ||
+       templ->height0 > screen_limits->max_texture_2d ||
+       templ->depth0 > screen_limits->max_texture_3d ||
        (templ->target == PIPE_TEXTURE_1D &&
         (templ->height0 != 1 || templ->depth0 != 1 ||
          templ->array_size != 1)) ||
        (templ->target == PIPE_TEXTURE_1D_ARRAY &&
         (templ->height0 != 1 || templ->depth0 != 1 ||
-         templ->array_size == 0 || templ->array_size > 2048)) ||
+         templ->array_size == 0 ||
+         templ->array_size > screen_limits->max_texture_layers)) ||
        (templ->target == PIPE_TEXTURE_2D && templ->array_size != 1) ||
        (templ->target == PIPE_TEXTURE_RECT &&
         (templ->array_size != 1 || templ->last_level != 0)) ||
@@ -8796,8 +9027,24 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
         (templ->array_size < 6 || templ->array_size > 2046 ||
          templ->array_size % 6 != 0 || templ->width0 != templ->height0)) ||
        templ->last_level > util_logbase2(
-          MAX3(templ->width0, templ->height0, templ->depth0)))
+          MAX3(templ->width0, templ->height0, templ->depth0))) {
+      /* Named, once per shape, because a refused texture allocation reaches
+       * the application as GL_OUT_OF_MEMORY from whatever call made it and
+       * says nothing about why. Blender's startup hit this and the log had
+       * only "GL_OUT_OF_MEMORY in glTexStorage2D" to go on. */
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr,
+                 "gex-wgpu: texture resource refused: %s target=%u "
+                 "%ux%ux%u array=%u levels=%u samples=%u/%u bind=0x%x\n",
+                 util_format_short_name(templ->format), templ->target,
+                 templ->width0, templ->height0, templ->depth0,
+                 templ->array_size, templ->last_level + 1, templ->nr_samples,
+                 templ->nr_storage_samples, templ->bind);
+      }
       return NULL;
+   }
 
    struct gex_wgpu_resource *resource = CALLOC_STRUCT(gex_wgpu_resource);
    if (!resource)
@@ -11541,6 +11788,32 @@ gex_wgpu_texture_unmap(struct pipe_context *pipe,
    FREE(gex);
 }
 
+/* A clear colour WebGPU will accept.
+ *
+ * GL puts no constraint on glClearColor's arguments -- a NaN is a legal
+ * request, and for a normalised target the value is clamped to [0,1] when the
+ * clear happens, which makes a NaN's result unobservable. WebGPU validates
+ * the clearValue dictionary instead and rejects the whole render pass:
+ *
+ *   Color clearValue ([Color r:nan, g:nan, b:nan, a:nan]) contains a NaN or
+ *   Inf.
+ *
+ * ...which loses every command in that pass. Blender clears with NaN during
+ * its startup, so this is not a corner. A non-finite component becomes zero
+ * and an infinity is clamped, which is what a normalised target would have
+ * produced anyway; a float target loses the ability to be cleared to
+ * infinity, which no GL program asks for and which is worth a lost pass
+ * exactly never. */
+static double
+gex_wgpu_finite_clear(float value)
+{
+   if (isnan(value))
+      return 0.0;
+   if (isinf(value))
+      return value > 0.0f ? 1.0 : 0.0;
+   return (double)value;
+}
+
 static void
 gex_wgpu_clear_render_target(struct pipe_context *pipe,
                              struct pipe_surface *dst,
@@ -11618,10 +11891,10 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
       attachment.clearValue.b = (double)color->ui[2];
       attachment.clearValue.a = (double)color->ui[3];
    } else {
-      attachment.clearValue.r = color->f[0];
-      attachment.clearValue.g = color->f[1];
-      attachment.clearValue.b = color->f[2];
-      attachment.clearValue.a = color->f[3];
+      attachment.clearValue.r = gex_wgpu_finite_clear(color->f[0]);
+      attachment.clearValue.g = gex_wgpu_finite_clear(color->f[1]);
+      attachment.clearValue.b = gex_wgpu_finite_clear(color->f[2]);
+      attachment.clearValue.a = gex_wgpu_finite_clear(color->f[3]);
    }
    WGPURenderPassDescriptor pass_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
    pass_desc.colorAttachmentCount = 1;
@@ -19964,6 +20237,26 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
        * after this one; a lost draw is the smaller answer. */
       return;
    }
+   /* ARB_shader_draw_parameters, recorded here and nowhere deeper.
+    *
+    * gl_BaseVertexARB is the *application's* basevertex, and by the time the
+    * draw reaches the bind path it may be gone: the provoking-vertex and
+    * unfilled rewrites build a fresh index list with the base already folded
+    * into the indices and `index_bias` reset to zero, which is correct for
+    * the draw and wrong for the value the shader asked for. A flat varying is
+    * enough to trigger that -- `gl44-draw-parameters-probe` reported 0 for a
+    * basevertex of 7 while getting gl_VertexID right.
+    *
+    * draw_depth is already the "as the application issued it" test used by
+    * the bisection above, so it serves here too. */
+   if (ctx->draw_depth == 0 && info && draws) {
+      ctx->draw_base_vertex = info->index_size ? (uint32_t)draws[0].index_bias
+                                               : 0u;
+      ctx->draw_first_vertex = info->index_size
+         ? (uint32_t)draws[0].index_bias : draws[0].start;
+   }
+   if (ctx->draw_depth == 0 && info)
+      ctx->draw_base_instance = info->start_instance;
    ctx->draw_depth++;
    gex_wgpu_draw_vbo_inner(pipe, info, drawid_offset, indirect, draws,
                            num_draws);
@@ -20342,8 +20635,24 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * util_draw_vbo_without_prim_restart below re-issues a restarting draw as
     * however many restart-free ranges it found, so this is not a rare path. */
    if (info && draws && num_draws > 1) {
-      for (unsigned i = 0; i < num_draws && !ctx->failed; ++i)
-         gex_wgpu_draw_vbo(pipe, info, drawid_offset, indirect, &draws[i], 1);
+      for (unsigned i = 0; i < num_draws && !ctx->failed; ++i) {
+         /* A multi-draw may give each sub-draw its own basevertex. */
+         if (info->index_bias_varies && info->index_size) {
+            ctx->draw_base_vertex = (uint32_t)draws[i].index_bias;
+            ctx->draw_first_vertex = (uint32_t)draws[i].index_bias;
+         }
+         /* gl_DrawID counts across the sub-draws of a glMultiDraw* command,
+          * and Gallium says so with info->increment_draw_id -- the same loop
+          * also serves the primitive-restart splitter, whose ranges all came
+          * from *one* draw and must share its id. Passing drawid_offset
+          * unchanged gave every sub-draw of a glMultiDrawArrays the same
+          * gl_DrawIDARB, which the probe reads as 1,1,1 where it should see
+          * 1,2,3. */
+         gex_wgpu_draw_vbo(pipe, info,
+                           info->increment_draw_id ? drawid_offset + i
+                                                   : drawid_offset,
+                           indirect, &draws[i], 1);
+      }
       return;
    }
 
@@ -20429,14 +20738,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       : (!info || !draws)                           ? "no draw"
       : indirect                                    ? "indirect count from stream output"
       : num_draws != 1                              ? "multi-draw"
-      /* gl_DrawID. util_draw_indirect hands each sub-draw of a
-       * glMultiDraw*Indirect its own index here, so refusing every non-zero
-       * offset refused multi-draw indirect entirely -- and a refusal latches
-       * the context. It only changes the result for a shader that actually
-       * reads gl_DrawID, so that is what is refused; anything else does not
-       * care what the offset was. */
-      : (drawid_offset != 0 && ctx->vs && ctx->vs->reads_draw_id)
-                                                    ? "draw id offset"
+      /* gl_DrawID used to be refused for any non-zero offset, because
+       * nothing carried the value into the shader. ARB_shader_draw_parameters
+       * does now -- it rides the constant ring with the base vertex and base
+       * instance -- so the only case left is a shader that reads it through
+       * some path the lowering did not rewrite. */
+      : (drawid_offset != 0 && ctx->vs && ctx->vs->reads_draw_id &&
+         !ctx->vs->reads_draw_params)              ? "draw id offset"
       : !(GEX_WGPU_PRIM_MODES & BITFIELD_BIT(info->mode)) ? "topology"
       : (info->index_size != 0 && info->index_size != 2 &&
          info->index_size != 4)                     ? "index size"
@@ -21798,8 +22106,41 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* Shader storage blocks ride in the same group as the stage's uniform
     * blocks -- they were given the stage's descriptor set -- so a stage with
     * storage blocks and no uniform blocks still needs the group. */
+   /* ARB_shader_draw_parameters: the three per-draw scalars, staged into the
+    * constant ring so the binding stays one stable buffer. Only for a shader
+    * that reads them, which is the condition on the whole feature's cost. */
+   unsigned draw_params_offset = ~0u;
+   if (ctx->vs->reads_draw_params) {
+      uint32_t words[GEX_WGPU_DRAW_PARAM_WORDS] = {0};
+      /* gl_BaseVertexARB is the basevertex parameter, and *zero* where the
+       * command has none -- glDrawArrays' `first` is not it. The internal
+       * first-vertex value, which is what gl_VertexID is derived from, is the
+       * separate word below. */
+      words[GEX_WGPU_DRAW_PARAM_BASE_VERTEX] = ctx->draw_base_vertex;
+      words[GEX_WGPU_DRAW_PARAM_FIRST_VERTEX] = ctx->draw_first_vertex;
+      words[GEX_WGPU_DRAW_PARAM_BASE_INSTANCE] = ctx->draw_base_instance;
+      words[GEX_WGPU_DRAW_PARAM_DRAW_ID] = drawid_offset;
+      if (getenv("GEX_WGPU_DRAW_PARAMS_LOG"))
+         fprintf(stderr, "gex-wgpu: draw params base_vertex=%u "
+                 "base_instance=%u draw_id=%u first_vertex=%u "
+                 "(index_size=%u bias=%d start=%u)\n",
+                 words[GEX_WGPU_DRAW_PARAM_BASE_VERTEX],
+                 words[GEX_WGPU_DRAW_PARAM_BASE_INSTANCE],
+                 words[GEX_WGPU_DRAW_PARAM_DRAW_ID],
+                 words[GEX_WGPU_DRAW_PARAM_FIRST_VERTEX],
+                 info->index_size, draws[0].index_bias, draws[0].start);
+      draw_params_offset =
+         gex_wgpu_stage_ring_words(ctx, words, GEX_WGPU_DRAW_PARAM_WORDS);
+      if (draw_params_offset == ~0u) {
+         if (!ctx->failed)
+            fprintf(stderr, "gex-wgpu: could not stage the draw parameters\n");
+         gex_fail(ctx);
+         return;
+      }
+   }
    const unsigned vertex_group_count =
-      ctx->vs->ubo_count + ctx->vs->ssbo_count + ctx->vs->buftex_count;
+      ctx->vs->ubo_count + ctx->vs->ssbo_count + ctx->vs->buftex_count +
+      (ctx->vs->reads_draw_params ? 1u : 0u);
    const unsigned fragment_group_count =
       ctx->fs->ubo_count + ctx->fs->ssbo_count + ctx->fs->image_count +
       ctx->fs->buftex_count;
@@ -22146,7 +22487,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       vertex_layout_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
                             GEX_WGPU_MAX_SO_BUFFERS +
                             GEX_WGPU_MAX_SHADER_BUFFERS +
-                            GEX_WGPU_MAX_BUFFER_TEXTURES];
+                            GEX_WGPU_MAX_BUFFER_TEXTURES +
+                            /* the draw parameters */ 1];
    WGPUBindGroupLayoutEntry
       fragment_layout_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
                               GEX_WGPU_MAX_SHADER_BUFFERS +
@@ -22247,6 +22589,21 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       vertex_layout_entries[at].buffer.type =
          WGPUBufferBindingType_ReadOnlyStorage;
       vertex_layout_entries[at].buffer.hasDynamicOffset = false;
+   }
+   if (ctx->vs->reads_draw_params) {
+      const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
+                          ctx->vs->buftex_count;
+      vertex_layout_entries[at] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      vertex_layout_entries[at].binding = GEX_WGPU_DRAW_PARAMS_BINDING;
+      vertex_layout_entries[at].visibility = WGPUShaderStage_Vertex;
+      /* Read-only, because WGSL forbids a writable storage buffer in the
+       * vertex stage -- the same reason the buffer textures above are. */
+      vertex_layout_entries[at].buffer.type =
+         WGPUBufferBindingType_ReadOnlyStorage;
+      vertex_layout_entries[at].buffer.hasDynamicOffset = true;
+      vertex_layout_entries[at].buffer.minBindingSize =
+         GEX_WGPU_DRAW_PARAM_WORDS * 4;
    }
    for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
       const unsigned slot = ctx->fs->ubo_slots[i];
@@ -22597,7 +22954,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       WGPUBindGroupEntry
          entries[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SO_BUFFERS +
                  GEX_WGPU_MAX_SHADER_BUFFERS +
-                 GEX_WGPU_MAX_BUFFER_TEXTURES];
+                 GEX_WGPU_MAX_BUFFER_TEXTURES +
+                 /* the draw parameters */ 1];
       for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
          const unsigned slot = ctx->vs->ubo_slots[i];
          const struct pipe_constant_buffer *constant =
@@ -22660,6 +23018,20 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[at].buffer = gex_resource(view->texture)->buffer;
          entries[at].offset = view->u.buf.offset;
          entries[at].size = view->u.buf.size;
+      }
+      if (ctx->vs->reads_draw_params) {
+         const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
+                             ctx->vs->buftex_count;
+         entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[at].binding = GEX_WGPU_DRAW_PARAMS_BINDING;
+         entries[at].buffer = gex_resource(ctx->constant_ring)->buffer;
+         entries[at].offset = 0;
+         entries[at].size = GEX_WGPU_DRAW_PARAM_WORDS * 4;
+         /* The offset is the draw's, not the bind group's -- see the uniform
+          * blocks above: one stable buffer plus a dynamic offset is what lets
+          * the bind group be cached across draws. */
+         gex_wgpu_add_dynamic_offset(&dynamic[1], GEX_WGPU_DRAW_PARAMS_BINDING,
+                                     draw_params_offset);
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[1];
@@ -24076,6 +24448,11 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * straight across; what WebGPU has no form of is a view format outside the
     * texture's own sRGB pair, which create_sampler_view refuses by name. */
    caps->sampler_view_target = true;
+   /* ARB_shader_draw_parameters. gl_BaseVertexARB, gl_BaseInstanceARB and
+    * gl_DrawIDARB are lowered onto a driver-owned block in the vertex group;
+    * see GEX_WGPU_DRAW_PARAMS_BINDING. Blender 5.2 refuses to start without
+    * it, and it is the last thing it named. */
+   caps->draw_parameters = true;
    caps->clip_halfz = true;
    caps->fs_coord_origin_upper_left = true;
    caps->fs_coord_pixel_center_half_integer = true;
@@ -24210,7 +24587,7 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
          stages[i] == MESA_SHADER_VERTEX ||
          stages[i] == MESA_SHADER_COMPUTE
             ? MIN2(GEX_WGPU_MAX_SHADER_BUFFERS,
-                   screen->max_storage_buffers * 2)
+                   MAX2(24u, screen->max_storage_buffers * 2))
             : 0;
       /* Shader images, the last gate before ARB_compute_shader:
        * st_extensions turns on ARB_shader_image_load_store when the *fragment*
