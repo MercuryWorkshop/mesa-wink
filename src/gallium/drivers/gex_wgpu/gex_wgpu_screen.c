@@ -517,6 +517,9 @@ struct gex_wgpu_context {
     * pipe_context, which is why it is not simply moved up. */
    struct gex_wgpu_rasterizer *facing_pass;
    bool facing_split;
+   /* Post-vertex-shader positions, captured to decide each polygon's facing
+    * when an unfilled draw has to be culled. See gex_wgpu_cull_polygons. */
+   struct pipe_resource *facing_vs_out;
    /* Set while a provoking-vertex rewrite is re-issuing its draw, so the
     * rewrite does not see its own output and recurse. */
    bool provoking_rewritten;
@@ -12386,6 +12389,27 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
    NIR_PASS(_, nir, nir_lower_returns);
 
    nir->info.stage = MESA_SHADER_COMPUTE;
+   /* Clear the per-stage half of shader_info along with the stage.
+    *
+    * shader_info's stage-specific fields are a *union*, so the vertex
+    * stage's and the compute stage's occupy the same bytes. Changing the
+    * stage without clearing them leaves whatever the vertex shader had there
+    * to be read as compute state, and ntv reads exactly one field of it to
+    * choose the SPIR-V addressing model:
+    *
+    *   if (s->info.cs.ptr_size == 64) {
+    *      emit_cap(PhysicalStorageBufferAddresses);
+    *      model = PhysicalStorageBuffer64;
+    *
+    * Tint refuses that outright -- "Capability PhysicalStorageBufferAddresses
+    * is not allowed by Vulkan 1.1" -- so the whole module is rejected for a
+    * shader that touches no global memory at all. Whether it happens depends
+    * on what the vertex fields happened to hold, which is why it struck one
+    * shader (st/mesa's fixed-function vertex shader with the edge-flag
+    * passthrough, which is what glPolygonMode makes st emit) and not the
+    * captures that have been running all along. All three of these builders
+    * turn a vertex shader into a compute one and all three had it. */
+   memset(&nir->info.cs, 0, sizeof(nir->info.cs));
    nir->info.workgroup_size[0] = GEX_WGPU_CAPTURE_GROUP;
    nir->info.workgroup_size[1] = 1;
    nir->info.workgroup_size[2] = 1;
@@ -12503,12 +12527,18 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
           !memcmp(&v->varyings, varyings, sizeof(*varyings)))
          return v;
    }
-   if (!vs->varying_nir)
+   if (!vs->varying_nir) {
+      if (getenv("GEX_WGPU_UNFILLED_LOG"))
+         fprintf(stderr, "gex-wgpu: capture variant: no varying_nir kept\n");
       return NULL;
+   }
 
    nir_shader *nir = nir_shader_clone(NULL, vs->varying_nir);
-   if (!nir)
+   if (!nir) {
+      if (getenv("GEX_WGPU_UNFILLED_LOG"))
+         fprintf(stderr, "gex-wgpu: capture variant: clone failed\n");
       return NULL;
+   }
 
    struct gex_wgpu_capture state = {0};
    state.layout = vertex;
@@ -12522,8 +12552,14 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
                               nir_metadata_control_flow, &state);
    nir_shader_intrinsics_pass(nir, gex_wgpu_capture_builtin,
                               nir_metadata_control_flow, &state);
-   if (state.failed ||
-       !gex_wgpu_emit_varying_stores(nir, &state, gex_wgpu_capture_slot_of)) {
+   const bool stores_ok =
+      !state.failed &&
+      gex_wgpu_emit_varying_stores(nir, &state, gex_wgpu_capture_slot_of);
+   if (!stores_ok) {
+      if (getenv("GEX_WGPU_UNFILLED_LOG"))
+         fprintf(stderr, "gex-wgpu: capture variant failed (%s) slots=%u\n",
+                 state.failed ? "input lowering" : "varying stores",
+                 varyings->count);
       ralloc_free(nir);
       return NULL;
    }
@@ -12538,6 +12574,8 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    NIR_PASS(_, nir, nir_lower_returns);
 
    nir->info.stage = MESA_SHADER_COMPUTE;
+   /* Same union hazard as the transform-feedback capture above. */
+   memset(&nir->info.cs, 0, sizeof(nir->info.cs));
    nir->info.workgroup_size[0] = GEX_WGPU_CAPTURE_GROUP;
    nir->info.workgroup_size[1] = 1;
    nir->info.workgroup_size[2] = 1;
@@ -13349,6 +13387,8 @@ gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs)
    NIR_PASS(_, nir, nir_opt_dce);
 
    nir->info.stage = MESA_SHADER_COMPUTE;
+   /* Same union hazard as the transform-feedback capture above. */
+   memset(&nir->info.cs, 0, sizeof(nir->info.cs));
    nir->info.workgroup_size[0] = GEX_WGPU_GS_GROUP;
    nir->info.workgroup_size[1] = 1;
    nir->info.workgroup_size[2] = 1;
@@ -16501,11 +16541,392 @@ gex_wgpu_draw_provoking_last(struct pipe_context *pipe,
  * to run before the topology rewrite, on the primitive the application asked
  * for.
  *
- * One fidelity gap, deliberately: GL culls before applying polygon mode, so a
- * culled back face contributes no edges. Lines carry no winding, so a
- * wireframe drawn with culling enabled shows back-facing polygons' edges too.
- * That pairing is uncommon and the alternative is culling on the CPU.
+ * Culling is *not* done here, and cannot be: WebGPU's cullMode acts only on
+ * triangle topology and this rewrite has already turned the polygons into
+ * lines or points. The caller filters the source polygons by facing first --
+ * see gex_wgpu_cull_polygons, which is the CPU cull this comment used to say
+ * was the only alternative. It is also what makes the per-face polygon mode
+ * split correct, since each of its passes culls the other face.
  */
+/* Which source polygons face the way the cull state wants to keep, decided on
+ * the CPU from the post-vertex-shader positions.
+ *
+ * GL culls before applying polygon mode, so a culled back face contributes no
+ * edges. WebGPU applies cullMode only to *triangle* topology, and an unfilled
+ * polygon has been rewritten into lines or points by the time it is drawn, so
+ * the cull is inert exactly when polygon mode is in use. That was a
+ * documented gap in gex_wgpu_draw_unfilled, and the per-face split made it
+ * matter far more: each of its two passes culls the other face, so with the
+ * cull inert both passes drew every polygon and the two fill modes landed on
+ * top of each other.
+ *
+ * Facing is the sign of the polygon's signed area in window coordinates,
+ * which needs the positions the vertex shader produced -- so the vertex
+ * shader is run as compute into a capture buffer, the same first pass the
+ * wide-line rewrite uses, with a one-slot layout because only
+ * VARYING_SLOT_POS is wanted (it is always slot zero, so the record is 16
+ * bytes and the position sits at offset 0).
+ *
+ * Source polygons are filtered rather than the translator's output: the
+ * unfilled rewrite deliberately runs before the topology conversion so that a
+ * quad's four edges stay four edges and not two triangles' six, and the
+ * mapping from output line to input polygon differs per topology. Strips and
+ * fans become TRIANGLES and a quad strip becomes QUADS, which is lossless
+ * here because polygon mode's edges are per-polygon either way.
+ *
+ * Returns false when it cannot decide, and the caller then draws everything
+ * unfilled -- the old behaviour, which is wrong in the same way it always was
+ * rather than newly wrong.
+ */
+/* Why a facing capture could not be taken. Every one of these leaves the draw
+ * to go through unculled, which is what it did before the capture existed --
+ * so they are reasons a wireframe is less exact, not failures. */
+#define GEX_CAPTURE_DECLINE(why)                                            \
+   do {                                                                     \
+      if (getenv("GEX_WGPU_UNFILLED_LOG"))                                  \
+         fprintf(stderr, "gex-wgpu: facing capture declined (%s)\n", (why)); \
+      return false;                                                         \
+   } while (0)
+
+static bool
+gex_wgpu_capture_positions(struct gex_wgpu_context *ctx, unsigned first,
+                           unsigned count, unsigned *out_record,
+                           unsigned *out_edge_offset)
+{
+   if (!ctx->vs || !count)
+      GEX_CAPTURE_DECLINE("no vs or no vertices");
+   /* A vertex shader that samples a texture would compile into a compute
+    * module declaring bindings this dispatch does not provide, and a pipeline
+    * WebGPU rejects poisons the device. Same rule as the line capture. */
+   if (ctx->vs->texture_count || ctx->vs->sampler_count)
+      GEX_CAPTURE_DECLINE("the vertex shader samples a texture");
+
+   struct gex_wgpu_varying_layout varyings;
+   memset(&varyings, 0, sizeof(varyings));
+   varyings.location[varyings.count++] = VARYING_SLOT_POS;
+   /* The edge flag, when there is one to have. Mesa only produces it when it
+    * can matter: st_atom_shader sets passthrough_edgeflags from
+    * ctx->Array._PerVertexEdgeFlagsEnabled, which varray.c clears unless the
+    * polygon mode of an unculled face is something other than FILL. So a
+    * vertex shader writing VARYING_SLOT_EDGE is exactly the case where GL
+    * says the flags decide which edges are drawn. */
+   *out_edge_offset = ~0u;
+   if (ctx->vs->original_nir &&
+       (ctx->vs->original_nir->info.outputs_written &
+        BITFIELD64_BIT(VARYING_SLOT_EDGE))) {
+      *out_edge_offset = varyings.count * 16;
+      varyings.location[varyings.count++] = VARYING_SLOT_EDGE;
+   }
+   const unsigned record = gex_wgpu_varying_stride(&varyings);
+
+   struct gex_wgpu_capture_layout layout;
+   memset(&layout, 0, sizeof(layout));
+   if (ctx->vertex_elements) {
+      layout.count = ctx->vertex_elements->count;
+      for (unsigned i = 0; i < layout.count; ++i) {
+         const struct pipe_vertex_element *ve =
+            &ctx->vertex_elements->elements[i];
+         if (ve->instance_divisor)
+            GEX_CAPTURE_DECLINE("a per-instance attribute");
+         layout.buffer[i] = ve->vertex_buffer_index;
+         layout.offset[i] = ve->src_offset;
+         layout.stride[i] = ve->src_stride;
+         layout.format[i] = ve->src_format;
+      }
+   }
+   struct gex_wgpu_varying_variant *variant =
+      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &varyings);
+   if (!variant)
+      GEX_CAPTURE_DECLINE("no compute variant for this layout");
+   if (!gex_wgpu_ensure_buffer(ctx, &ctx->facing_vs_out, count * record,
+                               PIPE_BIND_VERTEX_BUFFER |
+                               PIPE_BIND_SHADER_BUFFER))
+      GEX_CAPTURE_DECLINE("the capture buffer could not be allocated");
+
+   /* An immediate-mode draw's vertices are staged through the stream
+    * uploader, and this pass reads them on the GPU rather than through the
+    * ordinary vertex fetch, so an open mapping is not there yet. */
+   u_upload_unmap(ctx->base.stream_uploader);
+   uint32_t params[GEX_WGPU_PARAM_WORDS] = {0};
+   params[GEX_WGPU_PARAM_FIRST_VERTEX] = first;
+   params[GEX_WGPU_PARAM_COUNT] = count;
+   struct gex_wgpu_bindings group0 = {0}, group1 = {0};
+   for (unsigned i = 0; i < GEX_WGPU_MAX_VERTEX_BUFFERS; ++i) {
+      if (!(variant->vb_mask & (1u << i)))
+         continue;
+      if (i >= ctx->vertex_buffer_count || !ctx->vertex_buffers[i])
+         GEX_CAPTURE_DECLINE("a vertex buffer is unbound");
+      params[GEX_WGPU_PARAM_VB_OFFSET + i] = ctx->vertex_buffer_offsets[i];
+      gex_wgpu_bind_storage_access(&group0, GEX_WGPU_VB_FIRST_BINDING + i,
+                                   ctx->vertex_buffers[i], true);
+   }
+   struct pipe_resource *param_buffer =
+      gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS);
+   gex_wgpu_bind_storage(&group0, GEX_WGPU_VARYING_OUT_BINDING,
+                         ctx->facing_vs_out);
+   gex_wgpu_bind_storage(&group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
+                         param_buffer);
+   bool ok = param_buffer &&
+             gex_wgpu_bind_constants(ctx, &group1, MESA_SHADER_VERTEX,
+                                     ctx->vs->ubo_count, ctx->vs->ubo_slots,
+                                     ctx->vs->ubo_bindings,
+                                     ctx->vs->ubo_storage_mask);
+   if (ok)
+      ok = gex_wgpu_dispatch(ctx, variant->module, &group0, &group1, NULL,
+                             DIV_ROUND_UP(count, GEX_WGPU_CAPTURE_GROUP));
+   pipe_resource_reference(&param_buffer, NULL);
+   if (ok)
+      *out_record = record;
+   return ok;
+}
+
+/* How a topology's polygons are laid out: how many vertices each has, how far
+ * apart consecutive polygons start, and what to draw the survivors as. */
+struct gex_wgpu_polygon_walk {
+   unsigned verts;
+   unsigned step;
+   enum mesa_prim out_mode;
+   bool alternates;   /* a triangle strip flips winding on odd primitives */
+   bool fan;
+   bool single;       /* GL_POLYGON: one primitive of every vertex */
+};
+
+static bool
+gex_wgpu_polygon_walk(enum mesa_prim mode, struct gex_wgpu_polygon_walk *walk)
+{
+   memset(walk, 0, sizeof(*walk));
+   switch (mode) {
+   case MESA_PRIM_TRIANGLES:
+      walk->verts = 3; walk->step = 3; walk->out_mode = MESA_PRIM_TRIANGLES;
+      return true;
+   case MESA_PRIM_TRIANGLE_STRIP:
+      walk->verts = 3; walk->step = 1; walk->out_mode = MESA_PRIM_TRIANGLES;
+      walk->alternates = true;
+      return true;
+   case MESA_PRIM_TRIANGLE_FAN:
+      walk->verts = 3; walk->step = 1; walk->out_mode = MESA_PRIM_TRIANGLES;
+      walk->fan = true;
+      return true;
+   case MESA_PRIM_QUADS:
+      walk->verts = 4; walk->step = 4; walk->out_mode = MESA_PRIM_QUADS;
+      return true;
+   case MESA_PRIM_QUAD_STRIP:
+      walk->verts = 4; walk->step = 2; walk->out_mode = MESA_PRIM_QUADS;
+      return true;
+   case MESA_PRIM_POLYGON:
+      walk->out_mode = MESA_PRIM_POLYGON; walk->single = true;
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+gex_wgpu_cull_polygons(struct pipe_context *pipe,
+                       const struct pipe_draw_info *info,
+                       const struct pipe_draw_start_count_bias *draw,
+                       unsigned cull_face, unsigned fill_mode,
+                       uint32_t **out_indices, unsigned *out_count,
+                       enum mesa_prim *out_mode)
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   struct gex_wgpu_polygon_walk walk;
+   if (!ctx->rasterizer || !gex_wgpu_polygon_walk(info->mode, &walk))
+      return false;
+   unsigned count = draw->count;
+   if (!u_trim_pipe_prim(info->mode, &count) || count == 0)
+      return false;
+   if (info->index_size && info->index_size != 1 && info->index_size != 2 &&
+       info->index_size != 4)
+      return false;
+
+   /* The source indices, resolved to vertex numbers once so that everything
+    * below -- the capture range and the emitted list -- speaks one language. */
+   uint32_t *source = MALLOC(count * sizeof(*source));
+   if (!source)
+      return false;
+   struct pipe_transfer *transfer = NULL;
+   const void *raw = NULL;
+   if (info->index_size) {
+      raw = info->has_user_indices
+         ? (const void *)((const char *)info->index.user +
+                          (size_t)draw->start * info->index_size)
+         : pipe_buffer_map_range(pipe, info->index.resource,
+                                 (size_t)draw->start * info->index_size,
+                                 (size_t)count * info->index_size,
+                                 PIPE_MAP_READ, &transfer);
+      if (!raw) {
+         FREE(source);
+         return false;
+      }
+   }
+   for (unsigned i = 0; i < count; ++i) {
+      int64_t index;
+      if (!info->index_size)
+         index = (int64_t)draw->start + i;
+      else if (info->index_size == 1)
+         index = ((const uint8_t *)raw)[i];
+      else if (info->index_size == 2)
+         index = ((const uint16_t *)raw)[i];
+      else
+         index = ((const uint32_t *)raw)[i];
+      if (info->index_size)
+         index += draw->index_bias;
+      if (index < 0) {
+         if (transfer) pipe_buffer_unmap(pipe, transfer);
+         FREE(source);
+         return false;
+      }
+      source[i] = (uint32_t)index;
+   }
+   if (transfer)
+      pipe_buffer_unmap(pipe, transfer);
+
+   uint32_t low = source[0], high = source[0];
+   for (unsigned i = 1; i < count; ++i) {
+      low = MIN2(low, source[i]);
+      high = MAX2(high, source[i]);
+   }
+   /* Only the range the draw touches is captured, which for a non-indexed
+    * draw is exactly the draw and for an indexed one is its index bounds. */
+   unsigned record = 0, edge_offset = ~0u;
+   if (!gex_wgpu_capture_positions(ctx, low, high - low + 1, &record,
+                                   &edge_offset)) {
+      FREE(source);
+      return false;
+   }
+
+   struct pipe_transfer *read = NULL;
+   const float *captured =
+      pipe_buffer_map_range(pipe, ctx->facing_vs_out, 0,
+                            (size_t)(high - low + 1) * record, PIPE_MAP_READ,
+                            &read);
+   if (!captured) {
+      FREE(source);
+      return false;
+   }
+
+   /* GL's window y runs up and so does Gallium's clip space, and the y flip
+    * this driver applies lives in the *rasterising* vertex module rather than
+    * in the capture -- so the captured positions are in Gallium clip space
+    * and a counter-clockwise winding here is counter-clockwise in the window.
+    * Measured against llvmpipe with two triangles of known opposite winding
+    * in gl44-polygon-mode-faces-probe, not derived: the front/back pair and
+    * the two cull cases all invert together if this sign is wrong, which is
+    * what makes the probe able to tell. */
+   const bool front_ccw = ctx->rasterizer->front_ccw;
+   const unsigned stride_floats = record / 4;
+   /* With edge flags in play the line or point list is built here rather than
+    * handed to u_unfilled_translator, because the decision is per *edge* and
+    * the translator has no way to be told. GL gives each vertex a flag that
+    * says whether the edge *beginning* at it is a boundary edge; a LINE
+    * polygon draws only its boundary edges, and a POINT polygon draws only
+    * the vertices that begin one. Two edges of `tri-edgeflag`'s triangle are
+    * boundary edges and the third is not, which is the whole of its
+    * divergence. */
+   const bool have_edges = edge_offset != ~0u;
+   const bool emit_lines = have_edges && fill_mode == PIPE_POLYGON_MODE_LINE;
+   const bool emit_points = have_edges && fill_mode == PIPE_POLYGON_MODE_POINT;
+   /* Two indices per edge in the worst case, and a polygon has as many edges
+    * as vertices. */
+   uint32_t *kept = MALLOC((size_t)count * 2 * sizeof(*kept));
+   if (!kept) {
+      pipe_buffer_unmap(pipe, read);
+      FREE(source);
+      return false;
+   }
+   unsigned kept_count = 0;
+
+   const unsigned polygons = walk.single ? 1
+      : (count >= walk.verts ? (count - walk.verts) / walk.step + 1 : 0);
+   for (unsigned p = 0; p < polygons; ++p) {
+      /* The polygon's vertices, in the order the topology gives them. */
+      uint32_t corner[4];
+      const unsigned verts = walk.single ? count : walk.verts;
+      if (walk.single) {
+         /* A polygon's facing is its whole outline's, and its first three
+          * vertices give it for the convex polygons GL defines this for. */
+         corner[0] = source[0]; corner[1] = source[1]; corner[2] = source[2];
+      } else if (walk.fan) {
+         corner[0] = source[0];
+         corner[1] = source[p + 1];
+         corner[2] = source[p + 2];
+      } else if (info->mode == MESA_PRIM_QUAD_STRIP) {
+         /* A strip quad's corners in winding order are v0, v1, v3, v2. */
+         corner[0] = source[p * 2 + 0];
+         corner[1] = source[p * 2 + 1];
+         corner[2] = source[p * 2 + 3];
+         corner[3] = source[p * 2 + 2];
+      } else {
+         for (unsigned k = 0; k < walk.verts; ++k)
+            corner[k] = source[p * walk.step + k];
+         /* An odd triangle in a strip has the opposite winding, and GL
+          * compensates so that every triangle in a strip faces the same way.
+          * Swapping two corners here is that compensation. */
+         if (walk.alternates && (p & 1)) {
+            const uint32_t swap = corner[1];
+            corner[1] = corner[2];
+            corner[2] = swap;
+         }
+      }
+
+      float x[3], y[3];
+      bool usable = true;
+      for (unsigned k = 0; k < 3; ++k) {
+         const float *v = captured + (size_t)(corner[k] - low) * stride_floats;
+         const float w = v[3];
+         /* A vertex at or behind the eye has no window position, so the
+          * polygon's facing is undecidable; it is kept rather than guessed
+          * at, which errs the way the old behaviour did. */
+         if (!(w > 0.0f)) { usable = false; break; }
+         x[k] = v[0] / w;
+         y[k] = v[1] / w;
+      }
+      const float area = usable
+         ? (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0])
+         : 0.0f;
+      const bool front = !usable || area == 0.0f ? true
+                                                 : (area > 0.0f) == front_ccw;
+      const bool culled = usable && area != 0.0f &&
+                          (front ? cull_face == PIPE_FACE_FRONT
+                                 : cull_face == PIPE_FACE_BACK);
+      if (culled)
+         continue;
+
+      /* The polygon's vertices in winding order, which for GL_POLYGON is the
+       * whole draw and for everything else is the corners worked out above. */
+      const uint32_t *ring = walk.single ? source : corner;
+      const unsigned ring_count = walk.single ? verts
+         : (info->mode == MESA_PRIM_QUAD_STRIP ||
+            info->mode == MESA_PRIM_QUADS) ? 4u : 3u;
+
+      if (emit_lines || emit_points) {
+         for (unsigned k = 0; k < ring_count; ++k) {
+            const float *v =
+               captured + (size_t)(ring[k] - low) * stride_floats;
+            if (!(v[edge_offset / 4] > 0.5f))
+               continue;
+            kept[kept_count++] = ring[k];
+            if (emit_lines)
+               kept[kept_count++] = ring[(k + 1) % ring_count];
+         }
+         continue;
+      }
+      for (unsigned k = 0; k < ring_count; ++k)
+         kept[kept_count++] = ring[k];
+   }
+   pipe_buffer_unmap(pipe, read);
+   FREE(source);
+
+   *out_indices = kept;
+   *out_count = kept_count;
+   /* LINES or POINTS means the list is final and must not be run through the
+    * unfilled translator again; anything else is still polygons. */
+   *out_mode = emit_lines ? MESA_PRIM_LINES
+             : emit_points ? MESA_PRIM_POINTS : walk.out_mode;
+   return true;
+}
+
 static bool
 gex_wgpu_draw_unfilled(struct pipe_context *pipe,
                        const struct pipe_draw_info *info,
@@ -16872,8 +17293,93 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        !indirect && ctx->rasterizer &&
        ctx->rasterizer->fill_mode != PIPE_POLYGON_MODE_FILL &&
        u_reduced_prim(info->mode) == MESA_PRIM_TRIANGLES) {
-      if (gex_wgpu_draw_unfilled(pipe, info, drawid_offset, &draws[0],
-                                 ctx->rasterizer->fill_mode))
+      /* Culling has to be applied here rather than left to the rasterizer.
+       * WebGPU's cullMode acts only on triangle topology and the rewrite
+       * below turns these polygons into lines or points, so the cull would
+       * be silently inert exactly when polygon mode is in use -- and the
+       * per-face split relies on it, since each of its passes culls the
+       * other face. See gex_wgpu_cull_polygons; it decides facing from the
+       * post-vertex-shader positions and hands on only the polygons that
+       * survive. When it cannot decide, the draw goes through unculled,
+       * which is the behaviour this had before it existed. */
+      const struct pipe_draw_info *unfilled_info = info;
+      const struct pipe_draw_start_count_bias *unfilled_draw = &draws[0];
+      struct pipe_draw_info culled_info;
+      struct pipe_draw_start_count_bias culled_draw;
+      uint32_t *culled_indices = NULL;
+      /* Edge flags need the same pass whether or not anything is culled: it
+       * is the only place the per-vertex flag can be read. */
+      const bool want_edges = ctx->vs && ctx->vs->original_nir &&
+         (ctx->vs->original_nir->info.outputs_written &
+          BITFIELD64_BIT(VARYING_SLOT_EDGE));
+      static int no_facing = -1;
+      if (no_facing < 0)
+         no_facing = getenv("GEX_WGPU_NO_FACING_CULL") ? 1 : 0;
+      if (!no_facing && (want_edges ||
+          ctx->rasterizer->cull_face == PIPE_FACE_FRONT ||
+          ctx->rasterizer->cull_face == PIPE_FACE_BACK)) {
+         unsigned culled_count = 0;
+         enum mesa_prim culled_mode = MESA_PRIM_TRIANGLES;
+         if (gex_wgpu_cull_polygons(pipe, info, &draws[0],
+                                    ctx->rasterizer->cull_face,
+                                    ctx->rasterizer->fill_mode,
+                                    &culled_indices, &culled_count,
+                                    &culled_mode)) {
+            if (!culled_count) {
+               FREE(culled_indices);
+               return;   /* nothing survived the cull and the edge flags */
+            }
+            culled_info = *info;
+            culled_info.mode = culled_mode;
+            culled_info.index_size = 4;
+            culled_info.has_user_indices = true;
+            culled_info.index.user = culled_indices;
+            culled_info.primitive_restart = false;
+            culled_info.index_bounds_valid = false;
+            culled_info.min_index = 0;
+            culled_info.max_index = ~0u;
+            culled_draw = draws[0];
+            culled_draw.start = 0;
+            culled_draw.count = culled_count;
+            /* The filter resolved real vertex numbers, so the bias is
+             * already in the indices and must not be applied twice. */
+            culled_draw.index_bias = 0;
+            unfilled_info = &culled_info;
+            unfilled_draw = &culled_draw;
+            /* A LINES or POINTS list is already the thing to rasterize --
+             * the edge flags decided it per edge, which the unfilled
+             * translator cannot be told. Re-entering the draw path with a
+             * non-polygon topology does not come back through this hook, and
+             * it picks up the wide, smooth and stippled line rewrites on the
+             * way, which is where GL_LINE_SMOOTH on an unfilled polygon gets
+             * honoured. */
+            if (getenv("GEX_WGPU_UNFILLED_LOG"))
+               fprintf(stderr, "gex-wgpu: unfilled filtered mode=%u count=%u "
+                       "(from mode=%u fill=%u cull=%u edges=%d)\n",
+                       culled_mode, culled_count, info->mode,
+                       ctx->rasterizer->fill_mode, ctx->rasterizer->cull_face,
+                       (int)want_edges);
+            if (culled_mode == MESA_PRIM_LINES ||
+                culled_mode == MESA_PRIM_POINTS) {
+               gex_wgpu_draw_vbo(pipe, &culled_info, drawid_offset, NULL,
+                                 &culled_draw, 1);
+               FREE(culled_indices);
+               return;
+            }
+         }
+      }
+      if (getenv("GEX_WGPU_UNFILLED_LOG"))
+         fprintf(stderr, "gex-wgpu: unfilled mode=%u fill=%u cull=%u "
+                 "want_edges=%d filtered=%s count=%u\n", info->mode,
+                 ctx->rasterizer->fill_mode, ctx->rasterizer->cull_face,
+                 (int)want_edges,
+                 unfilled_info == &culled_info ? "yes" : "no",
+                 unfilled_draw->count);
+      const bool drawn =
+         gex_wgpu_draw_unfilled(pipe, unfilled_info, drawid_offset,
+                                unfilled_draw, ctx->rasterizer->fill_mode);
+      FREE(culled_indices);
+      if (drawn)
          return;
       static bool said;
       if (!said) {
@@ -19636,6 +20142,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    if (ctx->primconvert)
       util_primconvert_destroy(ctx->primconvert);
    FREE(ctx->facing_pass);
+   pipe_resource_reference(&ctx->facing_vs_out, NULL);
    util_copy_framebuffer_state(&ctx->framebuffer, NULL);
    for (unsigned i = 0; i < ARRAY_SIZE(ctx->vertex_buffer_state); ++i)
       pipe_vertex_buffer_unreference(&ctx->vertex_buffer_state[i]);
