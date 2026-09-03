@@ -27,6 +27,7 @@
 #include "util/u_memory.h"
 #include "util/u_helpers.h"
 #include "util/u_prim.h"
+#include "util/u_surface.h"
 #include "util/u_prim_restart.h"
 #include "indices/u_indices.h"
 #include "tessellator/p_tessellator.h"
@@ -737,6 +738,14 @@ struct gex_wgpu_context {
    bool poly_stipple_set;
    uint32_t fb_width;
    uint32_t fb_height;
+   /* ARB_framebuffer_no_attachments: a framebuffer with nothing attached,
+    * sized by GL_FRAMEBUFFER_DEFAULT_WIDTH/HEIGHT. WebGPU has no such render
+    * pass -- one attachment is the minimum -- so a scratch colour target is
+    * allocated at the default size and stands in for the whole framebuffer.
+    * `fb_scratch_target` says colour attachment zero is that stand-in and
+    * nothing may be written to it. */
+   struct pipe_resource *fb_scratch;
+   bool fb_scratch_target;
    /* Samples per pixel of the bound framebuffer. WebGPU requires the render
     * pipeline's sample count to match its attachments exactly. */
    uint32_t fb_samples;
@@ -8251,6 +8260,20 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
       }
       return true;
    }
+   /* An attachment-less framebuffer, which st/mesa asks about as
+    * PIPE_FORMAT_NONE with the render-target bind -- that is how
+    * MaxFramebufferSamples is measured, and ARB_framebuffer_no_attachments
+    * needs it to reach MaxSamples. There is no format to check: what is being
+    * asked is whether a render pass can exist with nothing attached, and here
+    * the answer is a stand-in target at the framebuffer's default size, which
+    * can be multisampled on exactly the terms the colour formats are. */
+   if (format == PIPE_FORMAT_NONE) {
+      const unsigned none_samples = MAX2(1, sample_count);
+      return (bind & PIPE_BIND_RENDER_TARGET) &&
+             (none_samples == 1 || none_samples == 4) &&
+             MAX2(1, storage_sample_count) == none_samples &&
+             (target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_2D_ARRAY);
+   }
    /* Shader images. Storage textures are a narrow list and a single-sampled,
     * non-cube affair, so the claim is made only where WebGPU can actually
     * take one -- st/mesa asks per format and disables the rest. */
@@ -12616,6 +12639,36 @@ gex_wgpu_resource_copy_region(struct pipe_context *pipe,
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    if (ctx->failed)
       return;
+   /* ARB_copy_image, which is where a *cross-format* copy comes from.
+    *
+    * glCopyImageSubData copies between images of the same bytes per block
+    * rather than the same format -- DXT1 and RG32UI are both eight bytes, so
+    * the specification pairs them, and st/mesa hands such a copy straight
+    * here (st_cb_copyimage.c's copy_image, whose first branch covers
+    * "either side is compressed" as well as equal formats). WebGPU's
+    * texture-to-texture copy demands identical formats, so there is no
+    * command for it.
+    *
+    * util_resource_copy_region is: it maps both sides and copies blocks,
+    * and it already knows the whole rule -- shrink the destination box by the
+    * source's block size when the source is compressed, expand it by the
+    * destination's when the destination is, and refuse when the block sizes
+    * disagree. Reimplementing that against a staging buffer would be a
+    * WebGPU round trip per row and the same arithmetic, written a second
+    * time.
+    *
+    * It is a CPU round trip, which for glCopyImageSubData is acceptable:
+    * texture streaming calls it once per promoted tile, not once per draw.
+    * Equal formats keep the GPU path below. */
+   if (dst && src && dst->format != src->format &&
+       dst->target != PIPE_BUFFER && src->target != PIPE_BUFFER &&
+       MAX2(1, dst->nr_samples) == 1 && MAX2(1, src->nr_samples) == 1 &&
+       util_format_get_blocksize(dst->format) ==
+          util_format_get_blocksize(src->format)) {
+      util_resource_copy_region(pipe, dst, dst_level, dstx, dsty, dstz, src,
+                                src_level, box);
+      return;
+   }
    if (!gex_wgpu_copy_texture_region(pipe, dst, dst_level, dstx, dsty, dstz,
                                      src, src_level, box, false))
       gex_fail(ctx);
@@ -13376,6 +13429,77 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
    } else if (state && state->zsbuf.texture) {
       gex_fail(ctx);
    }
+   /* ARB_framebuffer_no_attachments.
+    *
+    * A framebuffer with nothing attached is complete in GL as long as
+    * GL_FRAMEBUFFER_DEFAULT_WIDTH and _HEIGHT are set, and rendering into it
+    * runs the fragment shader over the covered area for its *side effects* --
+    * image stores, storage-buffer writes, atomic counters. Voxel cone
+    * tracing, GPU-driven culling and per-pixel linked lists are all built on
+    * it.
+    *
+    * WebGPU's render pass needs at least one attachment, so one is
+    * manufactured at the default size and thrown away. It stands in as
+    * colour attachment zero, which means every path below -- the views, the
+    * pass, the pipeline, the viewport bounds -- works unchanged; only the
+    * write mask has to be forced off, because the fragment shader has no
+    * output to write and WebGPU requires a target the shader does not write
+    * to be masked out.
+    *
+    * R8_UNORM because it is the cheapest renderable format there is: the
+    * contents are never read. */
+   ctx->fb_scratch_target = false;
+   if (!color_count && !depth && state && state->width && state->height) {
+      const uint32_t want_samples = MAX2(1u, (uint32_t)state->samples);
+      struct gex_wgpu_resource *have = ctx->fb_scratch
+         ? gex_resource(ctx->fb_scratch) : NULL;
+      if (!have || ctx->fb_scratch->width0 < state->width ||
+          ctx->fb_scratch->height0 < state->height ||
+          MAX2(1u, (uint32_t)ctx->fb_scratch->nr_samples) != want_samples) {
+         pipe_resource_reference(&ctx->fb_scratch, NULL);
+         struct pipe_resource templ;
+         memset(&templ, 0, sizeof(templ));
+         templ.target = PIPE_TEXTURE_2D;
+         templ.format = PIPE_FORMAT_R8_UNORM;
+         templ.width0 = state->width;
+         templ.height0 = state->height;
+         templ.depth0 = 1;
+         templ.array_size = 1;
+         templ.nr_samples = want_samples > 1 ? want_samples : 0;
+         templ.bind = PIPE_BIND_RENDER_TARGET;
+         ctx->fb_scratch =
+            pipe->screen->resource_create(pipe->screen, &templ);
+      }
+      /* GL_FRAMEBUFFER_DEFAULT_LAYERS asks for layered rendering into
+       * nothing, which needs a shader writing gl_Layer and a layered
+       * attachment -- WebGPU attaches one layer at a time, so the stand-in
+       * covers layer zero and says so rather than quietly dropping the rest. */
+      if (state->layers > 1) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: attachment-less framebuffer asked for "
+                            "%u layers; only layer 0 is rasterized\n",
+                    (unsigned)state->layers);
+         }
+      }
+      if (ctx->fb_scratch) {
+         colors[0] = ctx->fb_scratch;
+         color_formats[0] = PIPE_FORMAT_R8_UNORM;
+         color_levels[0] = 0;
+         color_layers[0] = 0;
+         color_count = 1;
+         ctx->fb_scratch_target = true;
+      } else if (!ctx->failed) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: could not allocate the %ux%u stand-in "
+                            "for an attachment-less framebuffer\n",
+                    state->width, state->height);
+         }
+      }
+   }
    for (unsigned i = 0; i < GEX_WGPU_MAX_COLOR_TARGETS; ++i) {
       pipe_resource_reference(&ctx->colors[i],
                               i < color_count ? colors[i] : NULL);
@@ -13406,6 +13530,12 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
     * application -- on a framebuffer that was otherwise complete. */
    uint32_t samples = 0;
    for (unsigned i = 0; i < color_count; ++i) {
+      /* A hole is a null entry with a real count around it -- see the
+       * glDrawBuffers(GL_NONE) case above -- so this cannot dereference
+       * blind. It did, which is a null read waiting for the first program to
+       * multisample a framebuffer with a hole in it. */
+      if (!colors[i])
+         continue;
       const uint32_t attachment = MAX2(1, colors[i]->nr_samples);
       if (!samples)
          samples = attachment;
@@ -20689,6 +20819,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * neither a write mask nor a blend state. */
       if (color_targets[i].format == WGPUTextureFormat_Undefined)
          continue;
+      /* The attachment-less framebuffer's stand-in. WebGPU requires a colour
+       * target the fragment shader does not write to be masked out, and a
+       * fragment shader rendering into a framebuffer with no attachments
+       * writes nothing by definition -- that is what it is for. Leaving the
+       * application's glColorMask here is a validation error, and a
+       * validation error poisons the device. */
+      if (ctx->fb_scratch_target) {
+         color_targets[i].writeMask = 0;
+         continue;
+      }
       if (!ctx->blend)
          continue;
       const struct pipe_rt_blend_state *rt =
@@ -22818,6 +22958,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    pipe_resource_reference(&ctx->tess_coords, NULL);
    pipe_resource_reference(&ctx->tess_vertices, NULL);
    pipe_resource_reference(&ctx->tess_indices, NULL);
+   pipe_resource_reference(&ctx->fb_scratch, NULL);
    for (unsigned i = 0; i < GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS; ++i)
       pipe_resource_reference(&ctx->point_gathered[i], NULL);
    pipe_resource_reference(&ctx->line_vs_out, NULL);
@@ -23176,6 +23317,29 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * is also the shape this driver wants: a patch input is a variable with a
     * location, which the lowering already addresses, where a system value
     * would be an intrinsic with no buffer behind it. */
+   /* ARB_robust_buffer_access_behavior, which is a promise rather than a
+    * feature: an out-of-bounds buffer access from a shader cannot crash,
+    * cannot read another buffer, and cannot write outside its own -- the
+    * value it returns is explicitly undefined.
+    *
+    * WebGPU makes exactly that guarantee by construction. Its specification
+    * defines every out-of-bounds buffer access as returning zero or being
+    * discarded, and an implementation that let one escape would be a
+    * security bug rather than a conformance one. Claiming it is therefore
+    * honest as long as *this driver* does not defeat it -- a CPU-side index
+    * clamp with signed arithmetic, or a binding sized from the shader's
+    * declaration rather than from the buffer, would -- which is what
+    * gl44-robust-access-probe checks with a sentinel in the neighbouring
+    * buffer of every case. */
+   caps->robust_buffer_access_behavior = true;
+   /* ARB_copy_image. Named for its hardest case -- a copy between a
+    * compressed format and a plain one of the same block size -- which
+    * resource_copy_region above serves through util_resource_copy_region. */
+   caps->copy_between_compressed_and_plain_formats = true;
+   /* ARB_framebuffer_no_attachments: served by a stand-in colour target at
+    * the framebuffer's default size, since WebGPU's render pass needs at
+    * least one attachment. See gex_wgpu_set_framebuffer_state. */
+   caps->framebuffer_no_attachment = true;
    caps->glsl_tess_levels_as_inputs = true;
    /* Per-patch varyings, in vec4s. st/mesa reports MaxTessPatchComponents as
     * four times this and GL 4.0 requires 120, so thirty is the floor rather
