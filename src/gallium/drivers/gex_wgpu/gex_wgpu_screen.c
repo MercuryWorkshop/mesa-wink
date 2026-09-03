@@ -4245,6 +4245,44 @@ gex_wgpu_strip_point_size_instr(nir_builder *b, nir_intrinsic_instr *intr,
  *   The fragment input at location 4 doesn't have a corresponding vertex
  *   output.
  */
+/* A barrier's memory modes, narrowed to the address spaces WebGPU has.
+ *
+ * zink's emitter turns nir_var_mem_global into
+ * SpvMemorySemanticsCrossWorkgroupMemoryMask, and Tint's SPIR-V reader
+ * refuses it:
+ *
+ *   error: unsupported control barrier semantics: 512
+ *
+ * 512 is that bit. WGSL has no cross-workgroup address space at all -- a
+ * storage buffer is the widest thing a barrier can order here -- so global
+ * is folded into ssbo, which is what the memory actually is.
+ *
+ * The no-modes case has to be filled in rather than left alone: the emitter
+ * reads an empty set as "everything", and its everything includes the same
+ * bit. Naming the three spaces that do exist keeps the barrier as strong as
+ * the shader asked for without the one Tint cannot read. Blender's EEVEE has
+ * such a barrier in a compute shader. */
+static bool
+gex_wgpu_narrow_barrier_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                              void *data)
+{
+   (void)b;
+   (void)data;
+   if (intr->intrinsic != nir_intrinsic_barrier)
+      return false;
+   if (nir_intrinsic_memory_scope(intr) == SCOPE_NONE)
+      return false;
+   const nir_variable_mode modes = nir_intrinsic_memory_modes(intr);
+   const nir_variable_mode wanted =
+      !modes ? (nir_var_mem_shared | nir_var_mem_ssbo | nir_var_image)
+             : ((modes & ~nir_var_mem_global) |
+                ((modes & nir_var_mem_global) ? nir_var_mem_ssbo : 0));
+   if (wanted == modes)
+      return false;
+   nir_intrinsic_set_memory_modes(intr, wanted);
+   return true;
+}
+
 static bool
 gex_wgpu_lower_point_coord_instr(nir_builder *b, nir_intrinsic_instr *intr,
                                  void *data)
@@ -4990,6 +5028,9 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass,
             gex_wgpu_lower_point_coord_instr,
             nir_metadata_control_flow | nir_metadata_loop_analysis, NULL);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+            gex_wgpu_narrow_barrier_instr,
+            nir_metadata_all, NULL);
    /* Keep st/mesa's vertex input numbering across ntv_shader_prepare.
     *
     * That pass rewrites every vertex input's driver_location -- which becomes
@@ -8859,8 +8900,9 @@ gex_wgpu_get_device_vendor(struct pipe_screen *screen)
  * float32-filterable and float32-blendable, which is why is_format_supported
  * gates on them. The cost is twice the memory and a conversion on transfer.
  */
-/* GEX_WGPU_PROMOTE_STORAGE=1 widens two more formats, for the same reason and
- * at the same cost, so that they can be *storage* textures.
+/* GEX_WGPU_PROMOTE_STORAGE=1 widens two more formats for the same reason and
+ * at the same cost, so that they can be *storage* textures. Off by default,
+ * and the reason is not the memory.
  *
  * WebGPU's base storage formats are a short list, and neither r16float nor
  * rg11b10ufloat is on it; the optional feature that would add them
@@ -8871,9 +8913,27 @@ gex_wgpu_get_device_vendor(struct pipe_screen *screen)
  *
  * r32float and rgba16float *are* base storage formats, and both are wider
  * than what they stand in for, so the round trip gains precision rather than
- * losing it. The cost is twice the memory on two formats a renderer uses
- * heavily for HDR, which is why this is a switch and not a default: measure a
- * real run both ways before making it one.
+ * losing it. The memory is not the problem: a SuperTuxKart race peaks at
+ * 1571 MiB of video memory with this on and 1563 MiB without -- half a
+ * percent -- because these formats are common in shaders rather than in the
+ * large textures that dominate a scene. And it earns something real:
+ * selecting Blender's rendered viewport without it fails a shader link and
+ * Blender dumps core on the null program.
+ *
+ * What keeps it off is a direct conflict with format reinterpretation.
+ * Widening is *per format*, so promoting R16_FLOAT stores every one of them
+ * as four bytes -- and a colour target that views an R16_FLOAT texture as
+ * R16_UINT is then no longer looking at two bytes per texel, so the copy that
+ * serves it has nothing to preserve. gl44-target-view (Blender's own pair)
+ * goes from 3/3 to 0/3 with this enabled, which is why the check below
+ * compares the *stored* format: with the switch on, that reinterpretation is
+ * refused by name rather than quietly corrupted.
+ *
+ * Both cases can only be served at once by promoting per *resource* --
+ * recreating a texture with the wider backing when it is first bound as an
+ * image -- which means threading a resource through every site that names a
+ * format. That is the real cost, and it is written up in
+ * docs/gl-webgpu-handoff.md.
  *
  * The three-channel case is not exact. GL samples a format with no alpha as
  * alpha = 1, and rgba16float has an alpha to store, so a shader that writes
@@ -8892,6 +8952,12 @@ gex_wgpu_promote_storage(void)
    }
    return enabled != 0;
 }
+
+/* The format the WGPU texture is really stored as: the backing when there is
+ * one, the format itself otherwise. Anything reasoning about *bytes* -- which
+ * is what a reinterpreting view does -- has to ask this rather than the
+ * Gallium format. */
+static enum pipe_format gex_wgpu_stored_format(enum pipe_format format);
 
 static enum pipe_format
 gex_wgpu_format_backing(enum pipe_format format)
@@ -8920,6 +8986,13 @@ gex_wgpu_format_backing(enum pipe_format format)
 /* Whether the *backing* is float32, which is the only case the
  * float32-filterable/blendable gate below has anything to say about:
  * rgba16float is filterable and blendable with no feature at all. */
+static enum pipe_format
+gex_wgpu_stored_format(enum pipe_format format)
+{
+   const enum pipe_format backing = gex_wgpu_format_backing(format);
+   return backing != PIPE_FORMAT_NONE ? backing : format;
+}
+
 static bool
 gex_wgpu_backing_is_float32(enum pipe_format format)
 {
@@ -14463,9 +14536,11 @@ gex_wgpu_color_needs_scratch(enum pipe_format surface_format,
    if (!texture || surface_format == texture->format)
       return false;
    /* A copy through a buffer preserves bytes, not texels: an unequal texel
-    * size is a different picture, and stays refused. */
+    * size is a different picture, and stays refused. Against the *stored*
+    * format, because a promoted texture holds more bytes per texel than its
+    * Gallium format says -- see gex_wgpu_promote_storage. */
    if (util_format_get_blocksize(surface_format) !=
-       util_format_get_blocksize(texture->format))
+       util_format_get_blocksize(gex_wgpu_stored_format(texture->format)))
       return false;
    if (util_format_linear(surface_format) !=
        util_format_linear(texture->format))
@@ -15761,7 +15836,8 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
                   util_format_linear(surface->format) !=
                      util_format_linear(surface->texture->format) &&
                   util_format_get_blocksize(surface->format) !=
-                     util_format_get_blocksize(surface->texture->format))
+                     util_format_get_blocksize(
+                        gex_wgpu_stored_format(surface->texture->format)))
                                                     ? "surface reinterprets the format at another texel size"
                : !gex_wgpu_color_renderable(pipe->screen, surface->format)
                                                     ? "format is not renderable"
