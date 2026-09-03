@@ -858,6 +858,10 @@ struct gex_wgpu_context {
     * See gex_wgpu_set_constant_buffer. */
    struct pipe_resource *constant_ring;
    unsigned constant_ring_offset;
+   /* A zero-filled buffer bound in place of a storage block a shader
+    * declares and the application never bound. See
+    * gex_wgpu_placeholder_storage. */
+   struct pipe_resource *placeholder_storage;
    /* The ring's contents, staged on the CPU. Uniform uploads are the most
     * frequent call a frame makes -- two per draw, some 6800 a frame in
     * Minecraft -- and one wgpuQueueWriteBuffer each costs more than all the
@@ -3911,6 +3915,19 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
    for (unsigned i = 0; i < shader->texture_count; ++i) {
       const unsigned slot = shader->texture_slots[i];
       const struct pipe_sampler_view *view = views[slot];
+      /* A slot the shader samples with no view behind it: either nothing was
+       * ever bound, or create_sampler_view refused it -- Blender asks for an
+       * r16g16_float view of an r32_float texture, which WebGPU has no way to
+       * express. There is nothing to lower either way, and dereferencing it
+       * below segfaulted the process.
+       *
+       * This is what removing a latch exposes. The refusal used to fail the
+       * context, so the next call returned GL_OUT_OF_MEMORY and no draw ever
+       * reached here; with the latch gone the draw arrives and finds a null
+       * view. A crash is worse than either, so the null case has to be
+       * handled wherever a refusal can produce one. */
+      if (!view)
+         continue;
       if (!samplers[slot]) {
          /* Read by texelFetch only. There is no sampler state to model, but
           * the view's swizzle still has to be applied. */
@@ -8134,6 +8151,59 @@ gex_wgpu_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
 
 
 /* The staged uniform bytes nobody has told the queue about yet. */
+/* Something valid to bind for a storage block the shader declares and nothing
+ * is bound to.
+ *
+ * GL leaves reading an unbound shader storage block undefined rather than
+ * fatal, and this driver advertises robust_buffer_access_behavior, under which
+ * such a read returns zero -- so zeros are the answer GL has already been
+ * promised. WebGPU has no concept of an unbound entry at all: a layout that
+ * declares the binding must have a buffer behind it or the bind group does not
+ * build.
+ *
+ * All three bind paths -- vertex, fragment and compute -- used to fail the
+ * context instead, which turns one unbound block into GL_OUT_OF_MEMORY from
+ * every later call. Blender's startup declares a fragment storage block it
+ * does not bind and died on it.
+ *
+ * Grown rather than reallocated per size, and never read back, so the writes a
+ * shader may aim at it cost nothing. */
+static WGPUBuffer
+gex_wgpu_placeholder_storage(struct gex_wgpu_context *ctx, uint64_t least)
+{
+   struct pipe_context *pipe = &ctx->base;
+   const uint64_t want = MAX2(least, 1024u);
+   if (ctx->placeholder_storage &&
+       ctx->placeholder_storage->width0 < want) {
+      pipe_resource_reference(&ctx->placeholder_storage, NULL);
+   }
+   if (!ctx->placeholder_storage) {
+      struct pipe_resource templ = {0};
+      templ.target = PIPE_BUFFER;
+      templ.format = PIPE_FORMAT_R8_UNORM;
+      templ.width0 = (unsigned)MIN2(want, (uint64_t)1u << 20);
+      templ.height0 = 1;
+      templ.depth0 = 1;
+      templ.array_size = 1;
+      templ.bind = PIPE_BIND_SHADER_BUFFER;
+      ctx->placeholder_storage =
+         pipe->screen->resource_create(pipe->screen, &templ);
+      if (!ctx->placeholder_storage)
+         return NULL;
+      /* resource_create leaves the contents undefined; the promise is zero. */
+      static const uint8_t zeros[256] = {0};
+      for (unsigned at = 0; at < ctx->placeholder_storage->width0;
+           at += sizeof(zeros)) {
+         const unsigned bytes =
+            MIN2((unsigned)sizeof(zeros),
+                 ctx->placeholder_storage->width0 - at);
+         gex_wgpu_buffer_subdata(pipe, ctx->placeholder_storage,
+                                 PIPE_MAP_WRITE, at, bytes, zeros);
+      }
+   }
+   return gex_resource(ctx->placeholder_storage)->buffer;
+}
+
 static void
 gex_wgpu_flush_constant_ring(struct gex_wgpu_context *ctx)
 {
@@ -13080,6 +13150,19 @@ struct gex_wgpu_compute_binding {
    uint32_t required;
    uint8_t slot;
    uint8_t kind;
+   /* The shader never writes this block, so the SPIR-V emitter declares it
+    * `var<storage, read>` and the layout has to say ReadOnlyStorage. The
+    * graphics path carries the same bit per stage as ssbo_readonly_mask;
+    * this one had no equivalent and always said Storage, which WebGPU
+    * rejects:
+    *
+    *   The buffer type in the shader (BufferBindingType::ReadOnlyStorage) is
+    *   not compatible with the type in the layout (BufferBindingType::Storage)
+    *
+    * and an invalid compute pipeline makes the whole command buffer invalid,
+    * so the submit fails and everything recorded with it is lost. Blender's
+    * startup does exactly this. */
+   bool readonly;
 };
 
 struct gex_wgpu_compute_state {
@@ -13182,6 +13265,8 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
          : binding >= GEX_WGPU_STORAGE_UBO_FIRST_BINDING
             ? GEX_WGPU_COMPUTE_UNIFORM_SPILL
             : GEX_WGPU_COMPUTE_UNIFORM;
+      /* nir_opt_access marks a block the shader only reads. */
+      entry->readonly = (var->data.access & ACCESS_NON_WRITEABLE) != 0;
       ++compute->binding_count;
    }
 
@@ -13312,26 +13397,44 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          offset = slot->buffer_offset;
          size = slot->buffer_size;
       }
+      WGPUBuffer wgpu_buffer = NULL;
       if (!buffer) {
          static bool said;
          if (!said) {
             said = true;
             fprintf(stderr, "gex-wgpu: compute %s block %u has no buffer "
-                    "bound\n", from_constants ? "uniform" : "storage",
-                    block->slot);
+                    "bound%s\n", from_constants ? "uniform" : "storage",
+                    block->slot,
+                    from_constants ? "" : "; reading zeros");
          }
-         gex_fail(ctx);
-         return;
+         /* A uniform block with nothing bound has no defensible answer -- its
+            size is part of the layout -- but a storage block does: zeros, per
+            robust_buffer_access_behavior. */
+         if (from_constants) {
+            gex_fail(ctx);
+            return;
+         }
+         wgpu_buffer = gex_wgpu_placeholder_storage(ctx, block->required);
+         if (!wgpu_buffer) {
+            gex_fail(ctx);
+            return;
+         }
+         offset = 0;
+         size = 0;
+      } else {
+         wgpu_buffer = gex_resource(buffer)->buffer;
       }
       entries[count] =
          (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       entries[count].binding = block->binding;
       entries[count].visibility = WGPUShaderStage_Compute;
       entries[count].buffer.type = block->kind == GEX_WGPU_COMPUTE_UNIFORM
-         ? WGPUBufferBindingType_Uniform : WGPUBufferBindingType_Storage;
+         ? WGPUBufferBindingType_Uniform
+         : block->readonly ? WGPUBufferBindingType_ReadOnlyStorage
+                           : WGPUBufferBindingType_Storage;
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       bindings[count].binding = block->binding;
-      bindings[count].buffer = gex_resource(buffer)->buffer;
+      bindings[count].buffer = wgpu_buffer;
       bindings[count].offset = offset;
       bindings[count].size = size;
       ++count;
@@ -14549,6 +14652,25 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
                           surface->texture->height0,
                           surface->level, surface->first_layer,
                           surface->last_layer);
+               /* Latched, deliberately, and this was tried the other way.
+                *
+                * Dropping the attachment instead -- the treatment the
+                * bytes-per-sample budget below gets -- lets the draw proceed
+                * against a framebuffer the application believes it has.
+                * Blender reinterprets *three* colour targets and a sampler
+                * view (r16_uint over r16_float, r16g16_float over r32_float,
+                * r16g16b16a16_float over r32g32_float; WebGPU has no view
+                * across a format class, which is the platform ceiling), so
+                * dropping them left nothing to draw into and the failure
+                * moved from a named refusal to a segfault several layers
+                * deeper -- once inside this driver, and then inside Blender
+                * itself once that was guarded.
+                *
+                * A latch is a bad outcome. A crash with no diagnostic is a
+                * worse one, and the application cannot render this pass
+                * either way. Revisit if an application turns up that
+                * reinterprets *one* of several attachments and would keep
+                * working without it. */
                gex_fail(ctx);
                color_count = 0;
                break;
@@ -23917,21 +24039,35 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const unsigned slot = ctx->vs->ssbo_slots[i];
          const struct pipe_shader_buffer *sb =
             &ctx->shader_buffers[MESA_SHADER_VERTEX][slot];
-         if (!sb->buffer) {
+         WGPUBuffer sb_buffer;
+         uint64_t sb_offset, sb_size;
+         if (sb->buffer) {
+            sb_buffer = gex_resource(sb->buffer)->buffer;
+            sb_offset = sb->buffer_offset;
+            sb_size = sb->buffer_size;
+         } else {
+            /* Zeros, which is what robust_buffer_access_behavior promises for
+               a block nothing is bound to; failing the context instead cost
+               every later call. */
             static bool said;
             if (!said) {
                said = true;
-               fprintf(stderr, "gex-wgpu: vertex storage block %u has no "
-                       "buffer bound\n", slot);
+               fprintf(stderr, "gex-wgpu: vertex storage block %u has no buffer "
+                       "bound; reading zeros\n", slot);
             }
-            gex_fail(ctx);
-            return;
+            sb_buffer = gex_wgpu_placeholder_storage(ctx, 0);
+            sb_offset = 0;
+            sb_size = 0;
+            if (!sb_buffer) {
+               gex_fail(ctx);
+               return;
+            }
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = ctx->vs->ssbo_bindings[i];
-         entries[at].buffer = gex_resource(sb->buffer)->buffer;
-         entries[at].offset = sb->buffer_offset;
-         entries[at].size = sb->buffer_size;
+         entries[at].buffer = sb_buffer;
+         entries[at].offset = sb_offset;
+         entries[at].size = sb_size;
       }
       /* Buffer textures: the sampler view holds a buffer, not a texture, so
        * the binding is the buffer itself over the view's range. */
@@ -24003,21 +24139,35 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const unsigned slot = ctx->fs->ssbo_slots[i];
          const struct pipe_shader_buffer *sb =
             &ctx->shader_buffers[MESA_SHADER_FRAGMENT][slot];
-         if (!sb->buffer) {
+         WGPUBuffer sb_buffer;
+         uint64_t sb_offset, sb_size;
+         if (sb->buffer) {
+            sb_buffer = gex_resource(sb->buffer)->buffer;
+            sb_offset = sb->buffer_offset;
+            sb_size = sb->buffer_size;
+         } else {
+            /* Zeros, which is what robust_buffer_access_behavior promises for
+               a block nothing is bound to; failing the context instead cost
+               every later call. */
             static bool said;
             if (!said) {
                said = true;
-               fprintf(stderr, "gex-wgpu: fragment storage block %u has no "
-                       "buffer bound\n", slot);
+               fprintf(stderr, "gex-wgpu: fragment storage block %u has no buffer "
+                       "bound; reading zeros\n", slot);
             }
-            gex_fail(ctx);
-            return;
+            sb_buffer = gex_wgpu_placeholder_storage(ctx, 0);
+            sb_offset = 0;
+            sb_size = 0;
+            if (!sb_buffer) {
+               gex_fail(ctx);
+               return;
+            }
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = ctx->fs->ssbo_bindings[i];
-         entries[at].buffer = gex_resource(sb->buffer)->buffer;
-         entries[at].offset = sb->buffer_offset;
-         entries[at].size = sb->buffer_size;
+         entries[at].buffer = sb_buffer;
+         entries[at].offset = sb_offset;
+         entries[at].size = sb_size;
       }
       /* One view per image, built here rather than cached on the resource:
        * glBindImageTexture names a level and a layer, and the same texture
@@ -24648,6 +24798,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    for (unsigned i = 0; i < ARRAY_SIZE(ctx->vertex_buffer_state); ++i)
       pipe_vertex_buffer_unreference(&ctx->vertex_buffer_state[i]);
    pipe_resource_reference(&ctx->constant_ring, NULL);
+   pipe_resource_reference(&ctx->placeholder_storage, NULL);
    FREE(ctx->constant_staging);
    /* The scratch the geometry path runs through. */
    pipe_resource_reference(&ctx->gs_vs_out, NULL);
