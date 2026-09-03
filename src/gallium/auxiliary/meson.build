@@ -1,6 +1,21 @@
 # Copyright © 2017 Dylan Baker
 # SPDX-License-Identifier: MIT
 
+# The fixed-function tessellator, unconditionally.
+#
+# It is a self-contained port of the WARP tessellator -- u_math, u_memory,
+# p_defines and <cmath>, nothing else -- and it used to sit inside the
+# `draw_with_llvm` block because the draw module was its only consumer. A
+# driver that emulates the tessellation stages needs the same code and has no
+# reason to want LLVM, so keeping it there meant `p_tess_init` was simply
+# absent from a build without gallivm.
+files_libgallium_tessellator = files(
+  'tessellator/tessellator.cpp',
+  'tessellator/tessellator.hpp',
+  'tessellator/p_tessellator.cpp',
+  'tessellator/p_tessellator.h',
+)
+
 files_libgallium = files(
   'driver_ddebug/dd_draw.c',
   'driver_ddebug/dd_util.h',
@@ -371,10 +386,6 @@ if draw_with_llvm
     'draw/draw_llvm.h',
     'draw/draw_pt_fetch_shade_pipeline_llvm.c',
     'draw/draw_vs_llvm.c',
-    'tessellator/tessellator.cpp',
-    'tessellator/tessellator.hpp',
-    'tessellator/p_tessellator.cpp',
-    'tessellator/p_tessellator.h',
     'nir/nir_to_tgsi_info.c',
     'nir/nir_to_tgsi_info.h',
   )
@@ -509,7 +520,8 @@ u_unfilled_gen_c = custom_target(
 libgallium_extra_c_args = []
 libgallium = static_library(
   'gallium',
-  [files_libgallium, u_indices_gen_c, u_unfilled_gen_c],
+  [files_libgallium, files_libgallium_tessellator, u_indices_gen_c,
+   u_unfilled_gen_c],
   include_directories : [
     inc_loader, inc_gallium, inc_src, inc_include, include_directories('util')
   ],

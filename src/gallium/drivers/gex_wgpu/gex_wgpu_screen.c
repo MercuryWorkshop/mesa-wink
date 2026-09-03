@@ -29,6 +29,7 @@
 #include "util/u_prim.h"
 #include "util/u_prim_restart.h"
 #include "indices/u_indices.h"
+#include "tessellator/p_tessellator.h"
 #include "indices/u_primconvert.h"
 #include "nir/tgsi_to_nir.h"
 #include "util/u_blitter.h"
@@ -208,6 +209,70 @@ gex_wgpu_buffer_texture_words(enum pipe_format format)
  * what the driver advertises as max_inputs/max_outputs. */
 #define GEX_WGPU_MAX_VARYINGS 16
 
+/* ---- Tessellation ---------------------------------------------------------
+ *
+ * WebGPU has no tessellation stage, and unlike the geometry stage there is a
+ * *fixed-function* piece in the middle: the tessellator, which turns two
+ * levels and a domain into a mesh of (u,v,w) coordinates and a topology. So a
+ * tessellated draw becomes five passes:
+ *
+ *   1  the application's vertex shader, as compute, writing the control
+ *      shader's inputs to a buffer (the geometry path's first pass, unchanged)
+ *   2  the tessellation-control shader, as compute: one workgroup per patch
+ *      and one invocation per output control point, so `barrier()` is a
+ *      workgroup barrier and gl_InvocationID is the local invocation index
+ *   3  the tessellator, on the CPU, from the levels pass 2 wrote --
+ *      src/gallium/auxiliary/tessellator is the same implementation llvmpipe
+ *      uses, so the generated mesh is identical rather than merely similar
+ *   4  the tessellation-evaluation shader, as compute: one invocation per
+ *      generated vertex, reading its own tessellation coordinate
+ *   5  an ordinary indexed draw of what pass 4 wrote, through the geometry
+ *      path's passthrough vertex shader
+ *
+ * Pass 3 is a GPU-to-CPU read of the levels, which is a stall. It is also the
+ * only honest option available: the topology depends on numbers a shader
+ * computes, and porting the tessellator to WGSL is a much larger piece of work
+ * than the rest of this put together. The stall is per draw, not per patch.
+ */
+#define GEX_WGPU_TCS_PARAMS_BINDING 0
+#define GEX_WGPU_TCS_VSOUT_BINDING 1
+#define GEX_WGPU_TCS_OUT_BINDING 2
+#define GEX_WGPU_TCS_PATCH_BINDING 3
+#define GEX_WGPU_TCS_LEVEL_BINDING 4
+/* Words of the control pass's parameter buffer: how many invocations the
+ * dispatch has real work for -- patches times vertices_out, since the guard
+ * compares against the linear invocation number -- and how many vertices each
+ * input patch carries (glPatchParameteri, which is draw state rather than
+ * shader state). */
+#define GEX_WGPU_TCS_PARAM_INVOCATIONS 0
+#define GEX_WGPU_TCS_PARAM_VERTS_IN 1
+#define GEX_WGPU_TCS_PARAM_WORDS 4
+
+#define GEX_WGPU_TES_PARAMS_BINDING 0
+#define GEX_WGPU_TES_TCSOUT_BINDING 1
+#define GEX_WGPU_TES_PATCH_BINDING 2
+#define GEX_WGPU_TES_LEVEL_BINDING 3
+#define GEX_WGPU_TES_COORD_BINDING 4
+#define GEX_WGPU_TES_OUT_BINDING 5
+/* Words of the evaluation pass's parameter buffer: how many vertices the
+ * tessellator generated in total, and how many control points a patch has on
+ * the way *out* of the control shader (its `layout(vertices = N) out`), which
+ * is what gl_PatchVerticesIn reports to the evaluation shader. */
+#define GEX_WGPU_TES_PARAM_VERTICES 0
+#define GEX_WGPU_TES_PARAM_VERTS_OUT 1
+#define GEX_WGPU_TES_PARAM_WORDS 4
+#define GEX_WGPU_TESS_GROUP 64
+/* One patch's levels, laid out as struct pipe_tessellation_factors expects
+ * them: outer[4], inner[2], and two words of padding. Passing the buffer to
+ * the tessellator by cast rather than copying field by field is what keeps
+ * the two descriptions from drifting. */
+#define GEX_WGPU_TESS_LEVEL_WORDS 8
+/* Words per generated vertex in the coordinate buffer: u, v, w and the index
+ * of the patch it came from. The patch travels with the vertex because the
+ * evaluation shader needs it to find its own control points, and one draw
+ * covers every patch. */
+#define GEX_WGPU_TESS_COORD_WORDS 4
+
 /* The primitive topologies WebGPU has. Everything else GL can draw -- triangle
  * fans, line loops, quads, polygons -- is rewritten into one of these by
  * u_primconvert before it reaches the pipeline.
@@ -220,7 +285,10 @@ gex_wgpu_buffer_texture_words(enum pipe_format format)
    (BITFIELD_BIT(MESA_PRIM_POINTS) | BITFIELD_BIT(MESA_PRIM_LINES) |    \
     BITFIELD_BIT(MESA_PRIM_LINE_STRIP) |                                \
     BITFIELD_BIT(MESA_PRIM_TRIANGLES) |                                 \
-    BITFIELD_BIT(MESA_PRIM_TRIANGLE_STRIP))
+    BITFIELD_BIT(MESA_PRIM_TRIANGLE_STRIP) |                                /* Not a WebGPU topology at all: a patch draw is decomposed by the
+     * tessellation path below and never reaches a pipeline. Claiming it is
+     * what keeps u_primconvert from trying to rewrite it into triangles,
+     * which would silently discard the patch structure. */                  BITFIELD_BIT(MESA_PRIM_PATCHES))
 
 /* Which formats WebGPU will take as a *storage* texture, which is a much
  * narrower list than the renderable or sampleable ones and is the real limit
@@ -803,6 +871,21 @@ struct gex_wgpu_context {
    struct pipe_resource *gs_vs_out;
    struct pipe_resource *gs_vertices;
    struct pipe_resource *gs_indices;
+   /* The bound tessellation stages and the scratch the five-pass tessellated
+    * path runs through. See the tessellation comment above the binding
+    * numbers for what each pass writes. */
+   struct gex_wgpu_tcs *tcs;
+   struct gex_wgpu_tes *tes;
+   struct pipe_resource *tess_vs_out;
+   struct pipe_resource *tess_tcs_out;
+   struct pipe_resource *tess_patch_out;
+   struct pipe_resource *tess_levels;
+   struct pipe_resource *tess_coords;
+   struct pipe_resource *tess_vertices;
+   struct pipe_resource *tess_indices;
+   /* glPatchParameteri(GL_PATCH_VERTICES), which reaches a Gallium driver
+    * through set_patch_vertices rather than in pipe_draw_info. */
+   uint8_t patch_vertices;
    /* Shader storage buffers, which only the compute stage may write on
     * WebGPU. Indexed by slot, as Gallium binds them. */
    /* Per stage, because GL numbers shader storage blocks per program stage
@@ -1190,6 +1273,76 @@ struct gex_wgpu_gs {
    /* The rasterization half: a vertex shader that reads the geometry output
     * buffer as a vertex buffer and passes it straight through, and the vertex
     * element state describing that buffer. */
+   struct gex_wgpu_shader *passthrough;
+   void *passthrough_elements;
+};
+
+/* The tessellation-control shader, lowered to compute.
+ *
+ * Three varying layouts rather than the geometry stage's two, because the
+ * control shader emits per-vertex outputs *and* per-patch ones, and they live
+ * in separate buffers: a per-patch value is written once per patch and read by
+ * every generated vertex of it. */
+struct gex_wgpu_tcs {
+   struct gex_wgpu_varying_layout inputs;
+   struct gex_wgpu_varying_layout outputs;
+   struct gex_wgpu_varying_layout patch_outputs;
+   /* `layout(vertices = N) out`, which is both the workgroup size and the
+    * stride of a patch in the output buffer. */
+   unsigned vertices_out;
+   unsigned ubo_count;
+   uint8_t ubo_slots[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   uint32_t ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   uint32_t ubo_required[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   uint32_t ubo_storage_mask;
+   WGPUShaderModule module;
+};
+
+/* One compute variant of a tessellation-evaluation shader.
+ *
+ * The evaluation shader reads the control shader's output buffers, so its
+ * loads depend on layouts that belong to the *other* stage -- and GL only
+ * guarantees the two agree on the varyings both declare, not on the ones one
+ * side dropped. Keying the module on the producer's layouts is the same
+ * arrangement the geometry path uses for the vertex stage, one stage further
+ * along. */
+struct gex_wgpu_tes_variant {
+   struct gex_wgpu_varying_layout tcs_outputs;
+   struct gex_wgpu_varying_layout tcs_patch_outputs;
+   unsigned verts_per_patch;
+   WGPUShaderModule module;
+   struct gex_wgpu_tes_variant *next;
+};
+
+struct gex_wgpu_tes {
+   struct gex_wgpu_varying_layout inputs;
+   struct gex_wgpu_varying_layout patch_inputs;
+   struct gex_wgpu_varying_layout outputs;
+   enum tess_primitive_mode domain;
+   enum pipe_tess_spacing spacing;
+   bool point_mode;
+   /* What p_tess_init's third argument actually wants, which is **not** what
+    * its name says.
+    *
+    * The parameter is spelled `tes_vertex_order_cw`, and the draw module --
+    * the reference consumer -- passes `!shader->vertex_order_cw` into it
+    * (draw_tess.c:365). So it behaves as "counter-clockwise", and passing GL's
+    * `cw` straight in inverts every generated triangle: the driver drew the
+    * `cw` patch and culled the `ccw` one, exactly backwards, with the
+    * tessellator receiving the flag correctly all along. A probe pair --
+    * `cw` and `ccw` with the same culling -- is what said "inverted" rather
+    * than "ignored", which are the same single failure otherwise. */
+   bool ccw;
+   unsigned ubo_count;
+   uint8_t ubo_slots[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   uint32_t ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   uint32_t ubo_required[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   uint32_t ubo_storage_mask;
+   /* The clone the variants are built from, and the variants themselves. */
+   nir_shader *nir;
+   struct gex_wgpu_tes_variant *variants;
+   /* The rasterization half, exactly as the geometry stage's: a vertex shader
+    * that reads the evaluation output buffer as a vertex buffer. */
    struct gex_wgpu_shader *passthrough;
    void *passthrough_elements;
 };
@@ -7479,11 +7632,18 @@ gex_wgpu_set_constant_buffer(struct pipe_context *pipe,
     * gex_wgpu_bind_constants, and everything below is indexed by stage, so
     * the only thing missing was permission to store them -- and refusing that
     * failed the context, which is why `gsraytrace` rendered a black window
-    * with no other complaint. Stages beyond these three are still refused;
-    * nothing binds them. */
+    * with no other complaint.
+    *
+    * Both tessellation stages are here for the same reason, one feature
+    * later: a control shader computing its levels from a uniform is the
+    * ordinary case, not a corner. Missing them latched the context on the
+    * first tessellated program -- "first refusal at
+    * gex_wgpu_set_constant_buffer" and then GL_OUT_OF_MEMORY out of every
+    * glReadPixels, with nothing said about tessellation at all. */
    const bool unbinding = !buffer || (!buffer->buffer && !buffer->user_buffer);
    if (shader != MESA_SHADER_VERTEX && shader != MESA_SHADER_FRAGMENT &&
-       shader != MESA_SHADER_GEOMETRY) {
+       shader != MESA_SHADER_GEOMETRY && shader != MESA_SHADER_TESS_CTRL &&
+       shader != MESA_SHADER_TESS_EVAL) {
       if (!unbinding) {
          gex_fail(ctx);
          return;
@@ -12584,6 +12744,8 @@ gex_wgpu_blit_with_blitter(struct gex_wgpu_context *ctx,
    util_blitter_save_fragment_shader(ctx->blitter, ctx->fs);
    util_blitter_save_vertex_shader(ctx->blitter, ctx->vs);
    util_blitter_save_geometry_shader(ctx->blitter, ctx->gs);
+   util_blitter_save_tessctrl_shader(ctx->blitter, ctx->tcs);
+   util_blitter_save_tesseval_shader(ctx->blitter, ctx->tes);
    util_blitter_save_vertex_elements(ctx->blitter, ctx->vertex_elements);
    util_blitter_save_vertex_buffers(ctx->blitter, ctx->vertex_buffer_state,
                                     ARRAY_SIZE(ctx->vertex_buffer_state));
@@ -14355,6 +14517,818 @@ gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs)
    return module;
 }
 
+static void
+gex_wgpu_delete_tes_state(struct pipe_context *pipe, void *state);
+
+/* ---- The tessellation stages, lowered to compute --------------------------
+ *
+ * The control shader runs as one workgroup per patch, with `vertices_out`
+ * invocations in it -- so `barrier()` stays a workgroup barrier and needs no
+ * rewriting, which is the whole reason for that shape. The evaluation shader
+ * runs as one invocation per generated vertex.
+ *
+ * Both stages reach here with their varyings still as *variables* accessed
+ * through derefs, and both have shapes the geometry stage never had: a
+ * per-vertex varying is an array (gl_in[] and gl_out[]), a per-patch one is
+ * not, and the tessellation levels are outputs of one stage and inputs of the
+ * other while being fixed-function state rather than varyings.
+ */
+
+/* The levels are declared alongside the varyings and travel separately. */
+static bool
+gex_wgpu_tess_level_slot(unsigned location)
+{
+   return location == VARYING_SLOT_TESS_LEVEL_OUTER ||
+          location == VARYING_SLOT_TESS_LEVEL_INNER;
+}
+
+/* One class of tessellation varying: per-vertex or per-patch, in or out.
+ *
+ * A per-vertex varying is an array whose *element* has to be a vector, which
+ * is why this cannot be gex_wgpu_collect_varyings -- that one asks
+ * glsl_without_array, which strips every level and so accepts an
+ * array-of-vectors per vertex that nothing here can address. */
+static bool
+gex_wgpu_collect_tess_varyings(nir_shader *nir, nir_variable_mode mode,
+                               bool patch,
+                               struct gex_wgpu_varying_layout *layout)
+{
+   memset(layout, 0, sizeof(*layout));
+   nir_foreach_variable_with_modes(var, nir, mode) {
+      if (!!var->data.patch != patch)
+         continue;
+      if (gex_wgpu_tess_level_slot(var->data.location))
+         continue;
+      const struct glsl_type *type = var->type;
+      if (!patch) {
+         if (!glsl_type_is_array(type))
+            return false;
+         type = glsl_get_array_element(type);
+      }
+      if (!glsl_type_is_vector_or_scalar(type))
+         return false;
+      if (layout->count >= GEX_WGPU_MAX_VARYINGS)
+         return false;
+      /* Sorted, so producer and consumer agree without negotiating -- the
+       * same rule as the geometry path's layouts. */
+      unsigned at = layout->count;
+      while (at > 0 && layout->location[at - 1] > var->data.location) {
+         layout->location[at] = layout->location[at - 1];
+         --at;
+      }
+      layout->location[at] = var->data.location;
+      ++layout->count;
+   }
+   return true;
+}
+
+/* Word-level access to an interstage buffer.
+ *
+ * The geometry path reads and writes whole vec4 slots, which is all it needs.
+ * A tessellation shader writes single components -- `gl_out[i].gl_Position.y`
+ * and `gl_TessLevelOuter[2]` are both one word -- so the two stages here
+ * address words rather than slots. */
+static nir_def *
+gex_wgpu_tess_load_word(nir_builder *b, nir_variable *block, nir_def *word)
+{
+   nir_deref_instr *words = gex_wgpu_block_words(b, block);
+   return nir_load_deref(b, nir_build_deref_array(b, words, word));
+}
+
+static void
+gex_wgpu_tess_store_word(nir_builder *b, nir_variable *block, nir_def *word,
+                         nir_def *value)
+{
+   nir_deref_instr *words = gex_wgpu_block_words(b, block);
+   nir_store_deref(b, nir_build_deref_array(b, words, word), value, 0x1);
+}
+
+/* Where a deref chain lands, resolved to a variable, an optional per-vertex
+ * index and an optional component index.
+ *
+ * Exactly three shapes occur once the varying types are restricted as above:
+ * the variable itself (a per-patch varying), one array index (a per-vertex
+ * varying or a level), and two (a component of a per-vertex varying). A
+ * fourth shape is a refusal rather than a guess -- a wrong address here writes
+ * plausible-looking geometry somewhere else in the buffer. */
+struct gex_wgpu_tess_deref {
+   nir_variable *var;
+   nir_def *vertex;
+   nir_def *component;
+   unsigned components;
+};
+
+static bool
+gex_wgpu_tess_resolve_deref(nir_deref_instr *deref,
+                            struct gex_wgpu_tess_deref *out)
+{
+   memset(out, 0, sizeof(*out));
+   nir_def *indices[2] = {NULL, NULL};
+   unsigned depth = 0;
+   while (deref && deref->deref_type == nir_deref_type_array) {
+      if (depth >= 2)
+         return false;
+      indices[depth++] = deref->arr.index.ssa;
+      deref = nir_deref_instr_parent(deref);
+   }
+   if (!deref || deref->deref_type != nir_deref_type_var)
+      return false;
+   out->var = deref->var;
+   /* The chain was walked from the inside out, so the *last* index found is
+    * the outermost -- the vertex, when there is one. */
+   if (depth == 2) {
+      out->vertex = indices[1];
+      out->component = indices[0];
+   } else if (depth == 1) {
+      out->vertex = indices[0];
+   }
+   const struct glsl_type *type = out->var->type;
+   if (glsl_type_is_array(type))
+      type = glsl_get_array_element(type);
+   out->components = glsl_type_is_vector_or_scalar(type)
+      ? glsl_get_vector_elements(type) : 0;
+   return out->components != 0 && out->components <= 4;
+}
+
+struct gex_wgpu_tess_lowering {
+   const struct gex_wgpu_varying_layout *in_layout;
+   const struct gex_wgpu_varying_layout *out_layout;
+   const struct gex_wgpu_varying_layout *patch_layout;
+   nir_variable *params;
+   nir_variable *in_block;
+   nir_variable *out_block;
+   nir_variable *patch_block;
+   nir_variable *levels;
+   /* Evaluation stage only. */
+   nir_variable *coords;
+   /* Control stage only: how many vertices a patch carries out, which is the
+    * workgroup size and so a compile-time constant. */
+   unsigned vertices_out;
+   bool evaluation;
+   bool failed;
+   const char *refusal;
+};
+
+/* The linear invocation number, which both stages derive everything from. */
+static nir_def *
+gex_wgpu_tess_invocation(nir_builder *b)
+{
+   return nir_channel(b, nir_load_global_invocation_id(b, 32), 0);
+}
+
+/* The patch this invocation belongs to.
+ *
+ * The control stage dispatches one workgroup of `vertices_out` invocations
+ * per patch, so the patch is the invocation divided by that -- a constant
+ * division, and one that avoids needing a workgroup-id builtin at all. The
+ * evaluation stage has one invocation per *generated vertex*, and which patch
+ * a generated vertex came from is not derivable: it is carried in the fourth
+ * word of the vertex's tessellation coordinate. */
+static nir_def *
+gex_wgpu_tess_patch(nir_builder *b, struct gex_wgpu_tess_lowering *state)
+{
+   if (state->evaluation)
+      return gex_wgpu_tess_load_word(
+         b, state->coords,
+         nir_iadd_imm(b, nir_imul_imm(b, gex_wgpu_tess_invocation(b),
+                                      GEX_WGPU_TESS_COORD_WORDS), 3));
+   return nir_udiv(b, gex_wgpu_tess_invocation(b),
+                   nir_imm_int(b, state->vertices_out));
+}
+
+static nir_def *
+gex_wgpu_tess_local_invocation(nir_builder *b,
+                               struct gex_wgpu_tess_lowering *state)
+{
+   return nir_umod(b, gex_wgpu_tess_invocation(b),
+                   nir_imm_int(b, state->vertices_out));
+}
+
+/* The word a (buffer, patch, vertex, slot, component) tuple addresses. */
+static nir_def *
+gex_wgpu_tess_word_of(nir_builder *b, nir_def *record, unsigned slot,
+                      nir_def *component)
+{
+   nir_def *word = nir_iadd_imm(b, nir_imul_imm(b, record, 4), slot * 4);
+   return component ? nir_iadd(b, word, component) : word;
+}
+
+/* Rewrite one deref access into a buffer access. Returns false to leave the
+ * instruction alone, which is how a non-varying deref passes through. */
+static bool
+gex_wgpu_tess_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct gex_wgpu_tess_lowering *state = data;
+   const bool store = intr->intrinsic == nir_intrinsic_store_deref;
+   if (!store && intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   if (!deref)
+      return false;
+   nir_variable *base = nir_deref_instr_get_variable(deref);
+   if (!base || !(base->data.mode & (nir_var_shader_in | nir_var_shader_out)))
+      return false;
+   /* The evaluation stage's outputs are ordinary vertex-shader outputs and
+    * are written once at the end by the varying-store pass, exactly as the
+    * vertex capture does it. Rewriting them here as well would write them
+    * twice, to two different layouts. */
+   if (state->evaluation && base->data.mode == nir_var_shader_out)
+      return false;
+
+   struct gex_wgpu_tess_deref at;
+   if (!gex_wgpu_tess_resolve_deref(deref, &at)) {
+      state->failed = true;
+      state->refusal = "a tessellation varying this driver cannot address";
+      return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *patch = gex_wgpu_tess_patch(b, state);
+   const bool is_level = gex_wgpu_tess_level_slot(at.var->data.location);
+   nir_variable *block = NULL;
+   nir_def *word = NULL;
+   unsigned components = at.components;
+
+   if (is_level) {
+      /* outer[4] then inner[2], within this patch's eight words. */
+      const unsigned first =
+         at.var->data.location == VARYING_SLOT_TESS_LEVEL_INNER ? 4 : 0;
+      /* A level is a float array, so the index that resolve_deref called the
+       * vertex is really the element. */
+      nir_def *element = at.vertex ? at.vertex : nir_imm_int(b, 0);
+      block = state->levels;
+      word = nir_iadd(b,
+                      nir_imul_imm(b, patch, GEX_WGPU_TESS_LEVEL_WORDS),
+                      nir_iadd_imm(b, element, first));
+      components = 1;
+   } else if (at.var->data.patch) {
+      const int slot =
+         gex_wgpu_varying_slot(state->patch_layout, at.var->data.location);
+      if (slot < 0) {
+         /* An input the producer never declared reads as zero, which is what
+          * GL says an unwritten varying is worth -- and the two stages need
+          * not declare the same set, since either compiler may drop what its
+          * own half does not use. Refusing here made an evaluation shader
+          * reading a per-patch value its control shader had optimised away
+          * fail to compile. */
+         if (!store) {
+            nir_def_replace(&intr->def,
+                            nir_imm_zero(b, intr->def.num_components, 32));
+            return true;
+         }
+         state->failed = true;
+         state->refusal = "a per-patch output with no slot";
+         return false;
+      }
+      block = state->patch_block;
+      word = gex_wgpu_tess_word_of(
+         b, nir_imul_imm(b, patch, state->patch_layout->count), slot,
+         at.component);
+   } else {
+      const bool input = at.var->data.mode == nir_var_shader_in;
+      const struct gex_wgpu_varying_layout *layout =
+         input ? state->in_layout : state->out_layout;
+      const int slot =
+         gex_wgpu_varying_slot(layout, at.var->data.location);
+      if (slot < 0 && !store && input) {
+         nir_def_replace(&intr->def,
+                         nir_imm_zero(b, intr->def.num_components, 32));
+         return true;
+      }
+      if (slot < 0 || !at.vertex) {
+         state->failed = true;
+         state->refusal = input ? "a per-vertex input with no slot"
+                                : "a per-vertex output with no slot";
+         return false;
+      }
+      /* How many vertices one patch occupies in this buffer. The control
+       * shader's *input* patch size is draw state (glPatchParameteri) and its
+       * output size is shader state, so the two come from different places. */
+      nir_def *stride;
+      if (input && !state->evaluation) {
+         nir_deref_instr *params = gex_wgpu_block_words(b, state->params);
+         stride = nir_load_deref(
+            b, nir_build_deref_array(
+                  b, params, nir_imm_int(b, GEX_WGPU_TCS_PARAM_VERTS_IN)));
+      } else {
+         nir_deref_instr *params = gex_wgpu_block_words(b, state->params);
+         stride = state->evaluation
+            ? nir_load_deref(
+                 b, nir_build_deref_array(
+                       b, params,
+                       nir_imm_int(b, GEX_WGPU_TES_PARAM_VERTS_OUT)))
+            : nir_imm_int(b, state->vertices_out);
+      }
+      block = input ? state->in_block : state->out_block;
+      nir_def *record =
+         nir_iadd(b, nir_imul(b, patch,
+                              nir_imul_imm(b, stride, layout->count)),
+                  nir_imul_imm(b, at.vertex, layout->count));
+      word = gex_wgpu_tess_word_of(b, record, slot, at.component);
+   }
+
+   if (at.component)
+      components = 1;
+
+   if (store) {
+      nir_def *value = intr->src[1].ssa;
+      const unsigned mask = nir_intrinsic_write_mask(intr);
+      for (unsigned c = 0; c < components; ++c) {
+         if (!(mask & (1u << c)))
+            continue;
+         gex_wgpu_tess_store_word(b, block, nir_iadd_imm(b, word, c),
+                                  nir_channel(b, value, c));
+      }
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+
+   nir_def *comps[4];
+   for (unsigned c = 0; c < 4; ++c)
+      comps[c] = c < components
+         ? gex_wgpu_tess_load_word(b, block, nir_iadd_imm(b, word, c))
+         : nir_imm_int(b, 0);
+   nir_def *value = nir_vec(b, comps, intr->def.num_components);
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
+/* The builtins each stage reads. */
+static bool
+gex_wgpu_tess_builtin(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct gex_wgpu_tess_lowering *state = data;
+   b->cursor = nir_before_instr(&intr->instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_invocation_id:
+      if (state->evaluation)
+         return false;
+      nir_def_replace(&intr->def, gex_wgpu_tess_local_invocation(b, state));
+      return true;
+   case nir_intrinsic_load_primitive_id:
+      nir_def_replace(&intr->def, gex_wgpu_tess_patch(b, state));
+      return true;
+   case nir_intrinsic_load_patch_vertices_in: {
+      nir_deref_instr *params = gex_wgpu_block_words(b, state->params);
+      const unsigned which = state->evaluation ? GEX_WGPU_TES_PARAM_VERTS_OUT
+                                               : GEX_WGPU_TCS_PARAM_VERTS_IN;
+      nir_def_replace(&intr->def,
+                      nir_load_deref(b, nir_build_deref_array(
+                                           b, params, nir_imm_int(b, which))));
+      return true;
+   }
+   case nir_intrinsic_load_tess_coord: {
+      if (!state->evaluation)
+         return false;
+      nir_def *base = nir_imul_imm(b, gex_wgpu_tess_invocation(b),
+                                   GEX_WGPU_TESS_COORD_WORDS);
+      nir_def *comps[3];
+      for (unsigned c = 0; c < 3; ++c)
+         comps[c] = gex_wgpu_tess_load_word(b, state->coords,
+                                            nir_iadd_imm(b, base, c));
+      nir_def_replace(&intr->def, nir_vec(b, comps, intr->def.num_components));
+      return true;
+   }
+   case nir_intrinsic_barrier:
+      /* The outputs it was ordering are storage buffers now, and the scope
+       * is the workgroup either way -- one workgroup is one patch. */
+      nir_intrinsic_set_memory_modes(intr, nir_var_mem_ssbo);
+      nir_intrinsic_set_memory_scope(intr, SCOPE_WORKGROUP);
+      nir_intrinsic_set_execution_scope(intr, SCOPE_WORKGROUP);
+      return true;
+   /* Named rather than lowered: each of these is a real GL feature whose
+    * absence should read as a refusal in the log, not as wrong geometry. */
+   case nir_intrinsic_load_tess_level_outer:
+   case nir_intrinsic_load_tess_level_inner:
+      state->failed = true;
+      state->refusal = "a tessellation level read as an intrinsic";
+      return false;
+   default:
+      return false;
+   }
+}
+
+/* Shared tail of both stages' module builders: bound the dispatch, drop the
+ * shader in/out variables a compute shader may not have, and compile. */
+static WGPUShaderModule
+gex_wgpu_tess_finish_module(struct pipe_context *pipe, nir_shader *nir,
+                            struct gex_wgpu_tess_lowering *state,
+                            unsigned limit_word, unsigned workgroup,
+                            const char *what)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   /* The dispatch is rounded up to whole workgroups, so the tail has
+    * no work and must not write. Inserted after the lowering rather than
+    * before it, so everything the passes appended is inside the guard. */
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_deref_instr *params = gex_wgpu_block_words(&b, state->params);
+   nir_def *limit = nir_load_deref(
+      &b, nir_build_deref_array(&b, params, nir_imm_int(&b, limit_word)));
+   nir_push_if(&b, nir_uge(&b, gex_wgpu_tess_invocation(&b), limit));
+   nir_jump(&b, nir_jump_return);
+   nir_pop_if(&b, NULL);
+   nir_progress(true, impl, nir_metadata_none);
+   NIR_PASS(_, nir, nir_lower_returns);
+
+   /* Every access to them is a buffer access now, so they are dead -- but
+    * deleting a variable an orphaned deref still points at fails NIR
+    * validation inside ntv, which is what the texture-buffer lowering learnt
+    * the hard way. DCE first. */
+   NIR_PASS(_, nir, nir_opt_dce);
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
+      var->data.mode = nir_var_shader_temp;
+   nir_fixup_deref_modes(nir);
+   nir_remove_dead_variables(nir, nir_var_shader_in | nir_var_system_value,
+                             NULL);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_opt_dce);
+
+   nir->info.stage = MESA_SHADER_COMPUTE;
+   /* info.cs shares a union with info.tess, so the tessellation fields have
+    * to be read before this and are unreadable after. Leaving them made ntv
+    * read a stale byte as info.cs.ptr_size and ask for
+    * PhysicalStorageBufferAddresses. */
+   memset(&nir->info.cs, 0, sizeof(nir->info.cs));
+   nir->info.workgroup_size[0] = workgroup;
+   nir->info.workgroup_size[1] = 1;
+   nir->info.workgroup_size[2] = 1;
+   nir->info.workgroup_size_variable = false;
+   nir->xfb_info = NULL;
+
+   char *error = NULL;
+   WGPUShaderModule module =
+      gex_wgpu_compile_nir(pipe, nir, MESA_SHADER_COMPUTE, false, &error);
+   if (!module)
+      fprintf(stderr, "gex-wgpu: %s rejected: %s\n", what,
+              error ? error : "unknown");
+   free(error);
+   return module;
+}
+
+/* The control shader as compute: one workgroup per patch, `vertices_out`
+ * invocations in it. */
+static WGPUShaderModule
+gex_wgpu_tcs_module(struct pipe_context *pipe, nir_shader *nir,
+                    struct gex_wgpu_tcs *tcs)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo)
+      var->data.descriptor_set = 1;
+
+   struct gex_wgpu_tess_lowering state = {0};
+   state.in_layout = &tcs->inputs;
+   state.out_layout = &tcs->outputs;
+   state.patch_layout = &tcs->patch_outputs;
+   state.vertices_out = tcs->vertices_out;
+   state.params = gex_wgpu_word_block(nir, "gex_tcs_params",
+                                      GEX_WGPU_TCS_PARAMS_BINDING, 0, false);
+   state.in_block = gex_wgpu_word_block(nir, "gex_tcs_vsout",
+                                        GEX_WGPU_TCS_VSOUT_BINDING, 0, false);
+   state.out_block = gex_wgpu_word_block(nir, "gex_tcs_out",
+                                         GEX_WGPU_TCS_OUT_BINDING, 0, false);
+   state.patch_block = gex_wgpu_word_block(nir, "gex_tcs_patch",
+                                           GEX_WGPU_TCS_PATCH_BINDING, 0,
+                                           false);
+   state.levels = gex_wgpu_word_block(nir, "gex_tcs_levels",
+                                      GEX_WGPU_TCS_LEVEL_BINDING, 0, false);
+
+   nir_shader_intrinsics_pass(nir, gex_wgpu_tess_access,
+                              nir_metadata_control_flow, &state);
+   nir_shader_intrinsics_pass(nir, gex_wgpu_tess_builtin,
+                              nir_metadata_control_flow, &state);
+   if (state.failed) {
+      fprintf(stderr, "gex-wgpu: tessellation control shader refused (%s)\n",
+              state.refusal ? state.refusal : "unknown");
+      ralloc_free(nir);
+      return NULL;
+   }
+   return gex_wgpu_tess_finish_module(
+      pipe, nir, &state, GEX_WGPU_TCS_PARAM_INVOCATIONS, tcs->vertices_out,
+      "tessellation control shader");
+}
+
+static nir_def *
+gex_wgpu_tess_slot_of(nir_builder *b, struct gex_wgpu_capture *state)
+{
+   (void)state;
+   return gex_wgpu_tess_invocation(b);
+}
+
+/* The evaluation shader as compute: one invocation per generated vertex,
+ * writing its varyings for the passthrough vertex shader to rasterize. */
+static WGPUShaderModule
+gex_wgpu_tes_module(struct pipe_context *pipe, nir_shader *nir,
+                    struct gex_wgpu_tes *tes,
+                    const struct gex_wgpu_varying_layout *tcs_outputs,
+                    const struct gex_wgpu_varying_layout *tcs_patch_outputs)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo)
+      var->data.descriptor_set = 1;
+
+   struct gex_wgpu_tess_lowering state = {0};
+   state.evaluation = true;
+   state.in_layout = tcs_outputs;
+   state.patch_layout = tcs_patch_outputs;
+   state.params = gex_wgpu_word_block(nir, "gex_tes_params",
+                                      GEX_WGPU_TES_PARAMS_BINDING, 0, false);
+   state.in_block = gex_wgpu_word_block(nir, "gex_tes_tcsout",
+                                        GEX_WGPU_TES_TCSOUT_BINDING, 0, false);
+   state.patch_block = gex_wgpu_word_block(nir, "gex_tes_patch",
+                                           GEX_WGPU_TES_PATCH_BINDING, 0,
+                                           false);
+   state.levels = gex_wgpu_word_block(nir, "gex_tes_levels",
+                                      GEX_WGPU_TES_LEVEL_BINDING, 0, false);
+   state.coords = gex_wgpu_word_block(nir, "gex_tes_coords",
+                                      GEX_WGPU_TES_COORD_BINDING, 0, false);
+   nir_variable *out_block =
+      gex_wgpu_word_block(nir, "gex_tes_out", GEX_WGPU_TES_OUT_BINDING, 0,
+                          false);
+
+   nir_shader_intrinsics_pass(nir, gex_wgpu_tess_access,
+                              nir_metadata_control_flow, &state);
+   nir_shader_intrinsics_pass(nir, gex_wgpu_tess_builtin,
+                              nir_metadata_control_flow, &state);
+   struct gex_wgpu_capture emit = {0};
+   emit.varyings = &tes->outputs;
+   emit.varying_out = out_block;
+   if (state.failed ||
+       !gex_wgpu_emit_varying_stores(nir, &emit, gex_wgpu_tess_slot_of)) {
+      fprintf(stderr,
+              "gex-wgpu: tessellation evaluation shader refused (%s)\n",
+              state.refusal ? state.refusal : "could not write its varyings");
+      ralloc_free(nir);
+      return NULL;
+   }
+   return gex_wgpu_tess_finish_module(
+      pipe, nir, &state, GEX_WGPU_TES_PARAM_VERTICES, GEX_WGPU_TESS_GROUP,
+      "tessellation evaluation shader");
+}
+
+/* Build, or find, the evaluation variant that reads these producer layouts. */
+static struct gex_wgpu_tes_variant *
+gex_wgpu_tes_variant_get(struct pipe_context *pipe, struct gex_wgpu_tes *tes,
+                         const struct gex_wgpu_tcs *tcs)
+{
+   for (struct gex_wgpu_tes_variant *v = tes->variants; v; v = v->next) {
+      if (v->verts_per_patch == tcs->vertices_out &&
+          !memcmp(&v->tcs_outputs, &tcs->outputs, sizeof(tcs->outputs)) &&
+          !memcmp(&v->tcs_patch_outputs, &tcs->patch_outputs,
+                  sizeof(tcs->patch_outputs)))
+         return v;
+   }
+   if (!tes->nir)
+      return NULL;
+   nir_shader *nir = nir_shader_clone(NULL, tes->nir);
+   if (!nir)
+      return NULL;
+   WGPUShaderModule module =
+      gex_wgpu_tes_module(pipe, nir, tes, &tcs->outputs, &tcs->patch_outputs);
+   if (!module)
+      return NULL;
+   struct gex_wgpu_tes_variant *variant =
+      CALLOC_STRUCT(gex_wgpu_tes_variant);
+   if (!variant) {
+      wgpuShaderModuleRelease(module);
+      return NULL;
+   }
+   variant->tcs_outputs = tcs->outputs;
+   variant->tcs_patch_outputs = tcs->patch_outputs;
+   variant->verts_per_patch = tcs->vertices_out;
+   variant->module = module;
+   variant->next = tes->variants;
+   tes->variants = variant;
+   return variant;
+}
+
+/* The uniform and storage blocks a lowered tessellation stage will want bound
+ * to its group one, in the order gex_wgpu_bind_constants expects. */
+static void
+gex_wgpu_tess_collect_ubos(nir_shader *nir, unsigned *count, uint8_t *slots,
+                           uint32_t *bindings, uint32_t *required,
+                           uint32_t *storage_mask)
+{
+   nir_foreach_variable_with_modes(var, nir,
+                                   nir_var_mem_ubo | nir_var_mem_ssbo) {
+      if (var->data.descriptor_set != 2 ||
+          *count >= GEX_WGPU_MAX_CONSTANT_BUFFERS)
+         continue;
+      slots[*count] = var->data.driver_location;
+      bindings[*count] = var->data.binding;
+      required[*count] = gex_wgpu_block_declared_size(var);
+      if (var->data.mode == nir_var_mem_ssbo)
+         *storage_mask |= 1u << *count;
+      ++*count;
+   }
+}
+
+static void *
+gex_wgpu_create_tcs_state(struct pipe_context *pipe,
+                          const struct pipe_shader_state *state)
+{
+   struct pipe_shader_state *mutable_state = (struct pipe_shader_state *)state;
+   nir_shader *nir = state->type == PIPE_SHADER_IR_NIR ? state->ir.nir : NULL;
+   if (!nir || nir->info.stage != MESA_SHADER_TESS_CTRL) {
+      gex_wgpu_set_compile_error(mutable_state,
+                                 "gex_wgpu requires tessellation control NIR");
+      if (nir)
+         ralloc_free(nir);
+      return NULL;
+   }
+   struct gex_wgpu_tcs *tcs = CALLOC_STRUCT(gex_wgpu_tcs);
+   if (!tcs) {
+      ralloc_free(nir);
+      return NULL;
+   }
+   /* Read before anything touches info.cs: the two share a union. */
+   tcs->vertices_out = nir->info.tess.tcs_vertices_out;
+   const char *refusal = NULL;
+   if (!tcs->vertices_out || tcs->vertices_out > 32)
+      refusal = "gex_wgpu tessellation control shaders must emit 1..32 vertices";
+   else if (!gex_wgpu_lower_gallium_ubos(
+               nir, MESA_SHADER_TESS_CTRL,
+               gex_screen(pipe->screen)->max_uniform_buffers, NULL, 0) ||
+            !gex_wgpu_collect_tess_varyings(nir, nir_var_shader_in, false,
+                                            &tcs->inputs) ||
+            !gex_wgpu_collect_tess_varyings(nir, nir_var_shader_out, false,
+                                            &tcs->outputs) ||
+            !gex_wgpu_collect_tess_varyings(nir, nir_var_shader_out, true,
+                                            &tcs->patch_outputs))
+      refusal = "gex_wgpu could not lay out tessellation control varyings";
+   if (refusal) {
+      gex_wgpu_set_compile_error(mutable_state, refusal);
+      ralloc_free(nir);
+      FREE(tcs);
+      return NULL;
+   }
+   gex_wgpu_tess_collect_ubos(nir, &tcs->ubo_count, tcs->ubo_slots,
+                              tcs->ubo_bindings, tcs->ubo_required,
+                              &tcs->ubo_storage_mask);
+   tcs->module = gex_wgpu_tcs_module(pipe, nir, tcs);
+   if (!tcs->module) {
+      gex_wgpu_set_compile_error(
+         mutable_state, "gex_wgpu could not compile the tessellation control "
+                        "shader as compute");
+      FREE(tcs);
+      return NULL;
+   }
+   return tcs;
+}
+
+static void
+gex_wgpu_bind_tcs_state(struct pipe_context *pipe, void *state)
+{
+   ((struct gex_wgpu_context *)pipe)->tcs = state;
+}
+
+static void
+gex_wgpu_delete_tcs_state(struct pipe_context *pipe, void *state)
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   struct gex_wgpu_tcs *tcs = state;
+   if (!tcs)
+      return;
+   if (ctx->tcs == tcs)
+      ctx->tcs = NULL;
+   if (tcs->module)
+      wgpuShaderModuleRelease(tcs->module);
+   FREE(tcs);
+}
+
+static void *
+gex_wgpu_create_tes_state(struct pipe_context *pipe,
+                          const struct pipe_shader_state *state)
+{
+   struct pipe_shader_state *mutable_state = (struct pipe_shader_state *)state;
+   nir_shader *nir = state->type == PIPE_SHADER_IR_NIR ? state->ir.nir : NULL;
+   if (!nir || nir->info.stage != MESA_SHADER_TESS_EVAL) {
+      gex_wgpu_set_compile_error(
+         mutable_state, "gex_wgpu requires tessellation evaluation NIR");
+      if (nir)
+         ralloc_free(nir);
+      return NULL;
+   }
+   struct gex_wgpu_tes *tes = CALLOC_STRUCT(gex_wgpu_tes);
+   if (!tes) {
+      ralloc_free(nir);
+      return NULL;
+   }
+   tes->domain = nir->info.tess._primitive_mode;
+   tes->point_mode = nir->info.tess.point_mode;
+   tes->ccw = nir->info.tess.ccw;
+   switch ((enum gl_tess_spacing)nir->info.tess.spacing) {
+   case TESS_SPACING_FRACTIONAL_ODD:
+      tes->spacing = PIPE_TESS_SPACING_FRACTIONAL_ODD;
+      break;
+   case TESS_SPACING_FRACTIONAL_EVEN:
+      tes->spacing = PIPE_TESS_SPACING_FRACTIONAL_EVEN;
+      break;
+   default:
+      tes->spacing = PIPE_TESS_SPACING_EQUAL;
+      break;
+   }
+   const char *refusal = NULL;
+   if (tes->domain != TESS_PRIMITIVE_TRIANGLES &&
+       tes->domain != TESS_PRIMITIVE_QUADS &&
+       tes->domain != TESS_PRIMITIVE_ISOLINES)
+      refusal = "gex_wgpu tessellation needs a triangle, quad or isoline domain";
+   else if (!gex_wgpu_lower_gallium_ubos(
+               nir, MESA_SHADER_TESS_EVAL,
+               gex_screen(pipe->screen)->max_uniform_buffers, NULL, 0) ||
+            !gex_wgpu_collect_tess_varyings(nir, nir_var_shader_in, false,
+                                            &tes->inputs) ||
+            !gex_wgpu_collect_tess_varyings(nir, nir_var_shader_in, true,
+                                            &tes->patch_inputs) ||
+            !gex_wgpu_collect_varyings(nir, nir_var_shader_out, &tes->outputs))
+      refusal = "gex_wgpu could not lay out tessellation evaluation varyings";
+   else if (!tes->outputs.count)
+      refusal = "gex_wgpu tessellation evaluation shader writes nothing";
+   if (refusal) {
+      gex_wgpu_set_compile_error(mutable_state, refusal);
+      ralloc_free(nir);
+      FREE(tes);
+      return NULL;
+   }
+   gex_wgpu_tess_collect_ubos(nir, &tes->ubo_count, tes->ubo_slots,
+                              tes->ubo_bindings, tes->ubo_required,
+                              &tes->ubo_storage_mask);
+   /* The variants are built from this clone at draw time, because each one
+    * depends on the control shader bound with it. The rasterization half does
+    * not: it reads this shader's own outputs, which are known now. */
+   tes->nir = nir;
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   struct pipe_shader_state passthrough_state = {0};
+   passthrough_state.type = PIPE_SHADER_IR_NIR;
+   passthrough_state.ir.nir = gex_wgpu_gs_passthrough_nir(pipe, &tes->outputs);
+   passthrough_state.report_compile_error = true;
+   tes->passthrough = gex_wgpu_create_shader_state(pipe, &passthrough_state,
+                                                   MESA_SHADER_VERTEX);
+   free(passthrough_state.error_message);
+
+   struct pipe_vertex_element elements[GEX_WGPU_MAX_VARYINGS];
+   memset(elements, 0, sizeof(elements));
+   for (unsigned i = 0; i < tes->outputs.count; ++i) {
+      elements[i].src_offset = i * 16;
+      elements[i].src_stride = gex_wgpu_varying_stride(&tes->outputs);
+      elements[i].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      elements[i].vertex_buffer_index = 0;
+   }
+   tes->passthrough_elements = ctx->base.create_vertex_elements_state(
+      &ctx->base, tes->outputs.count, elements);
+   if (!tes->passthrough || !tes->passthrough_elements) {
+      gex_wgpu_set_compile_error(
+         mutable_state,
+         !tes->passthrough
+            ? "gex_wgpu could not build the tessellation passthrough vertex "
+              "shader"
+            : "gex_wgpu could not build the tessellation passthrough vertex "
+              "layout");
+      gex_wgpu_delete_tes_state(pipe, tes);
+      return NULL;
+   }
+   return tes;
+}
+
+static void
+gex_wgpu_bind_tes_state(struct pipe_context *pipe, void *state)
+{
+   ((struct gex_wgpu_context *)pipe)->tes = state;
+}
+
+/* glPatchParameteri(GL_PATCH_VERTICES). It is state rather than a draw
+ * parameter, and the control shader's input patch size is the only thing that
+ * reads it -- its *output* size is `layout(vertices = N) out` and comes from
+ * the shader. */
+static void
+gex_wgpu_set_patch_vertices(struct pipe_context *pipe, uint8_t vertices)
+{
+   ((struct gex_wgpu_context *)pipe)->patch_vertices = vertices;
+}
+
+static void
+gex_wgpu_delete_tes_state(struct pipe_context *pipe, void *state)
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   struct gex_wgpu_tes *tes = state;
+   if (!tes)
+      return;
+   if (ctx->tes == tes)
+      ctx->tes = NULL;
+   for (struct gex_wgpu_tes_variant *v = tes->variants; v;) {
+      struct gex_wgpu_tes_variant *next = v->next;
+      if (v->module)
+         wgpuShaderModuleRelease(v->module);
+      FREE(v);
+      v = next;
+   }
+   if (tes->passthrough)
+      gex_wgpu_delete_shader_state(pipe, tes->passthrough);
+   if (tes->passthrough_elements)
+      pipe->delete_vertex_elements_state(pipe, tes->passthrough_elements);
+   if (tes->nir)
+      ralloc_free(tes->nir);
+   FREE(tes);
+}
+
 static void *
 gex_wgpu_create_gs_state(struct pipe_context *pipe,
                          const struct pipe_shader_state *state)
@@ -15979,6 +16953,348 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    ctx->vertex_buffer_offsets[0] = saved_offset;
    ctx->vertex_buffer_count = saved_count;
    return !ctx->failed;
+}
+
+
+/* The five-pass tessellated draw. See the tessellation comment above the
+ * binding numbers for the shape; this is where the CPU tessellator sits. */
+static bool
+gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
+                   const struct pipe_draw_info *info, unsigned drawid_offset,
+                   const struct pipe_draw_start_count_bias *draw)
+{
+   struct gex_wgpu_tcs *tcs = ctx->tcs;
+   struct gex_wgpu_tes *tes = ctx->tes;
+   /* Declined, not latched -- the same reason the geometry path declines: a
+    * latch becomes GL_OUT_OF_MEMORY from some later allocation, which reads
+    * as a driver failure rather than as an unimplemented case. */
+#define GEX_TESS_DECLINE(why)                                                 \
+   do {                                                                       \
+      static bool said;                                                       \
+      if (!said) {                                                            \
+         said = true;                                                         \
+         fprintf(stderr, "gex-wgpu: tessellated draw declined (%s)\n", why);  \
+      }                                                                       \
+      return false;                                                           \
+   } while (0)
+
+   if (!tcs || !tes)
+      GEX_TESS_DECLINE("a patch draw with no tessellation shaders");
+   if (ctx->gs)
+      GEX_TESS_DECLINE("a geometry shader after tessellation");
+   if (info->index_size || info->instance_count != 1)
+      GEX_TESS_DECLINE("an indexed or instanced patch draw");
+   const unsigned verts_in = ctx->patch_vertices;
+   if (!verts_in || draw->count < verts_in)
+      GEX_TESS_DECLINE("a patch draw with no complete patch");
+   const unsigned patches = draw->count / verts_in;
+   const unsigned in_stride = MAX2(gex_wgpu_varying_stride(&tcs->inputs), 16u);
+   const unsigned out_stride =
+      MAX2(gex_wgpu_varying_stride(&tcs->outputs), 16u);
+   const unsigned patch_stride =
+      MAX2(gex_wgpu_varying_stride(&tcs->patch_outputs), 16u);
+   const unsigned tes_stride = gex_wgpu_varying_stride(&tes->outputs);
+   if (!tes_stride)
+      GEX_TESS_DECLINE("an evaluation shader with no outputs");
+
+   struct gex_wgpu_tes_variant *variant =
+      gex_wgpu_tes_variant_get(&ctx->base, tes, tcs);
+   if (!variant)
+      GEX_TESS_DECLINE("could not build the evaluation variant");
+
+   if (!gex_wgpu_ensure_buffer(ctx, &ctx->tess_vs_out,
+                               patches * verts_in * in_stride,
+                               PIPE_BIND_SHADER_BUFFER) ||
+       !gex_wgpu_ensure_buffer(ctx, &ctx->tess_tcs_out,
+                               patches * tcs->vertices_out * out_stride,
+                               PIPE_BIND_SHADER_BUFFER) ||
+       !gex_wgpu_ensure_buffer(ctx, &ctx->tess_patch_out,
+                               patches * patch_stride,
+                               PIPE_BIND_SHADER_BUFFER) ||
+       !gex_wgpu_ensure_buffer(ctx, &ctx->tess_levels,
+                               patches * GEX_WGPU_TESS_LEVEL_WORDS * 4,
+                               PIPE_BIND_SHADER_BUFFER))
+      GEX_TESS_DECLINE("could not allocate the tessellation buffers");
+
+   /* Pass one: the vertex shader, as compute, writing the control shader's
+    * inputs -- the geometry path's first pass, unchanged. */
+   struct gex_wgpu_capture_layout layout;
+   memset(&layout, 0, sizeof(layout));
+   if (ctx->vertex_elements) {
+      layout.count = ctx->vertex_elements->count;
+      for (unsigned i = 0; i < layout.count; ++i) {
+         const struct pipe_vertex_element *ve =
+            &ctx->vertex_elements->elements[i];
+         layout.buffer[i] = ve->vertex_buffer_index;
+         layout.offset[i] = ve->src_offset;
+         layout.stride[i] = ve->src_stride;
+         layout.format[i] = ve->src_format;
+      }
+   }
+   struct gex_wgpu_varying_variant *vs_variant =
+      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &tcs->inputs);
+   if (!vs_variant)
+      GEX_TESS_DECLINE("could not build the vertex capture variant");
+
+   uint32_t params[GEX_WGPU_PARAM_WORDS] = {0};
+   params[GEX_WGPU_PARAM_FIRST_VERTEX] = draw->start;
+   params[GEX_WGPU_PARAM_COUNT] = patches * verts_in;
+   struct gex_wgpu_bindings vs_group0 = {0}, vs_group1 = {0};
+   for (unsigned i = 0; i < GEX_WGPU_MAX_VERTEX_BUFFERS; ++i) {
+      if (!(vs_variant->vb_mask & (1u << i)))
+         continue;
+      if (i >= ctx->vertex_buffer_count || !ctx->vertex_buffers[i])
+         GEX_TESS_DECLINE("a vertex buffer the tessellation pass reads is "
+                          "unbound");
+      params[GEX_WGPU_PARAM_VB_OFFSET + i] = ctx->vertex_buffer_offsets[i];
+      gex_wgpu_bind_storage_access(&vs_group0, GEX_WGPU_VB_FIRST_BINDING + i,
+                                   ctx->vertex_buffers[i], true);
+   }
+   struct pipe_resource *vs_params =
+      gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS);
+   gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_VARYING_OUT_BINDING,
+                         ctx->tess_vs_out);
+   gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
+                         vs_params);
+   bool ok = vs_params &&
+             gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
+                                     ctx->vs->ubo_count, ctx->vs->ubo_slots,
+                                     ctx->vs->ubo_bindings,
+                                     ctx->vs->ubo_storage_mask);
+   if (ok)
+      ok = gex_wgpu_dispatch(ctx, vs_variant->module, &vs_group0, &vs_group1,
+                             NULL,
+                             DIV_ROUND_UP(patches * verts_in,
+                                          GEX_WGPU_CAPTURE_GROUP));
+   pipe_resource_reference(&vs_params, NULL);
+   if (!ok) {
+      gex_fail(ctx);
+      return false;
+   }
+
+   /* Pass two: the control shader, one workgroup per patch. The levels are
+    * zeroed first, so a level the shader does not write culls the patch
+    * rather than tessellating to whatever was in the buffer -- GL requires
+    * every level of the domain to be written, and reading stale ones back
+    * would make one draw's geometry depend on the last one's. */
+   uint32_t tcs_params[GEX_WGPU_TCS_PARAM_WORDS] = {0};
+   tcs_params[GEX_WGPU_TCS_PARAM_INVOCATIONS] = patches * tcs->vertices_out;
+   tcs_params[GEX_WGPU_TCS_PARAM_VERTS_IN] = verts_in;
+   struct gex_wgpu_bindings tcs_group0 = {0}, tcs_group1 = {0};
+   struct pipe_resource *tcs_param_buffer =
+      gex_wgpu_params_buffer(ctx, tcs_params, GEX_WGPU_TCS_PARAM_WORDS);
+   gex_wgpu_bind_storage(&tcs_group0, GEX_WGPU_TCS_PARAMS_BINDING,
+                         tcs_param_buffer);
+   gex_wgpu_bind_storage(&tcs_group0, GEX_WGPU_TCS_VSOUT_BINDING,
+                         ctx->tess_vs_out);
+   gex_wgpu_bind_storage(&tcs_group0, GEX_WGPU_TCS_OUT_BINDING,
+                         ctx->tess_tcs_out);
+   gex_wgpu_bind_storage(&tcs_group0, GEX_WGPU_TCS_PATCH_BINDING,
+                         ctx->tess_patch_out);
+   gex_wgpu_bind_storage(&tcs_group0, GEX_WGPU_TCS_LEVEL_BINDING,
+                         ctx->tess_levels);
+   ok = tcs_param_buffer &&
+        gex_wgpu_bind_constants(ctx, &tcs_group1, MESA_SHADER_TESS_CTRL,
+                                tcs->ubo_count, tcs->ubo_slots,
+                                tcs->ubo_bindings, tcs->ubo_storage_mask);
+   if (ok)
+      ok = gex_wgpu_dispatch(ctx, tcs->module, &tcs_group0, &tcs_group1,
+                             ctx->tess_levels, patches);
+   pipe_resource_reference(&tcs_param_buffer, NULL);
+   if (!ok) {
+      gex_fail(ctx);
+      return false;
+   }
+
+   /* Pass three: the tessellator, on the CPU.
+    *
+    * This is a GPU-to-CPU read of the levels, and so a stall. It is also the
+    * only honest option: the topology depends on numbers a shader computed,
+    * and src/gallium/auxiliary/tessellator is the same implementation llvmpipe
+    * uses -- so the mesh is identical to the reference rather than merely
+    * similar, which is what makes the probe's pinned pixel values reachable
+    * at all. One stall per draw, not per patch. */
+   struct pipe_transfer *level_transfer = NULL;
+   const float *levels = pipe_buffer_map_range(
+      &ctx->base, ctx->tess_levels, 0,
+      patches * GEX_WGPU_TESS_LEVEL_WORDS * 4, PIPE_MAP_READ,
+      &level_transfer);
+   if (!levels)
+      GEX_TESS_DECLINE("could not read the tessellation levels back");
+
+   struct pipe_tessellator *ts =
+      p_tess_init(tes->domain == TESS_PRIMITIVE_QUADS ? MESA_PRIM_QUADS
+                  : tes->domain == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES
+                                                           : MESA_PRIM_TRIANGLES,
+                  tes->spacing, tes->ccw, tes->point_mode);
+   uint32_t *indices = NULL;
+   float *coords = NULL;
+   unsigned index_count = 0, vertex_count = 0;
+   unsigned index_capacity = 0, vertex_capacity = 0;
+   bool overflow = false;
+   for (unsigned p = 0; ts && p < patches && !overflow; ++p) {
+      struct pipe_tessellation_factors factors;
+      memcpy(&factors, levels + p * GEX_WGPU_TESS_LEVEL_WORDS,
+             sizeof(factors));
+      struct pipe_tessellator_data data = {0};
+      p_tessellate(ts, &factors, &data);
+      if (!data.num_indices || !data.num_domain_points)
+         continue;
+      if (vertex_count + data.num_domain_points > vertex_capacity) {
+         vertex_capacity = MAX2(vertex_capacity * 2,
+                                vertex_count + data.num_domain_points + 64);
+         float *grown = realloc(coords, (size_t)vertex_capacity *
+                                        GEX_WGPU_TESS_COORD_WORDS * 4);
+         if (!grown) { overflow = true; break; }
+         coords = grown;
+      }
+      if (index_count + data.num_indices > index_capacity) {
+         index_capacity = MAX2(index_capacity * 2,
+                               index_count + data.num_indices + 64);
+         uint32_t *grown = realloc(indices, (size_t)index_capacity * 4);
+         if (!grown) { overflow = true; break; }
+         indices = grown;
+      }
+      for (unsigned v = 0; v < data.num_domain_points; ++v) {
+         float *at = coords +
+            (size_t)(vertex_count + v) * GEX_WGPU_TESS_COORD_WORDS;
+         const float u = data.domain_points_u[v];
+         const float w = data.domain_points_v[v];
+         at[0] = u;
+         at[1] = w;
+         /* The tessellator hands back two coordinates and documents the
+          * third: for a triangle domain w = 1 - u - v, and for the others it
+          * is unused. gl_TessCoord.z is read by every barycentric evaluation
+          * shader there is, so computing it here is not optional. */
+         at[2] = tes->domain == TESS_PRIMITIVE_TRIANGLES ? 1.0f - u - w : 0.0f;
+         /* The patch travels with the vertex, as a bit pattern the shader
+          * reads as an integer -- one draw covers every patch and the
+          * evaluation shader has no other way to find its control points. */
+         memcpy(&at[3], &p, sizeof(p));
+      }
+      for (unsigned i = 0; i < data.num_indices; ++i)
+         indices[index_count + i] = data.indices[i] + vertex_count;
+      vertex_count += data.num_domain_points;
+      index_count += data.num_indices;
+   }
+   if (ts)
+      p_tess_destroy(ts);
+   pipe_buffer_unmap(&ctx->base, level_transfer);
+   if (overflow || !ts) {
+      free(coords);
+      free(indices);
+      GEX_TESS_DECLINE("could not build the tessellated mesh");
+   }
+   if (!index_count || !vertex_count) {
+      /* Every patch was culled, which is a legitimate outcome -- an outer
+       * level of zero or less discards the patch, and that is how a
+       * tessellation shader rejects off-screen geometry. */
+      free(coords);
+      free(indices);
+      return true;
+   }
+
+   if (!gex_wgpu_ensure_buffer(ctx, &ctx->tess_coords,
+                               vertex_count * GEX_WGPU_TESS_COORD_WORDS * 4,
+                               PIPE_BIND_SHADER_BUFFER) ||
+       !gex_wgpu_ensure_buffer(ctx, &ctx->tess_vertices,
+                               vertex_count * tes_stride,
+                               PIPE_BIND_VERTEX_BUFFER |
+                               PIPE_BIND_SHADER_BUFFER) ||
+       !gex_wgpu_ensure_buffer(ctx, &ctx->tess_indices, index_count * 4,
+                               PIPE_BIND_INDEX_BUFFER)) {
+      free(coords);
+      free(indices);
+      GEX_TESS_DECLINE("could not allocate the tessellated mesh buffers");
+   }
+   gex_wgpu_buffer_subdata(&ctx->base, ctx->tess_coords, PIPE_MAP_WRITE, 0,
+                           vertex_count * GEX_WGPU_TESS_COORD_WORDS * 4,
+                           coords);
+   gex_wgpu_buffer_subdata(&ctx->base, ctx->tess_indices, PIPE_MAP_WRITE, 0,
+                           index_count * 4, indices);
+   free(coords);
+   free(indices);
+
+   /* Pass four: the evaluation shader, one invocation per generated vertex. */
+   uint32_t tes_params[GEX_WGPU_TES_PARAM_WORDS] = {0};
+   tes_params[GEX_WGPU_TES_PARAM_VERTICES] = vertex_count;
+   tes_params[GEX_WGPU_TES_PARAM_VERTS_OUT] = tcs->vertices_out;
+   struct gex_wgpu_bindings tes_group0 = {0}, tes_group1 = {0};
+   struct pipe_resource *tes_param_buffer =
+      gex_wgpu_params_buffer(ctx, tes_params, GEX_WGPU_TES_PARAM_WORDS);
+   gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_PARAMS_BINDING,
+                         tes_param_buffer);
+   gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_TCSOUT_BINDING,
+                         ctx->tess_tcs_out);
+   gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_PATCH_BINDING,
+                         ctx->tess_patch_out);
+   gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_LEVEL_BINDING,
+                         ctx->tess_levels);
+   gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_COORD_BINDING,
+                         ctx->tess_coords);
+   gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_OUT_BINDING,
+                         ctx->tess_vertices);
+   ok = tes_param_buffer &&
+        gex_wgpu_bind_constants(ctx, &tes_group1, MESA_SHADER_TESS_EVAL,
+                                tes->ubo_count, tes->ubo_slots,
+                                tes->ubo_bindings, tes->ubo_storage_mask);
+   if (ok)
+      ok = gex_wgpu_dispatch(ctx, variant->module, &tes_group0, &tes_group1,
+                             NULL,
+                             DIV_ROUND_UP(vertex_count, GEX_WGPU_TESS_GROUP));
+   pipe_resource_reference(&tes_param_buffer, NULL);
+   if (!ok) {
+      gex_fail(ctx);
+      return false;
+   }
+
+   /* Pass five: rasterize it, through the passthrough vertex shader. */
+   struct gex_wgpu_shader *saved_vs = ctx->vs;
+   struct gex_wgpu_vertex_elements *saved_elements = ctx->vertex_elements;
+   struct pipe_resource *saved_buffer = ctx->vertex_buffers[0];
+   const uint32_t saved_offset = ctx->vertex_buffer_offsets[0];
+   const unsigned saved_count = ctx->vertex_buffer_count;
+
+   ctx->vs = tes->passthrough;
+   ctx->vertex_elements = tes->passthrough_elements;
+   ctx->vertex_buffers[0] = ctx->tess_vertices;
+   ctx->vertex_buffer_offsets[0] = 0;
+   ctx->vertex_buffer_count = 1;
+   ctx->tcs = NULL;
+   ctx->tes = NULL;
+
+   struct pipe_draw_info raster = *info;
+   /* The topology is the tessellator's, not the application's: a patch draw
+    * rasterizes as whatever the domain and point mode produce. */
+   raster.mode = tes->point_mode ? MESA_PRIM_POINTS
+                 : tes->domain == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES
+                                                          : MESA_PRIM_TRIANGLES;
+   raster.index_size = 4;
+   raster.index.resource = ctx->tess_indices;
+   raster.has_user_indices = false;
+   raster.primitive_restart = false;
+   raster.index_bounds_valid = false;
+   struct pipe_draw_start_count_bias raster_draw;
+   memset(&raster_draw, 0, sizeof(raster_draw));
+   raster_draw.count = index_count;
+   if (getenv("GEX_WGPU_TESS_LOG"))
+      fprintf(stderr, "gex-wgpu: tess patches=%u verts_in=%u verts_out=%u "
+              "domain=%u spacing=%u ccw=%d points=%d -> %u vertices %u "
+              "indices mode=%u\n", patches, verts_in, tcs->vertices_out,
+              (unsigned)tes->domain, (unsigned)tes->spacing, (int)tes->ccw,
+              (int)tes->point_mode, vertex_count, index_count,
+              (unsigned)raster.mode);
+   gex_wgpu_draw_vbo(&ctx->base, &raster, drawid_offset, NULL, &raster_draw, 1);
+
+   ctx->tcs = tcs;
+   ctx->tes = tes;
+   ctx->vs = saved_vs;
+   ctx->vertex_elements = saved_elements;
+   ctx->vertex_buffers[0] = saved_buffer;
+   ctx->vertex_buffer_offsets[0] = saved_offset;
+   ctx->vertex_buffer_count = saved_count;
+   return !ctx->failed;
+#undef GEX_TESS_DECLINE
 }
 
 /* A vertex module whose output interpolation matches the bound fragment
@@ -18802,6 +20118,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
    }
 
+   /* Tessellation replaces this draw with five passes of its own, the last
+    * of which comes back through here with the passthrough shader bound.
+    * Before the geometry check, because a geometry shader *after*
+    * tessellation is a combination gex_wgpu_tess_draw declines by name
+    * rather than half-serving. */
+   if (ctx->tcs || ctx->tes) {
+      if (!gex_wgpu_tess_draw(ctx, info, drawid_offset, &draws[0]))
+         gex_fail(ctx);
+      return;
+   }
+
    /* A geometry shader replaces this draw with three passes of its own, the
     * last of which comes back through here with the passthrough shader
     * bound. */
@@ -21484,6 +22811,13 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    pipe_resource_reference(&ctx->gs_vs_out, NULL);
    pipe_resource_reference(&ctx->gs_vertices, NULL);
    pipe_resource_reference(&ctx->gs_indices, NULL);
+   pipe_resource_reference(&ctx->tess_vs_out, NULL);
+   pipe_resource_reference(&ctx->tess_tcs_out, NULL);
+   pipe_resource_reference(&ctx->tess_patch_out, NULL);
+   pipe_resource_reference(&ctx->tess_levels, NULL);
+   pipe_resource_reference(&ctx->tess_coords, NULL);
+   pipe_resource_reference(&ctx->tess_vertices, NULL);
+   pipe_resource_reference(&ctx->tess_indices, NULL);
    for (unsigned i = 0; i < GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS; ++i)
       pipe_resource_reference(&ctx->point_gathered[i], NULL);
    pipe_resource_reference(&ctx->line_vs_out, NULL);
@@ -21558,6 +22892,13 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.create_gs_state = gex_wgpu_create_gs_state;
    ctx->base.bind_gs_state = gex_wgpu_bind_gs_state;
    ctx->base.delete_gs_state = gex_wgpu_delete_gs_state;
+   ctx->base.create_tcs_state = gex_wgpu_create_tcs_state;
+   ctx->base.bind_tcs_state = gex_wgpu_bind_tcs_state;
+   ctx->base.delete_tcs_state = gex_wgpu_delete_tcs_state;
+   ctx->base.create_tes_state = gex_wgpu_create_tes_state;
+   ctx->base.bind_tes_state = gex_wgpu_bind_tes_state;
+   ctx->base.delete_tes_state = gex_wgpu_delete_tes_state;
+   ctx->base.set_patch_vertices = gex_wgpu_set_patch_vertices;
    ctx->base.delete_vs_state = gex_wgpu_delete_shader_state;
    ctx->base.create_fs_state = gex_wgpu_create_fs_state;
    ctx->base.bind_fs_state = gex_wgpu_bind_fs_state;
@@ -21824,6 +23165,23 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * st only builds float64.glsl when GLSLVersion >= 400, and
     * nir_lower_double_ops asserts on its absence -- so caps.doubles and this
     * have to move together. */
+   /* The tessellation levels reach the evaluation shader as *patch inputs*
+    * rather than as system values.
+    *
+    * This is not a preference. gl_nir_linker asserts on the combination of
+    * ARB_tessellation_shader, `compact_arrays` (which this driver's NIR
+    * options set) and this cap being false -- "the NIR linker doesn't support
+    * linking these as compat arrays of sysvals" -- and the assert fires
+    * during linking, so the first tessellated program aborts the process. It
+    * is also the shape this driver wants: a patch input is a variable with a
+    * location, which the lowering already addresses, where a system value
+    * would be an intrinsic with no buffer behind it. */
+   caps->glsl_tess_levels_as_inputs = true;
+   /* Per-patch varyings, in vec4s. st/mesa reports MaxTessPatchComponents as
+    * four times this and GL 4.0 requires 120, so thirty is the floor rather
+    * than a choice; a per-patch varying costs a slot in the patch buffer and
+    * nothing more. */
+   caps->max_shader_patch_varyings = 30;
    caps->glsl_feature_level = 400;
    caps->glsl_feature_level_compatibility = 400;
 
@@ -22175,6 +23533,16 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
    const mesa_shader_stage stages[] = { MESA_SHADER_VERTEX,
                                         MESA_SHADER_FRAGMENT,
                                         MESA_SHADER_GEOMETRY,
+                                        /* st_extensions turns
+                                         * ARB_tessellation_shader on from the
+                                         * control stage's max_instructions
+                                         * alone, so these two being here is
+                                         * the whole of the claim -- and GL 4.0
+                                         * is granted on the strength of it.
+                                         * They belong here only once the
+                                         * five-pass path below works. */
+                                        MESA_SHADER_TESS_CTRL,
+                                        MESA_SHADER_TESS_EVAL,
                                         MESA_SHADER_COMPUTE };
    for (unsigned i = 0; i < ARRAY_SIZE(stages); ++i) {
       struct pipe_shader_caps *caps =
