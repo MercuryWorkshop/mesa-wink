@@ -637,6 +637,10 @@ struct gex_wgpu_resource {
     * and no error anywhere. Tracking it is the only way to tell that apart
     * from a shader or blend problem. */
    bool texture_written;
+   /* Bumped whenever anything writes this texture. A sampler view that
+    * reinterprets the format keeps a copy of the bytes in another format and
+    * uses this to know when that copy is stale. */
+   uint64_t write_serial;
    /* Touched by a draw that is recorded but not yet submitted. */
    bool in_batch;
    /* A snapshot of this texture, taken when a draw both renders to it and
@@ -1537,6 +1541,23 @@ struct gex_wgpu_sampler_view {
    struct pipe_sampler_view base;
    WGPUTextureView view;
    WGPUTextureView array_view;
+   /* A view whose format is a different *class* from its texture's.
+    *
+    * WebGPU's viewFormats only span the sRGB pair, so there is no view across
+    * classes -- but a texture-to-buffer-to-texture copy is format-agnostic as
+    * long as the bytes per texel match, because a buffer is just bytes. So
+    * the bytes are copied into a scratch texture of the view's format and the
+    * shader samples that. This is what ARB_texture_view's format-class case
+    * asks for, and what Blender's viewport asks for (r16g16_float over an
+    * r32_float texture). */
+   WGPUTexture reinterpret;
+   WGPUBuffer reinterpret_staging;
+   uint64_t reinterpret_bytes;
+   uint32_t reinterpret_row_bytes;
+   uint32_t reinterpret_width;
+   uint32_t reinterpret_height;
+   /* The source's write_serial the copy was taken at; UINT64_MAX means never. */
+   uint64_t reinterpret_serial;
 };
 
 /* One occlusion query.
@@ -10125,6 +10146,7 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
       one_d_array ? (uint32_t)box->height : (uint32_t)box->depth,
    };
    gex_resource(resource)->texture_written = true;
+   gex_resource(resource)->write_serial++;
    wgpuQueueWriteTexture(gex_screen(pipe->screen)->queue, &destination,
                          upload, upload_size, &layout, &extent);
    FREE(converted);
@@ -10207,6 +10229,24 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
         * and the rest of the run is gone. */
        (util_format_linear(templ->format) !=
            util_format_linear(texture->format) &&
+        /* A different format *class* over the same bytes, which is what
+         * ARB_texture_view's format-class rule allows. WebGPU has no view
+         * across classes, so this is served by copying the bytes into a
+         * scratch texture of the view's format -- see the reinterpret fields
+         * on gex_wgpu_sampler_view. Restricted to a single level of a single
+         * layer of a 2D texture, which is what the cases that ask for it use;
+         * a wider view still refuses rather than serving part of itself. */
+        !(util_format_get_blocksize(templ->format) ==
+             util_format_get_blocksize(texture->format) &&
+          !util_format_is_depth_or_stencil(templ->format) &&
+          !util_format_is_depth_or_stencil(texture->format) &&
+          !util_format_is_compressed(templ->format) &&
+          !util_format_is_compressed(texture->format) &&
+          gex_wgpu_texture_format(templ->format) !=
+             WGPUTextureFormat_Undefined &&
+          templ->target == PIPE_TEXTURE_2D &&
+          templ->u.tex.first_level == templ->u.tex.last_level &&
+          templ->u.tex.first_layer == templ->u.tex.last_layer) &&
         /* A stencil-aspect view names a different format from its texture by
          * construction -- X24S8_UINT of a Z24_UNORM_S8_UINT texture -- so the
          * sRGB pairing rule above cannot be the only exception. It is still a
@@ -10311,8 +10351,63 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
    } else {
       desc.aspect = WGPUTextureAspect_All;
    }
-   view->view = wgpuTextureCreateView(gex_resource(texture)->texture, &desc);
+   /* A cross-class view samples a scratch texture holding the same bytes in
+    * the view's format; the guard above bounded this to one level of one
+    * layer of a 2D texture, so the scratch is a plain 2D texture and the view
+    * over it starts at level zero. */
+   WGPUTexture view_source = gex_resource(texture)->texture;
+   const bool reinterpreting =
+      util_format_linear(templ->format) != util_format_linear(texture->format) &&
+      !gex_wgpu_is_stencil_only_format(templ->format) &&
+      !util_format_is_depth_or_stencil(texture->format);
+   if (reinterpreting) {
+      const uint32_t width = u_minify(texture->width0, templ->u.tex.first_level);
+      const uint32_t height = u_minify(texture->height0, templ->u.tex.first_level);
+      const uint32_t texel = util_format_get_blocksize(templ->format);
+      WGPUTextureDescriptor scratch_desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+      scratch_desc.dimension = WGPUTextureDimension_2D;
+      scratch_desc.size = (WGPUExtent3D){width, height, 1};
+      scratch_desc.format = gex_wgpu_texture_format(templ->format);
+      scratch_desc.mipLevelCount = 1;
+      scratch_desc.sampleCount = 1;
+      scratch_desc.usage = WGPUTextureUsage_CopyDst |
+                           WGPUTextureUsage_TextureBinding;
+      view->reinterpret =
+         wgpuDeviceCreateTexture(gex_screen(pipe->screen)->device,
+                                 &scratch_desc);
+      /* copyTextureToBuffer wants a 256-byte row pitch. */
+      view->reinterpret_row_bytes = ALIGN_POT(width * texel, 256u);
+      view->reinterpret_bytes =
+         (uint64_t)view->reinterpret_row_bytes * height;
+      WGPUBufferDescriptor staging_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+      staging_desc.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+      staging_desc.size = view->reinterpret_bytes;
+      view->reinterpret_staging =
+         wgpuDeviceCreateBuffer(gex_screen(pipe->screen)->device,
+                                &staging_desc);
+      view->reinterpret_width = width;
+      view->reinterpret_height = height;
+      view->reinterpret_serial = UINT64_MAX;
+      if (!view->reinterpret || !view->reinterpret_staging) {
+         if (view->reinterpret) wgpuTextureRelease(view->reinterpret);
+         if (view->reinterpret_staging)
+            wgpuBufferRelease(view->reinterpret_staging);
+         GEX_SAMPLER_VIEW_REFUSED("reinterpreting scratch allocation");
+         FREE(view);
+         return NULL;
+      }
+      view_source = view->reinterpret;
+      desc.baseMipLevel = 0;
+      desc.mipLevelCount = 1;
+      desc.baseArrayLayer = 0;
+      desc.arrayLayerCount = 1;
+      desc.aspect = WGPUTextureAspect_All;
+   }
+   view->view = wgpuTextureCreateView(view_source, &desc);
    if (!view->view) {
+      if (view->reinterpret) wgpuTextureRelease(view->reinterpret);
+      if (view->reinterpret_staging)
+         wgpuBufferRelease(view->reinterpret_staging);
       FREE(view);
       return NULL;
    }
@@ -10364,6 +10459,10 @@ gex_wgpu_sampler_view_destroy(struct pipe_context *pipe,
       wgpuTextureViewRelease(view->view);
    if (view->array_view)
       wgpuTextureViewRelease(view->array_view);
+   if (view->reinterpret)
+      wgpuTextureRelease(view->reinterpret);
+   if (view->reinterpret_staging)
+      wgpuBufferRelease(view->reinterpret_staging);
    FREE(view);
 }
 
@@ -13756,6 +13855,69 @@ gex_wgpu_texture_barrier(struct pipe_context *pipe, unsigned flags)
    (void)flags;
 }
 
+/* Bring a cross-class sampler view's bytes up to date.
+ *
+ * WebGPU's viewFormats span only the sRGB pair, so a view whose format is a
+ * different *class* from its texture's cannot exist. A copy can: a
+ * texture-to-buffer-to-texture round trip moves bytes without caring what
+ * either side calls them, as long as the bytes per texel match -- a buffer is
+ * just bytes. So the source's texels are copied into a scratch texture
+ * declared with the view's format, and the shader samples that.
+ *
+ * Refreshed when the source's write_serial moves, not on every draw: a view
+ * of a texture nothing has written since the last copy is already correct.
+ * The copy is still a real cost when the source *is* being written every
+ * frame, which is why the guard in create_sampler_view keeps this to one
+ * level of one layer.
+ *
+ * This is what gl44-texture-view-probe's format-class case asks for -- the
+ * one case in the suite this driver used to fail -- and what Blender's
+ * viewport asks for with r16g16_float over an r32_float texture. */
+static void
+gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
+                              struct gex_wgpu_sampler_view *view)
+{
+   if (!view || !view->reinterpret || !view->base.texture)
+      return;
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   struct gex_wgpu_resource *source = gex_resource(view->base.texture);
+   if (!source->texture || view->reinterpret_serial == source->write_serial)
+      return;
+   /* The source's writes have to reach the queue before they are copied. */
+   gex_wgpu_submit_pending(ctx);
+   struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
+   WGPUCommandEncoder encoder =
+      wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+   if (!encoder)
+      return;
+   WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+   from.texture = source->texture;
+   from.mipLevel = view->base.u.tex.first_level;
+   from.origin = (WGPUOrigin3D){0, 0, view->base.u.tex.first_layer};
+   from.aspect = WGPUTextureAspect_All;
+   WGPUTexelCopyBufferInfo staging = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+   staging.buffer = view->reinterpret_staging;
+   staging.layout.offset = 0;
+   staging.layout.bytesPerRow = view->reinterpret_row_bytes;
+   staging.layout.rowsPerImage = view->reinterpret_height;
+   const WGPUExtent3D extent = {view->reinterpret_width,
+                                view->reinterpret_height, 1};
+   wgpuCommandEncoderCopyTextureToBuffer(encoder, &from, &staging, &extent);
+   WGPUTexelCopyTextureInfo into = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+   into.texture = view->reinterpret;
+   into.mipLevel = 0;
+   into.origin = (WGPUOrigin3D){0, 0, 0};
+   into.aspect = WGPUTextureAspect_All;
+   wgpuCommandEncoderCopyBufferToTexture(encoder, &staging, &into, &extent);
+   WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
+   wgpuCommandEncoderRelease(encoder);
+   if (!commands)
+      return;
+   gex_wgpu_queue_submit(screen, 1, &commands);
+   wgpuCommandBufferRelease(commands);
+   view->reinterpret_serial = source->write_serial;
+}
+
 static void
 gex_wgpu_render_condition(struct pipe_context *pipe, struct pipe_query *query,
                           bool condition, enum pipe_render_cond_flag mode)
@@ -13959,6 +14121,7 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
     * "samples a texture nothing ever wrote" while the copy was in fact
     * happening. */
    gex_resource(dst)->texture_written = true;
+   gex_resource(dst)->write_serial++;
 #define GEX_COPY_DONE(result)                                                 \
    do {                                                                       \
       if (scratch)                                                            \
@@ -14964,6 +15127,7 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
             /* Attached as a render target, so from here on it has contents
              * whether or not anything uploaded to it. */
             gex_resource(surface->texture)->texture_written = true;
+            gex_resource(surface->texture)->write_serial++;
          }
          /* WebGPU bounds the attachments' combined bytes per sample. Exceeding
           * it is a validation error at pipeline creation, which poisons the
@@ -15024,6 +15188,7 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
        * as "nothing ever wrote it" made the unwritten-texture warning report
        * every shadow lookup in the scene. */
       gex_resource(depth)->texture_written = true;
+      gex_resource(depth)->write_serial++;
    } else if (state && state->zsbuf.texture) {
       gex_fail(ctx);
    }
@@ -21539,6 +21704,26 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
     * rewrite paths split into several is skipped as one. */
    if (ctx->draw_depth == 0 && !gex_wgpu_render_cond_passes(ctx))
       return;
+
+   /* Cross-class sampler views sample a copy of their source's bytes, and the
+    * copy is brought up to date here -- before anything is recorded, not
+    * where the bind group is built.
+    *
+    * The refresh submits whatever is pending, because the source's writes
+    * have to reach the queue before they can be copied, and doing that in the
+    * middle of building a pass releases the encoder the draw is recording on:
+    * Dawn then faults inside ValidateCanEncodeOn at BeginRenderPass. Nothing
+    * is recorded yet at the outermost entry, so it is safe here. The serial
+    * check inside makes it free for a source nothing has written. */
+   if (ctx->draw_depth == 0) {
+      for (unsigned i = 0; i < GEX_WGPU_MAX_SAMPLERS; ++i) {
+         gex_wgpu_sampler_view_refresh(
+            pipe, (struct gex_wgpu_sampler_view *)ctx->sampler_views[i]);
+         gex_wgpu_sampler_view_refresh(
+            pipe,
+            (struct gex_wgpu_sampler_view *)ctx->vertex_sampler_views[i]);
+      }
+   }
 
    /* Bisection over a frame's draws; see gex_wgpu_frame_draw. Counted only at
     * the outermost level, so a draw split into several by the restart or
