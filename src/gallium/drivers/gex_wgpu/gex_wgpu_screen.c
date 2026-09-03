@@ -71,6 +71,41 @@ extern void gex_wgpu_jspi_signal(void);
 #define GEX_WGPU_MAX_SHADER_IMAGES 8
 #define GEX_WGPU_IMAGE_FIRST_BINDING \
    (GEX_WGPU_SSBO_FIRST_BINDING + GEX_WGPU_MAX_SHADER_BUFFERS)
+/* Texture buffers -- GL's `samplerBuffer`, core since GL 3.1. WebGPU has no
+ * texel buffer, so each one is bound as a read-only storage buffer and
+ * texelFetch becomes word loads; see gex_wgpu_lower_buffer_texture. */
+#define GEX_WGPU_MAX_BUFFER_TEXTURES 4
+#define GEX_WGPU_BUFTEX_FIRST_BINDING \
+   (GEX_WGPU_IMAGE_FIRST_BINDING + GEX_WGPU_MAX_SHADER_IMAGES)
+
+/* How many 32-bit words a texel of a buffer-texture format occupies, or 0 for
+ * a format this driver cannot serve as one.
+ *
+ * Only the 32-bit-per-channel formats: a texel is then a run of words and the
+ * fetch is a load plus a bitcast, with no packing to undo. The 8- and 16-bit
+ * formats GL also allows would each need their own unpack, and answering for
+ * them here without writing it would claim a format that reads as rubbish --
+ * is_format_supported is asked per format, so refusing them is visible to
+ * st/mesa rather than silent. */
+static unsigned
+gex_wgpu_buffer_texture_words(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R32_FLOAT:
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R32_UINT:            return 1;
+   case PIPE_FORMAT_R32G32_FLOAT:
+   case PIPE_FORMAT_R32G32_SINT:
+   case PIPE_FORMAT_R32G32_UINT:         return 2;
+   case PIPE_FORMAT_R32G32B32_FLOAT:
+   case PIPE_FORMAT_R32G32B32_SINT:
+   case PIPE_FORMAT_R32G32B32_UINT:      return 3;
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_UINT:   return 4;
+   default:                              return 0;
+   }
+}
 /* Two different limits, deliberately.
  *
  * GEX_WGPU_MAX_VERTEX_BUFFERS is a WebGPU limit: how many vertex buffers one
@@ -840,6 +875,16 @@ struct gex_wgpu_shader {
     * ReadOnlyStorage. Getting this backwards is not an error anyone sees --
     * the bind group simply fails to build and the draw reads zeros. */
    uint32_t ssbo_readonly_mask;
+   /* GL's samplerBuffer. Each one is bound as a read-only storage buffer and
+    * its texelFetch lowered to word loads, because WebGPU has no texel
+    * buffer. The texel's *word count* comes from the bound sampler view
+    * rather than from the shader -- a samplerBuffer yields a vec4 whatever
+    * the format is -- so it is part of the per-draw variant key rather than
+    * of the shader. */
+   unsigned buftex_count;
+   uint8_t buftex_slots[GEX_WGPU_MAX_BUFFER_TEXTURES];
+   uint32_t buftex_bindings[GEX_WGPU_MAX_BUFFER_TEXTURES];
+   nir_alu_type buftex_types[GEX_WGPU_MAX_BUFFER_TEXTURES];
    /* Application shader images -- GL's image load/store, WebGPU's storage
     * textures. The format and the access are part of the *type* in WGSL, so
     * both have to be carried from the shader to the bind group layout or the
@@ -946,6 +991,9 @@ struct gex_wgpu_interp_variant {
     * both points and triangles through one shader -- which `spriteblast`
     * does -- would otherwise recompile on every mode change. */
    struct gex_wgpu_wide_point wide;
+   /* Texel word counts of the bound buffer textures this module's texelFetch
+    * lowering was built against; see gex_wgpu_lower_buffer_texture. */
+   uint8_t buftex_words[GEX_WGPU_MAX_BUFFER_TEXTURES];
    uint64_t mask;
    /* Scale and translate folded into gl_Position for a viewport WebGPU
     * cannot set. All zero when the viewport fits and nothing is folded. */
@@ -978,6 +1026,10 @@ struct gex_wgpu_shader_variant {
    /* Whether this variant discards the corners of the point, for
     * GL_POINT_SMOOTH. */
    bool point_smooth;
+   /* Texel word counts of the bound buffer textures this variant's texelFetch
+    * lowering was built against. The format is on the sampler view, not in
+    * the shader, so it is state and belongs in the key. */
+   uint8_t buftex_words[GEX_WGPU_MAX_BUFFER_TEXTURES];
    /* The varying this variant reads a line's coverage and distance from, or
     * ~0u, and the stipple pattern it baked in. */
    unsigned line_edge_location;
@@ -1367,6 +1419,178 @@ gex_wgpu_lower_ubo_load(nir_builder *b, nir_instr *instr, void *data)
       b, loaded, BITFIELD_RANGE(first_component, intr->def.num_components));
    nir_def_rewrite_uses(&intr->def, replacement);
    nir_instr_remove(instr);
+   return true;
+}
+
+/* GL's `samplerBuffer`, lowered to loads from a read-only storage buffer.
+ *
+ * WebGPU has no texel buffer of any kind, so a texture buffer is bound as a
+ * storage buffer and `texelFetch(buf, i)` becomes a run of word loads. Only
+ * the 32-bit-per-channel formats are served (see
+ * gex_wgpu_buffer_texture_words), which makes a texel a run of words and the
+ * fetch a load plus a reinterpretation -- NIR values are untyped bit
+ * patterns, so nothing has to be converted, only the *padding* differs
+ * between a float and an integer sampler.
+ *
+ * The word count per texel comes from the bound sampler view, not from the
+ * shader: a `samplerBuffer` yields a vec4 whatever the format holds. That is
+ * why this runs in the per-draw variant builders rather than at shader
+ * creation, and why the counts are part of both stages' variant keys.
+ */
+/* Defined below with the capture passes; declared here because the buffer
+ * texture lowering is the first thing that needs one. */
+static nir_variable *gex_wgpu_word_block(nir_shader *nir, const char *name,
+                                         unsigned binding,
+                                         unsigned driver_location,
+                                         bool read_only);
+
+struct gex_wgpu_buftex_lowering {
+   const uint8_t *words;                                  /* per slot */
+   nir_variable *block[GEX_WGPU_MAX_BUFFER_TEXTURES];
+   bool failed;
+   char why[176];
+};
+
+static bool
+gex_wgpu_lower_buffer_texture(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_BUF)
+      return false;
+   struct gex_wgpu_buftex_lowering *state = data;
+   const unsigned slot = tex->texture_index;
+   if (slot >= GEX_WGPU_MAX_BUFFER_TEXTURES || !state->block[slot] ||
+       !state->words[slot]) {
+      state->failed = true;
+      if (!state->why[0])
+         snprintf(state->why, sizeof(state->why),
+                  "texture buffer slot %u has no buffer bound", slot);
+      return false;
+   }
+   /* texelFetch only. textureSize on a buffer would need the binding's
+    * length, which means arrayLength() on the runtime array -- a different
+    * opcode and a different claim, so it is refused by name rather than
+    * answered with a guess. */
+   if (tex->op != nir_texop_txf) {
+      state->failed = true;
+      if (!state->why[0])
+         snprintf(state->why, sizeof(state->why),
+                  "texture buffer operation %u is not texelFetch",
+                  (unsigned)tex->op);
+      return false;
+   }
+   const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_src < 0) {
+      state->failed = true;
+      if (!state->why[0])
+         snprintf(state->why, sizeof(state->why),
+                  "texture buffer fetch has no coordinate");
+      return false;
+   }
+
+   const unsigned n = state->words[slot];
+   b->cursor = nir_before_instr(instr);
+   nir_def *base = nir_imul_imm(b, tex->src[coord_src].src.ssa, n);
+   nir_deref_instr *words =
+      nir_build_deref_struct(b, nir_build_deref_var(b, state->block[slot]), 0);
+   const bool floating =
+      nir_alu_type_get_base_type(tex->def.bit_size == 32 ? tex->dest_type
+                                                         : tex->dest_type) ==
+      nir_type_float;
+   nir_def *comp[4];
+   for (unsigned k = 0; k < 4; ++k) {
+      if (k < n) {
+         comp[k] = nir_load_deref(
+            b, nir_build_deref_array(b, words, nir_iadd_imm(b, base, k)));
+      } else {
+         /* GL fills the components a format does not carry with (0,0,0,1) --
+          * as floats for a float sampler and as integers otherwise. */
+         comp[k] = floating
+            ? nir_imm_float(b, k == 3 ? 1.0f : 0.0f)
+            : nir_imm_int(b, k == 3 ? 1 : 0);
+      }
+   }
+   nir_def *result = nir_vec(b, comp, 4);
+   if (tex->def.num_components < 4)
+      result = nir_trim_vector(b, result, tex->def.num_components);
+   nir_def_rewrite_uses(&tex->def, result);
+   nir_instr_remove(instr);
+   return true;
+}
+
+/* The texel word count of each bound buffer texture, which is what both
+ * stages' variant keys carry: the format lives on the sampler view, and a
+ * samplerBuffer yields a vec4 whatever it is. */
+static void
+gex_wgpu_buftex_words(const struct gex_wgpu_shader *shader,
+                      struct pipe_sampler_view *const *views,
+                      uint8_t words[GEX_WGPU_MAX_BUFFER_TEXTURES])
+{
+   memset(words, 0, GEX_WGPU_MAX_BUFFER_TEXTURES);
+   if (!shader || !views)
+      return;
+   for (unsigned i = 0; i < shader->buftex_count; ++i) {
+      const unsigned slot = shader->buftex_slots[i];
+      const struct pipe_sampler_view *view = views[slot];
+      if (view && view->target == PIPE_BUFFER)
+         words[slot] = (uint8_t)gex_wgpu_buffer_texture_words(view->format);
+   }
+}
+
+/* Declare a read-only storage block for every buffer texture the shader uses,
+ * run the lowering, and drop the sampler variables it replaced. Shared by
+ * both stages' variant builders. */
+static bool
+gex_wgpu_apply_buffer_textures(nir_shader *nir,
+                               const struct gex_wgpu_shader *shader,
+                               enum mesa_shader_stage stage,
+                               const uint8_t *words, char *why,
+                               size_t why_len)
+{
+   if (!shader->buftex_count)
+      return true;
+   struct gex_wgpu_buftex_lowering state = {0};
+   state.words = words;
+   for (unsigned i = 0; i < shader->buftex_count; ++i) {
+      const unsigned slot = shader->buftex_slots[i];
+      char name[32];
+      snprintf(name, sizeof(name), "gex_buftex%u", slot);
+      nir_variable *block =
+         gex_wgpu_word_block(nir, name, shader->buftex_bindings[i], 0, true);
+      if (!block)
+         return false;
+      block->data.descriptor_set = stage == MESA_SHADER_VERTEX ? 1 : 2;
+      state.block[slot] = block;
+   }
+   nir_shader_instructions_pass(nir, gex_wgpu_lower_buffer_texture,
+                                nir_metadata_control_flow, &state);
+   if (state.failed) {
+      if (why) snprintf(why, why_len, "%s", state.why);
+      return false;
+   }
+   /* Dead code first. Removing the tex instruction leaves its
+    * `deref_var` behind as a separate orphaned instruction, and dropping the
+    * variable then leaves that deref pointing at nothing -- which NIR
+    * validation catches as
+    *
+    *   deref_var &gex_texture0 (uniform textureBuffer) error: entry
+    *
+    * inside ntv, after its own copy-prop. One case survived only because DCE
+    * happened to run first. */
+   NIR_PASS(_, nir, nir_opt_dce);
+   /* The sampler variables are unreferenced now; leaving them declared would
+    * have the emitter describe a texture binding the layout does not
+    * provide -- and a samplerBuffer reaches SPIR-V as dimension Buffer,
+    * which Tint refuses outright. */
+   nir_foreach_variable_with_modes_safe(var, nir, nir_var_uniform) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      if (glsl_type_is_texture(type) &&
+          glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_BUF)
+         exec_node_remove(&var->node);
+   }
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    return true;
 }
 
@@ -5152,6 +5376,40 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       if (glsl_type_is_texture(type)) {
          const unsigned slot = var->data.driver_location;
          const enum glsl_sampler_dim dim = glsl_get_sampler_dim(type);
+         /* A texture buffer is not a texture as far as WebGPU is concerned:
+          * it becomes a read-only storage buffer, so it is recorded here and
+          * kept out of the texture table entirely. Falling through used to
+          * reach the view-dimension switch below, come out Undefined, and
+          * reject the whole shader -- which is why a samplerBuffer failed to
+          * link on a driver claiming GL 3.3, where they are core. */
+         if (dim == GLSL_SAMPLER_DIM_BUF) {
+            bool seen = false;
+            for (unsigned i = 0; i < shader->buftex_count; ++i)
+               seen |= shader->buftex_slots[i] == slot;
+            if (seen)
+               continue;
+            if (shader->buftex_count >= GEX_WGPU_MAX_BUFFER_TEXTURES ||
+                slot >= GEX_WGPU_MAX_BUFFER_TEXTURES) {
+               char detail[144];
+               snprintf(detail, sizeof(detail),
+                        "gex_wgpu texture buffer rejected: slot=%u count=%u "
+                        "max=%u", slot, shader->buftex_count,
+                        (unsigned)GEX_WGPU_MAX_BUFFER_TEXTURES);
+               ralloc_free(nir);
+               FREE(shader);
+               gex_wgpu_set_compile_error(mutable_state, detail);
+               return NULL;
+            }
+            const unsigned at = shader->buftex_count;
+            shader->buftex_slots[at] = (uint8_t)slot;
+            shader->buftex_bindings[at] =
+               GEX_WGPU_BUFTEX_FIRST_BINDING + slot;
+            shader->buftex_types[at] =
+               nir_get_nir_type_for_glsl_base_type(
+                  glsl_get_sampler_result_type(type));
+            ++shader->buftex_count;
+            continue;
+         }
          const bool is_array = glsl_sampler_type_is_array(type);
          const bool multisampled = dim == GLSL_SAMPLER_DIM_MS;
          const WGPUTextureViewDimension view_dimension =
@@ -5451,7 +5709,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       return NULL;
    }
    nir_shader *flipped = (expected_stage == MESA_SHADER_VERTEX &&
-                          !shader->integer_sampled_slots)
+                          !shader->integer_sampled_slots &&
+                          !shader->buftex_count)
       ? nir_shader_clone(NULL, nir) : NULL;
    char *error = NULL;
    /* Integer sampling has to be lowered against the sampler state, which is
@@ -5460,7 +5719,17 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * vertex stage used to compile eagerly and have Tint refuse the result --
     * "sampled image must have float component type" -- which reached the
     * application as a link error and failed 13 texture_swizzle cases. */
-   const bool deferred_integer_sampling = shader->integer_sampled_slots != 0 &&
+   /* A buffer texture is deferred for the same reason and one step more
+    * firmly: its texelFetch is lowered against the bound view's *format*,
+    * which is not known here either -- and compiling eagerly does not merely
+    * produce a wrong module, it produces one Tint refuses outright, since a
+    * samplerBuffer reaches SPIR-V as an image of dimension Buffer:
+    *
+    *   Tint rejected SPIR-V: error: invalid dimension: 5
+    *
+    * which arrives at the application as a link error. */
+   const bool deferred_integer_sampling =
+      (shader->integer_sampled_slots != 0 || shader->buftex_count != 0) &&
       (expected_stage == MESA_SHADER_FRAGMENT ||
        expected_stage == MESA_SHADER_VERTEX);
    if (deferred_integer_sampling)
@@ -5719,9 +5988,14 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
     * every other point case already right, which is a good reminder that
     * "the variant is built" and "the variant is reached" are separate
     * claims. */
+   /* A buffer texture always needs a variant: its texelFetch is lowered here
+    * against the bound view's format, so the base module would carry a
+    * texture binding the layout does not provide. */
+   uint8_t want_buftex[GEX_WGPU_MAX_BUFFER_TEXTURES];
+   gex_wgpu_buftex_words(fs, ctx->sampler_views, want_buftex);
    if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
-       line_edge_location == ~0u)
+       line_edge_location == ~0u && !fs->buftex_count)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -5825,11 +6099,13 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u;
-   if (!needs_variant)
+   if (!needs_variant && !fs->buftex_count)
       return fs->module;
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
         cached; cached = cached->next) {
       bool match = cached->sampler_mask == sampler_mask &&
+                   memcmp(cached->buftex_words, want_buftex,
+                          sizeof(cached->buftex_words)) == 0 &&
                    cached->color_output_type == wanted_output &&
                    cached->coord_replace == coord_replace &&
                    cached->point_coord_location == point_coord_location &&
@@ -5925,6 +6201,15 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       gex_fail(ctx);
       return NULL;
    }
+   {
+      char why[176] = {0};
+      if (!gex_wgpu_apply_buffer_textures(variant, fs, MESA_SHADER_FRAGMENT,
+                                          want_buftex, why, sizeof(why))) {
+         GEX_FS_DECLINE(why[0] ? why : "texture buffer lowering");
+         ralloc_free(variant);
+         return NULL;
+      }
+   }
    char *error = NULL;
    WGPUShaderModule module = gex_wgpu_compile_nir(
       &ctx->base, variant, MESA_SHADER_FRAGMENT, false, &error);
@@ -5944,6 +6229,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       return NULL;
    }
    cached->module = module;
+   memcpy(cached->buftex_words, want_buftex, sizeof(cached->buftex_words));
    cached->sampler_mask = sampler_mask;
    cached->color_output_type = wanted_output;
    cached->coord_replace = coord_replace;
@@ -7743,7 +8029,10 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
                                 * caps->draw_vertex_state says so, and this
                                 * driver leaves that false, so the buffer is
                                 * an ordinary vertex and index buffer. */
-                               PIPE_BIND_VERTEX_STATE;
+                               PIPE_BIND_VERTEX_STATE |
+                               /* glTexBuffer: a sampler view of a buffer,
+                                * narrowed to the decodable formats above. */
+                               PIPE_BIND_SAMPLER_VIEW;
       if (sample_count > 1 || storage_sample_count > 1 || (bind & ~allowed))
          return false;
       /* A vertex format is the one buffer question with a real answer, and
@@ -7757,6 +8046,11 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
        * WebGPU has no form of (it has only the unsigned one), and lost its
        * renderer to exactly that. Answering honestly hands the format to
        * u_vbuf, which converts it to something expressible. */
+      /* A texture buffer, which is asked about per format: only the ones
+       * gex_wgpu_buffer_texture_words can decode are claimed. */
+      if ((bind & PIPE_BIND_SAMPLER_VIEW) &&
+          gex_wgpu_buffer_texture_words(format) == 0)
+         return false;
       if (bind == PIPE_BIND_VERTEX_BUFFER && format != PIPE_FORMAT_NONE) {
          unsigned vertex_size, vertex_alignment;
          if (!gex_wgpu_vertex_format(format, &vertex_size, &vertex_alignment))
@@ -8707,6 +9001,29 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
       }                                                                        \
    } while (0)
 
+   /* A texture buffer, which is not a texture here at all: it is bound as a
+    * read-only storage buffer and its texelFetch lowered to word loads. It
+    * has to leave before the guards below, which read `templ->u.tex` -- and
+    * for a buffer view that union member holds the offset and size instead,
+    * so a level range read out of it is nonsense. */
+   if (texture && texture->target == PIPE_BUFFER) {
+      if (gex_wgpu_buffer_texture_words(templ->format) == 0) {
+         GEX_SAMPLER_VIEW_REFUSED("texture buffer format needs unpacking");
+         return NULL;
+      }
+      struct gex_wgpu_sampler_view *buffer_view =
+         CALLOC_STRUCT(gex_wgpu_sampler_view);
+      if (!buffer_view)
+         return NULL;
+      buffer_view->base = *templ;
+      buffer_view->base.reference.count = 1;
+      buffer_view->base.texture = NULL;
+      pipe_resource_reference(&buffer_view->base.texture, texture);
+      buffer_view->base.context = pipe;
+      /* No WGPUTextureView: the bind path recognises a PIPE_BUFFER view and
+       * binds the buffer itself. */
+      return &buffer_view->base;
+   }
    if (!texture ||
       (texture->target != PIPE_TEXTURE_1D &&
         texture->target != PIPE_TEXTURE_1D_ARRAY &&
@@ -15613,6 +15930,10 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    const struct gex_wgpu_wide_point *want_wide = wide ? wide : &no_wide;
    const struct gex_wgpu_vertex_elements *ve = ctx->vertex_elements;
    const bool unpack_attribs = ve && ve->any_unpack;
+   /* A shader with a buffer texture has no base module either: the fetch is
+    * lowered here against the bound view's format, so `plain` would carry a
+    * texture binding the layout does not provide. */
+   const bool has_buftex = vs->buftex_count != 0;
    const uint8_t *want_unpack = unpack_attribs ? ve->unpack : no_unpack;
    /* A vertex shader that samples an integer texture has no base module: its
     * sampling is lowered here against the bound sampler state, the way the
@@ -15670,8 +15991,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    if (!lower_textures)
       sampler_mask = 0;
    if ((!fs && !fold_viewport && !unpack_attribs && !lower_textures &&
-        !wide) || !vs->original_nir)
-      return fold_viewport || unpack_attribs || lower_textures || wide
+        !wide && !has_buftex) || !vs->original_nir)
+      return fold_viewport || unpack_attribs || lower_textures || wide ||
+             has_buftex
          ? NULL : plain;
 
    const uint64_t fs_mask = fs ? fs->varying_interp_mask : 0;
@@ -15683,16 +16005,20 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
            vs->varying_components[i] != fs->varying_components[i]))
          differs = true;
    if (!differs && !fold_viewport && !unpack_attribs && !lower_textures &&
-       !wide)
+       !wide && !has_buftex)
       return plain;
 
    const float none[4] = {0.0f, 0.0f, 0.0f, 0.0f};
    const float *want = fold_viewport ? viewport : none;
    const uint8_t *want_interp = fs ? fs->varying_interp : NULL;
    const uint8_t *want_components = fs ? fs->varying_components : NULL;
+   uint8_t want_buftex[GEX_WGPU_MAX_BUFFER_TEXTURES];
+   gex_wgpu_buftex_words(vs, ctx->vertex_sampler_views, want_buftex);
    for (struct gex_wgpu_interp_variant *v = vs->interp_variants; v;
         v = v->next) {
       bool match = v->mask == fs_mask && v->sampler_mask == sampler_mask &&
+                   memcmp(v->buftex_words, want_buftex,
+                          sizeof(v->buftex_words)) == 0 &&
                    memcmp(&v->wide, want_wide, sizeof(v->wide)) == 0 &&
                    memcmp(v->viewport, want, sizeof(v->viewport)) == 0 &&
                    memcmp(v->attrib_unpack, want_unpack,
@@ -15729,9 +16055,11 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    struct gex_wgpu_interp_variant *variant =
       CALLOC_STRUCT(gex_wgpu_interp_variant);
    if (!variant)
-      return fold_viewport || unpack_attribs || wide ? NULL : plain;
+      return fold_viewport || unpack_attribs || wide || has_buftex
+                ? NULL : plain;
    variant->mask = fs_mask;
    variant->wide = *want_wide;
+   memcpy(variant->buftex_words, want_buftex, sizeof(variant->buftex_words));
    memcpy(variant->viewport, want, sizeof(variant->viewport));
    memcpy(variant->attrib_unpack, want_unpack,
           sizeof(variant->attrib_unpack));
@@ -15810,6 +16138,11 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
          ralloc_free(clone);
          break;
       }
+      if (!gex_wgpu_apply_buffer_textures(clone, vs, MESA_SHADER_VERTEX,
+                                          want_buftex, NULL, 0)) {
+         ralloc_free(clone);
+         break;
+      }
       char *error = NULL;
       WGPUShaderModule module = gex_wgpu_compile_nir(
          &ctx->base, clone, MESA_SHADER_VERTEX, pass == 1, &error);
@@ -15832,7 +16165,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
                          "(interpolation, viewport, attribute unpack or "
                          "integer sampling)\n");
       }
-      return fold_viewport || unpack_attribs || lower_textures || wide
+      return fold_viewport || unpack_attribs || lower_textures || wide ||
+             has_buftex
          ? NULL : plain;
    }
    variant->next = vs->interp_variants;
@@ -19518,9 +19852,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * blocks -- they were given the stage's descriptor set -- so a stage with
     * storage blocks and no uniform blocks still needs the group. */
    const unsigned vertex_group_count =
-      ctx->vs->ubo_count + ctx->vs->ssbo_count;
+      ctx->vs->ubo_count + ctx->vs->ssbo_count + ctx->vs->buftex_count;
    const unsigned fragment_group_count =
-      ctx->fs->ubo_count + ctx->fs->ssbo_count + ctx->fs->image_count;
+      ctx->fs->ubo_count + ctx->fs->ssbo_count + ctx->fs->image_count +
+      ctx->fs->buftex_count;
    const bool needs_vertex_constant = vertex_group_count != 0;
    const bool needs_fragment_constant = fragment_group_count != 0;
    const bool needs_texture = ctx->fs->texture_count != 0;
@@ -19863,11 +20198,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    WGPUBindGroupLayoutEntry
       vertex_layout_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
                             GEX_WGPU_MAX_SO_BUFFERS +
-                            GEX_WGPU_MAX_SHADER_BUFFERS];
+                            GEX_WGPU_MAX_SHADER_BUFFERS +
+                            GEX_WGPU_MAX_BUFFER_TEXTURES];
    WGPUBindGroupLayoutEntry
       fragment_layout_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
                               GEX_WGPU_MAX_SHADER_BUFFERS +
-                              GEX_WGPU_MAX_SHADER_IMAGES];
+                              GEX_WGPU_MAX_SHADER_IMAGES +
+                              GEX_WGPU_MAX_BUFFER_TEXTURES];
    if (needs_texture) {
       for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
          texture_layout_entries[i] =
@@ -19948,6 +20285,18 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          gex_fail(ctx);
          return;
       }
+      vertex_layout_entries[at].buffer.type =
+         WGPUBufferBindingType_ReadOnlyStorage;
+      vertex_layout_entries[at].buffer.hasDynamicOffset = false;
+   }
+   /* Buffer textures, one read-only storage binding each: WebGPU has no texel
+    * buffer, so this is what a samplerBuffer actually is here. */
+   for (unsigned i = 0; i < ctx->vs->buftex_count; ++i) {
+      const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count + i;
+      vertex_layout_entries[at] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      vertex_layout_entries[at].binding = ctx->vs->buftex_bindings[i];
+      vertex_layout_entries[at].visibility = WGPUShaderStage_Vertex;
       vertex_layout_entries[at].buffer.type =
          WGPUBufferBindingType_ReadOnlyStorage;
       vertex_layout_entries[at].buffer.hasDynamicOffset = false;
@@ -20052,6 +20401,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          fragment_layout_entries[at].storageTexture.viewDimension =
             ctx->fs->image_dimensions[i];
       }
+   }
+   for (unsigned i = 0; i < ctx->fs->buftex_count; ++i) {
+      const unsigned at = ctx->fs->ubo_count + ctx->fs->ssbo_count +
+                          ctx->fs->image_count + i;
+      fragment_layout_entries[at] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      fragment_layout_entries[at].binding = ctx->fs->buftex_bindings[i];
+      fragment_layout_entries[at].visibility = WGPUShaderStage_Fragment;
+      fragment_layout_entries[at].buffer.type =
+         WGPUBufferBindingType_ReadOnlyStorage;
+      fragment_layout_entries[at].buffer.hasDynamicOffset = false;
    }
    const unsigned group_count = needs_vertex_texture ? 4
       : needs_fragment_constant ? 3
@@ -20289,7 +20649,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * are written by the vertex stage and so live in this group. */
       WGPUBindGroupEntry
          entries[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SO_BUFFERS +
-                 GEX_WGPU_MAX_SHADER_BUFFERS];
+                 GEX_WGPU_MAX_SHADER_BUFFERS +
+                 GEX_WGPU_MAX_BUFFER_TEXTURES];
       for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
          const unsigned slot = ctx->vs->ubo_slots[i];
          const struct pipe_constant_buffer *constant =
@@ -20330,6 +20691,29 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[at].offset = sb->buffer_offset;
          entries[at].size = sb->buffer_size;
       }
+      /* Buffer textures: the sampler view holds a buffer, not a texture, so
+       * the binding is the buffer itself over the view's range. */
+      for (unsigned i = 0; i < ctx->vs->buftex_count; ++i) {
+         const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count + i;
+         const unsigned slot = ctx->vs->buftex_slots[i];
+         const struct pipe_sampler_view *view =
+            ctx->vertex_sampler_views[slot];
+         if (!view || view->target != PIPE_BUFFER || !view->texture) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: vertex texture buffer %u has no "
+                       "buffer bound\n", slot);
+            }
+            gex_fail(ctx);
+            return;
+         }
+         entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[at].binding = ctx->vs->buftex_bindings[i];
+         entries[at].buffer = gex_resource(view->texture)->buffer;
+         entries[at].offset = view->u.buf.offset;
+         entries[at].size = view->u.buf.size;
+      }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[1];
       bind_desc.entryCount = vertex_group_count;
@@ -20341,7 +20725,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (pipeline && needs_fragment_constant) {
       WGPUBindGroupEntry entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
                                  GEX_WGPU_MAX_SHADER_BUFFERS +
-                                 GEX_WGPU_MAX_SHADER_IMAGES];
+                                 GEX_WGPU_MAX_SHADER_IMAGES +
+                                 GEX_WGPU_MAX_BUFFER_TEXTURES];
       for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
          const unsigned slot = ctx->fs->ubo_slots[i];
          const struct pipe_constant_buffer *constant =
@@ -20417,6 +20802,27 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = ctx->fs->image_bindings[i];
          entries[at].textureView = view;
+      }
+      for (unsigned i = 0; i < ctx->fs->buftex_count; ++i) {
+         const unsigned at = ctx->fs->ubo_count + ctx->fs->ssbo_count +
+                             ctx->fs->image_count + i;
+         const unsigned slot = ctx->fs->buftex_slots[i];
+         const struct pipe_sampler_view *view = ctx->sampler_views[slot];
+         if (!view || view->target != PIPE_BUFFER || !view->texture) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: fragment texture buffer %u has no "
+                       "buffer bound\n", slot);
+            }
+            gex_fail(ctx);
+            return;
+         }
+         entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[at].binding = ctx->fs->buftex_bindings[i];
+         entries[at].buffer = gex_resource(view->texture)->buffer;
+         entries[at].offset = view->u.buf.offset;
+         entries[at].size = view->u.buf.size;
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[2];
@@ -21466,6 +21872,18 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * format in the storage texture's type, so every image access is
     * formatted by construction. */
    caps->image_store_formatted = true;
+   /* Texture buffers. Core GL 3.1 functionality, so this is a hole in the
+    * version already reported rather than an extension: a samplerBuffer
+    * shader used to fail to link. Each one is bound as a read-only storage
+    * buffer and texelFetch is lowered to word loads.
+    *
+    * The offset alignment is WebGPU's for a storage binding, which is what
+    * glTexBufferRange has to respect. */
+   caps->texture_buffer_objects = true;
+   caps->texture_buffer_offset_alignment = 256;
+   caps->max_texel_buffer_elements =
+      screen->max_storage_buffer_size ? screen->max_storage_buffer_size / 16
+                                      : 65536;
    /* GL compute. st_extensions reads this before it looks at compute_caps at
     * all, so without it the whole compute block is skipped and
     * ARB_compute_shader stays off however well its own three gates are met.
