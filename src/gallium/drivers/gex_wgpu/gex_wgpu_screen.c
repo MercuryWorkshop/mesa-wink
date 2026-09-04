@@ -16638,6 +16638,12 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
                  (int)info->alpha_blend, (int)info->render_condition_enable,
                  info->num_window_rectangles, info->mask);
       }
+      /* GEX_WGPU_NO_BLITTER declines instead, for telling a fault in the
+       * blitter's quad draw apart from one somewhere else. */
+      if (getenv("GEX_WGPU_NO_BLITTER")) {
+         gex_decline(ctx);
+         return;
+      }
       gex_wgpu_blit_with_blitter(ctx, info);
       return;
    }
@@ -23165,6 +23171,17 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
         simple_mtx_unlock(&screen->cache_lock);
         return gex_ret; }
 
+   /* GEX_WGPU_NO_PIPELINE_CACHE builds a fresh pipeline every time and hands
+    * ownership to the caller, which is what `*cached = false` means. For
+    * telling a cache bug apart from everything else: a fault that survives it
+    * is not the cache's. */
+   if (getenv("GEX_WGPU_NO_PIPELINE_CACHE")) {
+      const WGPURenderPipeline fresh =
+         wgpuDeviceCreateRenderPipeline(screen->device, desc);
+      *cached = false;
+      simple_mtx_unlock(&screen->cache_lock);
+      return fresh;
+   }
    const uint32_t hash = gex_wgpu_cache_hash(key, length);
    struct gex_wgpu_pipeline_cache_slot *slot =
       &screen->pipeline_cache[hash % GEX_WGPU_PIPELINE_CACHE_SLOTS];
