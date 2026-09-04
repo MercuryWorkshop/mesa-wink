@@ -1894,6 +1894,11 @@ struct gex_wgpu_shader_variant {
     * framebuffer height: the row index does not depend on it, see
     * gex_wgpu_lower_poly_stipple. */
    bool poly_stipple;
+   /* Whether this variant had its gl_SampleMask write neutralised because the
+    * framebuffer is single-sampled; see gex_wgpu_ignore_sample_mask. Part of
+    * the key because the same shader is correct both ways depending on the
+    * target bound. */
+   bool ignore_sample_mask;
    uint32_t stipple[32];
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
@@ -8420,6 +8425,56 @@ gex_wgpu_reads_draw_params(nir_shader *nir)
  * The culling itself is done on the captured values; see
  * gex_wgpu_cull_distance_draw.
  */
+/* gl_SampleMask has no effect on a single-sample framebuffer.
+ *
+ * GL applies the multisample fragment operations -- which is where the
+ * shader's sample mask is ANDed into the coverage -- only when SAMPLE_BUFFERS
+ * is one. Write it on an ordinary framebuffer and GL ignores it; WebGPU
+ * honours @builtin(sample_mask) whatever the sample count, so a shader that
+ * writes zero had its fragments discarded here and drawn everywhere else.
+ * KHR-GL45.sample_variables' samples_0 cases are exactly this, and llvmpipe
+ * passes all of them by ignoring the write.
+ *
+ * The value is replaced rather than the store removed: an output the emitter
+ * has already decided to declare should be written, and all-ones is the mask
+ * that changes nothing.
+ */
+static bool
+gex_wgpu_ignore_sample_mask_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                                  void *data)
+{
+   (void)data;
+   nir_def *value = NULL;
+   if (intr->intrinsic == nir_intrinsic_store_deref) {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+      if (!var || var->data.mode != nir_var_shader_out ||
+          var->data.location != FRAG_RESULT_SAMPLE_MASK)
+         return false;
+      value = intr->src[1].ssa;
+   } else if (intr->intrinsic == nir_intrinsic_store_output) {
+      if (nir_intrinsic_io_semantics(intr).location != FRAG_RESULT_SAMPLE_MASK)
+         return false;
+      value = intr->src[0].ssa;
+   } else {
+      return false;
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *ones = nir_imm_int(b, ~0);
+   if (value->num_components > 1)
+      ones = nir_replicate(b, ones, value->num_components);
+   nir_src_rewrite(intr->intrinsic == nir_intrinsic_store_deref
+                      ? &intr->src[1] : &intr->src[0], ones);
+   return true;
+}
+
+static bool
+gex_wgpu_ignore_sample_mask(nir_shader *nir)
+{
+   return nir_shader_intrinsics_pass(nir, gex_wgpu_ignore_sample_mask_instr,
+                                     nir_metadata_control_flow, NULL);
+}
+
 static bool
 gex_wgpu_neutralise_cull_distances(nir_shader *nir)
 {
@@ -9805,6 +9860,19 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    } while (0)
 
    struct gex_wgpu_shader *fs = ctx->fs;
+   /* GL applies the multisample fragment operations only when SAMPLE_BUFFERS
+    * is one, so a shader's gl_SampleMask write does nothing on an ordinary
+    * framebuffer. WebGPU honours it whatever the sample count, so the write
+    * has to be neutralised -- which makes this a reason to build a variant.
+    *
+    * Decided here, above *both* of this function's early returns. There are
+    * two, and putting it below the first one cost the whole fix twice over: a
+    * shader that needs no other variant takes that return, keeps its base
+    * module, and goes on discarding its fragments. */
+   const bool want_ignore_sample_mask =
+      ctx->fb_samples <= 1 && fs->original_nir &&
+      (fs->original_nir->info.outputs_written &
+       BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK)) != 0;
    /* What the bound colour target needs the fragment output to be. */
    const nir_alu_type wanted_output =
       ctx->color_count == 0 ? nir_alu_type_get_base_type(fs->color_output_type)
@@ -9928,7 +9996,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
        line_edge_location == ~0u && !fs->buftex_count &&
-       !want_sample_positions && !want_logicop)
+       !want_sample_positions && !want_logicop && !want_ignore_sample_mask)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -10035,9 +10103,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
-      want_sample_positions != 0 || want_logicop != 0;
+      want_sample_positions != 0 || want_logicop != 0 ||
+      want_ignore_sample_mask;
    if (!needs_variant && !fs->buftex_count)
       return fs->module;
+
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
         cached; cached = cached->next) {
       bool match = cached->sampler_mask == sampler_mask &&
@@ -10054,6 +10124,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
                    cached->line_stipple_factor == line_stipple_factor &&
                    cached->unproduced == unproduced &&
                    cached->poly_stipple == want_stipple &&
+                   cached->ignore_sample_mask == want_ignore_sample_mask &&
                    (!want_stipple ||
                     memcmp(cached->stipple, ctx->poly_stipple,
                            sizeof(cached->stipple)) == 0);
@@ -10149,6 +10220,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
          fprintf(stderr, "==== gex wide-point FS variant %u\n", told);
          nir_print_shader(variant, stderr); }
    }
+   if (want_ignore_sample_mask)
+      gex_wgpu_ignore_sample_mask(variant);
    /* Before the texture lowering, which reads gl_FragCoord for nothing and
     * would otherwise see the load this adds. */
    if (want_stipple)
@@ -10215,6 +10288,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    cached->line_stipple_factor = line_stipple_factor;
    cached->unproduced = unproduced;
    cached->poly_stipple = want_stipple;
+   cached->ignore_sample_mask = want_ignore_sample_mask;
    memcpy(cached->stipple, ctx->poly_stipple, sizeof(cached->stipple));
    for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
       if (!(sampler_mask & (UINT64_C(1) << slot)))
@@ -32888,13 +32962,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           * the view or the sampler is the odd one out. */
          fprintf(stderr,
                  "gex-wgpu: draw declined (%s) slot=%u shader_type=%d "
-                 "view_format=%d compare=%d filter=%d/%d/%d\n",
+                 "view_format=%s(%d) compare=%d filter=%d/%d/%d\n",
                  missing_constant ? "a constant buffer is not bound"
                                   : binding_why ? binding_why : "binding",
                  binding_slot,
                  ctx->fs ? gex_wgpu_shader_sample_type_for_slot(ctx->fs,
                                                                 binding_slot)
                          : -1,
+                 bad_view ? util_format_short_name(bad_view->format)
+                          : "none",
                  bad_view ? (int)bad_view->format : -1,
                  bad_sampler ? (int)bad_sampler->state.compare_mode : -1,
                  bad_sampler ? (int)bad_sampler->state.min_img_filter : -1,
