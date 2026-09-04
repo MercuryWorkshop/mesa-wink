@@ -95,6 +95,25 @@ gex_wgpu_spirv_to_wgsl(const uint32_t *words, size_t word_count,
                            generated.Failure().reason);
       return nullptr;
    }
+   /* GEX_WGPU_DUMP_WGSL=<n> prints the first n modules Tint produces.
+    *
+    * The missing instrument for every shader that compiles and then computes
+    * the wrong thing: the SPIR-V is dumped only when Tint *rejects* it, so a
+    * module that translates cleanly and behaves wrongly left nothing to read.
+    * Counted rather than gated on a single shader, because the interesting
+    * one is rarely the first. */
+   {
+      static int budget = -1;
+      if (budget < 0) {
+         const char *want = getenv("GEX_WGPU_DUMP_WGSL");
+         budget = want ? atoi(want) : 0;
+      }
+      if (budget > 0) {
+         --budget;
+         fprintf(stderr, "==== gex WGSL (%zu bytes) ====\n%s==== end ====\n",
+                 generated.Get().wgsl.size(), generated.Get().wgsl.c_str());
+      }
+   }
    char *wgsl = copy_string(generated.Get().wgsl);
    if (!wgsl)
       set_error(error_out, "out of memory copying WGSL");
