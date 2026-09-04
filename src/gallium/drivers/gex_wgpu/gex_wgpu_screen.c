@@ -13573,7 +13573,20 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
           !util_format_is_compressed(texture->format) &&
           gex_wgpu_texture_format(templ->format) !=
              WGPUTextureFormat_Undefined &&
-          templ->target == PIPE_TEXTURE_2D &&
+          /* Any target the scratch can stand in for, which is any that comes
+           * down to one layer of a 2D texture -- the single-level and
+           * single-layer conditions beside this do the real restricting. It
+           * used to insist on PIPE_TEXTURE_2D exactly, and Blender's EEVEE
+           * spells the very same thing as a *one-layer 2D array*: an r32ui
+           * view of one layer of an r32f array, refused for the name of its
+           * target rather than for anything about it. A cube view cannot
+           * reach here, needing six layers, and the driver already views 1D
+           * as 2D. */
+          (templ->target == PIPE_TEXTURE_2D ||
+           templ->target == PIPE_TEXTURE_2D_ARRAY ||
+           templ->target == PIPE_TEXTURE_RECT ||
+           templ->target == PIPE_TEXTURE_1D ||
+           templ->target == PIPE_TEXTURE_1D_ARRAY) &&
           templ->u.tex.first_level == templ->u.tex.last_level &&
           templ->u.tex.first_layer == templ->u.tex.last_layer) &&
         /* A stencil-aspect view names a different format from its texture by
@@ -34127,6 +34140,12 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->max_colour_bytes_per_sample =
       got_limits && limits.maxColorAttachmentBytesPerSample
          ? limits.maxColorAttachmentBytesPerSample : 32u;
+   if (getenv("GEX_WGPU_LIMIT_TRACE"))
+      fprintf(stderr, "gex-limits: colour bytes/sample granted %u "
+              "(storage textures/stage %u, sampled/stage %u)\n",
+              screen->max_colour_bytes_per_sample,
+              got_limits ? limits.maxStorageTexturesPerShaderStage : 0u,
+              got_limits ? limits.maxSampledTexturesPerShaderStage : 0u);
    /* Both gate the 16-bit normalized formats: they are backed by float32, and
     * a float32 attachment is only filterable and blendable when the device
     * granted these. Without them the formats stay unadvertised rather than

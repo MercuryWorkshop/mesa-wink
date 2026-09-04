@@ -294,6 +294,12 @@ create_device(void)
       GEX_WANT(maxTextureDimension3D, 2048);
       GEX_WANT(maxTextureArrayLayers, 2048);
 #undef GEX_WANT
+      if (getenv("GEX_WGPU_LIMIT_TRACE"))
+         fprintf(stderr, "gex-limits: adapter colour bytes/sample %u "
+                 "(asked %u), storage textures/stage %u\n",
+                 adapter_limits.maxColorAttachmentBytesPerSample,
+                 limits.maxColorAttachmentBytesPerSample,
+                 adapter_limits.maxStorageTexturesPerShaderStage);
       fprintf(stderr,
               "gex-wgpu: adapter compute limits invocations/workgroup %u "
               "workgroup %ux%ux%u shared %uB (asking for %u)\n",
