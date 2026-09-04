@@ -330,9 +330,23 @@ static void gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
  * missing feature but a dead context. */
 #define GEX_WGPU_MAX_VIEWPORTS 16
 
-/* Varyings carried between stages through a buffer, one vec4 each. Sixteen is
- * what the driver advertises as max_inputs/max_outputs. */
-#define GEX_WGPU_MAX_VARYINGS 16
+/* Varyings carried between stages through a buffer, one vec4 each.
+ *
+ * Thirty-two, which is 128 components -- what GL 4.0 requires of
+ * MAX_TESS_CONTROL_OUTPUT_COMPONENTS and MAX_TESS_PATCH_COMPONENTS, and what
+ * llvmpipe reports. It is deliberately *not* the number every IO cap is
+ * derived from, because only some of these layouts live in a buffer. A stage
+ * whose outputs are rasterized reaches the fragment shader through the
+ * passthrough vertex shader, so it is bounded twice over by WebGPU -- once by
+ * the vertex-attribute count and once by the inter-stage variable count, both
+ * sixteen -- and those caps stay at sixteen by hand. Deriving them from this
+ * would advertise a limit that fails at pipeline creation instead of at link
+ * time. */
+#define GEX_WGPU_MAX_VARYINGS 32
+
+/* The subset of the above a rasterized interface may use: WebGPU's guaranteed
+ * vertex-attribute and inter-stage variable counts are both sixteen. */
+#define GEX_WGPU_MAX_RASTER_VARYINGS 16
 
 /* ---- Tessellation ---------------------------------------------------------
  *
@@ -29838,12 +29852,14 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    /* Both of these defaulted to zero, which st/mesa reports verbatim as
     * MAX_TRANSFORM_FEEDBACK_*_COMPONENTS -- so every program declaring a
     * feedback varying failed to link, however few it declared. GL 3.2 asks
-    * for 64 interleaved and 4 separate, and the capture path carries exactly
-    * GEX_WGPU_MAX_VARYINGS vec4 slots, which is 64 components: the floor the
-    * spec sets and the ceiling this layout has happen to be the same number,
-    * so this claims what the buffer can actually hold rather than a minimum
-    * borrowed from the specification. */
-   caps->max_stream_output_interleaved_components = GEX_WGPU_MAX_VARYINGS * 4;
+    * for 64 interleaved and 4 separate, and what is captured is a stage whose
+    * outputs are rasterized -- so it carries GEX_WGPU_MAX_RASTER_VARYINGS
+    * vec4 slots, which is 64 components: the floor the spec sets and the
+    * ceiling that layout has happen to be the same number, so this claims
+    * what the buffer can actually hold rather than a minimum borrowed from
+    * the specification. */
+   caps->max_stream_output_interleaved_components =
+      GEX_WGPU_MAX_RASTER_VARYINGS * 4;
    /* ARB_transform_feedback3: gl_NextBuffer and gl_SkipComponents, which let
     * one interleaved capture be split across several buffers. The linker
     * expresses that entirely in the xfb info the capture pass already walks
@@ -30093,15 +30109,33 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
       caps->max_tex_instructions = 16384;
       caps->max_tex_indirections = 16384;
       caps->max_control_flow_depth = 64;
-      caps->max_inputs = stages[i] == MESA_SHADER_VERTEX ? 16 : 16;
+      /* An input carried in a buffer *could* exceed WebGPU's inter-stage
+       * count, but these limits have to agree with each other as well as with
+       * the hardware: the CTS skips outright when
+       * GL_MAX_VERTEX_OUTPUT_COMPONENTS is below the stage that consumes it,
+       * and a vertex shader's outputs are bounded at sixteen because they may
+       * be rasterized instead. So only the evaluation shader is raised, to
+       * match the control shader's outputs below -- the one interface in this
+       * driver that is a buffer at both ends. */
+      caps->max_inputs = stages[i] == MESA_SHADER_TESS_EVAL
+                            ? GEX_WGPU_MAX_VARYINGS
+                            : GEX_WGPU_MAX_RASTER_VARYINGS;
       /* st/mesa reports MaxGeometryOutputComponents as four times this, and
        * GL 3.2 requires 128. Eight slots gave 32 -- a quarter of the floor --
        * and transform_feedback's geometry cases failed at link time with
        * "geometry shader uses too many output components (60 > 32)". The
        * geometry stage is emulated as a compute pass writing a buffer, so
        * what actually bounds it is that buffer, not a hardware slot count. */
-      caps->max_outputs = stages[i] == MESA_SHADER_FRAGMENT
-         ? 8 : GEX_WGPU_MAX_VARYINGS;
+      /* Only the control shader's outputs stay in a buffer -- the evaluation
+       * and geometry stages hand theirs to the passthrough vertex shader, so
+       * theirs are a rasterized interface however they got there. GL 4.0 asks
+       * for 128 control-shader output components, and this is where that
+       * comes from; MAX_TESS_PATCH_COMPONENTS is st/mesa's own 120 and needs
+       * the same room. */
+      caps->max_outputs =
+         stages[i] == MESA_SHADER_FRAGMENT ? 8
+         : stages[i] == MESA_SHADER_TESS_CTRL ? GEX_WGPU_MAX_VARYINGS
+                                              : GEX_WGPU_MAX_RASTER_VARYINGS;
       caps->max_temps = 256;
       caps->max_const_buffer0_size = 16 * 1024;
       /* Never more than the device will bind. st/mesa needs 13 for
