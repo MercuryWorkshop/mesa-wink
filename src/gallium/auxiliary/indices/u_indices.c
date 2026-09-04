@@ -55,6 +55,20 @@ u_index_prim_type_convert(unsigned hw_mask, enum mesa_prim prim, bool pv_matches
    case MESA_PRIM_TRIANGLES:
    case MESA_PRIM_TRIANGLE_STRIP:
    case MESA_PRIM_TRIANGLE_FAN:
+      /* Only ever triangles. Substituting MESA_PRIM_QUADS here -- which this
+       * used to do for the whole triangle family whenever the driver
+       * advertised quads -- names an output that has no translator: the
+       * translate_quads[] table is populated by quads() and quadstrip()
+       * alone, so translate_quads[..][MESA_PRIM_TRIANGLE_FAN] is NULL and
+       * u_primconvert calls it. There is no fan-to-quads or strip-to-quads
+       * rewrite to be had in any case; a fan cannot be expressed as quads.
+       *
+       * It takes a driver that advertises MESA_PRIM_QUADS but *not*
+       * MESA_PRIM_TRIANGLE_FAN to reach this, which is why it has stood: for
+       * every driver that supports quads today the fan is supported too, so
+       * the (hw_mask & (1<<prim)) test above returns before the switch.
+       */
+      return MESA_PRIM_TRIANGLES;
    case MESA_PRIM_QUADS:
    case MESA_PRIM_QUAD_STRIP:
       if ((hw_mask & (1<<MESA_PRIM_QUADS)) && pv_matches)
