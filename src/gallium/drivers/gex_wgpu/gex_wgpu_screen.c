@@ -1295,6 +1295,11 @@ struct gex_wgpu_shader {
    /* ARB_shader_draw_parameters. Vertex stage only; the block is declared
     * only when the shader reads one of the three values. */
    bool reads_draw_params;
+   /* Whether the fragment stage reads gl_SamplePosition, which makes the
+    * framebuffer's sample count part of its variant key. Scanned rather than
+    * read off info.system_values_read, for the reason gl_PointCoord and the
+    * draw parameters were: a missed read is a rejected module. */
+   bool reads_sample_pos;
    /* Whether the fragment stage reads gl_PointCoord. An expanded wide point
     * feeds it from the corner attribute through a varying, which costs a
     * varying slot, so it is only added where something reads it. */
@@ -1397,6 +1402,10 @@ struct gex_wgpu_shader_variant {
    /* Whether this variant discards the corners of the point, for
     * GL_POINT_SMOOTH. */
    bool point_smooth;
+   /* The framebuffer sample count this variant's gl_SamplePosition table was
+    * built for. Zero when the shader does not read it, so a shader that does
+    * not is one variant however the framebuffer changes. */
+   uint8_t sample_positions_for;
    /* Texel word counts of the bound buffer textures this variant's texelFetch
     * lowering was built against. The format is on the sampler view, not in
     * the shader, so it is state and belongs in the key. */
@@ -6666,6 +6675,33 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       shader->reads_draw_params = draw_params.used;
       nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    }
+   /* Whether the fragment stage reads gl_SamplePosition. Scanned, not
+    * lowered: the lowering needs the framebuffer's sample count and so
+    * belongs with the other per-draw fragment variants. */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      /* Both shapes gl_SamplePosition arrives in. GLSL gives it as a
+       * *variable* in nir_var_system_value -- which is what the SPIR-V
+       * emitter decorates BuiltIn SamplePosition, and so what Tint refuses --
+       * while a shader that has been through nir_lower_system_values has the
+       * intrinsic instead. Matching only the intrinsic found neither: the
+       * scan came back false, the variant was never built, and the draw
+       * vanished at `if (!fragment.module) return;` without a word. */
+      nir_foreach_variable_with_modes(var, nir, nir_var_system_value |
+                                                nir_var_shader_in) {
+         if (var->data.location == SYSTEM_VALUE_SAMPLE_POS)
+            shader->reads_sample_pos = true;
+      }
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_intrinsic &&
+                   nir_instr_as_intrinsic(instr)->intrinsic ==
+                      nir_intrinsic_load_sample_pos)
+                  shader->reads_sample_pos = true;
+            }
+         }
+      }
+   }
 
    nir_foreach_variable_with_modes(var, nir,
                                    nir_var_mem_ubo | nir_var_mem_ssbo) {
@@ -7250,8 +7286,16 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     *   Tint rejected SPIR-V: error: invalid dimension: 5
     *
     * which arrives at the application as a link error. */
+   /* A third reason to defer, beside the two the comment above gives:
+    * gl_SamplePosition is resolved against the framebuffer's *sample count*,
+    * which is not known here either -- and like a samplerBuffer, compiling
+    * eagerly does not merely give a wrong module but one Tint refuses,
+    * because the position reaches SPIR-V as builtin 19 and WGSL has no such
+    * builtin. That refusal arrives as a link error and the program does not
+    * run at all. */
    const bool deferred_integer_sampling =
-      (shader->integer_sampled_slots != 0 || shader->buftex_count != 0) &&
+      (shader->integer_sampled_slots != 0 || shader->buftex_count != 0 ||
+       shader->reads_sample_pos) &&
       (expected_stage == MESA_SHADER_FRAGMENT ||
        expected_stage == MESA_SHADER_VERTEX);
    if (deferred_integer_sampling)
@@ -7395,6 +7439,105 @@ gex_wgpu_retype_color_outputs(nir_shader *nir, nir_alu_type want)
    nir_fixup_deref_types(nir);
 }
 
+/* Where WebGPU takes its samples inside a pixel.
+ *
+ * WebGPU does not let a pipeline choose sample locations, so they are the
+ * standard ones -- the same table Vulkan calls `standardSampleLocations` and
+ * D3D has had since 11. Both things GL asks about them come from here, which
+ * is the point: `glGetMultisamplefv(GL_SAMPLE_POSITION)` and
+ * `gl_SamplePosition` are required to agree, and they cannot disagree if
+ * there is only one table.
+ *
+ * Without this, `get_sample_position` was unimplemented and Mesa answered
+ * (0.5, 0.5) for every sample of a 4x target -- true of no sample but the
+ * single-sampled one -- while gl_SamplePosition did not reach WGSL at all and
+ * *rejected the shader*, so a program using it did not run.
+ *
+ * WebGPU has only sample counts 1 and 4, so those are the only rows there can
+ * be. The y coordinate is the table's own: this driver renders flipped, and
+ * the flip cancels the difference between GL's lower-left pixel origin and
+ * the table's upper-left one. gl44-sample-position-probe checks that against
+ * a reference rather than leaving it argued.
+ */
+static void
+gex_wgpu_standard_sample_position(unsigned samples, unsigned index,
+                                  float *out)
+{
+   static const float four[4][2] = {
+      {0.375f, 0.125f}, {0.875f, 0.375f},
+      {0.125f, 0.625f}, {0.625f, 0.875f},
+   };
+   if (samples >= 4 && index < 4) {
+      out[0] = four[index][0];
+      out[1] = four[index][1];
+      return;
+   }
+   /* One sample, or an index past what the table has: the pixel centre, which
+    * is where a single sample is and the only honest answer for the rest. */
+   out[0] = 0.5f;
+   out[1] = 0.5f;
+}
+
+static void
+gex_wgpu_get_sample_position(struct pipe_context *pipe, unsigned sample_count,
+                             unsigned index, float *out)
+{
+   (void)pipe;
+   gex_wgpu_standard_sample_position(sample_count, index, out);
+}
+
+/* gl_SamplePosition, which WGSL has no builtin for -- the SPIR-V reaches Tint
+ * as builtin 19 and is refused, taking the whole program with it.
+ *
+ * It does not need one. The locations are fixed by the table above and the
+ * *index* does reach WGSL, as @builtin(sample_index), so the position is a
+ * select over the sample id. The framebuffer's sample count decides which
+ * table row set applies, which makes it part of the variant key rather than
+ * something the shader can read. */
+struct gex_wgpu_sample_pos_lowering {
+   unsigned samples;
+   bool used;
+};
+
+static bool
+gex_wgpu_lower_sample_pos(nir_builder *b, nir_intrinsic_instr *intr,
+                          void *data)
+{
+   struct gex_wgpu_sample_pos_lowering *state = data;
+   if (intr->intrinsic == nir_intrinsic_load_deref) {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+      if (!var || var->data.location != SYSTEM_VALUE_SAMPLE_POS ||
+          !(var->data.mode & (nir_var_system_value | nir_var_shader_in)))
+         return false;
+   } else if (intr->intrinsic != nir_intrinsic_load_sample_pos) {
+      return false;
+   }
+   state->used = true;
+   b->cursor = nir_before_instr(&intr->instr);
+
+   float centre[2];
+   gex_wgpu_standard_sample_position(1, 0, centre);
+   nir_def *value = nir_imm_vec2(b, centre[0], centre[1]);
+   if (state->samples > 1) {
+      nir_def *id = nir_load_sample_id(b);
+      /* Built from the last row backwards, so the first row is the value the
+       * chain falls through to and no index is left unhandled. */
+      for (int i = (int)state->samples - 1; i >= 1; --i) {
+         float at[2];
+         gex_wgpu_standard_sample_position(state->samples, (unsigned)i, at);
+         value = nir_bcsel(b, nir_ieq_imm(b, id, i),
+                           nir_imm_vec2(b, at[0], at[1]), value);
+      }
+      float first[2];
+      gex_wgpu_standard_sample_position(state->samples, 0, first);
+      value = nir_bcsel(b, nir_ieq_imm(b, id, 0),
+                        nir_imm_vec2(b, first[0], first[1]), value);
+   }
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
 static WGPUShaderModule
 gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
 {
@@ -7470,6 +7613,10 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    /* GL_POINT_SMOOTH, which needs the sprite coordinate whether or not the
     * shader itself reads it -- the decision in draw_vbo_inner asks for the
     * varying on its behalf. */
+   /* Zero unless the shader reads gl_SamplePosition, so a shader that does
+    * not is one variant however the framebuffer's sample count changes. */
+   const uint8_t want_sample_positions =
+      fs->reads_sample_pos ? (uint8_t)MAX2(1u, ctx->fb_samples) : 0u;
    const bool want_point_smooth =
       point_coord_location != ~0u && ctx->rasterizer &&
       ctx->rasterizer->point_smooth;
@@ -7515,9 +7662,13 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
     * texture binding the layout does not provide. */
    uint8_t want_buftex[GEX_WGPU_MAX_BUFFER_TEXTURES];
    gex_wgpu_buftex_words(fs, ctx->sampler_views, want_buftex);
+   /* gl_SamplePosition belongs in this list for the same reason a buffer
+    * texture does: the shader has no base module when it reads one, so
+    * falling through here returns NULL and the draw disappears without a
+    * word -- `if (!fragment.module) return;` is a silent early exit. */
    if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
-       line_edge_location == ~0u && !fs->buftex_count)
+       line_edge_location == ~0u && !fs->buftex_count && !want_sample_positions)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -7623,7 +7774,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    const bool needs_variant =
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
-      want_point_smooth || line_edge_location != ~0u;
+      want_point_smooth || line_edge_location != ~0u ||
+      want_sample_positions != 0;
    if (!needs_variant && !fs->buftex_count)
       return fs->module;
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
@@ -7635,6 +7787,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
                    cached->coord_replace == coord_replace &&
                    cached->point_coord_location == point_coord_location &&
                    cached->point_smooth == want_point_smooth &&
+                   cached->sample_positions_for == want_sample_positions &&
                    cached->line_edge_location == line_edge_location &&
                    cached->line_stipple_pattern == line_stipple_pattern &&
                    cached->line_stipple_factor == line_stipple_factor &&
@@ -7705,6 +7858,13 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       gex_wgpu_drop_unproduced_inputs(variant, produced, sprite_locations);
    if (want_point_smooth)
       gex_wgpu_lower_point_smooth(variant, point_coord_location);
+   if (want_sample_positions) {
+      struct gex_wgpu_sample_pos_lowering sample_pos = {
+         .samples = want_sample_positions,
+      };
+      nir_shader_intrinsics_pass(variant, gex_wgpu_lower_sample_pos,
+                                 nir_metadata_control_flow, &sample_pos);
+   }
    if (want_line_smooth)
       gex_wgpu_lower_line_smooth(variant, line_edge_location);
    if (want_line_stipple)
@@ -7760,6 +7920,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    cached->coord_replace = coord_replace;
    cached->point_coord_location = point_coord_location;
    cached->point_smooth = want_point_smooth;
+   cached->sample_positions_for = want_sample_positions;
    cached->line_edge_location = line_edge_location;
    cached->line_stipple_pattern = line_stipple_pattern;
    cached->line_stipple_factor = line_stipple_factor;
@@ -27973,6 +28134,7 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.set_min_samples = gex_wgpu_set_min_samples;
    ctx->base.set_clip_state = gex_wgpu_set_clip_state;
    ctx->base.set_active_query_state = gex_wgpu_set_active_query_state;
+   ctx->base.get_sample_position = gex_wgpu_get_sample_position;
    ctx->base.create_query = gex_wgpu_create_query;
    ctx->base.destroy_query = gex_wgpu_destroy_query;
    ctx->base.begin_query = gex_wgpu_begin_query;
