@@ -585,16 +585,37 @@ gex_wgpu_image_view_dimension(enum glsl_sampler_dim dim, bool is_array)
 {
    switch (dim) {
    case GLSL_SAMPLER_DIM_1D:
-      return is_array ? WGPUTextureViewDimension_Undefined
-                      : WGPUTextureViewDimension_1D;
+      /* Both served as 2D one texel tall, and they have to be: this driver
+       * creates every non-3D texture as WGPUTextureDimension_2D, so a 1D
+       * *view* of one is never valid --
+       *
+       *   The dimension (TextureViewDimension::e1D) of the texture view is
+       *   not compatible with the dimension (TextureDimension::e2D)
+       *
+       * -- which is why the sampled path already views them as 2D and only
+       * the image path did not. gex_wgpu_lower_image_shape rewrites the
+       * shader to match. */
+      return is_array ? WGPUTextureViewDimension_2DArray
+                      : WGPUTextureViewDimension_2D;
    case GLSL_SAMPLER_DIM_2D:
+   /* A rectangle *image* is a 2D image. The difference between the two is
+    * that a rectangle texture is sampled with unnormalised coordinates -- and
+    * imageLoad and imageStore address by texel whatever the dimension is, so
+    * for an image there is no difference left to express. The texture is
+    * already a 2D WebGPU texture; only the shader said otherwise, and
+    * gex_wgpu_lower_image_rect rewrites that. */
+   case GLSL_SAMPLER_DIM_RECT:
       return is_array ? WGPUTextureViewDimension_2DArray
                       : WGPUTextureViewDimension_2D;
    case GLSL_SAMPLER_DIM_3D:
       return is_array ? WGPUTextureViewDimension_Undefined
                       : WGPUTextureViewDimension_3D;
+   /* A cube image is a 2D array of six faces -- see
+    * gex_wgpu_lower_image_shape, which rewrites the shader to match. */
+   case GLSL_SAMPLER_DIM_CUBE:
+      return WGPUTextureViewDimension_2DArray;
    default:
-      /* Cube, buffer, rectangle, multisampled, subpass: none of them. */
+      /* Buffer, multisampled, subpass: none of them. */
       return WGPUTextureViewDimension_Undefined;
    }
 }
@@ -2497,6 +2518,140 @@ gex_wgpu_apply_buffer_textures(nir_shader *nir, unsigned buftex_count,
    return true;
 }
 
+/* Say 2D where the shader said rectangle, and 2D-array where it said cube.
+ *
+ * WGSL has exactly four storage-texture types -- 1d, 2d, 2d_array, 3d -- and
+ * SPIR-V has a Dim of its own for a rectangle and for a cube, so a shader
+ * declaring `image2DRect` or `imageCube` was refused however the layout and
+ * the view were built. Both rewrites are *exact* rather than approximations,
+ * which is the only reason to make them:
+ *
+ *   - The difference between a 2D and a rectangle texture is that a rectangle
+ *     is *sampled* with unnormalised coordinates. imageLoad and imageStore
+ *     address by texel whatever the dimension is, so for an image there is no
+ *     difference left to express.
+ *   - A cube image's coordinate is already `ivec3(x, y, face)` and GL numbers
+ *     the faces +X,-X,+Y,-Y,+Z,-Z -- which is the order the six array layers
+ *     of a WebGPU cube texture are in. `texture_storage_2d_array` indexes
+ *     `(coord.xy, layer)`. The two are the same operation written twice.
+ *   - A 1D image, with or without an array, is a 2D one whose rows are a
+ *     single texel tall -- which is how this driver stores every non-3D
+ *     texture anyway, so a 1D *view* of one is not even valid. `(x)` becomes
+ *     `(x, 0)` and `(x, layer)` becomes `(x, 0, layer)`. imageSize is the one
+ *     place the shape shows through, and only for the array: the query
+ *     answers `(width, 1, layers)` where the shader asked for
+ *     `(width, layers)`, so the first and last are taken and the height
+ *     dropped. Without the array the shader asks for one component and the
+ *     first component of a 2D query is the width either way.
+ *
+ * KHR-GL44.shader_image_load_store's allTargets cases walk every target in
+ * turn, so each refusal hid the next; the rectangle one came off first and
+ * the cube was immediately behind it.
+ *
+ * The intrinsics carry the dimension and the array flag too, next to the
+ * deref that also implies them, so all of it is set or ntv and the variable
+ * disagree. */
+static bool
+gex_wgpu_lower_image_shape_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (!nir_intrinsic_has_image_dim(intr))
+      return false;
+   (void)data;
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const bool array =
+      nir_intrinsic_has_image_array(intr) && nir_intrinsic_image_array(intr);
+   const bool one_d = dim == GLSL_SAMPLER_DIM_1D;
+   const bool one_d_array = one_d && array;
+   if (dim != GLSL_SAMPLER_DIM_RECT && dim != GLSL_SAMPLER_DIM_CUBE && !one_d)
+      return false;
+
+   nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
+   if (dim == GLSL_SAMPLER_DIM_CUBE && nir_intrinsic_has_image_array(intr))
+      nir_intrinsic_set_image_array(intr, true);
+
+   if (!one_d)
+      return true;
+   if (!one_d_array) {
+      /* A plain 1D image: the coordinate gains a row of zero and that is
+       * all. imageSize needs no fixup -- it asks for one component, and the
+       * first component of a 2D query is the width either way. */
+      nir_src *only = &intr->src[1];
+      if (only->ssa->num_components < 4)
+         return true;
+      b->cursor = nir_before_instr(instr);
+      nir_src_rewrite(only, nir_vec4(b, nir_channel(b, only->ssa, 0),
+                                     nir_imm_int(b, 0),
+                                     nir_channel(b, only->ssa, 2),
+                                     nir_channel(b, only->ssa, 3)));
+      return true;
+   }
+
+   /* A 1D array's coordinate is (x, layer) and a 2D array's is (x, y, layer),
+    * so a row index of zero goes in the middle. */
+   if (intr->intrinsic == nir_intrinsic_image_deref_size) {
+      /* The query now answers (width, height, layers) where the shader asked
+       * for (width, layers), and height is the 1 this driver stores such a
+       * texture with. Take the first and last. */
+      b->cursor = nir_after_instr(instr);
+      const unsigned components = intr->def.num_components;
+      intr->def.num_components = 3;
+      intr->num_components = 3;
+      nir_def *size = nir_vec2(b, nir_channel(b, &intr->def, 0),
+                               nir_channel(b, &intr->def, 2));
+      if (components < 2)
+         size = nir_trim_vector(b, size, components);
+      nir_def_rewrite_uses_after(&intr->def, size);
+      return true;
+   }
+   /* Four components, always: NIR declares an image coordinate as vec4 and
+    * pads whatever the dimension does not use, so this moves the layer from
+    * .y to .z rather than growing the vector. Building a vec3 instead is a
+    * validation failure -- "src->ssa->num_components == num_components" --
+    * and it aborts inside the driver with the shader printed and no mention
+    * of which source was wrong. */
+   nir_src *coord = &intr->src[1];
+   if (coord->ssa->num_components < 4)
+      return true;
+   b->cursor = nir_before_instr(instr);
+   nir_def *widened = nir_vec4(b, nir_channel(b, coord->ssa, 0),
+                               nir_imm_int(b, 0),
+                               nir_channel(b, coord->ssa, 1),
+                               nir_channel(b, coord->ssa, 3));
+   nir_src_rewrite(coord, widened);
+   return true;
+}
+
+static void
+gex_wgpu_lower_image_shape(nir_shader *nir)
+{
+   bool any = false;
+   nir_foreach_variable_with_modes(var, nir, nir_var_image) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      if (!glsl_type_is_image(type))
+         continue;
+      const enum glsl_sampler_dim dim = glsl_get_sampler_dim(type);
+      const bool array = glsl_sampler_type_is_array(type);
+      if (dim != GLSL_SAMPLER_DIM_RECT && dim != GLSL_SAMPLER_DIM_CUBE &&
+          dim != GLSL_SAMPLER_DIM_1D)
+         continue;
+      const struct glsl_type *flat = glsl_image_type(
+         GLSL_SAMPLER_DIM_2D, dim == GLSL_SAMPLER_DIM_CUBE || array,
+         glsl_get_sampler_result_type(type));
+      /* An array of images keeps its array; only the element changes. */
+      var->type = glsl_type_is_array(var->type)
+         ? glsl_array_type(flat, glsl_get_length(var->type), 0) : flat;
+      any = true;
+   }
+   if (!any)
+      return;
+   nir_shader_instructions_pass(nir, gex_wgpu_lower_image_shape_instr,
+                                nir_metadata_control_flow, NULL);
+   nir_fixup_deref_types(nir);
+}
+
 /* The GL image unit a variable names, which is what glBindImageTexture sets
  * and what ctx->shader_images is indexed by.
  *
@@ -3607,6 +3762,9 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
     *
     * It is made read-only instead, which is what a size query needs and what
     * the layout can then agree with. */
+   /* Before the loop below reads each image's dimension, and before the
+    * collection sites that build the layout from it. */
+   gex_wgpu_lower_image_shape(nir);
    nir_foreach_variable_with_modes(var, nir, nir_var_image) {
       const unsigned slot = gex_wgpu_image_slot(var);
       if (slot >= GEX_WGPU_MAX_SHADER_IMAGES) {
