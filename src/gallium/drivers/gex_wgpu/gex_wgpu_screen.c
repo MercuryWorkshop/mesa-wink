@@ -640,6 +640,19 @@ struct gex_wgpu_screen {
       WGPUTextureView view;
    } default_textures[16];
    unsigned default_texture_count;
+   /* The same for a shader *image* slot GL left without a complete texture.
+    * GL says such a unit reads zero and discards its writes rather than
+    * erroring, so a 1x1 stand-in is the behaviour, not a workaround. Keyed on
+    * the storage format and view dimension the shader declared, because a
+    * storage binding's format must match the layout exactly. See
+    * gex_wgpu_default_storage_view. */
+   struct {
+      WGPUTextureViewDimension dimension;
+      WGPUTextureFormat format;
+      WGPUTexture texture;
+      WGPUTextureView view;
+   } default_images[16];
+   unsigned default_image_count;
    /* One per WGPUSamplerBindingType: filtering, non-filtering, comparison. */
    WGPUSampler default_samplers[4];
    /* Bind group layouts, pipeline layouts and bind groups, kept by content.
@@ -9780,6 +9793,13 @@ gex_wgpu_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
  *
  * Grown rather than reallocated per size, and never read back, so the writes a
  * shader may aim at it cost nothing. */
+/* Declared ahead of its first use in the draw and dispatch paths, which come
+ * before the texture-cache helpers it lives beside. */
+static WGPUTextureView
+gex_wgpu_default_storage_view(struct gex_wgpu_screen *screen,
+                              WGPUTextureViewDimension dimension,
+                              WGPUTextureFormat format);
+
 static WGPUBuffer
 gex_wgpu_placeholder_storage(struct gex_wgpu_context *ctx, uint64_t least)
 {
@@ -16060,14 +16080,34 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       const struct pipe_image_view *iv =
          &ctx->shader_images[MESA_SHADER_COMPUTE][slot];
       if (!iv->resource || !gex_resource(iv->resource)->texture) {
-         static bool said;
-         if (!said) {
-            said = true;
-            fprintf(stderr, "gex-wgpu: compute image %u has no texture "
-                    "bound\n", slot);
+         /* The stand-in, as in the draw path: GL says such a unit reads zero
+          * and discards its stores rather than being an error. */
+         WGPUTextureView stand_in = gex_wgpu_default_storage_view(
+            screen, compute->image_dimensions[i],
+            gex_wgpu_storage_texture_format(compute->image_formats[i]));
+         if (!stand_in) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: dispatch declined (no stand-in for "
+                       "compute image %u)\n", slot);
+            }
+            goto release_views;
          }
-         gex_fail(ctx);
-         goto release_views;
+         entries[count] =
+            (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+         entries[count].binding = compute->image_bindings[i];
+         entries[count].visibility = WGPUShaderStage_Compute;
+         entries[count].storageTexture.access = compute->image_access[i];
+         entries[count].storageTexture.format =
+            gex_wgpu_storage_texture_format(compute->image_formats[i]);
+         entries[count].storageTexture.viewDimension =
+            compute->image_dimensions[i];
+         bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         bindings[count].binding = compute->image_bindings[i];
+         bindings[count].textureView = stand_in;
+         ++count;
+         continue;
       }
       WGPUTextureViewDescriptor view_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
       view_desc.format =
@@ -16084,7 +16124,20 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          wgpuTextureCreateView(gex_resource(iv->resource)->texture,
                                &view_desc);
       if (!image_view) {
-         gex_fail(ctx);
+         /* Also declined. The view WebGPU would not make is a combination it
+          * does not express -- a slice of a 3D texture bound as a
+          * non-layered image2D is one, since a 3D texture has one array
+          * layer and no 2D view of a slice -- and that is a missing feature,
+          * not a broken device. */
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: dispatch declined (no image view for "
+                    "slot %u: level %u layers %u..%u of a %u-layer %s)\n",
+                    slot, iv->u.tex.level, iv->u.tex.first_layer,
+                    iv->u.tex.last_layer, iv->resource->array_size,
+                    util_format_short_name(iv->resource->format));
+         }
          goto release_views;
       }
       image_views[image_view_count++] = image_view;
@@ -23771,6 +23824,77 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
  * Cached per (dimension, sample type) because the view has to match what the
  * module declared, or the bind group is a validation error.
  */
+/* A 1x1 storage-texture stand-in for an image slot with nothing usable bound.
+ *
+ * GL leaves image units bound to incomplete textures, and says such a unit
+ * reads zero and has its stores discarded -- not that the draw is an error.
+ * Declining the draw is closer than failing the context but still wrong: the
+ * draw is supposed to happen and simply see zeroes.
+ *
+ * The format has to be the one the shader declared, because a storage
+ * binding's format must match its layout exactly -- unlike the sampled
+ * stand-in, where a sample *type* is all that must agree. Cached per
+ * (dimension, format) on the screen, and never written, so it reads as the
+ * zeroes GL asks for. */
+static WGPUTextureView
+gex_wgpu_default_storage_view(struct gex_wgpu_screen *screen,
+                              WGPUTextureViewDimension dimension,
+                              WGPUTextureFormat format)
+{
+   if (format == WGPUTextureFormat_Undefined)
+      return NULL;
+   simple_mtx_lock(&screen->cache_lock);
+   for (unsigned i = 0; i < screen->default_image_count; ++i)
+      if (screen->default_images[i].dimension == dimension &&
+          screen->default_images[i].format == format) {
+         const WGPUTextureView gex_ret = screen->default_images[i].view;
+         simple_mtx_unlock(&screen->cache_lock);
+         return gex_ret;
+      }
+   if (screen->default_image_count >= ARRAY_SIZE(screen->default_images)) {
+      simple_mtx_unlock(&screen->cache_lock);
+      return NULL;
+   }
+
+   /* A cube storage texture does not exist in WebGPU; a shader declaring a
+    * cube image gets a 2D-array stand-in, which is what the driver declares
+    * such an image as anyway. */
+   const bool array = dimension == WGPUTextureViewDimension_2DArray ||
+                      dimension == WGPUTextureViewDimension_Cube ||
+                      dimension == WGPUTextureViewDimension_CubeArray;
+   WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+   desc.dimension = dimension == WGPUTextureViewDimension_3D
+      ? WGPUTextureDimension_3D : WGPUTextureDimension_2D;
+   desc.size = (WGPUExtent3D){1, 1, 1};
+   desc.format = format;
+   desc.mipLevelCount = 1;
+   desc.sampleCount = 1;
+   desc.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_CopyDst;
+   WGPUTexture texture = wgpuDeviceCreateTexture(screen->device, &desc);
+   if (!texture) {
+      simple_mtx_unlock(&screen->cache_lock);
+      return NULL;
+   }
+   WGPUTextureViewDescriptor view_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   view_desc.format = format;
+   view_desc.dimension = array ? WGPUTextureViewDimension_2DArray : dimension;
+   view_desc.mipLevelCount = 1;
+   view_desc.arrayLayerCount = 1;
+   WGPUTextureView view = wgpuTextureCreateView(texture, &view_desc);
+   if (!view) {
+      wgpuTextureRelease(texture);
+      simple_mtx_unlock(&screen->cache_lock);
+      return NULL;
+   }
+   const unsigned i = screen->default_image_count++;
+   screen->default_images[i].dimension = dimension;
+   screen->default_images[i].format = format;
+   screen->default_images[i].texture = texture;
+   screen->default_images[i].view = view;
+   simple_mtx_unlock(&screen->cache_lock);
+   return view;
+}
+
 static WGPUTextureView
 gex_wgpu_default_texture_view(struct gex_wgpu_screen *screen,
                               WGPUTextureViewDimension dimension,
@@ -29021,14 +29145,27 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const struct pipe_image_view *iv =
             &ctx->shader_images[MESA_SHADER_FRAGMENT][slot];
          if (!iv->resource || !gex_resource(iv->resource)->texture) {
-            static bool said;
-            if (!said) {
-               said = true;
-               fprintf(stderr, "gex-wgpu: fragment image %u has no texture "
-                       "bound\n", slot);
+            /* The stand-in, because GL says an image unit bound to an
+             * incomplete texture reads zero and discards its stores -- the
+             * draw is meant to happen. This used to fail the *context*, so
+             * the next unrelated call returned GL_OUT_OF_MEMORY and
+             * KHR-GL44's shader_image_load_store.incomplete_textures reported
+             * "context already failed" and nothing about itself. */
+            entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+            entries[at].binding = ctx->fs->image_bindings[i];
+            entries[at].textureView = gex_wgpu_default_storage_view(
+               screen, ctx->fs->image_dimensions[i],
+               gex_wgpu_storage_texture_format(ctx->fs->image_formats[i]));
+            if (!entries[at].textureView) {
+               static bool said;
+               if (!said) {
+                  said = true;
+                  fprintf(stderr, "gex-wgpu: draw declined (no stand-in for "
+                          "fragment image %u)\n", slot);
+               }
+               return;
             }
-            gex_fail(ctx);
-            return;
+            continue;
          }
          WGPUTextureViewDescriptor desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
          desc.format = gex_wgpu_storage_texture_format(ctx->fs->image_formats[i]);
@@ -29043,7 +29180,20 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          WGPUTextureView view =
             wgpuTextureCreateView(gex_resource(iv->resource)->texture, &desc);
          if (!view) {
-            gex_fail(ctx);
+            /* A view WebGPU will not make is a combination it cannot express
+             * -- one slice of a 3D texture bound as a non-layered image2D is
+             * one, because a 3D texture has a single array layer and there is
+             * no 2D view of a slice. A missing feature, not a dead device. */
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: draw declined (no image view for "
+                       "fragment slot %u: level %u layers %u..%u of a "
+                       "%u-layer %s)\n", slot, iv->u.tex.level,
+                       iv->u.tex.first_layer, iv->u.tex.last_layer,
+                       iv->resource->array_size,
+                       util_format_short_name(iv->resource->format));
+            }
             return;
          }
          if (image_view_count < ARRAY_SIZE(image_views))
