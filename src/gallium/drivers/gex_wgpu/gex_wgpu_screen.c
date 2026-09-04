@@ -13582,6 +13582,29 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
       GEX_SAMPLER_VIEW_REFUSED("cube-array layer range");
       return NULL;
    }
+   /* A view whose texel size differs from the texture's, which nothing here
+    * can serve.
+    *
+    * A same-size reinterpretation goes through the scratch copy below --
+    * that is byte-for-byte and format-agnostic. A *different* size has no
+    * byte correspondence to preserve, and WebGPU will not make the view
+    * either:
+    *
+    *   The texture view format (RG32Float) is not compatible with the
+    *   texture format (R32Float)
+    *
+    * Which was the failure mode worth naming: the driver built the view
+    * anyway, so the view was invalid, so its bind group was invalid, so the
+    * whole command buffer was -- and every batched draw went with it, with
+    * nothing in the GL error path. Blender's EEVEE asks for this. Against the
+    * *stored* format, because a promoted texture holds more bytes per texel
+    * than its Gallium format says. */
+   if (templ->format != texture->format &&
+       util_format_get_blocksize(templ->format) !=
+          util_format_get_blocksize(gex_wgpu_stored_format(texture->format))) {
+      GEX_SAMPLER_VIEW_REFUSED("view format has a different texel size");
+      return NULL;
+   }
    struct gex_wgpu_sampler_view *view = CALLOC_STRUCT(gex_wgpu_sampler_view);
    if (!view)
       return NULL;
