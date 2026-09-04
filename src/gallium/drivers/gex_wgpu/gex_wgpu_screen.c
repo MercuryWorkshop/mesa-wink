@@ -28801,8 +28801,14 @@ gex_wgpu_cull_polygons(struct pipe_context *pipe,
        * ordering ends on v3, and a strip triangle's winding compensation
        * swaps the very corner in question. Taken from `source` for that
        * reason, where one expression serves all six topologies. */
+      /* GL_POLYGON is the exception in GL's flatshading table: a single
+       * polygon takes its value from vertex *one*, its first, where every
+       * other topology takes its primitive's last. Applying the last-vertex
+       * rule to it painted poly-flat-unfilled-clip cyan where both references
+       * draw red. It is not affected by glProvokingVertex either -- the table
+       * names vertex 1 outright. */
       const uint32_t provoking = walk.single
-         ? source[ctx->rasterizer->flatshade_first ? 0 : count - 1]
+         ? source[0]
          : source[p * walk.step +
                   (ctx->rasterizer->flatshade_first ? 0 : walk.verts - 1)];
 
@@ -29234,7 +29240,10 @@ gex_wgpu_draw_unfilled(struct pipe_context *pipe,
                                         : ((const uint32_t *)out)[i];
                for (unsigned p = 0; p < polygons; ++p) {
                   const unsigned base = p * 2 * ring;
-                  const unsigned at = ctx->rasterizer->flatshade_first
+                  /* GL_POLYGON takes vertex one, not its last; see the note
+                   * in gex_wgpu_cull_polygons. */
+                  const unsigned at =
+                     (walk.single || ctx->rasterizer->flatshade_first)
                      ? base : base + 2 * (ring - 1);
                   for (unsigned k = 0; k < 2 * ring; ++k)
                      provoking[base + k] = edges[at];
