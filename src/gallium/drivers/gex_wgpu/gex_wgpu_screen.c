@@ -1278,6 +1278,10 @@ struct gex_wgpu_context {
     * redraws edges with, and the capture they read from. */
    struct gex_wgpu_flat_replay *flat_replays;
    struct pipe_resource *flat_vs_out;
+   /* Staging for a buffer copy whose source and destination are the same
+    * buffer, which WebGPU forbids and GL allows; see
+    * gex_wgpu_copy_buffer_region. */
+   struct pipe_resource *copy_scratch;
    /* The varying a line's coverage and along-the-line distance ride on while
     * one is being drawn, or ~0u. Both stages are given the same number, which
     * is what makes the quad shader's output and the fragment variant's input
@@ -19294,6 +19298,11 @@ gex_wgpu_feedback_snapshot(struct gex_wgpu_context *ctx,
  * alignment rule -- the copy goes through the CPU, where the source's shadow
  * already holds the bytes and buffer_subdata already knows how to write an
  * unaligned range. */
+/* Defined below, beside the other per-context scratch allocators. */
+static bool gex_wgpu_ensure_buffer(struct gex_wgpu_context *ctx,
+                                   struct pipe_resource **slot, unsigned size,
+                                   unsigned bind);
+
 static bool
 gex_wgpu_copy_buffer_region(struct pipe_context *pipe,
                             struct pipe_resource *dst, unsigned dstx,
@@ -19325,6 +19334,38 @@ gex_wgpu_copy_buffer_region(struct pipe_context *pipe,
          wgpuDeviceCreateCommandEncoder(screen->device, NULL);
       if (!encoder)
          return false;
+      /* GL lets a buffer be copied into itself as long as the ranges do not
+       * overlap -- glCopyBufferSubData says so outright, and a program
+       * compacting or rotating a buffer in place does exactly that. WebGPU
+       * refuses it whatever the ranges:
+       *
+       *   Source and destination are the same buffer ([Buffer (unlabeled)]).
+       *
+       * and an invalid copy invalidates the command buffer, which fails the
+       * submit, which *latches the context*. That cost far more than the one
+       * copy: KHR-GL45.direct_state_access.buffers_functional does a
+       * self-copy, and after it every later case in the family reported
+       * InternalError -- 256 of them -- because the context never recovered.
+       * Run alone, those same cases pass.
+       *
+       * So it goes through a staging buffer, both copies on this encoder. */
+      if (gex_src->buffer == gex_dst->buffer) {
+         if (!gex_wgpu_ensure_buffer(ctx, &ctx->copy_scratch, size,
+                                     PIPE_BIND_SHADER_BUFFER)) {
+            wgpuCommandEncoderRelease(encoder);
+            return false;
+         }
+         WGPUBuffer scratch = gex_resource(ctx->copy_scratch)->buffer;
+         if (!scratch) {
+            wgpuCommandEncoderRelease(encoder);
+            return false;
+         }
+         wgpuCommandEncoderCopyBufferToBuffer(encoder, gex_src->buffer,
+                                              src_offset, scratch, 0, size);
+         wgpuCommandEncoderCopyBufferToBuffer(encoder, scratch, 0,
+                                              gex_dst->buffer, dst_offset,
+                                              size);
+      } else
       wgpuCommandEncoderCopyBufferToBuffer(encoder, gex_src->buffer,
                                            src_offset, gex_dst->buffer,
                                            dst_offset, size);
@@ -34467,6 +34508,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    }
    ctx->flat_replays = NULL;
    pipe_resource_reference(&ctx->flat_vs_out, NULL);
+   pipe_resource_reference(&ctx->copy_scratch, NULL);
    for (struct gex_wgpu_line_quad *q = ctx->line_quads; q;) {
       struct gex_wgpu_line_quad *next = q->next;
       /* The shader and the element state are real driver objects, made the
