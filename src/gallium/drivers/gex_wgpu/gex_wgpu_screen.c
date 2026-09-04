@@ -2168,6 +2168,10 @@ struct gex_wgpu_line_quad {
 struct gex_wgpu_flat_replay {
    struct gex_wgpu_varying_layout layout;
    uint32_t flat_mask;
+   /* Whether each non-flat slot is mixed between two captured records rather
+    * than taken from one. The clipped-polygon replay needs it: its vertices
+    * are points *along* original edges. */
+   bool lerp;
    struct gex_wgpu_shader *shader;
    struct gex_wgpu_vertex_elements *elements;
    struct gex_wgpu_flat_replay *next;
@@ -21263,6 +21267,79 @@ gex_wgpu_line_quad_get(struct gex_wgpu_context *ctx,
  * because the quad shader reads it by slot zero, then everything the fragment
  * stage reads. A varying the vertex shader does not write is captured as
  * zero, which is what GL says an unwritten input is worth. */
+/* The replay shader for a clipped polygon's edges.
+ *
+ * Same job as the geometry stage's passthrough -- forward a captured record to
+ * the matching output -- except that each vertex is a *point along* an
+ * original edge, so every interpolated slot is mixed between two records with
+ * a per-vertex factor. Mixing in clip space is exactly what clipping does, so
+ * the position comes out where GL puts it.
+ *
+ * A flat slot is not mixed. It comes whole from the polygon's provoking
+ * vertex, which is an original vertex and so has a record of its own; mixing
+ * it would defeat the point of flat shading.
+ *
+ * Attribute numbering has to agree with the element table built beside it, so
+ * both walk the slots in the same order: two attributes for a mixed slot, one
+ * for a flat slot, and the mix factor last.
+ */
+static nir_shader *
+gex_wgpu_clip_replay_nir(struct pipe_context *pipe,
+                         const struct gex_wgpu_varying_layout *outputs,
+                         uint32_t flat_mask)
+{
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_VERTEX, pipe->screen->nir_options[MESA_SHADER_VERTEX],
+      "gex-clip-replay");
+   const unsigned n = outputs->count;
+   nir_variable *first[GEX_WGPU_MAX_VARYINGS] = {0};
+   nir_variable *second[GEX_WGPU_MAX_VARYINGS] = {0};
+   unsigned at = 0;
+   for (unsigned i = 0; i < n; ++i) {
+      char name[32];
+      snprintf(name, sizeof(name), "gex_clip_a%u", i);
+      first[i] = nir_variable_create(b.shader, nir_var_shader_in,
+                                     glsl_vec4_type(), name);
+      first[i]->data.location = VERT_ATTRIB_GENERIC0 + at;
+      first[i]->data.driver_location = at;
+      ++at;
+      if (flat_mask & (1u << i))
+         continue;
+      snprintf(name, sizeof(name), "gex_clip_b%u", i);
+      second[i] = nir_variable_create(b.shader, nir_var_shader_in,
+                                      glsl_vec4_type(), name);
+      second[i]->data.location = VERT_ATTRIB_GENERIC0 + at;
+      second[i]->data.driver_location = at;
+      ++at;
+   }
+   nir_variable *factor = nir_variable_create(b.shader, nir_var_shader_in,
+                                              glsl_float_type(),
+                                              "gex_clip_t");
+   factor->data.location = VERT_ATTRIB_GENERIC0 + at;
+   factor->data.driver_location = at;
+
+   nir_def *t = nir_replicate(&b, nir_load_var(&b, factor), 4);
+   for (unsigned i = 0; i < n; ++i) {
+      char name[32];
+      snprintf(name, sizeof(name), "gex_clip_out%u", i);
+      nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
+                                              glsl_vec4_type(), name);
+      out->data.location = outputs->location[i];
+      out->data.driver_location = i;
+      nir_def *a = nir_load_var(&b, first[i]);
+      nir_def *value = a;
+      if (second[i]) {
+         nir_def *d = nir_load_var(&b, second[i]);
+         value = nir_fadd(&b, a, nir_fmul(&b, nir_fsub(&b, d, a), t));
+      }
+      nir_store_var(&b, out, value, 0xf);
+   }
+   nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
+   if (getenv("GEX_WGPU_CLIP_NIR"))
+      nir_print_shader(b.shader, stderr);
+   return b.shader;
+}
+
 /* The passthrough shader and elements for a flat-unfilled replay.
  *
  * The shader is the geometry stage's own passthrough -- one vec4 attribute
@@ -21277,45 +21354,97 @@ gex_wgpu_line_quad_get(struct gex_wgpu_context *ctx,
 static struct gex_wgpu_flat_replay *
 gex_wgpu_flat_replay_get(struct gex_wgpu_context *ctx,
                          const struct gex_wgpu_varying_layout *layout,
-                         uint32_t flat_mask)
+                         uint32_t flat_mask, bool lerp)
 {
    for (struct gex_wgpu_flat_replay *r = ctx->flat_replays; r; r = r->next)
-      if (r->flat_mask == flat_mask &&
+      if (r->flat_mask == flat_mask && r->lerp == lerp &&
           !memcmp(&r->layout, layout, sizeof(*layout)))
          return r->shader && r->elements ? r : NULL;
 
    const unsigned n = layout->count;
-   if (!n || n > GEX_WGPU_MAX_VERTEX_ELEMENTS)
+   /* The mixing form needs two attributes per interpolated slot plus one for
+    * the factor, against WebGPU's sixteen. A shader with more varyings than
+    * that leaves its clipped polygons without their boundary edge, which is
+    * what every shader had before this existed. */
+   const unsigned needed = lerp
+      ? 2 * n - util_bitcount(flat_mask & BITFIELD_MASK(n)) + 1 : n;
+   if (!n || needed > GEX_WGPU_MAX_VERTEX_ELEMENTS) {
+      if (getenv("GEX_WGPU_UNFILLED_LOG"))
+         fprintf(stderr, "gex-wgpu: replay layout too wide (n=%u needed=%u "
+                 "lerp=%d)\n", n, needed, (int)lerp);
       return NULL;
+   }
 
    struct gex_wgpu_flat_replay *replay = CALLOC_STRUCT(gex_wgpu_flat_replay);
    if (!replay)
       return NULL;
    replay->layout = *layout;
    replay->flat_mask = flat_mask;
+   replay->lerp = lerp;
 
    struct pipe_shader_state state = {0};
    state.type = PIPE_SHADER_IR_NIR;
-   state.ir.nir = gex_wgpu_gs_passthrough_nir(&ctx->base, layout, 0);
+   state.ir.nir = lerp
+      ? gex_wgpu_clip_replay_nir(&ctx->base, layout, flat_mask)
+      : gex_wgpu_gs_passthrough_nir(&ctx->base, layout, 0);
    state.report_compile_error = true;
    replay->shader = state.ir.nir
       ? gex_wgpu_create_shader_state(&ctx->base, &state, MESA_SHADER_VERTEX)
       : NULL;
+   if (!replay->shader && getenv("GEX_WGPU_UNFILLED_LOG"))
+      fprintf(stderr, "gex-wgpu: replay shader rejected (lerp=%d n=%u "
+              "mask=0x%x): %s\n", (int)lerp, n, flat_mask,
+              state.error_message ? state.error_message : "no message");
    free(state.error_message);
 
    const unsigned record = gex_wgpu_varying_stride(layout);
    struct pipe_vertex_element elements[GEX_WGPU_MAX_VERTEX_ELEMENTS];
    memset(elements, 0, sizeof(elements));
+   unsigned at = 0;
    for (unsigned i = 0; i < n; ++i) {
-      elements[i].src_offset = i * 16;
-      elements[i].src_stride = record;
-      elements[i].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
-      elements[i].vertex_buffer_index = (flat_mask >> i) & 1u;
+      const bool is_flat = (flat_mask >> i) & 1u;
+      elements[at].src_offset = i * 16;
+      elements[at].src_stride = record;
+      elements[at].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      /* Without mixing, binding zero is the vertex's own record and binding
+       * one the provoking vertex's. With it, bindings zero and one are the
+       * two ends of the original edge, two is the mix factor and *three* is
+       * the provoking vertex.
+       *
+       * The factor sits below the provoking records rather than above them so
+       * that the indices an element table actually references are always
+       * contiguous. With the factor last, a shader whose fragment stage
+       * consumes no varyings at all -- one slot, position, nothing flat --
+       * referenced buffers 0, 1 and 3 and left a hole at 2, and the driver
+       * rejects that outright ("vertex buffer slot 2 unreferenced below
+       * highest 3"). A rejected element state is not a refused draw: it
+       * leaves the previous state bound. */
+      elements[at].vertex_buffer_index = lerp ? (is_flat ? 3u : 0u) : is_flat;
+      ++at;
+      if (!lerp || is_flat)
+         continue;
+      elements[at].src_offset = i * 16;
+      elements[at].src_stride = record;
+      elements[at].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+      elements[at].vertex_buffer_index = 1;
+      ++at;
    }
-   replay->elements = ctx->base.create_vertex_elements_state(&ctx->base, n,
+   if (lerp) {
+      elements[at].src_offset = 0;
+      elements[at].src_stride = 4;
+      elements[at].src_format = PIPE_FORMAT_R32_FLOAT;
+      elements[at].vertex_buffer_index = 2;
+      ++at;
+   }
+   replay->elements = ctx->base.create_vertex_elements_state(&ctx->base, at,
                                                              elements);
    replay->next = ctx->flat_replays;
    ctx->flat_replays = replay;
+   if ((!replay->shader || !replay->elements) &&
+       getenv("GEX_WGPU_UNFILLED_LOG"))
+      fprintf(stderr, "gex-wgpu: replay incomplete (shader=%d elements=%d "
+              "lerp=%d n=%u at=%u)\n", replay->shader ? 1 : 0,
+              replay->elements ? 1 : 0, (int)lerp, n, at);
    return replay->shader && replay->elements ? replay : NULL;
 }
 
@@ -28585,13 +28714,170 @@ gex_wgpu_cull_distance_filter(struct pipe_context *pipe,
    return true;
 }
 
+/* CPU polygon clipping, for glPolygonMode's benefit.
+ *
+ * GL clips a polygon and *then* applies polygon mode, so an unfilled polygon
+ * that a user clip plane cuts is outlined with an extra edge along the plane.
+ * This driver applies polygon mode first and lets the GPU clip the resulting
+ * lines: every original edge comes out right and the introduced edge is never
+ * drawn at all -- three edges where GL draws four. Both references agree
+ * exactly on that (llvmpipe and radeonsi pixel-identical), and it is the whole
+ * of the residual on the comparison's surviving `-clip` rows.
+ *
+ * The clip is done from the *capture* rather than from the plane equations,
+ * which is what makes it cheap to be correct: st has already run
+ * nir_lower_clip_vs, so the vertex shader writes one gl_ClipDistance component
+ * per enabled plane and the captured distances encode the planes. Clipping is
+ * then Sutherland-Hodgman on those numbers, with no geometry to re-derive and
+ * no plane state to read.
+ *
+ * A vertex of the clipped ring is either an original vertex or a point on an
+ * original edge, so it is described as a pair of original vertex numbers and a
+ * parameter along them -- which is exactly what the replay draw can fetch, two
+ * captured records and a mix factor.
+ */
+#define GEX_WGPU_CLIP_RING_MAX 32
+
+/* The edges of the polygons a clip plane actually cut, which cannot go in an
+ * index list: their vertices are points *along* original edges. Parallel
+ * arrays, two entries per edge, holding the original edge and the parameter
+ * along it, plus the polygon's provoking vertex for flat shading. */
+struct gex_wgpu_clip_edges {
+   uint32_t *a, *b, *flat;
+   float *t;
+   unsigned count, capacity;
+};
+
+struct gex_wgpu_clip_vertex {
+   /* a == b means an original vertex, and t is then unused. */
+   uint32_t a, b;
+   float t;
+};
+
+static float
+gex_wgpu_clip_dist(const float *captured, unsigned low,
+                   unsigned stride_floats, unsigned clip_offset,
+                   const struct gex_wgpu_clip_vertex *v, unsigned c)
+{
+   /* CLIP_DIST0 and CLIP_DIST1 are adjacent slots in the capture record, so
+    * eight components are contiguous from clip_offset and a component index
+    * addresses them directly. */
+   const float *da = captured + (size_t)(v->a - low) * stride_floats +
+                     clip_offset / 4 + c;
+   if (v->a == v->b)
+      return *da;
+   const float *db = captured + (size_t)(v->b - low) * stride_floats +
+                     clip_offset / 4 + c;
+   return *da + (*db - *da) * v->t;
+}
+
+/* The original edge two adjacent ring vertices both lie on, with each one's
+ * parameter along it.
+ *
+ * Every vertex Sutherland-Hodgman introduces lies on the segment between two
+ * ring vertices, and to be expressible as a mix of two *original* records that
+ * segment has to lie along one original edge. It does in every case but one:
+ * where a boundary edge from one plane is cut by a second plane, the new
+ * vertex is a mix of two already-mixed vertices and no pair of original
+ * records describes it. That polygon is declined and drawn the old way, which
+ * loses its boundary edges exactly as before rather than drawing them wrongly.
+ */
+static bool
+gex_wgpu_clip_segment_edge(const struct gex_wgpu_clip_vertex *cur,
+                           const struct gex_wgpu_clip_vertex *nxt,
+                           uint32_t *oa, uint32_t *ob,
+                           float *t_cur, float *t_nxt)
+{
+   const bool cur_orig = cur->a == cur->b, nxt_orig = nxt->a == nxt->b;
+   if (cur_orig && nxt_orig) {
+      *oa = cur->a; *ob = nxt->a; *t_cur = 0.0f; *t_nxt = 1.0f;
+      return *oa != *ob;
+   }
+   if (!cur_orig && !nxt_orig) {
+      if (cur->a != nxt->a || cur->b != nxt->b)
+         return false;
+      *oa = cur->a; *ob = cur->b; *t_cur = cur->t; *t_nxt = nxt->t;
+      return true;
+   }
+   const struct gex_wgpu_clip_vertex *orig = cur_orig ? cur : nxt;
+   const struct gex_wgpu_clip_vertex *mixed = cur_orig ? nxt : cur;
+   float t_orig;
+   if (orig->a == mixed->a)
+      t_orig = 0.0f;
+   else if (orig->a == mixed->b)
+      t_orig = 1.0f;
+   else
+      return false;
+   *oa = mixed->a; *ob = mixed->b;
+   *t_cur = cur_orig ? t_orig : mixed->t;
+   *t_nxt = cur_orig ? mixed->t : t_orig;
+   return true;
+}
+
+/* One Sutherland-Hodgman pass over one clip-distance component. Returns false
+ * when the ring would overflow or when a new vertex is not expressible; the
+ * caller then leaves the polygon alone. `*cut` is set when the plane actually
+ * crossed the polygon, which is what decides whether the replay is needed at
+ * all. */
+static bool
+gex_wgpu_clip_ring(struct gex_wgpu_clip_vertex *ring, unsigned *ring_count,
+                   const float *captured, unsigned low,
+                   unsigned stride_floats, unsigned clip_offset, unsigned c,
+                   bool *cut)
+{
+   struct gex_wgpu_clip_vertex out[GEX_WGPU_CLIP_RING_MAX];
+   const unsigned n = *ring_count;
+   unsigned out_n = 0;
+   if (n < 3 || n > GEX_WGPU_CLIP_RING_MAX)
+      return false;
+   for (unsigned i = 0; i < n; ++i) {
+      const struct gex_wgpu_clip_vertex *cur = &ring[i];
+      const struct gex_wgpu_clip_vertex *nxt = &ring[(i + 1) % n];
+      const float dc = gex_wgpu_clip_dist(captured, low, stride_floats,
+                                          clip_offset, cur, c);
+      const float dn = gex_wgpu_clip_dist(captured, low, stride_floats,
+                                          clip_offset, nxt, c);
+      const bool in_cur = dc >= 0.0f, in_nxt = dn >= 0.0f;
+      if (in_cur) {
+         if (out_n >= GEX_WGPU_CLIP_RING_MAX)
+            return false;
+         out[out_n++] = *cur;
+      }
+      if (in_cur == in_nxt)
+         continue;
+      *cut = true;
+      uint32_t oa, ob;
+      float t_cur, t_nxt;
+      if (!gex_wgpu_clip_segment_edge(cur, nxt, &oa, &ob, &t_cur, &t_nxt))
+         return false;
+      /* Where along cur->nxt the distance reaches zero, carried back onto the
+       * original edge's own parameter. */
+      const float span = dc - dn;
+      if (!(span != 0.0f))
+         return false;
+      const float f = dc / span;
+      if (out_n >= GEX_WGPU_CLIP_RING_MAX)
+         return false;
+      out[out_n].a = oa;
+      out[out_n].b = ob;
+      out[out_n].t = t_cur + (t_nxt - t_cur) * f;
+      ++out_n;
+   }
+   if (out_n && out_n < 3)
+      return false;   /* a degenerate sliver; leave the polygon alone */
+   memcpy(ring, out, out_n * sizeof(*ring));
+   *ring_count = out_n;
+   return true;
+}
+
 static bool
 gex_wgpu_cull_polygons(struct pipe_context *pipe,
                        const struct pipe_draw_info *info,
                        const struct pipe_draw_start_count_bias *draw,
                        unsigned cull_face, unsigned fill_mode,
                        uint32_t **out_indices, unsigned *out_count,
-                       enum mesa_prim *out_mode, uint32_t **out_flat)
+                       enum mesa_prim *out_mode, uint32_t **out_flat,
+                       struct gex_wgpu_clip_edges *out_clip)
 {
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct gex_wgpu_polygon_walk walk;
@@ -28653,12 +28939,19 @@ gex_wgpu_cull_polygons(struct pipe_context *pipe,
    }
    /* Only the range the draw touches is captured, which for a non-indexed
     * draw is exactly the draw and for an indexed one is its index bounds. */
-   unsigned record = 0, edge_offset = ~0u;
+   unsigned record = 0, edge_offset = ~0u, clip_offset = ~0u;
    if (!gex_wgpu_capture_positions(ctx, low, high - low + 1, &record,
-                                   &edge_offset, NULL)) {
+                                   &edge_offset,
+                                   out_clip ? &clip_offset : NULL)) {
       FREE(source);
       return false;
    }
+   /* nir_lower_clip_vs writes one gl_ClipDistance component per *enabled*
+    * plane, so the array size is the count of planes and the cull distances
+    * follow them. Only the clip half is clipped against. */
+   const unsigned clip_components =
+      out_clip && clip_offset != ~0u && ctx->vs && ctx->vs->original_nir
+      ? ctx->vs->original_nir->info.clip_distance_array_size : 0;
 
    struct pipe_transfer *read = NULL;
    const float *captured =
@@ -28812,6 +29105,70 @@ gex_wgpu_cull_polygons(struct pipe_context *pipe,
          : source[p * walk.step +
                   (ctx->rasterizer->flatshade_first ? 0 : walk.verts - 1)];
 
+      /* A polygon a clip plane cuts is outlined from its *clipped* ring, so
+       * the edge the plane introduced gets drawn -- which is what GL does and
+       * what the ordinary index path cannot express. Only when a plane
+       * actually crosses this polygon: one that is wholly inside is left to
+       * the cheap path, and one wholly outside contributes nothing.
+       *
+       * Edge flags are excluded rather than combined. An introduced edge has
+       * no flag of its own and GL always draws it, while the original edges
+       * keep theirs; carrying that through the clipper is work with no
+       * demand behind it, since a program that sets edge flags *and* user
+       * clip planes on the same unfilled draw is not one that has turned up.
+       */
+      if (clip_components && !have_edges &&
+          fill_mode == PIPE_POLYGON_MODE_LINE) {
+         struct gex_wgpu_clip_vertex clipped[GEX_WGPU_CLIP_RING_MAX];
+         unsigned clipped_count = ring_count;
+         bool ok = ring_count <= GEX_WGPU_CLIP_RING_MAX, cut = false;
+         for (unsigned k = 0; ok && k < ring_count; ++k) {
+            clipped[k].a = clipped[k].b = ring[k];
+            clipped[k].t = 0.0f;
+         }
+         for (unsigned c = 0; ok && c < clip_components; ++c)
+            ok = gex_wgpu_clip_ring(clipped, &clipped_count, captured, low,
+                                    stride_floats, clip_offset, c, &cut);
+         if (ok && cut) {
+            if (!clipped_count)
+               continue;   /* the planes removed it entirely */
+            const unsigned want = out_clip->count + 2 * clipped_count;
+            if (want > out_clip->capacity) {
+               /* Grown on first use: a draw that cuts nothing pays nothing. */
+               unsigned cap = out_clip->capacity ? out_clip->capacity * 2 : 64;
+               while (cap < want)
+                  cap *= 2;
+               uint32_t *na = realloc(out_clip->a, cap * sizeof(*na));
+               uint32_t *nb = realloc(out_clip->b, cap * sizeof(*nb));
+               uint32_t *nf = realloc(out_clip->flat, cap * sizeof(*nf));
+               float *nt = realloc(out_clip->t, cap * sizeof(*nt));
+               if (na) out_clip->a = na;
+               if (nb) out_clip->b = nb;
+               if (nf) out_clip->flat = nf;
+               if (nt) out_clip->t = nt;
+               if (!na || !nb || !nf || !nt) {
+                  /* Out of memory: stop clipping and let this polygon and
+                   * the rest go through the ordinary path. */
+                  out_clip->capacity = 0;
+                  goto no_clip;
+               }
+               out_clip->capacity = cap;
+            }
+            for (unsigned k = 0; k < clipped_count; ++k) {
+               const struct gex_wgpu_clip_vertex *v0 = &clipped[k];
+               const struct gex_wgpu_clip_vertex *v1 =
+                  &clipped[(k + 1) % clipped_count];
+               unsigned at = out_clip->count;
+               out_clip->a[at] = v0->a; out_clip->b[at] = v0->b;
+               out_clip->t[at] = v0->t; out_clip->flat[at] = provoking;
+               out_clip->a[at + 1] = v1->a; out_clip->b[at + 1] = v1->b;
+               out_clip->t[at + 1] = v1->t; out_clip->flat[at + 1] = provoking;
+               out_clip->count = at + 2;
+            }
+            continue;
+         }
+      }
+no_clip:
       if (emit_lines || emit_points) {
          for (unsigned k = 0; k < ring_count; ++k) {
             const float *v =
@@ -28895,9 +29252,15 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
                             const struct pipe_draw_info *info,
                             unsigned drawid_offset,
                             const struct pipe_draw_start_count_bias *draw,
-                            const uint32_t *edges, const uint32_t *provoking,
+                            const uint32_t *edges, const uint32_t *second,
+                            const float *factors, const uint32_t *provoking,
                             unsigned count)
 {
+   /* With `second` and `factors` the draw is a clipped polygon's outline:
+    * each vertex is a point along the original edge edges[i] -> second[i] at
+    * factors[i], and the replay shader mixes the two captured records. */
+   const bool lerp = second && factors;
+   const unsigned sections = lerp ? 3u : 2u;
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
 
 #define GEX_FLAT_DECLINE(why)                                                 \
@@ -28933,12 +29296,14 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
       if (ctx->fs->varying_interp[varyings.location[i]] == INTERP_MODE_FLAT)
          flat_mask |= 1u << i;
    /* Nothing flat means nothing to move, and the ordinary draw is already
-    * right -- which is the common case and must stay free. */
-   if (!flat_mask)
+    * right -- which is the common case and must stay free. A clipped outline
+    * is different: its geometry is what the replay is for, so it runs whether
+    * or not anything is flat. */
+   if (!flat_mask && !lerp)
       GEX_FLAT_DECLINE("no flat varying");
 
    struct gex_wgpu_flat_replay *replay =
-      gex_wgpu_flat_replay_get(ctx, &varyings, flat_mask);
+      gex_wgpu_flat_replay_get(ctx, &varyings, flat_mask, lerp);
    if (!replay)
       GEX_FLAT_DECLINE("no passthrough shader for this varying layout");
 
@@ -28966,21 +29331,42 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
     * capture keeps one: a buffer sized to the last record exactly leaves the
     * final vertex's fetch reading up to the end. */
    if (!gex_wgpu_ensure_buffer(ctx, &ctx->flat_vs_out,
-                               (2 * count + 1) * record,
+                               (sections * count + 1) * record,
                                PIPE_BIND_VERTEX_BUFFER |
                                PIPE_BIND_SHADER_BUFFER))
       GEX_FLAT_DECLINE("the capture buffer could not be allocated");
 
-   uint32_t *table = MALLOC(2 * (size_t)count * sizeof(*table));
+   uint32_t *table = MALLOC(sections * (size_t)count * sizeof(*table));
    if (!table)
       GEX_FLAT_DECLINE("the slot table could not be allocated");
    memcpy(table, edges, (size_t)count * sizeof(*table));
-   memcpy(table + count, provoking, (size_t)count * sizeof(*table));
+   if (lerp) {
+      memcpy(table + count, second, (size_t)count * sizeof(*table));
+      memcpy(table + 2 * count, provoking, (size_t)count * sizeof(*table));
+   } else {
+      memcpy(table + count, provoking, (size_t)count * sizeof(*table));
+   }
    struct pipe_resource *slot_table =
-      gex_wgpu_params_buffer(ctx, table, 2 * count);
+      gex_wgpu_params_buffer(ctx, table, sections * count);
    FREE(table);
    if (!slot_table)
       GEX_FLAT_DECLINE("the slot table could not be uploaded");
+   /* The mix factors, as an ordinary per-vertex vertex buffer. */
+   struct pipe_resource *factor_buffer = NULL;
+   if (lerp) {
+      uint32_t *bits = MALLOC((size_t)count * sizeof(*bits));
+      if (!bits) {
+         pipe_resource_reference(&slot_table, NULL);
+         GEX_FLAT_DECLINE("the mix factors could not be allocated");
+      }
+      memcpy(bits, factors, (size_t)count * sizeof(*bits));
+      factor_buffer = gex_wgpu_params_buffer(ctx, bits, count);
+      FREE(bits);
+      if (!factor_buffer) {
+         pipe_resource_reference(&slot_table, NULL);
+         GEX_FLAT_DECLINE("the mix factors could not be uploaded");
+      }
+   }
 
    /* Pass one: the vertex shader as compute, over both halves at once.
     *
@@ -28990,7 +29376,7 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
    u_upload_unmap(ctx->base.stream_uploader);
    uint32_t params[GEX_WGPU_PARAM_WORDS] = {0};
    params[GEX_WGPU_PARAM_FIRST_VERTEX] = 0;
-   params[GEX_WGPU_PARAM_COUNT] = 2 * count;
+   params[GEX_WGPU_PARAM_COUNT] = sections * count;
    struct gex_wgpu_bindings vs_group0 = {0}, vs_group1 = {0};
    bool ok = true;
    for (unsigned i = 0; i < GEX_WGPU_MAX_VERTEX_BUFFERS; ++i) {
@@ -29022,14 +29408,17 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
                                    ctx->vs->ubo_storage_mask) &&
            gex_wgpu_dispatch(ctx, variant->module, &vs_group0, &vs_group1,
                              NULL,
-                             DIV_ROUND_UP(2 * count, GEX_WGPU_CAPTURE_GROUP));
+                             DIV_ROUND_UP(sections * count,
+                                          GEX_WGPU_CAPTURE_GROUP));
    } else {
       ok = false;
    }
    pipe_resource_reference(&vs_params, NULL);
    pipe_resource_reference(&slot_table, NULL);
-   if (!ok)
+   if (!ok) {
+      pipe_resource_reference(&factor_buffer, NULL);
       GEX_FLAT_DECLINE("the capture pass did not run");
+   }
 
    /* Pass two: rasterize the edges from the capture. The passthrough vertex
     * shader and its element table stand in for the application's for the
@@ -29044,19 +29433,33 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
     */
    struct gex_wgpu_shader *saved_vs = ctx->vs;
    struct gex_wgpu_vertex_elements *saved_elements = ctx->vertex_elements;
-   struct pipe_resource *saved_buffers[2] = {ctx->vertex_buffers[0],
-                                             ctx->vertex_buffers[1]};
-   const uint32_t saved_offsets[2] = {ctx->vertex_buffer_offsets[0],
-                                      ctx->vertex_buffer_offsets[1]};
+   struct pipe_resource *saved_buffers[4];
+   uint32_t saved_offsets[4];
+   for (unsigned i = 0; i < 4; ++i) {
+      saved_buffers[i] = ctx->vertex_buffers[i];
+      saved_offsets[i] = ctx->vertex_buffer_offsets[i];
+   }
    const unsigned saved_count = ctx->vertex_buffer_count;
 
    ctx->vs = replay->shader;
    ctx->vertex_elements = replay->elements;
-   ctx->vertex_buffers[0] = ctx->flat_vs_out;
-   ctx->vertex_buffer_offsets[0] = 0;
-   ctx->vertex_buffers[1] = ctx->flat_vs_out;
-   ctx->vertex_buffer_offsets[1] = count * record;
-   ctx->vertex_buffer_count = 2;
+   /* One capture buffer bound once per section, a section apart: the
+    * vertex's own record, then the far end of its edge when mixing, then the
+    * provoking vertex's. The mix factors are a buffer of their own. */
+   for (unsigned i = 0; i < 2; ++i) {
+      ctx->vertex_buffers[i] = ctx->flat_vs_out;
+      ctx->vertex_buffer_offsets[i] = i * count * record;
+   }
+   if (lerp) {
+      ctx->vertex_buffers[2] = factor_buffer;
+      ctx->vertex_buffer_offsets[2] = 0;
+      ctx->vertex_buffers[3] = ctx->flat_vs_out;
+      ctx->vertex_buffer_offsets[3] = 2 * count * record;
+   } else {
+      ctx->vertex_buffers[1] = ctx->flat_vs_out;
+      ctx->vertex_buffer_offsets[1] = count * record;
+   }
+   ctx->vertex_buffer_count = lerp ? 4 : 2;
    ctx->flat_unfilled_rewritten = true;
 
    struct pipe_draw_info raster = *info;
@@ -29072,19 +29475,20 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
    memset(&raster_draw, 0, sizeof(raster_draw));
    raster_draw.count = count;
    if (getenv("GEX_WGPU_UNFILLED_LOG"))
-      fprintf(stderr, "gex-wgpu: flat unfilled replay verts=%u record=%u "
-              "mask=0x%x slots=%u\n", count, record, flat_mask,
-              varyings.count);
+      fprintf(stderr, "gex-wgpu: %s replay verts=%u record=%u mask=0x%x "
+              "slots=%u\n", lerp ? "clipped outline" : "flat unfilled",
+              count, record, flat_mask, varyings.count);
    gex_wgpu_draw_vbo(pipe, &raster, drawid_offset, NULL, &raster_draw, 1);
 
    ctx->flat_unfilled_rewritten = false;
    ctx->vs = saved_vs;
    ctx->vertex_elements = saved_elements;
-   ctx->vertex_buffers[0] = saved_buffers[0];
-   ctx->vertex_buffers[1] = saved_buffers[1];
-   ctx->vertex_buffer_offsets[0] = saved_offsets[0];
-   ctx->vertex_buffer_offsets[1] = saved_offsets[1];
+   for (unsigned i = 0; i < 4; ++i) {
+      ctx->vertex_buffers[i] = saved_buffers[i];
+      ctx->vertex_buffer_offsets[i] = saved_offsets[i];
+   }
    ctx->vertex_buffer_count = saved_count;
+   pipe_resource_reference(&factor_buffer, NULL);
    return true;
 #undef GEX_FLAT_DECLINE
 }
@@ -29249,8 +29653,8 @@ gex_wgpu_draw_unfilled(struct pipe_context *pipe,
                      provoking[base + k] = edges[at];
                }
                if (gex_wgpu_flat_unfilled_draw(pipe, info, drawid_offset,
-                                               draw, edges, provoking,
-                                               out_nr)) {
+                                               draw, edges, NULL, NULL,
+                                               provoking, out_nr)) {
                   FREE(edges);
                   FREE(provoking);
                   FREE(out);
@@ -29601,6 +30005,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       /* Parallel to culled_indices: each emitted edge vertex's polygon's
        * provoking vertex, which only this filter still knows. */
       uint32_t *culled_flat = NULL;
+      /* The outlines of polygons a user clip plane cut, which have to be
+       * drawn from the capture: their vertices are points along original
+       * edges, so no index list can name them. */
+      struct gex_wgpu_clip_edges clip_edges = {0};
       /* Edge flags need the same pass whether or not anything is culled: it
        * is the only place the per-vertex flag can be read. */
       const bool want_edges = ctx->vs && ctx->vs->original_nir &&
@@ -29609,7 +30017,19 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       static int no_facing = -1;
       if (no_facing < 0)
          no_facing = getenv("GEX_WGPU_NO_FACING_CULL") ? 1 : 0;
-      if (!no_facing && (want_edges ||
+      /* A user clip plane needs the same pass, for a different reason: GL
+       * clips a polygon *before* applying polygon mode, so the outline of a
+       * cut polygon has an edge along the plane that this driver drew nowhere
+       * -- and deciding where that edge is needs the per-vertex clip
+       * distances, which only the capture has. */
+      static int no_clip = -1;
+      if (no_clip < 0)
+         no_clip = getenv("GEX_WGPU_NO_POLYGON_CLIP") ? 1 : 0;
+      const bool want_clip = !no_clip &&
+         ctx->rasterizer->fill_mode == PIPE_POLYGON_MODE_LINE &&
+         ctx->vs && ctx->vs->original_nir &&
+         ctx->vs->original_nir->info.clip_distance_array_size > 0;
+      if (!no_facing && (want_edges || want_clip ||
           ctx->rasterizer->cull_face == PIPE_FACE_FRONT ||
           ctx->rasterizer->cull_face == PIPE_FACE_BACK)) {
          unsigned culled_count = 0;
@@ -29618,11 +30038,27 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                     ctx->rasterizer->cull_face,
                                     ctx->rasterizer->fill_mode,
                                     &culled_indices, &culled_count,
-                                    &culled_mode, &culled_flat)) {
+                                    &culled_mode, &culled_flat,
+                                    want_clip ? &clip_edges : NULL)) {
+            /* The clipped outlines are a draw of their own, issued whatever
+             * became of the rest: a draw can be all cut polygons and no
+             * whole ones. */
+            if (clip_edges.count) {
+               if (!gex_wgpu_flat_unfilled_draw(pipe, info, drawid_offset,
+                                                &draws[0], clip_edges.a,
+                                                clip_edges.b, clip_edges.t,
+                                                clip_edges.flat,
+                                                clip_edges.count) &&
+                   getenv("GEX_WGPU_UNFILLED_LOG"))
+                  fprintf(stderr, "gex-wgpu: %u clipped outline vertices "
+                          "went undrawn\n", clip_edges.count);
+            }
+            free(clip_edges.a); free(clip_edges.b);
+            free(clip_edges.flat); free(clip_edges.t);
             if (!culled_count) {
                FREE(culled_indices);
                FREE(culled_flat);
-               return;   /* nothing survived the cull and the edge flags */
+               return;   /* nothing whole survived the cull, clip and flags */
             }
             culled_info = *info;
             culled_info.mode = culled_mode;
@@ -29664,8 +30100,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                if (culled_mode != MESA_PRIM_LINES || !culled_flat ||
                    !gex_wgpu_flat_unfilled_draw(pipe, &culled_info,
                                                 drawid_offset, &culled_draw,
-                                                culled_indices, culled_flat,
-                                                culled_count))
+                                                culled_indices, NULL, NULL,
+                                                culled_flat, culled_count))
                   gex_wgpu_draw_vbo(pipe, &culled_info, drawid_offset, NULL,
                                     &culled_draw, 1);
                FREE(culled_indices);
