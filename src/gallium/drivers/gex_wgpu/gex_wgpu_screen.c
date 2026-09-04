@@ -29984,8 +29984,21 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    static int no_unfilled = -1;
    if (no_unfilled < 0)
       no_unfilled = getenv("GEX_WGPU_NO_UNFILLED") ? 1 : 0;
+   /* Not a draw this driver built to *rasterize* a line.
+    *
+    * The wide, smooth and stippled line rewrite draws its segments as
+    * triangles, and polygon mode was still GL_LINE when they arrived here --
+    * so the unfilled rewrite turned each quad into its own wireframe. A
+    * glLineWidth(4) unfilled polygon came out as a one-pixel outline plus a
+    * sloped band per edge, which is each quad's outline and diagonal, at 520
+    * lit pixels against llvmpipe's 696. Polygon mode has already been applied
+    * by the time that draw exists; applying it again is not a second chance
+    * but a second rewrite.
+    *
+    * gs_rasterizing is deliberately *not* excluded here: GL does apply
+    * polygon mode to a geometry shader's output primitives. */
    if (!no_unfilled && !ctx->failed && info && draws && num_draws == 1 &&
-       !indirect && ctx->rasterizer &&
+       !indirect && ctx->rasterizer && !ctx->line_rewritten &&
        ctx->rasterizer->fill_mode != PIPE_POLYGON_MODE_FILL &&
        u_reduced_prim(info->mode) == MESA_PRIM_TRIANGLES) {
       /* Culling has to be applied here rather than left to the rasterizer.
