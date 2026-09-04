@@ -3530,9 +3530,23 @@ struct gex_wgpu_border_lowering {
 
 struct gex_wgpu_texture_lowering {
    bool failed;
+   /* Which condition refused, for the report in gex_wgpu_lower_texture_variant.
+    * A texture lowering that fails without saying why costs an afternoon: the
+    * caller only knows "could not build a variant", the draw vanishes, and
+    * the shader that failed never reaches the dump in gex_wgpu_compile_nir --
+    * so there is nothing to read. First refusal wins, since the later ones
+    * are usually consequences. */
+   const char *why;
    bool active[GEX_WGPU_MAX_SAMPLERS];
    struct gex_wgpu_border_lowering slots[GEX_WGPU_MAX_SAMPLERS];
 };
+
+#define gex_tex_lower_fail(table, reason)                                     \
+   do {                                                                       \
+      if (!(table)->why)                                                      \
+         (table)->why = (reason);                                             \
+      (table)->failed = true;                                                 \
+   } while (0)
 
 static uint8_t
 gex_wgpu_effective_view_swizzle(const struct pipe_sampler_view *view,
@@ -3579,7 +3593,7 @@ gex_wgpu_lower_sampler_lod_bias_instr(nir_builder *b, nir_instr *instr,
       ? sampler_var->data.driver_location : GEX_WGPU_MAX_SAMPLERS;
    struct gex_wgpu_texture_lowering *table = data;
    if (slot >= GEX_WGPU_MAX_SAMPLERS || !table->active[slot]) {
-      table->failed = true;
+      gex_tex_lower_fail(table, "a LOD-bias slot with no sampler state");
       return false;
    }
    const float bias = table->slots[slot].lod_bias;
@@ -3589,7 +3603,7 @@ gex_wgpu_lower_sampler_lod_bias_instr(nir_builder *b, nir_instr *instr,
    if (tex->op == nir_texop_tg4)
       return true;
    if (tex->is_shadow) {
-      table->failed = true;
+      gex_tex_lower_fail(table, "sampler LOD bias on a shadow lookup");
       return false;
    }
 
@@ -3603,7 +3617,7 @@ gex_wgpu_lower_sampler_lod_bias_instr(nir_builder *b, nir_instr *instr,
          ? nir_tex_src_lod : nir_tex_src_bias;
       nir_def *original = nir_steal_tex_src(tex, source);
       if (!original) {
-         table->failed = true;
+         gex_tex_lower_fail(table, "sampler LOD bias with no bias or LOD source");
          return false;
       }
       nir_tex_instr_add_src(
@@ -3613,9 +3627,159 @@ gex_wgpu_lower_sampler_lod_bias_instr(nir_builder *b, nir_instr *instr,
        * LOD bias.  Leave both derivatives unchanged. */
       return true;
    } else {
-      table->failed = true;
+      gex_tex_lower_fail(table, "sampler LOD bias on an unexpected texture op");
       return false;
    }
+   return true;
+}
+
+/* An integer textureGather, as four nearest samples.
+ *
+ * Tint's SPIR-V reader refuses OpImageGather on an integer image outright --
+ * "sampled image must have float component type" -- so unlike the float form
+ * this cannot simply be passed through, even though WGSL itself has
+ * textureGather for texture_2d<i32>. It is every int and uint case in
+ * KHR-GL44.texture_gather, in all three of its forms.
+ *
+ * A gather is four *unfiltered* texel reads, so it decomposes into four
+ * nearest samples at the centres of the four texels a bilinear filter would
+ * have blended -- and this driver already lowers a nearest integer sample
+ * into a fetch with GL's wrap rule, the edge clamp, the border colour and the
+ * view swizzle all applied. So this pass only has to name the four
+ * coordinates and leave the hard part to the pass that follows it: it runs
+ * before gex_wgpu_lower_integer_sample_instr, and the samples it creates are
+ * that pass's ordinary input.
+ *
+ * Two details are easy to get wrong. The footprint is
+ * `floor(P * size - 0.5)`, not `floor(P * size)` -- the half-texel is what
+ * makes the four texels the ones a filter would use. And GL's rotation is
+ * (texel(i0,j1), texel(i1,j1), texel(i1,j0), texel(i0,j0)): anticlockwise
+ * from the *upper* left, so component 3 is the lower-left texel and not the
+ * first one. Any other order returns the right four values in the wrong
+ * places, which a probe using four distinct texels catches and one using a
+ * constant texture does not.
+ */
+static bool
+gex_wgpu_lower_integer_gather_instr(nir_builder *b, nir_instr *instr,
+                                    void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->op != nir_texop_tg4)
+      return false;
+   const nir_alu_type result_type =
+      nir_alu_type_get_base_type(tex->dest_type);
+   if (result_type != nir_type_uint && result_type != nir_type_int)
+      return false;
+
+   struct gex_wgpu_texture_lowering *table = data;
+   const int texture_src =
+      nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int sampler_src =
+      nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (texture_src < 0 || sampler_src < 0 || coord_src < 0) {
+      gex_tex_lower_fail(table, "an integer gather with no texture, sampler or coordinate");
+      return false;
+   }
+   nir_variable *sampler_var = nir_deref_instr_get_variable(
+      nir_src_as_deref(tex->src[sampler_src].src));
+   const unsigned slot = sampler_var
+      ? sampler_var->data.driver_location : GEX_WGPU_MAX_SAMPLERS;
+   /* Not an integer-sampled slot: nothing here applies, and the pass that
+    * owns it will say so. */
+   if (slot >= GEX_WGPU_MAX_SAMPLERS || !table->active[slot] ||
+       !table->slots[slot].integer_sampled)
+      return false;
+   /* A gather has no 1D or 3D form, and a cube one arrives as a 2D array only
+    * if the cubemap lowering ran ahead of this. The four-offset form is split
+    * into four single-offset gathers by nir_lower_tex before this, so an
+    * explicit offset table here means that did not happen. */
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_shadow ||
+       tex->coord_components != (tex->is_array ? 3u : 2u) ||
+       nir_tex_instr_has_explicit_tg4_offsets(tex) ||
+       tex->component > 3) {
+      gex_tex_lower_fail(table, "an integer gather whose shape this driver cannot decompose");
+      return false;
+   }
+
+   b->cursor = nir_before_instr(instr);
+   nir_def *coord = tex->src[coord_src].src.ssa;
+   nir_def *texture_deref = tex->src[texture_src].src.ssa;
+   nir_def *sampler_deref = tex->src[sampler_src].src.ssa;
+
+   nir_tex_instr *txs = nir_tex_instr_create(b->shader, 2);
+   txs->op = nir_texop_txs;
+   txs->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   txs->is_array = tex->is_array;
+   txs->dest_type = nir_type_int32;
+   txs->texture_index = tex->texture_index;
+   txs->src[0] =
+      nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture_deref);
+   txs->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
+   nir_def_init(&txs->instr, &txs->def, tex->is_array ? 3 : 2, 32);
+   nir_builder_instr_insert(b, &txs->instr);
+   nir_def *size = nir_i2f32(
+      b, nir_vec2(b, nir_channel(b, &txs->def, 0),
+                  nir_channel(b, &txs->def, 1)));
+
+   /* The lower-left texel of the footprint, in texel space. */
+   nir_def *uv = nir_vec2(b, nir_channel(b, coord, 0),
+                          nir_channel(b, coord, 1));
+   nir_def *corner =
+      nir_ffloor(b, nir_fadd_imm(b, nir_fmul(b, uv, size), -0.5f));
+   const int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   if (offset_src >= 0)
+      corner = nir_fadd(b, corner,
+                        nir_i2f32(b, tex->src[offset_src].src.ssa));
+
+   /* GL's rotation, as texel offsets from that corner. */
+   static const float across[4] = {0.0f, 1.0f, 1.0f, 0.0f};
+   static const float up[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+   nir_def *gathered[4];
+   for (unsigned k = 0; k < 4; ++k) {
+      /* The texel's centre, back in normalised coordinates, so the sample
+       * below lands unambiguously inside it whatever the wrap rule does. */
+      nir_def *centre = nir_fdiv(
+         b, nir_fadd(b, corner,
+                     nir_imm_vec2(b, across[k] + 0.5f, up[k] + 0.5f)),
+         size);
+      nir_def *full = tex->is_array
+         ? nir_vec3(b, nir_channel(b, centre, 0), nir_channel(b, centre, 1),
+                    nir_channel(b, coord, 2))
+         : centre;
+      /* An *explicit* level, and not because a gather has one to choose: it
+       * reads the view's base level and nothing else. It matters because an
+       * implicit-LOD sample is illegal outside a fragment shader -- there are
+       * no derivatives to take one from -- and SPIR-V validation says so
+       * about the entry point rather than about the instruction:
+       *
+       *   OpEntryPoint Entry Point's callgraph contains function %main,
+       *   which cannot be used with the current execution model
+       *
+       * The CTS gathers in a *vertex* shader, so an implicit-LOD decomposition
+       * passes a fragment-shader probe and fails every case in the suite. */
+      nir_tex_instr *one = nir_tex_instr_create(b->shader, 4);
+      one->op = nir_texop_txl;
+      one->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      one->is_array = tex->is_array;
+      one->coord_components = tex->coord_components;
+      one->dest_type = tex->dest_type;
+      one->texture_index = tex->texture_index;
+      one->sampler_index = tex->sampler_index;
+      one->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, full);
+      one->src[1] =
+         nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture_deref);
+      one->src[2] =
+         nir_tex_src_for_ssa(nir_tex_src_sampler_deref, sampler_deref);
+      one->src[3] =
+         nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_float(b, 0.0f));
+      nir_def_init(&one->instr, &one->def, 4, tex->def.bit_size);
+      nir_builder_instr_insert(b, &one->instr);
+      gathered[k] = nir_channel(b, &one->def, tex->component);
+   }
+   nir_def_replace(&tex->def, nir_vec(b, gathered, 4));
    return true;
 }
 
@@ -3632,6 +3796,16 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       return false;
    /* These are the legal integer-texture operations emitted by this pass. */
    if (tex->op == nir_texop_txf || tex->op == nir_texop_txs)
+      return false;
+   /* A gather needs no emulation. This pass exists because WebGPU forbids a
+    * *filtering* sampler on an integer texture, so an integer `texture()` has
+    * to become a fetch with the wrap rule and the filter done by hand -- and
+    * a gather filters nothing: it returns four raw texels, which a
+    * non-filtering sampler is entitled to do. Refusing it here cost every
+    * int and uint case in KHR-GL44.texture_gather, in all three of its forms,
+    * and the refusal latched -- so the *next* unrelated call returned
+    * GL_OUT_OF_MEMORY and the failure surfaced nowhere near a gather. */
+   if (tex->op == nir_texop_tg4)
       return false;
    const int texture_src =
       nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
@@ -3651,7 +3825,7 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
        !supported_dim || tex->is_shadow ||
        texture_src < 0 || sampler_src < 0 || coord_src < 0 ||
        (tex->op == nir_texop_txl && lod_src < 0)) {
-      table->failed = true;
+      gex_tex_lower_fail(table, "an integer texture op that is not a nearest sample");
       return false;
    }
    nir_variable *sampler_var = nir_deref_instr_get_variable(
@@ -3660,7 +3834,7 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       ? sampler_var->data.driver_location : GEX_WGPU_MAX_SAMPLERS;
    if (slot >= GEX_WGPU_MAX_SAMPLERS || !table->active[slot] ||
        !table->slots[slot].integer_sampled) {
-      table->failed = true;
+      gex_tex_lower_fail(table, "an integer sample on a slot with no integer sampler state");
       return false;
    }
 
@@ -3669,13 +3843,13 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
    b->cursor = nir_after_instr(instr);
    const struct gex_wgpu_border_lowering *lower = &table->slots[slot];
    if (lower->integer_cube && tex->op != nir_texop_txl) {
-      table->failed = true;
+      gex_tex_lower_fail(table, "an integer cube sample without an explicit LOD");
       return false;
    }
    if (tex->is_array != lower->integer_array ||
        is_1d != lower->integer_1d ||
        is_3d != lower->integer_3d) {
-      table->failed = true;
+      gex_tex_lower_fail(table, "an integer sample whose shape disagrees with its slot");
       return false;
    }
    nir_def *zero_lod = nir_imm_int(b, 0);
@@ -3840,7 +4014,7 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       } else if (swizzle == PIPE_SWIZZLE_1) {
          swizzled[i] = nir_imm_int(b, 1);
       } else {
-         table->failed = true;
+         gex_tex_lower_fail(table, "a view swizzle component that is neither a channel, 0 nor 1");
          return false;
       }
    }
@@ -3882,7 +4056,7 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
    const int sampler_src =
       nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
    if (sampler_src < 0) {
-      table->failed = true;
+      gex_tex_lower_fail(table, "a mirror-clamp sample with no sampler");
       return false;
    }
    nir_variable *sampler_var = nir_deref_instr_get_variable(
@@ -3891,7 +4065,7 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
       ? sampler_var->data.driver_location : GEX_WGPU_MAX_SAMPLERS;
    if (sampler_slot >= GEX_WGPU_MAX_SAMPLERS ||
        !table->active[sampler_slot]) {
-      table->failed = true;
+      gex_tex_lower_fail(table, "a mirror-clamp sample on a slot with no sampler state");
       return false;
    }
    const struct gex_wgpu_border_lowering *lower =
@@ -4559,6 +4733,11 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
    const nir_lower_tex_options rect_options = {
       .lower_rect = true,
       .lower_txd_cb = gex_wgpu_lower_integer_txd,
+      /* textureGatherOffsets, split into four single-offset gathers taking
+       * one texel each -- Mesa's own lowering, so the rule about *which*
+       * texel of each footprint is authoritative rather than remembered. The
+       * integer gather pass below only ever sees one offset because of it. */
+      .lower_tg4_offsets = true,
    };
    bool progress = false;
    NIR_PASS(progress, nir, nir_lower_tex, &rect_options);
@@ -4676,6 +4855,10 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
    }
    progress |= has_integer_cube &&
       dxil_nir_lower_int_cubemaps(nir, true);
+   /* Before the sample pass, whose ordinary input is what this produces. */
+   progress |= nir_shader_instructions_pass(
+      nir, gex_wgpu_lower_integer_gather_instr,
+      nir_metadata_control_flow | nir_metadata_loop_analysis, &table);
    progress |= nir_shader_instructions_pass(
       nir, gex_wgpu_lower_integer_sample_instr,
       nir_metadata_control_flow | nir_metadata_loop_analysis, &table);
@@ -4697,6 +4880,14 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
     * which, through st/mesa's GL_OUT_OF_MEMORY, ends the whole CTS run. A
     * variant that changed nothing is a correct variant. */
    (void)progress;
+   if (table.failed) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: texture lowering refused (%s)\n",
+                 table.why ? table.why : "unknown");
+      }
+   }
    return !table.failed;
 }
 
@@ -5421,6 +5612,40 @@ gex_wgpu_tex_log(nir_shader *nir, const char *where)
    }
 }
 
+/* Whether a texture instruction carries an offset that is not a constant.
+ *
+ * Tint's SPIR-V reader accepts the `ConstOffset` image operand and rejects the
+ * dynamic `Offset` one:
+ *
+ *   error: unsupported image operands (16): %34 = OpImageGather ...
+ *
+ * -- 16 being SpvImageOperandsOffsetMask. WGSL's offset parameter must be a
+ * const-expression, so there is nothing to translate it to. GL 4.0 does allow
+ * a non-constant offset for textureGatherOffset (ARB_gpu_shader5 relaxed the
+ * constant requirement), so this is a real GL feature and not a shader bug,
+ * and every one of KHR-GL44.texture_gather's fifteen offset-gather cases is
+ * it -- including the float ones, which have nothing else wrong with them.
+ *
+ * nir_lower_tex folds the offset into the coordinate instead, which is what
+ * the offset means: texels for a rect sampler, offset/textureSize for a
+ * normalised one, and never applied to an array layer. That is Mesa's own
+ * lowering rather than a local approximation, so it agrees with the
+ * reference.
+ *
+ * A *constant* offset must not be lowered: `ConstOffset` is exact, while the
+ * lowering divides by the texture size and lands on a texel boundary, which
+ * is precisely where a gather's footprint is ambiguous. */
+static bool
+gex_wgpu_tex_offset_is_dynamic(const nir_instr *instr, const void *data)
+{
+   (void)data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex((nir_instr *)instr);
+   const int at = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   return at >= 0 && !nir_src_as_const_value(tex->src[at].src);
+}
+
 static WGPUShaderModule
 gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
                      enum mesa_shader_stage stage, bool flip_y,
@@ -5459,6 +5684,8 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
        * Adding the offset to the coordinate is what the offset means for a
        * fetch, since a fetch takes texels and never wraps or filters. */
       .lower_txf_offset = true,
+      /* textureGatherOffset with a non-constant offset; see the filter. */
+      .lower_offset_filter = gex_wgpu_tex_offset_is_dynamic,
    };
    gex_wgpu_tex_log(nir, "entry");
    NIR_PASS(_, nir, nir_lower_tex, &texture_options);
@@ -23110,6 +23337,19 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       char *error = NULL;
       WGPUShaderModule module = gex_wgpu_compile_nir(
          &ctx->base, clone, MESA_SHADER_VERTEX, pass == 1, &error);
+      /* Said out loud rather than freed unread. Discarding it left the
+       * failure below with nothing but a list of the four things it could
+       * have been, and the shader that failed never reaches the dump in
+       * compile_nir -- so a rejected vertex variant was undiagnosable from
+       * the log. */
+      if (!module && error) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: vertex variant compile failed: %s\n",
+                    error);
+         }
+      }
       FREE(error);
       if (pass == 0)
          variant->module = module;
