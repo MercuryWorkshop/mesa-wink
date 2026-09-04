@@ -183,7 +183,14 @@ gex_wgpu_buffer_texture_words(enum pipe_format format)
 #define GEX_WGPU_PARAM_FIRST_INDEX \
    (GEX_WGPU_PARAM_VB_OFFSET + GEX_WGPU_MAX_VERTEX_BUFFERS)
 #define GEX_WGPU_PARAM_INDEX_BIAS (GEX_WGPU_PARAM_FIRST_INDEX + 1)
-#define GEX_WGPU_PARAM_WORDS (GEX_WGPU_PARAM_INDEX_BIAS + 1)
+/* How many capture slots one instance occupies, and the draw's first
+ * instance. A capture of an instanced draw is laid out instance-major --
+ * slot = instance * VERTS_PER_INSTANCE + vertex -- so these two turn a slot
+ * back into the pair it stands for. Zero means the draw is not instanced,
+ * which is what every caller that never sets them gets. */
+#define GEX_WGPU_PARAM_VERTS_PER_INSTANCE (GEX_WGPU_PARAM_INDEX_BIAS + 1)
+#define GEX_WGPU_PARAM_FIRST_INSTANCE (GEX_WGPU_PARAM_VERTS_PER_INSTANCE + 1)
+#define GEX_WGPU_PARAM_WORDS (GEX_WGPU_PARAM_FIRST_INSTANCE + 1)
 #define GEX_WGPU_CAPTURE_GROUP 64
 /* Where a vertex shader run as compute writes its varyings when a geometry
  * shader is going to consume them.
@@ -234,10 +241,48 @@ gex_wgpu_buffer_texture_words(enum pipe_format format)
 #define GEX_WGPU_GS_VSOUT_BINDING 1
 #define GEX_WGPU_GS_VERTEX_BINDING 2
 #define GEX_WGPU_GS_INDEX_BINDING 3
-/* Words of the geometry pass parameter buffer. */
+/* How many primitives each invocation actually closed. Rasterization does not
+ * need it -- an unemitted index slot holds a degenerate primitive, which
+ * draws nothing -- but transform feedback does, because a degenerate
+ * primitive that *was* emitted has to be recorded and one that was not must
+ * not be, and nothing else in the buffers tells the two apart. */
+#define GEX_WGPU_GS_COUNT_BINDING 4
+/* Words of the geometry pass parameter buffer. `ID_BASE` is what
+ * gl_PrimitiveIDIn counts from: zero for an ordinary draw, and for one split
+ * by primitive restart the number of primitives the earlier ranges already
+ * took, because GL numbers primitives across the whole draw call and a
+ * restart does not reset the count. */
 #define GEX_WGPU_GS_PARAM_PRIMITIVES 0
+#define GEX_WGPU_GS_PARAM_ID_BASE 1
 #define GEX_WGPU_GS_PARAM_WORDS 4
 #define GEX_WGPU_GS_GROUP 32
+
+/* Bindings of the scan that turns those per-invocation counts into the offset
+ * each invocation's primitives start at, so the compaction below can write
+ * them packed and in primitive order -- which is the order GL records. */
+#define GEX_WGPU_GSSCAN_PARAMS_BINDING 0
+#define GEX_WGPU_GSSCAN_COUNTS_BINDING 1
+#define GEX_WGPU_GSSCAN_OFFSETS_BINDING 2
+#define GEX_WGPU_GSSCAN_PARAM_INVOCATIONS 0
+#define GEX_WGPU_GSSCAN_PARAM_WORDS 4
+
+/* Bindings of the transform-feedback compaction pass, which is what actually
+ * records a geometry shader's output: one invocation per (invocation,
+ * primitive slot) pair, reading the vertices the geometry pass wrote through
+ * the indices it wrote, and writing the captured components packed. */
+#define GEX_WGPU_GSXFB_PARAMS_BINDING 0
+#define GEX_WGPU_GSXFB_COUNTS_BINDING 1
+#define GEX_WGPU_GSXFB_OFFSETS_BINDING 2
+#define GEX_WGPU_GSXFB_VERTICES_BINDING 3
+#define GEX_WGPU_GSXFB_INDICES_BINDING 4
+#define GEX_WGPU_GSXFB_SO_FIRST_BINDING 5
+#define GEX_WGPU_GSXFB_PARAM_INVOCATIONS 0
+#define GEX_WGPU_GSXFB_PARAM_SLOTS 1
+#define GEX_WGPU_GSXFB_PARAM_WRITABLE 2
+#define GEX_WGPU_GSXFB_PARAM_SO_OFFSET 3
+#define GEX_WGPU_GSXFB_PARAM_WORDS \
+   (GEX_WGPU_GSXFB_PARAM_SO_OFFSET + GEX_WGPU_MAX_SO_BUFFERS)
+#define GEX_WGPU_GSXFB_GROUP 64
 
 /* Defined with the format tables far below, and used by the shader fixups
  * that come first: a format this driver stores in a wider one, so that the
@@ -466,6 +511,7 @@ struct gex_wgpu_screen {
    /* The prefix pass a stippled line strip needs; see
     * gex_wgpu_line_prefix_module. */
    WGPUShaderModule line_prefix_module;
+   WGPUShaderModule gs_scan_module;
    WGPUDevice device;
    WGPUQueue queue;
    /* Reading depth back.
@@ -1028,6 +1074,19 @@ struct gex_wgpu_context {
    struct pipe_resource *gs_vs_out;
    struct pipe_resource *gs_vertices;
    struct pipe_resource *gs_indices;
+   /* Primitives closed per geometry invocation, and the exclusive prefix sum
+    * of those -- the two buffers transform feedback out of a geometry shader
+    * needs and rasterization does not. */
+   struct pipe_resource *gs_counts;
+   struct pipe_resource *gs_offsets;
+   /* Where the next sub-draw of a restart-split draw starts numbering its
+    * primitives, and whether such a split is in progress at all. */
+   unsigned gs_primitive_base;
+   bool gs_primitive_base_active;
+   /* Set while the geometry path re-enters the draw to rasterize what it
+    * produced. The primitive queries count what the *application* drew, and
+    * that re-entry is not it. */
+   bool gs_rasterizing;
    /* The bound tessellation stages and the scratch the five-pass tessellated
     * path runs through. See the tessellation comment above the binding
     * numbers for what each pass writes. */
@@ -1406,6 +1465,11 @@ struct gex_wgpu_capture_layout {
    uint32_t offset[PIPE_MAX_ATTRIBS];
    uint32_t stride[PIPE_MAX_ATTRIBS];
    uint32_t format[PIPE_MAX_ATTRIBS];
+   /* An instanced attribute advances once per `divisor` instances rather than
+    * once per vertex. Zero is the ordinary per-vertex attribute. Part of the
+    * key because, like the formats above, it changes the address the shader
+    * computes rather than anything the draw passes in. */
+   uint32_t divisor[PIPE_MAX_ATTRIBS];
 };
 
 /* A geometry shader, which runs as a compute pass.
@@ -1451,8 +1515,20 @@ struct gex_wgpu_gs {
    uint32_t passthrough_skip;
    unsigned max_output_prims;
    unsigned indices_per_prim;
+   /* What this shader captures, kept because the module build below clears
+    * nir->xfb_info once the geometry shader has become a compute shader --
+    * and the capture pass, which is built lazily on the first draw that
+    * records, still needs it. */
+   nir_xfb_info *xfb;
+   WGPUShaderModule xfb_module;
    unsigned verts_per_input_prim;
    enum mesa_prim output_prim;
+   /* The draw topology this shader's declared input primitive corresponds to.
+    * GL lets a `layout(lines)` shader be fed GL_LINES, GL_LINE_STRIP or
+    * GL_LINE_LOOP; only the list form has one primitive per N consecutive
+    * vertices, which is the whole of what the linear indexing below assumes,
+    * so the other two are declined at draw time rather than mis-read. */
+   enum mesa_prim input_list_prim;
    unsigned ubo_count;
    uint8_t ubo_slots[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    uint32_t ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS];
@@ -5533,18 +5609,47 @@ gex_wgpu_capture_slot(nir_builder *b)
    return nir_channel(b, nir_load_global_invocation_id(b, 32), 0);
 }
 
+/* An instanced capture is instance-major, so the slot splits into the two
+ * numbers the vertex stage actually wants. VERTS_PER_INSTANCE is zero for a
+ * draw that is not instanced -- and for every caller written before this
+ * existed -- which has to mean instance zero and the slot unchanged rather
+ * than a division by zero. */
+static nir_def *
+gex_wgpu_capture_instance(nir_builder *b, struct gex_wgpu_capture *state)
+{
+   nir_def *per = gex_wgpu_param(b, state, GEX_WGPU_PARAM_VERTS_PER_INSTANCE);
+   nir_def *instance =
+      nir_udiv(b, gex_wgpu_capture_slot(b), nir_umax(b, per, nir_imm_int(b, 1)));
+   return nir_bcsel(b, nir_ieq_imm(b, per, 0), nir_imm_int(b, 0), instance);
+}
+
+/* Which vertex of its instance this slot stands for: the slot itself unless
+ * the draw is instanced, in which case every instance repeats the same
+ * vertices -- and, for an indexed draw, the same indices, which is why the
+ * slot table below holds one instance's worth however many there are. */
+static nir_def *
+gex_wgpu_capture_vertex_slot(nir_builder *b, struct gex_wgpu_capture *state)
+{
+   nir_def *slot = gex_wgpu_capture_slot(b);
+   nir_def *per = gex_wgpu_param(b, state, GEX_WGPU_PARAM_VERTS_PER_INSTANCE);
+   nir_def *within =
+      nir_umod(b, slot, nir_umax(b, per, nir_imm_int(b, 1)));
+   return nir_bcsel(b, nir_ieq_imm(b, per, 0), slot, within);
+}
+
 static nir_def *
 gex_wgpu_capture_vertex(nir_builder *b, struct gex_wgpu_capture *state)
 {
    if (!state->layout || !state->layout->index_table || !state->index)
-      return nir_iadd(b, gex_wgpu_capture_slot(b),
+      return nir_iadd(b, gex_wgpu_capture_vertex_slot(b, state),
                       gex_wgpu_param(b, state, GEX_WGPU_PARAM_FIRST_VERTEX));
 
    /* One entry per captured vertex, already resolved through the index buffer
     * and through the primitive topology, so gl_VertexID is a single load. */
    nir_deref_instr *words = gex_wgpu_block_words(b, state->index);
    return nir_load_deref(
-      b, nir_build_deref_array(b, words, gex_wgpu_capture_slot(b)));
+      b, nir_build_deref_array(b, words,
+                               gex_wgpu_capture_vertex_slot(b, state)));
 }
 
 static nir_variable *
@@ -5626,10 +5731,25 @@ gex_wgpu_capture_fetch(nir_builder *b, struct gex_wgpu_capture *state,
       return zero;
    }
 
+   /* An instanced attribute advances once per `divisor` instances and does
+    * not move with the vertex at all -- so it is addressed by
+    * `first_instance + instance / divisor`, which for the common divisor of
+    * one is just the instance. */
+   nir_def *element_index;
+   if (layout->divisor[element]) {
+      nir_def *instance = gex_wgpu_capture_instance(b, state);
+      if (layout->divisor[element] > 1)
+         instance = nir_udiv_imm(b, instance, layout->divisor[element]);
+      element_index =
+         nir_iadd(b, gex_wgpu_param(b, state, GEX_WGPU_PARAM_FIRST_INSTANCE),
+                  instance);
+   } else {
+      element_index = gex_wgpu_capture_vertex(b, state);
+   }
    nir_def *byte =
       nir_iadd(b, gex_wgpu_param(b, state, GEX_WGPU_PARAM_VB_OFFSET + slot),
                nir_iadd_imm(b,
-                            nir_imul_imm(b, gex_wgpu_capture_vertex(b, state),
+                            nir_imul_imm(b, element_index,
                                          layout->stride[element]),
                             layout->offset[element]));
    nir_def *word = nir_ushr_imm(b, byte, 2);
@@ -5680,8 +5800,7 @@ gex_wgpu_capture_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
-/* The vertex-stage system values a compute invocation has to stand in for.
- * Instanced capture is refused at the draw, so the instance is always zero. */
+/* The vertex-stage system values a compute invocation has to stand in for. */
 static bool
 gex_wgpu_capture_builtin(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -5693,14 +5812,18 @@ gex_wgpu_capture_builtin(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       value = gex_wgpu_capture_vertex(b, state);
       break;
    case nir_intrinsic_load_vertex_id_zero_base:
-      value = gex_wgpu_capture_slot(b);
+      value = gex_wgpu_capture_vertex_slot(b, state);
       break;
    case nir_intrinsic_load_first_vertex:
    case nir_intrinsic_load_base_vertex:
       value = gex_wgpu_param(b, state, GEX_WGPU_PARAM_FIRST_VERTEX);
       break;
    case nir_intrinsic_load_instance_id:
+      value = gex_wgpu_capture_instance(b, state);
+      break;
    case nir_intrinsic_load_base_instance:
+      value = gex_wgpu_param(b, state, GEX_WGPU_PARAM_FIRST_INSTANCE);
+      break;
    case nir_intrinsic_load_draw_id:
       value = nir_imm_int(b, 0);
       break;
@@ -16891,6 +17014,7 @@ struct gex_wgpu_gs_lowering {
    nir_variable *indices;
    nir_variable *verts_in_prim;
    nir_variable *triangles;
+   nir_variable *counts;
    bool failed;
 };
 
@@ -17027,6 +17151,40 @@ gex_wgpu_gs_emit(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return true;
    }
 
+   /* A line strip closes a line from the previous vertex to this one -- one
+    * previous vertex, no winding to alternate, so the triangle arithmetic
+    * below does not describe it and it gets its own short branch. Before
+    * there is a previous vertex the two indices collapse to one, leaving a
+    * zero-length line in the slot until a real one overwrites it, exactly as
+    * the triangle path leaves a degenerate triangle. */
+   if (gs->output_prim == MESA_PRIM_LINE_STRIP) {
+      nir_def *in_prim = nir_load_var(b, state->verts_in_prim);
+      nir_def *closes = nir_uge_imm(b, in_prim, 1);
+      nir_def *from =
+         nir_bcsel(b, closes, nir_iadd(b, base, nir_iadd_imm(b, emitted, -1)),
+                   base);
+      nir_def *to = nir_bcsel(b, closes, slot, base);
+
+      nir_def *line =
+         nir_iadd(b, nir_imul_imm(b, invocation, gs->max_output_prims),
+                  nir_load_var(b, state->triangles));
+      nir_deref_instr *line_data = gex_wgpu_block_words(b, state->indices);
+      nir_def *index_word = nir_imul_imm(b, line, 2);
+      nir_def *written[2] = {from, to};
+      for (unsigned i = 0; i < 2; ++i) {
+         nir_deref_instr *at = nir_build_deref_array(
+            b, line_data, nir_iadd_imm(b, index_word, i));
+         nir_store_deref(b, at, written[i], 0x1);
+      }
+
+      nir_store_var(b, state->triangles,
+                    nir_iadd(b, nir_load_var(b, state->triangles),
+                             nir_b2i32(b, closes)), 0x1);
+      nir_store_var(b, state->verts_in_prim, nir_iadd_imm(b, in_prim, 1), 0x1);
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+
    /* The strip closes a triangle from this vertex and the previous two, with
     * the winding flipped on every other one. Before there are two previous
     * vertices there is no triangle, and the three indices collapse to one, so
@@ -17069,9 +17227,15 @@ gex_wgpu_gs_builtin(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *value = NULL;
    switch (intr->intrinsic) {
-   case nir_intrinsic_load_primitive_id:
-      value = gex_wgpu_gs_invocation(b);
+   case nir_intrinsic_load_primitive_id: {
+      nir_deref_instr *words = gex_wgpu_block_words(b, state->params);
+      value = nir_iadd(
+         b, gex_wgpu_gs_invocation(b),
+         nir_load_deref(b, nir_build_deref_array(
+                              b, words,
+                              nir_imm_int(b, GEX_WGPU_GS_PARAM_ID_BASE))));
       break;
+   }
    case nir_intrinsic_load_invocation_id:
       /* Geometry shader instancing is refused when the shader is created. */
       value = nir_imm_int(b, 0);
@@ -17587,6 +17751,10 @@ gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs)
                                         GEX_WGPU_GS_VERTEX_BINDING, 2, false);
    state.indices = gex_wgpu_word_block(nir, "gex_gs_indices",
                                        GEX_WGPU_GS_INDEX_BINDING, 3, false);
+   /* Declared whether or not this draw captures. A bind group layout is part
+    * of the module, so making it conditional would mean two modules. */
+   state.counts = gex_wgpu_word_block(nir, "gex_gs_counts",
+                                      GEX_WGPU_GS_COUNT_BINDING, 4, false);
 
    /* The shader's own constant buffers move to group one, so group zero is
     * this pass's buffers alone -- the same split the vertex compute pass
@@ -17612,6 +17780,20 @@ gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs)
    if (state.failed) {
       ralloc_free(nir);
       return NULL;
+   }
+
+   /* How many primitives this invocation closed, recorded for the capture
+    * pass. Written at the end of the shader and before the bounds check
+    * below is lowered, so `nir_lower_returns` predicates it away for an
+    * invocation with no primitive exactly as it does everything else. */
+   {
+      nir_builder tail = nir_builder_at(nir_after_impl(impl));
+      nir_deref_instr *count_words =
+         gex_wgpu_block_words(&tail, state.counts);
+      nir_store_deref(&tail,
+                      nir_build_deref_array(&tail, count_words,
+                                            gex_wgpu_gs_invocation(&tail)),
+                      nir_load_var(&tail, state.triangles), 0x1);
    }
 
    /* One invocation per input primitive; the rest of the workgroup has no
@@ -18518,26 +18700,76 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
    }
 
    /* What this path implements, stated once. Anything else is refused here
-    * rather than mis-rendered later. */
+    * rather than mis-rendered later.
+    *
+    * The input primitive decides only two numbers: how many vertices one
+    * invocation reads, and which draw topology feeds it. GL's five input
+    * primitives are all *lists* of consecutive vertices -- including the two
+    * adjacency forms, where the adjacent vertices are simply part of the
+    * primitive -- so one table covers them and the linear indexing in the
+    * fetch pass needs no case of its own. */
+   struct gs_input_kind {
+      enum mesa_prim declared;   /* what the shader says */
+      enum mesa_prim list;       /* the draw topology that feeds it */
+      unsigned verts;
+   };
+   static const struct gs_input_kind input_kinds[] = {
+      {MESA_PRIM_POINTS,             MESA_PRIM_POINTS,             1},
+      {MESA_PRIM_LINES,              MESA_PRIM_LINES,              2},
+      {MESA_PRIM_LINES_ADJACENCY,    MESA_PRIM_LINES_ADJACENCY,    4},
+      {MESA_PRIM_TRIANGLES,          MESA_PRIM_TRIANGLES,          3},
+      {MESA_PRIM_TRIANGLES_ADJACENCY, MESA_PRIM_TRIANGLES_ADJACENCY, 6},
+   };
+   const struct gs_input_kind *input_kind = NULL;
+   for (unsigned i = 0; i < ARRAY_SIZE(input_kinds); ++i) {
+      if (input_kinds[i].declared == nir->info.gs.input_primitive) {
+         input_kind = &input_kinds[i];
+         break;
+      }
+   }
+
+   /* The output primitive decides how many indices each emitted primitive
+    * takes, how many of them a strip of `vertices_out` closes, and how few
+    * vertices a shader may declare and still close one. GL has three, and a
+    * strip of N closes N - (verts_per_prim - 1) of them; points are the
+    * degenerate case where that arithmetic gives N. */
+   struct gs_output_kind {
+      enum mesa_prim declared;
+      unsigned indices;          /* per emitted primitive */
+      unsigned least_vertices;   /* below this the shader closes nothing */
+      const char *cannot_close;
+   };
+   static const struct gs_output_kind output_kinds[] = {
+      {MESA_PRIM_POINTS, 1, 1,
+       "gex_wgpu geometry shaders must be able to emit a point"},
+      {MESA_PRIM_LINE_STRIP, 2, 2,
+       "gex_wgpu geometry shaders must be able to emit a line"},
+      {MESA_PRIM_TRIANGLE_STRIP, 3, 3,
+       "gex_wgpu geometry shaders must be able to emit a triangle"},
+   };
+   const struct gs_output_kind *output_kind = NULL;
+   for (unsigned i = 0; i < ARRAY_SIZE(output_kinds); ++i) {
+      if (output_kinds[i].declared == nir->info.gs.output_primitive) {
+         output_kind = &output_kinds[i];
+         break;
+      }
+   }
+
    const char *refusal = NULL;
-   const bool points_out = nir->info.gs.output_primitive == MESA_PRIM_POINTS;
-   const bool points_in = nir->info.gs.input_primitive == MESA_PRIM_POINTS;
-   if (!points_out && nir->info.gs.output_primitive != MESA_PRIM_TRIANGLE_STRIP)
-      refusal = "gex_wgpu geometry shaders must output points or a triangle strip";
-   else if (!points_in && nir->info.gs.input_primitive != MESA_PRIM_TRIANGLES)
-      refusal = "gex_wgpu geometry shaders must take points or triangles";
+   if (!output_kind)
+      refusal = "gex_wgpu geometry shaders must output points, a line strip or a triangle strip";
+   else if (!input_kind)
+      refusal = "gex_wgpu geometry shaders must take points, lines or triangles";
    else if (nir->info.gs.invocations > 1)
       refusal = "gex_wgpu does not implement geometry shader instancing";
    else if (nir->info.gs.active_stream_mask & ~1u)
       refusal = "gex_wgpu geometry shaders may only write stream zero";
-   /* A triangle strip needs three vertices before it closes anything; a point
-    * stream needs one. Requiring three of both refused the smallest useful
-    * geometry shader there is -- `max_vertices = 1` emitting a single point,
-    * which is what the transform-feedback tests use. */
-   else if (nir->info.gs.vertices_out < (points_out ? 1u : 3u))
-      refusal = points_out
-         ? "gex_wgpu geometry shaders must be able to emit a point"
-         : "gex_wgpu geometry shaders must be able to emit a triangle";
+   /* A triangle strip needs three vertices before it closes anything; a line
+    * strip two, a point stream one. Requiring three of all three refused the
+    * smallest useful geometry shader there is -- `max_vertices = 1` emitting
+    * a single point, which is what the transform-feedback tests use. */
+   else if (nir->info.gs.vertices_out < output_kind->least_vertices)
+      refusal = output_kind->cannot_close;
    if (refusal) {
       gex_wgpu_set_compile_error(mutable_state, refusal);
       ralloc_free(nir);
@@ -18551,25 +18783,25 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
    }
    gs->max_vertices = nir->info.gs.vertices_out;
    gs->output_prim = nir->info.gs.output_primitive;
-   /* The output primitive decides how many indices each emitted primitive
-    * takes and how many of them a strip of `vertices_out` closes; the *input*
-    * primitive decides how many vertices one invocation reads. Deriving both
-    * from the output was a latent bug the refusal above hid: a shader taking
-    * points and emitting triangles -- point expansion, which is how a
-    * billboard or a particle is drawn, and what
-    * KHR-GL44.texture_view.view_sampling uses -- would have read three
-    * vertices per point. Now that they are separate the two can differ, and
-    * `verts_per_input_prim` means what its two other readers already assume:
-    * the draw's topology (POINTS or TRIANGLES) and the divisor that turns a
-    * vertex count into an invocation count. */
-   gs->verts_per_input_prim = points_in ? 1 : 3;
-   if (points_out) {
-      gs->max_output_prims = gs->max_vertices;
-      gs->indices_per_prim = 1;
-   } else {
-      gs->max_output_prims = gs->max_vertices - 2;
-      gs->indices_per_prim = 3;
+   if (nir->xfb_info) {
+      const size_t bytes = nir_xfb_info_size(nir->xfb_info->output_count);
+      gs->xfb = malloc(bytes);
+      if (gs->xfb)
+         memcpy(gs->xfb, nir->xfb_info, bytes);
    }
+   /* Input and output are read from their own tables. Deriving both from the
+    * output was a latent bug an earlier refusal hid: a shader taking points
+    * and emitting triangles -- point expansion, which is how a billboard or a
+    * particle is drawn, and what KHR-GL44.texture_view.view_sampling uses --
+    * would have read three vertices per point. They are separate now, and
+    * `verts_per_input_prim` means what its two other readers already assume:
+    * the divisor that turns a vertex count into an invocation count, and the
+    * stride of the fetch into the captured vertex-shader outputs. */
+   gs->verts_per_input_prim = input_kind->verts;
+   gs->input_list_prim = input_kind->list;
+   gs->indices_per_prim = output_kind->indices;
+   gs->max_output_prims =
+      gs->max_vertices - (output_kind->least_vertices - 1);
    gs->max_triangles = gs->max_output_prims;
 
    if (!gex_wgpu_lower_gallium_ubos(
@@ -18580,6 +18812,7 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       gex_wgpu_set_compile_error(
          mutable_state, "gex_wgpu could not lay out geometry shader varyings");
       ralloc_free(nir);
+      free(gs->xfb);
       FREE(gs);
       return NULL;
    }
@@ -18664,6 +18897,7 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       if (gs->passthrough)
          gex_wgpu_delete_shader_state(pipe, gs->passthrough);
       ralloc_free(nir);
+      free(gs->xfb);
       FREE(gs);
       return NULL;
    }
@@ -18684,6 +18918,9 @@ gex_wgpu_delete_gs_state(struct pipe_context *pipe, void *state)
       return;
    if (gs->module)
       wgpuShaderModuleRelease(gs->module);
+   if (gs->xfb_module)
+      wgpuShaderModuleRelease(gs->xfb_module);
+   free(gs->xfb);
    if (gs->passthrough)
       gex_wgpu_delete_shader_state(pipe, gs->passthrough);
    if (gs->passthrough_elements)
@@ -18819,6 +19056,7 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
          layout.offset[i] = ve->src_offset;
          layout.stride[i] = ve->src_stride;
          layout.format[i] = ve->src_format;
+         layout.divisor[i] = ve->instance_divisor;
       }
    }
 
@@ -19840,6 +20078,7 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
          layout.offset[i] = ve->src_offset;
          layout.stride[i] = ve->src_stride;
          layout.format[i] = ve->src_format;
+         layout.divisor[i] = ve->instance_divisor;
       }
    }
 
@@ -20138,18 +20377,517 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
 #undef GEX_LINE_DECLINE
 }
 
+/* Which GL draw topologies feed a geometry shader that declares this input
+ * primitive. GL lets a `layout(triangles)` shader be fed triangles, a strip
+ * or a fan -- they are the same primitives assembled differently -- so the
+ * shader's declaration names a *class* of topologies and not one of them.
+ * MESA_PRIM_COUNT for a topology no geometry shader takes. */
+static enum mesa_prim
+gex_wgpu_gs_input_class(enum mesa_prim mode)
+{
+   switch (mode) {
+   case MESA_PRIM_POINTS:
+      return MESA_PRIM_POINTS;
+   case MESA_PRIM_LINES:
+   case MESA_PRIM_LINE_STRIP:
+   case MESA_PRIM_LINE_LOOP:
+      return MESA_PRIM_LINES;
+   case MESA_PRIM_TRIANGLES:
+   case MESA_PRIM_TRIANGLE_STRIP:
+   case MESA_PRIM_TRIANGLE_FAN:
+      return MESA_PRIM_TRIANGLES;
+   case MESA_PRIM_LINES_ADJACENCY:
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return MESA_PRIM_LINES_ADJACENCY;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY:
+      return MESA_PRIM_TRIANGLES_ADJACENCY;
+   default:
+      return MESA_PRIM_COUNT;
+   }
+}
+
+/* Which vertex of the draw the Nth vertex of the geometry shader's Pth input
+ * primitive comes from.
+ *
+ * The non-adjacency topologies are the same assembly transform feedback does,
+ * so they are that function; the four adjacency ones are only ever assembled
+ * for a geometry shader and live here. Their orders are Mesa's own, from
+ * u_indices_gen.py's do_lineadj/do_triadj -- in particular a triangle strip
+ * with adjacency, whose odd primitives take their six vertices in an order
+ * that is not any rotation of the even ones. */
+static unsigned
+gex_wgpu_gs_input_vertex(enum mesa_prim mode, unsigned prim, unsigned vertex,
+                         unsigned count)
+{
+   switch (mode) {
+   case MESA_PRIM_TRIANGLE_STRIP:
+      /* Not the order transform feedback assembles a strip in. Both keep the
+       * winding by exchanging two of the three vertices, but they exchange a
+       * different two -- feedback swaps the last pair, and GL's own table
+       * for what a geometry shader reads swaps the *first*, so an odd
+       * triangle arrives as (i+1, i, i+2). A shader that reads gl_in[0] and
+       * gl_in[1] separately can tell, and the CTS's rendering cases do. */
+      if (prim & 1) {
+         static const unsigned odd[3] = {1, 0, 2};
+         return prim + odd[vertex];
+      }
+      return prim + vertex;
+   case MESA_PRIM_LINES_ADJACENCY:
+      return prim * 4 + vertex;
+   case MESA_PRIM_LINE_STRIP_ADJACENCY:
+      return prim + vertex;
+   case MESA_PRIM_TRIANGLES_ADJACENCY:
+      return prim * 6 + vertex;
+   case MESA_PRIM_TRIANGLE_STRIP_ADJACENCY: {
+      /* The awkward one, and the only topology whose mapping is not a
+       * formula: GL's table gives the first primitive, the last primitive and
+       * the even and odd middles four different rows, because the ends have
+       * no neighbour to borrow an adjacent vertex from. The offsets below are
+       * that table, converted from its one-based vertex numbering, and
+       * interleaved the way gl_in is -- even slots the triangle's own
+       * vertices, odd slots the adjacent ones.
+       *
+       * u_indices' version of this agrees on the odd rows and not the even
+       * ones, which is correct for what it does (it keeps the triangle and
+       * throws the adjacency away) and wrong for a geometry shader, which
+       * reads all six. */
+      const unsigned triangles = count >= 4 ? (count - 4) / 2 : 0;
+      const bool last = triangles && prim == triangles - 1;
+      static const int first[6]     = {0,  1, 2, 6, 4, 3};
+      static const int even[6]      = {0, -2, 2, 6, 4, 3};
+      static const int even_last[6] = {0, -2, 2, 5, 4, 3};
+      static const int odd[6]       = {2, -2, 0, 3, 4, 6};
+      static const int odd_last[6]  = {2, -2, 0, 3, 4, 5};
+      /* The first primitive is its own row even when it is also the last,
+       * which is the order GL's table is written in. */
+      const int *row = prim == 0        ? first
+                     : !(prim & 1)      ? (last ? even_last : even)
+                                        : (last ? odd_last : odd);
+      /* Every negative offset is -2 and only reachable for prim >= 1, where
+       * 2 * prim is at least 2, so this never underflows. */
+      return (unsigned)((int)(prim * 2) + row[vertex]);
+   }
+   default:
+      return gex_wgpu_assembled_vertex(mode, prim, vertex, count);
+   }
+}
+
+/* The scan that turns the geometry pass's per-invocation primitive counts
+ * into the offset each invocation's primitives start at.
+ *
+ * One invocation running a serial loop. That is the honest shape for what
+ * this is: transform feedback out of a geometry shader is a rare path, and a
+ * correct serial scan is worth more than a fast wrong one. The upgrade, if a
+ * profile ever asks for it, is the usual two-level scan -- block sums in
+ * parallel, a serial pass over the block sums, then each invocation adding
+ * its within-block prefix -- which needs no change anywhere else, because
+ * only this module's contents would differ.
+ *
+ * The last entry written is the grand total, which is how many primitives the
+ * capture recorded and what the queries want. */
+static WGPUShaderModule
+gex_wgpu_gs_scan_module(struct gex_wgpu_context *ctx)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   if (screen->gs_scan_module)
+      return screen->gs_scan_module;
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, screen->base.nir_options[MESA_SHADER_COMPUTE],
+      "gex-gs-scan");
+   nir_variable *params =
+      gex_wgpu_word_block(b.shader, "gex_gs_scan_params",
+                          GEX_WGPU_GSSCAN_PARAMS_BINDING, 0, true);
+   nir_variable *counts =
+      gex_wgpu_word_block(b.shader, "gex_gs_scan_counts",
+                          GEX_WGPU_GSSCAN_COUNTS_BINDING, 1, true);
+   nir_variable *offsets =
+      gex_wgpu_word_block(b.shader, "gex_gs_scan_offsets",
+                          GEX_WGPU_GSSCAN_OFFSETS_BINDING, 2, false);
+
+   nir_deref_instr *param_words = gex_wgpu_block_words(&b, params);
+   nir_def *invocations = nir_load_deref(
+      &b, nir_build_deref_array(
+             &b, param_words,
+             nir_imm_int(&b, GEX_WGPU_GSSCAN_PARAM_INVOCATIONS)));
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(b.shader);
+   nir_variable *at =
+      nir_local_variable_create(impl, glsl_uint_type(), "gex_gs_scan_at");
+   nir_variable *sum =
+      nir_local_variable_create(impl, glsl_uint_type(), "gex_gs_scan_sum");
+   nir_store_var(&b, at, nir_imm_int(&b, 0), 0x1);
+   nir_store_var(&b, sum, nir_imm_int(&b, 0), 0x1);
+
+   nir_deref_instr *count_words = gex_wgpu_block_words(&b, counts);
+   nir_deref_instr *offset_words = gex_wgpu_block_words(&b, offsets);
+   nir_push_loop(&b);
+   {
+      nir_def *i = nir_load_var(&b, at);
+      nir_push_if(&b, nir_uge(&b, i, invocations));
+      nir_jump(&b, nir_jump_break);
+      nir_pop_if(&b, NULL);
+
+      /* Exclusive: this invocation's primitives start where the running
+       * total stood before its own count was added. */
+      nir_store_deref(&b, nir_build_deref_array(&b, offset_words, i),
+                      nir_load_var(&b, sum), 0x1);
+      nir_store_var(&b, sum,
+                    nir_iadd(&b, nir_load_var(&b, sum),
+                             nir_load_deref(
+                                &b, nir_build_deref_array(&b, count_words, i))),
+                    0x1);
+      nir_store_var(&b, at, nir_iadd_imm(&b, i, 1), 0x1);
+   }
+   nir_pop_loop(&b, NULL);
+   /* One past the end: the total. */
+   nir_store_deref(&b, nir_build_deref_array(&b, offset_words, invocations),
+                   nir_load_var(&b, sum), 0x1);
+
+   nir_shader *nir = b.shader;
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_lower_returns);
+   nir->info.workgroup_size[0] = 1;
+   nir->info.workgroup_size[1] = 1;
+   nir->info.workgroup_size[2] = 1;
+   nir->info.workgroup_size_variable = false;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+   char *error = NULL;
+   screen->gs_scan_module =
+      gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false, &error);
+   if (!screen->gs_scan_module)
+      fprintf(stderr, "gex-wgpu: geometry scan shader failed to compile: %s\n",
+              error ? error : "unknown");
+   FREE(error);
+   return screen->gs_scan_module;
+}
+
+/* The compaction that records a geometry shader's primitives.
+ *
+ * One invocation per (geometry invocation, primitive slot) pair. A slot the
+ * shader never closed is skipped -- that is what the counts are for -- and
+ * the rest are written packed at `offsets[invocation] + slot`, which is the
+ * order GL requires and the order the scan above established.
+ *
+ * The vertices come from the geometry pass's own buffers, read through the
+ * indices it wrote: those already name the right vertices in the right order,
+ * with a strip's winding alternation applied, so a triangle strip is recorded
+ * as separate triangles without this pass knowing that strips exist. */
+static WGPUShaderModule
+gex_wgpu_gs_xfb_module(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs)
+{
+   if (gs->xfb_module || !gs->xfb)
+      return gs->xfb_module;
+
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   const nir_xfb_info *xfb = gs->xfb;
+   const unsigned per_prim = gs->indices_per_prim;
+   const unsigned stride_words = gex_wgpu_varying_stride(&gs->outputs) / 4;
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, screen->base.nir_options[MESA_SHADER_COMPUTE],
+      "gex-gs-xfb");
+   nir_variable *params =
+      gex_wgpu_word_block(b.shader, "gex_gs_xfb_params",
+                          GEX_WGPU_GSXFB_PARAMS_BINDING, 0, true);
+   nir_variable *counts =
+      gex_wgpu_word_block(b.shader, "gex_gs_xfb_counts",
+                          GEX_WGPU_GSXFB_COUNTS_BINDING, 1, true);
+   nir_variable *offsets =
+      gex_wgpu_word_block(b.shader, "gex_gs_xfb_offsets",
+                          GEX_WGPU_GSXFB_OFFSETS_BINDING, 2, true);
+   nir_variable *vertices =
+      gex_wgpu_word_block(b.shader, "gex_gs_xfb_vertices",
+                          GEX_WGPU_GSXFB_VERTICES_BINDING, 3, true);
+   nir_variable *indices =
+      gex_wgpu_word_block(b.shader, "gex_gs_xfb_indices",
+                          GEX_WGPU_GSXFB_INDICES_BINDING, 4, true);
+   nir_variable *so[GEX_WGPU_MAX_SO_BUFFERS] = {0};
+
+   nir_deref_instr *param_words = gex_wgpu_block_words(&b, params);
+#define GEX_GSXFB_PARAM(index)                                                \
+   nir_load_deref(&b, nir_build_deref_array(&b, param_words,                  \
+                                            nir_imm_int(&b, (index))))
+   nir_def *invocations = GEX_GSXFB_PARAM(GEX_WGPU_GSXFB_PARAM_INVOCATIONS);
+   nir_def *slots = GEX_GSXFB_PARAM(GEX_WGPU_GSXFB_PARAM_SLOTS);
+   nir_def *writable = GEX_GSXFB_PARAM(GEX_WGPU_GSXFB_PARAM_WRITABLE);
+
+   nir_def *id = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_push_if(&b, nir_uge(&b, id, nir_imul(&b, invocations, slots)));
+   nir_jump(&b, nir_jump_return);
+   nir_pop_if(&b, NULL);
+
+   nir_def *invocation = nir_udiv(&b, id, slots);
+   nir_def *slot = nir_umod(&b, id, slots);
+
+   /* A slot past what this invocation closed holds a primitive it never
+    * emitted, and an emitted degenerate one is indistinguishable from it in
+    * the index buffer -- which is the whole reason the counts exist. */
+   nir_deref_instr *count_words = gex_wgpu_block_words(&b, counts);
+   nir_def *closed = nir_load_deref(
+      &b, nir_build_deref_array(&b, count_words, invocation));
+   nir_push_if(&b, nir_uge(&b, slot, closed));
+   nir_jump(&b, nir_jump_return);
+   nir_pop_if(&b, NULL);
+
+   nir_deref_instr *offset_words = gex_wgpu_block_words(&b, offsets);
+   nir_def *destination = nir_iadd(
+      &b, nir_load_deref(&b, nir_build_deref_array(&b, offset_words,
+                                                   invocation)),
+      slot);
+   /* GL stops recording on a whole primitive when the buffer runs out. */
+   nir_push_if(&b, nir_uge(&b, destination, writable));
+   nir_jump(&b, nir_jump_return);
+   nir_pop_if(&b, NULL);
+
+   nir_deref_instr *index_words = gex_wgpu_block_words(&b, indices);
+   nir_deref_instr *vertex_words = gex_wgpu_block_words(&b, vertices);
+   for (unsigned k = 0; k < per_prim; ++k) {
+      nir_def *index_at = nir_iadd_imm(
+         &b,
+         nir_imul_imm(&b, nir_iadd(&b, nir_imul(&b, invocation, slots), slot),
+                      per_prim),
+         k);
+      nir_def *vertex =
+         nir_load_deref(&b, nir_build_deref_array(&b, index_words, index_at));
+      nir_def *source = nir_imul_imm(&b, vertex, stride_words);
+      /* Which recorded vertex this is: primitives are recorded whole and in
+       * order, so it is the destination primitive times its vertex count. */
+      nir_def *recorded =
+         nir_iadd_imm(&b, nir_imul_imm(&b, destination, per_prim), k);
+
+      for (unsigned o = 0; o < xfb->output_count; ++o) {
+         const nir_xfb_output_info *out = &xfb->outputs[o];
+         const int varying = gex_wgpu_varying_slot(&gs->outputs, out->location);
+         if (varying < 0)
+            continue;
+         if (!so[out->buffer]) {
+            char name[32];
+            snprintf(name, sizeof(name), "gex_gs_xfb_so%u", out->buffer);
+            so[out->buffer] = gex_wgpu_word_block(
+               b.shader, name, GEX_WGPU_GSXFB_SO_FIRST_BINDING + out->buffer,
+               GEX_WGPU_GSXFB_SO_FIRST_BINDING + out->buffer, false);
+         }
+         nir_deref_instr *so_words = gex_wgpu_block_words(&b, so[out->buffer]);
+         nir_def *base = nir_iadd(
+            &b, GEX_GSXFB_PARAM(GEX_WGPU_GSXFB_PARAM_SO_OFFSET + out->buffer),
+            nir_iadd_imm(&b,
+                         nir_imul_imm(&b, recorded,
+                                      xfb->buffers[out->buffer].stride),
+                         out->offset));
+         /* out->offset is the byte offset of the lowest component in the
+          * mask, so a component's own destination is that plus its rank
+          * among the set bits -- the same rule the vertex-stage capture
+          * follows, and for the same reason. */
+         unsigned rank = 0;
+         for (unsigned c = 0; c < 4; ++c) {
+            if (!(out->component_mask & (1u << c)))
+               continue;
+            nir_def *value = nir_load_deref(
+               &b, nir_build_deref_array(
+                      &b, vertex_words,
+                      nir_iadd_imm(&b, source, varying * 4 + c)));
+            nir_def *word =
+               nir_ushr_imm(&b, nir_iadd_imm(&b, base, rank * 4), 2);
+            nir_store_deref(&b, nir_build_deref_array(&b, so_words, word),
+                            value, 0x1);
+            ++rank;
+         }
+      }
+   }
+#undef GEX_GSXFB_PARAM
+
+   nir_shader *nir = b.shader;
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_lower_returns);
+   nir->info.workgroup_size[0] = GEX_WGPU_GSXFB_GROUP;
+   nir->info.workgroup_size[1] = 1;
+   nir->info.workgroup_size[2] = 1;
+   nir->info.workgroup_size_variable = false;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+   char *error = NULL;
+   gs->xfb_module =
+      gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false, &error);
+   if (!gs->xfb_module)
+      fprintf(stderr, "gex-wgpu: geometry capture shader failed to compile: "
+                      "%s\n", error ? error : "unknown");
+   FREE(error);
+   return gs->xfb_module;
+}
+
+/* Record a geometry shader's primitives into the bound feedback buffers.
+ *
+ * Two dispatches after the geometry pass: the scan, which turns its
+ * per-invocation primitive counts into the offset each invocation writes at,
+ * and the compaction, which does the writing. Returns false having already
+ * failed the context.
+ *
+ * How much was actually recorded is a number only the GPU has -- it is
+ * `offsets[invocations]`, written by the scan -- and both the append offset
+ * on each target and the primitive queries need it on the CPU. It is read
+ * back here, which stalls: the alternative is to leave the number on the
+ * target and resolve it at the three places that can observe it (a resumed
+ * capture, an appended one, DrawTransformFeedback), and that is the shape to
+ * reach for if this path ever turns up in a profile. It records nothing today
+ * and is used by no application this driver runs, so the four bytes are
+ * cheaper than the bookkeeping. */
+static bool
+gex_wgpu_gs_scan(struct gex_wgpu_context *ctx, unsigned prims)
+{
+   WGPUShaderModule scan = gex_wgpu_gs_scan_module(ctx);
+   if (!scan) {
+      gex_fail(ctx);
+      return false;
+   }
+   uint32_t scan_params[GEX_WGPU_GSSCAN_PARAM_WORDS] = {0};
+   scan_params[GEX_WGPU_GSSCAN_PARAM_INVOCATIONS] = prims;
+   struct gex_wgpu_bindings scan_group0 = {0}, scan_group1 = {0};
+   struct pipe_resource *scan_buffer =
+      gex_wgpu_params_buffer(ctx, scan_params, GEX_WGPU_GSSCAN_PARAM_WORDS);
+   /* Read-only where the module declares it so: a bind group layout that
+    * disagrees with the shader's own access is an invalid pipeline, which
+    * takes the whole command buffer with it. */
+   gex_wgpu_bind_storage_access(&scan_group0, GEX_WGPU_GSSCAN_PARAMS_BINDING,
+                                scan_buffer, true);
+   gex_wgpu_bind_storage_access(&scan_group0, GEX_WGPU_GSSCAN_COUNTS_BINDING,
+                                ctx->gs_counts, true);
+   gex_wgpu_bind_storage(&scan_group0, GEX_WGPU_GSSCAN_OFFSETS_BINDING,
+                         ctx->gs_offsets);
+   const bool ok = scan_buffer && gex_wgpu_dispatch(ctx, scan, &scan_group0,
+                                                    &scan_group1, NULL, 1);
+   pipe_resource_reference(&scan_buffer, NULL);
+   if (!ok)
+      gex_fail(ctx);
+   return ok;
+}
+
+/* The grand total the scan wrote one past the counts: how many primitives the
+ * geometry stage produced. Reading it costs a stall, so it is asked for only
+ * when something can observe it -- a capture, or a primitive query. */
+static unsigned
+gex_wgpu_gs_generated(struct gex_wgpu_context *ctx, unsigned prims)
+{
+   gex_resource(ctx->gs_offsets)->gpu_written = true;
+   struct pipe_transfer *transfer = NULL;
+   const uint32_t *at =
+      pipe_buffer_map_range(&ctx->base, ctx->gs_offsets, (size_t)prims * 4, 4,
+                            PIPE_MAP_READ, &transfer);
+   const unsigned total = at ? *at : 0u;
+   if (transfer)
+      pipe_buffer_unmap(&ctx->base, transfer);
+   return total;
+}
+
+/* Record a geometry shader's primitives into the bound feedback buffers. */
+static bool
+gex_wgpu_gs_capture(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs,
+                    unsigned prims)
+{
+   const nir_xfb_info *xfb = gs->xfb;
+   WGPUShaderModule compact = gex_wgpu_gs_xfb_module(ctx, gs);
+   if (!compact || !gex_wgpu_gs_scan(ctx, prims)) {
+      gex_fail(ctx);
+      return false;
+   }
+
+   /* How many primitives the smallest bound buffer has room for. GL stops on
+    * a whole primitive, so this is a primitive count and not a byte count. */
+   const unsigned per_prim = gs->indices_per_prim;
+   unsigned writable = prims * gs->max_output_prims;
+   uint32_t params[GEX_WGPU_GSXFB_PARAM_WORDS] = {0};
+   params[GEX_WGPU_GSXFB_PARAM_INVOCATIONS] = prims;
+   params[GEX_WGPU_GSXFB_PARAM_SLOTS] = gs->max_output_prims;
+
+   struct gex_wgpu_bindings group0 = {0}, group1 = {0};
+   for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
+      if (!(xfb->buffers_written & (1u << i)))
+         continue;
+      struct pipe_stream_output_target *target = ctx->so_targets[i];
+      if (!target || !target->buffer) {
+         gex_fail(ctx);
+         return false;
+      }
+      struct gex_wgpu_so_target *so = (struct gex_wgpu_so_target *)target;
+      params[GEX_WGPU_GSXFB_PARAM_SO_OFFSET + i] =
+         target->buffer_offset + so->written;
+      gex_resource(target->buffer)->gpu_written = true;
+      const unsigned stride = xfb->buffers[i].stride;
+      const unsigned left = target->buffer_size > so->written
+                               ? (unsigned)(target->buffer_size - so->written)
+                               : 0u;
+      writable = MIN2(writable, stride ? left / (stride * per_prim) : 0u);
+      gex_wgpu_bind_storage(&group0, GEX_WGPU_GSXFB_SO_FIRST_BINDING + i,
+                            target->buffer);
+   }
+   params[GEX_WGPU_GSXFB_PARAM_WRITABLE] = writable;
+
+   struct pipe_resource *param_buffer =
+      gex_wgpu_params_buffer(ctx, params, GEX_WGPU_GSXFB_PARAM_WORDS);
+   gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GSXFB_PARAMS_BINDING,
+                                param_buffer, true);
+   gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GSXFB_COUNTS_BINDING,
+                                ctx->gs_counts, true);
+   gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GSXFB_OFFSETS_BINDING,
+                                ctx->gs_offsets, true);
+   gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GSXFB_VERTICES_BINDING,
+                                ctx->gs_vertices, true);
+   gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GSXFB_INDICES_BINDING,
+                                ctx->gs_indices, true);
+   const bool ok = param_buffer &&
+        gex_wgpu_dispatch(ctx, compact, &group0, &group1, NULL,
+                          DIV_ROUND_UP(prims * gs->max_output_prims,
+                                       GEX_WGPU_GSXFB_GROUP));
+   pipe_resource_reference(&param_buffer, NULL);
+   if (!ok) {
+      gex_fail(ctx);
+      return false;
+   }
+
+   const unsigned generated = gex_wgpu_gs_generated(ctx, prims);
+   const unsigned recorded = MIN2(generated, writable);
+
+   for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
+      if (!(xfb->buffers_written & (1u << i)) || !ctx->so_targets[i])
+         continue;
+      struct gex_wgpu_so_target *so =
+         (struct gex_wgpu_so_target *)ctx->so_targets[i];
+      so->stride = xfb->buffers[i].stride;
+      so->written += recorded * per_prim * so->stride;
+   }
+   /* PRIMITIVES_GENERATED counts what the geometry stage produced;
+    * PRIMITIVES_EMITTED counts what the capture managed to record, which is
+    * less when a buffer ran out. */
+   if (ctx->active_query) {
+      switch (ctx->active_query->type) {
+      case PIPE_QUERY_PRIMITIVES_GENERATED:
+         ctx->active_query->result += generated;
+         break;
+      case PIPE_QUERY_PRIMITIVES_EMITTED:
+      case PIPE_QUERY_SO_STATISTICS:
+         ctx->active_query->result += recorded;
+         break;
+      default:
+         break;
+      }
+   }
+   return true;
+}
+
 static bool
 gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                  const struct pipe_draw_info *info, unsigned drawid_offset,
                  const struct pipe_draw_start_count_bias *draw)
 {
    struct gex_wgpu_gs *gs = ctx->gs;
-   const enum mesa_prim wanted_mode =
-      gs->verts_per_input_prim == 1 ? MESA_PRIM_POINTS : MESA_PRIM_TRIANGLES;
+   const enum mesa_prim wanted_mode = gs->input_list_prim;
    /* Declined, not latched. What this path cannot do it cannot do for this
     * draw only; latching turns it into GL_OUT_OF_MEMORY from some later
     * allocation, which dEQP treats as fatal and which cost ten of the
     * eleven failing KHR-GL32.transform_feedback cases. */
+   struct pipe_resource *slot_table = NULL;
 #define GEX_GS_DECLINE(why)                                                   \
    do {                                                                       \
       static bool said;                                                       \
@@ -20157,13 +20895,43 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
          said = true;                                                          \
          fprintf(stderr, "gex-wgpu: geometry draw declined (%s)\n", why);      \
       }                                                                       \
+      pipe_resource_reference(&slot_table, NULL);                             \
       return false;                                                           \
    } while (0)
-   if (info->index_size || info->instance_count != 1 ||
-       info->mode != wanted_mode ||
-       draw->count % gs->verts_per_input_prim != 0)
-      GEX_GS_DECLINE("indexed, instanced, or the wrong input primitive");
-   const unsigned prims = draw->count / gs->verts_per_input_prim;
+   if (gex_wgpu_gs_input_class(info->mode) != wanted_mode)
+      GEX_GS_DECLINE("the draw's topology is not what the shader takes");
+   if (info->primitive_restart)
+      GEX_GS_DECLINE("primitive restart");
+   if (!info->instance_count)
+      return true;   /* nothing to draw, and nothing to report */
+   const unsigned instances = info->instance_count;
+   const unsigned prims_per_instance =
+      u_decomposed_prims_for_vertices(info->mode, (int)draw->count);
+   /* Instancing is unrolled into the capture rather than handed to the
+    * rasterizer: the capture runs the vertex shader once per (instance,
+    * vertex) and the geometry pass once per (instance, primitive), both
+    * instance-major, so `invocation * verts_per_input_prim` still lands on
+    * the right captured vertex without either pass knowing about instances.
+    * The rasterization draw that follows is a single non-instanced one over
+    * everything they produced. */
+   const unsigned prims = prims_per_instance * instances;
+   /* One captured vertex per (primitive, vertex-of-primitive) pair rather
+    * than one per drawn vertex: a strip's vertices belong to more than one
+    * primitive, and the geometry pass reads each primitive's vertices at a
+    * fixed stride. For a plain list the two are the same number. */
+   const unsigned assembled = prims_per_instance * gs->verts_per_input_prim;
+   const unsigned captured = assembled * instances;
+   if (!prims_per_instance)
+      return true;   /* fewer vertices than one primitive needs */
+   if (prims / instances != prims_per_instance ||
+       captured / instances != assembled ||
+       assembled / gs->verts_per_input_prim != prims_per_instance)
+      GEX_GS_DECLINE("an instanced draw too large to lay out");
+   /* A draw whose topology is the shader's own and that names its vertices
+    * directly needs no assembly: slot N is vertex N. Everything else -- a
+    * strip, a fan, a loop, any indexed draw -- is resolved into a table. */
+   const bool needs_table =
+      info->index_size || info->mode != gs->input_list_prim;
    /* A geometry shader that reads no varying from the vertex stage is
     * ordinary -- the CTS's transform feedback shaders are exactly that -- so
     * a zero input stride is not a failure. The buffer still needs a size,
@@ -20178,6 +20946,7 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
 
    struct gex_wgpu_capture_layout layout;
    memset(&layout, 0, sizeof(layout));
+   layout.index_table = needs_table ? 1 : 0;
    if (ctx->vertex_elements) {
       layout.count = ctx->vertex_elements->count;
       for (unsigned i = 0; i < layout.count; ++i) {
@@ -20187,12 +20956,90 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
          layout.offset[i] = ve->src_offset;
          layout.stride[i] = ve->src_stride;
          layout.format[i] = ve->src_format;
+         layout.divisor[i] = ve->instance_divisor;
       }
    }
+
+   /* An indexed draw is de-indexed on the CPU into a table of vertex numbers,
+    * one per captured slot, so the capture writes the vertex shader's outputs
+    * in *primitive* order. That is the whole reason the geometry pass can go
+    * on reading `invocation * verts_per_input_prim + vertex` and know nothing
+    * about indices. An instanced indexed draw reuses the same indices for
+    * every instance, so the table holds one instance's worth however many
+    * there are -- which is what the capture's slot-to-vertex split assumes. */
+   if (needs_table) {
+      if (info->index_size && info->index_size != 1 && info->index_size != 2 &&
+          info->index_size != 4)
+         GEX_GS_DECLINE("an index width that is not 1, 2 or 4 bytes");
+      struct pipe_transfer *index_transfer = NULL;
+      const void *raw = NULL;
+      if (info->index_size) {
+         raw = info->has_user_indices
+            ? (const void *)((const char *)info->index.user +
+                             (size_t)draw->start * info->index_size)
+            : pipe_buffer_map_range(&ctx->base, info->index.resource,
+                                    (size_t)draw->start * info->index_size,
+                                    (size_t)draw->count * info->index_size,
+                                    PIPE_MAP_READ, &index_transfer);
+         if (!raw)
+            GEX_GS_DECLINE("the index buffer could not be read");
+      }
+      uint32_t *table = MALLOC(assembled * sizeof(*table));
+      if (!table) {
+         if (index_transfer)
+            pipe_buffer_unmap(&ctx->base, index_transfer);
+         GEX_GS_DECLINE("the slot table could not be allocated");
+      }
+      for (unsigned p = 0; p < prims_per_instance; ++p) {
+         for (unsigned v = 0; v < gs->verts_per_input_prim; ++v) {
+            /* Assembly first -- which of the draw's vertices this is -- and
+             * only then the index lookup, because an indexed strip indexes
+             * the *assembled* position rather than the primitive's. */
+            const unsigned at =
+               gex_wgpu_gs_input_vertex(info->mode, p, v, draw->count);
+            uint32_t vertex;
+            if (at == UINT_MAX || at >= draw->count) {
+               vertex = 0;
+            } else if (!info->index_size) {
+               vertex = draw->start + at;
+            } else if (info->index_size == 1) {
+               vertex = ((const uint8_t *)raw)[at];
+            } else if (info->index_size == 2) {
+               uint16_t narrow;
+               memcpy(&narrow, (const char *)raw + (size_t)at * 2, 2);
+               vertex = narrow;
+            } else {
+               memcpy(&vertex, (const char *)raw + (size_t)at * 4, 4);
+            }
+            if (info->index_size)
+               vertex = (uint32_t)((int64_t)vertex + draw->index_bias);
+            table[p * gs->verts_per_input_prim + v] = vertex;
+         }
+      }
+      if (index_transfer)
+         pipe_buffer_unmap(&ctx->base, index_transfer);
+      if (getenv("GEX_WGPU_GS_ASSEMBLY")) {
+         fprintf(stderr, "gex-gs: mode=%u count=%u prims=%u per=%u\n",
+                 (unsigned)info->mode, draw->count, prims_per_instance,
+                 gs->verts_per_input_prim);
+         for (unsigned p = 0; p < prims_per_instance; ++p) {
+            fprintf(stderr, "gex-gs:   prim %u:", p);
+            for (unsigned v = 0; v < gs->verts_per_input_prim; ++v)
+               fprintf(stderr, " %u",
+                       table[p * gs->verts_per_input_prim + v]);
+            fprintf(stderr, "\n");
+         }
+      }
+      slot_table = gex_wgpu_params_buffer(ctx, table, assembled);
+      FREE(table);
+      if (!slot_table)
+         GEX_GS_DECLINE("the slot table could not be uploaded");
+   }
+
    struct gex_wgpu_varying_variant *variant =
       gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &gs->inputs);
    if (!variant ||
-       !gex_wgpu_ensure_buffer(ctx, &ctx->gs_vs_out, draw->count * vs_stride,
+       !gex_wgpu_ensure_buffer(ctx, &ctx->gs_vs_out, captured * vs_stride,
                                PIPE_BIND_SHADER_BUFFER) ||
        !gex_wgpu_ensure_buffer(ctx, &ctx->gs_vertices,
                                prims * gs->max_vertices * gs_stride,
@@ -20200,13 +21047,25 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                                PIPE_BIND_SHADER_BUFFER) ||
        !gex_wgpu_ensure_buffer(ctx, &ctx->gs_indices, index_count * 4,
                                PIPE_BIND_INDEX_BUFFER |
+                               PIPE_BIND_SHADER_BUFFER) ||
+       !gex_wgpu_ensure_buffer(ctx, &ctx->gs_counts, prims * 4,
+                               PIPE_BIND_SHADER_BUFFER) ||
+       !gex_wgpu_ensure_buffer(ctx, &ctx->gs_offsets, (prims + 1) * 4,
                                PIPE_BIND_SHADER_BUFFER))
       GEX_GS_DECLINE("could not build the variant or its buffers");
 
-   /* Pass one: the vertex shader, as compute, writing its varyings. */
+   /* Pass one: the vertex shader, as compute, writing its varyings.
+    *
+    * The stream uploader is flushed first. An immediate-mode draw's vertices
+    * are staged through it, and this pass reads them on the GPU rather than
+    * through the ordinary vertex fetch -- so anything still sitting in an
+    * open mapping is not there yet. */
+   u_upload_unmap(ctx->base.stream_uploader);
    uint32_t params[GEX_WGPU_PARAM_WORDS] = {0};
-   params[GEX_WGPU_PARAM_FIRST_VERTEX] = draw->start;
-   params[GEX_WGPU_PARAM_COUNT] = draw->count;
+   params[GEX_WGPU_PARAM_FIRST_VERTEX] = needs_table ? 0 : draw->start;
+   params[GEX_WGPU_PARAM_COUNT] = captured;
+   params[GEX_WGPU_PARAM_VERTS_PER_INSTANCE] = instances > 1 ? assembled : 0;
+   params[GEX_WGPU_PARAM_FIRST_INSTANCE] = info->start_instance;
    struct gex_wgpu_bindings vs_group0 = {0}, vs_group1 = {0};
    for (unsigned i = 0; i < GEX_WGPU_MAX_VERTEX_BUFFERS; ++i) {
       if (!(variant->vb_mask & (1u << i)))
@@ -20223,6 +21082,9 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                          ctx->gs_vs_out);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
                          vs_params);
+   if (slot_table)
+      gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_INDEX_BINDING,
+                            slot_table);
    bool ok = vs_params &&
              gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
                                      ctx->vs->ubo_count, ctx->vs->ubo_slots,
@@ -20231,9 +21093,10 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    if (ok)
       ok = gex_wgpu_dispatch(ctx, variant->module, &vs_group0, &vs_group1,
                              NULL,
-                             DIV_ROUND_UP(draw->count,
+                             DIV_ROUND_UP(captured,
                                           GEX_WGPU_CAPTURE_GROUP));
    pipe_resource_reference(&vs_params, NULL);
+   pipe_resource_reference(&slot_table, NULL);
    if (!ok) {
       gex_fail(ctx);
       return false;
@@ -20244,6 +21107,10 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
     * writes holds three equal indices -- a degenerate triangle. */
    uint32_t gs_params[GEX_WGPU_GS_PARAM_WORDS] = {0};
    gs_params[GEX_WGPU_GS_PARAM_PRIMITIVES] = prims;
+   gs_params[GEX_WGPU_GS_PARAM_ID_BASE] =
+      ctx->gs_primitive_base_active ? ctx->gs_primitive_base : 0;
+   if (ctx->gs_primitive_base_active)
+      ctx->gs_primitive_base += prims;
    struct gex_wgpu_bindings gs_group0 = {0}, gs_group1 = {0};
    struct pipe_resource *gs_param_buffer =
       gex_wgpu_params_buffer(ctx, gs_params, GEX_WGPU_GS_PARAM_WORDS);
@@ -20254,6 +21121,7 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                          ctx->gs_vertices);
    gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_INDEX_BINDING,
                          ctx->gs_indices);
+   gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_COUNT_BINDING, ctx->gs_counts);
    ok = gs_param_buffer &&
         gex_wgpu_bind_constants(ctx, &gs_group1, MESA_SHADER_GEOMETRY,
                                 gs->ubo_count, gs->ubo_slots, gs->ubo_bindings,
@@ -20268,7 +21136,25 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
       return false;
    }
 
-   /* Pass three: rasterize what the geometry shader wrote. The passthrough
+   /* Passes three and four: transform feedback, which is what GL records for
+    * a draw with a geometry shader -- the geometry stage is the last one
+    * before rasterization, so its output is the captured one. */
+   if (ctx->so_target_count && gs->xfb) {
+      if (!gex_wgpu_gs_capture(ctx, gs, prims))
+         return false;
+   } else if (ctx->active_query &&
+              (ctx->active_query->type == PIPE_QUERY_PRIMITIVES_GENERATED ||
+               ctx->active_query->type == PIPE_QUERY_SO_STATISTICS)) {
+      /* GL_PRIMITIVES_GENERATED counts the last stage before rasterization,
+       * so with a geometry shader bound it is that stage's output and not the
+       * draw's vertex count -- a number only the geometry pass has. Nothing
+       * is being recorded here, so the scan runs for the total alone. */
+      if (!gex_wgpu_gs_scan(ctx, prims))
+         return false;
+      ctx->active_query->result += gex_wgpu_gs_generated(ctx, prims);
+   }
+
+   /* Pass five: rasterize what the geometry shader wrote. The passthrough
     * vertex shader and its element state stand in for the application's for
     * the length of this draw. */
    struct gex_wgpu_shader *saved_vs = ctx->vs;
@@ -20283,14 +21169,17 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    ctx->vertex_buffer_offsets[0] = 0;
    ctx->vertex_buffer_count = 1;
    ctx->gs = NULL;
+   const bool saved_rasterizing = ctx->gs_rasterizing;
+   ctx->gs_rasterizing = true;
 
    struct pipe_draw_info raster = *info;
    /* The topology is the geometry shader's output, not the application's
     * input: a points-out shader fed by a points draw still has to rasterize
     * as points, and inheriting info->mode would have rasterized whatever the
     * application happened to be drawing. */
-   raster.mode = gs->output_prim == MESA_PRIM_POINTS ? MESA_PRIM_POINTS
-                                                     : MESA_PRIM_TRIANGLES;
+   raster.mode = gs->output_prim == MESA_PRIM_POINTS  ? MESA_PRIM_POINTS
+               : gs->output_prim == MESA_PRIM_LINE_STRIP ? MESA_PRIM_LINES
+                                                         : MESA_PRIM_TRIANGLES;
    raster.index_size = 4;
    raster.index.resource = ctx->gs_indices;
    raster.has_user_indices = false;
@@ -20330,6 +21219,7 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                         1);
 
    ctx->gs = gs;
+   ctx->gs_rasterizing = saved_rasterizing;
    ctx->vs = saved_vs;
    ctx->vertex_elements = saved_elements;
    ctx->vertex_buffers[0] = saved_buffer;
@@ -20532,6 +21422,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
          layout.offset[i] = ve->src_offset;
          layout.stride[i] = ve->src_stride;
          layout.format[i] = ve->src_format;
+         layout.divisor[i] = ve->instance_divisor;
       }
    }
    struct gex_wgpu_varying_variant *vs_variant =
@@ -22584,6 +23475,7 @@ gex_wgpu_capture_positions(struct gex_wgpu_context *ctx, unsigned first,
          layout.offset[i] = ve->src_offset;
          layout.stride[i] = ve->src_stride;
          layout.format[i] = ve->src_format;
+         layout.divisor[i] = ve->instance_divisor;
       }
    }
    struct gex_wgpu_varying_variant *variant =
@@ -23548,9 +24440,19 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * draw as the ranges between restarts. */
    if (info && draws && num_draws == 1 && info->primitive_restart &&
        info->index_size && !ctx->failed) {
+      /* A geometry shader numbers its primitives across the whole draw, so
+       * the ranges have to agree on where each one's numbering starts --
+       * which the sub-draws cannot carry, being ordinary draws. The context
+       * holds it for the length of the split instead. */
+      const bool was_active = ctx->gs_primitive_base_active;
+      const unsigned saved_base = ctx->gs_primitive_base;
+      ctx->gs_primitive_base_active = true;
+      ctx->gs_primitive_base = 0;
       if (util_draw_vbo_without_prim_restart(pipe, info, drawid_offset,
                                              indirect, &draws[0]) != PIPE_OK)
          gex_fail(ctx);
+      ctx->gs_primitive_base_active = was_active;
+      ctx->gs_primitive_base = saved_base;
       return;
    }
 
@@ -23775,8 +24677,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
 
    /* Primitive counting for the transform-feedback queries. Counted before
     * anything below can decline the draw, because GL counts what the vertex
-    * stage produced whether or not this backend could render it. */
-   if (ctx->active_query && draws) {
+    * stage produced whether or not this backend could render it.
+    *
+    * Not with a geometry shader, though: GL counts the last stage before
+    * rasterization, and that is the geometry stage, whose primitive count is
+    * a number only its compute pass has. gex_wgpu_gs_draw supplies it. Nor
+    * for the re-entry that rasterizes what the geometry stage produced, which
+    * would otherwise count the same draw a second time -- three times, in
+    * fact, which is what a points-out shader emitting six primitives from
+    * three points reported until this said so. */
+   if (ctx->active_query && draws && !ctx->gs && !ctx->gs_rasterizing) {
       const unsigned prims =
          gex_wgpu_primitive_count(ctx, info->mode, draws[0].count) *
          MAX2(1u, info->instance_count);
@@ -23807,32 +24717,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * last of which comes back through here with the passthrough shader
     * bound. */
    if (ctx->gs) {
-      /* Transform feedback with a geometry shader captures nothing.
-       *
-       * GL captures the last pre-rasterization stage, which is the geometry
-       * shader; this returns before the capture block below, and that block
-       * would run the *vertex* shader anyway. So the feedback buffers keep
-       * whatever they held -- silently, which is the part worth saying out
-       * loud. It is what fails the five capture_geometry_* / query_geometry_*
-       * / discard_geometry cases in KHR-GL33.transform_feedback.
-       *
-       * Rendering is left alone rather than refused: the draw itself is
-       * correct, and an application that binds feedback buffers around a
-       * geometry draw would otherwise lose its image as well as its capture.
-       *
-       * Doing it properly means capturing from the geometry pass, which
-       * already runs as compute and could write the buffers directly -- it
-       * needs the emitted-vertex count (dynamic, unlike the vertex stage's)
-       * and a primitives-emitted count the driver does not model today. */
-      if (ctx->so_target_count) {
-         static bool said;
-         if (!said) {
-            said = true;
-            fprintf(stderr, "gex-wgpu: transform feedback with a geometry "
-                            "shader is not captured; the feedback buffers "
-                            "are left unchanged\n");
-         }
-      }
+      /* GL captures the *last* pre-rasterization stage, so with a geometry
+       * shader bound it is the geometry stage's output that is recorded and
+       * not the vertex stage's -- which is why this returns before the
+       * capture block below, and why gex_wgpu_gs_draw does its own. */
       gex_wgpu_gs_draw(ctx, info, drawid_offset, &draws[0]);
       return;
    }
