@@ -1520,6 +1520,7 @@ struct gex_wgpu_shader {
    uint8_t packed_image_slots[GEX_WGPU_MAX_SHADER_IMAGES];
    uint32_t packed_image_bindings[GEX_WGPU_MAX_SHADER_IMAGES];
    enum pipe_format packed_image_formats[GEX_WGPU_MAX_SHADER_IMAGES];
+   bool packed_image_read[GEX_WGPU_MAX_SHADER_IMAGES];
    /* Bytes the emitted module declares for that block, or 0 where the block
     * ends in a runtime-sized array and has no fixed size. Only the layout's
     * minBindingSize wants it -- see gex_wgpu_min_binding_size. */
@@ -3843,7 +3844,7 @@ static void gex_wgpu_end_pass(struct gex_wgpu_context *ctx);
 static WGPUBuffer gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx,
                                              const struct pipe_image_view *iv,
                                              enum pipe_format format,
-                                             uint64_t *size_out,
+                                             bool seed, uint64_t *size_out,
                                              WGPUBuffer *header_out);
 static WGPUBuffer gex_wgpu_packed_image_scratch(struct gex_wgpu_context *ctx,
                                                 bool header);
@@ -8262,11 +8263,14 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       /* Before the format refusals below, because it is what lifts most of
        * them: an image WebGPU has no storage texture for goes through a
        * storage buffer and never reaches the image tables at all. */
+      /* The read case is taken here too. A draw cannot copy the texture into
+       * the buffer while it is recording into a render pass -- but the bind
+       * group is built *before* this draw's pass is opened, so seeding it
+       * there only ends whatever pass came before, which is what any state
+       * change does. The cost is a pass break per draw that binds one. */
       if (gex_wgpu_image_is_packed(
              format, no_read, no_write,
-             glsl_get_sampler_dim(glsl_without_array(var->type)),
-             /* a draw would have to break its render pass open to copy the
-              * texture in, so the read case stays refused here */ false)) {
+             glsl_get_sampler_dim(glsl_without_array(var->type)), true)) {
          const unsigned at = shader->packed_image_count;
          /* driver_location, not gex_wgpu_image_slot: by the time this runs
           * gex_wgpu_lower_gallium_ubos has already normalised the unit into
@@ -8288,6 +8292,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          shader->packed_image_bindings[at] =
             GEX_WGPU_PACKED_IMAGE_FIRST_BINDING + slot;
          shader->packed_image_formats[at] = format;
+         shader->packed_image_read[at] = !no_read;
          ++shader->packed_image_count;
          continue;
       }
@@ -17511,10 +17516,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          size = GEX_WGPU_PACKED_IMAGE_HEADER_BYTES;
       } else {
          buffer = gex_wgpu_packed_image_bind(
-            ctx, iv, compute->packed_image_formats[i], &size, &header);
-         if (buffer && compute->packed_image_read[i])
-            gex_wgpu_packed_image_seed(ctx, iv,
-                                       compute->packed_image_formats[i]);
+            ctx, iv, compute->packed_image_formats[i],
+            compute->packed_image_read[i], &size, &header);
       }
       if (!buffer || !header) {
          static bool said;
@@ -25736,8 +25739,8 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
 static WGPUBuffer
 gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx,
                            const struct pipe_image_view *iv,
-                           enum pipe_format format, uint64_t *size_out,
-                           WGPUBuffer *header_out)
+                           enum pipe_format format, bool seed,
+                           uint64_t *size_out, WGPUBuffer *header_out)
 {
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
    struct pipe_resource *resource = iv->resource;
@@ -25789,6 +25792,15 @@ gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx,
                         sizeof(header));
    if (header_out)
       *header_out = gex->packed_image_header;
+
+   /* Seeding *before* the copy out below is registered, not after. Seeding
+    * submits -- the texture's own writes have to reach the queue first -- and
+    * a submit closes the open pass, which flushes the pending copies. Doing
+    * it the other way round flushed this image's copy immediately, so an
+    * unwritten buffer landed on the texture before the draw ran and the copy
+    * the draw needed was gone. The probe died on the spot. */
+   if (seed)
+      gex_wgpu_packed_image_seed(ctx, iv, format);
 
    for (unsigned i = 0; i < ctx->packed_copy_count; ++i) {
       if (ctx->packed_copies[i].buffer == gex->packed_image_buffer &&
@@ -25848,10 +25860,13 @@ gex_wgpu_packed_image_scratch(struct gex_wgpu_context *ctx, bool header)
 /* Copy the texture *into* a packed image's buffer, for an image the shader
  * reads as well as writes.
  *
- * Only the compute stage asks for this. It needs its own encoder and submit
- * because it happens while a bind group is being built, and it is ordered
- * before the dispatch's own command buffer by the queue. A draw cannot do the
- * same: it would have to end the render pass it is recording into. */
+ * It needs its own encoder and submit, because it happens while a bind group
+ * is being built and the texture's own writes have to reach the queue first;
+ * the queue then orders it before the work that reads it. A draw can do this
+ * as well as a dispatch, because the bind group is built *before* that draw's
+ * render pass is opened -- so the submit ends whatever pass came before,
+ * which is what any state change does, rather than the one being recorded.
+ * The cost is a pass break per draw that binds a read image. */
 static void
 gex_wgpu_packed_image_seed(struct gex_wgpu_context *ctx,
                            const struct pipe_image_view *iv,
@@ -30873,7 +30888,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             size = GEX_WGPU_PACKED_IMAGE_HEADER_BYTES;
          } else {
             buffer = gex_wgpu_packed_image_bind(
-               ctx, iv, ctx->fs->packed_image_formats[i], &size, &header);
+               ctx, iv, ctx->fs->packed_image_formats[i],
+               ctx->fs->packed_image_read[i], &size, &header);
          }
          if (!buffer || !header) {
             static bool said;
@@ -30957,6 +30973,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* explicit_pipeline_layout, group_layouts[] and bind_groups[] all belong
     * to the screen's caches; releasing them here would free objects the next
     * draw expects to find. */
+   /* Building the bind groups may have submitted: seeding a packed image the
+    * shader reads has to, because the texture's own writes must reach the
+    * queue before they are copied. A submit releases the encoder captured
+    * above, so re-read it here rather than begin a render pass on a freed
+    * one -- which is a segfault inside Dawn's own encoding context, with this
+    * driver nowhere in the backtrace above BeginRenderPass. Nothing recorded
+    * onto the old encoder is lost; it was submitted, not discarded. */
+   if (!ctx->pending_encoder)
+      ctx->pending_encoder =
+         wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+   encoder = ctx->pending_encoder;
    const bool bind_failed =
       (needs_texture && !bind_groups[0]) ||
       (needs_vertex_constant && !bind_groups[1]) ||
