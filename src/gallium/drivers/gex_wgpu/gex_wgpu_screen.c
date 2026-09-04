@@ -387,6 +387,24 @@ static void gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
 #define GEX_WGPU_TES_PARAM_VERTS_OUT 1
 #define GEX_WGPU_TES_PARAM_WORDS 4
 #define GEX_WGPU_TESS_GROUP 64
+/* The capture that records a tessellated draw's primitives.
+ *
+ * Simpler than the geometry stage's, which needs a scan first: a geometry
+ * shader decides at run time how many primitives each invocation emits, so
+ * where each one writes is only known after a prefix sum. The tessellator has
+ * already produced a fixed mesh by the time this runs -- every primitive in
+ * the index buffer is emitted, in order -- so a primitive's destination is
+ * its own position in that buffer and there is nothing to scan. */
+#define GEX_WGPU_TESXFB_PARAMS_BINDING 0
+#define GEX_WGPU_TESXFB_VERTICES_BINDING 1
+#define GEX_WGPU_TESXFB_INDICES_BINDING 2
+#define GEX_WGPU_TESXFB_SO_FIRST_BINDING 3
+#define GEX_WGPU_TESXFB_PARAM_PRIMS 0
+#define GEX_WGPU_TESXFB_PARAM_WRITABLE 1
+#define GEX_WGPU_TESXFB_PARAM_SO_OFFSET 2
+#define GEX_WGPU_TESXFB_PARAM_WORDS \
+   (GEX_WGPU_TESXFB_PARAM_SO_OFFSET + GEX_WGPU_MAX_SO_BUFFERS)
+#define GEX_WGPU_TESXFB_GROUP 64
 /* One patch's levels, laid out as struct pipe_tessellation_factors expects
  * them: outer[4], inner[2], and two words of padding. Passing the buffer to
  * the tessellator by cast rather than copying field by field is what keeps
@@ -1148,6 +1166,11 @@ struct gex_wgpu_context {
     * produced. The primitive queries count what the *application* drew, and
     * that re-entry is not it. */
    bool gs_rasterizing;
+   /* Set while the tessellated draw's fifth pass rasterizes the mesh, for the
+    * same reason as the flag above: that pass re-enters draw_vbo with the
+    * tessellation stages unbound, and GL_PRIMITIVES_GENERATED must not count
+    * the same draw twice. */
+   bool tess_rasterizing;
    /* The bound tessellation stages and the scratch the five-pass tessellated
     * path runs through. See the tessellation comment above the binding
     * numbers for what each pass writes. */
@@ -1694,6 +1717,12 @@ struct gex_wgpu_tes {
     * that reads the evaluation output buffer as a vertex buffer. */
    struct gex_wgpu_shader *passthrough;
    void *passthrough_elements;
+   /* What this shader captures. Kept for the same reason the geometry stage
+    * keeps it: the module build clears nir->xfb_info once the evaluation
+    * shader has become a compute shader, and the capture pass is built
+    * lazily on the first draw that records. */
+   nir_xfb_info *xfb;
+   WGPUShaderModule xfb_module;
 };
 
 /* A vertex shader compiled to compute so that it writes its varyings to a
@@ -19309,6 +19338,15 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
       FREE(tes);
       return NULL;
    }
+   /* Copied before the variant build, which clears it: the evaluation shader
+    * is the last stage before rasterization when it is bound, so its outputs
+    * are the ones transform feedback records. */
+   if (nir->xfb_info) {
+      const size_t bytes = nir_xfb_info_size(nir->xfb_info->output_count);
+      tes->xfb = malloc(bytes);
+      if (tes->xfb)
+         memcpy(tes->xfb, nir->xfb_info, bytes);
+   }
    gex_wgpu_tess_collect_ubos(nir, &tes->ubo_count, tes->ubo_slots,
                               tes->ubo_bindings, tes->ubo_required,
                               &tes->ubo_storage_mask);
@@ -19419,6 +19457,9 @@ gex_wgpu_delete_tes_state(struct pipe_context *pipe, void *state)
       pipe->delete_vertex_elements_state(pipe, tes->passthrough_elements);
    if (tes->nir)
       ralloc_free(tes->nir);
+   if (tes->xfb_module)
+      wgpuShaderModuleRelease(tes->xfb_module);
+   free(tes->xfb);
    FREE(tes);
 }
 
@@ -22077,6 +22118,216 @@ gex_wgpu_restore_instance_divisors(struct gex_wgpu_context *ctx,
    }
 }
 
+/* The compaction that records a tessellated draw's primitives.
+ *
+ * One invocation per output primitive. The vertices come from the evaluation
+ * pass's own output buffer, read through the tessellator's index buffer --
+ * those already name the right vertices in the right order, so a triangle
+ * from a quad domain is recorded with its winding already applied and this
+ * pass never learns that domains exist.
+ *
+ * `per_prim` is a property of the evaluation shader rather than of the draw
+ * (the topology is the domain's and point mode's, never the application's),
+ * so one module serves every draw that shader takes part in. */
+static WGPUShaderModule
+gex_wgpu_tes_xfb_module(struct gex_wgpu_context *ctx, struct gex_wgpu_tes *tes,
+                        unsigned per_prim)
+{
+   if (tes->xfb_module || !tes->xfb)
+      return tes->xfb_module;
+
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   const nir_xfb_info *xfb = tes->xfb;
+   const unsigned stride_words = gex_wgpu_varying_stride(&tes->outputs) / 4;
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_COMPUTE, screen->base.nir_options[MESA_SHADER_COMPUTE],
+      "gex-tes-xfb");
+   nir_variable *params =
+      gex_wgpu_word_block(b.shader, "gex_tes_xfb_params",
+                          GEX_WGPU_TESXFB_PARAMS_BINDING, 0, true);
+   nir_variable *vertices =
+      gex_wgpu_word_block(b.shader, "gex_tes_xfb_vertices",
+                          GEX_WGPU_TESXFB_VERTICES_BINDING, 1, true);
+   nir_variable *indices =
+      gex_wgpu_word_block(b.shader, "gex_tes_xfb_indices",
+                          GEX_WGPU_TESXFB_INDICES_BINDING, 2, true);
+   nir_variable *so[GEX_WGPU_MAX_SO_BUFFERS] = {0};
+
+   nir_deref_instr *param_words = gex_wgpu_block_words(&b, params);
+#define GEX_TESXFB_PARAM(index)                                               \
+   nir_load_deref(&b, nir_build_deref_array(&b, param_words,                  \
+                                            nir_imm_int(&b, (index))))
+   nir_def *prims = GEX_TESXFB_PARAM(GEX_WGPU_TESXFB_PARAM_PRIMS);
+   nir_def *writable = GEX_TESXFB_PARAM(GEX_WGPU_TESXFB_PARAM_WRITABLE);
+
+   nir_def *prim = nir_channel(&b, nir_load_global_invocation_id(&b, 32), 0);
+   nir_push_if(&b, nir_uge(&b, prim, prims));
+   nir_jump(&b, nir_jump_return);
+   nir_pop_if(&b, NULL);
+   /* GL stops recording on a whole primitive when a bound buffer runs out,
+    * so this is a primitive count and the comparison is against the
+    * primitive rather than against any byte offset. */
+   nir_push_if(&b, nir_uge(&b, prim, writable));
+   nir_jump(&b, nir_jump_return);
+   nir_pop_if(&b, NULL);
+
+   nir_deref_instr *index_words = gex_wgpu_block_words(&b, indices);
+   nir_deref_instr *vertex_words = gex_wgpu_block_words(&b, vertices);
+   for (unsigned k = 0; k < per_prim; ++k) {
+      nir_def *index_at =
+         nir_iadd_imm(&b, nir_imul_imm(&b, prim, per_prim), k);
+      nir_def *vertex =
+         nir_load_deref(&b, nir_build_deref_array(&b, index_words, index_at));
+      nir_def *source = nir_imul_imm(&b, vertex, stride_words);
+      /* Primitives are recorded whole and in order, so a vertex's place in
+       * the feedback buffer is its primitive's times the vertex count. */
+      nir_def *recorded = nir_iadd_imm(&b, nir_imul_imm(&b, prim, per_prim), k);
+
+      for (unsigned o = 0; o < xfb->output_count; ++o) {
+         const nir_xfb_output_info *out = &xfb->outputs[o];
+         const int varying = gex_wgpu_varying_slot(&tes->outputs,
+                                                   out->location);
+         if (varying < 0)
+            continue;
+         if (!so[out->buffer]) {
+            char name[32];
+            snprintf(name, sizeof(name), "gex_tes_xfb_so%u", out->buffer);
+            so[out->buffer] = gex_wgpu_word_block(
+               b.shader, name, GEX_WGPU_TESXFB_SO_FIRST_BINDING + out->buffer,
+               GEX_WGPU_TESXFB_SO_FIRST_BINDING + out->buffer, false);
+         }
+         nir_deref_instr *so_words = gex_wgpu_block_words(&b, so[out->buffer]);
+         nir_def *base = nir_iadd(
+            &b, GEX_TESXFB_PARAM(GEX_WGPU_TESXFB_PARAM_SO_OFFSET + out->buffer),
+            nir_iadd_imm(&b,
+                         nir_imul_imm(&b, recorded,
+                                      xfb->buffers[out->buffer].stride),
+                         out->offset));
+         /* out->offset is the byte offset of the lowest component in the
+          * mask, so a component's own destination is that plus its rank
+          * among the set bits -- the rule both other captures follow. */
+         unsigned rank = 0;
+         for (unsigned c = 0; c < 4; ++c) {
+            if (!(out->component_mask & (1u << c)))
+               continue;
+            nir_def *value = nir_load_deref(
+               &b, nir_build_deref_array(
+                      &b, vertex_words,
+                      nir_iadd_imm(&b, source, varying * 4 + c)));
+            nir_def *word =
+               nir_ushr_imm(&b, nir_iadd_imm(&b, base, rank * 4), 2);
+            nir_store_deref(&b, nir_build_deref_array(&b, so_words, word),
+                            value, 0x1);
+            ++rank;
+         }
+      }
+   }
+#undef GEX_TESXFB_PARAM
+
+   nir_shader *nir = b.shader;
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_lower_returns);
+   nir->info.workgroup_size[0] = GEX_WGPU_TESXFB_GROUP;
+   nir->info.workgroup_size[1] = 1;
+   nir->info.workgroup_size[2] = 1;
+   nir->info.workgroup_size_variable = false;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+   char *error = NULL;
+   tes->xfb_module =
+      gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false, &error);
+   if (!tes->xfb_module)
+      fprintf(stderr, "gex-wgpu: tessellation capture shader failed to "
+                      "compile: %s\n", error ? error : "unknown");
+   FREE(error);
+   return tes->xfb_module;
+}
+
+/* Record a tessellated draw into the bound feedback buffers.
+ *
+ * One dispatch after the evaluation pass. Returns false having already failed
+ * the context, because by this point the draw is committed -- the mesh exists
+ * and the evaluation shader has run, so a failure here is a driver fault and
+ * not a case to decline. */
+static bool
+gex_wgpu_tes_capture(struct gex_wgpu_context *ctx, struct gex_wgpu_tes *tes,
+                     unsigned index_count, unsigned per_prim)
+{
+   const nir_xfb_info *xfb = tes->xfb;
+   const unsigned prims = per_prim ? index_count / per_prim : 0u;
+   WGPUShaderModule compact = gex_wgpu_tes_xfb_module(ctx, tes, per_prim);
+   if (!compact || !prims) {
+      gex_fail(ctx);
+      return false;
+   }
+
+   unsigned writable = prims;
+   uint32_t params[GEX_WGPU_TESXFB_PARAM_WORDS] = {0};
+   params[GEX_WGPU_TESXFB_PARAM_PRIMS] = prims;
+
+   struct gex_wgpu_bindings group0 = {0}, group1 = {0};
+   for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
+      if (!(xfb->buffers_written & (1u << i)))
+         continue;
+      struct pipe_stream_output_target *target = ctx->so_targets[i];
+      if (!target || !target->buffer) {
+         gex_fail(ctx);
+         return false;
+      }
+      struct gex_wgpu_so_target *so = (struct gex_wgpu_so_target *)target;
+      params[GEX_WGPU_TESXFB_PARAM_SO_OFFSET + i] =
+         target->buffer_offset + so->written;
+      gex_resource(target->buffer)->gpu_written = true;
+      const unsigned stride = xfb->buffers[i].stride;
+      const unsigned left = target->buffer_size > so->written
+                               ? (unsigned)(target->buffer_size - so->written)
+                               : 0u;
+      writable = MIN2(writable, stride ? left / (stride * per_prim) : 0u);
+      gex_wgpu_bind_storage(&group0, GEX_WGPU_TESXFB_SO_FIRST_BINDING + i,
+                            target->buffer);
+   }
+   params[GEX_WGPU_TESXFB_PARAM_WRITABLE] = writable;
+
+   struct pipe_resource *param_buffer =
+      gex_wgpu_params_buffer(ctx, params, GEX_WGPU_TESXFB_PARAM_WORDS);
+   gex_wgpu_bind_storage_access(&group0, GEX_WGPU_TESXFB_PARAMS_BINDING,
+                                param_buffer, true);
+   gex_wgpu_bind_storage_access(&group0, GEX_WGPU_TESXFB_VERTICES_BINDING,
+                                ctx->tess_vertices, true);
+   gex_wgpu_bind_storage_access(&group0, GEX_WGPU_TESXFB_INDICES_BINDING,
+                                ctx->tess_indices, true);
+   const bool ok = param_buffer &&
+        gex_wgpu_dispatch(ctx, compact, &group0, &group1, NULL,
+                          DIV_ROUND_UP(prims, GEX_WGPU_TESXFB_GROUP));
+   pipe_resource_reference(&param_buffer, NULL);
+   if (!ok) {
+      gex_fail(ctx);
+      return false;
+   }
+
+   const unsigned recorded = MIN2(prims, writable);
+   if (getenv("GEX_WGPU_TESS_LOG"))
+      fprintf(stderr, "gex-wgpu: tess capture prims=%u per_prim=%u "
+              "writable=%u recorded=%u\n", prims, per_prim, writable,
+              recorded);
+   for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
+      if (!(xfb->buffers_written & (1u << i)) || !ctx->so_targets[i])
+         continue;
+      struct gex_wgpu_so_target *so =
+         (struct gex_wgpu_so_target *)ctx->so_targets[i];
+      so->stride = xfb->buffers[i].stride;
+      so->written += recorded * per_prim * so->stride;
+   }
+   /* GENERATED counts what the tessellator produced; EMITTED counts what the
+    * capture managed to record, which is less when a buffer ran out. */
+   gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_GENERATED, prims);
+   gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_EMITTED, recorded);
+   if (recorded < prims)
+      gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_OVERFLOW, 1);
+   return true;
+}
+
 /* The five-pass tessellated draw. See the tessellation comment above the
  * binding numbers for the shape; this is where the CPU tessellator sits. */
 static bool
@@ -22370,6 +22621,36 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
       return false;
    }
 
+   /* The topology the tessellator produced, which is what both the capture
+    * and the rasterization below record and draw. It is the domain's and
+    * point mode's, never the application's. */
+   const enum mesa_prim out_prim =
+      tes->point_mode ? MESA_PRIM_POINTS
+      : tes->domain == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES
+                                               : MESA_PRIM_TRIANGLES;
+   const unsigned per_prim = mesa_vertices_per_prim(out_prim);
+
+   /* Pass four and a half: transform feedback. With tessellation bound the
+    * evaluation shader is the last stage before rasterization, so its output
+    * is what GL records -- and until this existed a tessellated draw with
+    * feedback active rasterized normally and wrote *nothing* to the bound
+    * buffers, with no refusal, which is the silent-wrong-answer shape. It is
+    * 72 of the 76 failures in KHR-GL44's
+    * tessellation_control_to_tessellation_evaluation family: every one of
+    * them reads its result back through feedback, so all of them read zeroes
+    * and blamed whichever value they checked first. */
+   if (ctx->so_target_count && tes->xfb) {
+      if (!gex_wgpu_tes_capture(ctx, tes, index_count, per_prim))
+         return false;
+   } else if (ctx->active_queries[GEX_WGPU_QUERY_GENERATED]) {
+      /* GL_PRIMITIVES_GENERATED counts the last stage before rasterization,
+       * so with tessellation bound it counts the tessellator's output and not
+       * the draw's patch count. Nothing is recorded here, so only the total
+       * moves. */
+      gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_GENERATED,
+                         per_prim ? index_count / per_prim : 0u);
+   }
+
    /* Pass five: rasterize it, through the passthrough vertex shader. */
    struct gex_wgpu_shader *saved_vs = ctx->vs;
    struct gex_wgpu_vertex_elements *saved_elements = ctx->vertex_elements;
@@ -22386,11 +22667,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    ctx->tes = NULL;
 
    struct pipe_draw_info raster = *info;
-   /* The topology is the tessellator's, not the application's: a patch draw
-    * rasterizes as whatever the domain and point mode produce. */
-   raster.mode = tes->point_mode ? MESA_PRIM_POINTS
-                 : tes->domain == TESS_PRIMITIVE_ISOLINES ? MESA_PRIM_LINES
-                                                          : MESA_PRIM_TRIANGLES;
+   raster.mode = out_prim;
    raster.index_size = 4;
    raster.index.resource = ctx->tess_indices;
    raster.has_user_indices = false;
@@ -22399,6 +22676,8 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    struct pipe_draw_start_count_bias raster_draw;
    memset(&raster_draw, 0, sizeof(raster_draw));
    raster_draw.count = index_count;
+   const bool saved_rasterizing = ctx->tess_rasterizing;
+   ctx->tess_rasterizing = true;
    if (getenv("GEX_WGPU_TESS_LOG"))
       fprintf(stderr, "gex-wgpu: tess patches=%u verts_in=%u verts_out=%u "
               "domain=%u spacing=%u ccw=%d points=%d -> %u vertices %u "
@@ -22407,6 +22686,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
               (int)tes->point_mode, vertex_count, index_count,
               (unsigned)raster.mode);
    gex_wgpu_draw_vbo(&ctx->base, &raster, drawid_offset, NULL, &raster_draw, 1);
+   ctx->tess_rasterizing = saved_rasterizing;
 
    ctx->tcs = tcs;
    ctx->tes = tes;
@@ -25665,9 +25945,19 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * for the re-entry that rasterizes what the geometry stage produced, which
     * would otherwise count the same draw a second time -- three times, in
     * fact, which is what a points-out shader emitting six primitives from
-    * three points reported until this said so. */
+    * three points reported until this said so.
+    *
+    * Tessellation is the same shape and needs the same exclusions: the patch
+    * draw itself, whose primitive count is meaningless because the
+    * tessellator has not run yet, and the fifth pass that rasterizes the mesh
+    * with the stages unbound. Leaving those in doubled the count -- and
+    * because the CTS *measures* its expected vertex count with this very
+    * query, it then sized its feedback buffer at twice what the capture
+    * writes, so the tail stayed zero and every case that collects the unique
+    * captured values saw two of them instead of one. */
    if (ctx->active_queries[GEX_WGPU_QUERY_GENERATED] && draws && !ctx->gs &&
-       !ctx->gs_rasterizing) {
+       !ctx->gs_rasterizing && !ctx->tcs && !ctx->tes &&
+       !ctx->tess_rasterizing) {
       const unsigned prims =
          gex_wgpu_primitive_count(ctx, info->mode, draws[0].count) *
          MAX2(1u, info->instance_count);
