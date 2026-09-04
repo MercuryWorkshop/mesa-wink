@@ -811,6 +811,10 @@ enum gex_wgpu_query_slot {
    GEX_WGPU_QUERY_OCCLUSION,
    GEX_WGPU_QUERY_GENERATED,
    GEX_WGPU_QUERY_EMITTED,
+   /* ARB_transform_feedback_overflow_query, which asks a different question
+    * from either counter: not how much was recorded but whether anything was
+    * *not* -- so it is its own target and may run beside them. */
+   GEX_WGPU_QUERY_OVERFLOW,
    GEX_WGPU_QUERY_SLOTS,
 };
 
@@ -827,6 +831,9 @@ gex_wgpu_query_slot(unsigned type)
    case PIPE_QUERY_PRIMITIVES_EMITTED:
    case PIPE_QUERY_SO_STATISTICS:
       return GEX_WGPU_QUERY_EMITTED;
+   case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
+   case PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE:
+      return GEX_WGPU_QUERY_OVERFLOW;
    default:
       return -1;
    }
@@ -14409,6 +14416,13 @@ gex_wgpu_create_query(struct pipe_context *pipe, unsigned query_type,
    const bool counted = query_type == PIPE_QUERY_PRIMITIVES_GENERATED ||
                         query_type == PIPE_QUERY_PRIMITIVES_EMITTED ||
                         query_type == PIPE_QUERY_SO_STATISTICS;
+   /* Overflow: whether transform feedback ran out of room. Both capture
+    * passes already work out how much a draw generated and how much fit,
+    * because GL stops on a whole primitive and the counters have to report
+    * what was written rather than what was produced -- so the predicate is
+    * the comparison they already make, and needs nothing new to measure. */
+   const bool overflow = query_type == PIPE_QUERY_SO_OVERFLOW_PREDICATE ||
+                         query_type == PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE;
    /* Timer queries, measured on the CPU.
     *
     * This is what softpipe does -- caps.query_timestamp with
@@ -14437,7 +14451,8 @@ gex_wgpu_create_query(struct pipe_context *pipe, unsigned query_type,
     * KHR-GL44.transform_feedback.geometry did not fail, it **ended the whole
     * mustpass run**, 31 cases in of 16843. The comment above says exactly
     * this about the counted types and the index was not covered by it. */
-   if ((index != 0 && !counted) || (!occlusion && !counted && !timer))
+   if ((index != 0 && !counted && !overflow) ||
+       (!occlusion && !counted && !timer && !overflow))
       return NULL;
 
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
@@ -14585,6 +14600,15 @@ gex_wgpu_get_query_result(struct pipe_context *pipe, struct pipe_query *q,
       return true;
    }
 
+   if (query->type == PIPE_QUERY_SO_OVERFLOW_PREDICATE ||
+       query->type == PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE) {
+      /* A predicate: true when some draw produced more than it could
+       * record. The capture passes set it; a capture that never overflowed
+       * leaves it zero, which is the answer. */
+      if (result)
+         result->b = query->result != 0;
+      return true;
+   }
    if (query->type == PIPE_QUERY_PRIMITIVES_GENERATED ||
        query->type == PIPE_QUERY_PRIMITIVES_EMITTED ||
        query->type == PIPE_QUERY_SO_STATISTICS) {
@@ -19896,6 +19920,11 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    /* PRIMITIVES_GENERATED counts what the vertex stage produced;
     * PRIMITIVES_EMITTED counts what transform feedback recorded. */
    gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_EMITTED, writable_prims);
+   /* `prims` is what the draw assembled and `writable_prims` is what the
+    * bound buffers had room for; GL stops on a whole primitive, so the
+    * difference is exactly what overflowed. */
+   if (prims > writable_prims)
+      gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_OVERFLOW, 1);
 
    WGPUBufferDescriptor params_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
    params_desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
@@ -21567,6 +21596,10 @@ gex_wgpu_gs_capture(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs,
     * less when a buffer ran out. */
    gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_GENERATED, generated);
    gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_EMITTED, recorded);
+   /* Overflow is a predicate, so it accumulates as "did it ever happen"
+    * rather than by how much. */
+   if (generated > recorded)
+      gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_OVERFLOW, 1);
    return true;
 }
 
@@ -29186,6 +29219,48 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * honours it, and the browser side is untested besides -- the guest
     * exports no glPolygonOffsetClampEXT, and adding one shifts the opcode
     * numbering the guest and host share. */
+   /* ARB_shader_group_vote is *not* claimed, and the reason is one link in a
+    * chain that is otherwise complete. anyInvocationARB and its two
+    * companions are subgroup ballots: Mesa's GLSL gives them as
+    * nir_intrinsic_vote_any, vote_all and vote_ieq; zink's emitter has
+    * SpvOpGroupNonUniformAny, All and AllEqual for exactly those; the device
+    * grants WGPUFeatureName_Subgroups, which is requested with the other
+    * optional features; and WGSL has subgroupAny and subgroupAll.
+    *
+    * Tint's SPIR-V *reader* does not:
+    *
+    *   Tint rejected SPIR-V: error: unhandled instruction with opcode 335:
+    *   %27 = OpGroupNonUniformAny %24 %26 %25
+    *
+    * -- so the shader is refused and the program fails, which is worse than
+    * not having the extension. Measured with gl44-group-vote-probe, which
+    * skips cleanly while the cap is off and is ready for the day the reader
+    * learns them. */
+   /* ARB_gl_spirv and ARB_spirv_extensions, two more of the six: an
+    * application may hand GL a SPIR-V module instead of GLSL source.
+    *
+    * Mesa does the whole of it -- glShaderBinary keeps the words,
+    * glSpecializeShader runs spirv_to_nir, and what reaches this driver is
+    * the NIR it already takes. Nothing about the backend needs to change,
+    * which is why this is a claim rather than a feature; what makes it worth
+    * claiming rather than assuming is gl44-spirv-probe, which hands over a
+    * real module and checks the pixel. */
+   caps->gl_spirv = true;
+   /* ARB_indirect_parameters, another of the six: glMultiDrawArraysIndirect-
+    * Count takes the *number of draws* from a buffer as well as the draws
+    * themselves. This driver resolves every indirect draw on the CPU through
+    * util_draw_indirect, which already maps the count buffer and reissues
+    * that many ordinary draws -- so the extension is a claim about a path
+    * that was already complete rather than a new one. */
+   caps->multi_draw_indirect = true;
+   caps->multi_draw_indirect_params = true;
+   /* ARB_transform_feedback_overflow_query, one of GL 4.6's six. The
+    * question it asks -- did transform feedback run out of room -- is one
+    * both capture passes already answer for the primitives-written counter,
+    * because GL stops recording on a whole primitive and the counter reports
+    * what was written rather than what was produced. So the predicate is the
+    * comparison they already make. */
+   caps->query_so_overflow = true;
    /* NV_texture_barrier, another of the five. glTextureBarrier promises that
     * writes to a texture are visible to later reads of it, and
     * gex_wgpu_texture_barrier submits everything recorded so far -- which on

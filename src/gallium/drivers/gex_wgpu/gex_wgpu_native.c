@@ -219,6 +219,12 @@ create_device(void)
       WGPUFeatureName_ClipDistances,
       WGPUFeatureName_DualSourceBlending,
       WGPUFeatureName_TimestampQuery,
+      /* Subgroups. Requested although nothing uses it yet: WGSL has the
+       * ballots ARB_shader_group_vote needs and this adapter grants the
+       * feature, but Tint's SPIR-V reader does not know
+       * OpGroupNonUniformAny, so the extension stays unclaimed. Asking here
+       * costs nothing and is one fewer thing to find later. */
+      WGPUFeatureName_Subgroups,
    };
    WGPUFeatureName granted[sizeof(optional) / sizeof(optional[0])];
    size_t granted_count = 0;
