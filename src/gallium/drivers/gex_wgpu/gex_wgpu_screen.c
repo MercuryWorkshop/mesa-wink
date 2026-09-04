@@ -31322,6 +31322,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             }
             continue;
          }
+         if (iv->format != iv->resource->format &&
+             getenv("GEX_WGPU_IMAGE_TRACE"))
+            fprintf(stderr, "gex-imgview: fragment slot=%u image=%s "
+                    "texture=%s stored=%s\n", slot,
+                    util_format_short_name(iv->format),
+                    util_format_short_name(iv->resource->format),
+                    util_format_short_name(
+                       gex_wgpu_stored_format(iv->resource->format)));
          WGPUTextureViewDescriptor desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
          /* The sampled format for a read-only image; see the compute path. */
          desc.format =
