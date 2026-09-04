@@ -175,6 +175,18 @@ create_device(void)
    WGPURequestAdapterOptions adapter_options =
       WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
    adapter_options.powerPreference = WGPUPowerPreference_HighPerformance;
+   /* GEX_WGPU_FALLBACK_ADAPTER asks for Dawn's software adapter instead of the
+    * GPU. Not a way to run anything -- it is far too slow for that, and the
+    * hardware path is the target -- but for telling a bad command stream apart
+    * from a driver or hardware problem when something hangs: a stream a CPU
+    * implementation executes happily is at least well-formed.
+    *
+    * The Dawn built in this tree has no fallback adapter -- it answers "No
+    * supported adapters" -- so this needs one built with SwiftShader before
+    * it is of any use. Left in because the question it answers is the first
+    * one worth asking about a hang. */
+   if (getenv("GEX_WGPU_FALLBACK_ADAPTER"))
+      adapter_options.forceFallbackAdapter = true;
    WGPURequestAdapterCallbackInfo adapter_cb =
       WGPU_REQUEST_ADAPTER_CALLBACK_INFO_INIT;
    adapter_cb.mode = WGPUCallbackMode_WaitAnyOnly;
