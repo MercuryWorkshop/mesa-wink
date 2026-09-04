@@ -11312,6 +11312,42 @@ static struct pipe_resource *
 gex_wgpu_resource_create(struct pipe_screen *screen,
                          const struct pipe_resource *templ)
 {
+   /* GEX_WGPU_IMGFMT_LOG=1 reports every texture whose format WebGPU has no
+    * storage texture for, with the binds st/mesa asked for.
+    *
+    * It was added to answer one question and did: such a format *could* be
+    * emulated by allocating a wider float format -- half float has a 10-bit
+    * mantissa where r11f_g11f_b10f has six, so nothing is lost -- and that is
+    * cheap if the texture is only ever an image, because then no other path
+    * sees the substitution. **It is not.** Blender's EEVEE creates its
+    * r11g11b10_float and r16_float textures with SAMPLED | RT, so a
+    * substitution would have to be undone again for every sample and every
+    * attachment: the sampled view would need the missing components restored
+    * to 0 and 1 (the swizzle lowering could carry that), the attachment
+    * format would change under the application, and glTexImage/glGetTexImage
+    * would need the pack and unpack that only exist for a few formats today.
+    *
+    * So the cheap route is ruled out by measurement rather than by argument,
+    * which is the reason to keep this knob: the next person to have the same
+    * idea can check in one run instead of reasoning about it. */
+   if (templ && getenv("GEX_WGPU_IMGFMT_LOG") &&
+       gex_wgpu_storage_texture_format(templ->format) ==
+          WGPUTextureFormat_Undefined &&
+       !util_format_is_depth_or_stencil(templ->format) &&
+       !gex_wgpu_is_bc_format(templ->format)) {
+      static unsigned told;
+      if (told < 40) {
+         ++told;
+         fprintf(stderr, "gex-imgfmt: %s binds=0x%x%s%s%s%s %ux%u\n",
+                 util_format_short_name(templ->format), templ->bind,
+                 (templ->bind & PIPE_BIND_SHADER_IMAGE) ? " IMAGE" : "",
+                 (templ->bind & PIPE_BIND_SAMPLER_VIEW) ? " SAMPLED" : "",
+                 (templ->bind & PIPE_BIND_RENDER_TARGET) ? " RT" : "",
+                 (templ->bind & PIPE_BIND_SHADER_BUFFER) ? " SB" : "",
+                 templ->width0, templ->height0);
+      }
+   }
+
    GEX_DEVICE_GUARD(gex_screen(screen));
    if (templ->target == PIPE_BUFFER) {
       /* Render-target and sampler-view binds on a *buffer* are st/mesa asking
