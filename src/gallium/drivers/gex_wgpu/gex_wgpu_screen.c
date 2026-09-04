@@ -4212,6 +4212,7 @@ static bool gex_wgpu_image_also_sampled(const struct gex_wgpu_context *ctx,
 static void gex_wgpu_trace_buffer_aliasing(
    const char *where, const WGPUBindGroupLayoutEntry *layout,
    const WGPUBindGroupEntry *bindings, unsigned count);
+static void gex_wgpu_trace_buffer_aliasing_reset(void);
 static WGPUBuffer gex_wgpu_alias_snapshot_ensure(
    struct gex_wgpu_context *ctx, struct pipe_resource *resource);
 static void gex_wgpu_alias_snapshot_copy(struct pipe_resource *resource,
@@ -18203,6 +18204,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    }
    /* After the rewrite, so what it reports is what is actually submitted --
     * reporting the state before it just names every case the fix handles. */
+   gex_wgpu_trace_buffer_aliasing_reset();
    gex_wgpu_trace_buffer_aliasing("compute", entries, bindings, count);
    if (getenv("GEX_WGPU_COMPUTE_LAYOUT_TRACE")) {
       unsigned storage = 0, uniform = 0;
@@ -26673,6 +26675,56 @@ gex_wgpu_alias_snapshot_ensure(struct gex_wgpu_context *ctx,
    return gex->alias_snapshot;
 }
 
+/* Take the copy now, on an encoder of its own.
+ *
+ * The draw path needs this rather than the two-step form: the bindings are
+ * filled long before there is an encoder to record onto, and a buffer copy
+ * cannot be recorded while a render pass is open. Submitting separately lets
+ * the queue order it ahead of the draw's own command buffer, which is what
+ * gex_wgpu_packed_image_seed does for the same reason. */
+static WGPUBuffer
+gex_wgpu_alias_snapshot_now(struct gex_wgpu_context *ctx,
+                            struct pipe_resource *resource)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   WGPUBuffer copy = gex_wgpu_alias_snapshot_ensure(ctx, resource);
+   if (!copy)
+      return NULL;
+   gex_wgpu_submit_pending(ctx);
+   WGPUCommandEncoder encoder =
+      wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+   if (!encoder)
+      return NULL;
+   gex_wgpu_alias_snapshot_copy(resource, encoder);
+   WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
+   wgpuCommandEncoderRelease(encoder);
+   if (commands) {
+      gex_wgpu_queue_submit(screen, 1, &commands);
+      wgpuCommandBufferRelease(commands);
+   }
+   return copy;
+}
+
+/* Whether the *fragment* stage writes this shader-storage slot, which makes a
+ * vertex-stage binding of the same buffer illegal in WebGPU however read-only
+ * it is: a buffer may not be writable in one binding and anything else in
+ * another within one pass, and the message names neither. A shader that
+ * declares one block in both stages and writes it only in the fragment one is
+ * ordinary GL, and the per-*group* aliasing check could not see it -- each
+ * group on its own is consistent. */
+static bool
+gex_wgpu_fragment_writes_ssbo(const struct gex_wgpu_context *ctx,
+                              unsigned slot)
+{
+   if (!ctx->fs)
+      return false;
+   for (unsigned i = 0; i < ctx->fs->ssbo_count; ++i)
+      if (ctx->fs->ssbo_slots[i] == slot &&
+          !(ctx->fs->ssbo_readonly_mask & (1u << i)))
+         return true;
+   return false;
+}
+
 /* Record the copy. Separate from the allocation because the bindings have to
  * name the snapshot before the bind group is built, and there is no encoder
  * until after it. */
@@ -26698,6 +26750,29 @@ gex_wgpu_alias_snapshot_copy(struct pipe_resource *resource,
  * read through the other -- and Dawn's message names neither binding, so
  * there is nothing to act on without this. Diagnostic only, behind
  * GEX_WGPU_ALIAS_TRACE. */
+struct gex_wgpu_alias_watch {
+   WGPUBuffer buffer;
+   uint64_t offset;
+   uint64_t size;
+   WGPUBufferBindingType type;
+   const char *where;
+   uint32_t binding;
+};
+
+/* Accumulated across the groups of one draw or dispatch. WebGPU checks a
+ * buffer's usages across the whole *pass*, not one bind group, so a writable
+ * binding in the fragment group and a read-only one in the vertex group
+ * collide while each group on its own looks fine -- which is exactly why the
+ * per-group version of this reported nothing while the error persisted. */
+static struct gex_wgpu_alias_watch gex_wgpu_alias_watch[64];
+static unsigned gex_wgpu_alias_watch_count;
+
+static void
+gex_wgpu_trace_buffer_aliasing_reset(void)
+{
+   gex_wgpu_alias_watch_count = 0;
+}
+
 static void
 gex_wgpu_trace_buffer_aliasing(const char *where,
                                const WGPUBindGroupLayoutEntry *layout,
@@ -26709,12 +26784,13 @@ gex_wgpu_trace_buffer_aliasing(const char *where,
    for (unsigned i = 0; i < count; ++i) {
       if (!bindings[i].buffer)
          continue;
-      for (unsigned j = i + 1; j < count; ++j) {
-         if (bindings[j].buffer != bindings[i].buffer)
+      for (unsigned j = 0; j < gex_wgpu_alias_watch_count; ++j) {
+         const struct gex_wgpu_alias_watch *seen = &gex_wgpu_alias_watch[j];
+         if (seen->buffer != bindings[i].buffer)
             continue;
          const uint64_t a_end = bindings[i].offset + bindings[i].size;
-         const uint64_t b_end = bindings[j].offset + bindings[j].size;
-         if (bindings[i].offset >= b_end || bindings[j].offset >= a_end)
+         const uint64_t b_end = seen->offset + seen->size;
+         if (bindings[i].offset >= b_end || seen->offset >= a_end)
             continue;                        /* disjoint ranges are allowed */
          /* Only a *writable* binding conflicts. Uniform beside
           * ReadOnlyStorage is allowed, and reporting it -- which the first
@@ -26723,19 +26799,29 @@ gex_wgpu_trace_buffer_aliasing(const char *where,
           * constant ring as a uniform buffer, which is fine and was never
           * the error being chased. */
          if (layout[i].buffer.type != WGPUBufferBindingType_Storage &&
-             layout[j].buffer.type != WGPUBufferBindingType_Storage)
+             seen->type != WGPUBufferBindingType_Storage)
             continue;
-         if (layout[i].buffer.type == layout[j].buffer.type)
+         if (layout[i].buffer.type == seen->type)
             continue;
-         fprintf(stderr, "gex-alias: %s buffer %p at bindings %u (type %u, "
-                 "%llu+%llu) and %u (type %u, %llu+%llu)\n", where,
-                 (void *)bindings[i].buffer, bindings[i].binding,
+         fprintf(stderr, "gex-alias: buffer %p at %s binding %u (type %u, "
+                 "%llu+%llu) and %s binding %u (type %u, %llu+%llu)\n",
+                 (void *)bindings[i].buffer, where, bindings[i].binding,
                  (unsigned)layout[i].buffer.type,
                  (unsigned long long)bindings[i].offset,
-                 (unsigned long long)bindings[i].size, bindings[j].binding,
-                 (unsigned)layout[j].buffer.type,
-                 (unsigned long long)bindings[j].offset,
-                 (unsigned long long)bindings[j].size);
+                 (unsigned long long)bindings[i].size, seen->where,
+                 seen->binding, (unsigned)seen->type,
+                 (unsigned long long)seen->offset,
+                 (unsigned long long)seen->size);
+      }
+      if (gex_wgpu_alias_watch_count < ARRAY_SIZE(gex_wgpu_alias_watch)) {
+         struct gex_wgpu_alias_watch *slot =
+            &gex_wgpu_alias_watch[gex_wgpu_alias_watch_count++];
+         slot->buffer = bindings[i].buffer;
+         slot->offset = bindings[i].offset;
+         slot->size = bindings[i].size;
+         slot->type = layout[i].buffer.type;
+         slot->where = where;
+         slot->binding = bindings[i].binding;
       }
    }
 }
@@ -31110,6 +31196,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
       return;
    }
+   /* One draw's groups are checked together; see
+    * gex_wgpu_trace_buffer_aliasing. */
+   gex_wgpu_trace_buffer_aliasing_reset();
    WGPUBindGroupLayoutEntry
       texture_layout_entries[GEX_WGPU_MAX_SAMPLERS * 2 + 1];
    /* Sized by the actual maxima, not a literal: raising
@@ -31712,6 +31801,18 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             sb_buffer = gex_resource(sb->buffer)->buffer;
             sb_offset = sb->buffer_offset;
             sb_size = sb->buffer_size;
+            /* Read-only here and writable in the fragment stage is a
+             * combination WebGPU refuses across the pass, so this side
+             * reads a copy. Undefined in GL without a barrier, and a
+             * barrier is already handled -- gex_wgpu_memory_barrier
+             * submits, which closes the scope. */
+            if (gex_wgpu_fragment_writes_ssbo(ctx, slot)) {
+               WGPUBuffer copy = gex_wgpu_alias_snapshot_now(ctx, sb->buffer);
+               if (copy) {
+                  sb_buffer = copy;
+                  sb_offset = 0;
+               }
+            }
          } else {
             /* Zeros, which is what robust_buffer_access_behavior promises for
                a block nothing is bound to; failing the context instead cost
