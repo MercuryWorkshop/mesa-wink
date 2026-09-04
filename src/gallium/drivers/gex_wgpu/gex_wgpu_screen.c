@@ -29965,7 +29965,8 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->rg11b10_renderable =
       wgpuDeviceHasFeature(device, WGPUFeatureName_RG11B10UfloatRenderable);
    screen->texture_compression_bc =
-      wgpuDeviceHasFeature(device, WGPUFeatureName_TextureCompressionBC);
+      wgpuDeviceHasFeature(device, WGPUFeatureName_TextureCompressionBC) &&
+      !getenv("GEX_WGPU_NO_BC");
    screen->max_colour_bytes_per_sample =
       got_limits && limits.maxColorAttachmentBytesPerSample
          ? limits.maxColorAttachmentBytesPerSample : 32u;
