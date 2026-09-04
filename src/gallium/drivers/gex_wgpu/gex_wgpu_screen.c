@@ -4679,7 +4679,8 @@ gex_wgpu_effective_view_swizzle(const struct pipe_sampler_view *view,
         view->format == PIPE_FORMAT_B8G8R8X8_UNORM ||
         view->format == PIPE_FORMAT_B8G8R8X8_SRGB ||
         view->format == PIPE_FORMAT_R8G8B8X8_UNORM ||
-        view->format == PIPE_FORMAT_R8G8B8X8_SRGB))
+        view->format == PIPE_FORMAT_R8G8B8X8_SRGB ||
+        view->format == PIPE_FORMAT_R10G10B10X2_UNORM))
       return PIPE_SWIZZLE_1;
    return requested;
 }
@@ -11859,6 +11860,18 @@ gex_wgpu_texture_format(enum pipe_format format)
    case PIPE_FORMAT_B8G8R8X8_SRGB: return WGPUTextureFormat_BGRA8UnormSrgb;
    case PIPE_FORMAT_R8G8B8X8_UNORM: return WGPUTextureFormat_RGBA8Unorm;
    case PIPE_FORMAT_R8G8B8X8_SRGB: return WGPUTextureFormat_RGBA8UnormSrgb;
+   /* The same trade one width up. GLX's texture-from-pixmap gives an
+    * r10g10b10x2 view of an r10g10b10a2 pixmap, and refusing it left
+    * `texture_from_pixmap` the only program in a 341-strong sweep this driver
+    * declined -- while WebGPU has exactly one 10-bit format and it is the
+    * same bytes. The ignored alpha is answered by the view swizzle in
+    * gex_wgpu_effective_view_swizzle, as it is for the 8-bit pair.
+    *
+    * Only the RGB order. WebGPU has no BGR 10-bit format at all, so
+    * B10G10R10A2 is deliberately unmapped here and its X sibling has to be
+    * too -- mapping it to RGB10A2Unorm would silently swap red and blue,
+    * which is worse than the refusal. */
+   case PIPE_FORMAT_R10G10B10X2_UNORM: return WGPUTextureFormat_RGB10A2Unorm;
    case PIPE_FORMAT_DXT1_RGB:
    case PIPE_FORMAT_DXT1_RGBA: return WGPUTextureFormat_BC1RGBAUnorm;
    case PIPE_FORMAT_DXT1_SRGB:
