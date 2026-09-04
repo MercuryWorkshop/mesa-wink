@@ -201,7 +201,12 @@ extern void gex_wgpu_jspi_signal(void);
 #define GEX_WGPU_PACKED_IMAGE_ROW_BYTES 3
 #define GEX_WGPU_PACKED_IMAGE_SLICE_BYTES 4
 #define GEX_WGPU_PACKED_IMAGE_TEXEL_BYTES 5
-#define GEX_WGPU_PACKED_IMAGE_HEADER_WORDS 6
+/* Byte offset of texel zero within the binding. Zero for a texture image,
+ * whose data binding starts at its own texels; a *buffer* image carries the
+ * view's offset here instead of in the binding, because WebGPU wants a
+ * storage binding offset 256-aligned and glBindImageTexture's is not. */
+#define GEX_WGPU_PACKED_IMAGE_BASE_BYTES 6
+#define GEX_WGPU_PACKED_IMAGE_HEADER_WORDS 7
 
 /* How many 32-bit words a texel of a buffer-texture format occupies, or 0 for
  * a format this driver cannot serve as one.
@@ -653,6 +658,15 @@ static bool
 gex_wgpu_image_is_packed(enum pipe_format format, bool no_read, bool no_write,
                          enum glsl_sampler_dim dim, bool allow_read)
 {
+   /* A buffer image is served here whatever its format and however it is
+    * accessed -- before the write test, because a *read-only* one has nowhere
+    * else to go either: WebGPU has no texel buffer at all, so unlike a
+    * read-only texture image there is no sampled fallback. There is also
+    * nothing to copy in either direction, because the resource *is* a
+    * buffer, so the shader addresses it in place and allow_read does not
+    * apply. */
+   if (dim == GLSL_SAMPLER_DIM_BUF)
+      return format != PIPE_FORMAT_NONE;
    if (no_write || format == PIPE_FORMAT_NONE)
       return false;
    if (!no_read && !allow_read)
@@ -2746,6 +2760,16 @@ gex_wgpu_packed_image_offset(nir_builder *b, nir_variable *block,
 {
    const unsigned components = coord->num_components;
    nir_def *x = nir_channel(b, coord, 0);
+   nir_def *base = gex_wgpu_packed_image_header(
+      b, block, GEX_WGPU_PACKED_IMAGE_BASE_BYTES);
+   if (dim == GLSL_SAMPLER_DIM_BUF) {
+      /* No rows and no layers: a buffer image is a run of texels. */
+      return nir_iadd(
+         b, base,
+         nir_imul(b, x,
+                  gex_wgpu_packed_image_header(
+                     b, block, GEX_WGPU_PACKED_IMAGE_TEXEL_BYTES)));
+   }
    nir_def *y = (dim == GLSL_SAMPLER_DIM_1D || components < 2)
       ? nir_imm_int(b, 0) : nir_channel(b, coord, 1);
    nir_def *layer = nir_imm_int(b, 0);
@@ -2772,12 +2796,13 @@ gex_wgpu_packed_image_offset(nir_builder *b, nir_variable *block,
       nir_imul(b, x,
                gex_wgpu_packed_image_header(
                   b, block, GEX_WGPU_PACKED_IMAGE_TEXEL_BYTES)));
-   /* No header offset: the data is its own binding, and the driver points it
-    * past the header. */
-   return at;
+   /* The data is its own binding and the driver points it past the header, so
+    * the base is zero for a texture image; it is added anyway rather than
+    * branched on. */
+   return nir_iadd(b, at, base);
 }
 
-/* A 16-bit float's bits, in the low half of a 32-bit word, as a float -- in
+/* A small float's bits, right-aligned in a 32-bit word, as an f32 -- in
  * 32-bit integer arithmetic and nothing else.
  *
  * Every route through NIR to this ends in a 16-bit type, and Tint's SPIR-V
@@ -2788,29 +2813,40 @@ gex_wgpu_packed_image_offset(nir_builder *b, nir_variable *block,
  * nir_format_unpack_rgba expresses a half channel as `f2f32(u2u16(word))`,
  * and asking for nir_unpack_half_2x16 instead only moves the problem --
  * nir_lower_alu_width expands *that* into nir_unpack_32_2x16 plus f2f32,
- * which is the same 16-bit vector with a different spelling. The store side
- * never hits it, which is why an r16f image could be written and not read
- * back, and why this only turned up once the compute stage took the read
- * case.
+ * which is the same 16-bit vector with a different spelling.
+ * nir_format_unpack_11f11f10f writes the identical pattern, so the two
+ * formats Blender's EEVEE cares about fail the same way and neither can be
+ * left to Mesa. The store side never hits it, which is why such an image
+ * could be written and not read back.
  *
  * So the conversion is done by hand. Bias 15 to 127 is +112, the mantissa
  * moves 10 bits to 23, an exponent of all ones stays all ones so infinities
  * and NaN payloads survive, and a subnormal is mantissa * 2^-24 -- which is
  * exact in f32, so no case is approximated. */
 static nir_def *
-gex_wgpu_half_bits_to_float(nir_builder *b, nir_def *bits)
+gex_wgpu_small_float_to_float(nir_builder *b, nir_def *bits,
+                              unsigned mantissa_bits, bool has_sign)
 {
-   nir_def *sign = nir_ishl_imm(b, nir_iand_imm(b, bits, 0x8000), 16);
-   nir_def *exponent = nir_iand_imm(b, nir_ushr_imm(b, bits, 10), 0x1f);
-   nir_def *mantissa = nir_iand_imm(b, bits, 0x3ff);
-   nir_def *shifted = nir_ishl_imm(b, mantissa, 13);
+   /* Every format here has a 5-bit exponent biased by 15, which is what lets
+    * one function serve f16, the 11-bit pair and the 10-bit one: only the
+    * mantissa width and the presence of a sign differ. */
+   const unsigned width = mantissa_bits + 5 + (has_sign ? 1 : 0);
+   nir_def *sign = has_sign
+      ? nir_ishl_imm(b, nir_iand_imm(b, bits, 1u << (width - 1)),
+                     32 - width)
+      : nir_imm_int(b, 0);
+   nir_def *exponent =
+      nir_iand_imm(b, nir_ushr_imm(b, bits, mantissa_bits), 0x1f);
+   nir_def *mantissa = nir_iand_imm(b, bits, (1u << mantissa_bits) - 1);
+   nir_def *shifted = nir_ishl_imm(b, mantissa, 23 - mantissa_bits);
    nir_def *normal = nir_ior(
       b, nir_ishl_imm(b, nir_iadd_imm(b, exponent, 112), 23), shifted);
    /* Not an imm_float of infinity: a non-finite constant is something Tint
     * folds and then refuses, so the pattern is built as bits. */
    nir_def *special = nir_ior(b, nir_imm_int(b, 0x7f800000), shifted);
-   nir_def *subnormal =
-      nir_fmul_imm(b, nir_u2f32(b, mantissa), 1.0 / 16777216.0);
+   /* A subnormal is mantissa * 2^-(14 + mantissa_bits), exactly. */
+   nir_def *subnormal = nir_fmul_imm(
+      b, nir_u2f32(b, mantissa), ldexp(1.0, -(int)(14 + mantissa_bits)));
    nir_def *finite =
       nir_bcsel(b, nir_ieq_imm(b, exponent, 31), special, normal);
    /* A NIR value is untyped bits, so the float and the bit pattern select
@@ -2831,7 +2867,26 @@ gex_wgpu_unpack_image_texel(nir_builder *b, nir_def *packed,
 {
    const struct util_format_description *desc =
       util_format_description(format);
-   bool all_half = desc && desc->layout == UTIL_FORMAT_LAYOUT_PLAIN &&
+   if (!desc)
+      return nir_format_unpack_rgba(b, packed, format);
+
+   /* r11f_g11f_b10f: three unsigned small floats in one word, low to high,
+    * and an alpha GL reads as 1. */
+   if (format == PIPE_FORMAT_R11G11B10_FLOAT) {
+      static const unsigned shift[3] = {0, 11, 22};
+      static const unsigned mantissa[3] = {6, 6, 5};
+      nir_def *component[4];
+      for (unsigned c = 0; c < 3; ++c)
+         component[c] = gex_wgpu_small_float_to_float(
+            b, nir_iand_imm(b, nir_ushr_imm(b, nir_channel(b, packed, 0),
+                                            shift[c]),
+                            (1u << (mantissa[c] + 5)) - 1),
+            mantissa[c], false);
+      component[3] = nir_imm_float(b, 1.0f);
+      return nir_vec(b, component, 4);
+   }
+
+   bool all_half = desc->layout == UTIL_FORMAT_LAYOUT_PLAIN &&
                    desc->nr_channels > 0;
    for (unsigned c = 0; all_half && c < desc->nr_channels; ++c)
       all_half = desc->channel[c].type == UTIL_FORMAT_TYPE_FLOAT &&
@@ -2851,8 +2906,8 @@ gex_wgpu_unpack_image_texel(nir_builder *b, nir_def *packed,
       nir_def *bits = nir_channel(b, packed, word);
       if (c & 1)
          bits = nir_ushr_imm(b, bits, 16);
-      component[c] = gex_wgpu_half_bits_to_float(b, nir_iand_imm(b, bits,
-                                                                 0xffff));
+      component[c] = gex_wgpu_small_float_to_float(
+         b, nir_iand_imm(b, bits, 0xffff), 10, true);
    }
    return nir_vec(b, component, 4);
 }
@@ -2898,7 +2953,8 @@ gex_wgpu_lower_packed_image(nir_builder *b, nir_instr *instr, void *data)
          gex_wgpu_packed_image_header(b, block, GEX_WGPU_PACKED_IMAGE_HEIGHT),
          gex_wgpu_packed_image_header(b, block, GEX_WGPU_PACKED_IMAGE_LAYERS),
       };
-      /* A 1D image's second component is its layer count, not its height. */
+      /* A 1D image's second component is its layer count, not its height,
+       * and a buffer image has only the one. */
       if (dim == GLSL_SAMPLER_DIM_1D)
          component[1] = component[2];
       nir_def *size = nir_vec(b, component, 3);
@@ -4009,6 +4065,7 @@ static WGPUBuffer gex_wgpu_packed_image_scratch(struct gex_wgpu_context *ctx,
 static void gex_wgpu_packed_image_seed(struct gex_wgpu_context *ctx,
                                        const struct pipe_image_view *iv,
                                        enum pipe_format format);
+static bool gex_wgpu_image_is_bound(const struct pipe_image_view *iv);
 static void gex_wgpu_flush_packed_images(struct gex_wgpu_context *ctx,
                                          WGPUCommandEncoder encoder);
 #define gex_wgpu_submit_pending(ctx) \
@@ -8979,6 +9036,13 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * because the position reaches SPIR-V as builtin 19 and WGSL has no such
     * builtin. That refusal arrives as a link error and the program does not
     * run at all. */
+   if (getenv("GEX_WGPU_IMAGE_TRACE"))
+      fprintf(stderr, "gex-shstate: stage=%u images=%u packed=%u buftex=%u "
+              "ssbo=%u ubo=%u tex=%u int_sampled=0x%x\n",
+              (unsigned)expected_stage, shader->image_count,
+              shader->packed_image_count, shader->buftex_count,
+              shader->ssbo_count, shader->ubo_count, shader->texture_count,
+              shader->integer_sampled_slots);
    const bool deferred_integer_sampling =
       (shader->integer_sampled_slots != 0 || shader->buftex_count != 0 ||
        shader->reads_sample_pos) &&
@@ -12997,6 +13061,22 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    const bool one_d_array = resource &&
       resource->target == PIPE_TEXTURE_1D_ARRAY;
+   /* Gallium's convention for a 1D array puts the layer in box->y and the
+    * layer count in box->height, and st_TexSubImage converts to it -- but not
+    * on every path. KHR-GL44.shader_image_load_store's allTargets cases
+    * upload a two-layer 1D array as a plain 3D box, 16x1x2, and this refused
+    * it for having depth 2 on a target whose depth must be 1: an upload
+    * dropped for good, on a target nothing else in the suite exercises.
+    *
+    * Both readings are accepted rather than one being declared correct. They
+    * only differ when there is something in the axis to disambiguate on, and
+    * a layer count or index in z is unambiguous. */
+   const bool layers_in_z =
+      one_d_array && box && (box->depth > 1 || box->z > 0);
+   const int layer_origin = !one_d_array ? (box ? box->z : 0)
+      : layers_in_z ? box->z : box->y;
+   const int layer_count = !one_d_array ? (box ? box->depth : 0)
+      : layers_in_z ? box->depth : box->height;
    const bool compressed = resource &&
       gex_wgpu_is_bc_format(resource->format);
    const unsigned bytes_per_pixel = resource
@@ -13039,10 +13119,11 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
        (uint64_t)(unsigned)box->x + box->width >
           u_minify(resource->width0, level) ||
        (uint64_t)(unsigned)box->y + box->height >
-          (one_d_array ? resource->array_size
+          (one_d_array ? (layers_in_z ? 1u : resource->array_size)
                        : u_minify(resource->height0, level)) ||
        (uint64_t)(unsigned)box->z + box->depth >
-          (one_d_array ? 1 : resource->target == PIPE_TEXTURE_3D
+          (one_d_array ? (layers_in_z ? resource->array_size : 1u)
+             : resource->target == PIPE_TEXTURE_3D
              ? u_minify(resource->depth0, level) : resource->array_size) ||
        (compressed &&
         (((unsigned)box->x % block_width) ||
@@ -13144,7 +13225,7 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
    destination.mipLevel = level;
    destination.origin.x = box->x;
    destination.origin.y = one_d_array ? 0 : box->y;
-   destination.origin.z = one_d_array ? box->y : box->z;
+   destination.origin.z = layer_origin;
    destination.aspect =
       (depth_stencil && wgpu_format != WGPUTextureFormat_Stencil8)
          ? WGPUTextureAspect_DepthOnly : WGPUTextureAspect_All;
@@ -13198,7 +13279,7 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
                   : compressed
                   ? ALIGN_POT((uint32_t)box->height, block_height)
                   : (uint32_t)box->height,
-      one_d_array ? (uint32_t)box->height : (uint32_t)box->depth,
+      (uint32_t)layer_count,
    };
    gex_resource(resource)->texture_written = true;
    gex_resource(resource)->write_serial++;
@@ -17668,7 +17749,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          &ctx->shader_images[MESA_SHADER_COMPUTE][slot];
       WGPUBuffer buffer = NULL, header = NULL;
       uint64_t size = 0;
-      if (!iv->resource || !gex_resource(iv->resource)->texture) {
+      if (!gex_wgpu_image_is_bound(iv)) {
          buffer = gex_wgpu_packed_image_scratch(ctx, false);
          header = gex_wgpu_packed_image_scratch(ctx, true);
          size = GEX_WGPU_PACKED_IMAGE_HEADER_BYTES;
@@ -25903,8 +25984,58 @@ gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx,
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
    struct pipe_resource *resource = iv->resource;
    struct gex_wgpu_resource *gex = gex_resource(resource);
-   const unsigned level = iv->u.tex.level;
    const uint32_t bytes = util_format_get_blocksize(format);
+
+   /* A buffer image needs no staging and no copies: the resource is already
+    * the buffer the shader packs into, so only the header has to be built. */
+   if (resource->target == PIPE_BUFFER) {
+      if (!gex->buffer)
+         return NULL;
+      if (!gex->packed_image_header) {
+         WGPUBufferDescriptor header_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+         header_desc.size = GEX_WGPU_PACKED_IMAGE_HEADER_BYTES;
+         header_desc.usage =
+            WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+         gex->packed_image_header =
+            wgpuDeviceCreateBuffer(screen->device, &header_desc);
+         if (!gex->packed_image_header)
+            return NULL;
+      }
+      const uint32_t span = iv->u.buf.size ? (uint32_t)iv->u.buf.size
+                                           : (uint32_t)resource->width0;
+      uint32_t words[GEX_WGPU_PACKED_IMAGE_HEADER_WORDS] = {0};
+      words[GEX_WGPU_PACKED_IMAGE_WIDTH] = bytes ? span / bytes : 0;
+      words[GEX_WGPU_PACKED_IMAGE_HEIGHT] = 1;
+      words[GEX_WGPU_PACKED_IMAGE_LAYERS] = 1;
+      words[GEX_WGPU_PACKED_IMAGE_ROW_BYTES] = span;
+      words[GEX_WGPU_PACKED_IMAGE_SLICE_BYTES] = span;
+      words[GEX_WGPU_PACKED_IMAGE_TEXEL_BYTES] = bytes;
+      words[GEX_WGPU_PACKED_IMAGE_BASE_BYTES] = (uint32_t)iv->u.buf.offset;
+      wgpuQueueWriteBuffer(screen->queue, gex->packed_image_header, 0, words,
+                           sizeof(words));
+      if (header_out)
+         *header_out = gex->packed_image_header;
+      if (size_out)
+         *size_out = (uint64_t)iv->u.buf.offset + span;
+      /* The shader is about to write it on the device, and a read map only
+       * goes to the device for a buffer it knows was written there -- the
+       * bind flags say SHADER_IMAGE, not SHADER_BUFFER, so nothing else was
+       * going to say so. Without this the store landed correctly and
+       * glGetBufferSubData returned the stale CPU shadow: zeroes, with no
+       * error anywhere. */
+      gex->gpu_written = true;
+      /* And the batch has to know it touched this resource, or a read map
+       * finds no conflict, skips the flush, and copies the buffer to its
+       * staging *before* the draw that writes it is submitted. The value read
+       * back is then whatever was there beforehand -- indistinguishable from
+       * a store that never happened, which is exactly how this looked. */
+      gex_wgpu_batch_touch(ctx, resource);
+      /* Nothing is registered for the pass to copy out; the writes are
+       * already where they belong. */
+      return gex->buffer;
+   }
+
+   const unsigned level = iv->u.tex.level;
    const uint32_t width = MAX2(u_minify(resource->width0, level), 1);
    const uint32_t height =
       (resource->target == PIPE_TEXTURE_1D ||
@@ -25990,6 +26121,24 @@ gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx,
    ctx->packed_copies[at].row_bytes = row_bytes;
    if (size_out) *size_out = total;
    return gex->packed_image_buffer;
+}
+
+/* Whether a bound image unit has anything behind it. A buffer image's
+ * resource carries a WGPU *buffer* and no texture, so asking about the
+ * texture -- which is what the storage-texture path rightly does -- sent
+ * every imageBuffer down the incomplete-texture path instead: its stores went
+ * to the scratch buffer and were discarded, with no error and no refusal
+ * anywhere. The draw ran, the module was right, and the value read back was
+ * simply whatever had been there before, which is the hardest shape of defect
+ * to see. */
+static bool
+gex_wgpu_image_is_bound(const struct pipe_image_view *iv)
+{
+   if (!iv->resource)
+      return false;
+   return iv->resource->target == PIPE_BUFFER
+      ? gex_resource(iv->resource)->buffer != NULL
+      : gex_resource(iv->resource)->texture != NULL;
 }
 
 /* Somewhere for a packed image bound to an incomplete texture to write.
@@ -31035,7 +31184,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             &ctx->shader_images[MESA_SHADER_FRAGMENT][slot];
          WGPUBuffer buffer = NULL, header = NULL;
          uint64_t size = 0;
-         if (!iv->resource || !gex_resource(iv->resource)->texture) {
+         if (!gex_wgpu_image_is_bound(iv)) {
             /* An image unit bound to an incomplete texture discards its
              * stores and the draw still happens -- the same rule the storage
              * texture path serves with a stand-in view. Scratch buffers
