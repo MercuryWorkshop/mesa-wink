@@ -69,6 +69,13 @@ extern void gex_wgpu_jspi_signal(void);
 #define GEX_WGPU_MAX_SHADER_BUFFERS 24
 #define GEX_WGPU_SSBO_FIRST_BINDING \
    (GEX_WGPU_STORAGE_UBO_FIRST_BINDING + GEX_WGPU_MAX_CONSTANT_BUFFERS)
+/* The colour attachment, copied, so a fragment shader can read what it is
+ * also writing -- which is what GL's logic ops need and WebGPU has no state
+ * for. A fragment shader's textures are numbered 2*unit and 2*unit+1 in set
+ * zero, so this sits just above the last unit's pair. It needs no sampler:
+ * the read is a texelFetch at gl_FragCoord. */
+#define GEX_WGPU_LOGICOP_BINDING (2 * GEX_WGPU_MAX_SAMPLERS)
+
 /* Application shader images, again in a range of their own. */
 #define GEX_WGPU_MAX_SHADER_IMAGES 8
 #define GEX_WGPU_IMAGE_FIRST_BINDING \
@@ -1406,6 +1413,9 @@ struct gex_wgpu_shader_variant {
     * built for. Zero when the shader does not read it, so a shader that does
     * not is one variant however the framebuffer changes. */
    uint8_t sample_positions_for;
+   /* The logic op this variant applies, plus one, or zero for none. Part of
+    * the key because the operation is compiled into the shader. */
+   uint8_t logicop;
    /* Texel word counts of the bound buffer textures this variant's texelFetch
     * lowering was built against. The format is on the sampler view, not in
     * the shader, so it is state and belongs in the key. */
@@ -7490,6 +7500,138 @@ gex_wgpu_retype_color_outputs(nir_shader *nir, nir_alu_type want)
    nir_fixup_deref_types(nir);
 }
 
+/* GL's logic ops, which WebGPU has no blend state for.
+ *
+ * The operation is defined on the framebuffer's *integer* representation, not
+ * on the float the shader wrote: XOR of 0.5 and 0.25 is not a number you can
+ * reach by arithmetic on floats. So for an 8-bit unorm target both sides are
+ * converted to bytes, the operation is applied, and the result is converted
+ * back. Other formats have other conversions and are declined at the draw
+ * rather than approximated.
+ *
+ * The destination comes from a copy of the colour attachment -- the same
+ * snapshot the feedback-loop path takes, for the same reason: WebGPU forbids
+ * sampling the texture a pass is rendering to. It is read with a texelFetch
+ * at gl_FragCoord, so it needs a texture binding but no sampler.
+ *
+ * The copy is taken once per draw, so two primitives of one draw that overlap
+ * both see the state before the draw rather than each other. That is right
+ * for the rubber-band rectangle this exists for and wrong for anything that
+ * overdraws itself; there is no cheap fix, because reading what the same draw
+ * just wrote is precisely what the API forbids.
+ */
+static nir_def *
+gex_wgpu_logicop_apply(nir_builder *b, unsigned func, nir_def *src,
+                       nir_def *dst)
+{
+   /* Bytes, so the bitwise operations mean what GL says they mean. */
+   nir_def *s = nir_f2u32(b, nir_fround_even(
+      b, nir_fmul_imm(b, nir_fsat(b, src), 255.0)));
+   nir_def *d = nir_f2u32(b, nir_fround_even(
+      b, nir_fmul_imm(b, nir_fsat(b, dst), 255.0)));
+   nir_def *value;
+   switch (func) {
+   case PIPE_LOGICOP_CLEAR:         value = nir_imm_int(b, 0); break;
+   case PIPE_LOGICOP_NOR:           value = nir_inot(b, nir_ior(b, s, d)); break;
+   case PIPE_LOGICOP_AND_INVERTED:  value = nir_iand(b, nir_inot(b, s), d); break;
+   case PIPE_LOGICOP_COPY_INVERTED: value = nir_inot(b, s); break;
+   case PIPE_LOGICOP_AND_REVERSE:   value = nir_iand(b, s, nir_inot(b, d)); break;
+   case PIPE_LOGICOP_INVERT:        value = nir_inot(b, d); break;
+   case PIPE_LOGICOP_XOR:           value = nir_ixor(b, s, d); break;
+   case PIPE_LOGICOP_NAND:          value = nir_inot(b, nir_iand(b, s, d)); break;
+   case PIPE_LOGICOP_AND:           value = nir_iand(b, s, d); break;
+   case PIPE_LOGICOP_EQUIV:         value = nir_inot(b, nir_ixor(b, s, d)); break;
+   case PIPE_LOGICOP_NOOP:          value = d; break;
+   case PIPE_LOGICOP_OR_INVERTED:   value = nir_ior(b, nir_inot(b, s), d); break;
+   case PIPE_LOGICOP_OR_REVERSE:    value = nir_ior(b, s, nir_inot(b, d)); break;
+   case PIPE_LOGICOP_OR:            value = nir_ior(b, s, d); break;
+   case PIPE_LOGICOP_SET:           value = nir_imm_int(b, 0xff); break;
+   case PIPE_LOGICOP_COPY:
+   default:                         value = s; break;
+   }
+   /* The operations above can set bits above the eighth -- `inot` of a byte
+    * is a full 32-bit complement -- and those are not part of the value. */
+   value = nir_iand_imm(b, value, 0xffu);
+   return nir_fmul_imm(b, nir_u2f32(b, value), 1.0 / 255.0);
+}
+
+struct gex_wgpu_logicop_lowering {
+   unsigned func;
+   nir_variable *texture;
+   bool lowered;
+};
+
+static bool
+gex_wgpu_lower_logicop_store(nir_builder *b, nir_intrinsic_instr *intr,
+                             void *data)
+{
+   struct gex_wgpu_logicop_lowering *state = data;
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+   if (!var || var->data.mode != nir_var_shader_out ||
+       (var->data.location != FRAG_RESULT_COLOR &&
+        var->data.location < FRAG_RESULT_DATA0))
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   /* The destination texel, at this fragment. gl_FragCoord is already in the
+    * framebuffer's own orientation -- the driver's y flip happens before the
+    * fragment stage sees it -- so the snapshot is indexed directly. */
+   nir_def *coord = nir_f2i32(
+      b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
+   nir_deref_instr *texture = nir_build_deref_var(b, state->texture);
+   nir_tex_instr *fetch = nir_tex_instr_create(b->shader, 3);
+   fetch->op = nir_texop_txf;
+   fetch->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   fetch->is_array = false;
+   fetch->dest_type = nir_type_float32;
+   fetch->coord_components = 2;
+   fetch->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref,
+                                       &texture->def);
+   fetch->src[1] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+   fetch->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
+   nir_def_init(&fetch->instr, &fetch->def, 4, 32);
+   nir_builder_instr_insert(b, &fetch->instr);
+
+   nir_def *src = intr->src[1].ssa;
+   const unsigned components = src->num_components;
+   nir_def *channels[4];
+   for (unsigned i = 0; i < components; ++i)
+      channels[i] = gex_wgpu_logicop_apply(b, state->func,
+                                           nir_channel(b, src, i),
+                                           nir_channel(b, &fetch->def, i));
+   nir_src_rewrite(&intr->src[1], nir_vec(b, channels, components));
+   state->lowered = true;
+   return true;
+}
+
+static bool
+gex_wgpu_lower_logicop(nir_shader *nir, unsigned func)
+{
+   struct gex_wgpu_logicop_lowering state = { .func = func };
+   const struct glsl_type *type =
+      glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_FLOAT);
+   state.texture =
+      nir_variable_create(nir, nir_var_uniform, type, "gex_logicop_dst");
+   if (!state.texture)
+      return false;
+   state.texture->data.descriptor_set = 0;
+   state.texture->data.binding = GEX_WGPU_LOGICOP_BINDING;
+   state.texture->data.explicit_binding = 1;
+   nir_shader_intrinsics_pass(nir, gex_wgpu_lower_logicop_store,
+                              nir_metadata_control_flow, &state);
+   if (!state.lowered) {
+      /* Nothing wrote a colour, so there is nothing to combine and the
+       * texture would be a binding the draw does not provide. */
+      exec_node_remove(&state.texture->node);
+      return false;
+   }
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   return true;
+}
+
 /* Where WebGPU takes its samples inside a pixel.
  *
  * WebGPU does not let a pipeline choose sample locations, so they are the
@@ -7664,6 +7806,14 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    /* GL_POINT_SMOOTH, which needs the sprite coordinate whether or not the
     * shader itself reads it -- the decision in draw_vbo_inner asks for the
     * varying on its behalf. */
+   /* The logic op, plus one, or zero. COPY is what "no logic op" means in GL
+    * and needs no shader; NOOP is a zero write mask and is handled at the
+    * draw, not here. */
+   const uint8_t want_logicop =
+      (ctx->blend && ctx->blend->logicop_enable &&
+       ctx->blend->logicop_func != PIPE_LOGICOP_COPY &&
+       ctx->blend->logicop_func != PIPE_LOGICOP_NOOP)
+         ? (uint8_t)(ctx->blend->logicop_func + 1) : 0u;
    /* Zero unless the shader reads gl_SamplePosition, so a shader that does
     * not is one variant however the framebuffer's sample count changes. */
    const uint8_t want_sample_positions =
@@ -7719,7 +7869,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
     * word -- `if (!fragment.module) return;` is a silent early exit. */
    if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
-       line_edge_location == ~0u && !fs->buftex_count && !want_sample_positions)
+       line_edge_location == ~0u && !fs->buftex_count &&
+       !want_sample_positions && !want_logicop)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -7826,7 +7977,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
-      want_sample_positions != 0;
+      want_sample_positions != 0 || want_logicop != 0;
    if (!needs_variant && !fs->buftex_count)
       return fs->module;
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
@@ -7839,6 +7990,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
                    cached->point_coord_location == point_coord_location &&
                    cached->point_smooth == want_point_smooth &&
                    cached->sample_positions_for == want_sample_positions &&
+                   cached->logicop == want_logicop &&
                    cached->line_edge_location == line_edge_location &&
                    cached->line_stipple_pattern == line_stipple_pattern &&
                    cached->line_stipple_factor == line_stipple_factor &&
@@ -7916,6 +8068,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       nir_shader_intrinsics_pass(variant, gex_wgpu_lower_sample_pos,
                                  nir_metadata_control_flow, &sample_pos);
    }
+   if (want_logicop)
+      gex_wgpu_lower_logicop(variant, (unsigned)want_logicop - 1u);
    if (want_line_smooth)
       gex_wgpu_lower_line_smooth(variant, line_edge_location);
    if (want_line_stipple)
@@ -7972,6 +8126,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    cached->point_coord_location = point_coord_location;
    cached->point_smooth = want_point_smooth;
    cached->sample_positions_for = want_sample_positions;
+   cached->logicop = want_logicop;
    cached->line_edge_location = line_edge_location;
    cached->line_stipple_pattern = line_stipple_pattern;
    cached->line_stipple_factor = line_stipple_factor;
@@ -8479,9 +8634,12 @@ gex_wgpu_create_blend_state(struct pipe_context *pipe,
     * `rt[]` past the first entry is deliberately not compared: with
     * independent blending off, Gallium says only `rt[0]` is meaningful, and
     * st/mesa does not promise the rest are zero. */
+   /* A logic op is served, not refused: the fragment variant reads a copy of
+    * the colour attachment and applies the operation itself. What it cannot
+    * do -- a target that is not 8-bit unorm, or more than one of them -- is
+    * declined at the draw, where the framebuffer is known. */
    const char *unmodelled =
-      state->logicop_enable ? "logic op"
-      : state->alpha_to_coverage ? "alpha to coverage"
+      state->alpha_to_coverage ? "alpha to coverage"
       : state->alpha_to_one ? "alpha to one"
       : state->advanced_blend_func ? "advanced blend equation"
       : state->is_yuv ? "YUV target" : NULL;
@@ -25764,6 +25922,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          color_targets[i].writeMask |= WGPUColorWriteMask_Blue;
       if (rt->colormask & PIPE_MASK_A)
          color_targets[i].writeMask |= WGPUColorWriteMask_Alpha;
+      /* GL_LOGIC_OP replaces blending rather than combining with it, and
+       * GL_NOOP means the target keeps what it holds -- which is a zero write
+       * mask and needs no shader at all. */
+      if (ctx->blend->logicop_enable) {
+         if (ctx->blend->logicop_func == PIPE_LOGICOP_NOOP)
+            color_targets[i].writeMask = 0;
+         continue;
+      }
       if (!rt->blend_enable)
          continue;
       blend_states[i] = (WGPUBlendState)WGPU_BLEND_STATE_INIT;
@@ -26369,7 +26535,56 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       ctx->fs->buftex_count;
    const bool needs_vertex_constant = vertex_group_count != 0;
    const bool needs_fragment_constant = fragment_group_count != 0;
-   const bool needs_texture = ctx->fs->texture_count != 0;
+   /* The logic op this draw applies, plus one, or zero. COPY means "write
+    * normally" and NOOP is a zero write mask handled with the colour targets,
+    * so neither needs the destination. */
+   const unsigned logicop =
+      (ctx->blend && ctx->blend->logicop_enable &&
+       ctx->blend->logicop_func != PIPE_LOGICOP_COPY &&
+       ctx->blend->logicop_func != PIPE_LOGICOP_NOOP)
+         ? (unsigned)ctx->blend->logicop_func + 1u : 0u;
+   /* What the operation is applied to has to be bytes, because that is what
+    * GL defines it on, and there has to be exactly one of them: the shader
+    * reads a single snapshot. Declined by name rather than approximated. */
+   if (logicop) {
+      const bool one_target = ctx->color_count == 1 && ctx->colors[0];
+      const bool byte_target =
+         one_target && ctx->color_formats[0] != PIPE_FORMAT_NONE &&
+         util_format_get_blocksize(ctx->color_formats[0]) == 4 &&
+         !util_format_is_pure_integer(ctx->color_formats[0]);
+      if (!byte_target) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: logic op declined (targets=%u "
+                    "format=%s); only a single 8-bit unorm colour target is "
+                    "served\n", ctx->color_count,
+                    one_target ? util_format_short_name(ctx->color_formats[0])
+                               : "none");
+         }
+         return;
+      }
+   }
+   const bool needs_texture = ctx->fs->texture_count != 0 || logicop != 0;
+   /* Taken here rather than where the bind group is filled: the snapshot
+    * copies a texture, which needs an encoder of its own, and by the time the
+    * entries are built the render pass has begun -- calling it there took
+    * Dawn's BeginRenderPass down with a segmentation fault. The feedback path
+    * takes its own snapshot in this same stretch, for the same reason. */
+   WGPUTextureView logicop_view = NULL;
+   if (logicop) {
+      logicop_view = gex_wgpu_feedback_snapshot(ctx, ctx->colors[0],
+                                                ctx->color_levels[0]);
+      if (!logicop_view) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: logic op declined (no snapshot of the "
+                            "colour attachment)\n");
+         }
+         return;
+      }
+   }
    bool missing_constant = false;
    static bool told_which;
    for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
@@ -26702,7 +26917,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       return;
    }
    WGPUBindGroupLayoutEntry
-      texture_layout_entries[GEX_WGPU_MAX_SAMPLERS * 2];
+      texture_layout_entries[GEX_WGPU_MAX_SAMPLERS * 2 + 1];
    /* Sized by the actual maxima, not a literal: raising
     * GEX_WGPU_MAX_CONSTANT_BUFFERS past 8 would otherwise overflow these on a
     * shader that declares enough uniform blocks. */
@@ -26734,6 +26949,21 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             ctx->fs->texture_dimensions[i];
          texture_layout_entries[i].texture.multisampled =
             (ctx->fs->multisampled_slots >> ctx->fs->texture_slots[i]) & 1;
+      }
+      if (logicop) {
+         /* The colour attachment's copy, read by texelFetch, so
+          * unfilterable-float and no sampler beside it. */
+         const unsigned entry =
+            ctx->fs->texture_count + ctx->fs->sampler_count;
+         texture_layout_entries[entry] =
+            (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+         texture_layout_entries[entry].binding = GEX_WGPU_LOGICOP_BINDING;
+         texture_layout_entries[entry].visibility = WGPUShaderStage_Fragment;
+         texture_layout_entries[entry].texture.sampleType =
+            WGPUTextureSampleType_UnfilterableFloat;
+         texture_layout_entries[entry].texture.viewDimension =
+            WGPUTextureViewDimension_2D;
+         texture_layout_entries[entry].texture.multisampled = false;
       }
       for (unsigned i = 0; i < ctx->fs->sampler_count; ++i) {
          const unsigned entry = ctx->fs->texture_count + i;
@@ -26948,7 +27178,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       WGPUBindGroupLayoutDescriptor desc =
          WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
       if (group == 0 && needs_texture) {
-         desc.entryCount = ctx->fs->texture_count + ctx->fs->sampler_count;
+         desc.entryCount =
+            ctx->fs->texture_count + ctx->fs->sampler_count + (logicop ? 1 : 0);
          desc.entries = texture_layout_entries;
       } else if (group == 1 && needs_vertex_constant) {
          desc.entryCount = vertex_group_count;
@@ -27140,7 +27371,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    unsigned image_view_count = 0;
    struct gex_wgpu_dynamic_offsets dynamic[4] = {{0}, {0}, {0}, {0}};
    if (pipeline && needs_texture) {
-      WGPUBindGroupEntry entries[GEX_WGPU_MAX_SAMPLERS * 2];
+      WGPUBindGroupEntry entries[GEX_WGPU_MAX_SAMPLERS * 2 + 1];
       for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
          const unsigned slot = ctx->fs->texture_slots[i];
          entries[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
@@ -27195,9 +27426,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                             ? WGPUSamplerBindingType_NonFiltering
                             : ctx->fs->sampler_types[i]);
       }
+      if (logicop) {
+         const unsigned entry =
+            ctx->fs->texture_count + ctx->fs->sampler_count;
+         entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[entry].binding = GEX_WGPU_LOGICOP_BINDING;
+         entries[entry].textureView = logicop_view;
+      }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[0];
-      bind_desc.entryCount = ctx->fs->texture_count + ctx->fs->sampler_count;
+      bind_desc.entryCount =
+         ctx->fs->texture_count + ctx->fs->sampler_count + (logicop ? 1 : 0);
       bind_desc.entries = entries;
       bind_groups[0] = gex_wgpu_cached_bind_group(
          screen, bind_desc.layout, bind_desc.entries,
