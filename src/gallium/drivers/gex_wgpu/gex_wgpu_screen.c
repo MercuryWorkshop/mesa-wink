@@ -28593,7 +28593,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* Bounded, so one command buffer cannot grow without limit and the GPU
     * always has something to be getting on with -- and submitted at once if
     * the batch ran out of room to keep this draw's resources alive. */
-   if (++ctx->pending_draws >= GEX_WGPU_MAX_BATCHED_DRAWS ||
+   /* GEX_WGPU_MAX_BATCH overrides the bound, down to submitting every draw.
+    * For telling a batching or synchronisation problem from everything else:
+    * a fault that survives a batch of one is not about how much is in flight.
+    */
+   static int batch_limit = -1;
+   if (batch_limit < 0) {
+      const char *want = getenv("GEX_WGPU_MAX_BATCH");
+      batch_limit = want ? MAX2(1, atoi(want)) : GEX_WGPU_MAX_BATCHED_DRAWS;
+   }
+   if ((int)++ctx->pending_draws >= batch_limit ||
        ctx->batch_touched_overflowed)
       gex_wgpu_submit_pending(ctx);
    if (gex_timing) {
