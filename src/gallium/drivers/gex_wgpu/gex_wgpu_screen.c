@@ -535,6 +535,40 @@ static void gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
      * what keeps u_primconvert from trying to rewrite it into triangles,
      * which would silently discard the patch structure. */                  BITFIELD_BIT(MESA_PRIM_PATCHES))
 
+/* The topologies this driver will *accept from st*, which is deliberately a
+ * wider set than the ones WebGPU has.
+ *
+ * A quad, a quad strip and a polygon each have to reach glPolygonMode's
+ * unfilled rewrite intact. GL draws a polygon's own edges, and once st has
+ * split a quad into two triangles that information is gone: the rewrite then
+ * emits six edges instead of four, and the two extra ones are the
+ * decomposition diagonal. `quad-unfilled` drew exactly that -- 224 extra lit
+ * pixels lying in 224 distinct rows *and* columns, which is a line from
+ * corner to corner -- while llvmpipe and softpipe were pixel-identical to
+ * each other.
+ *
+ * Claiming them costs nothing for a *filled* draw. The draw dispatch converts
+ * against GEX_WGPU_PRIM_MODES -- the topologies WebGPU actually has -- and
+ * u_primconvert is created with that same narrow set, so a filled quad is
+ * still rewritten into triangles exactly as before. Only the unfilled
+ * rewrite, which runs first, sees the original primitive. That is the shape
+ * the unfilled code was already written for: gex_wgpu_polygon_walk has cases
+ * for all three of these, which until now could not be reached.
+ *
+ * A triangle fan is deliberately *not* here, and the rule for what belongs is
+ * the reason: a fan's every triangle is already its own polygon, so st's split
+ * loses no edges and there is nothing to keep intact. A topology earns a place
+ * here only when the split would lose edges GL draws.
+ *
+ * supported_prim_modes_with_restart is left at the narrow set on purpose, so
+ * that Mesa resolves restart for a quad draw before the driver sees it and the
+ * unfilled rewrite gets one merged primitive list.
+ */
+#define GEX_WGPU_ACCEPTED_PRIM_MODES                                    \
+   (GEX_WGPU_PRIM_MODES | BITFIELD_BIT(MESA_PRIM_QUADS) |               \
+    BITFIELD_BIT(MESA_PRIM_QUAD_STRIP) |                                \
+    BITFIELD_BIT(MESA_PRIM_POLYGON))
+
 /* Which formats WebGPU will take as a *storage* texture, which is a much
  * narrower list than the renderable or sampleable ones and is the real limit
  * on GL image load/store. Anything absent here is refused rather than
@@ -34054,7 +34088,7 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * uploaded user buffers -- then reached the GPU as whatever the buffer
     * held before, with no error anywhere. */
    caps->buffer_map_persistent_coherent = false;
-   caps->supported_prim_modes = GEX_WGPU_PRIM_MODES;
+   caps->supported_prim_modes = GEX_WGPU_ACCEPTED_PRIM_MODES;
    /* Restart is resolved on the CPU by splitting the draw, which works for
     * every topology the driver takes. */
    /* WebGPU requires a storage binding offset to be 256-byte aligned, and
