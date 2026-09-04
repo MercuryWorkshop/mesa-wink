@@ -716,11 +716,24 @@ gex_wgpu_image_is_packed(enum pipe_format format, bool no_read, bool no_write,
       return false;
    if (!no_read && !allow_read)
       return false;
-   const enum pipe_format backing = gex_wgpu_format_backing(format);
+   /* A format the driver keeps in a wider one is **not** storable as far as an
+    * image is concerned, whatever the promotion does for the texture.
+    *
+    * Two reasons, and the second is the stronger. The promotion is per
+    * format, so an r16g16_unorm image is promoted to rg32float while the
+    * *texture* under it may be something else entirely -- an r32_float, in
+    * Blender's EEVEE -- and the storage view then names a format WebGPU
+    * refuses over that texture, at a different texel size, which not even a
+    * byte copy can bridge. And the promotion is *lossy in the wrong
+    * direction*: it stores full float32 where GL asks for 16-bit unorm, so a
+    * value written through the image and read back through a sampler has not
+    * been rounded as GL says it should be.
+    *
+    * The packed path has neither problem: a buffer has no format to promote,
+    * and the shader rounds exactly as the format requires. */
    const bool storable =
-      gex_wgpu_storage_texture_format(
-         backing != PIPE_FORMAT_NONE ? backing : format) !=
-      WGPUTextureFormat_Undefined;
+      gex_wgpu_format_backing(format) == PIPE_FORMAT_NONE &&
+      gex_wgpu_storage_texture_format(format) != WGPUTextureFormat_Undefined;
    /* A written-only image is packed when there is no storage texture for it;
     * one that is read as well is packed when there is no storage texture
     * *or* no read_write access for it. */
@@ -1097,6 +1110,10 @@ struct gex_wgpu_resource {
    /* A texture of the *image's* format standing in for this one, for an image
     * bound at another format in its GL format class -- see
     * gex_wgpu_image_alias. */
+   /* A copy of this buffer for a read-only binding that would otherwise
+    * overlap a writable one -- see gex_wgpu_alias_snapshot. */
+   WGPUBuffer alias_snapshot;
+   uint64_t alias_snapshot_bytes;
    WGPUTexture image_alias;
    WGPUBuffer image_alias_staging;
    enum pipe_format image_alias_format;
@@ -4189,6 +4206,16 @@ static void gex_wgpu_flush_packed_images(struct gex_wgpu_context *ctx,
 static WGPUTexture gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
                                         const struct pipe_image_view *iv,
                                         bool read);
+static bool gex_wgpu_image_also_sampled(const struct gex_wgpu_context *ctx,
+                                        const struct pipe_resource *resource,
+                                        bool compute);
+static void gex_wgpu_trace_buffer_aliasing(
+   const char *where, const WGPUBindGroupLayoutEntry *layout,
+   const WGPUBindGroupEntry *bindings, unsigned count);
+static WGPUBuffer gex_wgpu_alias_snapshot_ensure(
+   struct gex_wgpu_context *ctx, struct pipe_resource *resource);
+static void gex_wgpu_alias_snapshot_copy(struct pipe_resource *resource,
+                                         WGPUCommandEncoder encoder);
 static void gex_wgpu_flush_image_aliases(struct gex_wgpu_context *ctx,
                                          WGPUCommandEncoder encoder);
 #define gex_wgpu_submit_pending(ctx) \
@@ -13623,9 +13650,9 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
     * *stored* format, because a promoted texture holds more bytes per texel
     * than its Gallium format says. */
    if (templ->format != texture->format &&
-       util_format_get_blocksize(templ->format) !=
+       util_format_get_blocksize(gex_wgpu_stored_format(templ->format)) !=
           util_format_get_blocksize(gex_wgpu_stored_format(texture->format))) {
-      GEX_SAMPLER_VIEW_REFUSED("view format has a different texel size");
+      GEX_SAMPLER_VIEW_REFUSED("view format has a different stored texel size");
       return NULL;
    }
    struct gex_wgpu_sampler_view *view = CALLOC_STRUCT(gex_wgpu_sampler_view);
@@ -13714,7 +13741,17 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
    if (reinterpreting) {
       const uint32_t width = u_minify(texture->width0, templ->u.tex.first_level);
       const uint32_t height = u_minify(texture->height0, templ->u.tex.first_level);
-      const uint32_t texel = util_format_get_blocksize(templ->format);
+      /* The *stored* size, because that is the format the scratch below is
+       * created in -- gex_wgpu_texture_format applies the promotion. Using
+       * the Gallium size gave a scratch of eight bytes per texel with rows
+       * measured for four:
+       *
+       *   The byte size of each row (8384) is > bytesPerRow (4352)
+       *
+       * The guard above now refuses the case where the two *sides* disagree,
+       * so here the only question left is which size this one is. */
+      const uint32_t texel =
+         util_format_get_blocksize(gex_wgpu_stored_format(templ->format));
       WGPUTextureDescriptor scratch_desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
       scratch_desc.dimension = WGPUTextureDimension_2D;
       scratch_desc.size = (WGPUExtent3D){width, height, 1};
@@ -17845,7 +17882,9 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       WGPUTexture image_texture = gex_resource(iv->resource)->texture;
       if (gex_wgpu_texture_format(gex_wgpu_stored_format(iv->format)) !=
           gex_wgpu_texture_format(
-             gex_wgpu_stored_format(iv->resource->format))) {
+             gex_wgpu_stored_format(iv->resource->format)) ||
+          (compute->image_access[i] != WGPUStorageTextureAccess_ReadOnly &&
+           gex_wgpu_image_also_sampled(ctx, iv->resource, true))) {
          image_texture = gex_wgpu_image_alias(
             ctx, iv,
             compute->image_access[i] != WGPUStorageTextureAccess_WriteOnly);
@@ -18101,6 +18140,49 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       ++count;
    }
 
+   gex_wgpu_trace_buffer_aliasing("compute", entries, bindings, count);
+   /* Read-only storage bindings that overlap a writable one on the same
+    * buffer, which WebGPU refuses; each takes a copy instead. The resources
+    * are collected here and the copies recorded once there is an encoder,
+    * just before the dispatch. See gex_wgpu_alias_snapshot. */
+   struct pipe_resource *snapshot_of[GEX_WGPU_MAX_SHADER_BUFFERS];
+   unsigned snapshot_at[GEX_WGPU_MAX_SHADER_BUFFERS];
+   unsigned snapshot_count = 0;
+   for (unsigned i = 0; i < count; ++i) {
+      if (!bindings[i].buffer ||
+          entries[i].buffer.type != WGPUBufferBindingType_ReadOnlyStorage)
+         continue;
+      bool aliases_writable = false;
+      for (unsigned j = 0; j < count && !aliases_writable; ++j)
+         aliases_writable =
+            j != i && bindings[j].buffer == bindings[i].buffer &&
+            entries[j].buffer.type == WGPUBufferBindingType_Storage;
+      if (!aliases_writable ||
+          snapshot_count >= ARRAY_SIZE(snapshot_of))
+         continue;
+      /* Which Gallium resource this binding came from. Only the shader
+       * buffers can alias this way; a uniform block is never writable. */
+      struct pipe_resource *found = NULL;
+      for (unsigned b = 0; b < compute->binding_count && !found; ++b) {
+         if (compute->bindings[b].kind != GEX_WGPU_COMPUTE_STORAGE)
+            continue;
+         struct pipe_resource *candidate =
+            ctx->shader_buffers[MESA_SHADER_COMPUTE][compute->bindings[b].slot]
+               .buffer;
+         if (candidate && gex_resource(candidate)->buffer ==
+                             bindings[i].buffer)
+            found = candidate;
+      }
+      if (!found)
+         continue;
+      WGPUBuffer copy = gex_wgpu_alias_snapshot_ensure(ctx, found);
+      if (!copy)
+         continue;
+      bindings[i].buffer = copy;
+      snapshot_of[snapshot_count] = found;
+      snapshot_at[snapshot_count] = i;
+      ++snapshot_count;
+   }
    if (getenv("GEX_WGPU_COMPUTE_LAYOUT_TRACE")) {
       unsigned storage = 0, uniform = 0;
       for (unsigned i = 0; i < count; ++i) {
@@ -18166,6 +18248,10 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    WGPUCommandEncoder encoder =
       wgpuDeviceCreateCommandEncoder(screen->device, NULL);
    if (pipeline && encoder && (!count || group)) {
+      /* Before the pass, on the same encoder, so the copy is ordered ahead of
+       * the work that reads it without a separate submit. */
+      for (unsigned i = 0; i < snapshot_count; ++i)
+         gex_wgpu_alias_snapshot_copy(snapshot_of[i], encoder);
       WGPUComputePassDescriptor pass_desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
       WGPUComputePassEncoder pass =
          wgpuCommandEncoderBeginComputePass(encoder, &pass_desc);
@@ -18373,9 +18459,20 @@ gex_wgpu_rt_scratch_ensure(struct gex_wgpu_context *ctx,
    desc.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc |
                 WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding;
    gex->rt_scratch = wgpuDeviceCreateTexture(screen->device, &desc);
-   /* copyTextureToBuffer wants a 256-byte row pitch. */
-   gex->rt_scratch_row_bytes =
-      ALIGN_POT(width * util_format_get_blocksize(format), 256u);
+   /* copyTextureToBuffer wants a 256-byte row pitch, and the pitch has to be
+    * measured in the format the scratch was just *created* as -- which is
+    * gex_wgpu_texture_format(format), the promotion applied. Measuring the
+    * Gallium format instead gave a scratch of eight bytes per texel with rows
+    * for four:
+    *
+    *   The byte size of each row (8384) is > bytesPerRow (4352)
+    *
+    * which is the third place this same slip appeared, after the
+    * cross-class sampler view and the image alias. Anything that both creates
+    * a texture from gex_wgpu_texture_format and measures its rows has to ask
+    * gex_wgpu_stored_format for the size. */
+   gex->rt_scratch_row_bytes = ALIGN_POT(
+      width * util_format_get_blocksize(gex_wgpu_stored_format(format)), 256u);
    gex->rt_scratch_bytes = (uint64_t)gex->rt_scratch_row_bytes * height;
    WGPUBufferDescriptor staging_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
    staging_desc.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
@@ -26475,8 +26572,154 @@ gex_wgpu_packed_image_seed(struct gex_wgpu_context *ctx,
    wgpuCommandBufferRelease(commands);
 }
 
+/* A copy of a buffer, for a read-only binding that overlaps a writable one.
+ *
+ * GL lets one buffer be bound to several shader-storage slots and written
+ * through one while it is read through the others; WebGPU refuses any
+ * writable binding that shares a synchronization scope with another use of
+ * the same buffer --
+ *
+ *   [Buffer] usage (Storage(read-write)|Storage(read-only)) includes writable
+ *   usage and another usage in the same synchronization scope
+ *
+ * -- and naming neither binding, which is why GEX_WGPU_ALIAS_TRACE exists.
+ * Blender's EEVEE binds one 48 KiB buffer to three slots of its light-culling
+ * dispatch, writable at one and read-only at two.
+ *
+ * Making them all writable is refused as well (two writable bindings may not
+ * overlap), and making them all read-only would drop the write, so the
+ * read-only side gets a copy taken before the work runs. That is a legal
+ * answer rather than an approximation: GL says a shader that reads what it
+ * also writes, with no barrier between, gets undefined values -- and a
+ * barrier *is* handled, because gex_wgpu_memory_barrier submits and a submit
+ * closes the scope. */
+static WGPUBuffer
+gex_wgpu_alias_snapshot_ensure(struct gex_wgpu_context *ctx,
+                               struct pipe_resource *resource)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   struct gex_wgpu_resource *gex = gex_resource(resource);
+   if (!gex->buffer)
+      return NULL;
+   const uint64_t bytes = gex->allocation_size;
+   if (gex->alias_snapshot && gex->alias_snapshot_bytes < bytes) {
+      wgpuBufferRelease(gex->alias_snapshot);
+      gex->alias_snapshot = NULL;
+   }
+   if (!gex->alias_snapshot) {
+      WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+      desc.size = bytes;
+      desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst |
+                   WGPUBufferUsage_CopySrc;
+      gex->alias_snapshot = wgpuDeviceCreateBuffer(screen->device, &desc);
+      if (!gex->alias_snapshot)
+         return NULL;
+      gex->alias_snapshot_bytes = bytes;
+   }
+   return gex->alias_snapshot;
+}
+
+/* Record the copy. Separate from the allocation because the bindings have to
+ * name the snapshot before the bind group is built, and there is no encoder
+ * until after it. */
+static void
+gex_wgpu_alias_snapshot_copy(struct pipe_resource *resource,
+                             WGPUCommandEncoder encoder)
+{
+   struct gex_wgpu_resource *gex = gex_resource(resource);
+   if (!gex->buffer || !gex->alias_snapshot)
+      return;
+   wgpuCommandEncoderCopyBufferToBuffer(
+      encoder, gex->buffer, 0, gex->alias_snapshot, 0,
+      MIN2(gex->allocation_size, gex->alias_snapshot_bytes) & ~3ull);
+}
+
+/* Report two bindings in one group that name the same buffer with different
+ * access, which WebGPU refuses:
+ *
+ *   [Buffer] usage (Storage(read-write)|Storage(read-only)) includes writable
+ *   usage and another usage in the same synchronization scope
+ *
+ * GL permits it -- one buffer bound to two slots, written through one and
+ * read through the other -- and Dawn's message names neither binding, so
+ * there is nothing to act on without this. Diagnostic only, behind
+ * GEX_WGPU_ALIAS_TRACE. */
+static void
+gex_wgpu_trace_buffer_aliasing(const char *where,
+                               const WGPUBindGroupLayoutEntry *layout,
+                               const WGPUBindGroupEntry *bindings,
+                               unsigned count)
+{
+   if (!getenv("GEX_WGPU_ALIAS_TRACE"))
+      return;
+   for (unsigned i = 0; i < count; ++i) {
+      if (!bindings[i].buffer)
+         continue;
+      for (unsigned j = i + 1; j < count; ++j) {
+         if (bindings[j].buffer != bindings[i].buffer)
+            continue;
+         const uint64_t a_end = bindings[i].offset + bindings[i].size;
+         const uint64_t b_end = bindings[j].offset + bindings[j].size;
+         if (bindings[i].offset >= b_end || bindings[j].offset >= a_end)
+            continue;                        /* disjoint ranges are allowed */
+         if (layout[i].buffer.type == layout[j].buffer.type)
+            continue;
+         fprintf(stderr, "gex-alias: %s buffer %p at bindings %u (type %u, "
+                 "%llu+%llu) and %u (type %u, %llu+%llu)\n", where,
+                 (void *)bindings[i].buffer, bindings[i].binding,
+                 (unsigned)layout[i].buffer.type,
+                 (unsigned long long)bindings[i].offset,
+                 (unsigned long long)bindings[i].size, bindings[j].binding,
+                 (unsigned)layout[j].buffer.type,
+                 (unsigned long long)bindings[j].offset,
+                 (unsigned long long)bindings[j].size);
+      }
+   }
+}
+
+/* Whether this resource is also bound as a sampled texture for the work
+ * about to be recorded.
+ *
+ * WebGPU forbids a texture being a writable storage binding and anything else
+ * in one synchronization scope:
+ *
+ *   [Texture (RGBA16Float)] usage (TextureBinding|Storage(write-only))
+ *   includes writable usage and another usage in the same synchronization
+ *   scope
+ *
+ * GL allows it -- the values a draw samples while writing the same texture
+ * are undefined without a barrier, but the draw itself is legal, and
+ * glMemoryBarrier between two draws makes the whole thing well defined. That
+ * second case is already handled, because gex_wgpu_memory_barrier submits and
+ * a submit closes the pass. What is left is one draw doing both, which no
+ * pass boundary can separate -- so the image writes go to an alias and are
+ * copied back when the pass ends, leaving the sampled side reading the
+ * texture as it was. Undefined either way, and now it draws. */
+static bool
+gex_wgpu_image_also_sampled(const struct gex_wgpu_context *ctx,
+                            const struct pipe_resource *resource,
+                            bool compute)
+{
+   if (!resource)
+      return false;
+   for (unsigned i = 0; i < GEX_WGPU_MAX_SAMPLERS; ++i) {
+      const struct pipe_sampler_view *view =
+         compute ? ctx->compute_sampler_views[i] : ctx->sampler_views[i];
+      if (view && view->texture == resource)
+         return true;
+   }
+   if (!compute) {
+      for (unsigned i = 0; i < GEX_WGPU_MAX_SAMPLERS; ++i) {
+         const struct pipe_sampler_view *view = ctx->vertex_sampler_views[i];
+         if (view && view->texture == resource)
+            return true;
+      }
+   }
+   return false;
+}
+
 /* A texture of the *image's* format standing in for one bound at another
- * format in the same GL format class.
+ * format in the same GL format class, or for one this draw also samples.
  *
  * glBindImageTexture may name any format in the texture's class, so an
  * r32ui image over an r32f texture is ordinary GL -- and the storage view
@@ -31596,7 +31839,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          WGPUTexture image_texture = gex_resource(iv->resource)->texture;
          if (gex_wgpu_texture_format(gex_wgpu_stored_format(iv->format)) !=
              gex_wgpu_texture_format(
-                gex_wgpu_stored_format(iv->resource->format))) {
+                gex_wgpu_stored_format(iv->resource->format)) ||
+             (ctx->fs->image_access[i] != WGPUStorageTextureAccess_ReadOnly &&
+              gex_wgpu_image_also_sampled(ctx, iv->resource, false))) {
             image_texture = gex_wgpu_image_alias(
                ctx, iv,
                ctx->fs->image_access[i] != WGPUStorageTextureAccess_WriteOnly);
@@ -31722,6 +31967,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                half ? size : GEX_WGPU_PACKED_IMAGE_HEADER_BYTES;
          }
       }
+      gex_wgpu_trace_buffer_aliasing("fragment", fragment_layout_entries,
+                                     entries, fragment_group_count);
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[2];
       bind_desc.entryCount = fragment_group_count;
