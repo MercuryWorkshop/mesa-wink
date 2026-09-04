@@ -5175,6 +5175,33 @@ gex_wgpu_narrow_barrier_instr(nir_builder *b, nir_intrinsic_instr *intr,
     * That is stricter than the rule -- a branch on a uniform is uniform too --
     * but it needs no analysis and errs towards dropping a fence rather than
     * emitting a module that cannot be read. */
+   /* Outside compute there is no barrier of any kind in WGSL -- not even the
+    * control barrier the compute path substitutes -- so a pure memory barrier
+    * there has nowhere to go and was left as OpMemoryBarrier, which Tint
+    * cannot read:
+    *
+    *   error: unhandled instruction with opcode 225: OpMemoryBarrier
+    *
+    * losing the shader. It is dropped instead, on the same reasoning as the
+    * nested case below: a standalone memory barrier orders nothing observable
+    * on its own, and in these stages nothing can pair it with a control
+    * barrier, because there is none to pair it with. A barrier that *does*
+    * carry an execution scope outside compute is a different matter and stays
+    * a named refusal -- GL only allows one in a tessellation control shader,
+    * and this driver runs those as compute, so it would mean something has
+    * gone wrong rather than that a feature is missing.
+    * KHR-GL44's shader_storage_buffer_object.advanced-matrix is this. */
+   if (b->shader->info.stage != MESA_SHADER_COMPUTE &&
+       nir_intrinsic_execution_scope(intr) == SCOPE_NONE) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: a memoryBarrier outside a compute shader "
+                         "is dropped; WGSL has no barrier in that stage\n");
+      }
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
    if (b->shader->info.stage == MESA_SHADER_COMPUTE &&
        nir_intrinsic_execution_scope(intr) == SCOPE_NONE) {
       bool nested = false;
