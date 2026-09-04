@@ -1171,6 +1171,12 @@ struct gex_wgpu_context {
     * tessellation stages unbound, and GL_PRIMITIVES_GENERATED must not count
     * the same draw twice. */
    bool tess_rasterizing;
+   /* glPatchParameterfv's default levels, which are what a patch draw with no
+    * control shader tessellates by -- GL lets the evaluation shader stand
+    * alone, and then there is nothing on the GPU to compute a level. Both
+    * default to 1.0, as GL says. */
+   float default_outer_level[4];
+   float default_inner_level[2];
    /* The bound tessellation stages and the scratch the five-pass tessellated
     * path runs through. See the tessellation comment above the binding
     * numbers for what each pass writes. */
@@ -1679,6 +1685,10 @@ struct gex_wgpu_tcs {
  * arrangement the geometry path uses for the vertex stage, one stage further
  * along. */
 struct gex_wgpu_tes_variant {
+   /* The layouts the producer writes and this variant therefore reads. With a
+    * control shader bound that is its output; with none, GL lets the
+    * evaluation shader stand alone and the producer is the vertex shader, so
+    * these hold its capture layout and the patch layout is empty. */
    struct gex_wgpu_varying_layout tcs_outputs;
    struct gex_wgpu_varying_layout tcs_patch_outputs;
    unsigned verts_per_patch;
@@ -19004,20 +19014,35 @@ static WGPUShaderModule
 gex_wgpu_tess_finish_module(struct pipe_context *pipe, nir_shader *nir,
                             struct gex_wgpu_tess_lowering *state,
                             unsigned limit_word, unsigned workgroup,
-                            const char *what)
+                            bool guard_tail, const char *what)
 {
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   /* The dispatch is rounded up to whole workgroups, so the tail has
-    * no work and must not write. Inserted after the lowering rather than
-    * before it, so everything the passes appended is inside the guard. */
-   nir_builder b = nir_builder_at(nir_before_impl(impl));
-   nir_deref_instr *params = gex_wgpu_block_words(&b, state->params);
-   nir_def *limit = nir_load_deref(
-      &b, nir_build_deref_array(&b, params, nir_imm_int(&b, limit_word)));
-   nir_push_if(&b, nir_uge(&b, gex_wgpu_tess_invocation(&b), limit));
-   nir_jump(&b, nir_jump_return);
-   nir_pop_if(&b, NULL);
-   nir_progress(true, impl, nir_metadata_none);
+   /* A dispatch rounded up to whole workgroups has a tail with no work, which
+    * must not write. Inserted after the lowering rather than before it, so
+    * everything the passes appended is inside the guard.
+    *
+    * Not for the control shader, whose dispatch is exact by construction --
+    * one workgroup per patch, `vertices_out` invocations in each, so the
+    * guard's condition is unreachable. It is not merely redundant there: an
+    * early return becomes a conditional around everything after it, and a
+    * `barrier()` inside a conditional is not in uniform control flow, so Tint
+    * rejects the module outright with
+    *
+    *   'storageBarrier' must only be called from uniform control flow
+    *
+    * -- and a control shader that shares data between invocations, which is
+    * the only reason to write one that barriers, failed to compile at all.
+    * KHR-GL44's three tessellation_shader_tc_barriers cases are that. */
+   if (guard_tail) {
+      nir_builder b = nir_builder_at(nir_before_impl(impl));
+      nir_deref_instr *params = gex_wgpu_block_words(&b, state->params);
+      nir_def *limit = nir_load_deref(
+         &b, nir_build_deref_array(&b, params, nir_imm_int(&b, limit_word)));
+      nir_push_if(&b, nir_uge(&b, gex_wgpu_tess_invocation(&b), limit));
+      nir_jump(&b, nir_jump_return);
+      nir_pop_if(&b, NULL);
+      nir_progress(true, impl, nir_metadata_none);
+   }
    NIR_PASS(_, nir, nir_lower_returns);
 
    /* Every access to them is a buffer access now, so they are dead -- but
@@ -19094,7 +19119,7 @@ gex_wgpu_tcs_module(struct pipe_context *pipe, nir_shader *nir,
    }
    return gex_wgpu_tess_finish_module(
       pipe, nir, &state, GEX_WGPU_TCS_PARAM_INVOCATIONS, tcs->vertices_out,
-      "tessellation control shader");
+      false, "tessellation control shader");
 }
 
 static nir_def *
@@ -19151,19 +19176,21 @@ gex_wgpu_tes_module(struct pipe_context *pipe, nir_shader *nir,
    }
    return gex_wgpu_tess_finish_module(
       pipe, nir, &state, GEX_WGPU_TES_PARAM_VERTICES, GEX_WGPU_TESS_GROUP,
-      "tessellation evaluation shader");
+      true, "tessellation evaluation shader");
 }
 
 /* Build, or find, the evaluation variant that reads these producer layouts. */
 static struct gex_wgpu_tes_variant *
 gex_wgpu_tes_variant_get(struct pipe_context *pipe, struct gex_wgpu_tes *tes,
-                         const struct gex_wgpu_tcs *tcs)
+                         const struct gex_wgpu_varying_layout *producer,
+                         const struct gex_wgpu_varying_layout *producer_patch,
+                         unsigned verts_per_patch)
 {
    for (struct gex_wgpu_tes_variant *v = tes->variants; v; v = v->next) {
-      if (v->verts_per_patch == tcs->vertices_out &&
-          !memcmp(&v->tcs_outputs, &tcs->outputs, sizeof(tcs->outputs)) &&
-          !memcmp(&v->tcs_patch_outputs, &tcs->patch_outputs,
-                  sizeof(tcs->patch_outputs)))
+      if (v->verts_per_patch == verts_per_patch &&
+          !memcmp(&v->tcs_outputs, producer, sizeof(*producer)) &&
+          !memcmp(&v->tcs_patch_outputs, producer_patch,
+                  sizeof(*producer_patch)))
          return v;
    }
    if (!tes->nir)
@@ -19172,7 +19199,7 @@ gex_wgpu_tes_variant_get(struct pipe_context *pipe, struct gex_wgpu_tes *tes,
    if (!nir)
       return NULL;
    WGPUShaderModule module =
-      gex_wgpu_tes_module(pipe, nir, tes, &tcs->outputs, &tcs->patch_outputs);
+      gex_wgpu_tes_module(pipe, nir, tes, producer, producer_patch);
    if (!module)
       return NULL;
    struct gex_wgpu_tes_variant *variant =
@@ -19181,9 +19208,9 @@ gex_wgpu_tes_variant_get(struct pipe_context *pipe, struct gex_wgpu_tes *tes,
       wgpuShaderModuleRelease(module);
       return NULL;
    }
-   variant->tcs_outputs = tcs->outputs;
-   variant->tcs_patch_outputs = tcs->patch_outputs;
-   variant->verts_per_patch = tcs->vertices_out;
+   variant->tcs_outputs = *producer;
+   variant->tcs_patch_outputs = *producer_patch;
+   variant->verts_per_patch = verts_per_patch;
    variant->module = module;
    variant->next = tes->variants;
    tes->variants = variant;
@@ -19330,8 +19357,14 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
                                             &tes->patch_inputs) ||
             !gex_wgpu_collect_varyings(nir, nir_var_shader_out, &tes->outputs))
       refusal = "gex_wgpu could not lay out tessellation evaluation varyings";
-   else if (!tes->outputs.count)
+   else if (!tes->outputs.count) {
+      /* Mesa removes an output the next stage does not read, so a shader that
+       * writes only gl_PointSize arrives empty when a geometry shader follows
+       * it -- and a geometry shader after tessellation is a combination the
+       * draw path declines by name. The refusal here is accurate about what
+       * it sees, but the cause is downstream of it. */
       refusal = "gex_wgpu tessellation evaluation shader writes nothing";
+   }
    if (refusal) {
       gex_wgpu_set_compile_error(mutable_state, refusal);
       ralloc_free(nir);
@@ -19433,6 +19466,21 @@ static void
 gex_wgpu_set_patch_vertices(struct pipe_context *pipe, uint8_t vertices)
 {
    ((struct gex_wgpu_context *)pipe)->patch_vertices = vertices;
+}
+
+/* glPatchParameterfv(GL_PATCH_DEFAULT_{OUTER,INNER}_LEVEL). Only a patch draw
+ * with no control shader reads these -- with one bound, the levels it writes
+ * win and these are ignored, which is what GL says. */
+static void
+gex_wgpu_set_tess_state(struct pipe_context *pipe,
+                        const float default_outer_level[4],
+                        const float default_inner_level[2])
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   memcpy(ctx->default_outer_level, default_outer_level,
+          sizeof(ctx->default_outer_level));
+   memcpy(ctx->default_inner_level, default_inner_level,
+          sizeof(ctx->default_inner_level));
 }
 
 static void
@@ -22188,8 +22236,23 @@ gex_wgpu_tes_xfb_module(struct gex_wgpu_context *ctx, struct gex_wgpu_tes *tes,
          const nir_xfb_output_info *out = &xfb->outputs[o];
          const int varying = gex_wgpu_varying_slot(&tes->outputs,
                                                    out->location);
-         if (varying < 0)
+         if (varying < 0) {
+            /* An output the capture cannot place is one it writes nothing
+             * for, which leaves whatever the buffer held -- a silent zero.
+             * Say so rather than dropping it quietly. */
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: tessellation capture cannot place "
+                       "output location %u (buffer %u offset %u); the "
+                       "evaluation shader declares %u:", out->location,
+                       out->buffer, out->offset, tes->outputs.count);
+               for (unsigned k = 0; k < tes->outputs.count; ++k)
+                  fprintf(stderr, " %u", tes->outputs.location[k]);
+               fprintf(stderr, "\n");
+            }
             continue;
+         }
          if (!so[out->buffer]) {
             char name[32];
             snprintf(name, sizeof(name), "gex_tes_xfb_so%u", out->buffer);
@@ -22350,8 +22413,8 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
       return false;                                                           \
    } while (0)
 
-   if (!tcs || !tes)
-      GEX_TESS_DECLINE("a patch draw with no tessellation shaders");
+   if (!tes)
+      GEX_TESS_DECLINE("a patch draw with no evaluation shader");
    if (ctx->gs)
       GEX_TESS_DECLINE("a geometry shader after tessellation");
    if (info->index_size || info->instance_count != 1)
@@ -22360,26 +22423,42 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    if (!verts_in || draw->count < verts_in)
       GEX_TESS_DECLINE("a patch draw with no complete patch");
    const unsigned patches = draw->count / verts_in;
-   const unsigned in_stride = MAX2(gex_wgpu_varying_stride(&tcs->inputs), 16u);
-   const unsigned out_stride =
-      MAX2(gex_wgpu_varying_stride(&tcs->outputs), 16u);
+
+   /* A control shader is optional. Without one the evaluation shader reads the
+    * vertex shader's output directly -- one patch is `patch_vertices` of those
+    * vertices -- and the levels come from glPatchParameterfv rather than from
+    * anything a shader computed. So the producer layouts below are the control
+    * shader's when there is one and the evaluation shader's own inputs when
+    * there is not, and the per-vertex stride the module reads is a parameter
+    * either way, which is why the shader side needs no second spelling. */
+   static const struct gex_wgpu_varying_layout no_patch_outputs = {0};
+   const struct gex_wgpu_varying_layout *producer =
+      tcs ? &tcs->outputs : &tes->inputs;
+   const struct gex_wgpu_varying_layout *producer_patch =
+      tcs ? &tcs->patch_outputs : &no_patch_outputs;
+   const unsigned verts_per_patch = tcs ? tcs->vertices_out : verts_in;
+
+   const unsigned in_stride =
+      MAX2(gex_wgpu_varying_stride(tcs ? &tcs->inputs : &tes->inputs), 16u);
+   const unsigned out_stride = MAX2(gex_wgpu_varying_stride(producer), 16u);
    const unsigned patch_stride =
-      MAX2(gex_wgpu_varying_stride(&tcs->patch_outputs), 16u);
+      MAX2(gex_wgpu_varying_stride(producer_patch), 16u);
    const unsigned tes_stride = gex_wgpu_varying_stride(&tes->outputs);
    if (!tes_stride)
       GEX_TESS_DECLINE("an evaluation shader with no outputs");
 
-   struct gex_wgpu_tes_variant *variant =
-      gex_wgpu_tes_variant_get(&ctx->base, tes, tcs);
+   struct gex_wgpu_tes_variant *variant = gex_wgpu_tes_variant_get(
+      &ctx->base, tes, producer, producer_patch, verts_per_patch);
    if (!variant)
       GEX_TESS_DECLINE("could not build the evaluation variant");
 
    if (!gex_wgpu_ensure_buffer(ctx, &ctx->tess_vs_out,
                                patches * verts_in * in_stride,
                                PIPE_BIND_SHADER_BUFFER) ||
-       !gex_wgpu_ensure_buffer(ctx, &ctx->tess_tcs_out,
-                               patches * tcs->vertices_out * out_stride,
-                               PIPE_BIND_SHADER_BUFFER) ||
+       (tcs && !gex_wgpu_ensure_buffer(ctx, &ctx->tess_tcs_out,
+                                       patches * tcs->vertices_out *
+                                       out_stride,
+                                       PIPE_BIND_SHADER_BUFFER)) ||
        !gex_wgpu_ensure_buffer(ctx, &ctx->tess_patch_out,
                                patches * patch_stride,
                                PIPE_BIND_SHADER_BUFFER) ||
@@ -22388,8 +22467,10 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                                PIPE_BIND_SHADER_BUFFER))
       GEX_TESS_DECLINE("could not allocate the tessellation buffers");
 
-   /* Pass one: the vertex shader, as compute, writing the control shader's
-    * inputs -- the geometry path's first pass, unchanged. */
+   /* Pass one: the vertex shader, as compute, writing the next stage's
+    * inputs -- the geometry path's first pass, unchanged. The next stage is
+    * the control shader when there is one and the evaluation shader when
+    * there is not, and either way this buffer is what it reads. */
    struct gex_wgpu_capture_layout layout;
    memset(&layout, 0, sizeof(layout));
    if (ctx->vertex_elements) {
@@ -22405,7 +22486,8 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
       }
    }
    struct gex_wgpu_varying_variant *vs_variant =
-      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &tcs->inputs);
+      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout,
+                                   tcs ? &tcs->inputs : &tes->inputs);
    if (!vs_variant)
       GEX_TESS_DECLINE("could not build the vertex capture variant");
 
@@ -22445,11 +22527,36 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
       return false;
    }
 
+   /* The levels this draw tessellates by, on the CPU, where pass three needs
+    * them. With no control shader they are glPatchParameterfv's defaults and
+    * are known here -- so that case skips both the control dispatch and the
+    * readback stall below, and the buffer is written only because the
+    * evaluation shader may still read gl_TessLevelOuter/Inner from it. */
+   float *default_levels = NULL;
+   if (!tcs) {
+      default_levels =
+         calloc(patches, GEX_WGPU_TESS_LEVEL_WORDS * sizeof(float));
+      if (!default_levels)
+         GEX_TESS_DECLINE("could not build the default tessellation levels");
+      for (unsigned p = 0; p < patches; ++p) {
+         float *at = default_levels + (size_t)p * GEX_WGPU_TESS_LEVEL_WORDS;
+         /* outer[4] then inner[2] then two words of padding, which is both
+          * pipe_tessellation_factors' layout and the one the shader's level
+          * reads assume. */
+         memcpy(at, ctx->default_outer_level, 4 * sizeof(float));
+         memcpy(at + 4, ctx->default_inner_level, 2 * sizeof(float));
+      }
+      gex_wgpu_buffer_subdata(&ctx->base, ctx->tess_levels, PIPE_MAP_WRITE, 0,
+                              patches * GEX_WGPU_TESS_LEVEL_WORDS * 4,
+                              default_levels);
+   }
+
    /* Pass two: the control shader, one workgroup per patch. The levels are
     * zeroed first, so a level the shader does not write culls the patch
     * rather than tessellating to whatever was in the buffer -- GL requires
     * every level of the domain to be written, and reading stale ones back
     * would make one draw's geometry depend on the last one's. */
+   if (tcs) {
    uint32_t tcs_params[GEX_WGPU_TCS_PARAM_WORDS] = {0};
    tcs_params[GEX_WGPU_TCS_PARAM_INVOCATIONS] = patches * tcs->vertices_out;
    tcs_params[GEX_WGPU_TCS_PARAM_VERTS_IN] = verts_in;
@@ -22475,8 +22582,10 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                              ctx->tess_levels, patches);
    pipe_resource_reference(&tcs_param_buffer, NULL);
    if (!ok) {
+      free(default_levels);
       gex_fail(ctx);
       return false;
+   }
    }
 
    /* Pass three: the tessellator, on the CPU.
@@ -22488,12 +22597,15 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
     * similar, which is what makes the probe's pinned pixel values reachable
     * at all. One stall per draw, not per patch. */
    struct pipe_transfer *level_transfer = NULL;
-   const float *levels = pipe_buffer_map_range(
-      &ctx->base, ctx->tess_levels, 0,
-      patches * GEX_WGPU_TESS_LEVEL_WORDS * 4, PIPE_MAP_READ,
-      &level_transfer);
-   if (!levels)
-      GEX_TESS_DECLINE("could not read the tessellation levels back");
+   const float *levels = default_levels;
+   if (!levels) {
+      levels = pipe_buffer_map_range(
+         &ctx->base, ctx->tess_levels, 0,
+         patches * GEX_WGPU_TESS_LEVEL_WORDS * 4, PIPE_MAP_READ,
+         &level_transfer);
+      if (!levels)
+         GEX_TESS_DECLINE("could not read the tessellation levels back");
+   }
 
    struct pipe_tessellator *ts =
       p_tess_init(tes->domain == TESS_PRIMITIVE_QUADS ? MESA_PRIM_QUADS
@@ -22552,7 +22664,9 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    }
    if (ts)
       p_tess_destroy(ts);
-   pipe_buffer_unmap(&ctx->base, level_transfer);
+   if (level_transfer)
+      pipe_buffer_unmap(&ctx->base, level_transfer);
+   free(default_levels);
    if (overflow || !ts) {
       free(coords);
       free(indices);
@@ -22591,14 +22705,17 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    /* Pass four: the evaluation shader, one invocation per generated vertex. */
    uint32_t tes_params[GEX_WGPU_TES_PARAM_WORDS] = {0};
    tes_params[GEX_WGPU_TES_PARAM_VERTICES] = vertex_count;
-   tes_params[GEX_WGPU_TES_PARAM_VERTS_OUT] = tcs->vertices_out;
+   /* The per-vertex stride of the buffer below, and gl_PatchVerticesIn. With
+    * a control shader that is its output size; with none it is the draw's
+    * patch size, because the evaluation shader is reading vertices. */
+   tes_params[GEX_WGPU_TES_PARAM_VERTS_OUT] = verts_per_patch;
    struct gex_wgpu_bindings tes_group0 = {0}, tes_group1 = {0};
    struct pipe_resource *tes_param_buffer =
       gex_wgpu_params_buffer(ctx, tes_params, GEX_WGPU_TES_PARAM_WORDS);
    gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_PARAMS_BINDING,
                          tes_param_buffer);
    gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_TCSOUT_BINDING,
-                         ctx->tess_tcs_out);
+                         tcs ? ctx->tess_tcs_out : ctx->tess_vs_out);
    gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_PATCH_BINDING,
                          ctx->tess_patch_out);
    gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_LEVEL_BINDING,
@@ -29019,6 +29136,12 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
       return NULL;
    ctx->base.screen = screen;
    ctx->base.priv = priv;
+   /* GL's defaults, which apply until glPatchParameterfv says otherwise --
+    * and a context that never calls it still draws patches. */
+   for (unsigned i = 0; i < 4; ++i)
+      ctx->default_outer_level[i] = 1.0f;
+   ctx->default_inner_level[0] = 1.0f;
+   ctx->default_inner_level[1] = 1.0f;
    ctx->base.destroy = gex_wgpu_context_destroy;
    ctx->base.flush = gex_wgpu_flush;
    ctx->base.draw_vbo = gex_wgpu_draw_vbo;
@@ -29038,6 +29161,7 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.bind_tes_state = gex_wgpu_bind_tes_state;
    ctx->base.delete_tes_state = gex_wgpu_delete_tes_state;
    ctx->base.set_patch_vertices = gex_wgpu_set_patch_vertices;
+   ctx->base.set_tess_state = gex_wgpu_set_tess_state;
    ctx->base.delete_vs_state = gex_wgpu_delete_shader_state;
    ctx->base.create_fs_state = gex_wgpu_create_fs_state;
    ctx->base.bind_fs_state = gex_wgpu_bind_fs_state;
