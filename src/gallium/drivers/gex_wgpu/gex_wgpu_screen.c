@@ -7249,6 +7249,59 @@ gex_wgpu_split_atomic_derefs(nir_shader *nir)
    NIR_PASS(_, nir, nir_opt_dce);
 }
 
+/* Whether anything 64-bit is left in the shader at all.
+ *
+ * The sweep below is only worth its passes -- one of which flattens indirect
+ * indexing and can grow a big shader -- when there is something for them to
+ * find. Almost every shader has nothing, and pays one walk. */
+static bool
+gex_wgpu_has_64_bit(nir_shader *nir)
+{
+   nir_foreach_variable_in_shader(var, nir)
+      if (glsl_type_contains_64bit(var->type))
+         return true;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_alu) {
+               const nir_alu_instr *alu = nir_instr_as_alu(instr);
+               if (alu->def.bit_size == 64)
+                  return true;
+               for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i)
+                  if (alu->src[i].src.ssa->bit_size == 64)
+                     return true;
+            } else if (instr->type == nir_instr_type_intrinsic) {
+               const nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (nir_intrinsic_infos[intr->intrinsic].has_dest &&
+                   intr->def.bit_size == 64)
+                  return true;
+            } else if (instr->type == nir_instr_type_load_const) {
+               if (nir_instr_as_load_const(instr)->def.bit_size == 64)
+                  return true;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+/* Which ALU operations the late 64-bit sweep scalarises: the 64-bit ones, as
+ * nir_lower_doubles and nir_lower_int64 both want them. */
+static bool
+gex_wgpu_is_64_bit_alu(const nir_instr *instr, const void *data)
+{
+   (void)data;
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->def.bit_size == 64)
+      return true;
+   for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i)
+      if (alu->src[i].src.ssa->bit_size == 64)
+         return true;
+   return false;
+}
+
 static WGPUShaderModule
 gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
                      enum mesa_shader_stage stage, bool flip_y,
@@ -7571,6 +7624,57 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
                  (var->data.access & ACCESS_NON_READABLE) ? "W" : "",
                  (var->data.access & ACCESS_NON_WRITEABLE) ? "R" : "");
       }
+   }
+   /* A last sweep for 64-bit integers, after everything else has run.
+    *
+    * WGSL has no i64, and Tint refuses a module that contains one outright --
+    * "unhandled integer width: 64" -- so a single survivor costs the whole
+    * shader. st already lowers them: nir_lower_doubles turns fp64 into the
+    * software implementation and nir_lower_int64 expands the 64-bit integer
+    * halves it produces. But st runs gl_nir_opts *after* both, and an
+    * optimisation can put one back: an if/else assigning a double becomes a
+    * `bcsel` on the packed 64-bit value, which no earlier pass is left to see.
+    *
+    * That is what KHR-GL45.shading_language_420pack's implicit_conversions
+    * cases hit, and the disassembly showed it plainly -- a pack_64_2x32, an
+    * OpSelect on the packed ulong, an unpack straight after:
+    *
+    *     %94 = OpBitcast %ulong %93
+    *     %95 = OpSelect %ulong %39 %94 %ulong_0
+    *    %103 = OpBitcast %v2uint %95
+    *
+    * Running the lowering once more here is cheap for every shader that has
+    * no 64-bit anything -- the pass walks and finds nothing -- and is the only
+    * place late enough to catch what the optimiser reintroduces. The
+    * scalarisation is what nir_lower_doubles wants of vector 64-bit ops, and
+    * st does the same before its own call. */
+   if (nir->options->lower_int64_options && gex_wgpu_has_64_bit(nir)) {
+      /* A 64-bit *local variable* is not an operation and no ALU lowering
+       * touches it: it reaches the emitter as OpTypePointer Function %ulong
+       * and Tint refuses the module for the type alone. It survives SSA
+       * conversion when it is an array the shader indexes dynamically, which
+       * is what the fp64 builtin tests do for a dvec3 and not for a dvec2.
+       * Flattening the indexing and re-running vars-to-ssa dissolves it into
+       * values the lowering below can see. */
+      NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+               nir_var_function_temp, UINT32_MAX);
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, nir, nir_lower_alu_to_scalar, gex_wgpu_is_64_bit_alu, NULL);
+      NIR_PASS(_, nir, nir_lower_int64);
+      /* The lowering *represents* its results with pack_64_2x32_split and
+       * unpack_64_2x32_split, so it leaves 64-bit values behind by
+       * construction and expects an optimiser to fold the pairs away. Without
+       * this loop the type survives to the emitter and Tint refuses the
+       * module for it -- the lowering having done its work and undone none of
+       * the harm. */
+      bool progress;
+      do {
+         progress = false;
+         NIR_PASS(progress, nir, nir_opt_copy_prop);
+         NIR_PASS(progress, nir, nir_opt_algebraic);
+         NIR_PASS(progress, nir, nir_opt_constant_folding);
+         NIR_PASS(progress, nir, nir_opt_dce);
+      } while (progress);
    }
    /* Word indices, not byte offsets; see the note above. Last, so anything
     * this file added earlier is scaled too. */
