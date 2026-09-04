@@ -12904,6 +12904,35 @@ gex_wgpu_resolve_depth(struct pipe_context *pipe, struct pipe_resource *dst,
    return ok;
 }
 
+/* The view a stage's declared texture dimension calls for.
+ *
+ * WebGPU has no integer cube sample type, so an integer cube is declared as a
+ * 2D array and reached through an alternate view of the same six-layer
+ * allocation. The declaration and the bound view have to agree --
+ *
+ *   Dimension (TextureViewDimension::Cube) of [TextureView ...] doesn't
+ *   match the expected dimension (TextureViewDimension::e2DArray)
+ *
+ * -- and a bind group Dawn rejects means the work runs and writes nothing, so
+ * it reads back as a texture full of zeroes rather than as an error. The
+ * fragment stage chose the right view; the vertex and compute stages bound
+ * `view->view` whatever the layout said, which is why an integer cube sampled
+ * anywhere but the fragment shader read zeroes. */
+static WGPUTextureView
+gex_wgpu_stage_texture_view(const struct pipe_sampler_view *base,
+                            WGPUTextureViewDimension declared)
+{
+   if (!base)
+      return NULL;
+   const struct gex_wgpu_sampler_view *view =
+      (const struct gex_wgpu_sampler_view *)base;
+   if (declared == WGPUTextureViewDimension_2DArray && view->array_view &&
+       (base->target == PIPE_TEXTURE_CUBE ||
+        base->target == PIPE_TEXTURE_CUBE_ARRAY))
+      return view->array_view;
+   return view->view;
+}
+
 /* Write depth (and stencil, if the format has it) into a texture.
  *
  * The inverse of gex_wgpu_read_depth: unpack Gallium's layout into floats,
@@ -15604,6 +15633,24 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
          if (compute->sampler_slots[j] == compute->texture_slots[i])
             compute->integer_sampled_slots |= 1u << compute->texture_slots[i];
    }
+   /* WebGPU has no integer cube sample type, so an integer cube is declared
+    * as a 2D array and reached through an alternate view of the same
+    * six-layer allocation -- the graphics stages have done this all along,
+    * and compute had not, so its layout said Cube while the variant's module
+    * (which runs the same cubemap lowering) said 2D array. Dawn rejects the
+    * pipeline for the mismatch, and a rejected pipeline means the dispatch
+    * writes nothing. Must follow the sample-type scans above for the same
+    * reason the sampler fixup does. */
+   for (unsigned i = 0; i < compute->texture_count; ++i) {
+      if (compute->texture_sample_types[i] != WGPUTextureSampleType_Sint &&
+          compute->texture_sample_types[i] != WGPUTextureSampleType_Uint)
+         continue;
+      if (compute->texture_dimensions[i] == WGPUTextureViewDimension_Cube ||
+          compute->texture_dimensions[i] ==
+             WGPUTextureViewDimension_CubeArray)
+         compute->texture_dimensions[i] = WGPUTextureViewDimension_2DArray;
+   }
+
    /* A sampler's binding type follows from the texture it is paired with, so
     * this has to come *after* both scans above -- it ran before them once,
     * and read sample types that had not been decided yet, which left a
@@ -16063,7 +16110,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       entries[count].texture.viewDimension = compute->texture_dimensions[i];
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       bindings[count].binding = compute->texture_bindings[i];
-      bindings[count].textureView = view->view;
+      bindings[count].textureView = gex_wgpu_stage_texture_view(
+         &view->base, compute->texture_dimensions[i]);
       ++count;
    }
    for (unsigned i = 0; i < compute->sampler_count; ++i) {
@@ -28688,12 +28736,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                ? gex_wgpu_default_texture_view(
                     screen, ctx->fs->texture_dimensions[i],
                     ctx->fs->texture_sample_types[i])
-            : ctx->fs->texture_dimensions[i] ==
-                  WGPUTextureViewDimension_2DArray &&
-               (ctx->sampler_views[slot]->target == PIPE_TEXTURE_CUBE ||
-                ctx->sampler_views[slot]->target ==
-                   PIPE_TEXTURE_CUBE_ARRAY)
-               ? view->array_view : view->view;
+            : gex_wgpu_stage_texture_view(ctx->sampler_views[slot],
+                                          ctx->fs->texture_dimensions[i]);
          if (!entries[i].textureView) {
             static bool said;
             if (!said) {
@@ -29002,7 +29046,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             (struct gex_wgpu_sampler_view *)ctx->vertex_sampler_views[slot];
          entries[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[i].binding = ctx->vs->texture_bindings[i];
-         entries[i].textureView = view ? view->view : NULL;
+         entries[i].textureView = view
+            ? gex_wgpu_stage_texture_view(&view->base,
+                                          ctx->vs->texture_dimensions[i])
+            /* GL leaves units enabled with nothing bound, as in the fragment
+             * stage below. */
+            : gex_wgpu_default_texture_view(
+                 screen, ctx->vs->texture_dimensions[i],
+                 ctx->vs->texture_sample_types[i]);
       }
       for (unsigned i = 0; i < ctx->vs->sampler_count; ++i) {
          const unsigned slot = ctx->vs->sampler_slots[i];

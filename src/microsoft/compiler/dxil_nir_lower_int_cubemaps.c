@@ -328,6 +328,27 @@ handle_cube_gather(nir_builder *b, nir_tex_instr *tex, nir_def *coord)
 {
    nir_def *tex_size = nir_get_texture_size(b, tex);
 
+   /* Ask the *array* the variable has become, not the cube the op still says.
+    *
+    * This pass rewrites the variable's type to a 2D array, and every texture
+    * operation it emits below is built in that form -- but the size query
+    * above is derived from the original cube op, so it asks for two
+    * components where an arrayed image gives three. A backend that checks
+    * rejects the module for it; SPIR-V says
+    *
+    *   Result Type has 2 components, but 3 expected
+    *
+    * and a rejected module fails the whole program. d3d12, this pass's other
+    * consumer, lowers the query further and never sees the mismatch.
+    *
+    * Widening it is safe for every reader here: handle_cube_edge takes
+    * channel 0 and the texel-coordinate maths below trims to two, so the
+    * extra layer count goes unread. */
+   nir_tex_instr *size_query = nir_instr_as_tex(nir_def_instr(tex_size));
+   size_query->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   size_query->is_array = true;
+   tex_size->num_components = 3;
+
    /* nir_get_texture_size puts the cursor before the tex op */
    b->cursor = nir_after_def(coord);
 
