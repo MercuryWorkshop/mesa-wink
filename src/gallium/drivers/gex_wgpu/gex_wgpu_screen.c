@@ -7747,15 +7747,40 @@ gex_wgpu_capture_fetch(nir_builder *b, struct gex_wgpu_capture *state,
 
    unsigned words = 0;
    bool unorm8 = false;
+   bool integer = false;
    switch ((enum pipe_format)layout->format[element]) {
    case PIPE_FORMAT_R32_FLOAT: words = 1; break;
    case PIPE_FORMAT_R32G32_FLOAT: words = 2; break;
    case PIPE_FORMAT_R32G32B32_FLOAT: words = 3; break;
    case PIPE_FORMAT_R32G32B32A32_FLOAT: words = 4; break;
    case PIPE_FORMAT_R8G8B8A8_UNORM: words = 1; unorm8 = true; break;
+   /* The integer formats are word-per-component exactly as the float ones
+    * are, and a NIR value is an untyped bit pattern, so the loaded words are
+    * already what the shader reads -- only the fill for the components the
+    * format does not supply has to be an integer one.
+    *
+    * Leaving them out cost far more than an integer attribute. A transform
+    * feedback capture of a shader reading an `in int` refused, that refusal
+    * *latches* the context, and the CTS reuses one context for a whole
+    * family: KHR-GL45.direct_state_access.buffers_functional does exactly
+    * this, and the 256 cases that followed it all reported InternalError
+    * because the context never came back. Run alone they pass. */
+   case PIPE_FORMAT_R32_SINT:
+   case PIPE_FORMAT_R32_UINT: words = 1; integer = true; break;
+   case PIPE_FORMAT_R32G32_SINT:
+   case PIPE_FORMAT_R32G32_UINT: words = 2; integer = true; break;
+   case PIPE_FORMAT_R32G32B32_SINT:
+   case PIPE_FORMAT_R32G32B32_UINT: words = 3; integer = true; break;
+   case PIPE_FORMAT_R32G32B32A32_SINT:
+   case PIPE_FORMAT_R32G32B32A32_UINT: words = 4; integer = true; break;
    default:
       /* Every other format is translated by u_vbuf before it reaches the
        * driver, so reaching this is a driver bug rather than an app one. */
+      if (getenv("GEX_WGPU_XFB_DEBUG"))
+         fprintf(stderr, "gex-xfb: capture cannot fetch element %u format %s "
+                 "(%u)\n", element,
+                 util_format_short_name(layout->format[element]),
+                 layout->format[element]);
       state->failed = true;
       return zero;
    }
@@ -7817,9 +7842,11 @@ gex_wgpu_capture_fetch(nir_builder *b, struct gex_wgpu_capture *state,
       for (unsigned i = 0; i < words; ++i)
          comp[i] = raw[i];
    }
-   /* GL fills the components a format does not supply with (0, 0, 0, 1). */
+   /* GL fills the components a format does not supply with (0, 0, 0, 1) --
+    * and for an integer format that one is an integer one. */
    for (unsigned i = have; i < 4; ++i)
-      comp[i] = nir_imm_float(b, i == 3 ? 1.0f : 0.0f);
+      comp[i] = integer ? nir_imm_int(b, i == 3 ? 1 : 0)
+                        : nir_imm_float(b, i == 3 ? 1.0f : 0.0f);
    return nir_vec(b, comp, components);
 }
 
@@ -23124,6 +23151,34 @@ gex_wgpu_assembled_vertex(enum mesa_prim mode, unsigned prim, unsigned vertex,
    }
 }
 
+/* Why a transform feedback capture could not run.
+ *
+ * These are limits and app state, not device errors, and they must not latch:
+ * the CTS reuses one context for a whole family, so latching here cost the
+ * 200 cases *after* the offending one -- every one reporting InternalError
+ * for a feature it never used, while passing when run alone. The draw itself
+ * still goes ahead; what is lost is the feedback data, which fails the case
+ * that asked for it and nothing else.
+ *
+ * A genuine allocation or device failure still latches; those are left as
+ * gex_fail below. */
+#define GEX_CAPTURE_LIMIT(why)                                                \
+   do {                                                                       \
+      static const char *said[8];                                             \
+      bool told = false;                                                      \
+      unsigned free_slot = 8;                                                 \
+      for (unsigned i = 0; i < 8; ++i) {                                      \
+         if (said[i] == (why)) told = true;                                   \
+         else if (!said[i] && free_slot == 8) free_slot = i;                  \
+      }                                                                       \
+      if (!told && free_slot < 8) {                                           \
+         said[free_slot] = (why);                                             \
+         fprintf(stderr, "gex-wgpu: transform feedback records nothing for "  \
+                 "this draw (%s)\n", (why));                                  \
+      }                                                                       \
+      return false;                                                           \
+   } while (0)
+
 static bool
 gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
                           const struct pipe_draw_info *info,
@@ -23137,10 +23192,9 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
 
    /* An instanced capture still needs the invocation index to reach the
     * instance, which this variant does not model. */
-   if (info->instance_count != 1) {
-      gex_fail(ctx);
-      return false;
-   }
+   if (info->instance_count != 1)
+      GEX_CAPTURE_LIMIT("an instanced draw; the capture variant does not "
+                        "model the instance index");
 
    /* The slot table: one entry per captured vertex, resolved through the
     * index buffer and through the primitive topology. */
@@ -23168,10 +23222,8 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
                ? gex_resource(info->index.resource)->shadow : NULL);
       if (!indices ||
           (info->index_size != 1 && info->index_size != 2 &&
-           info->index_size != 4)) {
-         gex_fail(ctx);
-         return false;
-      }
+           info->index_size != 4))
+         GEX_CAPTURE_LIMIT("the index buffer could not be read");
       indices += (uint64_t)draw->start * info->index_size;
    }
    uint32_t *slot_table = MALLOC((size_t)captured * sizeof(uint32_t));
@@ -23229,9 +23281,38 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       wgpuQueueWriteBuffer(screen->queue, table_buffer, 0, slot_table,
                            (size_t)table_desc.size);
    FREE(slot_table);
-   if (!variant || !table_buffer) {
+   if (!variant) {
+      /* A capability limit, not a device error, so it must not latch.
+       *
+       * The capture runs the vertex shader as compute and fetches the vertex
+       * attributes itself, and it can only fetch the formats
+       * gex_wgpu_capture_fetch knows -- an `in vec2` of r8g8_snorm has to be
+       * unpacked and is not. Latching for that cost the whole of the rest of
+       * the run: the CTS reuses one context for a family, so
+       * direct_state_access.vertex_arrays_attribute_format poisoned the 200
+       * cases after it, every one reporting InternalError for a feature it
+       * never used. Run alone, those same cases pass.
+       *
+       * The draw still goes ahead. Its transform feedback records nothing,
+       * which fails the case that asked for it and nothing else -- named
+       * here so the next reader gets the format rather than a mystery. */
+      static const char *said[8];
+      const char *name = util_format_short_name(
+         layout.count ? layout.format[0] : PIPE_FORMAT_NONE);
+      bool told = false;
+      for (unsigned i = 0; i < 8; ++i)
+         if (said[i] && !strcmp(said[i], name)) told = true;
+      if (!told)
+         for (unsigned i = 0; i < 8; ++i)
+            if (!said[i]) { said[i] = name;
+               fprintf(stderr, "gex-wgpu: transform feedback records nothing "
+                       "for this draw (no capture variant; first attribute "
+                       "is %s)\n", name); break; }
       if (table_buffer)
          wgpuBufferRelease(table_buffer);
+      return false;
+   }
+   if (!table_buffer) {
       gex_fail(ctx);
       return false;
    }
@@ -23258,10 +23339,8 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       const struct pipe_stream_output_target *target = ctx->so_targets[i];
       /* A shader that captures needs its targets bound; without them the
        * dispatch would run and write nowhere. */
-      if (!target || !target->buffer) {
-         gex_fail(ctx);
-         return false;
-      }
+      if (!target || !target->buffer)
+         GEX_CAPTURE_LIMIT("a stream output target has no buffer bound");
       /* Bound whole and offset in the parameters, because a storage binding
        * offset must be 256-byte aligned and GL promises only four. */
       struct gex_wgpu_so_target *so = (struct gex_wgpu_so_target *)target;
@@ -23297,10 +23376,8 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    for (unsigned i = 0; i < GEX_WGPU_MAX_VERTEX_BUFFERS; ++i) {
       if (!(variant->vb_mask & (1u << i)))
          continue;
-      if (i >= ctx->vertex_buffer_count || !ctx->vertex_buffers[i]) {
-         gex_fail(ctx);
-         return false;
-      }
+      if (i >= ctx->vertex_buffer_count || !ctx->vertex_buffers[i])
+         GEX_CAPTURE_LIMIT("a vertex buffer the capture reads is unbound");
       params[GEX_WGPU_PARAM_VB_OFFSET + i] = ctx->vertex_buffer_offsets[i];
       entries[count] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       entries[count].binding = variant->vb_bindings[i];
@@ -31215,9 +31292,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* Transform feedback is its own compute pass, run before the draw: WGSL
     * will not let the vertex stage write a storage buffer, so the vertex
     * shader is run a second time as compute to do the capturing. */
-   if (ctx->so_target_count && ctx->vs->capture_nir &&
-       !gex_wgpu_capture_dispatch(ctx, info, &draws[0]))
-      return;
+   /* The draw goes ahead whether or not the capture could run. A capture
+    * this driver cannot do is one case's wrong answer; abandoning the draw
+    * as well made it two, and the second was silent. */
+   if (ctx->so_target_count && ctx->vs->capture_nir)
+      (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
    if (discard)
       return;
 
