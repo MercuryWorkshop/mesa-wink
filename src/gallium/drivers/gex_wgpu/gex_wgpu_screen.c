@@ -289,6 +289,23 @@ gex_wgpu_buffer_texture_words(enum pipe_format format)
  * shader, the bind group layout and the texture all name the same thing. */
 static enum pipe_format gex_wgpu_format_backing(enum pipe_format format);
 
+/* What one colour attachment of this format costs against WebGPU's
+ * per-sample budget, and what it has to be aligned to.
+ *
+ * These are the spec's own numbers and they are deliberately not the format's
+ * byte size: everything from 32 to 64 bits wide costs eight, which is why
+ * seven rgba8 targets come to 56 rather than 28 and overrun a budget of 32.
+ * Derived from the block size because the table is exactly that -- 1 byte
+ * costs 1, 2 bytes cost 2, 4 and 8 bytes cost 8, 16 bytes cost 16. */
+static void
+gex_wgpu_color_sample_cost(enum pipe_format format, unsigned *cost,
+                           unsigned *alignment)
+{
+   const unsigned bytes = util_format_get_blocksize(format);
+   *cost = bytes <= 1 ? 1 : bytes <= 2 ? 2 : bytes <= 8 ? 8 : 16;
+   *alignment = bytes <= 1 ? 1 : bytes <= 2 ? 2 : 4;
+}
+
 /* Defined with the sampler views; a compute dispatch binds them too. */
 struct gex_wgpu_sampler_view;
 static void gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
@@ -561,10 +578,14 @@ struct gex_wgpu_screen {
     * blend a float32 attachment, both of which are optional features. */
    bool float32_filterable;
    bool float32_blendable;
-   /* WebGPU bounds the total bytes per sample across colour attachments, and
-    * the default 32 is exactly eight RGBA8 targets -- so a framebuffer with
-    * any wider format in it is a validation error rather than a wide
-    * framebuffer. The page asks for more; this is what it got. */
+   /* WebGPU bounds the total bytes per sample across colour attachments.
+    *
+    * The budget is *not* spent in the formats' own byte sizes, which is what
+    * this used to assume: the spec's table charges everything from 32 to 64
+    * bits wide a flat eight, so the guaranteed minimum of 32 buys **four**
+    * rgba8 targets and not the eight it looks like. Seven of them come to 56.
+    * The page asks for more; this is what it got, and on the adapter this was
+    * found on asking for 64 still got 32. */
    uint32_t max_colour_bytes_per_sample;
    /* Two vec4s of GL's default generic vertex attribute -- (0,0,0,1) as
     * floats at offset 0 and as integers at offset 16 -- for the locations a
@@ -777,6 +798,32 @@ struct gex_wgpu_resource {
 };
 
 struct gex_wgpu_query;
+
+/* Which of GL's concurrently-allowed query groups a pipe query belongs to. */
+enum gex_wgpu_query_slot {
+   GEX_WGPU_QUERY_OCCLUSION,
+   GEX_WGPU_QUERY_GENERATED,
+   GEX_WGPU_QUERY_EMITTED,
+   GEX_WGPU_QUERY_SLOTS,
+};
+
+static int
+gex_wgpu_query_slot(unsigned type)
+{
+   switch (type) {
+   case PIPE_QUERY_OCCLUSION_COUNTER:
+   case PIPE_QUERY_OCCLUSION_PREDICATE:
+   case PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE:
+      return GEX_WGPU_QUERY_OCCLUSION;
+   case PIPE_QUERY_PRIMITIVES_GENERATED:
+      return GEX_WGPU_QUERY_GENERATED;
+   case PIPE_QUERY_PRIMITIVES_EMITTED:
+   case PIPE_QUERY_SO_STATISTICS:
+      return GEX_WGPU_QUERY_EMITTED;
+   default:
+      return -1;
+   }
+}
 
 struct gex_wgpu_context {
    struct pipe_context base;
@@ -1115,7 +1162,15 @@ struct gex_wgpu_context {
                                          GEX_WGPU_MAX_SO_BUFFERS
                                             ? GEX_WGPU_MAX_SHADER_BUFFERS
                                             : GEX_WGPU_MAX_SO_BUFFERS];
-   struct gex_wgpu_query *active_query;
+   /* One active query per *target group*, not one overall.
+    *
+    * GL allows an occlusion query, a primitives-generated query and a
+    * primitives-written query to run at the same time -- they are different
+    * targets -- and a single slot made the second glBeginQuery fail. st/mesa
+    * turns that into GL_OUT_OF_MEMORY, which dEQP treats as fatal: it is what
+    * ended the whole GL 4.4 mustpass run 31 cases in, at
+    * KHR-GL44.transform_feedback.geometry, which begins two of them. */
+   struct gex_wgpu_query *active_queries[GEX_WGPU_QUERY_SLOTS];
    /* glBeginConditionalRender. The query is owned by st/mesa, which keeps it
     * alive until EndConditionalRender clears the condition. */
    struct pipe_query *render_cond_query;
@@ -1714,6 +1769,11 @@ struct gex_wgpu_sampler_view {
  * anyway. */
 struct gex_wgpu_query {
    unsigned type;
+   /* The vertex stream a transform-feedback query counts. This driver writes
+    * stream zero only -- a geometry shader that names another is refused when
+    * it is created -- so a query on any other stream is answered with the
+    * zero that is actually true of it, rather than not answered at all. */
+   unsigned index;
    bool active;
    bool have_result;
    /* Whether a render pass carrying the occlusion query actually began while
@@ -2168,6 +2228,9 @@ gex_wgpu_apply_buffer_textures(nir_shader *nir,
 struct gex_wgpu_ssbo_lowering {
    bool failed;
    char why[192];
+   /* Only for a block this pass has to recreate; see
+    * gex_wgpu_ssbo_block_create. */
+   unsigned descriptor_set;
 };
 
 /* The block's single member, as an array of words. Flattening loses the
@@ -2190,6 +2253,47 @@ gex_wgpu_flatten_ssbo_blocks(nir_shader *nir)
       var->interface_type = flat;
       var->type = flat;
    }
+}
+
+/* A storage block whose *only* use is `length()` has no deref anywhere in the
+ * shader -- nothing addresses its contents -- so nothing keeps its variable
+ * alive and NIR removes it long before this driver sees the shader. The
+ * length() itself still names the slot, leaving a hole in an otherwise
+ * contiguous numbering: KHR-GL44's unsizedArrayLength shaders declare eight
+ * blocks and arrive with seven variables, numbered 0-4, 6, 7.
+ *
+ * So it is put back. The flattened shape is fixed and the binding follows
+ * from the slot exactly as the assignment above would have given it, and
+ * because this runs before the shader's storage-block bookkeeping is
+ * gathered, the driver goes on to bind a buffer to it like any other. */
+static nir_variable *
+gex_wgpu_ssbo_block_create(nir_shader *nir, unsigned slot, unsigned set)
+{
+   char name[40];
+   snprintf(name, sizeof(name), "gex_ssbo_length%u", slot);
+   struct glsl_struct_field field = {0};
+   field.type = glsl_array_type(glsl_uint_type(), 0, 4);
+   field.name = "words";
+   field.location = -1;
+   const struct glsl_type *flat =
+      glsl_interface_type(&field, 1, GLSL_INTERFACE_PACKING_STD430, false,
+                          name);
+   nir_variable *var =
+      nir_variable_create(nir, nir_var_mem_ssbo, flat, name);
+   if (!var)
+      return NULL;
+   var->interface_type = flat;
+   var->data.driver_location = slot;
+   var->data.descriptor_set = set;
+   var->data.binding = GEX_WGPU_SSBO_FIRST_BINDING + slot;
+   var->data.explicit_binding = 1;
+   /* Read-only, because asking a block's length is the only thing the shader
+    * does with it. Left writable it would be a read_write storage variable,
+    * which WGSL forbids outright in the vertex stage -- so a vertex shader
+    * that merely measured a buffer would have been rejected by the block put
+    * back to let it do so. */
+   var->data.access = ACCESS_NON_WRITEABLE;
+   return var;
 }
 
 static nir_variable *
@@ -2229,12 +2333,64 @@ gex_wgpu_lower_ssbo_access(nir_builder *b, nir_instr *instr, void *data)
       /* Anything else that names a storage block is not served, and saying
        * which is the whole diagnosis. */
       switch (intr->intrinsic) {
-      case nir_intrinsic_get_ssbo_size:
-         state->failed = true;
-         if (!state->why[0])
-            snprintf(state->why, sizeof(state->why),
-                     "shader storage length() is not implemented");
-         return false;
+      case nir_intrinsic_get_ssbo_size: {
+         /* GLSL's `.length()` on an unsized storage array. WGSL has this as
+          * `arrayLength`, and the flattened block above is exactly the shape
+          * it wants -- a struct whose last member is a runtime-sized array --
+          * so the length can be asked for directly rather than computed from
+          * a size the driver would have to supply per draw.
+          *
+          * It cannot go through ntv's own get_ssbo_size, which addresses
+          * zink's descriptor array by buffer number and so assumes a binding
+          * layout this driver does not have. The deref form names the block
+          * instead; ntv learnt it for this. */
+         if (!nir_src_is_const(intr->src[0])) {
+            state->failed = true;
+            if (!state->why[0])
+               snprintf(state->why, sizeof(state->why),
+                        "length() on a storage block chosen at run time");
+            return false;
+         }
+         const unsigned size_slot = nir_src_as_uint(intr->src[0]);
+         if (size_slot >= GEX_WGPU_MAX_SHADER_BUFFERS) {
+            state->failed = true;
+            if (!state->why[0])
+               snprintf(state->why, sizeof(state->why),
+                        "length() on storage block %u, above the %u this "
+                        "driver serves", size_slot,
+                        (unsigned)GEX_WGPU_MAX_SHADER_BUFFERS);
+            return false;
+         }
+         nir_variable *size_block = gex_wgpu_ssbo_block(b->shader, size_slot);
+         if (!size_block)
+            size_block = gex_wgpu_ssbo_block_create(b->shader, size_slot,
+                                                    state->descriptor_set);
+         if (!size_block) {
+            state->failed = true;
+            if (!state->why[0])
+               snprintf(state->why, sizeof(state->why),
+                        "length() on storage block %u, which this shader "
+                        "neither declares nor could be given", size_slot);
+            return false;
+         }
+         b->cursor = nir_before_instr(instr);
+         nir_deref_instr *words = nir_build_deref_struct(
+            b, nir_build_deref_var(b, size_block), 0);
+         nir_intrinsic_instr *length = nir_intrinsic_instr_create(
+            b->shader, nir_intrinsic_deref_buffer_array_length);
+         length->src[0] = nir_src_for_ssa(&words->def);
+         /* num_components stays zero: the intrinsic is declared with a fixed
+          * dest_comp, and nir_validate rejects one that also carries a
+          * component count. */
+         nir_def_init(&length->instr, &length->def, 1, 32);
+         nir_builder_instr_insert(b, &length->instr);
+         /* get_ssbo_size is defined to give *bytes* -- its consumers go on to
+          * compute `(size - offset) / stride` -- and the array is of words,
+          * so the element count has to be turned back into bytes for that
+          * arithmetic to land on the element count the shader asked for. */
+         nir_def_replace(&intr->def, nir_imul_imm(b, &length->def, 4));
+         return true;
+      }
       default:
          return false;
       }
@@ -2629,6 +2785,7 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
    gex_wgpu_flatten_ssbo_blocks(nir);
    {
       struct gex_wgpu_ssbo_lowering ssbo_state = {0};
+      ssbo_state.descriptor_set = stage == MESA_SHADER_VERTEX ? 1 : 2;
       nir_shader_instructions_pass(nir, gex_wgpu_lower_ssbo_access,
                                    nir_metadata_control_flow, &ssbo_state);
       if (ssbo_state.failed) {
@@ -3147,6 +3304,36 @@ gex_wgpu_mark_failed(struct gex_wgpu_context *ctx, const char *fn, int line)
 }
 
 #define gex_fail(ctx) gex_wgpu_mark_failed((ctx), __func__, __LINE__)
+
+/* Reported the same way and *not* latched.
+ *
+ * For an operation this backend cannot serve where the device is untouched:
+ * the operation does not happen, whatever it would have written keeps what it
+ * held, and everything after it goes on working. Most of Gallium's entry
+ * points return void, so the caller cannot be told either way -- which means
+ * latching does not report the failure, it only spreads it.
+ *
+ * The difference is not academic. Every one of these used to call gex_fail,
+ * and the chain from there is always the same: ctx->failed sticks, the next
+ * map returns NULL, Mesa turns that into GL_OUT_OF_MEMORY, and an application
+ * dies from a call that had nothing to do with the thing that was refused. */
+static void
+gex_wgpu_declined(const char *fn, int line)
+{
+   static struct { const char *fn; int line; } seen[32];
+   static unsigned seen_count;
+   for (unsigned i = 0; i < seen_count; ++i)
+      if (seen[i].line == line && seen[i].fn == fn)
+         return;
+   if (seen_count < ARRAY_SIZE(seen)) {
+      seen[seen_count].fn = fn;
+      seen[seen_count].line = line;
+      fprintf(stderr, "gex-wgpu: declined at %s:%d\n", fn, line);
+      ++seen_count;
+   }
+}
+
+#define gex_decline(ctx) ((void)(ctx), gex_wgpu_declined(__func__, __LINE__))
 
 static inline struct gex_wgpu_resource *
 gex_resource(struct pipe_resource *resource)
@@ -8168,7 +8355,7 @@ gex_wgpu_set_blend_color(struct pipe_context *pipe,
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    if (!color || !isfinite(color->color[0]) || !isfinite(color->color[1]) ||
        !isfinite(color->color[2]) || !isfinite(color->color[3])) {
-      gex_fail(ctx);
+      gex_decline(ctx);
       return;
    }
    ctx->blend_color = *color;
@@ -8225,7 +8412,7 @@ gex_wgpu_set_viewport_states(struct pipe_context *pipe, unsigned start_slot,
             fprintf(stderr, "gex-wgpu: viewport slots %u..%u past the %u this "
                             "driver has\n", start_slot,
                     start_slot + num_viewports - 1, GEX_WGPU_MAX_VIEWPORTS);
-         gex_fail(ctx);
+         gex_decline(ctx);
       }
       return;
    }
@@ -8254,7 +8441,7 @@ gex_wgpu_set_viewport_states(struct pipe_context *pipe, unsigned start_slot,
                  states ? states[0].translate[0] : 0.0f,
                  states ? states[0].translate[1] : 0.0f,
                  states ? states[0].translate[2] : 0.0f);
-      gex_fail(ctx);
+      gex_decline(ctx);
       return;
    }
    ctx->viewport = states[0];
@@ -8269,12 +8456,12 @@ gex_wgpu_set_scissor_states(struct pipe_context *pipe, unsigned start_slot,
    GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    if (!states || start_slot + num_scissors > GEX_WGPU_MAX_VIEWPORTS) {
-      gex_fail(ctx);
+      gex_decline(ctx);
       return;
    }
    for (unsigned i = 0; i < num_scissors; ++i) {
       if (states[i].minx > states[i].maxx || states[i].miny > states[i].maxy) {
-         gex_fail(ctx);
+         gex_decline(ctx);
          return;
       }
       ctx->scissors[start_slot + i] = states[i];
@@ -10812,7 +10999,10 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
                  resource ? resource->depth0 : 0,
                  resource ? resource->array_size : 0,
                  (unsigned long long)layer_stride);
-      gex_fail(ctx);
+      /* Declined, not latched. An upload this path cannot serve leaves that
+       * one texture holding what it held; latching it lost every later
+       * operation on every other object too, which is how one unsupported
+       * format took KHR-GL44.compute_shader down to three passing cases. */
       return;
    }
    /* A depth-stencil texture is copied one aspect at a time, and only some
@@ -13425,7 +13615,7 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
        level > resource->last_level ||
        dst->first_layer != dst->last_layer || dstx != 0 || dsty != 0 ||
        width != level_width || height != level_height) {
-      gex_fail(ctx);
+      gex_decline(ctx);
       return;
    }
 
@@ -13464,7 +13654,7 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
    if (!view || !encoder) {
       if (view) wgpuTextureViewRelease(view);
       if (encoder) wgpuCommandEncoderRelease(encoder);
-      gex_fail(ctx);
+      gex_decline(ctx);
       return;
    }
    WGPURenderPassColorAttachment attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
@@ -13510,7 +13700,7 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
    wgpuTextureViewRelease(view);
    if (!pass || !command) {
       if (command) wgpuCommandBufferRelease(command);
-      gex_fail(ctx);
+      gex_decline(ctx);
       return;
    }
    gex_wgpu_queue_submit(screen, 1, &command);
@@ -13578,7 +13768,7 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
         * NaN compares false against both bounds, so the second form lets it
         * through to depthClearValue, where the browser rejects the pass. */
        ((clear_flags & PIPE_CLEAR_DEPTH) && !(depth >= 0.0 && depth <= 1.0))) {
-      gex_fail(ctx);
+      gex_decline(ctx);
       return;
    }
    {
@@ -13655,7 +13845,7 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
    if (view) wgpuTextureViewRelease(view);
    if (!pass || !command) {
       if (command) wgpuCommandBufferRelease(command);
-      gex_fail(ctx);
+      gex_decline(ctx);
       return;
    }
    gex_wgpu_queue_submit(screen, 1, &command);
@@ -13746,7 +13936,7 @@ gex_wgpu_set_clip_state(struct pipe_context *pipe,
  * GL asks how many samples passed the depth and stencil tests; WebGPU's
  * occlusion query set answers exactly that, counted across a render pass.  The
  * pass has to be told which query set it writes to, so the draw path picks
- * this up from ctx->active_query.
+ * this up from ctx->active_queries.
  *
  * Only PIPE_QUERY_OCCLUSION_COUNTER and _PREDICATE are supported.  Timestamps
  * would need the timestamp-query feature and a different resolve; anything
@@ -13794,7 +13984,18 @@ gex_wgpu_create_query(struct pipe_context *pipe, unsigned query_type,
    const bool timer = query_type == PIPE_QUERY_TIME_ELAPSED ||
                       query_type == PIPE_QUERY_TIMESTAMP ||
                       query_type == PIPE_QUERY_TIMESTAMP_DISJOINT;
-   if (index != 0 || (!occlusion && !counted && !timer))
+   /* An *indexed* query names a vertex stream, and only the two
+    * transform-feedback counters have one; occlusion and timer queries are
+    * not indexed and GL never gives them a non-zero index.
+    *
+    * Refusing a non-zero stream outright was the last of these left, and it
+    * cost more than every other: returning NULL makes st/mesa raise
+    * GL_OUT_OF_MEMORY from glBeginQuery, the CTS wraps that in
+    * GLU_EXPECT_NO_ERROR, and dEQP treats it as a fatal ResourceError -- so
+    * KHR-GL44.transform_feedback.geometry did not fail, it **ended the whole
+    * mustpass run**, 31 cases in of 16843. The comment above says exactly
+    * this about the counted types and the index was not covered by it. */
+   if ((index != 0 && !counted) || (!occlusion && !counted && !timer))
       return NULL;
 
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
@@ -13828,8 +14029,10 @@ gex_wgpu_create_query(struct pipe_context *pipe, unsigned query_type,
    }
 
    struct gex_wgpu_query *query = CALLOC_STRUCT(gex_wgpu_query);
-   if (query)
+   if (query) {
       query->type = query_type;
+      query->index = index;
+   }
    return (struct pipe_query *)query;
 }
 
@@ -13837,9 +14040,22 @@ static void
 gex_wgpu_destroy_query(struct pipe_context *pipe, struct pipe_query *q)
 {
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
-   if (ctx->active_query == (struct gex_wgpu_query *)q)
-      ctx->active_query = NULL;
+   for (unsigned i = 0; i < GEX_WGPU_QUERY_SLOTS; ++i)
+      if (ctx->active_queries[i] == (struct gex_wgpu_query *)q)
+         ctx->active_queries[i] = NULL;
    FREE(q);
+}
+
+/* Add to whichever query of this group is running, if one is and if it counts
+ * the stream this driver actually writes. A query on a stream above zero
+ * stays at the zero that is true of it: only stream zero is ever produced. */
+static void
+gex_wgpu_query_add(struct gex_wgpu_context *ctx, enum gex_wgpu_query_slot slot,
+                   uint64_t count)
+{
+   struct gex_wgpu_query *query = ctx->active_queries[slot];
+   if (query && !query->index)
+      query->result += count;
 }
 
 static bool
@@ -13851,7 +14067,7 @@ gex_wgpu_begin_query(struct pipe_context *pipe, struct pipe_query *q)
       return false;
    /* A timer query does not occupy the occlusion slot: GL lets a TIME_ELAPSED
     * query run concurrently with an occlusion query, and claiming
-    * ctx->active_query here would make each refuse the other. */
+    * a slot here would make each refuse the other. */
    if (query->type == PIPE_QUERY_TIME_ELAPSED ||
        query->type == PIPE_QUERY_TIMESTAMP ||
        query->type == PIPE_QUERY_TIMESTAMP_DISJOINT) {
@@ -13862,13 +14078,14 @@ gex_wgpu_begin_query(struct pipe_context *pipe, struct pipe_query *q)
       query->start = os_time_get_nano();
       return true;
    }
-   if (ctx->active_query)
+   const int slot = gex_wgpu_query_slot(query->type);
+   if (slot < 0 || ctx->active_queries[slot])
       return false;
    query->active = true;
    query->have_result = false;
    query->counted = false;
    query->result = 0;
-   ctx->active_query = query;
+   ctx->active_queries[slot] = query;
    return true;
 }
 
@@ -13893,8 +14110,9 @@ gex_wgpu_end_query(struct pipe_context *pipe, struct pipe_query *q)
       query->have_result = true;
    }
    query->active = false;
-   if (ctx->active_query == query)
-      ctx->active_query = NULL;
+   for (unsigned i = 0; i < GEX_WGPU_QUERY_SLOTS; ++i)
+      if (ctx->active_queries[i] == query)
+         ctx->active_queries[i] = NULL;
    return true;
 }
 
@@ -14604,8 +14822,20 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
    struct gex_wgpu_compute_state *compute = ctx->compute;
-   if (ctx->failed || !compute) {
-      gex_fail(ctx);
+   if (ctx->failed)
+      return;
+   if (!compute) {
+      /* No compute state means the shader was refused when it was created,
+       * which is this dispatch's problem and not the device's -- see the
+       * draw path's refusal list for why that distinction is worth keeping.
+       * This one is what latched the context for every KHR-GL44 family whose
+       * first unsupported case happens to be a compute shader. */
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: dispatch declined (no compute shader; it "
+                         "was refused when created)\n");
+      }
       return;
    }
 
@@ -15629,12 +15859,12 @@ gex_wgpu_resource_copy_region(struct pipe_context *pipe,
    }
    if (dst && src && dst->target == PIPE_BUFFER && src->target == PIPE_BUFFER) {
       if (!gex_wgpu_copy_buffer_region(pipe, dst, dstx, src, box))
-         gex_fail(ctx);
+         gex_decline(ctx);
       return;
    }
    if (!gex_wgpu_copy_texture_region(pipe, dst, dst_level, dstx, dsty, dstz,
                                      src, src_level, box, false))
-      gex_fail(ctx);
+      gex_decline(ctx);
 }
 
 /* st/mesa reaches for this to move pixels between surfaces -- notably its
@@ -16043,9 +16273,13 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
                     util_format_short_name(info->src.format));
          }
       }
-      if (!gex_wgpu_resolve(pipe, info->dst.resource, info->dst.level,
-                            info->src.resource, info->src.level))
-         gex_fail(ctx);
+      /* Declined, not latched. gex_wgpu_resolve already names what it could
+       * not do -- a format pair, a level -- and the destination simply keeps
+       * what it held. Latching turned that into GL_OUT_OF_MEMORY from the
+       * next glReadPixels, which dEQP treats as fatal: it is what ended the
+       * mustpass run at framebuffer_blit, 864 cases in. */
+      (void)gex_wgpu_resolve(pipe, info->dst.resource, info->dst.level,
+                             info->src.resource, info->src.level);
       return;
    }
 
@@ -16201,7 +16435,7 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
                                      info->dst.box.y, info->dst.box.z,
                                      info->src.resource, info->src.level,
                                      &info->src.box, flip_y))
-      gex_fail(ctx);
+      gex_decline(ctx);
 }
 
 static void
@@ -16211,7 +16445,7 @@ gex_wgpu_set_sample_mask(struct pipe_context *pipe, unsigned sample_mask)
    if (ctx->failed)
       return;
    if (!(sample_mask & 1u))
-      gex_fail(ctx);
+      gex_decline(ctx);
 }
 
 static void
@@ -16229,7 +16463,8 @@ gex_wgpu_clear(struct pipe_context *pipe, unsigned buffers,
     * channels GL asked to be left alone. */
    if (ctx->failed || scissor_state ||
        ((buffers & PIPE_CLEAR_STENCIL) && stencil_clear_mask != 0xff)) {
-      gex_fail(ctx);
+      if (!ctx->failed)
+         gex_decline(ctx);
       return;
    }
 
@@ -16248,7 +16483,7 @@ gex_wgpu_clear(struct pipe_context *pipe, unsigned buffers,
          /* Four colormask bits per draw buffer; anything but all four is a
           * masked clear. */
          if (((color_clear_mask >> (4 * i)) & 0xf) != 0xf) {
-            gex_fail(ctx);
+            gex_decline(ctx);
             return;
          }
          /* The attached level and layer, at that level's own size.
@@ -16328,7 +16563,7 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
    if (state && state->nr_cbufs) {
       if (state->nr_cbufs > GEX_WGPU_MAX_COLOR_TARGETS ||
           state->width == 0 || state->height == 0) {
-         gex_fail(ctx);
+         gex_decline(ctx);
       } else {
          color_count = state->nr_cbufs;
          for (unsigned i = 0; i < color_count; ++i) {
@@ -16400,7 +16635,7 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
                 * target larger than its texture, a reinterpretation that
                 * changes the texel size, and a format WebGPU cannot render
                 * to at all. */
-               gex_fail(ctx);
+               gex_decline(ctx);
                color_count = 0;
                break;
             }
@@ -16442,12 +16677,25 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
           * device; dropping the attachments past the budget leaves a
           * framebuffer st/mesa reports as unsupported, which is what GL says
           * when a driver cannot honour a set of draw buffers. */
-         unsigned budget = gex_screen(pipe->screen)->max_colour_bytes_per_sample;
+         const unsigned budget =
+            gex_screen(pipe->screen)->max_colour_bytes_per_sample;
+         unsigned spent = 0;
          for (unsigned i = 0; i < color_count; ++i) {
-            const unsigned bytes = colors[i]
-               ? util_format_get_blocksize(color_formats[i]) : 0;
-            if (bytes <= budget) {
-               budget -= bytes;
+            unsigned bytes = 0, alignment = 1;
+            if (colors[i])
+               gex_wgpu_color_sample_cost(color_formats[i], &bytes,
+                                          &alignment);
+            /* WebGPU's own arithmetic: align the running total to this
+             * attachment's alignment before adding its cost. Counting the
+             * formats' plain byte sizes instead let seven rgba8 targets look
+             * like 28 against a budget of 32 while WebGPU made them 56 --
+             * the pipeline was rejected, the submit was invalid, and on this
+             * machine the device was lost and the GPU took a hard recovery.
+             * KHR-GL44.draw_buffers.draw_buffers_1 does exactly that. */
+            const unsigned aligned =
+               alignment ? (spent + alignment - 1) & ~(alignment - 1) : spent;
+            if (aligned + bytes <= budget) {
+               spent = aligned + bytes;
                continue;
             }
             static bool said;
@@ -16498,7 +16746,7 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
       gex_resource(depth)->texture_written = true;
       gex_resource(depth)->write_serial++;
    } else if (state && state->zsbuf.texture) {
-      gex_fail(ctx);
+      gex_decline(ctx);
    }
    /* ARB_framebuffer_no_attachments.
     *
@@ -16626,14 +16874,14 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
       if (!samples)
          samples = attachment;
       else if (attachment != samples)
-         gex_fail(ctx);
+         gex_decline(ctx);
    }
    if (depth) {
       const uint32_t attachment = MAX2(1, depth->nr_samples);
       if (!samples)
          samples = attachment;
       else if (attachment != samples)
-         gex_fail(ctx);
+         gex_decline(ctx);
    }
    ctx->fb_samples = MAX2(1, samples);
 }
@@ -19181,16 +19429,7 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    }
    /* PRIMITIVES_GENERATED counts what the vertex stage produced;
     * PRIMITIVES_EMITTED counts what transform feedback recorded. */
-   if (ctx->active_query) {
-      switch (ctx->active_query->type) {
-      case PIPE_QUERY_PRIMITIVES_EMITTED:
-      case PIPE_QUERY_SO_STATISTICS:
-         ctx->active_query->result += writable_prims;
-         break;
-      default:
-         break;
-      }
-   }
+   gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_EMITTED, writable_prims);
 
    WGPUBufferDescriptor params_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
    params_desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
@@ -20860,19 +21099,8 @@ gex_wgpu_gs_capture(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs,
    /* PRIMITIVES_GENERATED counts what the geometry stage produced;
     * PRIMITIVES_EMITTED counts what the capture managed to record, which is
     * less when a buffer ran out. */
-   if (ctx->active_query) {
-      switch (ctx->active_query->type) {
-      case PIPE_QUERY_PRIMITIVES_GENERATED:
-         ctx->active_query->result += generated;
-         break;
-      case PIPE_QUERY_PRIMITIVES_EMITTED:
-      case PIPE_QUERY_SO_STATISTICS:
-         ctx->active_query->result += recorded;
-         break;
-      default:
-         break;
-      }
-   }
+   gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_GENERATED, generated);
+   gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_EMITTED, recorded);
    return true;
 }
 
@@ -21142,16 +21370,17 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    if (ctx->so_target_count && gs->xfb) {
       if (!gex_wgpu_gs_capture(ctx, gs, prims))
          return false;
-   } else if (ctx->active_query &&
-              (ctx->active_query->type == PIPE_QUERY_PRIMITIVES_GENERATED ||
-               ctx->active_query->type == PIPE_QUERY_SO_STATISTICS)) {
+   } else if (ctx->active_queries[GEX_WGPU_QUERY_GENERATED]) {
       /* GL_PRIMITIVES_GENERATED counts the last stage before rasterization,
        * so with a geometry shader bound it is that stage's output and not the
        * draw's vertex count -- a number only the geometry pass has. Nothing
        * is being recorded here, so the scan runs for the total alone. */
       if (!gex_wgpu_gs_scan(ctx, prims))
          return false;
-      ctx->active_query->result += gex_wgpu_gs_generated(ctx, prims);
+      /* Only what was produced: nothing is recorded, so the written count
+       * this draw contributes is zero and its query is left alone. */
+      gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_GENERATED,
+                         gex_wgpu_gs_generated(ctx, prims));
    }
 
    /* Pass five: rasterize what the geometry shader wrote. The passthrough
@@ -24514,10 +24743,33 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        (draws[0].count == 0 || info->instance_count == 0))
       return;
    if (refusal) {
-      /* Named, not just located. This is the busiest refusal in the driver,
+      /* Declined, not latched -- every reason above is a state combination
+       * this backend does not serve, and not one of them touches the device.
+       * Latching them meant that a single shader the driver could not compile
+       * killed everything afterwards: the context stayed failed, every later
+       * draw and dispatch returned early, and unrelated calls came back as
+       * GL_OUT_OF_MEMORY. In KHR-GL44.shader_storage_buffer_object one
+       * refused compute shader took the family's unsizedArrayLength cases
+       * from 19 passing to 3, and an application it happens to is simply
+       * dead from that frame on.
+       *
+       * The two exceptions written above -- a zero-count draw and a
+       * non-zero index_bias -- were converted one at a time for this reason
+       * before the general case was understood. The latch is for a device
+       * that has actually broken, which is what gex_fail still means.
+       *
+       * Named, not just located: this is the busiest refusal in the driver,
        * and a line number costs a build cycle every time something new is
-       * rejected here. */
-      if (!ctx->failed)
+       * rejected here. Once per distinct reason, because it no longer stops
+       * after the first. */
+      static const char *told[16];
+      static unsigned told_count;
+      bool said = false;
+      for (unsigned i = 0; i < told_count; ++i)
+         if (told[i] == refusal) { said = true; break; }
+      if (!said) {
+         if (told_count < ARRAY_SIZE(told))
+            told[told_count++] = refusal;
          fprintf(stderr,
                  "gex-wgpu: draw refused (%s) mode=%u count=%u isz=%u "
                  "instances=%u colours=%u vs=%d fs=%d\n",
@@ -24525,7 +24777,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                  draws ? draws[0].count : 0, info ? info->index_size : 0,
                  info ? info->instance_count : 0, ctx->color_count,
                  ctx->vs ? 1 : 0, ctx->fs ? 1 : 0);
-      gex_fail(ctx);
+      }
       return;
    }
    /* Gallium does not require the bound vertex-buffer count to match what the
@@ -24686,20 +24938,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * would otherwise count the same draw a second time -- three times, in
     * fact, which is what a points-out shader emitting six primitives from
     * three points reported until this said so. */
-   if (ctx->active_query && draws && !ctx->gs && !ctx->gs_rasterizing) {
+   if (ctx->active_queries[GEX_WGPU_QUERY_GENERATED] && draws && !ctx->gs &&
+       !ctx->gs_rasterizing) {
       const unsigned prims =
          gex_wgpu_primitive_count(ctx, info->mode, draws[0].count) *
          MAX2(1u, info->instance_count);
-      switch (ctx->active_query->type) {
-      case PIPE_QUERY_PRIMITIVES_GENERATED:
-         ctx->active_query->result += prims;
-         break;
-      default:
-         /* PRIMITIVES_EMITTED and SO_STATISTICS are counted by the capture
-          * pass, which is the only thing that knows how much of the draw
-          * actually fit in the bound buffers. */
-         break;
-      }
+      /* PRIMITIVES_EMITTED and SO_STATISTICS are counted by the capture
+       * pass instead, which is the only thing that knows how much of the
+       * draw actually fit in the bound buffers. */
+      gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_GENERATED, prims);
    }
 
    /* Tessellation replaces this draw with five passes of its own, the last
@@ -24708,8 +24955,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * tessellation is a combination gex_wgpu_tess_draw declines by name
     * rather than half-serving. */
    if (ctx->tcs || ctx->tes) {
-      if (!gex_wgpu_tess_draw(ctx, info, drawid_offset, &draws[0]))
-         gex_fail(ctx);
+      /* Not latched when it declines. gex_wgpu_tess_draw already refuses by
+       * name -- a patch draw with no complete patch, a combination it does
+       * not serve -- and turning that into a context failure undid the whole
+       * point of naming it: the draw was lost *and* so was everything after.
+       * The geometry path below has never done this, which is why it was the
+       * one that behaved. */
+      (void)gex_wgpu_tess_draw(ctx, info, drawid_offset, &draws[0]);
       return;
    }
 
@@ -26545,7 +26797,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * views, descriptors or checks below are needed: they describe a pass that
     * is not going to be begun. Creating them anyway cost two to three
     * microseconds of every draw. */
-   const bool counting_now = ctx->active_query && ctx->occlusion_set;
+   const bool counting_now =
+      ctx->active_queries[GEX_WGPU_QUERY_OCCLUSION] && ctx->occlusion_set;
    const bool reuse = !counting_now && ctx->pending_pass &&
       memcmp(&ctx->pending_pass_key, &wanted_pass, sizeof(wanted_pass)) == 0;
    WGPUTextureView views[GEX_WGPU_MAX_COLOR_TARGETS] = {0};
@@ -27114,7 +27367,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    /* A pass can only write occlusion results if it is told the query set up
     * front, so an active query has to be known before the pass begins. */
-   const bool counting = ctx->active_query && ctx->occlusion_set;
+   const bool counting =
+      ctx->active_queries[GEX_WGPU_QUERY_OCCLUSION] && ctx->occlusion_set;
    if (counting)
       pass_desc.occlusionQuerySet = ctx->occlusion_set;
    if (gex_timing) gex_wgpu_time_bg += os_time_get_nano() - t_bg_start;
@@ -27143,8 +27397,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (pass) {
       if (counting)
          wgpuRenderPassEncoderBeginOcclusionQuery(pass, 0);
-         if (ctx->active_query)
-            ctx->active_query->counted = true;
+         if (ctx->active_queries[GEX_WGPU_QUERY_OCCLUSION])
+            ctx->active_queries[GEX_WGPU_QUERY_OCCLUSION]->counted = true;
       /* The pipeline by the state that built it, not by its handle: depth,
        * cull, topology and target format are what decide whether geometry
        * appears at all, and a handle normalised away for cross-run comparison

@@ -3278,6 +3278,43 @@ emit_global_atomic_intrinsic(struct ntv_context *ctx, nir_intrinsic_instr *intr)
    handle_atomic_op(ctx, intr, ptr, param, param2, ret_type);
 }
 
+/* The length of a runtime-sized array reached through a *deref*, rather than
+ * through the SSBO index emit_get_ssbo_size below takes.
+ *
+ * That one addresses zink's own descriptor array, `ctx->ssbos[2]`, indexed by
+ * the buffer number -- which is right for zink and wrong for any other
+ * consumer of this emitter, because it names a binding layout the caller does
+ * not have. A driver that gives each storage block a binding of its own can
+ * lower `length()` onto this instead: the deref names the block, so the
+ * OpArrayLength is taken against that block's own pointer and no layout is
+ * assumed. SPIR-V wants the *struct* pointer and a literal member index, so
+ * this walks up to the variable rather than using the member deref directly.
+ */
+static void
+emit_deref_buffer_array_length(struct ntv_context *ctx,
+                               nir_intrinsic_instr *intr)
+{
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+   struct hash_entry *he = var ? _mesa_hash_table_search(ctx->vars, var) : NULL;
+   if (!he) {
+      /* Nothing sensible to emit, and a zero length is a silently empty loop
+       * rather than a diagnosable failure -- so say so and emit zero, which
+       * at least does not read out of bounds. */
+      fprintf(stderr, "nir_to_spirv: deref_buffer_array_length on a variable "
+                      "with no storage block\n");
+      store_def(ctx, intr->def.index, emit_uint_const(ctx, 32, 0),
+                nir_type_uint);
+      return;
+   }
+   const struct glsl_type *bare_type = glsl_without_array(var->type);
+   const unsigned last_member_idx = glsl_get_length(bare_type) - 1;
+   SpvId result = spirv_builder_emit_binop(
+      &ctx->builder, SpvOpArrayLength, get_uvec_type(ctx, 32, 1),
+      (SpvId)(intptr_t)he->data, last_member_idx);
+   store_def(ctx, intr->def.index, result, nir_type_uint);
+}
+
 static void
 emit_get_ssbo_size(struct ntv_context *ctx, nir_intrinsic_instr *intr)
 {
@@ -4213,6 +4250,10 @@ emit_intrinsic(struct ntv_context *ctx, nir_intrinsic_instr *intr)
    case nir_intrinsic_begin_invocation_interlock:
    case nir_intrinsic_end_invocation_interlock:
       spirv_builder_emit_interlock(&ctx->builder, intr->intrinsic == nir_intrinsic_end_invocation_interlock);
+      break;
+
+   case nir_intrinsic_deref_buffer_array_length:
+      emit_deref_buffer_array_length(ctx, intr);
       break;
 
    case nir_intrinsic_get_ssbo_size:
