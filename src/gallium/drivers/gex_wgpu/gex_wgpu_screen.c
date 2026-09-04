@@ -26748,6 +26748,16 @@ gex_wgpu_alias_snapshot_copy(struct pipe_resource *resource,
    struct gex_wgpu_resource *gex = gex_resource(resource);
    if (!gex->buffer || !gex->alias_snapshot)
       return;
+   /* Every time, and it is worth saying why rather than leaving it to look
+    * like an oversight. The obvious guard is the one
+    * gex_wgpu_sampler_view_refresh uses -- skip the copy when the source's
+    * write_serial has not moved -- and it cannot be used here: write_serial
+    * is bumped for *texture* writes only. Nothing moves it when a shader
+    * writes a buffer through a storage binding, which is precisely the write
+    * this snapshot exists to see, so the guard would copy once and then serve
+    * stale bytes for the rest of the run. A buffer-side write counter is the
+    * prerequisite; until there is one the copy is unconditional, and the
+    * draw that found this case pays 22 MiB for it. */
    wgpuCommandEncoderCopyBufferToBuffer(
       encoder, gex->buffer, 0, gex->alias_snapshot, 0,
       MIN2(gex->allocation_size, gex->alias_snapshot_bytes) & ~3ull);
