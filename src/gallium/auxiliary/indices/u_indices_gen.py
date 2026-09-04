@@ -354,14 +354,27 @@ def trisadj(f: 'T.TextIO', intype, outtype, inpv, outpv, pr):
 def tristripadj(f: 'T.TextIO', intype, outtype, inpv, outpv, pr):
     preamble(f, intype, outtype, inpv, outpv, pr, out_prim=OUT_TRIS, prim='tristripadj')
     f.write('  for (i = start, j = 0; j < out_nr; i+=2, j+=6) {\n')
+    # The three vertices of the triangle itself are i+0, i+2 and i+4 for an
+    # even primitive and the first two exchanged for an odd one -- which is
+    # all a consumer that discards adjacency needs, and is why the even case
+    # used to be written as the identity. The three *adjacent* vertices are
+    # not consecutive, though, and a geometry shader reads all six: GL's own
+    # table (4.6 spec, table 10.2) interleaves them as below.
+    #
+    # The ends have no neighbour to borrow from, so the first primitive takes
+    # i+1 where it would read before the start, and the last takes i+5 where
+    # it would read past the end -- which the even row used to do, walking one
+    # vertex off the end of the buffer on every strip.
+    first = '(j == 0 ? i+1 : i-2)'
+    last = '(j + 6 >= out_nr ? i+5 : i+6)'
     f.write('    if (i % 4 == 0) {\n')
     f.write('      /* even triangle */\n')
     do_triadj(f, intype, outtype, 'out+j',
-              'i+0', 'i+1', 'i+2', 'i+3', 'i+4', 'i+5', inpv, outpv )
+              'i+0', first, 'i+2', last, 'i+4', 'i+3', inpv, outpv )
     f.write('    } else {\n')
     f.write('      /* odd triangle */\n')
     do_triadj(f, intype, outtype, 'out+j',
-              'i+2', 'i-2', 'i+0', 'i+3', 'i+4', 'i+6', inpv, outpv )
+              'i+2', 'i-2', 'i+0', 'i+3', 'i+4', last, inpv, outpv )
     f.write('    }\n')
     f.write('  }\n')
     postamble(f)
