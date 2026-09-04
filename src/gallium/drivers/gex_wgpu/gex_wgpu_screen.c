@@ -1899,6 +1899,9 @@ struct gex_wgpu_shader_variant {
     * the key because the same shader is correct both ways depending on the
     * target bound. */
    bool ignore_sample_mask;
+   /* Texture slots removed from this variant because the bound state could
+    * not satisfy their declaration; see gex_wgpu_unusable_texture_slots. */
+   uint16_t omitted_slots;
    uint32_t stipple[32];
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
@@ -6008,6 +6011,89 @@ gex_wgpu_lower_integer_txd(const nir_tex_instr *tex, const void *data)
    return base == nir_type_uint || base == nir_type_int;
 }
 
+/* A texture slot the bound state cannot satisfy reads zero, and its binding
+ * goes away entirely.
+ *
+ * GL calls a sampler whose bound texture does not match its type *incomplete*
+ * and says it samples as (0,0,0,1) -- not that the draw is an error. WebGPU
+ * has no such notion: every declared binding must match the layout, and a
+ * layout entry must name a real view.
+ *
+ * Usually a stand-in serves that: a 1x1 opaque black texture of the declared
+ * sample type, which is what an unbound unit already gets. It cannot serve
+ * this case, because the declaration that has to be matched is a *multisampled
+ * integer* texture and WebGPU has no such format -- integer formats have no
+ * multisample capability at all. So the sampler is removed from the shader
+ * instead, which is the same answer by a different route.
+ *
+ * The shape that needs it is ordinary: a shader declaring two samplers and
+ * choosing between them at run time.
+ *
+ *     uniform highp isampler2D   u_tex;
+ *     uniform highp isampler2DMS u_texMS;
+ *     ...
+ *     o_color = u_samples > 0 ? texelFetch(u_texMS, coord, sampleId)
+ *                             : texelFetch(u_tex, coord, 0);
+ *
+ * is KHR-GL45.sample_variables' verification shader, and with one sample the
+ * multisampled half is never executed and never given a texture worth the
+ * name. Declining the draw for it lost the whole of that family's integer and
+ * float cases.
+ */
+struct gex_wgpu_omit_textures {
+   uint16_t slots;
+   bool progress;
+};
+
+static bool
+gex_wgpu_omit_texture_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   struct gex_wgpu_omit_textures *state = data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   const int at = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   if (at < 0)
+      return false;
+   nir_variable *var =
+      nir_deref_instr_get_variable(nir_src_as_deref(tex->src[at].src));
+   if (!var || var->data.driver_location >= GEX_WGPU_MAX_SAMPLERS ||
+       !(state->slots & (1u << var->data.driver_location)))
+      return false;
+
+   b->cursor = nir_after_instr(instr);
+   /* GL's incomplete-texture value. A size or level query is answered with
+    * zero for the same reason: the texture is not there to describe. */
+   const unsigned components = tex->def.num_components;
+   const unsigned bits = tex->def.bit_size;
+   nir_def *comp[4];
+   const bool query = tex->op == nir_texop_txs ||
+                      tex->op == nir_texop_query_levels ||
+                      tex->op == nir_texop_texture_samples;
+   for (unsigned i = 0; i < components; ++i) {
+      const bool one = !query && i == 3;
+      comp[i] = nir_alu_type_get_base_type(tex->dest_type) == nir_type_float
+         ? nir_imm_floatN_t(b, one ? 1.0 : 0.0, bits)
+         : nir_imm_intN_t(b, one ? 1 : 0, bits);
+   }
+   nir_def_replace(&tex->def, nir_vec(b, comp, components));
+   state->progress = true;
+   return true;
+}
+
+static bool
+gex_wgpu_omit_textures(nir_shader *nir, uint16_t slots)
+{
+   struct gex_wgpu_omit_textures state = {.slots = slots};
+   nir_shader_instructions_pass(nir, gex_wgpu_omit_texture_instr,
+                                nir_metadata_control_flow, &state);
+   /* The variables go with the instructions that used them, so the emitter
+    * declares no binding for them and the bind group must leave them out
+    * too -- see the omitted mask threaded through gex_wgpu_draw_vbo_inner. */
+   nir_remove_dead_variables(nir, nir_var_uniform, NULL);
+   return state.progress;
+}
+
 static bool
 gex_wgpu_lower_texture_variant(nir_shader *nir,
                                unsigned texture_count,
@@ -9843,8 +9929,57 @@ gex_wgpu_lower_sample_pos(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* Defined below, with the other format mappings. */
+static WGPUTextureSampleType gex_wgpu_format_sample_type(enum pipe_format fmt);
+
+/* Texture slots whose bound state cannot satisfy what the shader declared.
+ *
+ * Only the two mismatches that are genuinely unbindable: integer against
+ * non-integer, and multisampled against single-sampled. A depth view read as
+ * an ordinary float texture is relaxed elsewhere and must stay that way -- it
+ * is a working shape, not an unusable one.
+ *
+ * A slot with *nothing* bound is not here: the 1x1 stand-in already serves
+ * that, and serving it is better than removing the sampler, because the
+ * shader may go on to use the result.
+ */
+static uint16_t
+gex_wgpu_unusable_texture_slots(struct gex_wgpu_context *ctx)
+{
+   const struct gex_wgpu_shader *fs = ctx->fs;
+   uint16_t mask = 0;
+   if (!fs)
+      return 0;
+   for (unsigned i = 0; i < fs->texture_count; ++i) {
+      const unsigned slot = fs->texture_slots[i];
+      if (slot >= GEX_WGPU_MAX_SAMPLERS)
+         continue;
+      const struct pipe_sampler_view *view = ctx->sampler_views[slot];
+      if (!view)
+         continue;
+      const bool declared_ms = (fs->multisampled_slots & (1u << slot)) != 0;
+      const bool bound_ms =
+         view->texture && MAX2(1, view->texture->nr_samples) > 1;
+      if (declared_ms != bound_ms) {
+         mask |= 1u << slot;
+         continue;
+      }
+      const WGPUTextureSampleType want = fs->texture_sample_types[i];
+      const WGPUTextureSampleType have =
+         gex_wgpu_format_sample_type(view->format);
+      const bool want_integer = want == WGPUTextureSampleType_Sint ||
+                                want == WGPUTextureSampleType_Uint;
+      const bool have_integer = have == WGPUTextureSampleType_Sint ||
+                                have == WGPUTextureSampleType_Uint;
+      if (want_integer != have_integer || (want_integer && want != have))
+         mask |= 1u << slot;
+   }
+   return mask;
+}
+
 static WGPUShaderModule
-gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
+gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
+                         uint16_t *omitted_out)
 {
    /* Declining, not latching. This returns NULL and draw_vbo checks it, so
     * the caller already learns of the failure -- latching on top ended the
@@ -9873,6 +10008,12 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       ctx->fb_samples <= 1 && fs->original_nir &&
       (fs->original_nir->info.outputs_written &
        BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK)) != 0;
+   /* Slots the bound state cannot satisfy; their samplers are removed from
+    * this variant and their bindings left out of the group. Decided here for
+    * the same reason as the line above: there are two early returns below. */
+   const uint16_t want_omit_slots = gex_wgpu_unusable_texture_slots(ctx);
+   if (omitted_out)
+      *omitted_out = want_omit_slots;
    /* What the bound colour target needs the fragment output to be. */
    const nir_alu_type wanted_output =
       ctx->color_count == 0 ? nir_alu_type_get_base_type(fs->color_output_type)
@@ -9996,7 +10137,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
        line_edge_location == ~0u && !fs->buftex_count &&
-       !want_sample_positions && !want_logicop && !want_ignore_sample_mask)
+       !want_sample_positions && !want_logicop && !want_ignore_sample_mask &&
+       !want_omit_slots)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -10104,7 +10246,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
       want_sample_positions != 0 || want_logicop != 0 ||
-      want_ignore_sample_mask;
+      want_ignore_sample_mask || want_omit_slots != 0;
    if (!needs_variant && !fs->buftex_count)
       return fs->module;
 
@@ -10125,6 +10267,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
                    cached->unproduced == unproduced &&
                    cached->poly_stipple == want_stipple &&
                    cached->ignore_sample_mask == want_ignore_sample_mask &&
+                   cached->omitted_slots == want_omit_slots &&
                    (!want_stipple ||
                     memcmp(cached->stipple, ctx->poly_stipple,
                            sizeof(cached->stipple)) == 0);
@@ -10222,6 +10365,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    }
    if (want_ignore_sample_mask)
       gex_wgpu_ignore_sample_mask(variant);
+   if (want_omit_slots)
+      gex_wgpu_omit_textures(variant, want_omit_slots);
    /* Before the texture lowering, which reads gl_FragCoord for nothing and
     * would otherwise see the load this adds. */
    if (want_stipple)
@@ -10289,6 +10434,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    cached->unproduced = unproduced;
    cached->poly_stipple = want_stipple;
    cached->ignore_sample_mask = want_ignore_sample_mask;
+   cached->omitted_slots = want_omit_slots;
    memcpy(cached->stipple, ctx->poly_stipple, sizeof(cached->stipple));
    for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
       if (!(sampler_mask & (UINT64_C(1) << slot)))
@@ -32018,8 +32164,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
    const int64_t t_fsmod_start = gex_timing ? os_time_get_nano() : 0;
+   /* Slots this variant dropped because the bound state could not satisfy
+    * their declaration; their bindings must be left out of the group too. */
+   uint16_t omitted_texture_slots = 0;
    fragment.module = gex_wgpu_fragment_module(
-      ctx, gex_wgpu_topology(info->mode) == WGPUPrimitiveTopology_PointList);
+      ctx, gex_wgpu_topology(info->mode) == WGPUPrimitiveTopology_PointList,
+      &omitted_texture_slots);
    if (gex_timing) gex_wgpu_time_fsmod += os_time_get_nano() - t_fsmod_start;
    if (!fragment.module)
       return;
@@ -32745,6 +32895,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * forbidding it; see gex_wgpu_default_texture_view. */
       if (!ctx->sampler_views[slot])
          continue;
+      /* Removed from this variant because the bound state could not satisfy
+       * it; its sampler no longer exists in the shader, so there is nothing
+       * left to reconcile. See gex_wgpu_unusable_texture_slots. */
+      if (omitted_texture_slots & (1u << slot))
+         continue;
       /* A texture cannot be sampled while it is also a colour attachment of
        * this pass: WebGPU calls that "writable usage and another usage in the
        * same synchronization scope" and rejects the whole command buffer, and
@@ -32976,6 +33131,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                  bad_sampler ? (int)bad_sampler->state.min_img_filter : -1,
                  bad_sampler ? (int)bad_sampler->state.mag_img_filter : -1,
                  bad_sampler ? (int)bad_sampler->state.min_mip_filter : -1);
+         if (ctx->fs)
+            for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
+               const struct pipe_sampler_view *v =
+                  ctx->sampler_views[ctx->fs->texture_slots[i]];
+               fprintf(stderr, "gex-wgpu:   declared slot %u type %d dim %d "
+                       "bound %s\n", ctx->fs->texture_slots[i],
+                       (int)ctx->fs->texture_sample_types[i],
+                       (int)ctx->fs->texture_dimensions[i],
+                       v ? util_format_short_name(v->format) : "(none)");
+            }
       }
       return;
    }
@@ -33011,14 +33176,26 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          texture_layout_entries[i].visibility = WGPUShaderStage_Fragment;
          /* Named as unfilterable-float where the shader asked for float and
           * the bound view is depth: that is the pair WebGPU accepts. */
+         /* An omitted slot is declared as a plain float 2D texture and bound
+          * to the ordinary stand-in. The shader no longer declares it at all
+          * -- a bind group layout may carry entries the shader does not use,
+          * which is what makes this simpler than compacting the entries --
+          * so nothing reads it, and what it says only has to be something a
+          * view can satisfy. Its own declaration is not: a multisampled
+          * integer texture has no WebGPU format. */
+         const bool omitted =
+            (omitted_texture_slots >> ctx->fs->texture_slots[i]) & 1;
          texture_layout_entries[i].texture.sampleType =
-            (depth_as_float & (1u << ctx->fs->texture_slots[i]))
+            omitted ? WGPUTextureSampleType_Float
+            : (depth_as_float & (1u << ctx->fs->texture_slots[i]))
                ? WGPUTextureSampleType_UnfilterableFloat
                : ctx->fs->texture_sample_types[i];
          texture_layout_entries[i].texture.viewDimension =
-            ctx->fs->texture_dimensions[i];
+            omitted ? WGPUTextureViewDimension_2D
+                    : ctx->fs->texture_dimensions[i];
          texture_layout_entries[i].texture.multisampled =
-            (ctx->fs->multisampled_slots >> ctx->fs->texture_slots[i]) & 1;
+            !omitted &&
+            ((ctx->fs->multisampled_slots >> ctx->fs->texture_slots[i]) & 1);
       }
       if (logicop) {
          /* The colour attachment's copy, read by texelFetch, so
@@ -33489,7 +33666,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          /* The snapshot, when this slot samples something the draw also
           * renders to; see gex_wgpu_feedback_snapshot. */
          entries[i].textureView =
-            (slot < GEX_WGPU_MAX_SAMPLERS && ctx->feedback_view[slot])
+            ((omitted_texture_slots >> slot) & 1)
+               ? gex_wgpu_default_texture_view(screen,
+                                               WGPUTextureViewDimension_2D,
+                                               WGPUTextureSampleType_Float)
+            : (slot < GEX_WGPU_MAX_SAMPLERS && ctx->feedback_view[slot])
                ? ctx->feedback_view[slot]
             /* GL leaves units enabled with nothing bound; a 1x1 opaque black
              * stand-in is what it says such a unit samples as. */
