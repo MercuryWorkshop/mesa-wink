@@ -1368,6 +1368,8 @@ struct gex_wgpu_shader {
     * it to match the target's; a mismatch is a validation error, and a
     * validation error poisons the device for every later command. */
    nir_alu_type color_output_type;
+   /* Which colour targets the shader writes; see create_shader_state. */
+   uint32_t color_output_mask;
    unsigned sampler_count;
    uint8_t sampler_slots[GEX_WGPU_MAX_SAMPLERS];
    uint32_t sampler_bindings[GEX_WGPU_MAX_SAMPLERS];
@@ -7608,6 +7610,39 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          shader->color_output_type =
             nir_get_nir_type_for_glsl_base_type(glsl_get_base_type(type));
          break;
+      }
+      /* Which colour targets this shader actually writes.
+       *
+       * WebGPU requires a colour target the fragment shader does not write to
+       * be masked out, and rejects the pipeline otherwise --
+       *
+       *   Color target has no corresponding fragment stage output but
+       *   writeMask is not zero
+       *
+       * -- which invalidates the whole command buffer, so every batched draw
+       * is lost with it. A fragment shader that writes only to an image or a
+       * storage buffer is an ordinary GL shader that writes no colour at all;
+       * so is one drawn for its side effects alone. The attachment-less
+       * framebuffer already had a special case for this and the general one
+       * was missing.
+       *
+       * gl_FragColor broadcasts to every target, and a dual-source second
+       * output sits at DATA0 with index 1 -- that is not target 1 and must
+       * not be counted as one. */
+      shader->color_output_mask = 0;
+      nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
+         if (var->data.location == FRAG_RESULT_COLOR) {
+            shader->color_output_mask = ~0u;
+            continue;
+         }
+         if (var->data.location < FRAG_RESULT_DATA0 || var->data.index != 0)
+            continue;
+         const unsigned first =
+            (unsigned)(var->data.location - FRAG_RESULT_DATA0);
+         const unsigned slots = glsl_count_attribute_slots(var->type, false);
+         for (unsigned k = 0; k < slots; ++k)
+            if (first + k < 32)
+               shader->color_output_mask |= 1u << (first + k);
       }
    }
    /* The @location numbers ntv will emit for this stage's inputs, taken from
@@ -27239,6 +27274,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * application's glColorMask here is a validation error, and a
        * validation error poisons the device. */
       if (ctx->fb_scratch_target) {
+         color_targets[i].writeMask = 0;
+         continue;
+      }
+      /* A target this shader has no output for, which WebGPU requires to be
+       * masked whatever glColorMask says. No fragment shader at all -- which
+       * a rasterizer-discard draw is allowed to have -- writes no colour
+       * either, so the same answer serves. */
+      if (!ctx->fs || !(ctx->fs->color_output_mask & (1u << i))) {
          color_targets[i].writeMask = 0;
          continue;
       }
