@@ -1000,25 +1000,12 @@ emit_input(struct ntv_context *ctx, struct nir_variable *var)
          spirv_builder_emit_location(&ctx->builder, var_id,
                                      var->data.driver_location);
       }
-      /* Centroid and sample on an *output* as well as on a fragment input.
-       * Vulkan tolerates the two stages disagreeing, so this had never been
-       * needed; WebGPU does not, and rejects the pipeline outright --
-       *
-       *   The interpolation sampling (Center) of the vertex output at
-       *   location 0 is different from the interpolation sampling (Centroid)
-       *   of the fragment input at location 0
-       *
-       * -- which invalidates the command buffer and loses every draw batched
-       * with it. GL only puts the qualifier on the fragment input, so the
-       * gex_wgpu driver copies it onto the vertex output in the variant it
-       * already builds to make the interpolation modes agree; without this
-       * the copy had nothing to travel on. */
-      if (var->data.centroid)
-         spirv_builder_emit_decoration(&ctx->builder, var_id,
-                                       SpvDecorationCentroid);
-      else if (var->data.sample)
-         spirv_builder_emit_decoration(&ctx->builder, var_id,
-                                       SpvDecorationSample);
+      /* No Centroid or Sample here either, and for the same reason as in
+       * emit_output: they are fragment-input decorations, and an input of a
+       * pre-fragment stage carrying them is not valid SPIR-V. This emitted
+       * them for a while, on the theory that it would let a consumer match
+       * the two stages' interpolation sampling; Tint drops them, so it never
+       * did anything at all. */
    }
 
    if (var->data.location_frac)
@@ -1094,6 +1081,13 @@ emit_output(struct ntv_context *ctx, struct nir_variable *var)
                                         var->data.driver_location);
       }
       emit_interpolation(ctx, var_id, var->data.interpolation);
+      /* Deliberately *not* Centroid or Sample here. They are defined for
+       * fragment inputs; a pre-fragment output carrying them is not valid
+       * SPIR-V, and Tint drops them -- so emitting them, which this did for a
+       * while, produced a module byte-identical to the one it was meant to
+       * differ from. A consumer that needs the two stages to agree about
+       * interpolation sampling, as WebGPU does, cannot be satisfied through
+       * SPIR-V and has to give the qualifier up on the fragment side. */
    } else {
       if (var->data.location >= FRAG_RESULT_DATA0) {
          spirv_builder_emit_location(&ctx->builder, var_id,

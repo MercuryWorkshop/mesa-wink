@@ -5589,8 +5589,16 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    /* Whether this is one of the scene's vertex shaders, decided before the
     * NIR is freed. Nine or more inputs is what the geometry uses; the UI and
     * skybox shaders have one to four. */
-   const bool dump_wgsl = nir->info.stage == MESA_SHADER_VERTEX &&
-      util_bitcount64(nir->info.inputs_read) >= 9;
+   /* GEX_WGPU_DUMP_VS dumps every vertex and fragment module rather than the
+    * one the heuristic guesses is the scene shader. Reading what @interpolate
+    * each side declares is how the interpolation-sampling mismatch was
+    * finally understood. */
+   const bool dump_wgsl =
+      (nir->info.stage == MESA_SHADER_VERTEX &&
+       util_bitcount64(nir->info.inputs_read) >= 9) ||
+      (getenv("GEX_WGPU_DUMP_VS") &&
+       (nir->info.stage == MESA_SHADER_VERTEX ||
+        nir->info.stage == MESA_SHADER_FRAGMENT));
    const double t_start = os_time_get_nano() / 1000000.0;
    /* A tex instruction with no texture deref aborts the emitter --
     *
@@ -5682,11 +5690,11 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    if (dump_wgsl) {
       /* In chunks: the harness truncates a console line, and the whole point
        * is to read how @builtin(position) is computed. Once per run. */
-      static bool dumped;
-      if (!dumped) {
-         dumped = true;
+      static unsigned dumped;
+      if (dumped < (getenv("GEX_WGPU_DUMP_VS") ? 16u : 1u)) {
+         ++dumped;
          const size_t len = strlen(wgsl);
-         fprintf(stderr, "gex-wgpu: scene vs WGSL (%zu bytes) follows\n", len);
+         fprintf(stderr, "gex-wgpu: scene vs WGSL (%zu bytes) stage=%u follows\n", len, (unsigned)nir->info.stage);
          for (size_t at = 0; at < len; at += 160) {
             char chunk[161];
             const size_t n = MIN2((size_t)160, len - at);
@@ -6599,6 +6607,49 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    shader->stage = expected_stage;
    if (expected_stage == MESA_SHADER_VERTEX)
       shader->inputs_read = nir->info.inputs_read;
+
+   /* Centroid and sample are dropped from every fragment input, and the
+    * varying is interpolated at the pixel centre instead.
+    *
+    * Not a choice so much as the only thing SPIR-V can express. WebGPU
+    * requires the two stages to declare the same interpolation *sampling*,
+    * and rejects the pipeline otherwise -- which invalidates the command
+    * buffer and loses every draw batched with it, so a `centroid in` varying
+    * used to cost far more than the difference it names. Making the vertex
+    * side agree is the obvious fix and it cannot be done: SpvDecorationCentroid
+    * and SpvDecorationSample are defined for fragment *inputs*, a vertex
+    * output carrying them is not valid SPIR-V, and Tint drops them -- so the
+    * decoration this driver used to emit on the vertex output never reached
+    * the WGSL and the two sides stayed different. The dump shows it: the
+    * fragment entry point gets `@interpolate(perspective, sample)` and the
+    * vertex output struct gets nothing.
+    *
+    * So the fragment side gives the qualifier up. Centroid and centre differ
+    * only where a pixel is partially covered, which GL already leaves to the
+    * implementation; `sample` is a real difference and is reported by name.
+    * The remaining route to honouring it is patching the WGSL text after
+    * Tint, which is worth doing only if something needs it.
+    *
+    * interpolateAtSample is refused rather than lowered for the same reason:
+    * it could be turned into a plain read of a `sample` varying, but there is
+    * no such thing here, so the read would silently be the centre value. */
+   if (expected_stage == MESA_SHADER_FRAGMENT) {
+      nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+         if (!var->data.centroid && !var->data.sample)
+            continue;
+         if (var->data.sample) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: `sample` interpolation is not "
+                       "expressible through SPIR-V; interpolating at the "
+                       "pixel centre instead\n");
+            }
+         }
+         var->data.centroid = 0;
+         var->data.sample = 0;
+      }
+   }
 
    /* What this stage says about each varying's interpolation, recorded by the
     * @location ntv will emit. The fragment stage's is the one GL means; the
