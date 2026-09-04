@@ -14674,6 +14674,39 @@ gex_wgpu_buffer_unmap(struct pipe_context *pipe,
                            (uint32_t)transfer->box.x, gex_transfer->data,
                            (size_t)transfer->box.width);
    } else if ((transfer->usage & PIPE_MAP_WRITE) &&
+              !(transfer->usage & PIPE_MAP_FLUSH_EXPLICIT) && gex->buffer &&
+              gex_transfer->data && transfer->box.width > 0) {
+      /* A map that both **read and wrote** a GPU-written buffer.
+       *
+       * Such a map is served from a private block read back off the device --
+       * the shadow cannot serve it, because the shadow does not know what the
+       * GPU wrote -- so the caller's edits land in `gex_transfer->data` and
+       * nowhere else. The branch below uploads from the *shadow*, which at
+       * this point still holds the copy taken when the map was made, before
+       * the caller touched anything: every edit through a read-write map was
+       * silently discarded.
+       *
+       * glMapBufferRange(GL_READ_BIT | GL_WRITE_BIT) over a buffer a shader
+       * has written is how an application reads back a counter, adjusts it
+       * and carries on -- KHR-GL44's
+       * shader_atomic_counters.advanced-usage-draw-update-draw does exactly
+       * that, and it is an ordinary thing to do. The shadow is refreshed too,
+       * so a later read map sees the edited bytes rather than reading the
+       * device again and finding them.
+       *
+       * Ahead of the shadow branch deliberately: both conditions match a
+       * read-write map, and this is the one that has the caller's data. */
+      if (gex->shadow)
+         memcpy(gex->shadow + transfer->box.x, gex_transfer->data,
+                (size_t)transfer->box.width);
+      gex->bytes_written += (uint64_t)transfer->box.width;
+      gex_wgpu_log_upload("readwrite", resource->width0,
+                          (uint32_t)transfer->box.x, gex_transfer->data,
+                          (size_t)transfer->box.width);
+      wgpuQueueWriteBuffer(gex_screen(pipe->screen)->queue, gex->buffer,
+                           (uint32_t)transfer->box.x, gex_transfer->data,
+                           (size_t)transfer->box.width);
+   } else if ((transfer->usage & PIPE_MAP_WRITE) &&
        !(transfer->usage & PIPE_MAP_FLUSH_EXPLICIT) && gex->buffer &&
        gex->shadow && transfer->box.width > 0) {
       const uint32_t start = (uint32_t)transfer->box.x;
