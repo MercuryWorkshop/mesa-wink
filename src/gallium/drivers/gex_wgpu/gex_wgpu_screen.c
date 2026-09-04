@@ -30437,9 +30437,28 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       ctx->rasterizer && info &&
       ctx->rasterizer->fill_mode != PIPE_POLYGON_MODE_FILL &&
       u_reduced_prim(info->mode) == MESA_PRIM_TRIANGLES;
+   /* A patch draw is excluded, and so is any draw with a tessellation or
+    * geometry stage bound.
+    *
+    * Two reasons, either of which is enough. A patch's vertex order is
+    * meaningful -- the control shader indexes gl_in[] -- so rotating it does
+    * not produce the same primitive the way rotating a triangle does. And
+    * the provoking vertex belongs to the primitives that are *rasterized*,
+    * which with tessellation or a geometry shader are generated downstream
+    * and have nothing to do with the order the input vertices arrived in.
+    *
+    * It also broke the draw outright: this rewrite makes the draw indexed,
+    * and gex_wgpu_tess_draw declines an indexed patch draw -- so a
+    * tessellated draw whose fragment shader had a flat varying rendered
+    * nothing at all, with the decline naming the index buffer this rewrite
+    * had just created. */
+   const bool downstream_primitives =
+      ctx->tcs || ctx->tes || ctx->gs ||
+      (info && info->mode == MESA_PRIM_PATCHES);
    if (!no_pv && !ctx->failed && !ctx->provoking_rewritten && info && draws &&
        num_draws == 1 && !indirect && ctx->fs && ctx->rasterizer &&
        !ctx->rasterizer->flatshade_first && !unfilled_draw_pending &&
+       !downstream_primitives &&
        u_reduced_prim(info->mode) != MESA_PRIM_POINTS &&
        gex_wgpu_shader_has_flat_varying(ctx->fs) &&
        gex_wgpu_draw_provoking_last(pipe, info, drawid_offset, &draws[0]))
