@@ -7288,12 +7288,27 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          gex_wgpu_set_compile_error(mutable_state, detail);
          return NULL;
       }
-      if (gex_wgpu_storage_texture_format(format) ==
+      /* A *read-only* image needs no storage format at all. Tint lowers a
+       * SPIR-V storage image that is only read to a plain texture_2d<T>, and
+       * this driver already binds such an image as a sampled texture rather
+       * than a storage one -- so what it needs is a sampleable format, and
+       * that table is far richer than WebGPU's storage list.
+       *
+       * The difference is most of GL 4.2's required image formats. WebGPU
+       * offers storage textures only for the four-channel 8/16/32-bit formats
+       * and the one- and two-channel 32-bit ones; rg16f, r16f, r8ui, rgb10_a2
+       * and r11f_g11f_b10f are all sampleable and none of them is a storage
+       * format. Blender's EEVEE reads r11f_g11f_b10f images, and refusing
+       * them here failed its shaders at link time and took the process with
+       * them. */
+      if (!no_write &&
+          gex_wgpu_storage_texture_format(format) ==
           WGPUTextureFormat_Undefined) {
          char detail[160];
          snprintf(detail, sizeof(detail),
                   "gex_wgpu image '%s' has format %s, which WebGPU cannot "
-                  "take as a storage texture",
+                  "take as a storage texture (and it is written, so it cannot "
+                  "be a sampled one either)",
                   var->name ? var->name : "(anon)",
                   util_format_short_name(format));
          ralloc_free(nir);
@@ -15507,10 +15522,14 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
          FREE(compute);
          return NULL;
       }
-      if (gex_wgpu_storage_texture_format(image_format) ==
+      /* Read-only needs no storage format; see the note in the graphics
+       * path's copy of this check. */
+      if (!no_write &&
+          gex_wgpu_storage_texture_format(image_format) ==
           WGPUTextureFormat_Undefined) {
          fprintf(stderr, "gex-wgpu: compute image '%s' has format %s, which "
-                 "WebGPU cannot take as a storage texture\n",
+                 "WebGPU cannot take as a storage texture (and it is written, "
+                 "so it cannot be a sampled one either)\n",
                  var->name ? var->name : "(anon)",
                  util_format_short_name(image_format));
          ralloc_free(nir);
@@ -16110,8 +16129,14 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          continue;
       }
       WGPUTextureViewDescriptor view_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+      /* A read-only image binds as a sampled texture, so its view carries the
+       * ordinary sampled format -- which exists for formats WebGPU has no
+       * storage texture for. Using the storage table here would give
+       * Undefined and a view of the wrong format, or none. */
       view_desc.format =
-         gex_wgpu_storage_texture_format(compute->image_formats[i]);
+         compute->image_access[i] == WGPUStorageTextureAccess_ReadOnly
+            ? gex_wgpu_texture_format(compute->image_formats[i])
+            : gex_wgpu_storage_texture_format(compute->image_formats[i]);
       view_desc.dimension = compute->image_dimensions[i];
       view_desc.baseMipLevel = iv->u.tex.level;
       view_desc.mipLevelCount = 1;
@@ -29168,7 +29193,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             continue;
          }
          WGPUTextureViewDescriptor desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
-         desc.format = gex_wgpu_storage_texture_format(ctx->fs->image_formats[i]);
+         /* The sampled format for a read-only image; see the compute path. */
+         desc.format =
+            ctx->fs->image_access[i] == WGPUStorageTextureAccess_ReadOnly
+               ? gex_wgpu_texture_format(ctx->fs->image_formats[i])
+               : gex_wgpu_storage_texture_format(ctx->fs->image_formats[i]);
          desc.dimension = ctx->fs->image_dimensions[i];
          desc.baseMipLevel = iv->u.tex.level;
          desc.mipLevelCount = 1;
