@@ -2347,6 +2347,11 @@ struct gex_wgpu_ssbo_lowering {
    /* Only for a block this pass has to recreate; see
     * gex_wgpu_ssbo_block_create. */
    unsigned descriptor_set;
+   /* Set when a dynamic block index turned a store into one guarded store per
+    * block. Recorded rather than acted on: the pass already declares
+    * nir_metadata_none, and this is here so a reader can tell whether it
+    * happened. */
+   bool added_control_flow;
 };
 
 /* The block's single member, as an array of words. Flattening loses the
@@ -2383,10 +2388,11 @@ gex_wgpu_flatten_ssbo_blocks(nir_shader *nir)
  * because this runs before the shader's storage-block bookkeeping is
  * gathered, the driver goes on to bind a buffer to it like any other. */
 static nir_variable *
-gex_wgpu_ssbo_block_create(nir_shader *nir, unsigned slot, unsigned set)
+gex_wgpu_ssbo_block_create(nir_shader *nir, unsigned slot, unsigned set,
+                           bool read_only)
 {
    char name[40];
-   snprintf(name, sizeof(name), "gex_ssbo_length%u", slot);
+   snprintf(name, sizeof(name), "gex_ssbo_block%u", slot);
    struct glsl_struct_field field = {0};
    field.type = glsl_array_type(glsl_uint_type(), 0, 4);
    field.name = "words";
@@ -2403,12 +2409,14 @@ gex_wgpu_ssbo_block_create(nir_shader *nir, unsigned slot, unsigned set)
    var->data.descriptor_set = set;
    var->data.binding = GEX_WGPU_SSBO_FIRST_BINDING + slot;
    var->data.explicit_binding = 1;
-   /* Read-only, because asking a block's length is the only thing the shader
-    * does with it. Left writable it would be a read_write storage variable,
-    * which WGSL forbids outright in the vertex stage -- so a vertex shader
-    * that merely measured a buffer would have been rejected by the block put
-    * back to let it do so. */
-   var->data.access = ACCESS_NON_WRITEABLE;
+   /* Read-only when the shader only measures or reads the block. Left
+    * writable it would be a read_write storage variable, which WGSL forbids
+    * outright in the vertex stage -- so a vertex shader that merely measured
+    * a buffer would have been rejected by the very block put back to let it
+    * do so. A block recreated for a *store* has to be writable, and a store
+    * to a read-only block is not expressible in GLSL, so there is no case
+    * where the caller has to choose wrongly. */
+   var->data.access = read_only ? ACCESS_NON_WRITEABLE : 0;
    return var;
 }
 
@@ -2431,6 +2439,30 @@ gex_wgpu_ssbo_block(nir_shader *nir, unsigned slot)
                  glsl_get_type_name(var->type));
    }
    return NULL;
+}
+
+/* The block at a slot, put back if NIR removed it.
+ *
+ * st/mesa lowers an access through an interface block into
+ * load_ssbo/store_ssbo carrying a block index, leaving no deref -- and NIR
+ * removes a storage variable nothing derefs. So a shader whose every use of a
+ * block went through that lowering arrives with the accesses intact and the
+ * variable gone, leaving a hole in the slot numbering this pass cannot name.
+ * The length() path already had to fill that hole; this is the same fix in one
+ * place for every caller. */
+static nir_variable *
+gex_wgpu_ssbo_block_get(nir_shader *nir, unsigned slot, unsigned set,
+                        bool for_store)
+{
+   nir_variable *block = gex_wgpu_ssbo_block(nir, slot);
+   if (!block && slot < GEX_WGPU_MAX_SHADER_BUFFERS)
+      block = gex_wgpu_ssbo_block_create(nir, slot, set, !for_store);
+   /* A block first seen through a load and now stored to. GLSL cannot write a
+    * readonly block, so a read-only flag on a recreated one is ours and
+    * stale. */
+   if (block && for_store && (block->data.access & ACCESS_NON_WRITEABLE))
+      block->data.access &= ~(unsigned)ACCESS_NON_WRITEABLE;
+   return block;
 }
 
 static bool
@@ -2479,8 +2511,8 @@ gex_wgpu_lower_ssbo_access(nir_builder *b, nir_instr *instr, void *data)
          }
          nir_variable *size_block = gex_wgpu_ssbo_block(b->shader, size_slot);
          if (!size_block)
-            size_block = gex_wgpu_ssbo_block_create(b->shader, size_slot,
-                                                    state->descriptor_set);
+            size_block = gex_wgpu_ssbo_block_create(
+               b->shader, size_slot, state->descriptor_set, true);
          if (!size_block) {
             state->failed = true;
             if (!state->why[0])
@@ -2578,30 +2610,120 @@ gex_wgpu_lower_ssbo_access(nir_builder *b, nir_instr *instr, void *data)
    const unsigned components =
       is_store ? value->num_components : intr->def.num_components;
 
-   if (bit_size != 32 || !nir_src_is_const(*block_src)) {
+   if (bit_size != 32) {
       state->failed = true;
       if (!state->why[0])
          snprintf(state->why, sizeof(state->why),
-                  "%s_ssbo bit_size=%u block-index-const=%d",
-                  is_load ? "load" : "store", bit_size,
-                  (int)nir_src_is_const(*block_src));
-      if (getenv("GEX_WGPU_SSBO_LOG")) {
-         fprintf(stderr, "gex-wgpu: ssbo index is not const; instr: ");
-         nir_print_instr(instr, stderr);
-         fprintf(stderr, "\n  index defined by: ");
-         nir_print_instr(nir_def_instr_nonconst(block_src->ssa), stderr);
-         fprintf(stderr, "\n");
-      }
+                  "%s_ssbo bit_size=%u", is_load ? "load" : "store", bit_size);
       return false;
    }
+
+   /* A *dynamic* block index -- `buffer B { ... } blocks[4];` reached as
+    * `blocks[i]`, which GL 4.3 allows and this suite's stdLayout and
+    * indirectAddressing cases use.
+    *
+    * WGSL has no array of storage buffers: every binding is its own variable,
+    * and there is no way to select one at run time. But the *set* of blocks
+    * is known when the shader is compiled, so the choice can be unrolled --
+    * a select across the loads, and one guarded store per block. GL clamps
+    * such an index to the declared range (these shaders do it themselves with
+    * umin), so the fan-out covers every value it can take.
+    *
+    * Loads read every block and select afterwards rather than branching:
+    * reading a block this invocation did not choose is harmless -- an unbound
+    * one has a placeholder buffer behind it -- and it keeps this pass free of
+    * control flow for the common case. Stores cannot do that, because writing
+    * every block would corrupt the ones not chosen, so they branch. */
+   if (!nir_src_is_const(*block_src)) {
+      const unsigned count =
+         MIN2(b->shader->info.num_ssbos,
+              (unsigned)GEX_WGPU_MAX_SHADER_BUFFERS);
+      if (getenv("GEX_WGPU_SSBO_LOG")) {
+         fprintf(stderr, "gex-wgpu: dynamic ssbo block index over %u "
+                 "block(s); instr: ", count);
+         nir_print_instr(instr, stderr);
+         fprintf(stderr, "\n");
+      }
+      if (!count) {
+         state->failed = true;
+         if (!state->why[0])
+            snprintf(state->why, sizeof(state->why),
+                     "a dynamic %s_ssbo index with no blocks declared",
+                     is_load ? "load" : "store");
+         return false;
+      }
+      nir_def *index = block_src->ssa;
+      b->cursor = nir_before_instr(instr);
+      nir_def *dyn_word = nir_src_is_const(*offset_src)
+         ? nir_imm_int(b, nir_src_as_uint(*offset_src) / 4)
+         : nir_ushr_imm(b, offset_src->ssa, 2);
+      if (is_load) {
+         nir_def *result = NULL;
+         for (unsigned k = 0; k < count; ++k) {
+            nir_variable *one = gex_wgpu_ssbo_block_get(
+               b->shader, k, state->descriptor_set, false);
+            if (!one) {
+               state->failed = true;
+               if (!state->why[0])
+                  snprintf(state->why, sizeof(state->why),
+                           "a dynamic load_ssbo over block %u, which this "
+                           "shader neither declares nor could be given", k);
+               return false;
+            }
+            nir_deref_instr *one_words =
+               nir_build_deref_struct(b, nir_build_deref_var(b, one), 0);
+            nir_def *channels[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned i = 0; i < components; ++i)
+               channels[i] = nir_load_deref(
+                  b, nir_build_deref_array(b, one_words,
+                                           nir_iadd_imm(b, dyn_word, i)));
+            nir_def *value_k = nir_vec(b, channels, components);
+            result = result
+               ? nir_bcsel(b, nir_ieq_imm(b, index, k), value_k, result)
+               : value_k;
+         }
+         nir_def_rewrite_uses(&intr->def, result);
+      } else {
+         const unsigned mask = nir_intrinsic_write_mask(intr);
+         for (unsigned k = 0; k < count; ++k) {
+            nir_variable *one = gex_wgpu_ssbo_block_get(
+               b->shader, k, state->descriptor_set, true);
+            if (!one) {
+               state->failed = true;
+               if (!state->why[0])
+                  snprintf(state->why, sizeof(state->why),
+                           "a dynamic store_ssbo over block %u, which this "
+                           "shader neither declares nor could be given", k);
+               return false;
+            }
+            nir_push_if(b, nir_ieq_imm(b, index, k));
+            nir_deref_instr *one_words =
+               nir_build_deref_struct(b, nir_build_deref_var(b, one), 0);
+            for (unsigned i = 0; i < components; ++i) {
+               if (!(mask & (1u << i)))
+                  continue;
+               nir_store_deref(
+                  b, nir_build_deref_array(b, one_words,
+                                           nir_iadd_imm(b, dyn_word, i)),
+                  nir_channel(b, value, i), 0x1);
+            }
+            nir_pop_if(b, NULL);
+         }
+      }
+      nir_instr_remove(instr);
+      state->added_control_flow |= !is_load;
+      return true;
+   }
    const unsigned slot = nir_src_as_uint(*block_src);
-   nir_variable *block = gex_wgpu_ssbo_block(b->shader, slot);
+   nir_variable *block = gex_wgpu_ssbo_block_get(b->shader, slot,
+                                                 state->descriptor_set,
+                                                 is_store);
    if (!block) {
       state->failed = true;
       if (!state->why[0])
          snprintf(state->why, sizeof(state->why),
-                  "%s_ssbo names block %u, which this shader does not declare",
-                  is_load ? "load" : "store", slot);
+                  "%s_ssbo names block %u, which this shader neither declares "
+                  "nor could be given", is_load ? "load" : "store", slot);
       return false;
    }
 
@@ -2902,8 +3024,11 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
    {
       struct gex_wgpu_ssbo_lowering ssbo_state = {0};
       ssbo_state.descriptor_set = stage == MESA_SHADER_VERTEX ? 1 : 2;
+      /* nir_metadata_none: a dynamic block index turns one store into a
+       * guarded store per block, which is new control flow, and claiming
+       * otherwise would leave stale dominance information behind. */
       nir_shader_instructions_pass(nir, gex_wgpu_lower_ssbo_access,
-                                   nir_metadata_control_flow, &ssbo_state);
+                                   nir_metadata_none, &ssbo_state);
       if (ssbo_state.failed) {
          if (why) snprintf(why, why_len, "%s", ssbo_state.why);
          return false;
