@@ -6543,15 +6543,39 @@ gex_wgpu_lower_line_smooth_instr(nir_builder *b, nir_intrinsic_instr *intr,
                                  void *data)
 {
    struct gex_wgpu_line_smooth *state = data;
-   if (intr->intrinsic != nir_intrinsic_store_deref)
+   /* Both spellings of a colour write. A shader whose outputs are still
+    * variables stores through a deref; one that has been through
+    * nir_lower_io stores with store_output and has no variable to ask. Only
+    * the deref form was handled, so a fixed-function shader -- which is what
+    * every legacy line demo has -- was smoothed not at all, silently, and
+    * gl_LINE_SMOOTH drew hard edges while the driver reported nothing. */
+   nir_def *value;
+   if (intr->intrinsic == nir_intrinsic_store_deref) {
+      nir_variable *var = nir_intrinsic_get_var(intr, 0);
+      /* FRAG_RESULT_COLOR as well as the numbered outputs, which is the test
+       * every other pass in this file makes. Omitting it here meant a
+       * fixed-function shader -- gl_FragColor, which is what every legacy
+       * line demo produces, and which is still COLOR in the NIR the variant
+       * is cloned from -- matched nothing, so GL_LINE_SMOOTH drew hard edges
+       * and said nothing. FRAG_RESULT_COLOR is 2 and FRAG_RESULT_DATA0 is 4,
+       * so `< DATA0` excluded exactly the common case. */
+      if (!var || var->data.mode != nir_var_shader_out ||
+          (var->data.location != FRAG_RESULT_COLOR &&
+           var->data.location < FRAG_RESULT_DATA0) ||
+          intr->src[1].ssa->num_components < 4)
+         return false;
+      value = intr->src[1].ssa;
+   } else if (intr->intrinsic == nir_intrinsic_store_output) {
+      const nir_io_semantics io = nir_intrinsic_io_semantics(intr);
+      if ((io.location != FRAG_RESULT_COLOR &&
+           io.location < FRAG_RESULT_DATA0) ||
+          intr->src[0].ssa->num_components < 4)
+         return false;
+      value = intr->src[0].ssa;
+   } else {
       return false;
-   nir_variable *var = nir_intrinsic_get_var(intr, 0);
-   if (!var || var->data.mode != nir_var_shader_out ||
-       var->data.location < FRAG_RESULT_DATA0 ||
-       intr->src[1].ssa->num_components < 4)
-      return false;
+   }
    b->cursor = nir_before_instr(&intr->instr);
-   nir_def *value = intr->src[1].ssa;
    nir_def *edge = nir_load_var(b, state->coverage);
    nir_def *distance = nir_fabs(b, nir_channel(b, edge, 0));
    nir_def *half = nir_channel(b, edge, 1);
@@ -6559,10 +6583,10 @@ gex_wgpu_lower_line_smooth_instr(nir_builder *b, nir_intrinsic_instr *intr,
     * `half - 0.5`, empty beyond `half + 0.5`. */
    nir_def *coverage =
       nir_fsat(b, nir_fadd_imm(b, nir_fsub(b, half, distance), 0.5f));
-   nir_src_rewrite(&intr->src[1],
-                   nir_vector_insert_imm(
-                      b, value,
-                      nir_fmul(b, nir_channel(b, value, 3), coverage), 3));
+   nir_def *modulated = nir_vector_insert_imm(
+      b, value, nir_fmul(b, nir_channel(b, value, 3), coverage), 3);
+   nir_src_rewrite(intr->intrinsic == nir_intrinsic_store_deref
+                      ? &intr->src[1] : &intr->src[0], modulated);
    state->any = true;
    return true;
 }
@@ -6590,6 +6614,16 @@ gex_wgpu_lower_line_smooth(nir_shader *nir, unsigned location)
 {
    struct gex_wgpu_line_smooth state = {0};
    state.coverage = gex_wgpu_line_edge_input(nir, location);
+   /* What the pass is looking at, because a mismatch here is silent: the
+    * location it wants and the location the shader has. Finding this needed
+    * exactly these two facts. */
+   if (getenv("GEX_WGPU_LINE_LOG")) {
+      nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
+         fprintf(stderr, "gex-smooth: output '%s' location=%d (COLOR=%d "
+                 "DATA0=%d)\n", var->name ? var->name : "(anon)",
+                 var->data.location, (int)FRAG_RESULT_COLOR,
+                 (int)FRAG_RESULT_DATA0);
+   }
    nir_shader_intrinsics_pass(nir, gex_wgpu_lower_line_smooth_instr,
                               nir_metadata_control_flow, &state);
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
@@ -9941,8 +9975,18 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    }
    if (want_logicop)
       gex_wgpu_lower_logicop(variant, (unsigned)want_logicop - 1u);
-   if (want_line_smooth)
-      gex_wgpu_lower_line_smooth(variant, line_edge_location);
+   if (want_line_smooth && !gex_wgpu_lower_line_smooth(variant,
+                                                       line_edge_location)) {
+      /* The pass found no colour write to modulate, so the line would be
+       * drawn with hard edges and nothing would say so. It returned a value
+       * all along and the caller threw it away. */
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: GL_LINE_SMOOTH found no colour output to "
+                 "modulate; this line is drawn aliased\n");
+      }
+   }
    if (want_line_stipple)
       gex_wgpu_lower_line_stipple(variant, line_edge_location,
                                   line_stipple_pattern, line_stipple_factor);
@@ -23576,10 +23620,11 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
       static unsigned told;
       if (told < 8) { ++told;
          fprintf(stderr, "gex-wgpu: line segments=%u records=%u fs=%p "
-                 "mask=0x%llx n=%u\n", segments, segment_records,
-                 (void *)ctx->fs,
+                 "mask=0x%llx n=%u smooth=%d stipple=%d edge=%d perp=%d\n",
+                 segments, segment_records, (void *)ctx->fs,
                  ctx->fs ? (unsigned long long)ctx->fs->varying_interp_mask : 0,
-                 varyings.count); }
+                 varyings.count, (int)smooth, (int)stipple,
+                 (int)edge_location, (int)perpendicular); }
    }
    struct gex_wgpu_line_quad *quad =
       gex_wgpu_line_quad_get(ctx, &varyings, segment_records, edge_location,
@@ -29157,6 +29202,21 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * Only when there is something to gain: an ordinary one-pixel line is
     * what WebGPU draws anyway, and glPolygonMode's rewrite produces a great
     * many of those. */
+   if (getenv("GEX_WGPU_LINE_TRACE") && info && ctx->rasterizer &&
+       (info->mode == MESA_PRIM_LINES || info->mode == MESA_PRIM_LINE_STRIP ||
+        info->mode == MESA_PRIM_LINE_LOOP)) {
+      static unsigned told;
+      if (told < 8) {
+         ++told;
+         fprintf(stderr, "gex-line: mode=%u width=%.2f smooth=%d stipple=%d "
+                 "rewritten=%d draws=%u indirect=%d instances=%u failed=%d\n",
+                 info->mode, ctx->rasterizer->line_width,
+                 (int)ctx->rasterizer->line_smooth,
+                 (int)ctx->rasterizer->line_stipple,
+                 (int)ctx->line_rewritten, num_draws, indirect ? 1 : 0,
+                 info->instance_count, (int)ctx->failed);
+      }
+   }
    if (!ctx->failed && !ctx->line_rewritten && info && draws &&
        num_draws == 1 && !indirect && ctx->vs && ctx->rasterizer &&
        info->instance_count <= 1 &&
