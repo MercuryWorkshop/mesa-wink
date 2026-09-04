@@ -1302,6 +1302,9 @@ struct gex_wgpu_shader {
    /* ARB_shader_draw_parameters. Vertex stage only; the block is declared
     * only when the shader reads one of the three values. */
    bool reads_draw_params;
+   /* How many of the merged clip/cull array's components are cull distances.
+    * Zero for a shader that writes none, which is almost all of them. */
+   uint8_t cull_distances;
    /* Whether the fragment stage reads gl_SamplePosition, which makes the
     * framebuffer's sample count part of its variant key. Scanned rather than
     * read off info.system_values_read, for the reason gl_PointCoord and the
@@ -6535,6 +6538,67 @@ gex_wgpu_reads_draw_params(nir_shader *nir)
    return false;
 }
 
+/* gl_CullDistance, which WebGPU has no equivalent for, in two halves.
+ *
+ * This half keeps the cull values out of the clipper. Mesa's GLSL linker runs
+ * nir_merge_clip_cull_distance_vars unconditionally, packing gl_CullDistance
+ * into the gl_ClipDistance array after the clip values, and the emitter hands
+ * that whole array to WebGPU's clip_distances -- so without this the cull
+ * values *clip*, which is precisely the wrong thing: a clip distance cuts a
+ * primitive where it reaches zero, a cull distance discards the primitive
+ * only when every vertex is negative and otherwise leaves it whole.
+ *
+ * Splitting the merged array structurally is the obvious fix and a large one,
+ * because the same array is what st/mesa's nir_lower_clip_vs writes for every
+ * user clip plane -- a path real applications here depend on. Overwriting is
+ * cheaper and leaves that path untouched: a clip distance of +1 never clips
+ * anything, so storing that into the cull components at the end of the shader
+ * neutralises them however the shader wrote them, without the pass having to
+ * understand the writes at all.
+ *
+ * The culling itself is done on the captured values; see
+ * gex_wgpu_cull_distance_draw.
+ */
+static bool
+gex_wgpu_neutralise_cull_distances(nir_shader *nir)
+{
+   const unsigned clip = nir->info.clip_distance_array_size;
+   const unsigned cull = nir->info.cull_distance_array_size;
+   if (!cull)
+      return false;
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl)
+      return false;
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   bool wrote = false;
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
+      if (var->data.location != VARYING_SLOT_CLIP_DIST0 &&
+          var->data.location != VARYING_SLOT_CLIP_DIST1)
+         continue;
+      const struct glsl_type *type = var->type;
+      if (!glsl_type_is_array(type))
+         continue;
+      /* CLIP_DIST1 carries components four and up, so the variable's own
+       * index zero is the array's index four. */
+      const unsigned base =
+         var->data.location == VARYING_SLOT_CLIP_DIST1 ? 4u : 0u;
+      const unsigned length = glsl_get_length(type);
+      for (unsigned i = 0; i < length; ++i) {
+         const unsigned at = base + i;
+         if (at < clip || at >= clip + cull)
+            continue;
+         nir_deref_instr *element = nir_build_deref_array_imm(
+            &b, nir_build_deref_var(&b, var), i);
+         nir_store_deref(&b, element, nir_imm_float(&b, 1.0f), 0x1);
+         wrote = true;
+      }
+   }
+   if (wrote)
+      nir_progress(true, impl, nir_metadata_none);
+   return wrote;
+}
+
 static struct gex_wgpu_shader *
 gex_wgpu_create_shader_state(struct pipe_context *pipe,
                              const struct pipe_shader_state *state,
@@ -6708,6 +6772,14 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * unconditionally because whether one will be bound is not known here. */
    if (expected_stage == MESA_SHADER_VERTEX)
       shader->varying_nir = nir_shader_clone(NULL, nir);
+
+   /* After both clones and before the module and its variants: the capture
+    * keeps the real cull values -- that is what the cull is decided from --
+    * and everything that rasterises gets them neutralised. */
+   if (expected_stage == MESA_SHADER_VERTEX)
+      shader->cull_distances = nir->info.cull_distance_array_size;
+   if (shader->cull_distances)
+      gex_wgpu_neutralise_cull_distances(nir);
 
    /* ARB_shader_draw_parameters, *after* the UBO lowering.
     *
@@ -17447,9 +17519,27 @@ gex_wgpu_emit_varying_stores(nir_shader *nir, struct gex_wgpu_capture *state,
        * zero, which is what GL says an unwritten input is worth. */
       nir_def *value = nir_imm_zero(&b, 4, 32);
       if (found) {
-         if (!glsl_type_is_vector_or_scalar(found->type))
+         if (glsl_type_is_vector_or_scalar(found->type)) {
+            value = nir_load_var(&b, found);
+         } else if (glsl_type_is_array(found->type) &&
+                    glsl_type_is_scalar(glsl_get_array_element(found->type))) {
+            /* gl_ClipDistance and gl_CullDistance arrive as an *array* of
+             * floats, not a vector, and one slot of the capture holds four of
+             * them -- which is how gl_CullDistance is read back for the
+             * per-primitive cull. Elements past the array's end stay zero,
+             * and zero does not cull, so a short array errs towards drawing.
+             */
+            const unsigned length = glsl_get_length(found->type);
+            nir_def *elements[4];
+            for (unsigned c = 0; c < 4; ++c)
+               elements[c] = c < length
+                  ? nir_load_deref(&b, nir_build_deref_array_imm(
+                       &b, nir_build_deref_var(&b, found), c))
+                  : nir_imm_float(&b, 0.0f);
+            value = nir_vec(&b, elements, 4);
+         } else {
             return false;
-         value = nir_load_var(&b, found);
+         }
       }
       gex_wgpu_store_varying(&b, state->varying_out,
                              nir_iadd_imm(&b, base, i * 16), value);
@@ -24050,7 +24140,8 @@ gex_wgpu_draw_provoking_last(struct pipe_context *pipe,
 static bool
 gex_wgpu_capture_positions(struct gex_wgpu_context *ctx, unsigned first,
                            unsigned count, unsigned *out_record,
-                           unsigned *out_edge_offset)
+                           unsigned *out_edge_offset,
+                           unsigned *out_clip_offset)
 {
    if (!ctx->vs || !count)
       GEX_CAPTURE_DECLINE("no vs or no vertices");
@@ -24075,6 +24166,22 @@ gex_wgpu_capture_positions(struct gex_wgpu_context *ctx, unsigned first,
         BITFIELD64_BIT(VARYING_SLOT_EDGE))) {
       *out_edge_offset = varyings.count * 16;
       varyings.location[varyings.count++] = VARYING_SLOT_EDGE;
+   }
+   /* The merged clip/cull array, when the caller wants it: the cull half is
+    * what gl_CullDistance culling is decided from, and it is only readable
+    * here -- the rasterising module has had it neutralised so the clipper
+    * leaves it alone. Up to eight components, so at most two slots. */
+   if (out_clip_offset) {
+      *out_clip_offset = ~0u;
+      const unsigned merged = ctx->vs && ctx->vs->original_nir
+         ? ctx->vs->original_nir->info.clip_distance_array_size +
+           ctx->vs->original_nir->info.cull_distance_array_size : 0;
+      if (merged) {
+         *out_clip_offset = varyings.count * 16;
+         varyings.location[varyings.count++] = VARYING_SLOT_CLIP_DIST0;
+         if (merged > 4)
+            varyings.location[varyings.count++] = VARYING_SLOT_CLIP_DIST1;
+      }
    }
    const unsigned record = gex_wgpu_varying_stride(&varyings);
 
@@ -24181,6 +24288,167 @@ gex_wgpu_polygon_walk(enum mesa_prim mode, struct gex_wgpu_polygon_walk *walk)
    }
 }
 
+/* The other half of gl_CullDistance: dropping the primitives GL says to drop.
+ *
+ * A cull distance discards a primitive when **every** one of its vertices is
+ * negative in the same distance, and otherwise leaves it whole -- including
+ * the parts where the distance is negative, which is exactly where mapping it
+ * onto clipping goes wrong. That is a per-primitive decision about per-vertex
+ * values, which no rasterizer state WebGPU has can express, so the vertex
+ * shader is run as compute, the distances are read back, and the draw becomes
+ * an indexed one over the primitives that survive.
+ *
+ * The same shape as gex_wgpu_cull_polygons, which decides facing the same way
+ * and for the same reason. Returns false when it cannot do it, and then
+ * nothing is culled -- which draws too much rather than too little, the safer
+ * direction for a feature that only ever removes geometry.
+ */
+static bool
+gex_wgpu_cull_distance_filter(struct pipe_context *pipe,
+                              const struct pipe_draw_info *info,
+                              const struct pipe_draw_start_count_bias *draw,
+                              uint32_t **out_indices, unsigned *out_count)
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   const struct gex_wgpu_shader *vs = ctx->vs;
+   if (getenv("GEX_WGPU_CULL_TRACE"))
+      fprintf(stderr, "gex-cull: enter vs=%p cull=%u orig=%p mode=%u "
+              "count=%u isz=%u inst=%u\n", (void *)vs,
+              vs ? vs->cull_distances : 0u,
+              vs ? (void *)vs->original_nir : NULL, (unsigned)info->mode,
+              draw->count, info->index_size, info->instance_count);
+   if (!vs || !vs->cull_distances || !vs->original_nir)
+      return false;
+   const unsigned clip = vs->original_nir->info.clip_distance_array_size;
+   const unsigned cull = vs->cull_distances;
+   if (clip + cull > 8)
+      return false;
+
+   const unsigned verts = mesa_vertices_per_prim(info->mode);
+   if (verts == 0 || verts > 3)
+      return false;   /* points, lines and triangles; adjacency is not a list */
+   unsigned count = draw->count;
+   if (!u_trim_pipe_prim(info->mode, &count) || count == 0)
+      return false;
+   if (info->index_size && info->index_size != 1 && info->index_size != 2 &&
+       info->index_size != 4)
+      return false;
+   if (info->instance_count != 1 || info->primitive_restart)
+      return false;
+
+   /* Vertex numbers once, so the capture range and the emitted list speak the
+    * same language -- the same reason gex_wgpu_cull_polygons does it. */
+   uint32_t *source = MALLOC(count * sizeof(*source));
+   if (!source)
+      return false;
+   struct pipe_transfer *transfer = NULL;
+   const void *raw = NULL;
+   if (info->index_size) {
+      raw = info->has_user_indices
+         ? (const void *)((const char *)info->index.user +
+                          (size_t)draw->start * info->index_size)
+         : pipe_buffer_map_range(pipe, info->index.resource,
+                                 (size_t)draw->start * info->index_size,
+                                 (size_t)count * info->index_size,
+                                 PIPE_MAP_READ, &transfer);
+      if (!raw) {
+         FREE(source);
+         return false;
+      }
+   }
+   for (unsigned i = 0; i < count; ++i) {
+      int64_t index;
+      if (!info->index_size)
+         index = (int64_t)draw->start + i;
+      else if (info->index_size == 1)
+         index = ((const uint8_t *)raw)[i] + draw->index_bias;
+      else if (info->index_size == 2) {
+         uint16_t narrow;
+         memcpy(&narrow, (const char *)raw + (size_t)i * 2, 2);
+         index = narrow + draw->index_bias;
+      } else {
+         uint32_t wide;
+         memcpy(&wide, (const char *)raw + (size_t)i * 4, 4);
+         index = (int64_t)wide + draw->index_bias;
+      }
+      if (index < 0) {
+         if (transfer)
+            pipe_buffer_unmap(pipe, transfer);
+         FREE(source);
+         return false;
+      }
+      source[i] = (uint32_t)index;
+   }
+   if (transfer)
+      pipe_buffer_unmap(pipe, transfer);
+
+   uint32_t low = source[0], high = source[0];
+   for (unsigned i = 1; i < count; ++i) {
+      low = MIN2(low, source[i]);
+      high = MAX2(high, source[i]);
+   }
+
+   unsigned record = 0, edge_offset = 0, clip_offset = 0;
+   if (!gex_wgpu_capture_positions(ctx, low, high - low + 1, &record,
+                                   &edge_offset, &clip_offset) ||
+       clip_offset == ~0u) {
+      if (getenv("GEX_WGPU_CULL_TRACE"))
+         fprintf(stderr, "gex-cull: capture failed (clip_offset=%u)\n",
+                 clip_offset);
+      FREE(source);
+      return false;
+   }
+   if (getenv("GEX_WGPU_CULL_TRACE"))
+      fprintf(stderr, "gex-cull: captured record=%u clip_offset=%u clip=%u "
+              "cull=%u\n", record, clip_offset, clip, cull);
+   const float *captured =
+      pipe_buffer_map_range(pipe, ctx->facing_vs_out, 0,
+                            (size_t)(high - low + 1) * record, PIPE_MAP_READ,
+                            &transfer);
+   if (!captured) {
+      FREE(source);
+      return false;
+   }
+
+   uint32_t *kept = MALLOC(count * sizeof(*kept));
+   if (!kept) {
+      pipe_buffer_unmap(pipe, transfer);
+      FREE(source);
+      return false;
+   }
+   unsigned kept_count = 0;
+   for (unsigned base = 0; base + verts <= count; base += verts) {
+      bool culled = false;
+      for (unsigned c = clip; c < clip + cull && !culled; ++c) {
+         /* The merged array runs across two slots of four components. */
+         const unsigned byte =
+            clip_offset + (c / 4) * 16 + (c % 4) * sizeof(float);
+         bool all_negative = true;
+         for (unsigned v = 0; v < verts && all_negative; ++v) {
+            const unsigned vertex = source[base + v] - low;
+            const float *record_at =
+               (const float *)((const char *)captured +
+                               (size_t)vertex * record + byte);
+            if (*record_at >= 0.0f)
+               all_negative = false;
+         }
+         /* Every vertex negative in *this* distance is what culls it; one
+          * distance is enough, and a mixed sign in every distance keeps the
+          * primitive whole. */
+         culled = all_negative;
+      }
+      if (culled)
+         continue;
+      for (unsigned v = 0; v < verts; ++v)
+         kept[kept_count++] = source[base + v];
+   }
+   pipe_buffer_unmap(pipe, transfer);
+   FREE(source);
+   *out_indices = kept;
+   *out_count = kept_count;
+   return true;
+}
+
 static bool
 gex_wgpu_cull_polygons(struct pipe_context *pipe,
                        const struct pipe_draw_info *info,
@@ -24251,7 +24519,7 @@ gex_wgpu_cull_polygons(struct pipe_context *pipe,
     * draw is exactly the draw and for an indexed one is its index bounds. */
    unsigned record = 0, edge_offset = ~0u;
    if (!gex_wgpu_capture_positions(ctx, low, high - low + 1, &record,
-                                   &edge_offset)) {
+                                   &edge_offset, NULL)) {
       FREE(source);
       return false;
    }
@@ -25047,6 +25315,46 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (indirect && info && !ctx->failed) {
       util_draw_indirect(pipe, info, drawid_offset, indirect);
       return;
+   }
+
+   /* gl_CullDistance, which no rasterizer state can express: the primitives
+    * every vertex of which is negative in one distance are dropped, and the
+    * draw becomes an indexed one over what survives. Before the facing cull
+    * below, which re-enters this path with its own index list. */
+   if (info && draws && num_draws == 1 && !indirect && !ctx->failed &&
+       ctx->vs && ctx->vs->cull_distances) {
+      uint32_t *survivors = NULL;
+      unsigned survivor_count = 0;
+      if (gex_wgpu_cull_distance_filter(pipe, info, &draws[0], &survivors,
+                                        &survivor_count)) {
+         if (!survivor_count) {
+            FREE(survivors);
+            return;   /* every primitive was culled */
+         }
+         struct pipe_draw_info culled = *info;
+         culled.index_size = 4;
+         culled.has_user_indices = true;
+         culled.index.user = survivors;
+         culled.primitive_restart = false;
+         culled.index_bounds_valid = false;
+         culled.min_index = 0;
+         culled.max_index = ~0u;
+         struct pipe_draw_start_count_bias culled_draw = draws[0];
+         culled_draw.start = 0;
+         culled_draw.count = survivor_count;
+         /* The filter resolved real vertex numbers, so the bias is already
+          * in them and must not be applied a second time. */
+         culled_draw.index_bias = 0;
+         /* Cleared across the re-entry, or it would cull the same primitives
+          * again against the list it has just produced. */
+         struct gex_wgpu_shader *saved_vs = ctx->vs;
+         const uint8_t saved_cull = saved_vs->cull_distances;
+         saved_vs->cull_distances = 0;
+         gex_wgpu_draw_vbo(pipe, &culled, drawid_offset, NULL, &culled_draw, 1);
+         saved_vs->cull_distances = saved_cull;
+         FREE(survivors);
+         return;
+      }
    }
 
    /* Primitive restart, split into restart-free draws. WebGPU has restart
@@ -28743,8 +29051,13 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * counters were the last hole and they were *already advertised* through
     * ARB_shader_atomic_counters, so the cap did not create that risk -- it
     * only made it worth closing, which gl44-ssbo-atomic-probe now gates. */
-   caps->glsl_feature_level = 440;
-   caps->glsl_feature_level_compatibility = 440;
+   /* 450 now that ARB_cull_distance is served, which is what GL 4.5's rung
+    * of _mesa_compute_version wants beside it. GLSL 4.50 adds very little
+    * over 4.40 -- most of what carries the version number is separate
+    * extensions -- and gl_CullDistance, the one addition that matters here,
+    * is the thing that just landed. */
+   caps->glsl_feature_level = 450;
+   caps->glsl_feature_level_compatibility = 450;
 
    /* ARB_texture_gather, exposed below its GL 4.0 core version.
     *
@@ -28799,10 +29112,29 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * gex_wgpu_render_cond_passes already tests against, so the inverted modes
     * need nothing the plain ones did not. */
    caps->conditional_render_inverted = true;
-   /* ARB_cull_distance is the one extension between this driver and GL 4.5,
-    * and it is deliberately withheld. Turning it on grants 4.5 immediately --
-    * measured -- and silently eats geometry, which is worse than not having
-    * it.
+   /* ARB_cull_distance, which grants GL 4.5.
+    *
+    * Two halves, because gl_CullDistance is not gl_ClipDistance: a clip
+    * distance cuts a primitive where it reaches zero, a cull distance
+    * discards the primitive only when *every* vertex is negative and
+    * otherwise leaves it whole -- including the parts where the distance is
+    * negative, which is exactly the corner a clipper would eat.
+    *
+    * Mesa's linker merges the cull values into the clip array, and the
+    * emitter hands that whole array to WebGPU's clip_distances, so the first
+    * half is keeping them out of the clipper:
+    * gex_wgpu_neutralise_cull_distances overwrites the cull components with
+    * +1 at the end of the rasterising shader, which never clips anything.
+    * The second half is gex_wgpu_cull_distance_filter, which reads the real
+    * values back from a capture and drops the primitives GL says to drop.
+    *
+    * Left as it was for a while, with this comment saying so, because turning
+    * the cap on without the second half grants 4.5 and silently eats
+    * geometry. gl44-cull-distance-probe is what says which of those is
+    * happening: its `mixed_kept` case is the one that distinguishes the two
+    * features, and a clip implementation fails it and nothing else. */
+   caps->cull_distance = true;
+   /* The old note, kept for the shape of what was considered and rejected:
     *
     * Why: gl_CullDistance is not gl_ClipDistance. A clip distance cuts a
     * primitive along the plane where it reaches zero; a cull distance
