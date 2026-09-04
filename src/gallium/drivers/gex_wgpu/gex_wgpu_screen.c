@@ -11308,6 +11308,38 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
           !(bind & ~allowed);
 }
 
+/* Whether this resource can be handed out as a shared handle. It cannot.
+ *
+ * Gallium leaves this hook optional, and Mesa's own drisw frontend calls it
+ * **without a NULL check**:
+ *
+ *   get_image_shm (drisw.c:136)
+ *     res->screen->resource_get_handle(res->screen, NULL, res, &whandle, ...)
+ *
+ * so a driver that does not set it segfaults at address zero rather than
+ * falling back. `texture_from_pixmap` and the muffin compositor both died that
+ * way -- the only two programs of 337 that crashed here and ran on llvmpipe,
+ * which is what the sweep's reference run exists to find.
+ *
+ * False is not a placeholder: it is the answer. A WebGPU buffer or texture has
+ * no shared-memory identifier to give out, and the caller's next line is
+ * `get_image(...)`, which copies the drawable through the CPU instead. So
+ * saying no gets the picture drawn; saying nothing at all crashed. */
+static bool
+gex_wgpu_resource_get_handle(struct pipe_screen *screen,
+                             struct pipe_context *ctx,
+                             struct pipe_resource *resource,
+                             struct winsys_handle *whandle,
+                             unsigned usage)
+{
+   (void)screen;
+   (void)ctx;
+   (void)resource;
+   (void)whandle;
+   (void)usage;
+   return false;
+}
+
 static struct pipe_resource *
 gex_wgpu_resource_create(struct pipe_screen *screen,
                          const struct pipe_resource *templ)
@@ -31771,6 +31803,8 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->base.fence_finish = gex_wgpu_fence_finish;
    screen->base.context_create = gex_wgpu_context_create;
    screen->base.resource_create = gex_wgpu_resource_create;
+   /* Set even though it can only say no: Mesa calls it without checking. */
+   screen->base.resource_get_handle = gex_wgpu_resource_get_handle;
    screen->base.resource_destroy = gex_wgpu_resource_destroy;
    return &screen->base;
 }
