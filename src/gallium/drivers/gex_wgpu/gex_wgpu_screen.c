@@ -20377,10 +20377,33 @@ gex_wgpu_emit_varying_stores(nir_shader *nir, struct gex_wgpu_capture *state,
 
    for (unsigned i = 0; i < layout->count; ++i) {
       nir_variable *found = NULL;
+      /* Which element of `found`'s array this slot starts at. Zero for
+       * everything except the upper half of a merged clip/cull array. */
+      unsigned element_base = 0;
       nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
          if (var->data.location == layout->location[i]) {
             found = var;
             break;
+         }
+      }
+      /* gl_ClipDistance and gl_CullDistance are merged into *one* array that
+       * spans two varying slots, and a shader with more than four of them
+       * between them declares a single variable at CLIP_DIST0 -- there is no
+       * variable at CLIP_DIST1 to find. Matching on location alone therefore
+       * captured zeros for the upper half, and since zero does not cull,
+       * gl_CullDistance simply stopped working past the fourth component:
+       * KHR-GL45.cull_distance scored 1 of 218 against llvmpipe's 202, with
+       * the CPU filter reading `k0.000` for every distance above the third
+       * while the shader had written real values. */
+      if (!found && layout->location[i] == VARYING_SLOT_CLIP_DIST1) {
+         nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
+            if (var->data.location == VARYING_SLOT_CLIP_DIST0 &&
+                glsl_type_is_array(var->type) &&
+                glsl_get_length(var->type) > 4) {
+               found = var;
+               element_base = 4;
+               break;
+            }
          }
       }
       /* A varying the consumer reads but this shader never declared reads as
@@ -20399,11 +20422,13 @@ gex_wgpu_emit_varying_stores(nir_shader *nir, struct gex_wgpu_capture *state,
              */
             const unsigned length = glsl_get_length(found->type);
             nir_def *elements[4];
-            for (unsigned c = 0; c < 4; ++c)
-               elements[c] = c < length
+            for (unsigned c = 0; c < 4; ++c) {
+               const unsigned at = element_base + c;
+               elements[c] = at < length
                   ? nir_load_deref(&b, nir_build_deref_array_imm(
-                       &b, nir_build_deref_var(&b, found), c))
+                       &b, nir_build_deref_var(&b, found), at))
                   : nir_imm_float(&b, 0.0f);
+            }
             value = nir_vec(&b, elements, 4);
          } else {
             return false;
@@ -20890,11 +20915,38 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
                                              glsl_vec4_type(), name);
       in->data.location = VERT_ATTRIB_GENERIC0 + i;
       in->data.driver_location = i;
-      nir_variable *out = nir_variable_create(b.shader, nir_var_shader_out,
-                                              glsl_vec4_type(), name);
+      /* gl_ClipDistance and gl_CullDistance have to be *arrays*, and a vec4
+       * is not one.
+       *
+       * SPIR-V requires it -- "BuiltIn ClipDistance variable needs to be a
+       * 32-bit float array" -- and Tint enforces it, so declaring this
+       * passthrough's clip slot as a vec4 like every other slot got the whole
+       * module rejected and the link failed with nothing but "Program linking
+       * failed" to go on. It took 56 of KHR-GL45.cull_distance's cases, whose
+       * programs carry a geometry stage. The same shape of bug already has a
+       * workaround a few lines up in ntv for FRAG_RESULT_SAMPLE_MASK.
+       *
+       * Declared the way nir_lower_clip does it, compact flag included, so
+       * that ntv and Tint see what they would from an ordinary shader. */
+      const bool is_clip = outputs->location[i] == VARYING_SLOT_CLIP_DIST0 ||
+                           outputs->location[i] == VARYING_SLOT_CLIP_DIST1;
+      nir_variable *out = nir_variable_create(
+         b.shader, nir_var_shader_out,
+         is_clip ? glsl_array_type(glsl_float_type(), 4, sizeof(float))
+                 : glsl_vec4_type(), name);
       out->data.location = outputs->location[i];
       out->data.driver_location = i;
-      nir_store_var(&b, out, nir_load_var(&b, in), 0xf);
+      nir_def *value = nir_load_var(&b, in);
+      if (is_clip) {
+         out->data.compact = 1;
+         for (unsigned c = 0; c < 4; ++c)
+            nir_store_deref(&b,
+                            nir_build_deref_array_imm(
+                               &b, nir_build_deref_var(&b, out), c),
+                            nir_channel(&b, value, c), 0x1);
+      } else {
+         nir_store_var(&b, out, value, 0xf);
+      }
    }
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    return b.shader;
@@ -28736,6 +28788,21 @@ gex_wgpu_cull_distance_filter(struct pipe_context *pipe,
           * distance is enough, and a mixed sign in every distance keeps the
           * primitive whole. */
          culled = all_negative;
+      }
+      if (getenv("GEX_WGPU_CULL_TRACE")) {
+         static unsigned told;
+         if (told < 6) { ++told;
+            fprintf(stderr, "gex-cull: prim %u culled=%d dists:", base / verts,
+                    (int)culled);
+            for (unsigned c = 0; c < clip + cull; ++c) {
+               const unsigned byte =
+                  clip_offset + (c / 4) * 16 + (c % 4) * sizeof(float);
+               const unsigned vertex = source[base] - low;
+               const float *at = (const float *)((const char *)captured +
+                                 (size_t)vertex * record + byte);
+               fprintf(stderr, " %s%.3f", c < clip ? "c" : "k", *at);
+            }
+            fprintf(stderr, "\n"); }
       }
       if (culled)
          continue;
