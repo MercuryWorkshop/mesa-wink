@@ -10156,8 +10156,19 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    if (needs_sampler_variant && !gex_wgpu_lower_texture_variant(
           variant, fs->texture_count, fs->texture_slots,
           fs->integer_sampled_slots, ctx->samplers, ctx->sampler_views)) {
+      /* A texture/sampler combination this driver cannot lower. The caller
+       * drops the draw when the module is NULL, which is the right answer on
+       * its own -- latching as well turned one lost draw into a lost context,
+       * and the CTS reuses one context for a whole family: 49 of
+       * direct_state_access's textures_storage cases reported InternalError
+       * behind this, for a shader they never compiled. */
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: draw dropped (no fragment sampler "
+                 "variant for this texture and sampler combination)\n");
+      }
       ralloc_free(variant);
-      gex_fail(ctx);
       return NULL;
    }
    {
