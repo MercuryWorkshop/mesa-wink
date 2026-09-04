@@ -1601,6 +1601,7 @@ struct gex_wgpu_shader {
    uint32_t packed_image_bindings[GEX_WGPU_MAX_SHADER_IMAGES];
    enum pipe_format packed_image_formats[GEX_WGPU_MAX_SHADER_IMAGES];
    bool packed_image_read[GEX_WGPU_MAX_SHADER_IMAGES];
+   bool packed_image_write[GEX_WGPU_MAX_SHADER_IMAGES];
    /* Bytes the emitted module declares for that block, or 0 where the block
     * ends in a runtime-sized array and has no fixed size. Only the layout's
     * minBindingSize wants it -- see gex_wgpu_min_binding_size. */
@@ -3173,6 +3174,7 @@ static bool
 gex_wgpu_apply_packed_images(nir_shader *nir, unsigned count,
                              const uint8_t *slots, const uint32_t *bindings,
                              const enum pipe_format *formats,
+                             const bool *writes,
                              enum mesa_shader_stage stage, char *why,
                              size_t why_len)
 {
@@ -3190,8 +3192,19 @@ gex_wgpu_apply_packed_images(nir_shader *nir, unsigned count,
       nir_variable *block =
          gex_wgpu_packed_image_header_block(nir, name, bindings[i]);
       snprintf(name, sizeof(name), "gex_packed_image%u_data", slot);
+      /* Read-only where the shader never writes it, and that is not tidiness:
+       * WebGPU refuses a writable storage binding that overlaps *any* other
+       * use of the same buffer in one scope, so a read-only image sharing a
+       * resource with anything else --
+       *
+       *   usage (Storage(read-write)|Storage(read-only)) includes writable
+       *   usage and another usage in the same synchronization scope
+       *
+       * -- is rejected for a write it never performs. Two read-only bindings
+       * may alias. */
       nir_variable *data = gex_wgpu_word_block(
-         nir, name, GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot, 0, false);
+         nir, name, GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot, 0,
+         writes && !writes[i]);
       if (!block || !data)
          return false;
       const unsigned set = stage == MESA_SHADER_VERTEX ? 1
@@ -8622,6 +8635,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          shader->packed_image_read[at] =
             !no_read || gex_wgpu_image_has_atomic(nir,
                                                   var->data.driver_location);
+         shader->packed_image_write[at] = !no_write ||
+            gex_wgpu_image_has_atomic(nir, var->data.driver_location);
          ++shader->packed_image_count;
          continue;
       }
@@ -9101,7 +9116,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       if (!gex_wgpu_apply_packed_images(
              nir, shader->packed_image_count, shader->packed_image_slots,
              shader->packed_image_bindings, shader->packed_image_formats,
-             expected_stage, why, sizeof(why))) {
+             shader->packed_image_write, expected_stage, why, sizeof(why))) {
          char detail[224];
          snprintf(detail, sizeof(detail), "gex_wgpu packed image lowering: %s",
                   why[0] ? why : "failed");
@@ -16849,6 +16864,7 @@ struct gex_wgpu_compute_state {
    uint32_t packed_image_bindings[GEX_WGPU_MAX_SHADER_IMAGES];
    enum pipe_format packed_image_formats[GEX_WGPU_MAX_SHADER_IMAGES];
    bool packed_image_read[GEX_WGPU_MAX_SHADER_IMAGES];
+   bool packed_image_write[GEX_WGPU_MAX_SHADER_IMAGES];
    /* Sampled textures, which a compute shader may have like any other stage.
     * GL 4.3's compute shaders sample as freely as a fragment shader does, and
     * a renderer doing its post-processing in compute does little else. This
@@ -17070,6 +17086,8 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
          compute->packed_image_read[at] =
             !no_read || gex_wgpu_image_has_atomic(nir,
                                                   var->data.driver_location);
+         compute->packed_image_write[at] = !no_write ||
+            gex_wgpu_image_has_atomic(nir, var->data.driver_location);
          ++compute->packed_image_count;
          continue;
       }
@@ -17341,7 +17359,8 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
       if (!gex_wgpu_apply_packed_images(
              nir, compute->packed_image_count, compute->packed_image_slots,
              compute->packed_image_bindings, compute->packed_image_formats,
-             MESA_SHADER_COMPUTE, why, sizeof(why))) {
+             compute->packed_image_write, MESA_SHADER_COMPUTE, why,
+             sizeof(why))) {
          fprintf(stderr, "gex-wgpu: compute packed image lowering: %s\n",
                  why[0] ? why : "failed");
          ralloc_free(nir);
@@ -17893,9 +17912,10 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
             ? GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot
             : compute->packed_image_bindings[i];
          entries[count].visibility = WGPUShaderStage_Compute;
-         entries[count].buffer.type = half
-            ? WGPUBufferBindingType_Storage
-            : WGPUBufferBindingType_ReadOnlyStorage;
+         entries[count].buffer.type =
+            half && compute->packed_image_write[i]
+               ? WGPUBufferBindingType_Storage
+               : WGPUBufferBindingType_ReadOnlyStorage;
          entries[count].buffer.hasDynamicOffset = false;
          bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          bindings[count].binding = entries[count].binding;
@@ -17907,6 +17927,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       }
    }
 
+   /* Slots whose depth view this dispatch reads as float; see below. */
+   uint32_t compute_depth_as_float = 0;
    /* Sampled textures and their samplers. The view is the one the sampler
     * view already holds, as in the graphics stages -- nothing is created per
     * dispatch, so nothing is released below. A slot the shader declares and
@@ -17927,10 +17949,32 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          goto release_views;
       }
       gex_wgpu_sampler_view_refresh(pipe, view);
+      /* A depth view read by a shader that declared a plain sampler, which
+       * GL allows and WebGPU serves only as unfilterable-float with a
+       * non-filtering sampler -- the same rule the draw path applies, and it
+       * was missing here. Dawn names the texture and not the stage:
+       *
+       *   None of the supported sample types (UnfilterableFloat|Depth) of
+       *   [Texture (Depth32Float)] ...
+       *
+       * Blender's EEVEE samples its depth buffer from a compute pass. */
+      WGPUTextureSampleType compute_sample_type =
+         compute->texture_sample_types[i];
+      const struct gex_wgpu_sampler *compute_sampler =
+         slot < GEX_WGPU_MAX_SAMPLERS ? ctx->compute_samplers[slot] : NULL;
+      if (gex_wgpu_format_sample_type(view->base.format) ==
+             WGPUTextureSampleType_Depth &&
+          compute_sample_type == WGPUTextureSampleType_Float &&
+          (!compute_sampler ||
+           compute_sampler->state.compare_mode !=
+              PIPE_TEX_COMPARE_R_TO_TEXTURE)) {
+         compute_sample_type = WGPUTextureSampleType_UnfilterableFloat;
+         compute_depth_as_float |= 1u << slot;
+      }
       entries[count] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       entries[count].binding = compute->texture_bindings[i];
       entries[count].visibility = WGPUShaderStage_Compute;
-      entries[count].texture.sampleType = compute->texture_sample_types[i];
+      entries[count].texture.sampleType = compute_sample_type;
       entries[count].texture.viewDimension = compute->texture_dimensions[i];
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       bindings[count].binding = compute->texture_bindings[i];
@@ -17944,13 +17988,20 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       entries[count] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       entries[count].binding = compute->sampler_bindings[i];
       entries[count].visibility = WGPUShaderStage_Compute;
-      entries[count].sampler.type = compute->sampler_types[i];
+      entries[count].sampler.type = (compute_depth_as_float & (1u << slot))
+         ? WGPUSamplerBindingType_NonFiltering
+         : compute->sampler_types[i];
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       bindings[count].binding = compute->sampler_bindings[i];
       /* A slot with no sampler state bound still needs one, and the
        * texture's own is the only defensible choice: GL's default sampler
-       * state is what st/mesa would have sent. */
-      bindings[count].sampler = sampler ? sampler->sampler : NULL;
+       * state is what st/mesa would have sent. A slot reading a depth view
+       * as float takes the nearest non-filtering twin, to match the layout
+       * above. */
+      bindings[count].sampler = sampler
+         ? ((compute_depth_as_float & (1u << slot)) && sampler->nonfiltering
+               ? sampler->nonfiltering : sampler->sampler)
+         : NULL;
       if (!sampler) {
          static bool said;
          if (!said) {
@@ -30745,9 +30796,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             ? GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot
             : ctx->fs->packed_image_bindings[i];
          fragment_layout_entries[at].visibility = WGPUShaderStage_Fragment;
-         fragment_layout_entries[at].buffer.type = half
-            ? WGPUBufferBindingType_Storage
-            : WGPUBufferBindingType_ReadOnlyStorage;
+         fragment_layout_entries[at].buffer.type =
+            half && ctx->fs->packed_image_write[i]
+               ? WGPUBufferBindingType_Storage
+               : WGPUBufferBindingType_ReadOnlyStorage;
          fragment_layout_entries[at].buffer.hasDynamicOffset = false;
       }
    }
