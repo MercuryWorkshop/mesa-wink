@@ -16938,6 +16938,39 @@ gex_wgpu_get_device_reset_status(struct pipe_context *pipe)
    return PIPE_NO_RESET;
 }
 
+/* Whether a shader samples a texture at all.
+ *
+ * The geometry and tessellation stages run as *compute* passes here, and
+ * nothing binds their textures: gex_wgpu_bind_sampler_states takes the
+ * fragment, vertex and compute stages only, and a real sampler bound to any
+ * other stage latches the context -- which reaches the application as
+ * GL_OUT_OF_MEMORY and, in the CTS, aborts the whole run at the first case
+ * rather than failing one.
+ *
+ * So the shader is refused here by name instead. That is not the feature, but
+ * it is an honest and *local* answer: the program fails to link with a message
+ * that says what is missing, and every later case still runs. Sampling in
+ * these stages needs the generated compute module to declare the texture and
+ * sampler bindings and the dispatch to bind them, the way the compute path
+ * already does.
+ */
+static bool
+gex_wgpu_shader_samples_texture(const nir_shader *nir)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform)
+      if (glsl_type_is_sampler(glsl_without_array(var->type)) ||
+          glsl_type_is_texture(glsl_without_array(var->type)))
+         return true;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block)
+            if (instr->type == nir_instr_type_tex)
+               return true;
+      }
+   }
+   return false;
+}
+
 static void
 gex_wgpu_set_debug_callback(struct pipe_context *pipe,
                             const struct util_debug_callback *cb)
@@ -22289,7 +22322,32 @@ gex_wgpu_create_tcs_state(struct pipe_context *pipe,
          ralloc_free(nir);
       return NULL;
    }
-
+   /* A GLSL sampler2D is a combined sampler and WebGPU has no such thing, so
+    * the derefs st/mesa lowered away have to be rebuilt here as they are for
+    * every other stage. Missing it, a tessellation shader that samples a
+    * texture reached the SPIR-V emitter with a tex instruction carrying no
+    * texture deref -- which used to abort inside emit_tex and now refuses by
+    * name. It cost the *whole* of KHR-GL45.shading_language_420pack, 282
+    * cases against llvmpipe's 329 clean, because those programs bind a
+    * sampler in every stage: even a test about UTF-8 in a comment failed, on
+    * a shader it never meant to be about.
+    *
+    * This is the third stage to need it -- compute, then geometry, now the
+    * two tessellation stages -- so it belongs with whatever creates a shader,
+    * not with the graphics path only. */
+   if (!gex_wgpu_split_combined_samplers(nir)) {
+      gex_wgpu_set_compile_error(
+         mutable_state, "gex_wgpu could not split a combined sampler");
+      ralloc_free(nir);
+      return NULL;
+   }
+   if (gex_wgpu_shader_samples_texture(nir)) {
+      gex_wgpu_set_compile_error(
+         mutable_state,
+         "gex_wgpu cannot sample a texture in the tessellation control stage");
+      ralloc_free(nir);
+      return NULL;
+   }
    struct gex_wgpu_tcs *tcs = CALLOC_STRUCT(gex_wgpu_tcs);
    if (!tcs) {
       ralloc_free(nir);
@@ -22363,7 +22421,20 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
          ralloc_free(nir);
       return NULL;
    }
-
+   /* The same split the control stage needs; see the note there. */
+   if (!gex_wgpu_split_combined_samplers(nir)) {
+      gex_wgpu_set_compile_error(
+         mutable_state, "gex_wgpu could not split a combined sampler");
+      ralloc_free(nir);
+      return NULL;
+   }
+   if (gex_wgpu_shader_samples_texture(nir)) {
+      gex_wgpu_set_compile_error(
+         mutable_state,
+         "gex_wgpu cannot sample a texture in the tessellation evaluation stage");
+      ralloc_free(nir);
+      return NULL;
+   }
    struct gex_wgpu_tes *tes = CALLOC_STRUCT(gex_wgpu_tes);
    if (!tes) {
       ralloc_free(nir);
@@ -22566,6 +22637,23 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       return NULL;
    }
 
+   /* The same combined-sampler split every other stage needs; see the note on
+    * the tessellation control stage. A geometry shader that samples a texture
+    * otherwise reaches the SPIR-V emitter with a tex instruction carrying no
+    * texture deref. */
+   if (!gex_wgpu_split_combined_samplers(nir)) {
+      gex_wgpu_set_compile_error(
+         mutable_state, "gex_wgpu could not split a combined sampler");
+      ralloc_free(nir);
+      return NULL;
+   }
+   if (gex_wgpu_shader_samples_texture(nir)) {
+      gex_wgpu_set_compile_error(
+         mutable_state,
+         "gex_wgpu cannot sample a texture in the geometry stage");
+      ralloc_free(nir);
+      return NULL;
+   }
 
    /* What this path implements, stated once. Anything else is refused here
     * rather than mis-rendered later.
