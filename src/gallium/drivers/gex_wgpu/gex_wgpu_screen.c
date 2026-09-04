@@ -654,9 +654,44 @@ gex_wgpu_storage_format_is_read_write(enum pipe_format format)
  * buffer can serve an imageCube that WGSL has no storage texture for at all.
  * A multisampled image is not: a sample index is not part of the linear
  * layout a texture copy assumes. */
+/* Whether any instruction atomically updates this image.
+ *
+ * GL's image atomics reach SPIR-V as OpImageTexelPointer, whose result lives
+ * in storage class Image -- and Tint's reader has no such class:
+ *
+ *   unknown SPIR-V storage class: 11
+ *
+ * So an atomic decides the *binding*, not just the instruction: the image has
+ * to be served through a buffer, where the atomic is an ordinary atomic on
+ * the word the texel occupies. Blender's MADefault_Surface_shadow_mesh is
+ * this, and it was EEVEE's last shader-level refusal. */
+static bool
+gex_wgpu_image_has_atomic(nir_shader *nir, unsigned slot)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_image_deref_atomic &&
+                intr->intrinsic != nir_intrinsic_image_deref_atomic_swap)
+               continue;
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            nir_variable *var =
+               deref ? nir_deref_instr_get_variable(deref) : NULL;
+            if (var && var->data.driver_location == slot)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 static bool
 gex_wgpu_image_is_packed(enum pipe_format format, bool no_read, bool no_write,
-                         enum glsl_sampler_dim dim, bool allow_read)
+                         enum glsl_sampler_dim dim, bool allow_read,
+                         bool atomic)
 {
    /* A buffer image is served here whatever its format and however it is
     * accessed -- before the write test, because a *read-only* one has nowhere
@@ -667,7 +702,17 @@ gex_wgpu_image_is_packed(enum pipe_format format, bool no_read, bool no_write,
     * apply. */
    if (dim == GLSL_SAMPLER_DIM_BUF)
       return format != PIPE_FORMAT_NONE;
-   if (no_write || format == PIPE_FORMAT_NONE)
+   if (format == PIPE_FORMAT_NONE)
+      return false;
+   /* An atomic comes here whatever the format can otherwise do, because
+    * nothing else can serve it at all -- but only where a texel *is* a
+    * 32-bit word. Below that several texels share one, and an atomic on the
+    * shared word is not an atomic on the texel: it would carry its
+    * neighbours along. GL only defines image atomics for r32i and r32ui
+    * anyway, so nothing real is lost. */
+   if (atomic)
+      return util_format_get_blocksize(format) == 4;
+   if (no_write)
       return false;
    if (!no_read && !allow_read)
       return false;
@@ -2969,26 +3014,68 @@ gex_wgpu_lower_packed_image(nir_builder *b, nir_instr *instr, void *data)
       nir_instr_remove(instr);
       return true;
    }
-   if (intr->intrinsic != nir_intrinsic_image_deref_store &&
+   const bool is_atomic =
+      intr->intrinsic == nir_intrinsic_image_deref_atomic ||
+      intr->intrinsic == nir_intrinsic_image_deref_atomic_swap;
+   if (!is_atomic && intr->intrinsic != nir_intrinsic_image_deref_store &&
        intr->intrinsic != nir_intrinsic_image_deref_load) {
-      /* An atomic on a packed image is refused by name rather than served
-       * wrongly: it would have to be an atomic on the *packed word*, which is
-       * not the same operation once several texels share one, and Tint has no
-       * SPIR-V image-texel-pointer support to fall back on either. */
       state->failed = true;
       if (!state->why[0])
          snprintf(state->why, sizeof(state->why),
-                  "gex_wgpu image '%s' (%s) is atomically updated, which the "
-                  "packed-image path cannot serve",
+                  "gex_wgpu image '%s' (%s) is used in a way the packed-image "
+                  "path cannot serve (intrinsic %u)",
                   var->name ? var->name : "(anon)",
-                  util_format_short_name(format));
+                  util_format_short_name(format),
+                  (unsigned)intr->intrinsic);
       return false;
+   }
+   if (is_atomic) {
+      /* WGSL has no floating-point atomics, and a texel that is not a whole
+       * word cannot carry one; the classifier keeps the second case away, so
+       * only the first is refused here. */
+      const nir_atomic_op op = nir_intrinsic_atomic_op(intr);
+      if (op == nir_atomic_op_fadd || op == nir_atomic_op_fmin ||
+          op == nir_atomic_op_fmax || op == nir_atomic_op_fcmpxchg) {
+         state->failed = true;
+         if (!state->why[0])
+            snprintf(state->why, sizeof(state->why),
+                     "gex_wgpu image '%s' takes a floating-point atomic, "
+                     "which WGSL has none of", var->name ? var->name
+                                                         : "(anon)");
+         return false;
+      }
    }
 
    nir_def *offset = gex_wgpu_packed_image_offset(b, block, intr->src[1].ssa,
                                                   dim, is_array);
    nir_deref_instr *texels =
       nir_build_deref_struct(b, nir_build_deref_var(b, state->data[slot]), 0);
+
+   if (is_atomic) {
+      /* One word per texel, which the classifier guaranteed, so the image
+       * atomic *is* a buffer atomic -- and the deref is built here per
+       * instruction for the reason gex_wgpu_split_atomic_derefs exists. */
+      nir_deref_instr *element =
+         nir_build_deref_array(b, texels, nir_ushr_imm(b, offset, 2));
+      const bool swap =
+         intr->intrinsic == nir_intrinsic_image_deref_atomic_swap;
+      nir_intrinsic_instr *lowered = nir_intrinsic_instr_create(
+         b->shader,
+         swap ? nir_intrinsic_deref_atomic_swap : nir_intrinsic_deref_atomic);
+      lowered->src[0] = nir_src_for_ssa(&element->def);
+      /* (deref, coord, sample, value) and (deref, coord, sample, compare,
+       * value): the operands follow the sample index either way. */
+      lowered->src[1] = nir_src_for_ssa(intr->src[3].ssa);
+      if (swap)
+         lowered->src[2] = nir_src_for_ssa(intr->src[4].ssa);
+      lowered->num_components = 1;
+      nir_intrinsic_set_atomic_op(lowered, nir_intrinsic_atomic_op(intr));
+      nir_def_init(&lowered->instr, &lowered->def, 1, 32);
+      nir_builder_instr_insert(b, &lowered->instr);
+      nir_def_rewrite_uses(&intr->def, &lowered->def);
+      nir_instr_remove(instr);
+      return true;
+   }
 
    if (intr->intrinsic == nir_intrinsic_image_deref_load) {
       /* The mirror of the store: gather the format's words and let
@@ -7078,9 +7165,31 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    nir_foreach_function_impl(impl, nir)
       nir_rematerialize_derefs_in_use_blocks_impl(impl);
    gex_wgpu_split_atomic_derefs(nir);
+   /* A dual-source fragment shader must decorate *both* its outputs with an
+    * Index, and an ordinary one must not decorate its only output at all.
+    *
+    * ntv omits the Index on index 0 because Tint turns one into
+    * `@blend_src(0)`, and WGSL allows @blend_src only on a pair -- a lone
+    * output carrying it is rejected. But omitting it on a shader that *does*
+    * have a second output at index 1 is the mirror image of the same rule:
+    *
+    *   '@blend_src' and '@location' are used on one member while another
+    *   member with '@location' doesn't use '@blend_src'
+    *
+    * which is what failed EEVEE's eevee_light_culling_debug -- two outputs at
+    * location 0, one of them index 1, exactly the dual-source form GL asks
+    * for. Detected from the variables rather than from
+    * info.fs.color_is_dual_source, because this runs after passes that
+    * rewrite the outputs and the flag is only as fresh as the last
+    * nir_shader_gather_info. */
+   bool dual_source_output = false;
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
+         dual_source_output |= var->data.index != 0;
+   }
    const struct ntv_info info = {
       .is_native_vulkan = true,
-      .omit_fragment_output_index_zero = true,
+      .omit_fragment_output_index_zero = !dual_source_output,
       .avoid_spv_khr_fma = true,
       .spirv_version = SPIRV_VERSION(1, 3),
       /* gex_wgpu has no bindless descriptor set.  Leaving this zero makes
@@ -8485,7 +8594,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
        * change does. The cost is a pass break per draw that binds one. */
       if (gex_wgpu_image_is_packed(
              format, no_read, no_write,
-             glsl_get_sampler_dim(glsl_without_array(var->type)), true)) {
+             glsl_get_sampler_dim(glsl_without_array(var->type)), true,
+             gex_wgpu_image_has_atomic(nir, var->data.driver_location))) {
          const unsigned at = shader->packed_image_count;
          /* driver_location, not gex_wgpu_image_slot: by the time this runs
           * gex_wgpu_lower_gallium_ubos has already normalised the unit into
@@ -8507,7 +8617,11 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          shader->packed_image_bindings[at] =
             GEX_WGPU_PACKED_IMAGE_FIRST_BINDING + slot;
          shader->packed_image_formats[at] = format;
-         shader->packed_image_read[at] = !no_read;
+         /* An atomic reads as well as writes, so the buffer has to be seeded
+          * from the texture even where the access flags say write-only. */
+         shader->packed_image_read[at] =
+            !no_read || gex_wgpu_image_has_atomic(nir,
+                                                  var->data.driver_location);
          ++shader->packed_image_count;
          continue;
       }
@@ -16935,8 +17049,10 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
        * dispatch can copy the texture into the buffer beforehand, so a read
        * image is servable and neither the format's absence from WebGPU's
        * storage list nor its lack of read_write access is fatal. */
-      if (gex_wgpu_image_is_packed(image_format, no_read, no_write,
-                                   glsl_get_sampler_dim(image_type), true)) {
+      if (gex_wgpu_image_is_packed(
+             image_format, no_read, no_write,
+             glsl_get_sampler_dim(image_type), true,
+             gex_wgpu_image_has_atomic(nir, var->data.driver_location))) {
          const unsigned at = compute->packed_image_count;
          const unsigned slot = var->data.driver_location;
          if (slot >= GEX_WGPU_MAX_SHADER_IMAGES) {
@@ -16950,7 +17066,10 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
          compute->packed_image_bindings[at] =
             GEX_WGPU_PACKED_IMAGE_FIRST_BINDING + slot;
          compute->packed_image_formats[at] = image_format;
-         compute->packed_image_read[at] = !no_read;
+         /* An atomic reads as well as writes; see the graphics path. */
+         compute->packed_image_read[at] =
+            !no_read || gex_wgpu_image_has_atomic(nir,
+                                                  var->data.driver_location);
          ++compute->packed_image_count;
          continue;
       }

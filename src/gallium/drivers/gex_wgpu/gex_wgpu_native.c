@@ -249,6 +249,26 @@ create_device(void)
       GEX_WANT(maxStorageBuffersPerShaderStage, 16);
       GEX_WANT(maxStorageBuffersInVertexStage, 16);
       GEX_WANT(maxStorageBuffersInFragmentStage, 16);
+      /* Storage *textures*, which WebGPU defaults to four per stage where
+       * GL 4.2 asks for eight image uniforms. Dawn says so itself when a
+       * shader wants more --
+       *
+       *   The number of storage textures (5) in the Compute stage exceeds the
+       *   maximum per-stage limit (4). This adapter supports a higher maximum
+       *
+       * -- and that "supports a higher maximum" is the whole point: nobody
+       * had asked. Blender's EEVEE binds five in one dispatch and
+       * KHR-GL44.shader_image_load_store's allTargets cases want seven. */
+      /* 8 and 16 are GEX_WGPU_MAX_SHADER_IMAGES and
+       * GEX_WGPU_MAX_SAMPLERS, which live in gex_wgpu_screen.c and are
+       * not visible here; keep them in step. */
+      GEX_WANT(maxStorageTexturesPerShaderStage, 8);
+      GEX_WANT(maxStorageTexturesInVertexStage, 8);
+      GEX_WANT(maxStorageTexturesInFragmentStage, 8);
+      /* And sampled textures, for the same reason: GL 3.3 wants sixteen per
+       * stage, which is WebGPU's default, but a stage that also splits
+       * combined samplers can name more. */
+      GEX_WANT(maxSampledTexturesPerShaderStage, 16);
       /* Eight RGBA8 draw buffers is exactly WebGPU's default 32 bytes per
        * sample, so GL 3.2's eight draw buffers of any wider format fails on
        * it. */
