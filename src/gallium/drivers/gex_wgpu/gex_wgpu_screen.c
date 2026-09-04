@@ -12623,8 +12623,17 @@ gex_wgpu_depth_upload_pipeline(struct gex_wgpu_screen *screen,
    if (screen->depth_upload[slot])
       return true;
 
+   /* `pos` is the *framebuffer* coordinate, and the staging texture holds
+    * only the box -- so the box's origin has to be subtracted to index it.
+    * Without that, any upload not at (0,0) read out of range, which WGSL's
+    * textureLoad answers with zero rather than an error, and wrote a depth of
+    * zero over exactly the region the caller was filling. A whole-level
+    * upload was correct and every partial one silently cleared its own patch,
+    * so glTexImage2D with data worked and glTexSubImage2D did not. */
    static const char wgsl[] =
       "@group(0) @binding(0) var src: texture_2d<f32>;\n"
+      "struct Placement { origin: vec2<u32> };\n"
+      "@group(0) @binding(1) var<uniform> place: Placement;\n"
       "@vertex fn vs(@builtin(vertex_index) i: u32)"
       " -> @builtin(position) vec4<f32> {\n"
       "  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0),"
@@ -12633,7 +12642,9 @@ gex_wgpu_depth_upload_pipeline(struct gex_wgpu_screen *screen,
       "}\n"
       "@fragment fn fs(@builtin(position) pos: vec4<f32>)"
       " -> @builtin(frag_depth) f32 {\n"
-      "  return textureLoad(src, vec2<i32>(i32(pos.x), i32(pos.y)), 0).r;\n"
+      "  let at = vec2<i32>(i32(pos.x), i32(pos.y))"
+      " - vec2<i32>(place.origin);\n"
+      "  return textureLoad(src, at, 0).r;\n"
       "}\n";
 
    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
@@ -12646,15 +12657,21 @@ gex_wgpu_depth_upload_pipeline(struct gex_wgpu_screen *screen,
       return false;
 
    if (!screen->depth_upload_layout) {
-      WGPUBindGroupLayoutEntry entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
-      entry.binding = 0;
-      entry.visibility = WGPUShaderStage_Fragment;
-      entry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
-      entry.texture.viewDimension = WGPUTextureViewDimension_2D;
+      WGPUBindGroupLayoutEntry entry[2];
+      entry[0] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry[0].binding = 0;
+      entry[0].visibility = WGPUShaderStage_Fragment;
+      entry[0].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+      entry[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+      entry[1] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry[1].binding = 1;
+      entry[1].visibility = WGPUShaderStage_Fragment;
+      entry[1].buffer.type = WGPUBufferBindingType_Uniform;
+      entry[1].buffer.minBindingSize = 16;
       WGPUBindGroupLayoutDescriptor layout_desc =
          WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
-      layout_desc.entryCount = 1;
-      layout_desc.entries = &entry;
+      layout_desc.entryCount = 2;
+      layout_desc.entries = entry;
       screen->depth_upload_layout =
          wgpuDeviceCreateBindGroupLayout(screen->device, &layout_desc);
    }
@@ -12985,15 +13002,31 @@ gex_wgpu_write_depth(struct gex_wgpu_context *ctx,
       ? wgpuTextureCreateView(gex_resource(resource)->texture, &target_view_desc)
       : NULL;
 
+   /* Where the staging texture sits in the level, for the shader above. */
+   WGPUBufferDescriptor place_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+   place_desc.size = 16;
+   place_desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+   WGPUBuffer place = ok ? wgpuDeviceCreateBuffer(screen->device, &place_desc)
+                         : NULL;
+   if (place) {
+      const uint32_t origin[4] = {(uint32_t)box->x, (uint32_t)box->y, 0u, 0u};
+      wgpuQueueWriteBuffer(screen->queue, place, 0, origin, sizeof(origin));
+   }
+
    WGPUBindGroup bind = NULL;
-   if (staging_view) {
-      WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
-      entry.binding = 0;
-      entry.textureView = staging_view;
+   if (staging_view && place) {
+      WGPUBindGroupEntry entry[2];
+      entry[0] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      entry[0].binding = 0;
+      entry[0].textureView = staging_view;
+      entry[1] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      entry[1].binding = 1;
+      entry[1].buffer = place;
+      entry[1].size = 16;
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = screen->depth_upload_layout;
-      bind_desc.entryCount = 1;
-      bind_desc.entries = &entry;
+      bind_desc.entryCount = 2;
+      bind_desc.entries = entry;
       bind = wgpuDeviceCreateBindGroup(screen->device, &bind_desc);
    }
    ok = ok && staging_view && target_view && bind;
@@ -13055,7 +13088,14 @@ gex_wgpu_write_depth(struct gex_wgpu_context *ctx,
       wgpuCommandEncoderRelease(encoder);
    }
 
+   if (getenv("GEX_WGPU_DEPTH_LOG"))
+      fprintf(stderr, "gex-wgpu: write_depth %s level=%u box=%d,%d,%d "
+              "%ux%ux%u stride=%u ok=%d first=%.4f\n",
+              util_format_short_name(format), level, box->x, box->y, box->z,
+              w, h, (unsigned)box->depth, src_stride, (int)ok,
+              depth ? depth[0] : -1.0f);
    if (bind) wgpuBindGroupRelease(bind);
+   if (place) wgpuBufferRelease(place);
    if (target_view) wgpuTextureViewRelease(target_view);
    if (staging_view) wgpuTextureViewRelease(staging_view);
    if (staging) wgpuTextureRelease(staging);
@@ -15484,12 +15524,12 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
           * back whatever the buffer already held, with no error anywhere. */
          const enum glsl_base_type sampled_base =
             glsl_get_sampler_result_type(type);
-         /* No depth case: shadow-ness belongs to the sampler, and the split
-          * has already taken it away -- `glsl_sampler_type_is_shadow` asserts
-          * on a texture type rather than answering false. A comparison in a
-          * compute shader would need the op scanned for, as the graphics
-          * stages do; nothing here has shown it wrong, so it is left alone
-          * rather than guessed at. */
+         /* Depth is not among these, and cannot be: shadow-ness belongs to
+          * the sampler, and the combined-sampler split has already taken it
+          * away -- `glsl_sampler_type_is_shadow` asserts on a texture type
+          * rather than answering false. It is filled in by the scan below,
+          * from the texture instructions, which is the only place a
+          * comparison still shows. */
          compute->texture_sample_types[at] =
             multisampled ? WGPUTextureSampleType_UnfilterableFloat
             : sampled_base == GLSL_TYPE_INT ? WGPUTextureSampleType_Sint
@@ -15522,16 +15562,34 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
       }
    }
 
-   /* A sampler paired with an integer texture must be non-filtering, and the
-    * pairing is by slot: the combined-sampler split gives both halves the
-    * same driver location. */
-   for (unsigned i = 0; i < compute->sampler_count; ++i) {
-      for (unsigned j = 0; j < compute->texture_count; ++j) {
-         if (compute->texture_slots[j] != compute->sampler_slots[i])
-            continue;
-         if (compute->texture_sample_types[j] == WGPUTextureSampleType_Sint ||
-             compute->texture_sample_types[j] == WGPUTextureSampleType_Uint)
-            compute->sampler_types[i] = WGPUSamplerBindingType_NonFiltering;
+   /* Which slots are compared rather than read. A depth texture sampled with
+    * a comparison needs the Depth sample type and a Comparison sampler, and a
+    * layout that says Float and Filtering instead is rejected -- so the
+    * dispatch ran and wrote nothing, which reads back as a buffer full of
+    * zeroes and looks exactly like a comparison that answered false
+    * everywhere. Only the op knows, so the op is what this reads. */
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            const nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (!tex->is_shadow)
+               continue;
+            const int at_src =
+               nir_tex_instr_src_index((nir_tex_instr *)tex,
+                                       nir_tex_src_texture_deref);
+            if (at_src < 0)
+               continue;
+            nir_variable *var = nir_deref_instr_get_variable(
+               nir_src_as_deref(tex->src[at_src].src));
+            if (!var)
+               continue;
+            for (unsigned i = 0; i < compute->texture_count; ++i)
+               if (compute->texture_slots[i] == var->data.driver_location)
+                  compute->texture_sample_types[i] =
+                     WGPUTextureSampleType_Depth;
+         }
       }
    }
 
@@ -15546,6 +15604,26 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
          if (compute->sampler_slots[j] == compute->texture_slots[i])
             compute->integer_sampled_slots |= 1u << compute->texture_slots[i];
    }
+   /* A sampler's binding type follows from the texture it is paired with, so
+    * this has to come *after* both scans above -- it ran before them once,
+    * and read sample types that had not been decided yet, which left a
+    * comparison sampler declared as an ordinary one and Dawn rejecting the
+    * pipeline for a mismatch the shader was right about. The pairing is by
+    * slot: the combined-sampler split gives both halves the same driver
+    * location. */
+   for (unsigned i = 0; i < compute->sampler_count; ++i) {
+      for (unsigned j = 0; j < compute->texture_count; ++j) {
+         if (compute->texture_slots[j] != compute->sampler_slots[i])
+            continue;
+         if (compute->texture_sample_types[j] == WGPUTextureSampleType_Sint ||
+             compute->texture_sample_types[j] == WGPUTextureSampleType_Uint)
+            compute->sampler_types[i] = WGPUSamplerBindingType_NonFiltering;
+         else if (compute->texture_sample_types[j] ==
+                  WGPUTextureSampleType_Depth)
+            compute->sampler_types[i] = WGPUSamplerBindingType_Comparison;
+      }
+   }
+
    if (compute->integer_sampled_slots) {
       /* No base module. Compiling one would fail anyway -- Tint's SPIR-V
        * reader refuses a sampled image with a non-float component type -- and
@@ -28311,9 +28389,23 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          vertex_texture_entries[entry].binding = ctx->vs->sampler_bindings[i];
          vertex_texture_entries[entry].visibility = WGPUShaderStage_Vertex;
          /* A vertex fetch is never filtered -- there are no derivatives -- so
-          * WebGPU wants the sampler named non-filtering to match. */
+          * WebGPU wants the sampler named non-filtering to match.
+          *
+          * Except a *comparison*, which is a binding type of its own and not
+          * a kind of filtering: a shadow lookup or a depth gather in a vertex
+          * shader needs `sampler_comparison`, and naming it non-filtering
+          * made Dawn reject the pipeline --
+          *
+          *   The sampler type in the shader (comparison: 1) doesn't match the
+          *   type in the layout (comparison: 0).
+          *
+          * -- which drops the draw with the render target left at its clear
+          * value, so it reads as a comparison that answered false everywhere
+          * rather than as a draw that never happened. */
          vertex_texture_entries[entry].sampler.type =
-            WGPUSamplerBindingType_NonFiltering;
+            ctx->vs->sampler_types[i] == WGPUSamplerBindingType_Comparison
+               ? WGPUSamplerBindingType_Comparison
+               : WGPUSamplerBindingType_NonFiltering;
       }
    }
    /* The fragment stage's, which may be written. */
@@ -28920,11 +29012,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          /* The non-filtering twin: the layout above names this binding
           * non-filtering because WebGPU has no filtering sampler in the
           * vertex stage, and the application's own sampler may well be
-          * LINEAR. */
+          * LINEAR. A comparison sampler is the exception, as in the layout
+          * above -- its twin has no comparison and would not match. */
+         const bool comparison =
+            ctx->vs->sampler_types[i] == WGPUSamplerBindingType_Comparison;
          entries[entry].sampler = ctx->vertex_samplers[slot]
-            ? ctx->vertex_samplers[slot]->nonfiltering
-            : gex_wgpu_default_sampler(screen,
-                                       WGPUSamplerBindingType_NonFiltering);
+            ? (comparison ? ctx->vertex_samplers[slot]->sampler
+                          : ctx->vertex_samplers[slot]->nonfiltering)
+            : gex_wgpu_default_sampler(
+                 screen, comparison ? WGPUSamplerBindingType_Comparison
+                                    : WGPUSamplerBindingType_NonFiltering);
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[3];
