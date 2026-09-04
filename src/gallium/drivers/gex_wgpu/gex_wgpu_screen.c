@@ -1094,6 +1094,16 @@ struct gex_wgpu_resource {
    /* Its strides and sizes, in a buffer of their own -- see
     * GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING for why it cannot share. */
    WGPUBuffer packed_image_header;
+   /* A texture of the *image's* format standing in for this one, for an image
+    * bound at another format in its GL format class -- see
+    * gex_wgpu_image_alias. */
+   WGPUTexture image_alias;
+   WGPUBuffer image_alias_staging;
+   enum pipe_format image_alias_format;
+   uint32_t image_alias_row_bytes;
+   uint32_t image_alias_width;
+   uint32_t image_alias_height;
+   uint32_t image_alias_layers;
 };
 
 struct gex_wgpu_query;
@@ -1350,6 +1360,14 @@ struct gex_wgpu_context {
       uint32_t row_bytes;
    } packed_copies[GEX_WGPU_MAX_SHADER_IMAGES];
    unsigned packed_copy_count;
+   /* Format-class image aliases whose bytes this pass has to copy back into
+    * their textures -- see gex_wgpu_image_alias. */
+   struct {
+      struct pipe_resource *resource;
+      unsigned level;
+      unsigned first_layer;
+   } alias_copies[GEX_WGPU_MAX_SHADER_IMAGES];
+   unsigned alias_copy_count;
    unsigned pending_draws;
    /* And the render pass they are being recorded into, held open across
     * consecutive draws that want the same attachments. One pass per draw is
@@ -4167,6 +4185,11 @@ static void gex_wgpu_packed_image_seed(struct gex_wgpu_context *ctx,
                                        enum pipe_format format);
 static bool gex_wgpu_image_is_bound(const struct pipe_image_view *iv);
 static void gex_wgpu_flush_packed_images(struct gex_wgpu_context *ctx,
+                                         WGPUCommandEncoder encoder);
+static WGPUTexture gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
+                                        const struct pipe_image_view *iv,
+                                        bool read);
+static void gex_wgpu_flush_image_aliases(struct gex_wgpu_context *ctx,
                                          WGPUCommandEncoder encoder);
 #define gex_wgpu_submit_pending(ctx) \
    gex_wgpu_submit_pending_named((ctx), __func__)
@@ -17817,6 +17840,27 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          ++count;
          continue;
       }
+      /* An image bound at another format in its class needs a texture of its
+       * own, exactly as in the draw path; see gex_wgpu_image_alias. */
+      WGPUTexture image_texture = gex_resource(iv->resource)->texture;
+      if (gex_wgpu_texture_format(gex_wgpu_stored_format(iv->format)) !=
+          gex_wgpu_texture_format(
+             gex_wgpu_stored_format(iv->resource->format))) {
+         image_texture = gex_wgpu_image_alias(
+            ctx, iv,
+            compute->image_access[i] != WGPUStorageTextureAccess_WriteOnly);
+         if (!image_texture) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: dispatch declined (no alias for "
+                       "compute image %u at %s over %s)\n", slot,
+                       util_format_short_name(iv->format),
+                       util_format_short_name(iv->resource->format));
+            }
+            goto release_views;
+         }
+      }
       WGPUTextureViewDescriptor view_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
       /* A read-only image binds as a sampled texture, so its view carries the
        * ordinary sampled format -- which exists for formats WebGPU has no
@@ -17834,9 +17878,15 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          view_desc.arrayLayerCount =
             iv->u.tex.last_layer - iv->u.tex.first_layer + 1;
       }
+      /* An alias holds one level and the bound layers, so a view of it starts
+       * at zero whatever the image named. */
+      if (image_texture != gex_resource(iv->resource)->texture) {
+         view_desc.baseMipLevel = 0;
+         if (view_desc.dimension != WGPUTextureViewDimension_3D)
+            view_desc.baseArrayLayer = 0;
+      }
       WGPUTextureView image_view =
-         wgpuTextureCreateView(gex_resource(iv->resource)->texture,
-                               &view_desc);
+         wgpuTextureCreateView(image_texture, &view_desc);
       if (!image_view) {
          /* Also declined. The view WebGPU would not make is a combination it
           * does not express -- a slice of a 3D texture bound as a
@@ -18130,6 +18180,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          /* The pass is closed and the encoder still open, which is where a
           * packed image's texels go back into its texture. */
          gex_wgpu_flush_packed_images(ctx, encoder);
+         gex_wgpu_flush_image_aliases(ctx, encoder);
       }
       WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
       if (commands) {
@@ -26424,6 +26475,215 @@ gex_wgpu_packed_image_seed(struct gex_wgpu_context *ctx,
    wgpuCommandBufferRelease(commands);
 }
 
+/* A texture of the *image's* format standing in for one bound at another
+ * format in the same GL format class.
+ *
+ * glBindImageTexture may name any format in the texture's class, so an
+ * r32ui image over an r32f texture is ordinary GL -- and the storage view
+ * the driver would build then carries a format WebGPU refuses:
+ *
+ *   The texture view format (R32Uint) is not compatible with the texture
+ *   format (R32Float)
+ *
+ * viewFormats cannot help: WebGPU accepts only the sRGB pair there, even at
+ * creation. What it does accept is a *copy*, which is bytes and no format at
+ * all, and the two formats are the same size by GL's own class rule -- so the
+ * image is bound to a texture of its own format and the bytes are moved
+ * across either side. Blender's EEVEE binds two such images per frame.
+ *
+ * The buffer hop is not avoidable: copyTextureToTexture requires equal
+ * formats, which is the very thing that differs. */
+static WGPUTexture
+gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
+                     const struct pipe_image_view *iv, bool read)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   struct pipe_resource *resource = iv->resource;
+   struct gex_wgpu_resource *gex = gex_resource(resource);
+   const unsigned level = iv->u.tex.level;
+   /* The *stored* sizes on both sides, because the copy moves bytes between
+    * the two real textures and either may be held in a wider format than its
+    * Gallium one says. GL's format classes guarantee the Gallium sizes match;
+    * the promotion can break that -- an r16g16_unorm image is stored as
+    * rg32float, eight bytes, over an r32_float texture's four -- and then
+    * there is no byte correspondence to copy. Refused by name rather than
+    * copied wrongly, which showed up as
+    *
+    *   The byte size of each row (8384) is > bytesPerRow (4352)
+    *
+    * from a copy whose two ends disagreed. */
+   const uint32_t bytes =
+      util_format_get_blocksize(gex_wgpu_stored_format(iv->format));
+   if (bytes !=
+       util_format_get_blocksize(gex_wgpu_stored_format(resource->format))) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: image alias refused: %s is stored as %u "
+                 "bytes per texel and its texture %s as %u\n",
+                 util_format_short_name(iv->format), bytes,
+                 util_format_short_name(resource->format),
+                 util_format_get_blocksize(
+                    gex_wgpu_stored_format(resource->format)));
+      }
+      return NULL;
+   }
+   const uint32_t width = MAX2(u_minify(resource->width0, level), 1);
+   const uint32_t height =
+      (resource->target == PIPE_TEXTURE_1D ||
+       resource->target == PIPE_TEXTURE_1D_ARRAY)
+      ? 1 : MAX2(u_minify(resource->height0, level), 1);
+   const uint32_t layers =
+      MAX2(iv->u.tex.last_layer - iv->u.tex.first_layer + 1, 1);
+   const uint32_t row_bytes = align(width * bytes, 256);
+
+   if (gex->image_alias &&
+       (gex->image_alias_format != iv->format ||
+        gex->image_alias_width != width || gex->image_alias_height != height ||
+        gex->image_alias_layers != layers)) {
+      wgpuTextureRelease(gex->image_alias);
+      gex->image_alias = NULL;
+      if (gex->image_alias_staging) {
+         wgpuBufferRelease(gex->image_alias_staging);
+         gex->image_alias_staging = NULL;
+      }
+   }
+   if (!gex->image_alias) {
+      WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+      desc.dimension = resource->target == PIPE_TEXTURE_3D
+         ? WGPUTextureDimension_3D : WGPUTextureDimension_2D;
+      desc.size = (WGPUExtent3D){width, height, layers};
+      desc.format = gex_wgpu_storage_texture_format(
+         gex_wgpu_stored_format(iv->format));
+      desc.mipLevelCount = 1;
+      desc.sampleCount = 1;
+      desc.usage = WGPUTextureUsage_StorageBinding |
+                   WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+      if (desc.format == WGPUTextureFormat_Undefined)
+         return NULL;
+      gex->image_alias = wgpuDeviceCreateTexture(screen->device, &desc);
+      if (!gex->image_alias)
+         return NULL;
+      WGPUBufferDescriptor staging = WGPU_BUFFER_DESCRIPTOR_INIT;
+      staging.size = (uint64_t)row_bytes * height * layers;
+      staging.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+      gex->image_alias_staging =
+         wgpuDeviceCreateBuffer(screen->device, &staging);
+      if (!gex->image_alias_staging) {
+         wgpuTextureRelease(gex->image_alias);
+         gex->image_alias = NULL;
+         return NULL;
+      }
+      gex->image_alias_format = iv->format;
+      gex->image_alias_row_bytes = row_bytes;
+      gex->image_alias_width = width;
+      gex->image_alias_height = height;
+      gex->image_alias_layers = layers;
+   }
+
+   /* Seeded whatever the access says, and *not* only when the image is read.
+    * The copy back below writes the whole subresource, so a texel the shader
+    * never stores to would take the alias's contents rather than keeping its
+    * own -- and GL is explicit that a store touches only the texel it names.
+    * A write-only image over a texture with content is exactly the case that
+    * exposed it: the two stored texels were right and every other one came
+    * back zero.
+    *
+    * Before the copy back is registered, for the reason
+    * gex_wgpu_packed_image_bind spells out: this submits, and a submit closes
+    * the open pass and drains the copies it owes. */
+   (void)read;
+   if (gex->texture) {
+      gex_wgpu_submit_pending(ctx);
+      WGPUCommandEncoder encoder =
+         wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+      if (encoder) {
+         WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+         from.texture = gex->texture;
+         from.mipLevel = level;
+         from.origin = (WGPUOrigin3D){0, 0, iv->u.tex.first_layer};
+         from.aspect = WGPUTextureAspect_All;
+         WGPUTexelCopyBufferInfo through = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+         through.buffer = gex->image_alias_staging;
+         through.layout.offset = 0;
+         through.layout.bytesPerRow = row_bytes;
+         through.layout.rowsPerImage = height;
+         const WGPUExtent3D extent = {width, height, layers};
+         wgpuCommandEncoderCopyTextureToBuffer(encoder, &from, &through,
+                                               &extent);
+         WGPUTexelCopyTextureInfo into = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+         into.texture = gex->image_alias;
+         into.mipLevel = 0;
+         into.origin = (WGPUOrigin3D){0, 0, 0};
+         into.aspect = WGPUTextureAspect_All;
+         wgpuCommandEncoderCopyBufferToTexture(encoder, &through, &into,
+                                               &extent);
+         WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
+         wgpuCommandEncoderRelease(encoder);
+         if (commands) {
+            gex_wgpu_queue_submit(screen, 1, &commands);
+            wgpuCommandBufferRelease(commands);
+         }
+      }
+   }
+
+   for (unsigned i = 0; i < ctx->alias_copy_count; ++i) {
+      if (ctx->alias_copies[i].resource == resource &&
+          ctx->alias_copies[i].level == level &&
+          ctx->alias_copies[i].first_layer == iv->u.tex.first_layer)
+         return gex->image_alias;
+   }
+   if (ctx->alias_copy_count < ARRAY_SIZE(ctx->alias_copies)) {
+      const unsigned at = ctx->alias_copy_count++;
+      ctx->alias_copies[at].resource = resource;
+      ctx->alias_copies[at].level = level;
+      ctx->alias_copies[at].first_layer = iv->u.tex.first_layer;
+   }
+   return gex->image_alias;
+}
+
+/* The aliases a closing pass or a finished dispatch owes their textures. */
+static void
+gex_wgpu_flush_image_aliases(struct gex_wgpu_context *ctx,
+                             WGPUCommandEncoder encoder)
+{
+   if (!ctx->alias_copy_count)
+      return;
+   if (!encoder) {
+      ctx->alias_copy_count = 0;
+      return;
+   }
+   for (unsigned i = 0; i < ctx->alias_copy_count; ++i) {
+      struct gex_wgpu_resource *gex =
+         gex_resource(ctx->alias_copies[i].resource);
+      if (!gex->image_alias || !gex->texture || !gex->image_alias_staging)
+         continue;
+      const WGPUExtent3D extent = {gex->image_alias_width,
+                                   gex->image_alias_height,
+                                   gex->image_alias_layers};
+      WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+      from.texture = gex->image_alias;
+      from.mipLevel = 0;
+      from.origin = (WGPUOrigin3D){0, 0, 0};
+      from.aspect = WGPUTextureAspect_All;
+      WGPUTexelCopyBufferInfo through = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+      through.buffer = gex->image_alias_staging;
+      through.layout.offset = 0;
+      through.layout.bytesPerRow = gex->image_alias_row_bytes;
+      through.layout.rowsPerImage = gex->image_alias_height;
+      wgpuCommandEncoderCopyTextureToBuffer(encoder, &from, &through, &extent);
+      WGPUTexelCopyTextureInfo into = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+      into.texture = gex->texture;
+      into.mipLevel = ctx->alias_copies[i].level;
+      into.origin =
+         (WGPUOrigin3D){0, 0, ctx->alias_copies[i].first_layer};
+      into.aspect = WGPUTextureAspect_All;
+      wgpuCommandEncoderCopyBufferToTexture(encoder, &through, &into, &extent);
+      ++gex->write_serial;
+   }
+   ctx->alias_copy_count = 0;
+}
+
 /* The copies a closing pass or a finished dispatch owes its packed images'
  * textures. The encoder is the caller's: a draw records onto the one the
  * render pass was closed on, a dispatch onto its own. */
@@ -26481,6 +26741,7 @@ gex_wgpu_end_pass(struct gex_wgpu_context *ctx)
    /* After the pass is closed and while the encoder is still open, which is
     * the only window a texture copy can be recorded in. */
    gex_wgpu_flush_packed_images(ctx, ctx->pending_encoder);
+   gex_wgpu_flush_image_aliases(ctx, ctx->pending_encoder);
 }
 
 /* ARB_buffer_storage: hand the device whatever has been written into a
@@ -31330,6 +31591,27 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                     util_format_short_name(iv->resource->format),
                     util_format_short_name(
                        gex_wgpu_stored_format(iv->resource->format)));
+         /* An image bound at another format in its class needs a texture of
+          * its own; see gex_wgpu_image_alias. */
+         WGPUTexture image_texture = gex_resource(iv->resource)->texture;
+         if (gex_wgpu_texture_format(gex_wgpu_stored_format(iv->format)) !=
+             gex_wgpu_texture_format(
+                gex_wgpu_stored_format(iv->resource->format))) {
+            image_texture = gex_wgpu_image_alias(
+               ctx, iv,
+               ctx->fs->image_access[i] != WGPUStorageTextureAccess_WriteOnly);
+            if (!image_texture) {
+               static bool said;
+               if (!said) {
+                  said = true;
+                  fprintf(stderr, "gex-wgpu: draw declined (no alias for "
+                          "fragment image %u at %s over %s)\n", slot,
+                          util_format_short_name(iv->format),
+                          util_format_short_name(iv->resource->format));
+               }
+               return;
+            }
+         }
          WGPUTextureViewDescriptor desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
          /* The sampled format for a read-only image; see the compute path. */
          desc.format =
@@ -31344,8 +31626,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             desc.arrayLayerCount =
                iv->u.tex.last_layer - iv->u.tex.first_layer + 1;
          }
-         WGPUTextureView view =
-            wgpuTextureCreateView(gex_resource(iv->resource)->texture, &desc);
+         /* An alias holds one level and the bound layers, so a view of it
+          * starts at zero whatever the image named. */
+         if (image_texture != gex_resource(iv->resource)->texture) {
+            desc.baseMipLevel = 0;
+            if (desc.dimension != WGPUTextureViewDimension_3D)
+               desc.baseArrayLayer = 0;
+         }
+         WGPUTextureView view = wgpuTextureCreateView(image_texture, &desc);
          if (!view) {
             /* A view WebGPU will not make is a combination it cannot express
              * -- one slice of a 3D texture bound as a non-layered image2D is
