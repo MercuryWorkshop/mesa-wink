@@ -59,6 +59,16 @@ struct ntv_info {
    /* WebGPU's SPIR-V ingest rejects SPV_KHR_fma.  Use the equivalent core
     * GLSL.std.450 Fma extended instruction for nir_op_ffma instead. */
    bool avoid_spv_khr_fma;
+   /* Store gl_SampleMask as a scalar rather than constructing the
+    * single-element array Vulkan mandates.
+    *
+    * WGSL's @builtin(sample_mask) is a u32 *scalar*, so Tint flattens the
+    * SPIR-V array declaration to one -- and then rejects the array-valued
+    * store that Vulkan requires against it: "cannot assign 'array<i32, 1>'
+    * to 'i32'". The declaration may stay an array; only the store has to be
+    * scalar. Vulkan consumers must leave this false.
+    */
+   bool sample_mask_scalar;
    bool have_shader_viewport_index_layer;
    bool have_shader_output_layer;
    struct {

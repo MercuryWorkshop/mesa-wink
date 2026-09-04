@@ -7352,6 +7352,9 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
       .is_native_vulkan = true,
       .omit_fragment_output_index_zero = !dual_source_output,
       .avoid_spv_khr_fma = true,
+      /* WGSL's sample_mask builtin is a scalar, so the single-element array
+       * Vulkan wants stored into gl_SampleMask cannot be assigned to it. */
+      .sample_mask_scalar = true,
       .spirv_version = SPIRV_VERSION(1, 3),
       /* gex_wgpu has no bindless descriptor set.  Leaving this zero makes
        * nir_to_spirv treat every ordinary set-0 sampler as bindless and index

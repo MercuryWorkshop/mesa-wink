@@ -1028,8 +1028,17 @@ emit_output(struct ntv_context *ctx, struct nir_variable *var)
 {
    SpvId var_type = get_glsl_type(ctx, var->type, false);
 
-   /* SampleMask is always an array in spirv */
-   if (ctx->stage == MESA_SHADER_FRAGMENT && var->data.location == FRAG_RESULT_SAMPLE_MASK)
+   /* SampleMask is always an array in spirv, so wrap a *scalar* one -- but
+    * only then. GLSL declares gl_SampleMask as int[], and when that survives
+    * into NIR as an array this wrapped it a second time: the variable came
+    * out as array<array<i32,1>,1>, and a store to element zero then tried to
+    * put the composite-constructed array into the i32 that element pointer
+    * addresses. Tint says "cannot assign 'array<i32, 1>' to 'i32'", which
+    * cost 117 of KHR-GL45.sample_variables' 190 cases against a reference
+    * that passes all of them. */
+   if (ctx->stage == MESA_SHADER_FRAGMENT &&
+       var->data.location == FRAG_RESULT_SAMPLE_MASK &&
+       !glsl_type_is_array(var->type))
       ctx->sample_mask_type = var_type = spirv_builder_type_array(&ctx->builder, var_type, emit_uint_const(ctx, 32, 1));
    SpvId pointer_type = spirv_builder_type_pointer(&ctx->builder,
                                                    SpvStorageClassOutput,
@@ -2735,9 +2744,31 @@ emit_store_deref(struct ntv_context *ctx, nir_intrinsic_instr *intr)
    SpvId result;
    if (ctx->stage == MESA_SHADER_FRAGMENT &&
        var->data.mode == nir_var_shader_out &&
-       var->data.location == FRAG_RESULT_SAMPLE_MASK) {
+       var->data.location == FRAG_RESULT_SAMPLE_MASK &&
+       !glsl_type_is_array(var->type)) {
       src = emit_bitcast(ctx, type, src);
-      /* SampleMask is always an array in spirv, so we need to construct it into one */
+      if (ctx->sinfo->sample_mask_scalar) {
+         /* Store the scalar through element zero rather than assigning the
+          * whole array.
+          *
+          * The declaration has to stay the array Vulkan mandates -- a scalar
+          * one is rejected outright, "BuiltIn SampleMask variable needs to be
+          * a 32-bit int array" -- but WGSL's @builtin(sample_mask) is a u32
+          * scalar, so Tint flattens that array and then will not take an
+          * array-valued store against it: "cannot assign 'array<i32, 1>' to
+          * 'i32'". An access chain to element zero is valid SPIR-V and is
+          * what the flattened builtin accepts, so it satisfies both. */
+         SpvId member_ptr_type =
+            spirv_builder_type_pointer(&ctx->builder, SpvStorageClassOutput,
+                                       type);
+         SpvId zero = emit_uint_const(ctx, 32, 0);
+         SpvId member = spirv_builder_emit_access_chain(&ctx->builder,
+                                                        member_ptr_type, ptr,
+                                                        &zero, 1);
+         spirv_builder_emit_store(&ctx->builder, member, src, false);
+         return;
+      }
+      /* SampleMask is always an array in spirv, so we need to construct it into one. */
       result = spirv_builder_emit_composite_construct(&ctx->builder, ctx->sample_mask_type, &src, 1);
    } else {
       if (ptype == stype)
