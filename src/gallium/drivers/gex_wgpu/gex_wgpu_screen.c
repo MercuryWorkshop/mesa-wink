@@ -2358,6 +2358,57 @@ static void gex_wgpu_buffer_subdata(struct pipe_context *pipe,
                                     unsigned usage, unsigned offset,
                                     unsigned size, const void *data);
 
+/* A 64-bit uniform load, split into the pairs of 32-bit words the rest of the
+ * pipeline already speaks.
+ *
+ * WGSL has no f64 or i64, and st has already turned every double *operation*
+ * into software 32-bit arithmetic -- but a `double` in a uniform block is
+ * still loaded as one 64-bit value, and gex_wgpu_lower_ubo_load takes 32-bit
+ * loads only. It refused the shader, which fails the link, so every
+ * KHR-GL45.gpu_shader_fp64 builtin case on a `double` or `dvec` lost its
+ * program outright. The `dmat` variants passed throughout, which is what said
+ * this was about the load and not about the arithmetic.
+ *
+ * Each component becomes a two-word load packed back into a 64-bit value.
+ * That looks like it reintroduces the thing WGSL cannot have, and it does not:
+ * the consumers are already unpack_64_2x32 pairs from the doubles lowering, so
+ * the optimiser folds pack straight into unpack and nothing 64-bit is left.
+ * The late sweep in gex_wgpu_compile_nir is what guarantees that.
+ *
+ * One component at a time, rather than one wide load: a dvec4 is eight words
+ * and a NIR load carries at most four.
+ */
+static bool
+gex_wgpu_split_64bit_ubo_load(nir_builder *b, nir_instr *instr, void *data)
+{
+   (void)data;
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic != nir_intrinsic_load_ubo || intr->def.bit_size != 64)
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+   const unsigned components = intr->def.num_components;
+   if (components > 4)
+      return false;
+   nir_def *packed[4];
+   for (unsigned c = 0; c < components; ++c) {
+      nir_def *offset =
+         nir_iadd_imm(b, intr->src[1].ssa, (uint64_t)c * 8);
+      /* Two words, eight-byte aligned: std140 gives a double at least that,
+       * and the vec4-backed lowering below only needs to know which half of
+       * the vec4 the pair starts in. */
+      nir_def *words = nir_load_ubo(b, 2, 32, intr->src[0].ssa, offset,
+                                    .align_mul = 8, .align_offset = 0,
+                                    .range_base = 0, .range = ~0u);
+      packed[c] = nir_pack_64_2x32_split(b, nir_channel(b, words, 0),
+                                         nir_channel(b, words, 1));
+   }
+   nir_def_replace(&intr->def, nir_vec(b, packed, components));
+   return true;
+}
+
 static bool
 gex_wgpu_lower_ubo_load(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -3951,6 +4002,9 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
          break;
       }
    }
+   /* Before the lowering below, which takes 32-bit loads only. */
+   nir_shader_instructions_pass(nir, gex_wgpu_split_64bit_ubo_load,
+                                nir_metadata_control_flow, NULL);
    nir_shader_instructions_pass(
       nir, gex_wgpu_lower_ubo_load, nir_metadata_control_flow, &state);
    if (state.failed) {
