@@ -2566,8 +2566,17 @@ gex_wgpu_lower_ssbo_access(nir_builder *b, nir_instr *instr, void *data)
          return false;
       }
       const unsigned atomic_slot = nir_src_as_uint(intr->src[0]);
+      /* Through the get-or-create, like the load and store paths: an atomic
+       * counter reaches this as an ssbo atomic whose block st/mesa lowered
+       * away, so the variable is gone and only the access is left. Writable,
+       * because an atomic both reads and writes.
+       *
+       * KHR-GL44's shader_atomic_counters.basic-usage-cs is this, and its
+       * message -- "a 32-bit atomic on storage block 1, which this shader
+       * does not declare" -- named the same hole the load path did. */
       nir_variable *atomic_block =
-         gex_wgpu_ssbo_block(b->shader, atomic_slot);
+         gex_wgpu_ssbo_block_get(b->shader, atomic_slot,
+                                 state->descriptor_set, true);
       if (!atomic_block || intr->def.bit_size != 32) {
          state->failed = true;
          if (!state->why[0])
