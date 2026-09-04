@@ -18140,7 +18140,6 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       ++count;
    }
 
-   gex_wgpu_trace_buffer_aliasing("compute", entries, bindings, count);
    /* Read-only storage bindings that overlap a writable one on the same
     * buffer, which WebGPU refuses; each takes a copy instead. The resources
     * are collected here and the copies recorded once there is an encoder,
@@ -18162,6 +18161,12 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          continue;
       /* Which Gallium resource this binding came from. Only the shader
        * buffers can alias this way; a uniform block is never writable. */
+      /* Which Gallium resource this binding came from. Every kind of
+       * read-only buffer binding a dispatch has is searched, not just the
+       * shader buffers: a samplerBuffer is a read-only storage binding too,
+       * and so is a packed image's header, and either can be the read-only
+       * half of the collision. Looking only at the shader buffers left one
+       * case unfixed with nothing to show which. */
       struct pipe_resource *found = NULL;
       for (unsigned b = 0; b < compute->binding_count && !found; ++b) {
          if (compute->bindings[b].kind != GEX_WGPU_COMPUTE_STORAGE)
@@ -18171,6 +18176,19 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
                .buffer;
          if (candidate && gex_resource(candidate)->buffer ==
                              bindings[i].buffer)
+            found = candidate;
+      }
+      for (unsigned b = 0; b < GEX_WGPU_MAX_SAMPLERS && !found; ++b) {
+         const struct pipe_sampler_view *view = ctx->compute_sampler_views[b];
+         if (view && view->texture && view->target == PIPE_BUFFER &&
+             gex_resource(view->texture)->buffer == bindings[i].buffer)
+            found = view->texture;
+      }
+      for (unsigned b = 0; b < GEX_WGPU_MAX_SHADER_IMAGES && !found; ++b) {
+         struct pipe_resource *candidate =
+            ctx->shader_images[MESA_SHADER_COMPUTE][b].resource;
+         if (candidate && candidate->target == PIPE_BUFFER &&
+             gex_resource(candidate)->buffer == bindings[i].buffer)
             found = candidate;
       }
       if (!found)
@@ -18183,6 +18201,9 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       snapshot_at[snapshot_count] = i;
       ++snapshot_count;
    }
+   /* After the rewrite, so what it reports is what is actually submitted --
+    * reporting the state before it just names every case the fix handles. */
+   gex_wgpu_trace_buffer_aliasing("compute", entries, bindings, count);
    if (getenv("GEX_WGPU_COMPUTE_LAYOUT_TRACE")) {
       unsigned storage = 0, uniform = 0;
       for (unsigned i = 0; i < count; ++i) {
@@ -22890,6 +22911,39 @@ gex_wgpu_group(WGPUDevice device, WGPUBindGroupLayout layout,
       entries[i].offset = group->offset[i];
       entries[i].size = group->size[i];
    }
+   /* The driver's own passes can collide the same way an application's
+    * bindings can -- one buffer bound read-only for its vertex data and
+    * writable for a capture output is exactly the shape WebGPU refuses, and
+    * its message names neither binding. Reported here rather than fixed
+    * because these bindings carry WGPUBuffers and not resources, so there is
+    * nothing to take a snapshot *of* without threading the resource through;
+    * naming the pass is what the next attempt needs first. */
+   if (getenv("GEX_WGPU_ALIAS_TRACE")) {
+      for (unsigned i = 0; i < group->count; ++i) {
+         if (!group->buffer[i] || !(group->storage_mask & (1u << i)))
+            continue;
+         for (unsigned j = i + 1; j < group->count; ++j) {
+            if (group->buffer[j] != group->buffer[i] ||
+                !(group->storage_mask & (1u << j)))
+               continue;
+            if (!!(group->readonly_mask & (1u << i)) ==
+                !!(group->readonly_mask & (1u << j)))
+               continue;
+            const uint64_t a_end = group->offset[i] + group->size[i];
+            const uint64_t b_end = group->offset[j] + group->size[j];
+            if (group->offset[i] >= b_end || group->offset[j] >= a_end)
+               continue;
+            fprintf(stderr, "gex-alias: internal pass buffer %p at bindings "
+                    "%u (%s) and %u (%s)\n", (void *)group->buffer[i],
+                    group->binding[i],
+                    (group->readonly_mask & (1u << i)) ? "read-only"
+                                                       : "writable",
+                    group->binding[j],
+                    (group->readonly_mask & (1u << j)) ? "read-only"
+                                                       : "writable");
+         }
+      }
+   }
    WGPUBindGroupDescriptor desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
    desc.layout = layout;
    desc.entryCount = group->count;
@@ -26662,6 +26716,15 @@ gex_wgpu_trace_buffer_aliasing(const char *where,
          const uint64_t b_end = bindings[j].offset + bindings[j].size;
          if (bindings[i].offset >= b_end || bindings[j].offset >= a_end)
             continue;                        /* disjoint ranges are allowed */
+         /* Only a *writable* binding conflicts. Uniform beside
+          * ReadOnlyStorage is allowed, and reporting it -- which the first
+          * version of this did, on nothing more than the types differing --
+          * named the driver's own draw-parameters block sitting in the same
+          * constant ring as a uniform buffer, which is fine and was never
+          * the error being chased. */
+         if (layout[i].buffer.type != WGPUBufferBindingType_Storage &&
+             layout[j].buffer.type != WGPUBufferBindingType_Storage)
+            continue;
          if (layout[i].buffer.type == layout[j].buffer.type)
             continue;
          fprintf(stderr, "gex-alias: %s buffer %p at bindings %u (type %u, "
@@ -31721,6 +31784,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          gex_wgpu_add_dynamic_offset(&dynamic[1], GEX_WGPU_DRAW_PARAMS_BINDING,
                                      draw_params_offset);
       }
+      gex_wgpu_trace_buffer_aliasing("vertex", vertex_layout_entries, entries,
+                                     vertex_group_count);
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[1];
       bind_desc.entryCount = vertex_group_count;
