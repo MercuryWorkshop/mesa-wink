@@ -16906,6 +16906,38 @@ gex_wgpu_set_active_query_state(struct pipe_context *pipe, bool enable)
    (void)enable;
 }
 
+/* GL_KHR_robustness' reset query, which is core in GL 4.5.
+ *
+ * Advertising it is what the *CTS* needs before it will start: the GL45
+ * package's framework creates its context through GLX and aborts outright
+ * with `FATAL ERROR: GLX extension "GLX_ARB_create_context_robustness" not
+ * supported` if it is missing -- and Mesa gates that extension on this cap
+ * alone (see __glXEnableDirectExtension in src/glx/glxext.c). So the whole of
+ * KHR-GL45 was unrunnable against this driver, silently, which is worse than
+ * any individual case failing. Real applications ask for a robust context
+ * too, and got the same refusal.
+ *
+ * It always answers PIPE_NO_RESET, and that is deliberate rather than
+ * unfinished. The tempting mapping is `ctx->failed` -- the driver's latched
+ * refusal -- but st/mesa turns a reported reset into a *lost* context:
+ * _mesa_set_context_lost_dispatch replaces the whole dispatch table and every
+ * later GL call returns GL_CONTEXT_LOST and does nothing. That would promote
+ * every soft refusal into a dead context, which is the failure this driver
+ * has already been bitten by once and deliberately avoids; a refused draw
+ * must not latch.
+ *
+ * Nothing is being hidden by that: this backend is not told when Dawn loses a
+ * device -- there is no lost-future wired up -- so "no reset has been
+ * observed" is the true answer and not a placeholder. If that notification is
+ * ever plumbed through, this is the one place it belongs.
+ */
+static enum pipe_reset_status
+gex_wgpu_get_device_reset_status(struct pipe_context *pipe)
+{
+   (void)pipe;
+   return PIPE_NO_RESET;
+}
+
 static void
 gex_wgpu_set_debug_callback(struct pipe_context *pipe,
                             const struct util_debug_callback *cb)
@@ -22205,6 +22237,7 @@ gex_wgpu_create_tcs_state(struct pipe_context *pipe,
          ralloc_free(nir);
       return NULL;
    }
+
    struct gex_wgpu_tcs *tcs = CALLOC_STRUCT(gex_wgpu_tcs);
    if (!tcs) {
       ralloc_free(nir);
@@ -22278,6 +22311,7 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
          ralloc_free(nir);
       return NULL;
    }
+
    struct gex_wgpu_tes *tes = CALLOC_STRUCT(gex_wgpu_tes);
    if (!tes) {
       ralloc_free(nir);
@@ -22479,6 +22513,7 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
          ralloc_free(nir);
       return NULL;
    }
+
 
    /* What this path implements, stated once. Anything else is refused here
     * rather than mis-rendered later.
@@ -33981,6 +34016,7 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.get_query_result_resource =
       gex_wgpu_get_query_result_resource;
    ctx->base.set_debug_callback = gex_wgpu_set_debug_callback;
+   ctx->base.get_device_reset_status = gex_wgpu_get_device_reset_status;
    ctx->base.create_stream_output_target = gex_wgpu_create_stream_output_target;
    ctx->base.stream_output_target_destroy = gex_wgpu_stream_output_target_destroy;
    ctx->base.set_stream_output_targets = gex_wgpu_set_stream_output_targets;
@@ -34327,6 +34363,10 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    caps->draw_indirect = true;
    /* ARB_timer_query, one of the four things GL 3.3 wants. CPU-timed -- see
     * the note in gex_wgpu_create_query. */
+   /* See gex_wgpu_get_device_reset_status: this cap is what Mesa gates
+    * GLX_ARB_create_context_robustness on, and without it the GL45 CTS
+    * refuses to create a context at all. */
+   caps->device_reset_status_query = true;
    caps->query_timestamp = true;
    caps->query_time_elapsed = true;
    caps->conditional_render = true;
