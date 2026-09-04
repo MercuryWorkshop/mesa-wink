@@ -817,6 +817,41 @@ gex_wgpu_topology(enum mesa_prim mode)
  * maxSamplersPerShaderStage are both exactly that. The slot masks below are
  * sized to match; an eight-bit mask silently dropped slots 8 and up. */
 #define GEX_WGPU_MAX_SAMPLERS 16
+
+/* The three stages this driver runs as compute passes and which therefore
+ * keep their sampler state in gex_wgpu_context::stage_sampler_views. */
+#define GEX_WGPU_COMPUTE_STAGES 3
+
+static inline int
+gex_wgpu_compute_stage_index(mesa_shader_stage stage)
+{
+   switch (stage) {
+   case MESA_SHADER_GEOMETRY:   return 0;
+   case MESA_SHADER_TESS_CTRL:  return 1;
+   case MESA_SHADER_TESS_EVAL:  return 2;
+   default:                     return -1;
+   }
+}
+
+/* The textures a compute-emulated stage samples, and how to bind them.
+ *
+ * GL lets every stage sample. The geometry and both tessellation stages run
+ * here as compute passes, so their textures are numbered in the compute range
+ * (the split stamps that) and bound into the dispatch's single group. This
+ * collects what the module declared, and gex_wgpu_bind_stage_textures below
+ * turns it into bind group entries -- one pair of helpers for three stages
+ * rather than a fourth copy of the per-stage arrays that gex_wgpu_shader and
+ * gex_wgpu_compute_state already each carry.
+ */
+struct gex_wgpu_stage_textures {
+   unsigned count;
+   uint8_t slots[GEX_WGPU_MAX_SAMPLERS];
+   uint32_t bindings[GEX_WGPU_MAX_SAMPLERS];
+   uint32_t sampler_bindings[GEX_WGPU_MAX_SAMPLERS];
+   WGPUTextureViewDimension dimensions[GEX_WGPU_MAX_SAMPLERS];
+   WGPUTextureSampleType sample_types[GEX_WGPU_MAX_SAMPLERS];
+};
+
 /* Spelled as a literal above because it is used in binding arithmetic before
  * this point; kept honest here rather than by hoping. */
 static_assert(GEX_WGPU_MAX_BUFFER_TEXTURES == GEX_WGPU_MAX_SAMPLERS,
@@ -1610,6 +1645,14 @@ struct gex_wgpu_context {
     * other stage -- see the note on gex_wgpu_compute_state::texture_count. */
    struct gex_wgpu_sampler *compute_samplers[GEX_WGPU_MAX_SAMPLERS];
    struct pipe_sampler_view *compute_sampler_views[GEX_WGPU_MAX_SAMPLERS];
+   /* And the geometry and two tessellation stages'. GL lets every stage
+    * sample; those three run here as compute passes, so their textures are
+    * numbered in the compute range and bound into the dispatch's one group.
+    * Indexed by gex_wgpu_compute_stage_index, not by mesa_shader_stage. */
+   struct gex_wgpu_sampler
+      *stage_samplers[GEX_WGPU_COMPUTE_STAGES][GEX_WGPU_MAX_SAMPLERS];
+   struct pipe_sampler_view
+      *stage_sampler_views[GEX_WGPU_COMPUTE_STAGES][GEX_WGPU_MAX_SAMPLERS];
 };
 
 /* How one draw expands its points into quads. Kept here rather than beside
@@ -1979,6 +2022,9 @@ struct gex_wgpu_capture_layout {
  * equal indices, which is a degenerate triangle that rasterizes nothing.
  */
 struct gex_wgpu_gs {
+   /* The sampled textures this geometry shader declares; see
+    * gex_wgpu_collect_stage_textures. */
+   struct gex_wgpu_stage_textures textures;
    nir_shader *nir;
    /* What the geometry shader reads from the vertex shader, and what it
     * writes for the rasterization draw. */
@@ -2041,6 +2087,9 @@ struct gex_wgpu_gs {
  * in separate buffers: a per-patch value is written once per patch and read by
  * every generated vertex of it. */
 struct gex_wgpu_tcs {
+   /* The sampled textures this tessellation control shader declares; see
+    * gex_wgpu_collect_stage_textures. */
+   struct gex_wgpu_stage_textures textures;
    struct gex_wgpu_varying_layout inputs;
    struct gex_wgpu_varying_layout outputs;
    struct gex_wgpu_varying_layout patch_outputs;
@@ -2076,6 +2125,9 @@ struct gex_wgpu_tes_variant {
 };
 
 struct gex_wgpu_tes {
+   /* The sampled textures this tessellation evaluation shader declares; see
+    * gex_wgpu_collect_stage_textures. */
+   struct gex_wgpu_stage_textures textures;
    struct gex_wgpu_varying_layout inputs;
    struct gex_wgpu_varying_layout patch_inputs;
    struct gex_wgpu_varying_layout outputs;
@@ -8009,8 +8061,13 @@ gex_wgpu_split_combined_samplers(nir_shader *nir)
        * numbered above the ranges the blocks and images already use. */
       const unsigned texture_set =
          nir->info.stage == MESA_SHADER_VERTEX ? 3 : 0;
+      /* The geometry and tessellation stages are compiled as compute modules
+       * and dispatched with one bind group, so they number their textures in
+       * the compute range too. Stamping them from zero put them on top of the
+       * pass's own blocks and of the shader's constant buffers. */
       const unsigned binding_base =
-         nir->info.stage == MESA_SHADER_COMPUTE
+         nir->info.stage == MESA_SHADER_COMPUTE ||
+         gex_wgpu_compute_stage_index(nir->info.stage) >= 0
             ? GEX_WGPU_COMPUTE_TEXTURE_FIRST_BINDING : 0;
       for (unsigned u = 0; u < units; ++u) {
          const unsigned unit = slot + u;
@@ -8657,7 +8714,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          /* nir_opt_access marks a block the shader only reads, and the
           * SPIR-V emitter turns that into a read-only declaration. */
          if (var->data.access & ACCESS_NON_WRITEABLE)
-            shader->ssbo_readonly_mask |= 1u << shader->ssbo_count;
+            shader->ssbo_readonly_mask |= UINT64_C(1) << shader->ssbo_count;
          ++shader->ssbo_count;
          continue;
       }
@@ -8717,7 +8774,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       shader->ubo_required[shader->ubo_count] =
          gex_wgpu_block_declared_size(var);
       if (var->data.mode == nir_var_mem_ssbo)
-         shader->ubo_storage_mask |= 1u << shader->ubo_count;
+         shader->ubo_storage_mask |= UINT64_C(1) << shader->ubo_count;
       ++shader->ubo_count;
    }
    /* Shader images, carried with their format, access and dimension because
@@ -9888,7 +9945,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
        * with a reversed swizzle then answered for every texelFetch after it,
        * whatever its texture or swizzle: 225 of KHR-GL33.texture_swizzle's
        * functional cases came back with the first case's colours. */
-      sampler_mask |= 1u << slot;
+      sampler_mask |= UINT64_C(1) << slot;
       /* The stand-in needs none of the checks below: they are all about
        * reconciling a real texture's target with a real sampler's state, and
        * an unbound slot has neither. */
@@ -9970,7 +10027,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
                     memcmp(cached->stipple, ctx->poly_stipple,
                            sizeof(cached->stipple)) == 0);
       for (unsigned slot = 0; match && slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
-         if (!(sampler_mask & (1u << slot)))
+         if (!(sampler_mask & (UINT64_C(1) << slot)))
             continue;
          const struct pipe_sampler_view *view = ctx->sampler_views[slot];
          const uint8_t swizzle[4] = {
@@ -10118,7 +10175,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points)
    cached->poly_stipple = want_stipple;
    memcpy(cached->stipple, ctx->poly_stipple, sizeof(cached->stipple));
    for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
-      if (!(sampler_mask & (1u << slot)))
+      if (!(sampler_mask & (UINT64_C(1) << slot)))
          continue;
       const struct pipe_sampler_view *view = ctx->sampler_views[slot];
       if (ctx->samplers[slot])
@@ -14269,8 +14326,9 @@ gex_wgpu_bind_sampler_states(struct pipe_context *pipe,
       return;
    }
 
+   const int compute_stage = gex_wgpu_compute_stage_index(shader);
    if (shader != MESA_SHADER_FRAGMENT && shader != MESA_SHADER_VERTEX &&
-       shader != MESA_SHADER_COMPUTE) {
+       shader != MESA_SHADER_COMPUTE && compute_stage < 0) {
       /* Clearing another stage's samplers still has to succeed: cso_context
        * unbinds every stage whenever a context is bound or torn down, and
        * refusing that would fail contexts that never sample outside the
@@ -14284,7 +14342,9 @@ gex_wgpu_bind_sampler_states(struct pipe_context *pipe,
       }
       return;
    }
-   struct gex_wgpu_sampler **slots = shader == MESA_SHADER_VERTEX
+   struct gex_wgpu_sampler **slots = compute_stage >= 0
+      ? ctx->stage_samplers[compute_stage]
+      : shader == MESA_SHADER_VERTEX
       ? ctx->vertex_samplers
       : shader == MESA_SHADER_COMPUTE ? ctx->compute_samplers
                                       : ctx->samplers;
@@ -14322,8 +14382,9 @@ gex_wgpu_set_sampler_views(struct pipe_context *pipe,
 {
    GEX_ENTRY_TIMER();
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   const int compute_stage = gex_wgpu_compute_stage_index(shader);
    if (shader != MESA_SHADER_FRAGMENT && shader != MESA_SHADER_VERTEX &&
-       shader != MESA_SHADER_COMPUTE) {
+       shader != MESA_SHADER_COMPUTE && compute_stage < 0) {
       /* Clearing another stage has to succeed, for the same reason
        * bind_sampler_states above says: cso_context unbinds every stage
        * whenever a context is bound or torn down, so refusing an unbind
@@ -14344,6 +14405,7 @@ gex_wgpu_set_sampler_views(struct pipe_context *pipe,
    struct pipe_sampler_view **slots = shader == MESA_SHADER_VERTEX
       ? ctx->vertex_sampler_views
       : shader == MESA_SHADER_COMPUTE ? ctx->compute_sampler_views
+      : compute_stage >= 0 ? ctx->stage_sampler_views[compute_stage]
                                       : ctx->sampler_views;
    if (start_slot > GEX_WGPU_MAX_SAMPLERS ||
        num_views > GEX_WGPU_MAX_SAMPLERS - start_slot ||
@@ -16939,6 +17001,105 @@ gex_wgpu_get_device_reset_status(struct pipe_context *pipe)
 {
    (void)pipe;
    return PIPE_NO_RESET;
+}
+
+static bool
+gex_wgpu_collect_stage_textures(nir_shader *nir,
+                                struct gex_wgpu_stage_textures *out,
+                                const char **why)
+{
+   memset(out, 0, sizeof(*out));
+   /* What each slot is *sampled* as, which is what the bind group's sample
+    * type has to say. Only a sampling op constrains it -- textureSize returns
+    * an ivec2 and says nothing about the texture -- so the query ops are
+    * skipped exactly as the graphics path skips them. */
+   uint32_t shadow_slots = 0, uint_slots = 0, sint_slots = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (tex->op == nir_texop_txs ||
+                tex->op == nir_texop_query_levels ||
+                tex->op == nir_texop_texture_samples)
+               continue;
+            const int at = nir_tex_instr_src_index(tex,
+                                                   nir_tex_src_texture_deref);
+            if (at < 0) {
+               *why = "a texture instruction with no texture deref";
+               return false;
+            }
+            nir_variable *var = nir_deref_instr_get_variable(
+               nir_src_as_deref(tex->src[at].src));
+            const unsigned slot = var ? var->data.driver_location
+                                      : GEX_WGPU_MAX_SAMPLERS;
+            if (slot >= GEX_WGPU_MAX_SAMPLERS) {
+               *why = "a texture instruction with no slot";
+               return false;
+            }
+            if (tex->is_shadow)
+               shadow_slots |= 1u << slot;
+            else if (nir_alu_type_get_base_type(tex->dest_type) ==
+                     nir_type_uint)
+               uint_slots |= 1u << slot;
+            else if (nir_alu_type_get_base_type(tex->dest_type) ==
+                     nir_type_int)
+               sint_slots |= 1u << slot;
+         }
+      }
+   }
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      if (!glsl_type_is_texture(type))
+         continue;
+      const enum glsl_sampler_dim dim = glsl_get_sampler_dim(type);
+      if (dim == GLSL_SAMPLER_DIM_BUF) {
+         /* A buffer texture is a storage buffer here, with a binding range of
+          * its own; serving it from a compute-emulated stage is more than
+          * this pair of helpers does. */
+         *why = "a buffer texture";
+         return false;
+      }
+      const bool is_array = glsl_sampler_type_is_array(type);
+      const bool multisampled = dim == GLSL_SAMPLER_DIM_MS;
+      const WGPUTextureViewDimension view_dimension =
+         multisampled && !is_array   ? WGPUTextureViewDimension_2D
+         : dim == GLSL_SAMPLER_DIM_1D
+            ? (is_array ? WGPUTextureViewDimension_2DArray
+                        : WGPUTextureViewDimension_2D)
+         : dim == GLSL_SAMPLER_DIM_RECT && !is_array
+                                     ? WGPUTextureViewDimension_2D
+         : dim == GLSL_SAMPLER_DIM_2D
+            ? (is_array ? WGPUTextureViewDimension_2DArray
+                        : WGPUTextureViewDimension_2D)
+         : dim == GLSL_SAMPLER_DIM_3D && !is_array
+                                     ? WGPUTextureViewDimension_3D
+         : dim == GLSL_SAMPLER_DIM_CUBE
+            ? (is_array ? WGPUTextureViewDimension_CubeArray
+                        : WGPUTextureViewDimension_Cube)
+                                     : WGPUTextureViewDimension_Undefined;
+      const unsigned slot = var->data.driver_location;
+      if (out->count >= GEX_WGPU_MAX_SAMPLERS ||
+          slot >= GEX_WGPU_MAX_SAMPLERS ||
+          view_dimension == WGPUTextureViewDimension_Undefined) {
+         *why = "a texture shape WebGPU has no view dimension for";
+         return false;
+      }
+      out->slots[out->count] = (uint8_t)slot;
+      out->bindings[out->count] = var->data.binding;
+      /* The split numbers the pair 2*unit and 2*unit+1 from the same base. */
+      out->sampler_bindings[out->count] = var->data.binding + 1;
+      out->dimensions[out->count] = view_dimension;
+      out->sample_types[out->count] =
+         (shadow_slots & (1u << slot)) ? WGPUTextureSampleType_Depth
+         : (uint_slots & (1u << slot)) ? WGPUTextureSampleType_Uint
+         : (sint_slots & (1u << slot)) ? WGPUTextureSampleType_Sint
+         : multisampled ? WGPUTextureSampleType_UnfilterableFloat
+                        : WGPUTextureSampleType_Float;
+      ++out->count;
+   }
+   return true;
 }
 
 /* Whether a shader samples a texture at all.
@@ -22307,7 +22468,7 @@ gex_wgpu_tess_collect_ubos(nir_shader *nir, unsigned *count, uint8_t *slots,
       bindings[*count] = var->data.binding;
       required[*count] = gex_wgpu_block_declared_size(var);
       if (var->data.mode == nir_var_mem_ssbo)
-         *storage_mask |= 1u << *count;
+         *storage_mask |= UINT64_C(1) << *count;
       ++*count;
    }
 }
@@ -22344,17 +22505,29 @@ gex_wgpu_create_tcs_state(struct pipe_context *pipe,
       ralloc_free(nir);
       return NULL;
    }
-   if (gex_wgpu_shader_samples_texture(nir)) {
-      gex_wgpu_set_compile_error(
-         mutable_state,
-         "gex_wgpu cannot sample a texture in the tessellation control stage");
-      ralloc_free(nir);
-      return NULL;
-   }
+
    struct gex_wgpu_tcs *tcs = CALLOC_STRUCT(gex_wgpu_tcs);
    if (!tcs) {
       ralloc_free(nir);
       return NULL;
+   }
+   /* What this stage samples. GL lets every stage sample; this one runs as a
+    * compute pass, so its textures are numbered in the compute range and
+    * bound into the dispatch's group by gex_wgpu_bind_stage_textures. A shape
+    * the pair of helpers cannot serve is refused by name here rather than
+    * mis-bound later. */
+   {
+      const char *why = NULL;
+      if (!gex_wgpu_collect_stage_textures(nir, &tcs->textures, &why)) {
+         char *detail = NULL;
+         asprintf(&detail,
+                  "gex_wgpu cannot sample a texture in the tessellation control stage (%s)",
+                  why ? why : "unsupported");
+         gex_wgpu_set_compile_error(mutable_state, detail);
+         ralloc_free(nir);
+         FREE(tcs);
+         return NULL;
+      }
    }
    /* Read before anything touches info.cs: the two share a union. */
    tcs->vertices_out = nir->info.tess.tcs_vertices_out;
@@ -22431,17 +22604,29 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
       ralloc_free(nir);
       return NULL;
    }
-   if (gex_wgpu_shader_samples_texture(nir)) {
-      gex_wgpu_set_compile_error(
-         mutable_state,
-         "gex_wgpu cannot sample a texture in the tessellation evaluation stage");
-      ralloc_free(nir);
-      return NULL;
-   }
+
    struct gex_wgpu_tes *tes = CALLOC_STRUCT(gex_wgpu_tes);
    if (!tes) {
       ralloc_free(nir);
       return NULL;
+   }
+   /* What this stage samples. GL lets every stage sample; this one runs as a
+    * compute pass, so its textures are numbered in the compute range and
+    * bound into the dispatch's group by gex_wgpu_bind_stage_textures. A shape
+    * the pair of helpers cannot serve is refused by name here rather than
+    * mis-bound later. */
+   {
+      const char *why = NULL;
+      if (!gex_wgpu_collect_stage_textures(nir, &tes->textures, &why)) {
+         char *detail = NULL;
+         asprintf(&detail,
+                  "gex_wgpu cannot sample a texture in the tessellation evaluation stage (%s)",
+                  why ? why : "unsupported");
+         gex_wgpu_set_compile_error(mutable_state, detail);
+         ralloc_free(nir);
+         FREE(tes);
+         return NULL;
+      }
    }
    tes->domain = nir->info.tess._primitive_mode;
    tes->point_mode = nir->info.tess.point_mode;
@@ -22650,13 +22835,7 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       ralloc_free(nir);
       return NULL;
    }
-   if (gex_wgpu_shader_samples_texture(nir)) {
-      gex_wgpu_set_compile_error(
-         mutable_state,
-         "gex_wgpu cannot sample a texture in the geometry stage");
-      ralloc_free(nir);
-      return NULL;
-   }
+
 
    /* What this path implements, stated once. Anything else is refused here
     * rather than mis-rendered later.
@@ -22740,6 +22919,24 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       ralloc_free(nir);
       return NULL;
    }
+   /* What this stage samples. GL lets every stage sample; this one runs as a
+    * compute pass, so its textures are numbered in the compute range and
+    * bound into the dispatch's group by gex_wgpu_bind_stage_textures. A shape
+    * the pair of helpers cannot serve is refused by name here rather than
+    * mis-bound later. */
+   {
+      const char *why = NULL;
+      if (!gex_wgpu_collect_stage_textures(nir, &gs->textures, &why)) {
+         char *detail = NULL;
+         asprintf(&detail,
+                  "gex_wgpu cannot sample a texture in the geometry stage (%s)",
+                  why ? why : "unsupported");
+         gex_wgpu_set_compile_error(mutable_state, detail);
+         ralloc_free(nir);
+         FREE(gs);
+         return NULL;
+      }
+   }
    gs->max_vertices = nir->info.gs.vertices_out;
    gs->output_prim = nir->info.gs.output_primitive;
    if (nir->xfb_info) {
@@ -22784,7 +22981,7 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       gs->ubo_bindings[gs->ubo_count] = var->data.binding;
       gs->ubo_required[gs->ubo_count] = gex_wgpu_block_declared_size(var);
       if (var->data.mode == nir_var_mem_ssbo)
-         gs->ubo_storage_mask |= 1u << gs->ubo_count;
+         gs->ubo_storage_mask |= UINT64_C(1) << gs->ubo_count;
       ++gs->ubo_count;
    }
 
@@ -23307,17 +23504,32 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
 /* One bind group's worth of buffers, in the two shapes these compute passes
  * use: group zero is the pass's own buffers, group one is the shader's
  * constant buffers. */
-#define GEX_WGPU_MAX_GROUP_BINDINGS (GEX_WGPU_MAX_CONSTANT_BUFFERS + 8)
+/* A dispatch's own blocks plus, for the compute-emulated stages, a texture
+ * and a sampler for every unit. The masks below are 64-bit for this reason. */
+#define GEX_WGPU_MAX_GROUP_BINDINGS \
+   (GEX_WGPU_MAX_CONSTANT_BUFFERS + 8 + 2 * GEX_WGPU_MAX_SAMPLERS)
 struct gex_wgpu_bindings {
    unsigned count;
-   uint32_t storage_mask;
+   uint64_t storage_mask;
    /* Bindings whose shader declaration is `var<storage, read>`. The layout
     * has to agree, and only these may alias one another. */
-   uint32_t readonly_mask;
+   uint64_t readonly_mask;
    uint32_t binding[GEX_WGPU_MAX_GROUP_BINDINGS];
    WGPUBuffer buffer[GEX_WGPU_MAX_GROUP_BINDINGS];
    uint64_t offset[GEX_WGPU_MAX_GROUP_BINDINGS];
    uint64_t size[GEX_WGPU_MAX_GROUP_BINDINGS];
+   /* Sampled textures and their samplers, for the stages this driver runs as
+    * compute passes. An entry is a buffer unless one of these masks claims
+    * it. GL lets every stage sample, and until these existed a dispatch could
+    * only bind buffers -- so a geometry or tessellation shader that sampled a
+    * texture had to be refused. */
+   uint64_t texture_mask;
+   uint64_t sampler_mask;
+   WGPUTextureView view[GEX_WGPU_MAX_GROUP_BINDINGS];
+   WGPUSampler sampler[GEX_WGPU_MAX_GROUP_BINDINGS];
+   WGPUTextureSampleType sample_type[GEX_WGPU_MAX_GROUP_BINDINGS];
+   WGPUTextureViewDimension view_dimension[GEX_WGPU_MAX_GROUP_BINDINGS];
+   WGPUSamplerBindingType sampler_type[GEX_WGPU_MAX_GROUP_BINDINGS];
 };
 
 static void
@@ -23331,9 +23543,9 @@ gex_wgpu_bind_storage_access(struct gex_wgpu_bindings *group, uint32_t binding,
    group->buffer[i] = gex_resource(resource)->buffer;
    group->offset[i] = 0;
    group->size[i] = gex_resource(resource)->allocation_size;
-   group->storage_mask |= 1u << i;
+   group->storage_mask |= UINT64_C(1) << i;
    if (read_only)
-      group->readonly_mask |= 1u << i;
+      group->readonly_mask |= UINT64_C(1) << i;
    static int log = -1;
    if (log < 0) {
       const char *value = getenv("GEX_WGPU_BIND_LOG");
@@ -23353,6 +23565,93 @@ gex_wgpu_bind_storage(struct gex_wgpu_bindings *group, uint32_t binding,
    gex_wgpu_bind_storage_access(group, binding, resource, false);
 }
 
+/* Append a compute-emulated stage's sampled textures and their samplers to a
+ * dispatch's bind group.
+ *
+ * One helper for the geometry stage and both tessellation stages, reading the
+ * per-stage sampler state GL keeps separate. The layout entries and the group
+ * entries are built from the same numbers here, which is the whole point: a
+ * layout that disagrees with its entries is reported by Dawn as an invalid
+ * bind group and nothing more specific.
+ *
+ * Returns false when a slot the shader declares has nothing bound. That is a
+ * refused draw rather than a latched context: the application gets no
+ * picture, which is what GL says an incomplete texture is worth, and every
+ * later draw still works.
+ */
+static bool
+gex_wgpu_bind_stage_textures(struct pipe_context *pipe, int stage_index,
+                             const struct gex_wgpu_stage_textures *textures,
+                             struct gex_wgpu_bindings *group)
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   if (stage_index < 0)
+      return true;
+   for (unsigned i = 0; i < textures->count; ++i) {
+      const unsigned slot = textures->slots[i];
+      struct gex_wgpu_sampler_view *view =
+         (struct gex_wgpu_sampler_view *)
+            ctx->stage_sampler_views[stage_index][slot];
+      if (!view || group->count + 2 > GEX_WGPU_MAX_GROUP_BINDINGS) {
+         if (getenv("GEX_WGPU_STAGE_TEXTURE_LOG"))
+            fprintf(stderr, "gex-wgpu: stage %d texture %u %s\n", stage_index,
+                    slot, view ? "has no room in the group"
+                               : "has no view bound");
+         return false;
+      }
+      gex_wgpu_sampler_view_refresh(pipe, view);
+      const struct gex_wgpu_sampler *sampler =
+         ctx->stage_samplers[stage_index][slot];
+      /* The same rule the draw and compute paths apply: a depth view read by
+       * a shader that declared a plain sampler is served as unfilterable
+       * float with a non-filtering sampler, because that is all WebGPU
+       * offers for it. */
+      WGPUTextureSampleType sample_type = textures->sample_types[i];
+      bool depth_as_float = false;
+      if (gex_wgpu_format_sample_type(view->base.format) ==
+             WGPUTextureSampleType_Depth &&
+          sample_type == WGPUTextureSampleType_Float &&
+          (!sampler ||
+           sampler->state.compare_mode != PIPE_TEX_COMPARE_R_TO_TEXTURE)) {
+         sample_type = WGPUTextureSampleType_UnfilterableFloat;
+         depth_as_float = true;
+      }
+      unsigned at = group->count++;
+      group->binding[at] = textures->bindings[i];
+      group->texture_mask |= UINT64_C(1) << at;
+      group->sample_type[at] = sample_type;
+      group->view_dimension[at] = textures->dimensions[i];
+      group->view[at] =
+         gex_wgpu_stage_texture_view(&view->base, textures->dimensions[i]);
+      if (!group->view[at])
+         return false;
+
+      at = group->count++;
+      group->binding[at] = textures->sampler_bindings[i];
+      group->sampler_mask |= UINT64_C(1) << at;
+      group->sampler_type[at] =
+         depth_as_float ? WGPUSamplerBindingType_NonFiltering
+         : sample_type == WGPUTextureSampleType_Depth
+            ? WGPUSamplerBindingType_Comparison
+         : sample_type == WGPUTextureSampleType_Float
+            ? WGPUSamplerBindingType_Filtering
+            : WGPUSamplerBindingType_NonFiltering;
+      /* A slot with no sampler state bound still needs one, and the
+       * texture's own default is what st/mesa would have sent. */
+      group->sampler[at] = sampler
+         ? (depth_as_float && sampler->nonfiltering ? sampler->nonfiltering
+                                                    : sampler->sampler)
+         : NULL;
+      if (!group->sampler[at]) {
+         if (getenv("GEX_WGPU_STAGE_TEXTURE_LOG"))
+            fprintf(stderr, "gex-wgpu: stage %d sampler %u has no state\n",
+                    stage_index, slot);
+         return false;
+      }
+   }
+   return true;
+}
+
 static WGPUBindGroupLayout
 gex_wgpu_group_layout(WGPUDevice device, const struct gex_wgpu_bindings *group)
 {
@@ -23367,9 +23666,18 @@ gex_wgpu_group_layout(WGPUDevice device, const struct gex_wgpu_bindings *group)
        * The read-only ones are the vertex buffers, and they are read-only
        * because WebGPU forbids two *writable* bindings over the same range
        * and one vertex buffer routinely feeds several attributes. */
+      if (group->texture_mask & (UINT64_C(1) << i)) {
+         entries[i].texture.sampleType = group->sample_type[i];
+         entries[i].texture.viewDimension = group->view_dimension[i];
+         continue;
+      }
+      if (group->sampler_mask & (UINT64_C(1) << i)) {
+         entries[i].sampler.type = group->sampler_type[i];
+         continue;
+      }
       entries[i].buffer.type =
-         !(group->storage_mask & (1u << i)) ? WGPUBufferBindingType_Uniform
-         : (group->readonly_mask & (1u << i))
+         !(group->storage_mask & (UINT64_C(1) << i)) ? WGPUBufferBindingType_Uniform
+         : (group->readonly_mask & (UINT64_C(1) << i))
             ? WGPUBufferBindingType_ReadOnlyStorage
             : WGPUBufferBindingType_Storage;
    }
@@ -23387,6 +23695,14 @@ gex_wgpu_group(WGPUDevice device, WGPUBindGroupLayout layout,
    for (unsigned i = 0; i < group->count; ++i) {
       entries[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       entries[i].binding = group->binding[i];
+      if (group->texture_mask & (UINT64_C(1) << i)) {
+         entries[i].textureView = group->view[i];
+         continue;
+      }
+      if (group->sampler_mask & (UINT64_C(1) << i)) {
+         entries[i].sampler = group->sampler[i];
+         continue;
+      }
       entries[i].buffer = group->buffer[i];
       entries[i].offset = group->offset[i];
       entries[i].size = group->size[i];
@@ -23400,14 +23716,14 @@ gex_wgpu_group(WGPUDevice device, WGPUBindGroupLayout layout,
     * naming the pass is what the next attempt needs first. */
    if (getenv("GEX_WGPU_ALIAS_TRACE")) {
       for (unsigned i = 0; i < group->count; ++i) {
-         if (!group->buffer[i] || !(group->storage_mask & (1u << i)))
+         if (!group->buffer[i] || !(group->storage_mask & (UINT64_C(1) << i)))
             continue;
          for (unsigned j = i + 1; j < group->count; ++j) {
             if (group->buffer[j] != group->buffer[i] ||
-                !(group->storage_mask & (1u << j)))
+                !(group->storage_mask & (UINT64_C(1) << j)))
                continue;
-            if (!!(group->readonly_mask & (1u << i)) ==
-                !!(group->readonly_mask & (1u << j)))
+            if (!!(group->readonly_mask & (UINT64_C(1) << i)) ==
+                !!(group->readonly_mask & (UINT64_C(1) << j)))
                continue;
             const uint64_t a_end = group->offset[i] + group->size[i];
             const uint64_t b_end = group->offset[j] + group->size[j];
@@ -23416,10 +23732,10 @@ gex_wgpu_group(WGPUDevice device, WGPUBindGroupLayout layout,
             fprintf(stderr, "gex-alias: internal pass buffer %p at bindings "
                     "%u (%s) and %u (%s)\n", (void *)group->buffer[i],
                     group->binding[i],
-                    (group->readonly_mask & (1u << i)) ? "read-only"
+                    (group->readonly_mask & (UINT64_C(1) << i)) ? "read-only"
                                                        : "writable",
                     group->binding[j],
-                    (group->readonly_mask & (1u << j)) ? "read-only"
+                    (group->readonly_mask & (UINT64_C(1) << j)) ? "read-only"
                                                        : "writable");
          }
       }
@@ -23572,8 +23888,8 @@ gex_wgpu_bind_constants(struct gex_wgpu_context *ctx,
       group->buffer[at] = gex_resource(constant->buffer)->buffer;
       group->offset[at] = constant->buffer_offset;
       group->size[at] = constant->buffer_size;
-      if (storage_mask & (1u << i))
-         group->storage_mask |= 1u << at;
+      if (storage_mask & (UINT64_C(1) << i))
+         group->storage_mask |= UINT64_C(1) << at;
    }
    return true;
 }
@@ -25105,6 +25421,10 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                          ctx->gs_indices);
    gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_COUNT_BINDING, ctx->gs_counts);
    ok = gs_param_buffer &&
+        gex_wgpu_bind_stage_textures(&ctx->base,
+                                     gex_wgpu_compute_stage_index(
+                                        MESA_SHADER_GEOMETRY),
+                                     &gs->textures, &gs_group0) &&
         gex_wgpu_bind_constants(ctx, &gs_group1, MESA_SHADER_GEOMETRY,
                                 gs->ubo_count, gs->ubo_slots, gs->ubo_bindings,
                                 gs->ubo_storage_mask);
@@ -25583,8 +25903,13 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
       GEX_TESS_DECLINE("a patch draw with no evaluation shader");
    if (ctx->gs)
       GEX_TESS_DECLINE("a geometry shader after tessellation");
-   if (info->index_size || info->instance_count != 1)
+   if (info->index_size || info->instance_count != 1) {
+      if (getenv("GEX_WGPU_TESS_LOG"))
+         fprintf(stderr, "gex-wgpu: tess decline detail isz=%u inst=%u "
+                 "count=%u patch_vertices=%u\n", info->index_size,
+                 info->instance_count, draw->count, ctx->patch_vertices);
       GEX_TESS_DECLINE("an indexed or instanced patch draw");
+   }
    const unsigned verts_in = ctx->patch_vertices;
    if (!verts_in || draw->count < verts_in)
       GEX_TESS_DECLINE("a patch draw with no complete patch");
@@ -25740,6 +26065,9 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    gex_wgpu_bind_storage(&tcs_group0, GEX_WGPU_TCS_LEVEL_BINDING,
                          ctx->tess_levels);
    ok = tcs_param_buffer &&
+        gex_wgpu_bind_stage_textures(&ctx->base,
+                                     gex_wgpu_compute_stage_index(MESA_SHADER_TESS_CTRL),
+                                     &tcs->textures, &tcs_group0) &&
         gex_wgpu_bind_constants(ctx, &tcs_group1, MESA_SHADER_TESS_CTRL,
                                 tcs->ubo_count, tcs->ubo_slots,
                                 tcs->ubo_bindings, tcs->ubo_storage_mask);
@@ -25891,6 +26219,9 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_OUT_BINDING,
                          ctx->tess_vertices);
    ok = tes_param_buffer &&
+        gex_wgpu_bind_stage_textures(&ctx->base,
+                                     gex_wgpu_compute_stage_index(MESA_SHADER_TESS_EVAL),
+                                     &tes->textures, &tes_group0) &&
         gex_wgpu_bind_constants(ctx, &tes_group1, MESA_SHADER_TESS_EVAL,
                                 tes->ubo_count, tes->ubo_slots,
                                 tes->ubo_bindings, tes->ubo_storage_mask);
@@ -26063,7 +26394,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
          }
          return NULL;
       }
-      sampler_mask |= 1u << slot;
+      sampler_mask |= UINT64_C(1) << slot;
       const bool swizzled =
          gex_wgpu_effective_view_swizzle(view, 0) != PIPE_SWIZZLE_X ||
          gex_wgpu_effective_view_swizzle(view, 1) != PIPE_SWIZZLE_Y ||
@@ -26140,7 +26471,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
                     memcmp(v->components, want_components,
                            sizeof(v->components)) == 0);
       for (unsigned slot = 0; match && slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
-         if (!(sampler_mask & (1u << slot)))
+         if (!(sampler_mask & (UINT64_C(1) << slot)))
             continue;
          const struct pipe_sampler_view *view = ctx->vertex_sampler_views[slot];
          const uint8_t swizzle[4] = {
@@ -26176,7 +26507,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
           sizeof(variant->attrib_unpack));
    variant->sampler_mask = sampler_mask;
    for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
-      if (!(sampler_mask & (1u << slot)))
+      if (!(sampler_mask & (UINT64_C(1) << slot)))
          continue;
       if (ctx->vertex_samplers[slot])
          variant->sampler_keys[slot] = ctx->vertex_samplers[slot]->state;
@@ -27199,7 +27530,7 @@ gex_wgpu_fragment_writes_ssbo(const struct gex_wgpu_context *ctx,
       return false;
    for (unsigned i = 0; i < ctx->fs->ssbo_count; ++i)
       if (ctx->fs->ssbo_slots[i] == slot &&
-          !(ctx->fs->ssbo_readonly_mask & (1u << i)))
+          !(ctx->fs->ssbo_readonly_mask & (UINT64_C(1) << i)))
          return true;
    return false;
 }
@@ -32494,7 +32825,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
       const unsigned slot = ctx->vs->ubo_slots[i];
-      const bool storage = ctx->vs->ubo_storage_mask & (1u << i);
+      const bool storage = ctx->vs->ubo_storage_mask & (UINT64_C(1) << i);
       vertex_layout_entries[i] =
          (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       vertex_layout_entries[i].binding = ctx->vs->ubo_bindings[i];
@@ -32529,7 +32860,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * still has to agree with what the emitter declared, and a vertex block
        * that is written would have been declared read_write. Say so rather
        * than build a layout the device will reject without explanation. */
-      if (!(ctx->vs->ssbo_readonly_mask & (1u << i))) {
+      if (!(ctx->vs->ssbo_readonly_mask & (UINT64_C(1) << i))) {
          static bool said;
          if (!said) {
             said = true;
@@ -32573,7 +32904,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
       const unsigned slot = ctx->fs->ubo_slots[i];
-      const bool storage = ctx->fs->ubo_storage_mask & (1u << i);
+      const bool storage = ctx->fs->ubo_storage_mask & (UINT64_C(1) << i);
       fragment_layout_entries[i] =
          (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       fragment_layout_entries[i].binding = ctx->fs->ubo_bindings[i];
@@ -32644,7 +32975,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       fragment_layout_entries[at].binding = ctx->fs->ssbo_bindings[i];
       fragment_layout_entries[at].visibility = WGPUShaderStage_Fragment;
       fragment_layout_entries[at].buffer.type =
-         (ctx->fs->ssbo_readonly_mask & (1u << i))
+         (ctx->fs->ssbo_readonly_mask & (UINT64_C(1) << i))
             ? WGPUBufferBindingType_ReadOnlyStorage
             : WGPUBufferBindingType_Storage;
       fragment_layout_entries[at].buffer.hasDynamicOffset = false;
