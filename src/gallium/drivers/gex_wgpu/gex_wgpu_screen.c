@@ -2932,6 +2932,240 @@ gex_wgpu_lower_image_shape_instr(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+static unsigned gex_wgpu_image_slot(const nir_variable *var);
+
+/* Split `uniform image2D img[N]` into N separate image variables.
+ *
+ * Tint refuses an array of them outright -- "arrays of textures or samplers
+ * are not supported in WGSL; can't translate variable or function parameter"
+ * -- and unlike a sampler array, nothing here had ever split one: the
+ * combined-sampler split takes samplers only, and every image path downstream
+ * assumes one variable is one unit. So an ordinary
+ * `layout(rgba32f) uniform image2D g_image[6]` failed to compile, with the
+ * message naming an OpVariable number and nothing else.
+ *
+ * The elements are consecutive units, exactly as the sampler split numbers
+ * them, and each access is rewritten to name its own variable. A dynamically
+ * indexed element is refused by name rather than guessed at -- that wants the
+ * unrolling gex_wgpu_lower_dynamic_sampler_index does, and nothing yet asks.
+ */
+static bool
+gex_wgpu_split_image_arrays(nir_shader *nir)
+{
+   nir_variable *origin[GEX_WGPU_MAX_SHADER_IMAGES] = {0};
+   nir_variable *split[GEX_WGPU_MAX_SHADER_IMAGES][GEX_WGPU_MAX_SHADER_IMAGES];
+   unsigned length[GEX_WGPU_MAX_SHADER_IMAGES] = {0};
+   /* Which elements this shader reads and writes, a bit per element. GLSL's
+    * readonly/writeonly qualifiers are optional and Mesa cannot infer them
+    * here -- its analysis identifies the variable behind an access with
+    * nir_chase_binding, which an array element defeats -- so an array arrives
+    * unqualified and the driver would call every element read_write. Tint
+    * infers from *usage* and lowers a read-only storage image to a plain
+    * texture, and then the layout disagrees with the module:
+    *
+    *   Binding type in the shader (texture) doesn't match the type in the
+    *   layout (storageTexture).
+    *
+    * This pass already visits every access, so it is the one place that knows
+    * the answer per element. */
+   uint32_t reads[GEX_WGPU_MAX_SHADER_IMAGES] = {0};
+   uint32_t writes[GEX_WGPU_MAX_SHADER_IMAGES] = {0};
+   unsigned count = 0;
+
+   nir_foreach_variable_with_modes(var, nir, nir_var_image) {
+      if (!glsl_type_is_array(var->type))
+         continue;
+      const struct glsl_type *elem = glsl_get_array_element(var->type);
+      if (!glsl_type_is_image(elem) || glsl_type_is_unsized_array(var->type) ||
+          count >= GEX_WGPU_MAX_SHADER_IMAGES)
+         return false;
+      const unsigned n = glsl_get_length(var->type);
+      if (n < 1 || n > GEX_WGPU_MAX_SHADER_IMAGES)
+         return false;
+      const unsigned base = gex_wgpu_image_slot(var);
+      if (base + n > GEX_WGPU_MAX_SHADER_IMAGES)
+         return false;
+      for (unsigned k = 0; k < n; ++k) {
+         char name[40];
+         snprintf(name, sizeof(name), "%s_%u",
+                  var->name ? var->name : "gex_image", k);
+         nir_variable *one = nir_variable_create(nir, nir_var_image, elem,
+                                                 name);
+         one->data = var->data;
+         one->data.driver_location = base + k;
+         one->data.binding = base + k;
+         one->data.explicit_binding = 1;
+         split[count][k] = one;
+      }
+      origin[count] = var;
+      length[count] = n;
+      ++count;
+   }
+   if (!count)
+      return true;
+
+   nir_foreach_function_impl(impl, nir) {
+      /* Collected first: unrolling a dynamic index splits the block the
+       * instruction is in, so rewriting during the walk would cut the list
+       * being iterated. */
+      nir_intrinsic_instr *found[64];
+      unsigned which_of[64];
+      unsigned found_count = 0;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_image_deref_load:
+            case nir_intrinsic_image_deref_store:
+            case nir_intrinsic_image_deref_atomic:
+            case nir_intrinsic_image_deref_atomic_swap:
+            case nir_intrinsic_image_deref_size:
+            case nir_intrinsic_image_deref_samples:
+            case nir_intrinsic_image_deref_sparse_load:
+            case nir_intrinsic_image_deref_levels:
+               break;
+            default:
+               continue;
+            }
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            if (!deref || deref->deref_type != nir_deref_type_array)
+               continue;
+            nir_deref_instr *parent = nir_deref_instr_parent(deref);
+            if (!parent || parent->deref_type != nir_deref_type_var)
+               continue;
+            unsigned which = count;
+            for (unsigned i = 0; i < count; ++i)
+               if (origin[i] == parent->var) { which = i; break; }
+            if (which == count)
+               continue;
+            if (found_count >= ARRAY_SIZE(found))
+               return false;
+            bool does_read = true, does_write = true;
+            switch (intr->intrinsic) {
+            case nir_intrinsic_image_deref_load:
+            case nir_intrinsic_image_deref_sparse_load:
+               does_write = false;
+               break;
+            case nir_intrinsic_image_deref_store:
+               does_read = false;
+               break;
+            case nir_intrinsic_image_deref_size:
+            case nir_intrinsic_image_deref_samples:
+            case nir_intrinsic_image_deref_levels:
+               /* A query is neither, and counting it as both would make an
+                * image used only for imageSize() read_write. */
+               does_read = does_write = false;
+               break;
+            default:
+               break;         /* the atomics are both */
+            }
+            uint32_t touched;
+            if (nir_src_is_const(deref->arr.index)) {
+               const uint64_t k = nir_src_as_uint(deref->arr.index);
+               touched = k < length[which] ? (uint32_t)1u << k : 0u;
+            } else {
+               touched = length[which] >= 32
+                  ? ~0u : (uint32_t)((1u << length[which]) - 1u);
+            }
+            if (does_read)
+               reads[which] |= touched;
+            if (does_write)
+               writes[which] |= touched;
+            which_of[found_count] = which;
+            found[found_count++] = intr;
+         }
+      }
+
+      nir_builder b = nir_builder_create(impl);
+      for (unsigned f = 0; f < found_count; ++f) {
+         nir_intrinsic_instr *intr = found[f];
+         const unsigned which = which_of[f];
+         nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+         if (nir_src_is_const(deref->arr.index)) {
+            const uint64_t k = nir_src_as_uint(deref->arr.index);
+            if (k >= length[which])
+               return false;
+            b.cursor = nir_before_instr(&intr->instr);
+            nir_deref_instr *one = nir_build_deref_var(&b, split[which][k]);
+            nir_src_rewrite(&intr->src[0], &one->def);
+            continue;
+         }
+         /* A dynamic element, unrolled the way a dynamically indexed sampler
+          * is: one copy of the access per element under a comparison, each
+          * naming its own variable. A `for (i = 0; i < 6; ++i)
+          * imageStore(img[i], ...)` that did not unroll is the ordinary case
+          * -- KHR-GL45's allMips tests are exactly that -- so refusing it
+          * would have left the split useful only for shaders that had
+          * already been unrolled for it. */
+         nir_def *index = deref->arr.index.ssa;
+         const bool has_dest = nir_intrinsic_infos[intr->intrinsic].has_dest;
+         b.cursor = nir_before_instr(&intr->instr);
+         nir_variable *result = NULL;
+         nir_component_mask_t mask = 0;
+         if (has_dest) {
+            mask = nir_component_mask(intr->def.num_components);
+            result = nir_local_variable_create(
+               impl, glsl_vector_type(GLSL_TYPE_UINT,
+                                      intr->def.num_components),
+               "gex_image_pick");
+            nir_store_var(&b, result,
+                          nir_imm_zero(&b, intr->def.num_components,
+                                       intr->def.bit_size), mask);
+         }
+         for (unsigned k = 0; k < length[which]; ++k) {
+            nir_push_if(&b, nir_ieq_imm(&b, index, (int)k));
+            nir_deref_instr *one = nir_build_deref_var(&b, split[which][k]);
+            nir_intrinsic_instr *copy =
+               nir_instr_as_intrinsic(nir_instr_clone(nir, &intr->instr));
+            nir_builder_instr_insert(&b, &copy->instr);
+            nir_src_rewrite(&copy->src[0], &one->def);
+            if (has_dest)
+               nir_store_var(&b, result, &copy->def, mask);
+            nir_pop_if(&b, NULL);
+         }
+         if (has_dest) {
+            nir_def *picked = nir_load_var(&b, result);
+            nir_def_replace(&intr->def, picked);
+         } else {
+            nir_instr_remove(&intr->instr);
+         }
+      }
+      nir_progress(true, impl, nir_metadata_none);
+   }
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+
+   /* And the qualifier each element earned. Only added, never cleared: a
+    * shader that did say `readonly` keeps saying it. */
+   for (unsigned i = 0; i < count; ++i) {
+      for (unsigned k = 0; k < length[i]; ++k) {
+         const uint32_t bit = (uint32_t)1u << k;
+         if (!(writes[i] & bit))
+            split[i][k]->data.access |= ACCESS_NON_WRITEABLE;
+         if (!(reads[i] & bit))
+            split[i][k]->data.access |= ACCESS_NON_READABLE;
+      }
+   }
+
+   /* The array variables are dead now; leaving one behind is not cosmetic,
+    * because the emitter would declare it and Tint would refuse the module
+    * for the type alone -- which is the message this pass exists to remove.
+    *
+    * Removed by DCE and nir_remove_dead_variables rather than by hand: the
+    * derefs that named them are still in the IR, dead but present, and
+    * unlinking a variable out from under one leaves a dangling pointer that
+    * surfaces much later as
+    *
+    *   nir_clone.c: _lookup_ptr: Assertion `state->allow_remap_fallback'
+    *
+    * in whichever pass next clones the shader. */
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_image, NULL);
+   nir_fixup_deref_types(nir);
+   return true;
+}
+
 static void
 gex_wgpu_lower_image_shape(nir_shader *nir)
 {
@@ -4171,6 +4405,13 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
     * the layout can then agree with. */
    /* Before the loop below reads each image's dimension, and before the
     * collection sites that build the layout from it. */
+   /* Before the shape lowering and before anything counts image variables:
+    * from here on one variable is one unit, which every image path assumes. */
+   if (!gex_wgpu_split_image_arrays(nir)) {
+      if (why)
+         snprintf(why, why_len, "gex_wgpu could not split an image array");
+      return false;
+   }
    gex_wgpu_lower_image_shape(nir);
    nir_foreach_variable_with_modes(var, nir, nir_var_image) {
       const unsigned slot = gex_wgpu_image_slot(var);
@@ -18549,6 +18790,18 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
       compute->image_dimensions[at] =
          gex_wgpu_image_view_dimension(dim,
                                        glsl_sampler_type_is_array(image_type));
+      if (getenv("GEX_WGPU_IMAGE_LOG"))
+         fprintf(stderr, "gex-image: compute '%s' slot=%u binding=%u "
+                 "access=0x%x fmt=%s -> %s\n",
+                 var->name ? var->name : "(anon)",
+                 (unsigned)compute->image_slots[at],
+                 compute->image_bindings[at], (unsigned)var->data.access,
+                 util_format_short_name(image_format),
+                 compute->image_access[at] == WGPUStorageTextureAccess_ReadOnly
+                    ? "ReadOnly"
+                 : compute->image_access[at] ==
+                      WGPUStorageTextureAccess_WriteOnly ? "WriteOnly"
+                                                         : "ReadWrite");
       if (unformatted)
          compute->unformatted_images |= (uint16_t)1u << at;
       if (compute->image_dimensions[at] == WGPUTextureViewDimension_Undefined) {
