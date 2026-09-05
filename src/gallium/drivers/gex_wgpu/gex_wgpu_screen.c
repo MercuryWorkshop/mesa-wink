@@ -1035,6 +1035,17 @@ gex_wgpu_collect_stage_images(nir_shader *nir,
          out->packed_write[at] = !no_write ||
             gex_wgpu_image_has_atomic(nir, var->data.driver_location);
          ++out->packed_count;
+         /* The packed branch used to log nothing, so an image that took it
+          * was invisible under GEX_WGPU_IMAGE_LOG and a stage that refuses
+          * packed images could not say which one it meant. */
+         if (getenv("GEX_WGPU_IMAGE_LOG"))
+            fprintf(stderr, "gex-image: %s '%s' slot=%u binding=%u "
+                    "access=0x%x fmt=%s dim=%u -> packed(read=%d write=%d)\n",
+                    stage, var->name ? var->name : "(anon)", slot,
+                    out->packed_bindings[at], (unsigned)var->data.access,
+                    util_format_short_name(image_format),
+                    (unsigned)glsl_get_sampler_dim(image_type),
+                    (int)out->packed_read[at], (int)out->packed_write[at]);
          continue;
       }
       if (!no_write && !no_read &&
@@ -1715,6 +1726,9 @@ struct gex_wgpu_context {
       uint32_t row_bytes;
    } packed_copies[GEX_WGPU_MAX_SHADER_IMAGES];
    unsigned packed_copy_count;
+   /* Set when a dispatch was refused against a device limit rather than
+    * failing; see gex_wgpu_dispatch_gave_up. */
+   bool dispatch_declined;
    /* Format-class image aliases whose bytes this pass has to copy back into
     * their textures -- see gex_wgpu_image_alias. */
    struct {
@@ -2478,6 +2492,20 @@ struct gex_wgpu_varying_variant {
     * gex_wgpu_varying_variant_get. Filled by gex_wgpu_collect_stage_textures,
     * exactly as the compute-emulated stages fill theirs. */
    struct gex_wgpu_stage_textures textures;
+   /* And its images. A vertex shader may have them now, and after the
+    * storage-write strip they are read-only here -- Tint lowers such an
+    * image to a sampled texture, which is legal in any stage. Left at the
+    * vertex descriptor set they would land in group 1, which these
+    * single-group dispatches do not provide: "the entry-point uses bindings
+    * in group 1 but [PipelineLayout] doesn't have a BindGroupLayout for this
+    * index", and the command buffer goes with the invalid pipeline.
+    *
+    * The views belong to the variant rather than to a dispatch, so that the
+    * five places that bind one need no lifetime handling of their own; each
+    * bind releases what the last one made. */
+   struct gex_wgpu_stage_images images;
+   WGPUTextureView image_views[GEX_WGPU_MAX_SHADER_IMAGES];
+   unsigned image_view_count;
    struct gex_wgpu_varying_variant *next;
 };
 
@@ -5370,6 +5398,31 @@ gex_wgpu_declined(const char *fn, int line)
 }
 
 #define gex_decline(ctx) ((void)(ctx), gex_wgpu_declined(__func__, __LINE__))
+
+/* A dispatch the *device* would not take is a decline, not a failure.
+ *
+ * The compute-emulated stages all report a dispatch that did not happen the
+ * same way -- `ok` is false and the caller calls gex_fail -- which is right
+ * for a broken one and wrong for one refused against a device limit. Getting
+ * it wrong costs more than the case that hit it:
+ * KHR-GL45.shading_language_420pack.binding_images_texture_type_2D wants
+ * eleven storage buffers where the adapter gives ten, and latching there took
+ * the context down, turned the next glGetTexImage into GL_OUT_OF_MEMORY and
+ * **aborted the whole run** with 129 cases still to go. */
+static void
+gex_wgpu_dispatch_gave_up(struct gex_wgpu_context *ctx, const char *fn,
+                          int line)
+{
+   if (ctx->dispatch_declined) {
+      ctx->dispatch_declined = false;
+      gex_wgpu_declined(fn, line);
+      return;
+   }
+   gex_wgpu_mark_failed(ctx, fn, line);
+}
+
+#define gex_dispatch_gave_up(ctx) \
+   gex_wgpu_dispatch_gave_up((ctx), __func__, __LINE__)
 
 static inline struct gex_wgpu_resource *
 gex_resource(struct pipe_resource *resource)
@@ -9756,7 +9809,7 @@ gex_wgpu_ignore_sample_mask(nir_shader *nir)
  * intrinsics st/mesa emits, and the deref form that survives in shaders whose
  * accesses were never lowered away. */
 static bool
-gex_wgpu_writes_storage(nir_shader *nir)
+gex_wgpu_writes_storage(nir_shader *nir, uint32_t direct_images)
 {
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -9776,11 +9829,21 @@ gex_wgpu_writes_storage(nir_shader *nir)
              * to. The compute dispatch performs it. */
             case nir_intrinsic_image_deref_store:
             case nir_intrinsic_image_deref_atomic:
-            case nir_intrinsic_image_deref_atomic_swap:
-            case nir_intrinsic_image_store:
-            case nir_intrinsic_image_atomic:
-            case nir_intrinsic_image_atomic_swap:
-               return true;
+            case nir_intrinsic_image_deref_atomic_swap: {
+               /* Only the images that will be *storage textures*. One served
+                * through a storage buffer -- the packed route -- needs none
+                * of this: WebGPU forbids a written storage texture in the
+                * vertex stage, not a written storage buffer, so the shader
+                * that rasterises can perform that store itself. */
+               nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+               nir_variable *var =
+                  deref ? nir_deref_instr_get_variable(deref) : NULL;
+               if (var && var->data.driver_location < 32 &&
+                   (direct_images &
+                    (UINT32_C(1) << var->data.driver_location)))
+                  return true;
+               break;
+            }
             case nir_intrinsic_store_deref:
             case nir_intrinsic_deref_atomic:
             case nir_intrinsic_deref_atomic_swap: {
@@ -9814,7 +9877,7 @@ gex_wgpu_writes_storage(nir_shader *nir)
  * shape is how Tint and Mesa have been made to abort before.
  */
 static bool
-gex_wgpu_strip_storage_writes(nir_shader *nir)
+gex_wgpu_strip_storage_writes(nir_shader *nir, uint32_t direct_images)
 {
    bool progress = false;
    nir_foreach_function_impl(impl, nir) {
@@ -9831,16 +9894,25 @@ gex_wgpu_strip_storage_writes(nir_shader *nir)
                atomic = storage = true;
                break;
             case nir_intrinsic_store_ssbo:
-            case nir_intrinsic_image_deref_store:
-            case nir_intrinsic_image_store:
                storage = true;
                break;
+            case nir_intrinsic_image_deref_store:
             case nir_intrinsic_image_deref_atomic:
-            case nir_intrinsic_image_deref_atomic_swap:
-            case nir_intrinsic_image_atomic:
-            case nir_intrinsic_image_atomic_swap:
-               atomic = storage = true;
+            case nir_intrinsic_image_deref_atomic_swap: {
+               /* Only the storage-texture ones; a packed image's store stays,
+                * because it is a buffer write and the vertex stage may do
+                * those. */
+               nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+               nir_variable *var =
+                  deref ? nir_deref_instr_get_variable(deref) : NULL;
+               if (!var || var->data.driver_location >= 32 ||
+                   !(direct_images &
+                     (UINT32_C(1) << var->data.driver_location)))
+                  continue;
+               storage = true;
+               atomic = intr->intrinsic != nir_intrinsic_image_deref_store;
                break;
+            }
             case nir_intrinsic_deref_atomic:
             case nir_intrinsic_deref_atomic_swap:
             case nir_intrinsic_store_deref: {
@@ -9885,6 +9957,14 @@ gex_wgpu_strip_storage_writes(nir_shader *nir)
        * it is honest, because after this pass the shader only ever reads. */
       nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo)
          var->data.access |= ACCESS_NON_WRITEABLE;
+      /* A storage-texture image whose store has just gone is read-only now
+       * and has to say so: read-only is the one access mode Tint accepts in
+       * the vertex stage, since it lowers such an image to a sampled texture.
+       * One never read at all falls out in the dead-variable pass below. */
+      nir_foreach_variable_with_modes(var, nir, nir_var_image)
+         if (var->data.driver_location < 32 &&
+             (direct_images & (UINT32_C(1) << var->data.driver_location)))
+            var->data.access |= ACCESS_NON_WRITEABLE;
       /* An image is *removed* instead, where a block is kept and made
        * read-only. Nothing needs it to stay: the dispatch binds images from
        * the table collected off the clone, before these stores were stripped,
@@ -10109,28 +10189,80 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * whether the stores came from feedback or from the application, so the
     * answer is the same: keep the stores in the compute clone, and take them
     * out of what rasterises. */
+   /* Which of this shader's images need the compute route, decided before
+    * anything is cloned or stripped, because both depend on the answer.
+    *
+    * Both kinds do, packed included, and finding that out cost an attempt.
+    * A packed image is served through a storage *buffer*, so it looked as
+    * though the rasterising shader could write it itself -- Tint's first
+    * refusal names the storage texture and only that. It has a second:
+    *
+    *   var with 'storage' address space and 'read_write' access mode cannot
+    *   be used by vertex pipeline stage
+    *
+    * A written packed image needs exactly that buffer, so it is no more
+    * expressible than the texture was. What rasterises keeps neither.
+    *
+    * Dropping the images this shader merely declares, and inferring
+    * readonly/writeonly for the rest, comes first: a plainly-declared image
+    * arrives read *and* written, which is a shape WebGPU grants only r32,
+    * so without this almost everything would look packed. */
+   uint32_t vs_direct_images = 0;
+   if (expected_stage == MESA_SHADER_VERTEX) {
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_image, NULL);
+      const nir_opt_access_options access_options = { .is_vulkan = false };
+      NIR_PASS(_, nir, nir_opt_access, &access_options);
+      struct gex_wgpu_stage_images classify;
+      if (!gex_wgpu_collect_stage_images(nir, &classify, "vertex")) {
+         gex_wgpu_set_compile_error(
+            mutable_state,
+            "gex_wgpu cannot serve an image in the vertex stage");
+         ralloc_free(nir);
+         FREE(shader);
+         return NULL;
+      }
+      for (unsigned i = 0; i < classify.count; ++i)
+         if (classify.slots[i] < 32)
+            vs_direct_images |= UINT32_C(1) << classify.slots[i];
+      for (unsigned i = 0; i < classify.packed_count; ++i)
+         if (classify.packed_slots[i] < 32)
+            vs_direct_images |= UINT32_C(1) << classify.packed_slots[i];
+      shader->capture_images = classify;
+   }
    const bool vs_writes_storage =
-      expected_stage == MESA_SHADER_VERTEX && gex_wgpu_writes_storage(nir);
+      expected_stage == MESA_SHADER_VERTEX &&
+      gex_wgpu_writes_storage(nir, vs_direct_images);
    if (expected_stage == MESA_SHADER_VERTEX &&
        ((nir->xfb_info && nir->xfb_info->output_count) || vs_writes_storage))
       shader->capture_nir = nir_shader_clone(NULL, nir);
-   /* Off the clone, and before the strip below: what rasterises is about to
-    * lose these entirely. A packed vertex image is refused rather than bound
-    * as something else -- it wants a buffer copied into and out of the
-    * texture around the pass, and this dispatch has nowhere to do that. */
-   if (shader->capture_nir &&
-       (!gex_wgpu_collect_stage_images(shader->capture_nir,
-                                       &shader->capture_images, "vertex") ||
-        shader->capture_images.packed_count)) {
-      ralloc_free(shader->capture_nir);
-      ralloc_free(nir);
-      FREE(shader);
-      return NULL;
+   /* The clone keeps the stores, so it is the copy that needs the packed
+    * lowering. MESA_SHADER_VERTEX puts the buffers in descriptor set 1, which
+    * is the group the capture dispatch binds. */
+   if (shader->capture_nir && shader->capture_images.packed_count) {
+      char why[176] = {0};
+      if (!gex_wgpu_apply_packed_images(
+             shader->capture_nir, shader->capture_images.packed_count,
+             shader->capture_images.packed_slots,
+             shader->capture_images.packed_bindings,
+             shader->capture_images.packed_formats,
+             shader->capture_images.packed_write, MESA_SHADER_VERTEX, why,
+             sizeof(why))) {
+         gex_wgpu_set_compile_error(
+            mutable_state,
+            "gex_wgpu could not lower a packed image for the vertex stage");
+         fprintf(stderr, "gex-wgpu: vertex packed image lowering: %s\n",
+                 why[0] ? why : "failed");
+         ralloc_free(shader->capture_nir);
+         ralloc_free(nir);
+         FREE(shader);
+         return NULL;
+      }
    }
    shader->writes_storage = vs_writes_storage;
    /* After the clone, so the capture keeps them. Declining here rather than
     * letting Tint refuse the module means the reason names itself. */
-   if (vs_writes_storage && !gex_wgpu_strip_storage_writes(nir)) {
+   if (vs_writes_storage &&
+       !gex_wgpu_strip_storage_writes(nir, vs_direct_images)) {
       ralloc_free(nir);
       FREE(shader);
       return NULL;
@@ -22815,6 +22947,16 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    variant->vb_mask = state.vb_mask;
    {
       const char *why = NULL;
+      /* Group zero, and collected, for the same reason the textures are.
+       * These are read-only after the storage-write strip, so they bind as
+       * sampled textures. */
+      nir_foreach_variable_with_modes(var, nir, nir_var_image)
+         var->data.descriptor_set = 0;
+      if (!gex_wgpu_collect_stage_images(nir, &variant->images, "vertex")) {
+         FREE(variant);
+         ralloc_free(nir);
+         return NULL;
+      }
       if (!gex_wgpu_collect_stage_textures(nir, &variant->textures, &why)) {
          fprintf(stderr, "gex-wgpu: no capture variant for a vertex shader "
                  "that samples (%s)\n", why ? why : "unknown");
@@ -24754,17 +24896,61 @@ gex_wgpu_create_tcs_state(struct pipe_context *pipe,
    /* After lower_gallium_ubos, which is what assigns image bindings, and in
     * group zero, which is where the dispatch binds them -- see the geometry
     * stage's copy of this for what each mistake looks like. */
+   /* An image the stage never actually touches is dropped, not served and not
+    * refused. GLSL lets a program declare the same image uniform in every
+    * stage and use it in one, which is exactly what
+    * KHR-GL45.shading_language_420pack.binding_image_* does -- and in the
+    * stages that only declare it, nir_opt_access has no access to infer, so
+    * it arrives read+write with no format and classifies as a packed image.
+    * Refusing that killed the whole program for the sake of a variable
+    * nothing reads or writes. */
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_image, NULL);
+   /* And infer readonly/writeonly for the images that are left. GLSL asks for
+    * the qualifiers only when a shader means to restrict itself, so an image
+    * declared plainly arrives read *and* written -- which WebGPU allows only
+    * for r32ui/r32i/r32f, so every ordinary format then takes the packed
+    * route, and these stages have nowhere to run its copies. Almost none of
+    * them are really both: this pass reads the derefs and says so. Nothing
+    * here ran it, though three comments already assumed something had.
+    * KHR-GL45.shading_language_420pack.binding_image_* is 13 cases of one
+    * plainly-declared rgba8 image2D shared by every stage. */
+   {
+      const nir_opt_access_options access_options = { .is_vulkan = false };
+      NIR_PASS(_, nir, nir_opt_access, &access_options);
+   }
    nir_foreach_variable_with_modes(var, nir, nir_var_image)
       var->data.descriptor_set = 0;
    if (!gex_wgpu_collect_stage_images(nir, &tcs->images,
-                                      "tessellation control") ||
-       tcs->images.packed_count) {
+                                      "tessellation control")) {
       gex_wgpu_set_compile_error(
          mutable_state,
          "gex_wgpu cannot serve an image in the tessellation control stage");
       ralloc_free(nir);
       FREE(tcs);
       return NULL;
+   }
+   /* A packed image -- one WebGPU has no storage texture for -- becomes a
+    * storage buffer the shader packs, and MESA_SHADER_COMPUTE puts it in
+    * descriptor set 0, which is where this dispatch binds. The copies back
+    * into the texture are recorded by gex_wgpu_dispatch once the pass ends. */
+   if (tcs->images.packed_count) {
+      char why[176] = {0};
+      if (!gex_wgpu_apply_packed_images(
+             nir, tcs->images.packed_count, tcs->images.packed_slots,
+             tcs->images.packed_bindings, tcs->images.packed_formats,
+             tcs->images.packed_write, MESA_SHADER_COMPUTE, why,
+             sizeof(why))) {
+         gex_wgpu_set_compile_error(
+            mutable_state,
+            "gex_wgpu could not lower a packed image for the tessellation "
+            "control stage");
+         fprintf(stderr,
+                 "gex-wgpu: tessellation control packed image lowering: %s\n",
+                 why[0] ? why : "failed");
+         ralloc_free(nir);
+      FREE(tcs);
+         return NULL;
+      }
    }
    gex_wgpu_tess_collect_ubos(nir, &tcs->ubo_count, tcs->ubo_slots,
                               tcs->ubo_bindings, tcs->ubo_required,
@@ -24909,11 +25095,32 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
    /* After lower_gallium_ubos, which is what assigns image bindings, and in
     * group zero, which is where the dispatch binds them -- see the geometry
     * stage's copy of this for what each mistake looks like. */
+   /* An image the stage never actually touches is dropped, not served and not
+    * refused. GLSL lets a program declare the same image uniform in every
+    * stage and use it in one, which is exactly what
+    * KHR-GL45.shading_language_420pack.binding_image_* does -- and in the
+    * stages that only declare it, nir_opt_access has no access to infer, so
+    * it arrives read+write with no format and classifies as a packed image.
+    * Refusing that killed the whole program for the sake of a variable
+    * nothing reads or writes. */
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_image, NULL);
+   /* And infer readonly/writeonly for the images that are left. GLSL asks for
+    * the qualifiers only when a shader means to restrict itself, so an image
+    * declared plainly arrives read *and* written -- which WebGPU allows only
+    * for r32ui/r32i/r32f, so every ordinary format then takes the packed
+    * route, and these stages have nowhere to run its copies. Almost none of
+    * them are really both: this pass reads the derefs and says so. Nothing
+    * here ran it, though three comments already assumed something had.
+    * KHR-GL45.shading_language_420pack.binding_image_* is 13 cases of one
+    * plainly-declared rgba8 image2D shared by every stage. */
+   {
+      const nir_opt_access_options access_options = { .is_vulkan = false };
+      NIR_PASS(_, nir, nir_opt_access, &access_options);
+   }
    nir_foreach_variable_with_modes(var, nir, nir_var_image)
       var->data.descriptor_set = 0;
    if (!gex_wgpu_collect_stage_images(nir, &tes->images,
-                                      "tessellation evaluation") ||
-       tes->images.packed_count) {
+                                      "tessellation evaluation")) {
       gex_wgpu_set_compile_error(
          mutable_state,
          "gex_wgpu cannot serve an image in the tessellation evaluation "
@@ -24921,6 +25128,30 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
       ralloc_free(nir);
       FREE(tes);
       return NULL;
+   }
+   /* A packed image -- one WebGPU has no storage texture for -- becomes a
+    * storage buffer the shader packs, and MESA_SHADER_COMPUTE puts it in
+    * descriptor set 0, which is where this dispatch binds. The copies back
+    * into the texture are recorded by gex_wgpu_dispatch once the pass ends. */
+   if (tes->images.packed_count) {
+      char why[176] = {0};
+      if (!gex_wgpu_apply_packed_images(
+             nir, tes->images.packed_count, tes->images.packed_slots,
+             tes->images.packed_bindings, tes->images.packed_formats,
+             tes->images.packed_write, MESA_SHADER_COMPUTE, why,
+             sizeof(why))) {
+         gex_wgpu_set_compile_error(
+            mutable_state,
+            "gex_wgpu could not lower a packed image for the tessellation "
+            "evaluation stage");
+         fprintf(stderr,
+                 "gex-wgpu: tessellation evaluation packed image "
+                 "lowering: %s\n",
+                 why[0] ? why : "failed");
+         ralloc_free(nir);
+      FREE(tes);
+         return NULL;
+      }
    }
    gex_wgpu_tess_collect_ubos(nir, &tes->ubo_count, tes->ubo_slots,
                               tes->ubo_bindings, tes->ubo_required,
@@ -25232,13 +25463,31 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
     * @group(2), for which the dispatch's pipeline layout has no group:
     * "The entry-point uses bindings in group 2 but [PipelineLayout] doesn't
     * have a BindGroupLayout for this index". */
+   /* An image the stage never actually touches is dropped, not served and not
+    * refused. GLSL lets a program declare the same image uniform in every
+    * stage and use it in one, which is exactly what
+    * KHR-GL45.shading_language_420pack.binding_image_* does -- and in the
+    * stages that only declare it, nir_opt_access has no access to infer, so
+    * it arrives read+write with no format and classifies as a packed image.
+    * Refusing that killed the whole program for the sake of a variable
+    * nothing reads or writes. */
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_image, NULL);
+   /* And infer readonly/writeonly for the images that are left. GLSL asks for
+    * the qualifiers only when a shader means to restrict itself, so an image
+    * declared plainly arrives read *and* written -- which WebGPU allows only
+    * for r32ui/r32i/r32f, so every ordinary format then takes the packed
+    * route, and these stages have nowhere to run its copies. Almost none of
+    * them are really both: this pass reads the derefs and says so. Nothing
+    * here ran it, though three comments already assumed something had.
+    * KHR-GL45.shading_language_420pack.binding_image_* is 13 cases of one
+    * plainly-declared rgba8 image2D shared by every stage. */
+   {
+      const nir_opt_access_options access_options = { .is_vulkan = false };
+      NIR_PASS(_, nir, nir_opt_access, &access_options);
+   }
    nir_foreach_variable_with_modes(var, nir, nir_var_image)
       var->data.descriptor_set = 0;
-   if (!gex_wgpu_collect_stage_images(nir, &gs->images, "geometry") ||
-       /* A packed image needs a storage buffer copied into and out of the
-        * texture around the pass, which this path has nowhere to do; refused
-        * by name rather than bound as something it is not. */
-       gs->images.packed_count) {
+   if (!gex_wgpu_collect_stage_images(nir, &gs->images, "geometry")) {
       gex_wgpu_set_compile_error(
          mutable_state,
          "gex_wgpu cannot serve an image in the geometry stage");
@@ -25246,6 +25495,28 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       free(gs->xfb);
       FREE(gs);
       return NULL;
+   }
+   /* A packed image -- one WebGPU has no storage texture for -- becomes a
+    * storage buffer the shader packs, and MESA_SHADER_COMPUTE puts it in
+    * descriptor set 0, which is where this dispatch binds. The copies back
+    * into the texture are recorded by gex_wgpu_dispatch once the pass ends. */
+   if (gs->images.packed_count) {
+      char why[176] = {0};
+      if (!gex_wgpu_apply_packed_images(
+             nir, gs->images.packed_count, gs->images.packed_slots,
+             gs->images.packed_bindings, gs->images.packed_formats,
+             gs->images.packed_write, MESA_SHADER_COMPUTE, why,
+             sizeof(why))) {
+         gex_wgpu_set_compile_error(
+            mutable_state,
+            "gex_wgpu could not lower a packed image for the geometry stage");
+         fprintf(stderr, "gex-wgpu: geometry packed image lowering: %s\n",
+                 why[0] ? why : "failed");
+         ralloc_free(nir);
+      free(gs->xfb);
+      FREE(gs);
+         return NULL;
+      }
    }
    nir_foreach_variable_with_modes(var, nir,
                                    nir_var_mem_ubo | nir_var_mem_ssbo) {
@@ -25924,6 +26195,53 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       ++ubo_total;
    }
 
+   /* And the packed ones, two bindings each over the buffer the shader packs
+    * into. gex_wgpu_flush_packed_images below copies them back into their
+    * textures once the pass has ended. */
+   for (unsigned i = 0; i < ctx->vs->capture_images.packed_count; ++i) {
+      const unsigned slot = ctx->vs->capture_images.packed_slots[i];
+      const struct pipe_image_view *iv =
+         &ctx->shader_images[MESA_SHADER_VERTEX][slot];
+      WGPUBuffer packed = NULL, header = NULL;
+      uint64_t packed_size = 0;
+      if (!gex_wgpu_image_is_bound(iv)) {
+         packed = gex_wgpu_packed_image_scratch(ctx, false);
+         header = gex_wgpu_packed_image_scratch(ctx, true);
+         packed_size = GEX_WGPU_PACKED_IMAGE_HEADER_BYTES;
+      } else {
+         packed = gex_wgpu_packed_image_bind(
+            ctx, iv, ctx->vs->capture_images.packed_formats[i],
+            ctx->vs->capture_images.packed_read[i], &packed_size, &header);
+      }
+      if (!packed || !header) {
+         fprintf(stderr, "gex-wgpu: vertex capture declined (no buffer for "
+                 "packed image %u)\n", slot);
+         for (unsigned r = 0; r < capture_image_view_count; ++r)
+            wgpuTextureViewRelease(capture_image_views[r]);
+         gex_fail(ctx);
+         return false;
+      }
+      for (unsigned half = 0; half < 2; ++half) {
+         ubo_entries[ubo_total] =
+            (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+         ubo_entries[ubo_total].binding = half
+            ? GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot
+            : ctx->vs->capture_images.packed_bindings[i];
+         ubo_entries[ubo_total].visibility = WGPUShaderStage_Compute;
+         ubo_entries[ubo_total].buffer.type = half
+            ? WGPUBufferBindingType_Storage
+            : WGPUBufferBindingType_ReadOnlyStorage;
+         ubo_bindings[ubo_total] =
+            (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         ubo_bindings[ubo_total].binding = ubo_entries[ubo_total].binding;
+         ubo_bindings[ubo_total].buffer = half ? packed : header;
+         ubo_bindings[ubo_total].offset = 0;
+         ubo_bindings[ubo_total].size =
+            half ? packed_size : GEX_WGPU_PACKED_IMAGE_HEADER_BYTES;
+         ++ubo_total;
+      }
+   }
+
    /* Two writable storage bindings over one range is refused by WebGPU with a
     * validation error, which takes the command buffer -- so this path checks
     * for it too. It builds its layout by hand rather than through
@@ -25994,6 +26312,9 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       } else {
          ok = false;
       }
+      /* The copies this dispatch's packed images owe their textures, after
+       * the pass so a texture copy is legal to record. */
+      gex_wgpu_flush_packed_images(ctx, encoder);
       WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
       if (commands) {
          gex_wgpu_queue_submit(screen, 1, &commands);
@@ -26273,6 +26594,62 @@ gex_wgpu_bind_stage_images(struct gex_wgpu_context *ctx,
    return true;
 }
 
+/* The packed images a stage declares -- those WebGPU has no storage texture
+ * for, served through a storage buffer the shader packs itself.
+ *
+ * Two bindings each, as in launch_grid: the header, and the texel data over
+ * the same buffer. A read image is served as well as a written one, because a
+ * dispatch has no open render pass for the copy in to fight with. */
+static bool
+gex_wgpu_bind_stage_packed_images(struct gex_wgpu_context *ctx,
+                                  mesa_shader_stage stage,
+                                  const struct gex_wgpu_stage_images *images,
+                                  const char *stage_name,
+                                  struct gex_wgpu_bindings *group)
+{
+   for (unsigned i = 0; i < images->packed_count; ++i) {
+      const unsigned slot = images->packed_slots[i];
+      const struct pipe_image_view *iv = &ctx->shader_images[stage][slot];
+      WGPUBuffer buffer = NULL, header = NULL;
+      uint64_t size = 0;
+      if (!gex_wgpu_image_is_bound(iv)) {
+         buffer = gex_wgpu_packed_image_scratch(ctx, false);
+         header = gex_wgpu_packed_image_scratch(ctx, true);
+         size = GEX_WGPU_PACKED_IMAGE_HEADER_BYTES;
+      } else {
+         buffer = gex_wgpu_packed_image_bind(ctx, iv,
+                                             images->packed_formats[i],
+                                             images->packed_read[i], &size,
+                                             &header);
+      }
+      if (!buffer || !header) {
+         fprintf(stderr, "gex-wgpu: %s declined (no buffer for packed image "
+                 "%u)\n", stage_name, slot);
+         return false;
+      }
+      for (unsigned half = 0; half < 2; ++half) {
+         if (group->count >= GEX_WGPU_MAX_GROUP_BINDINGS) {
+            fprintf(stderr, "gex-wgpu: %s declined (more bindings than one "
+                    "group holds)\n", stage_name);
+            return false;
+         }
+         const unsigned at = group->count;
+         group->binding[at] = half
+            ? GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot
+            : images->packed_bindings[i];
+         group->buffer[at] = half ? buffer : header;
+         group->offset[at] = 0;
+         group->size[at] = half ? size : GEX_WGPU_PACKED_IMAGE_HEADER_BYTES;
+         group->storage_mask |= UINT64_C(1) << at;
+         /* The header is read-only; the data is what the shader packs into. */
+         if (!half)
+            group->readonly_mask |= UINT64_C(1) << at;
+         ++group->count;
+      }
+   }
+   return true;
+}
+
 /* The textures a vertex shader run as a compute pass samples. Every path that
  * dispatches a varying variant needs this, and forgetting it is not a wrong
  * picture but an invalid pipeline, which loses the whole command buffer. */
@@ -26281,9 +26658,25 @@ gex_wgpu_bind_varying_textures(struct gex_wgpu_context *ctx,
                                const struct gex_wgpu_varying_variant *variant,
                                struct gex_wgpu_bindings *group)
 {
-   return gex_wgpu_bind_textures_from(&ctx->base, ctx->vertex_sampler_views,
-                                      ctx->vertex_samplers,
-                                      &variant->textures, group);
+   if (!gex_wgpu_bind_textures_from(&ctx->base, ctx->vertex_sampler_views,
+                                    ctx->vertex_samplers, &variant->textures,
+                                    group))
+      return false;
+   /* And its images, whose views the variant owns: releasing last time's here
+    * is what keeps the five callers free of lifetime handling. */
+   struct gex_wgpu_varying_variant *mutable_variant =
+      (struct gex_wgpu_varying_variant *)variant;
+   for (unsigned i = 0; i < mutable_variant->image_view_count; ++i)
+      wgpuTextureViewRelease(mutable_variant->image_views[i]);
+   mutable_variant->image_view_count = 0;
+   if (!gex_wgpu_bind_stage_images(ctx, MESA_SHADER_VERTEX,
+                                   &variant->images, "vertex varying pass",
+                                   group, mutable_variant->image_views,
+                                   &mutable_variant->image_view_count))
+      return false;
+   return gex_wgpu_bind_stage_packed_images(ctx, MESA_SHADER_VERTEX,
+                                            &variant->images,
+                                            "vertex varying pass", group);
 }
 
 static WGPUBindGroupLayout
@@ -26429,6 +26822,7 @@ gex_wgpu_dispatch(struct gex_wgpu_context *ctx, WGPUShaderModule module,
             fprintf(stderr, "gex-wgpu: dispatch declined (%u storage buffers, "
                     "the device takes %u per stage)\n", wanted, have);
          }
+         ctx->dispatch_declined = true;
          return false;
       }
    }
@@ -26477,6 +26871,11 @@ gex_wgpu_dispatch(struct gex_wgpu_context *ctx, WGPUShaderModule module,
       } else {
          ok = false;
       }
+      /* The copies the pass owes its packed images' textures. Every
+       * compute-emulated stage reaches the queue through here, so this is the
+       * one place all of them can settle it -- and it must be after the pass
+       * ends, because a texture copy cannot be recorded inside one. */
+      gex_wgpu_flush_packed_images(ctx, encoder);
       WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
       if (commands) {
          gex_wgpu_queue_submit(screen, 1, &commands);
@@ -27915,7 +28314,7 @@ gex_wgpu_gs_scan(struct gex_wgpu_context *ctx, unsigned prims)
                                                     &scan_group1, NULL, 1);
    pipe_resource_reference(&scan_buffer, NULL);
    if (!ok)
-      gex_fail(ctx);
+      gex_dispatch_gave_up(ctx);
    return ok;
 }
 
@@ -27997,7 +28396,7 @@ gex_wgpu_gs_capture(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs,
                                        GEX_WGPU_GSXFB_GROUP));
    pipe_resource_reference(&param_buffer, NULL);
    if (!ok) {
-      gex_fail(ctx);
+      gex_dispatch_gave_up(ctx);
       return false;
    }
 
@@ -28268,7 +28667,7 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    pipe_resource_reference(&vs_params, NULL);
    pipe_resource_reference(&slot_table, NULL);
    if (!ok) {
-      gex_fail(ctx);
+      gex_dispatch_gave_up(ctx);
       return false;
    }
 
@@ -28304,6 +28703,10 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
         gex_wgpu_bind_stage_images(ctx, MESA_SHADER_GEOMETRY, &gs->images,
                                    "geometry dispatch", &gs_group0,
                                    gs_image_views, &gs_image_view_count) &&
+        gex_wgpu_bind_stage_packed_images(ctx, MESA_SHADER_GEOMETRY,
+                                          &gs->images,
+                                          "geometry dispatch",
+                                          &gs_group0) &&
         gex_wgpu_bind_constants(ctx, &gs_group1, MESA_SHADER_GEOMETRY,
                                 gs->ubo_count, gs->ubo_slots, gs->ubo_bindings,
                                 gs->ubo_storage_mask);
@@ -28315,7 +28718,7 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
       wgpuTextureViewRelease(gs_image_views[i]);
    pipe_resource_reference(&gs_param_buffer, NULL);
    if (!ok) {
-      gex_fail(ctx);
+      gex_dispatch_gave_up(ctx);
       return false;
    }
 
@@ -28742,7 +29145,7 @@ gex_wgpu_tes_capture(struct gex_wgpu_context *ctx, struct gex_wgpu_tes *tes,
                           DIV_ROUND_UP(prims, GEX_WGPU_TESXFB_GROUP));
    pipe_resource_reference(&param_buffer, NULL);
    if (!ok) {
-      gex_fail(ctx);
+      gex_dispatch_gave_up(ctx);
       return false;
    }
 
@@ -28915,7 +29318,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                                           GEX_WGPU_CAPTURE_GROUP));
    pipe_resource_reference(&vs_params, NULL);
    if (!ok) {
-      gex_fail(ctx);
+      gex_dispatch_gave_up(ctx);
       return false;
    }
 
@@ -28974,6 +29377,10 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
         gex_wgpu_bind_stage_images(ctx, MESA_SHADER_TESS_CTRL, &tcs->images,
                                    "tcs dispatch", &tcs_group0,
                                    tcs_image_views, &tcs_image_view_count) &&
+        gex_wgpu_bind_stage_packed_images(ctx, MESA_SHADER_TESS_CTRL,
+                                          &tcs->images,
+                                          "tcs dispatch",
+                                          &tcs_group0) &&
         gex_wgpu_bind_constants(ctx, &tcs_group1, MESA_SHADER_TESS_CTRL,
                                 tcs->ubo_count, tcs->ubo_slots,
                                 tcs->ubo_bindings, tcs->ubo_storage_mask);
@@ -28985,7 +29392,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    pipe_resource_reference(&tcs_param_buffer, NULL);
    if (!ok) {
       free(default_levels);
-      gex_fail(ctx);
+      gex_dispatch_gave_up(ctx);
       return false;
    }
    }
@@ -29135,6 +29542,10 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
         gex_wgpu_bind_stage_images(ctx, MESA_SHADER_TESS_EVAL, &tes->images,
                                    "tes dispatch", &tes_group0,
                                    tes_image_views, &tes_image_view_count) &&
+        gex_wgpu_bind_stage_packed_images(ctx, MESA_SHADER_TESS_EVAL,
+                                          &tes->images,
+                                          "tes dispatch",
+                                          &tes_group0) &&
         gex_wgpu_bind_constants(ctx, &tes_group1, MESA_SHADER_TESS_EVAL,
                                 tes->ubo_count, tes->ubo_slots,
                                 tes->ubo_bindings, tes->ubo_storage_mask);
@@ -29146,7 +29557,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
       wgpuTextureViewRelease(tes_image_views[i]);
    pipe_resource_reference(&tes_param_buffer, NULL);
    if (!ok) {
-      gex_fail(ctx);
+      gex_dispatch_gave_up(ctx);
       return false;
    }
 
