@@ -2501,6 +2501,17 @@ struct gex_wgpu_gs {
    uint32_t ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    uint32_t ubo_required[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    uint32_t ubo_storage_mask;
+   /* And the application's shader storage blocks, which are bound from
+    * ctx->shader_buffers rather than from the constant buffers -- kept apart
+    * for the same reason the graphics stages keep them apart, that a slot
+    * number means a different thing in each table. This stage runs as a
+    * compute pass, where a storage buffer is entirely legal; what was missing
+    * was only the collection and the binding, and until both existed the cap
+    * had to say zero. */
+   unsigned ssbo_count;
+   uint8_t ssbo_slots[GEX_WGPU_MAX_SHADER_BUFFERS];
+   uint32_t ssbo_bindings[GEX_WGPU_MAX_SHADER_BUFFERS];
+   uint32_t ssbo_readonly_mask;
    WGPUShaderModule module;
    /* The rasterization half: a vertex shader that reads the geometry output
     * buffer as a vertex buffer and passes it straight through, and the vertex
@@ -2534,6 +2545,17 @@ struct gex_wgpu_tcs {
    uint32_t ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    uint32_t ubo_required[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    uint32_t ubo_storage_mask;
+   /* And the application's shader storage blocks, which are bound from
+    * ctx->shader_buffers rather than from the constant buffers -- kept apart
+    * for the same reason the graphics stages keep them apart, that a slot
+    * number means a different thing in each table. This stage runs as a
+    * compute pass, where a storage buffer is entirely legal; what was missing
+    * was only the collection and the binding, and until both existed the cap
+    * had to say zero. */
+   unsigned ssbo_count;
+   uint8_t ssbo_slots[GEX_WGPU_MAX_SHADER_BUFFERS];
+   uint32_t ssbo_bindings[GEX_WGPU_MAX_SHADER_BUFFERS];
+   uint32_t ssbo_readonly_mask;
    WGPUShaderModule module;
 };
 
@@ -2588,6 +2610,17 @@ struct gex_wgpu_tes {
    uint32_t ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    uint32_t ubo_required[GEX_WGPU_MAX_CONSTANT_BUFFERS];
    uint32_t ubo_storage_mask;
+   /* And the application's shader storage blocks, which are bound from
+    * ctx->shader_buffers rather than from the constant buffers -- kept apart
+    * for the same reason the graphics stages keep them apart, that a slot
+    * number means a different thing in each table. This stage runs as a
+    * compute pass, where a storage buffer is entirely legal; what was missing
+    * was only the collection and the binding, and until both existed the cap
+    * had to say zero. */
+   unsigned ssbo_count;
+   uint8_t ssbo_slots[GEX_WGPU_MAX_SHADER_BUFFERS];
+   uint32_t ssbo_bindings[GEX_WGPU_MAX_SHADER_BUFFERS];
+   uint32_t ssbo_readonly_mask;
    /* The clone the variants are built from, and the variants themselves. */
    nir_shader *nir;
    struct gex_wgpu_tes_variant *variants;
@@ -25085,9 +25118,19 @@ gex_wgpu_blocks_to_group_one(nir_shader *nir)
 {
    nir_foreach_variable_with_modes(var, nir,
                                    nir_var_mem_ubo | nir_var_mem_ssbo) {
+      /* Storage blocks in two ranges go: the spilled uniform ones, which are
+       * bound from ctx->constant_buffers with the rest of group one, and the
+       * *application's* own, which are bound from ctx->shader_buffers -- both
+       * into group one, because that is where the dispatch binds them.
+       *
+       * The upper bound matters as much as the lower. Above the shader-buffer
+       * range are the driver's own storage blocks: a packed image's texel
+       * data at GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING and everything
+       * beside it, all bound in group zero. Moving one of those is an invalid
+       * pipeline whose only symptom is a store that quietly did nothing. */
       if (var->data.mode == nir_var_mem_ssbo &&
           (var->data.binding < GEX_WGPU_STORAGE_UBO_FIRST_BINDING ||
-           var->data.binding >= GEX_WGPU_SSBO_FIRST_BINDING))
+           var->data.binding >= GEX_WGPU_IMAGE_FIRST_BINDING))
          continue;
       /* And a *uniform* block belongs to group one only if it is one of the
        * application's constant buffers. The pass has one of its own now --
@@ -25927,17 +25970,47 @@ gex_wgpu_tes_variant_get(struct pipe_context *pipe, struct gex_wgpu_tes *tes,
    return variant;
 }
 
-/* The uniform and storage blocks a lowered tessellation stage will want bound
- * to its group one, in the order gex_wgpu_bind_constants expects. */
+/* The blocks a lowered compute-emulated stage will want bound to its group
+ * one, split into the two tables that are bound from two different places.
+ *
+ * A block whose binding is in the shader-storage range is one of the
+ * *application's* storage blocks and comes from ctx->shader_buffers.
+ * Everything else is a constant buffer -- including a uniform block that
+ * spilled into storage mode because the device's uniform limit ran out, which
+ * is still bound from ctx->constant_buffers and is what ubo_storage_mask
+ * marks. Lumping the two together bound the wrong resource, which is why the
+ * emulated stages reported zero storage blocks until now.
+ *
+ * `ssbo_count` may be NULL for a caller that has no such table yet. */
 static void
-gex_wgpu_tess_collect_ubos(nir_shader *nir, unsigned *count, uint8_t *slots,
-                           uint32_t *bindings, uint32_t *required,
-                           uint32_t *storage_mask)
+gex_wgpu_stage_collect_blocks(nir_shader *nir, unsigned *count,
+                              uint8_t *slots, uint32_t *bindings,
+                              uint32_t *required, uint32_t *storage_mask,
+                              unsigned *ssbo_count, uint8_t *ssbo_slots,
+                              uint32_t *ssbo_bindings,
+                              uint32_t *ssbo_readonly_mask)
 {
    nir_foreach_variable_with_modes(var, nir,
                                    nir_var_mem_ubo | nir_var_mem_ssbo) {
-      if (var->data.descriptor_set != 2 ||
-          *count >= GEX_WGPU_MAX_CONSTANT_BUFFERS)
+      if (var->data.descriptor_set != 2)
+         continue;
+      if (ssbo_count && var->data.binding >= GEX_WGPU_SSBO_FIRST_BINDING &&
+          var->data.binding < GEX_WGPU_IMAGE_FIRST_BINDING) {
+         const unsigned slot = var->data.driver_location;
+         bool seen = false;
+         for (unsigned i = 0; i < *ssbo_count; ++i)
+            if (ssbo_slots[i] == slot) { seen = true; break; }
+         if (seen || *ssbo_count >= GEX_WGPU_MAX_SHADER_BUFFERS ||
+             slot >= GEX_WGPU_MAX_SHADER_BUFFERS)
+            continue;
+         ssbo_slots[*ssbo_count] = (uint8_t)slot;
+         ssbo_bindings[*ssbo_count] = var->data.binding;
+         if (var->data.access & ACCESS_NON_WRITEABLE)
+            *ssbo_readonly_mask |= UINT32_C(1) << *ssbo_count;
+         ++*ssbo_count;
+         continue;
+      }
+      if (*count >= GEX_WGPU_MAX_CONSTANT_BUFFERS)
          continue;
       slots[*count] = var->data.driver_location;
       bindings[*count] = var->data.binding;
@@ -26085,9 +26158,11 @@ gex_wgpu_create_tcs_state(struct pipe_context *pipe,
          return NULL;
       }
    }
-   gex_wgpu_tess_collect_ubos(nir, &tcs->ubo_count, tcs->ubo_slots,
-                              tcs->ubo_bindings, tcs->ubo_required,
-                              &tcs->ubo_storage_mask);
+   gex_wgpu_stage_collect_blocks(nir, &tcs->ubo_count, tcs->ubo_slots,
+                                 tcs->ubo_bindings, tcs->ubo_required,
+                                 &tcs->ubo_storage_mask, &tcs->ssbo_count,
+                                 tcs->ssbo_slots, tcs->ssbo_bindings,
+                                 &tcs->ssbo_readonly_mask);
    tcs->module = gex_wgpu_tcs_module(pipe, nir, tcs);
    if (!tcs->module) {
       gex_wgpu_set_compile_error(
@@ -26302,9 +26377,11 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
          return NULL;
       }
    }
-   gex_wgpu_tess_collect_ubos(nir, &tes->ubo_count, tes->ubo_slots,
-                              tes->ubo_bindings, tes->ubo_required,
-                              &tes->ubo_storage_mask);
+   gex_wgpu_stage_collect_blocks(nir, &tes->ubo_count, tes->ubo_slots,
+                                 tes->ubo_bindings, tes->ubo_required,
+                                 &tes->ubo_storage_mask, &tes->ssbo_count,
+                                 tes->ssbo_slots, tes->ssbo_bindings,
+                                 &tes->ssbo_readonly_mask);
    /* The variants are built from this clone at draw time, because each one
     * depends on the control shader bound with it. The rasterization half does
     * not: it reads this shader's own outputs, which are known now. */
@@ -26675,18 +26752,11 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
          return NULL;
       }
    }
-   nir_foreach_variable_with_modes(var, nir,
-                                   nir_var_mem_ubo | nir_var_mem_ssbo) {
-      if (var->data.descriptor_set != 2 ||
-          gs->ubo_count >= GEX_WGPU_MAX_CONSTANT_BUFFERS)
-         continue;
-      gs->ubo_slots[gs->ubo_count] = var->data.driver_location;
-      gs->ubo_bindings[gs->ubo_count] = var->data.binding;
-      gs->ubo_required[gs->ubo_count] = gex_wgpu_block_declared_size(var);
-      if (var->data.mode == nir_var_mem_ssbo)
-         gs->ubo_storage_mask |= UINT64_C(1) << gs->ubo_count;
-      ++gs->ubo_count;
-   }
+   gex_wgpu_stage_collect_blocks(nir, &gs->ubo_count, gs->ubo_slots,
+                                 gs->ubo_bindings, gs->ubo_required,
+                                 &gs->ubo_storage_mask, &gs->ssbo_count,
+                                 gs->ssbo_slots, gs->ssbo_bindings,
+                                 &gs->ssbo_readonly_mask);
 
    /* Which output slots are gl_ViewportIndex and gl_Layer, if either is
     * written. They stay in the buffer layout -- the compute pass writes them
@@ -27881,6 +27951,53 @@ gex_wgpu_bind_stage_packed_images(struct gex_wgpu_context *ctx,
          }
          ++group->count;
       }
+   }
+   return true;
+}
+
+/* The application's storage blocks, for a stage this driver runs as a compute
+ * pass. Bound from ctx->shader_buffers into the same group one the module
+ * declares them in, and writable, because a compute pass may write one -- that
+ * is the whole reason these stages can have them at all.
+ *
+ * A block with nothing bound reads zeros, which is what
+ * robust_buffer_access_behavior promises and what the graphics path already
+ * answers. */
+static bool
+gex_wgpu_bind_stage_ssbos(struct gex_wgpu_context *ctx,
+                          struct gex_wgpu_bindings *group,
+                          mesa_shader_stage stage, const char *stage_name,
+                          unsigned count, const uint8_t *slots,
+                          const uint32_t *bindings, uint32_t readonly_mask)
+{
+   for (unsigned i = 0; i < count; ++i) {
+      const struct pipe_shader_buffer *sb =
+         &ctx->shader_buffers[stage][slots[i]];
+      WGPUBuffer buffer;
+      uint64_t offset, size;
+      if (sb->buffer) {
+         buffer = gex_resource(sb->buffer)->buffer;
+         offset = sb->buffer_offset;
+         size = sb->buffer_size;
+      } else {
+         buffer = gex_wgpu_placeholder_storage(ctx, 0);
+         offset = 0;
+         size = ctx->placeholder_storage ? ctx->placeholder_storage->width0 : 0;
+      }
+      if (!buffer || group->count >= GEX_WGPU_MAX_GROUP_BINDINGS) {
+         fprintf(stderr, "gex-wgpu: %s declined (no room or no buffer for "
+                 "storage block %u)\n", stage_name, slots[i]);
+         return false;
+      }
+      const unsigned at = group->count;
+      group->binding[at] = bindings[i];
+      group->buffer[at] = buffer;
+      group->offset[at] = offset;
+      group->size[at] = ALIGN_POT(size, 4);
+      group->storage_mask |= UINT64_C(1) << at;
+      if (readonly_mask & (UINT32_C(1) << i))
+         group->readonly_mask |= UINT64_C(1) << at;
+      ++group->count;
    }
    return true;
 }
@@ -29973,7 +30090,11 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                                           &gs_group0) &&
         gex_wgpu_bind_constants(ctx, &gs_group1, MESA_SHADER_GEOMETRY,
                                 gs->ubo_count, gs->ubo_slots, gs->ubo_bindings,
-                                gs->ubo_storage_mask);
+                                gs->ubo_storage_mask) &&
+        gex_wgpu_bind_stage_ssbos(ctx, &gs_group1, MESA_SHADER_GEOMETRY,
+                                  "geometry dispatch", gs->ssbo_count,
+                                  gs->ssbo_slots, gs->ssbo_bindings,
+                                  gs->ssbo_readonly_mask);
    WGPUShaderModule gs_module = ok ? gex_wgpu_gs_module(ctx, gs) : NULL;
    if (ok && !gs_module) {
       for (unsigned i = 0; i < gs_image_view_count; ++i)
@@ -30752,7 +30873,11 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                                           &tcs_group0) &&
         gex_wgpu_bind_constants(ctx, &tcs_group1, MESA_SHADER_TESS_CTRL,
                                 tcs->ubo_count, tcs->ubo_slots,
-                                tcs->ubo_bindings, tcs->ubo_storage_mask);
+                                tcs->ubo_bindings, tcs->ubo_storage_mask) &&
+        gex_wgpu_bind_stage_ssbos(ctx, &tcs_group1, MESA_SHADER_TESS_CTRL,
+                                  "tcs dispatch", tcs->ssbo_count,
+                                  tcs->ssbo_slots, tcs->ssbo_bindings,
+                                  tcs->ssbo_readonly_mask);
    if (ok)
       ok = gex_wgpu_dispatch(ctx, tcs->module, &tcs_group0, &tcs_group1,
                              ctx->tess_levels, patches);
@@ -30919,7 +31044,11 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                                           &tes_group0) &&
         gex_wgpu_bind_constants(ctx, &tes_group1, MESA_SHADER_TESS_EVAL,
                                 tes->ubo_count, tes->ubo_slots,
-                                tes->ubo_bindings, tes->ubo_storage_mask);
+                                tes->ubo_bindings, tes->ubo_storage_mask) &&
+        gex_wgpu_bind_stage_ssbos(ctx, &tes_group1, MESA_SHADER_TESS_EVAL,
+                                  "tes dispatch", tes->ssbo_count,
+                                  tes->ssbo_slots, tes->ssbo_bindings,
+                                  tes->ssbo_readonly_mask);
    if (ok)
       ok = gex_wgpu_dispatch(ctx, variant->module, &tes_group0, &tes_group1,
                              NULL,
@@ -40591,12 +40720,33 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
        * would reject the bind group -- which the draw path reports as
        * "bind=failed" rather than mis-rendering. Understating the driver by
        * half to avoid a combination nothing does is the worse trade. */
+      /* The geometry and tessellation stages get them too, and get a smaller
+       * number honestly rather than the doubled one. Each runs as a compute
+       * pass, where a storage buffer is entirely legal -- what was missing
+       * was never the platform but the collection and the binding, and while
+       * those were missing the cap had to say zero. Zero is a legal answer in
+       * GL, so nothing complained; it simply meant the CTS skipped every
+       * tessellation variant it had ("Test requires
+       * GL_MAX_TESS_CONTROL_SHADER_STORAGE_BLOCKS >= 2, got 0") and no
+       * application could use one.
+       *
+       * Smaller because the pass itself spends up to six of the device's ten
+       * bindings on buffers of its own -- the parameters, the stage's inputs,
+       * its outputs, the tessellation levels -- so promising the full budget
+       * here would promise bindings that cannot exist. Doubled, as above,
+       * because st halves it. */
       caps->max_shader_buffers =
          stages[i] == MESA_SHADER_FRAGMENT ||
          stages[i] == MESA_SHADER_VERTEX ||
          stages[i] == MESA_SHADER_COMPUTE
             ? MIN2(GEX_WGPU_MAX_SHADER_BUFFERS,
                    MAX2(24u, screen->max_storage_buffers * 2))
+         : stages[i] == MESA_SHADER_GEOMETRY ||
+           stages[i] == MESA_SHADER_TESS_CTRL ||
+           stages[i] == MESA_SHADER_TESS_EVAL
+            ? MIN2(GEX_WGPU_MAX_SHADER_BUFFERS,
+                   2 * (screen->max_storage_buffers > 6
+                           ? screen->max_storage_buffers - 6 : 1u))
             : 0;
       /* Shader images, the last gate before ARB_compute_shader:
        * st_extensions turns on ARB_shader_image_load_store when the *fragment*
