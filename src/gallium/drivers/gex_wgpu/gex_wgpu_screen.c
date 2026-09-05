@@ -26866,15 +26866,31 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       GEX_CAPTURE_LIMIT("an instanced draw; the capture variant does not "
                         "model the instance index");
 
-   /* The slot table: one entry per captured vertex, resolved through the
-    * index buffer and through the primitive topology. */
-   const unsigned verts_per_prim = mesa_vertices_per_prim(info->mode);
+   /* Two shapes, and which one this is turns on whether anything is being
+    * recorded.
+    *
+    * Transform feedback records *primitives*, so its slot table is the draw
+    * assembled into them -- a strip becomes triangles, and a vertex shared by
+    * two of them appears twice. A dispatch that exists only for the vertex
+    * shader's own stores wants no assembly at all: GL runs that shader once
+    * per vertex, and the topology is not its business.
+    *
+    * Insisting on assembly for both meant a side-effect dispatch inherited
+    * the topology refusal below, and GL_PATCHES has no primitive size to
+    * assemble by -- so a vertex shader that stored to an image was silently
+    * declined for the whole of a tessellated draw. */
+   const bool assemble = ctx->so_target_count != 0;
+   const unsigned verts_per_prim =
+      assemble ? mesa_vertices_per_prim(info->mode) : 1;
    const unsigned prims =
-      gex_wgpu_primitive_count(ctx, info->mode, draw->count);
+      assemble ? gex_wgpu_primitive_count(ctx, info->mode, draw->count)
+               : draw->count;
    const uint64_t captured = (uint64_t)prims * verts_per_prim;
    if (!prims || !verts_per_prim || verts_per_prim > 3 ||
        captured > (1u << 22) ||
-       gex_wgpu_assembled_vertex(info->mode, 0, 0, draw->count) == UINT_MAX) {
+       (assemble &&
+        gex_wgpu_assembled_vertex(info->mode, 0, 0, draw->count) ==
+           UINT_MAX)) {
       static bool said;
       if (!said) {
          said = true;
@@ -26903,8 +26919,11 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    }
    for (unsigned prim = 0; prim < prims; ++prim) {
       for (unsigned v = 0; v < verts_per_prim; ++v) {
+         /* Slot i is vertex i when nothing is being assembled. */
          const unsigned at =
-            gex_wgpu_assembled_vertex(info->mode, prim, v, draw->count);
+            assemble ? gex_wgpu_assembled_vertex(info->mode, prim, v,
+                                                 draw->count)
+                     : prim;
          uint32_t vertex;
          if (!info->index_size) {
             vertex = draw->start + at;
@@ -36001,6 +36020,22 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
       return;
    }
+
+   /* A vertex shader's own stores happen in a compute dispatch of its own,
+    * which is further down -- past the two branches below, each of which
+    * replaces this draw with its stage's passes and returns. So a vertex
+    * shader that writes an image or a storage block did nothing whatsoever
+    * whenever it was paired with a geometry or a tessellation stage, and the
+    * only symptom was a zero where the value should have been.
+    *
+    * The varying pass those stages run cannot stand in for it: that one is
+    * built from the copy whose stores were stripped, precisely so the same
+    * writes do not happen twice. Running the capture dispatch here instead
+    * costs one extra pass over the vertices, and only for the rare shader
+    * that has both. */
+   if ((ctx->tcs || ctx->tes || ctx->gs) && ctx->vs &&
+       ctx->vs->writes_storage && ctx->vs->capture_nir)
+      (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
 
    /* Tessellation replaces this draw with five passes of its own, the last
     * of which comes back through here with the passthrough shader bound.
