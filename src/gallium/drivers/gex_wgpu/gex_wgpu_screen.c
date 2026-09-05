@@ -1737,7 +1737,13 @@ struct gex_wgpu_context {
       uint32_t height;
       uint32_t layers;
       uint32_t row_bytes;
-   } packed_copies[GEX_WGPU_MAX_SHADER_IMAGES];
+      /* Not GEX_WGPU_MAX_SHADER_IMAGES: the bound is per *pass*, not per
+       * draw, and the entries are keyed by level and first layer as well as
+       * by buffer -- so one pass that rebinds an image at several levels
+       * needs more than there are image units. Overflowing does not fail, it
+       * leaves an image's bytes uncopied, which is a wrong picture with one
+       * line in the log. */
+   } packed_copies[64];
    unsigned packed_copy_count;
    /* Set when a dispatch was refused against a device limit rather than
     * failing; see gex_wgpu_dispatch_gave_up. */
@@ -32285,18 +32291,35 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
 
 /* Dynamic offsets, which WebGPU takes as one array per bind group in
  * increasing binding order -- not in the order the entries were built. */
+/* One entry per binding the group declares with a dynamic offset.
+ *
+ * Sized for more than the uniform blocks alone: the vertex group also carries
+ * the draw parameters, so a shader using every constant buffer needs one more
+ * slot than there are constant buffers. The device advertises fewer uniform
+ * buffers per stage than GEX_WGPU_MAX_CONSTANT_BUFFERS, which is the only
+ * reason the old exact-fit array never overflowed -- and an overflow here is
+ * not a missing offset, it is a count that disagrees with the layout, which
+ * invalidates the bind group and every draw recorded with it. */
 struct gex_wgpu_dynamic_offsets {
    unsigned count;
-   uint32_t binding[GEX_WGPU_MAX_CONSTANT_BUFFERS];
-   uint32_t offset[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   uint32_t binding[GEX_WGPU_MAX_CONSTANT_BUFFERS + 4];
+   uint32_t offset[GEX_WGPU_MAX_CONSTANT_BUFFERS + 4];
 };
 
 static void
 gex_wgpu_add_dynamic_offset(struct gex_wgpu_dynamic_offsets *list,
                             uint32_t binding, uint32_t offset)
 {
-   if (list->count >= ARRAY_SIZE(list->binding))
+   if (list->count >= ARRAY_SIZE(list->binding)) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: more than %u dynamic offsets in one bind "
+                 "group; this group will not match its layout\n",
+                 (unsigned)ARRAY_SIZE(list->binding));
+      }
       return;
+   }
    unsigned at = list->count++;
    while (at > 0 && list->binding[at - 1] > binding) {
       list->binding[at] = list->binding[at - 1];
