@@ -2557,6 +2557,14 @@ struct gex_wgpu_capture_variant {
     * KHR-GL45.texture_view's reference_counting and coherency both sample a
     * view in the vertex stage and read the answer back through feedback. */
    struct gex_wgpu_stage_textures textures;
+   /* The sampler state this module was lowered against, compared only when
+    * the shader samples an integer texture -- the same key the varying
+    * variant carries, for the same reason. WGSL cannot sample an integer
+    * texture, so the fetch that replaces it bakes in the wrap, filter and
+    * swizzle, and a module built against one state cannot serve another. */
+   struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
+   uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
+   uint8_t targets[GEX_WGPU_MAX_SAMPLERS];
    WGPUShaderModule module;
    unsigned so_mask;
    uint32_t so_bindings[GEX_WGPU_MAX_SO_BUFFERS];
@@ -16172,9 +16180,21 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
     * quietly wrong with nothing in the log. Four of
     * gl44-sampling-matrix-probe's cases were exactly that, invisible until a
     * GL 4.4 context let the probe run. */
+   /* Mip-NEAREST is allowed here because the shader lowering models it --
+    * gex_wgpu_border_lowering carries integer_mip_filter and integer_levels,
+    * computes the level and clamps it, and refuses only MIPFILTER_LINEAR.
+    * Refusing it here was stricter than the pass that would have served it,
+    * and a refusal is not a neutral outcome: create_sampler_state returns
+    * NULL, cso binds NULL, and every consumer then reads the slot as
+    * texelFetch-only -- so the border lowering that exists for exactly this
+    * case never runs. KHR-GL45.gpu_shader5's four texture_gather_offset clamp
+    * cases died that way: their reference sampler is CLAMP_TO_BORDER with
+    * mip-nearest, the gather on it was left as a sampled integer image, and
+    * Tint rejected the whole capture shader. */
    if (border && (comparison ||
                   state->min_img_filter != state->mag_img_filter ||
-                  state->min_mip_filter != PIPE_TEX_MIPFILTER_NONE ||
+                  (state->min_mip_filter != PIPE_TEX_MIPFILTER_NONE &&
+                   state->min_mip_filter != PIPE_TEX_MIPFILTER_NEAREST) ||
                   (!state->border_color_is_integer &&
                    (!isfinite(state->border_color.f[0]) ||
                     !isfinite(state->border_color.f[1]) ||
@@ -16182,8 +16202,9 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
                     !isfinite(state->border_color.f[3])))))
       return gex_wgpu_sampler_refused(state,
                                       "clamp-to-border with comparison, "
-                                      "mismatched filters, mip filtering or "
-                                      "a non-finite border colour");
+                                      "mismatched filters, linear mip "
+                                      "filtering or a non-finite border "
+                                      "colour");
    struct pipe_sampler_state supported = {0};
    supported.wrap_s = state->wrap_s;
    supported.wrap_t = state->wrap_t;
@@ -22574,9 +22595,34 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
     * and a sampler variable per unit, so they are renumbered into the compute
     * range below and the dispatch binds them from the vertex stage's own
     * sampler state. */
-   for (struct gex_wgpu_capture_variant *v = vs->captures; v; v = v->next)
-      if (!memcmp(&v->layout, layout, sizeof(*layout)))
+   for (struct gex_wgpu_capture_variant *v = vs->captures; v; v = v->next) {
+      if (memcmp(&v->layout, layout, sizeof(*layout)))
+         continue;
+      if (!vs->integer_sampled_slots)
          return v;
+      /* An integer-sampling shader's module is specific to the state it was
+       * lowered against, so the layout matching is not enough. */
+      bool match = true;
+      for (unsigned i = 0; match && i < v->textures.count; ++i) {
+         const unsigned slot = v->textures.slots[i];
+         const struct pipe_sampler_view *view = ctx->vertex_sampler_views[slot];
+         const uint8_t swizzle[4] = {
+            gex_wgpu_effective_view_swizzle(view, 0),
+            gex_wgpu_effective_view_swizzle(view, 1),
+            gex_wgpu_effective_view_swizzle(view, 2),
+            gex_wgpu_effective_view_swizzle(view, 3),
+         };
+         if (ctx->vertex_samplers[slot])
+            match = memcmp(&v->sampler_keys[slot],
+                           &ctx->vertex_samplers[slot]->state,
+                           sizeof(v->sampler_keys[slot])) == 0;
+         match = match && memcmp(v->swizzles[slot], swizzle,
+                                 sizeof(swizzle)) == 0 &&
+                 v->targets[slot] == (view ? view->target : 0xffu);
+      }
+      if (match)
+         return v;
+   }
 
    nir_shader *nir = nir_shader_clone(NULL, vs->capture_nir);
    if (!nir)
@@ -22724,6 +22770,53 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
          return NULL;
       }
    }
+   /* An integer texture cannot be sampled in WGSL, so `texture()` or a
+    * gather on one has to become a fetch that applies the wrap, filter and
+    * swizzle itself. The varying variant has done this since the emulated
+    * stages learned to sample; the capture variant never did, so a vertex
+    * shader that gathered an integer texture and read the answer back through
+    * transform feedback reached Tint as a sampled image and came back
+    * "sampled image must have float component type" -- seven of the nine
+    * KHR-GL45.gpu_shader5 failures, which are all texture_gather_offset over
+    * exactly that shape. */
+   /* GEX_WGPU_CAPTEX_LOG names, per slot, whether a view and a sampler state
+    * are actually there. "view=1 samp=0" is the state that hides a refused
+    * sampler: the lowering reads a missing sampler as texelFetch-only and
+    * leaves a sampled image behind for Tint to reject. */
+   if (getenv("GEX_WGPU_CAPTEX_LOG")) {
+      fprintf(stderr, "gex-captex: int_sampled=0x%04x tex=%u:",
+              vs->integer_sampled_slots, variant->textures.count);
+      for (unsigned i = 0; i < variant->textures.count; ++i) {
+         const unsigned slot = variant->textures.slots[i];
+         fprintf(stderr, " [%u]view=%d samp=%d", slot,
+                 ctx->vertex_sampler_views[slot] ? 1 : 0,
+                 ctx->vertex_samplers[slot] ? 1 : 0);
+      }
+      fprintf(stderr, "\n");
+   }
+   if (vs->integer_sampled_slots) {
+      if (!gex_wgpu_lower_texture_variant(nir, variant->textures.count,
+                                          variant->textures.slots,
+                                          vs->integer_sampled_slots,
+                                          ctx->vertex_samplers,
+                                          ctx->vertex_sampler_views)) {
+         ralloc_free(nir);
+         FREE(variant);
+         return NULL;
+      }
+      for (unsigned i = 0; i < variant->textures.count; ++i) {
+         const unsigned slot = variant->textures.slots[i];
+         const struct pipe_sampler_view *view =
+            ctx->vertex_sampler_views[slot];
+         if (ctx->vertex_samplers[slot])
+            variant->sampler_keys[slot] = ctx->vertex_samplers[slot]->state;
+         for (unsigned channel = 0; channel < 4; ++channel)
+            variant->swizzles[slot][channel] =
+               gex_wgpu_effective_view_swizzle(view, channel);
+         variant->targets[slot] = view ? (uint8_t)view->target : 0xffu;
+      }
+   }
+
    variant->layout = *layout;
    variant->so_mask = state.so_mask;
    variant->vb_mask = state.vb_mask;
