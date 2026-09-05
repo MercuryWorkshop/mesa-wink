@@ -2201,6 +2201,14 @@ struct gex_wgpu_shader_variant {
    /* Texture slots removed from this variant because the bound state could
     * not satisfy their declaration; see gex_wgpu_unusable_texture_slots. */
    uint16_t omitted_slots;
+   /* The polygon offset this variant computes itself, and the state it baked
+    * in as immediates; see gex_wgpu_lower_polygon_offset_clamp. All four are
+    * part of the key because all four are constants in the shader. */
+   bool offset_clamp;
+   float offset_clamp_factor;
+   float offset_clamp_units;
+   float offset_clamp_value;
+   float offset_clamp_r;
    uint32_t stipple[32];
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
@@ -2210,6 +2218,10 @@ struct gex_wgpu_shader_variant {
 struct gex_wgpu_rasterizer {
    bool scissor;
    bool front_ccw;
+   /* GL's own glPolygonOffset arguments, before the scaling depth_bias
+    * carries. gex_wgpu_lower_polygon_offset_clamp needs them unscaled. */
+   float offset_units;
+   bool offset_units_unscaled;
    /* glPolygonMode per face. fill_mode is the one the draw path acts on and
     * is only meaningful when the two agree; when they differ the draw is
     * split into one pass per facing, each with its own fill_mode -- see the
@@ -6767,6 +6779,108 @@ gex_wgpu_fit_varyings(nir_shader *nir, const uint8_t *want)
  * differ only by an inversion on a 32-tall target and by an inversion plus a
  * shift on a 48-tall one. `tests/gl44-probe.sh polygon-stipple` checks both.
  */
+/* ARB_polygon_offset_clamp, computed in the fragment shader.
+ *
+ * Every part of the extension is already here -- pipe_rasterizer_state::
+ * offset_clamp reaches WGPUDepthStencilState::depthBiasClamp, which means the
+ * same thing, and the value arrives intact -- but the clamp has no effect on
+ * this platform. It was measured twice, and the second time traced as far as
+ * Dawn's Vulkan backend enabling the device feature and handing the value to
+ * the pipeline, so it is dropped past both. Claiming an extension whose effect
+ * is silently absent is worse than not having it, which is why the cap stayed
+ * off.
+ *
+ * The way out is not to depend on the platform for it. GL's offset is
+ *
+ *     o = m * factor + r * units
+ *
+ * with m the polygon's maximum depth slope and r the minimum resolvable
+ * difference, and all of that is computable in a fragment shader: m from the
+ * screen-space derivatives of gl_FragCoord.z, r as a constant of the depth
+ * format. So when a *finite, non-zero* clamp is set the fixed-function bias is
+ * turned off and the whole offset is done here instead, clamped as the spec
+ * says. A zero or infinite clamp does no clamping, so those keep the
+ * fixed-function path and cost nothing -- which is also what keeps this off
+ * the path of every ordinary polygon-offset draw.
+ *
+ * r is `2 / (2^bits - 1)`, which is not a guess: it is what the reference
+ * does. draw_pipe_offset.c computes `offset_units * mrd * 2` with mrd from
+ * util_get_depth_format_mrd, and it is the same factor of two this driver
+ * already applies when handing offset_units to WebGPU.
+ *
+ * Two things this gives up, both stated rather than hidden. A shader that
+ * writes gl_FragDepth itself is left alone: its own write is what reaches the
+ * depth test in GL too, so emulating underneath it would change the picture
+ * rather than fix it. And gl_FragCoord.z here is unbiased where GL would have
+ * offset it before the shader ran -- so a shader that both uses a clamped
+ * offset and reads its own window z sees the pre-offset value.
+ */
+/* Whether this draw's polygon offset has to be done in the shader.
+ *
+ * Only a finite, non-zero clamp needs it: zero and infinity clamp nothing, so
+ * the fixed-function bias is already exactly right for them, and a shader that
+ * writes its own gl_FragDepth overrides the offset in GL as well. */
+static bool
+gex_wgpu_offset_clamp_in_shader(const struct gex_wgpu_context *ctx)
+{
+   if (!ctx->rasterizer || !ctx->rasterizer->depth_bias_enabled || !ctx->depth)
+      return false;
+   const float clamp_value = ctx->rasterizer->depth_bias_clamp;
+   if (clamp_value == 0.0f || !isfinite(clamp_value))
+      return false;
+   return ctx->fs && ctx->fs->original_nir &&
+          !(ctx->fs->original_nir->info.outputs_written &
+            BITFIELD64_BIT(FRAG_RESULT_DEPTH));
+}
+
+/* GL's minimum resolvable difference for the bound depth format, times the
+ * two draw_pipe_offset.c applies -- the same factor this driver already puts
+ * on offset_units when handing it to WebGPU. */
+static float
+gex_wgpu_depth_offset_r(const struct gex_wgpu_context *ctx)
+{
+   if (ctx->rasterizer && ctx->rasterizer->offset_units_unscaled)
+      return 1.0f;
+   if (!ctx->depth)
+      return 0.0f;
+   return (float)(2.0 * util_get_depth_format_mrd(
+                     util_format_description(ctx->depth->format)));
+}
+
+static bool
+gex_wgpu_lower_polygon_offset_clamp(nir_shader *nir, float factor, float units,
+                                    float clamp_value, float r)
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl)
+      return false;
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   /* At the top of main, so the derivatives below are outside any control
+    * flow the shader introduces -- a derivative in non-uniform control flow
+    * has no defined value. */
+   nir_variable *pos = nir_get_variable_with_location(
+      nir, nir_var_shader_in, VARYING_SLOT_POS, glsl_vec4_type());
+   nir_def *z = nir_channel(&b, nir_load_var(&b, pos), 2);
+   nir_def *m = nir_fmax(&b, nir_fabs(&b, nir_ddx(&b, z)),
+                         nir_fabs(&b, nir_ddy(&b, z)));
+   nir_def *o = nir_fadd(&b, nir_fmul_imm(&b, m, factor),
+                         nir_imm_float(&b, r * units));
+   /* GL: a positive clamp is an upper bound, a negative one a lower bound,
+    * and zero -- or a non-finite value -- clamps nothing. The caller has
+    * already excluded those, so there is no infinity to build here; WGSL has
+    * no way to spell one. */
+   o = clamp_value > 0.0f ? nir_fmin(&b, o, nir_imm_float(&b, clamp_value))
+                          : nir_fmax(&b, o, nir_imm_float(&b, clamp_value));
+   nir_variable *depth = nir_get_variable_with_location(
+      nir, nir_var_shader_out, FRAG_RESULT_DEPTH, glsl_float_type());
+   nir_store_var(&b, depth, nir_fsat(&b, nir_fadd(&b, z, o)), 0x1);
+   nir->info.outputs_written |= BITFIELD64_BIT(FRAG_RESULT_DEPTH);
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
+}
+
 static bool
 gex_wgpu_lower_poly_stipple(nir_shader *nir, const uint32_t pattern[32])
 {
@@ -11964,6 +12078,16 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    /* glPolygonStipple, applied as a discard against the pattern. */
    const bool want_stipple = ctx->rasterizer && ctx->rasterizer->poly_stipple &&
                              ctx->poly_stipple_set;
+   /* ARB_polygon_offset_clamp, when the platform will not clamp for us. */
+   const bool want_offset_clamp = gex_wgpu_offset_clamp_in_shader(ctx);
+   const float offset_clamp_factor =
+      want_offset_clamp ? ctx->rasterizer->depth_bias_slope : 0.0f;
+   const float offset_clamp_units =
+      want_offset_clamp ? ctx->rasterizer->offset_units : 0.0f;
+   const float offset_clamp_value =
+      want_offset_clamp ? ctx->rasterizer->depth_bias_clamp : 0.0f;
+   const float offset_clamp_r =
+      want_offset_clamp ? gex_wgpu_depth_offset_r(ctx) : 0.0f;
    /* point_coord_location among them: a shader reading gl_PointCoord and
     * nothing else -- `pointcoord`, exactly -- took this exit and got the base
     * module, whose gl_PointCoord is the single-pixel centre. The expanded
@@ -11985,7 +12109,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
        line_edge_location == ~0u && !fs->buftex_count &&
        !want_sample_positions && !want_logicop && !want_ignore_sample_mask &&
-       !want_omit_slots)
+       !want_omit_slots && !want_offset_clamp)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -12093,7 +12217,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
       want_sample_positions != 0 || want_logicop != 0 ||
-      want_ignore_sample_mask || want_omit_slots != 0;
+      want_ignore_sample_mask || want_omit_slots != 0 || want_offset_clamp;
    if (!needs_variant && !fs->buftex_count)
       return fs->module;
 
@@ -12115,6 +12239,12 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->poly_stipple == want_stipple &&
                    cached->ignore_sample_mask == want_ignore_sample_mask &&
                    cached->omitted_slots == want_omit_slots &&
+                   cached->offset_clamp == want_offset_clamp &&
+                   (!want_offset_clamp ||
+                    (cached->offset_clamp_factor == offset_clamp_factor &&
+                     cached->offset_clamp_units == offset_clamp_units &&
+                     cached->offset_clamp_value == offset_clamp_value &&
+                     cached->offset_clamp_r == offset_clamp_r)) &&
                    (!want_stipple ||
                     memcmp(cached->stipple, ctx->poly_stipple,
                            sizeof(cached->stipple)) == 0);
@@ -12218,6 +12348,10 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * would otherwise see the load this adds. */
    if (want_stipple)
       gex_wgpu_lower_poly_stipple(variant, ctx->poly_stipple);
+   if (want_offset_clamp)
+      gex_wgpu_lower_polygon_offset_clamp(variant, offset_clamp_factor,
+                                          offset_clamp_units,
+                                          offset_clamp_value, offset_clamp_r);
    if (needs_sampler_variant && !gex_wgpu_lower_texture_variant(
           variant, fs->texture_count, fs->texture_slots,
           fs->integer_sampled_slots, ctx->samplers, ctx->sampler_views)) {
@@ -12282,6 +12416,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->poly_stipple = want_stipple;
    cached->ignore_sample_mask = want_ignore_sample_mask;
    cached->omitted_slots = want_omit_slots;
+   cached->offset_clamp = want_offset_clamp;
+   cached->offset_clamp_factor = offset_clamp_factor;
+   cached->offset_clamp_units = offset_clamp_units;
+   cached->offset_clamp_value = offset_clamp_value;
+   cached->offset_clamp_r = offset_clamp_r;
    memcpy(cached->stipple, ctx->poly_stipple, sizeof(cached->stipple));
    for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
       if (!(sampler_mask & (UINT64_C(1) << slot)))
@@ -12499,7 +12638,18 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
                                          (state->offset_units_unscaled ? 1.0f
                                                                        : 2.0f));
       rasterizer->depth_bias_slope = state->offset_scale;
-      rasterizer->depth_bias_clamp = state->offset_clamp;
+      /* GL allows an infinite or NaN clamp and means "do not clamp" by it;
+       * WebGPU takes a finite float and spells no-clamp as zero, and handing
+       * it an infinity fails pipeline validation -- which drops the draw, so
+       * the depth stays at the clear value. KHR-GL46.polygon_offset_clamp's
+       * ZeroInfinity case passes -INFINITY and read back 1.0 for exactly
+       * that. */
+      rasterizer->depth_bias_clamp = isfinite(state->offset_clamp)
+         ? state->offset_clamp : 0.0f;
+      /* The unscaled values, for the shader that has to reproduce GL's whole
+       * offset when the clamp cannot be left to the platform. */
+      rasterizer->offset_units = state->offset_units;
+      rasterizer->offset_units_unscaled = state->offset_units_unscaled;
       rasterizer->fill_front = state->fill_front;
       rasterizer->fill_back = state->fill_back;
       rasterizer->fill_mode = state->fill_front == state->fill_back
@@ -36594,9 +36744,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       if (ctx->rasterizer && ctx->rasterizer->depth_bias_enabled &&
           (bias_topology == WGPUPrimitiveTopology_TriangleList ||
            bias_topology == WGPUPrimitiveTopology_TriangleStrip)) {
-         depth_state.depthBias = ctx->rasterizer->depth_bias;
-         depth_state.depthBiasSlopeScale = ctx->rasterizer->depth_bias_slope;
-         depth_state.depthBiasClamp = ctx->rasterizer->depth_bias_clamp;
+         /* Unless the fragment shader is computing the whole offset itself,
+          * which it does when a finite clamp is set -- applying both would
+          * offset twice. */
+         if (!gex_wgpu_offset_clamp_in_shader(ctx)) {
+            depth_state.depthBias = ctx->rasterizer->depth_bias;
+            depth_state.depthBiasSlopeScale = ctx->rasterizer->depth_bias_slope;
+            depth_state.depthBiasClamp = ctx->rasterizer->depth_bias_clamp;
+         }
       }
       if (has_stencil) {
          const bool stencil_enabled = ctx->dsa && ctx->dsa->stencil[0].enabled;
@@ -39185,8 +39340,16 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * over 4.40 -- most of what carries the version number is separate
     * extensions -- and gl_CullDistance, the one addition that matters here,
     * is the thing that just landed. */
-   caps->glsl_feature_level = 450;
-   caps->glsl_feature_level_compatibility = 450;
+   /* 460, which is the other half of GL 4.6: st assigns
+    * `consts->GLSLVersion = screen->caps.glsl_feature_level` directly, and
+    * version.c's ver_4_6 wants that at 460 as well as the nine extensions.
+    * Everything GLSL 4.60 folds into core is already claimed as an extension
+    * here -- gl_spirv, the draw parameters, the group vote, the atomic
+    * counter ops, anisotropic filtering and the offset clamp -- so raising it
+    * grants applications the core spelling of what they could already ask for
+    * by name. */
+   caps->glsl_feature_level = 460;
+   caps->glsl_feature_level_compatibility = 460;
 
    /* ARB_texture_gather, exposed below its GL 4.0 core version.
     *
@@ -39299,7 +39462,8 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * refusing it used to cost. */
    caps->anisotropic_filter = true;
    caps->max_texture_anisotropy = 16.0f;
-   /* ARB_polygon_offset_clamp is deliberately *not* claimed, and the reason is
+   caps->polygon_offset_clamp = true;
+   /* Kept for the record: ARB_polygon_offset_clamp used to be *not* claimed,
     * worth keeping: every part of it is already here.
     * pipe_rasterizer_state::offset_clamp is carried through to
     * WGPUDepthStencilState::depthBiasClamp, which means the same thing, the
