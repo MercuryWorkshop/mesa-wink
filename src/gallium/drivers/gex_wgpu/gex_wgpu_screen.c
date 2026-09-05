@@ -562,6 +562,10 @@ static void gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
  * shader state). */
 #define GEX_WGPU_TCS_PARAM_INVOCATIONS 0
 #define GEX_WGPU_TCS_PARAM_VERTS_IN 1
+/* Patches in one instance. gl_PrimitiveID counts within the instance,
+ * while everything that *addresses* a patch counts across the whole
+ * dispatch, so the two cannot be the same number. */
+#define GEX_WGPU_TCS_PARAM_PATCHES 2
 #define GEX_WGPU_TCS_PARAM_WORDS 4
 
 #define GEX_WGPU_TES_PARAMS_BINDING 0
@@ -576,6 +580,8 @@ static void gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
  * is what gl_PatchVerticesIn reports to the evaluation shader. */
 #define GEX_WGPU_TES_PARAM_VERTICES 0
 #define GEX_WGPU_TES_PARAM_VERTS_OUT 1
+/* As GEX_WGPU_TCS_PARAM_PATCHES; see the note there. */
+#define GEX_WGPU_TES_PARAM_PATCHES 2
 #define GEX_WGPU_TES_PARAM_WORDS 4
 #define GEX_WGPU_TESS_GROUP 64
 /* The capture that records a tessellated draw's primitives.
@@ -24383,6 +24389,25 @@ gex_wgpu_tess_local_invocation(nir_builder *b,
                    nir_imm_int(b, state->vertices_out));
 }
 
+/* gl_PrimitiveID, which is not the same as the patch this invocation
+ * addresses. GL numbers primitives within the *instance*, and an instanced
+ * patch draw runs every instance's patches through one dispatch, so the
+ * addressing index counts across all of them and this one wraps. A zero
+ * parameter means the draw was not instanced and the two coincide. */
+static nir_def *
+gex_wgpu_tess_primitive_id(nir_builder *b,
+                           struct gex_wgpu_tess_lowering *state)
+{
+   nir_def *patch = gex_wgpu_tess_patch(b, state);
+   nir_deref_instr *params = gex_wgpu_block_words(b, state->params);
+   const unsigned which = state->evaluation ? GEX_WGPU_TES_PARAM_PATCHES
+                                            : GEX_WGPU_TCS_PARAM_PATCHES;
+   nir_def *per = nir_load_deref(
+      b, nir_build_deref_array(b, params, nir_imm_int(b, which)));
+   return nir_bcsel(b, nir_ieq_imm(b, per, 0), patch,
+                    nir_umod(b, patch, nir_umax(b, per, nir_imm_int(b, 1))));
+}
+
 /* The word a (buffer, patch, vertex, slot, component) tuple addresses. */
 static nir_def *
 gex_wgpu_tess_word_of(nir_builder *b, nir_def *record, unsigned slot,
@@ -24545,7 +24570,7 @@ gex_wgpu_tess_builtin(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nir_def_replace(&intr->def, gex_wgpu_tess_local_invocation(b, state));
       return true;
    case nir_intrinsic_load_primitive_id:
-      nir_def_replace(&intr->def, gex_wgpu_tess_patch(b, state));
+      nir_def_replace(&intr->def, gex_wgpu_tess_primitive_id(b, state));
       return true;
    case nir_intrinsic_load_patch_vertices_in: {
       nir_deref_instr *params = gex_wgpu_block_words(b, state->params);
@@ -29212,17 +29237,28 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    if (!tes)
       GEX_TESS_DECLINE("a patch draw with no evaluation shader");
 
-   if (info->index_size || info->instance_count != 1) {
-      if (getenv("GEX_WGPU_TESS_LOG"))
-         fprintf(stderr, "gex-wgpu: tess decline detail isz=%u inst=%u "
-                 "count=%u patch_vertices=%u\n", info->index_size,
-                 info->instance_count, draw->count, ctx->patch_vertices);
-      GEX_TESS_DECLINE("an indexed or instanced patch draw");
-   }
    const unsigned verts_in = ctx->patch_vertices;
+   /* The shape of the draw, before anything can decline it. This used to be
+    * printed only beside the indexed/instanced refusal, and so vanished with
+    * it -- but it is what identified that refusal in the first place, when
+    * three CTS cases were blaming gl_InvocationID and a barrier for a draw
+    * that had simply never run. A declined draw and a wrong draw look the
+    * same from the test's side; this line tells them apart. */
+   if (getenv("GEX_WGPU_TESS_LOG"))
+      fprintf(stderr, "gex-wgpu: tess draw isz=%u inst=%u count=%u start=%u "
+              "patch_vertices=%u\n", info->index_size, info->instance_count,
+              draw->count, draw->start, ctx->patch_vertices);
    if (!verts_in || draw->count < verts_in)
       GEX_TESS_DECLINE("a patch draw with no complete patch");
-   const unsigned patches = draw->count / verts_in;
+   /* Instanced, the same way the geometry path is: the capture runs the
+    * vertex shader once per (instance, vertex) instance-major, so a linear
+    * invocation still lands on the right vertex and neither the control nor
+    * the evaluation pass has to know about instances at all. They see one
+    * long run of patches; only gl_PrimitiveID has to wrap, and only because
+    * GL numbers primitives within the instance. */
+   const unsigned instances = info->instance_count ? info->instance_count : 1;
+   const unsigned patches_per_instance = draw->count / verts_in;
+   const unsigned patches = patches_per_instance * instances;
 
    /* A control shader is optional. Without one the evaluation shader reads the
     * vertex shader's output directly -- one patch is `patch_vertices` of those
@@ -29281,6 +29317,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
     * there is not, and either way this buffer is what it reads. */
    struct gex_wgpu_capture_layout layout;
    memset(&layout, 0, sizeof(layout));
+   layout.index_table = info->index_size ? 1 : 0;
    if (ctx->vertex_elements) {
       layout.count = ctx->vertex_elements->count;
       for (unsigned i = 0; i < layout.count; ++i) {
@@ -29302,6 +29339,14 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    uint32_t params[GEX_WGPU_PARAM_WORDS] = {0};
    params[GEX_WGPU_PARAM_FIRST_VERTEX] = draw->start;
    params[GEX_WGPU_PARAM_COUNT] = patches * verts_in;
+   /* Zero when the draw is not instanced, which is what tells the capture the
+    * slot *is* the vertex; see gex_wgpu_capture_instance. */
+   params[GEX_WGPU_PARAM_VERTS_PER_INSTANCE] =
+      instances > 1 ? patches_per_instance * verts_in : 0;
+   /* glDrawArraysInstancedBaseInstance: where the per-instance attributes
+    * start. Zero for every draw that does not use it, which is why leaving it
+    * unset looked right. */
+   params[GEX_WGPU_PARAM_FIRST_INSTANCE] = info->start_instance;
    struct gex_wgpu_bindings vs_group0 = {0}, vs_group1 = {0};
    for (unsigned i = 0; i < GEX_WGPU_MAX_VERTEX_BUFFERS; ++i) {
       if (!(vs_variant->vb_mask & (1u << i)))
@@ -29313,8 +29358,58 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
       gex_wgpu_bind_storage_access(&vs_group0, GEX_WGPU_VB_FIRST_BINDING + i,
                                    ctx->vertex_buffers[i], true);
    }
+   /* An indexed patch draw, as one instance's worth of source vertices. A
+    * patch has no assembly to speak of -- its vertices are consecutive -- so
+    * this is only the index lookup the geometry path's table also does, and
+    * one instance's worth however many there are, because every instance
+    * repeats the same indices. */
+   struct pipe_resource *slot_table = NULL;
+   if (info->index_size) {
+      if (info->index_size != 1 && info->index_size != 2 &&
+          info->index_size != 4)
+         GEX_TESS_DECLINE("an index width that is not 1, 2 or 4 bytes");
+      struct pipe_transfer *index_transfer = NULL;
+      const unsigned assembled = patches_per_instance * verts_in;
+      const void *raw = info->has_user_indices
+         ? (const void *)((const char *)info->index.user +
+                          (size_t)draw->start * info->index_size)
+         : pipe_buffer_map_range(&ctx->base, info->index.resource,
+                                 (size_t)draw->start * info->index_size,
+                                 (size_t)assembled * info->index_size,
+                                 PIPE_MAP_READ, &index_transfer);
+      if (!raw)
+         GEX_TESS_DECLINE("the index buffer could not be read");
+      uint32_t *table = MALLOC(assembled * sizeof(*table));
+      if (!table) {
+         if (index_transfer)
+            pipe_buffer_unmap(&ctx->base, index_transfer);
+         GEX_TESS_DECLINE("the slot table could not be allocated");
+      }
+      for (unsigned at = 0; at < assembled; ++at) {
+         uint32_t vertex;
+         if (info->index_size == 1) {
+            vertex = ((const uint8_t *)raw)[at];
+         } else if (info->index_size == 2) {
+            uint16_t narrow;
+            memcpy(&narrow, (const char *)raw + (size_t)at * 2, 2);
+            vertex = narrow;
+         } else {
+            memcpy(&vertex, (const char *)raw + (size_t)at * 4, 4);
+         }
+         table[at] = (uint32_t)((int64_t)vertex + draw->index_bias);
+      }
+      if (index_transfer)
+         pipe_buffer_unmap(&ctx->base, index_transfer);
+      slot_table = gex_wgpu_params_buffer(ctx, table, assembled);
+      FREE(table);
+      if (!slot_table)
+         GEX_TESS_DECLINE("the slot table buffer could not be made");
+   }
    struct pipe_resource *vs_params =
       gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS);
+   if (slot_table)
+      gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_INDEX_BINDING,
+                            slot_table);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_VARYING_OUT_BINDING,
                          ctx->tess_vs_out);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
@@ -29329,6 +29424,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
     * family died on the first one. */
    if (!gex_wgpu_bind_varying_textures(ctx, vs_variant, &vs_group0)) {
       pipe_resource_reference(&vs_params, NULL);
+      pipe_resource_reference(&slot_table, NULL);
       GEX_TESS_DECLINE("a texture the vertex capture pass reads is unbound");
    }
    bool ok = vs_params &&
@@ -29342,6 +29438,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                              DIV_ROUND_UP(patches * verts_in,
                                           GEX_WGPU_CAPTURE_GROUP));
    pipe_resource_reference(&vs_params, NULL);
+   pipe_resource_reference(&slot_table, NULL);
    if (!ok) {
       gex_dispatch_gave_up(ctx);
       return false;
@@ -29380,6 +29477,8 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    uint32_t tcs_params[GEX_WGPU_TCS_PARAM_WORDS] = {0};
    tcs_params[GEX_WGPU_TCS_PARAM_INVOCATIONS] = patches * tcs->vertices_out;
    tcs_params[GEX_WGPU_TCS_PARAM_VERTS_IN] = verts_in;
+   tcs_params[GEX_WGPU_TCS_PARAM_PATCHES] =
+      instances > 1 ? patches_per_instance : 0;
    struct gex_wgpu_bindings tcs_group0 = {0}, tcs_group1 = {0};
    struct pipe_resource *tcs_param_buffer =
       gex_wgpu_params_buffer(ctx, tcs_params, GEX_WGPU_TCS_PARAM_WORDS);
@@ -29543,6 +29642,8 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
     * a control shader that is its output size; with none it is the draw's
     * patch size, because the evaluation shader is reading vertices. */
    tes_params[GEX_WGPU_TES_PARAM_VERTS_OUT] = verts_per_patch;
+   tes_params[GEX_WGPU_TES_PARAM_PATCHES] =
+      instances > 1 ? patches_per_instance : 0;
    struct gex_wgpu_bindings tes_group0 = {0}, tes_group1 = {0};
    struct pipe_resource *tes_param_buffer =
       gex_wgpu_params_buffer(ctx, tes_params, GEX_WGPU_TES_PARAM_WORDS);
