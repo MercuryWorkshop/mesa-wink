@@ -225,9 +225,29 @@ create_device(void)
        * OpGroupNonUniformAny, so the extension stays unclaimed. Asking here
        * costs nothing and is one fewer thing to find later. */
       WGPUFeatureName_Subgroups,
+      /* Deliberately *not* here, though this adapter grants both:
+       * Unorm16TextureFormats and Snorm16TextureFormats would let R16_UNORM
+       * and its relatives be stored exactly instead of promoted to float32.
+       * The browser has no equivalent -- Chromium 151 offers no
+       * `texture-formats-tier1` -- so taking them would make the native path
+       * store something the target platform cannot, and every native
+       * measurement would overstate the browser by however much the
+       * promotion costs. The promotion is the honest common denominator
+       * until the browser catches up. GEX_WGPU_FEATURE_TRACE=1 prints what
+       * the adapter actually has, which is how this was checked.
+       *
+       * `texture-component-swizzle` is the mirror image and just as
+       * unusable: Chromium has it and this pinned Dawn does not, so adopting
+       * it would leave the native path unable to reproduce what the browser
+       * does -- and the native path is where the debugger is. */
    };
    WGPUFeatureName granted[sizeof(optional) / sizeof(optional[0])];
    size_t granted_count = 0;
+   if (getenv("GEX_WGPU_FEATURE_TRACE"))
+      for (size_t i = 0; i < sizeof(optional) / sizeof(optional[0]); ++i)
+         fprintf(stderr, "gex-feature: %u %s\n", (unsigned)optional[i],
+                 wgpuAdapterHasFeature(adapter_result.adapter, optional[i])
+                    ? "yes" : "NO");
    for (size_t i = 0; i < sizeof(optional) / sizeof(optional[0]); ++i)
       if (wgpuAdapterHasFeature(adapter_result.adapter, optional[i]))
          granted[granted_count++] = optional[i];

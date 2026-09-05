@@ -19093,6 +19093,36 @@ gex_wgpu_finite_clear(float value)
    return (double)value;
 }
 
+/* GL clamps an integer clear value to the attachment's representable range;
+ * WebGPU takes the number as given and lets it wrap. Both widths come from the
+ * format's own description, read through its swizzle so a packed or reversed
+ * layout reports the right component. */
+static uint64_t
+gex_wgpu_clamp_uint_clear(enum pipe_format format, unsigned component,
+                          uint32_t value)
+{
+   const unsigned bits =
+      util_format_get_component_bits(format, UTIL_FORMAT_COLORSPACE_RGB,
+                                     component);
+   if (bits == 0 || bits >= 32)
+      return value;
+   const uint64_t hi = (((uint64_t)1 << bits) - 1);
+   return value > hi ? hi : value;
+}
+
+static int64_t
+gex_wgpu_clamp_sint_clear(enum pipe_format format, unsigned component,
+                          int32_t value)
+{
+   const unsigned bits =
+      util_format_get_component_bits(format, UTIL_FORMAT_COLORSPACE_RGB,
+                                     component);
+   if (bits == 0 || bits >= 32)
+      return value;
+   const int64_t hi = ((int64_t)1 << (bits - 1)) - 1;
+   return CLAMP((int64_t)value, -hi - 1, hi);
+}
+
 static void
 gex_wgpu_clear_render_target(struct pipe_context *pipe,
                              struct pipe_surface *dst,
@@ -19192,16 +19222,27 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
     * 1 became the denormal 1.4e-45, which rounds to zero, so every integer
     * clear produced 0,0,0,0. WGPUColor is doubles, and Dawn takes the integer
     * value in them for an integer attachment. */
+   /* Clamped to what each component can hold, which GL requires of an integer
+    * clear and WebGPU does not do: rgb10a2uint's two-bit alpha handed 4 came
+    * back as zero, because the value wrapped rather than saturating.
+    * util_format_get_component_bits reads the width through the format's
+    * swizzle, so it is right for the packed and reversed layouts too. */
    if (util_format_is_pure_sint(dst->format)) {
-      attachment.clearValue.r = (double)color->i[0];
-      attachment.clearValue.g = (double)color->i[1];
-      attachment.clearValue.b = (double)color->i[2];
-      attachment.clearValue.a = (double)color->i[3];
+      double v[4];
+      for (unsigned c = 0; c < 4; ++c)
+         v[c] = (double)gex_wgpu_clamp_sint_clear(dst->format, c, color->i[c]);
+      attachment.clearValue.r = v[0];
+      attachment.clearValue.g = v[1];
+      attachment.clearValue.b = v[2];
+      attachment.clearValue.a = v[3];
    } else if (util_format_is_pure_uint(dst->format)) {
-      attachment.clearValue.r = (double)color->ui[0];
-      attachment.clearValue.g = (double)color->ui[1];
-      attachment.clearValue.b = (double)color->ui[2];
-      attachment.clearValue.a = (double)color->ui[3];
+      double v[4];
+      for (unsigned c = 0; c < 4; ++c)
+         v[c] = (double)gex_wgpu_clamp_uint_clear(dst->format, c, color->ui[c]);
+      attachment.clearValue.r = v[0];
+      attachment.clearValue.g = v[1];
+      attachment.clearValue.b = v[2];
+      attachment.clearValue.a = v[3];
    } else {
       attachment.clearValue.r = gex_wgpu_finite_clear(color->f[0]);
       attachment.clearValue.g = gex_wgpu_finite_clear(color->f[1]);
