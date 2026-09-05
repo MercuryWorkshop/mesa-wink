@@ -223,9 +223,15 @@ extern void gex_wgpu_jspi_signal(void);
  * storage binding offset 256-aligned and glBindImageTexture's is not. */
 #define GEX_WGPU_PACKED_IMAGE_BASE_BYTES 6
 #define GEX_WGPU_PACKED_IMAGE_HEADER_WORDS 7
+/* Rounded to four so a slot is a whole uvec4: the block is a *uniform* buffer
+ * and WGSL gives a uniform array a 16-byte stride, so it is declared as an
+ * array of uvec4 and a word is addressed as [w / 4][w % 4]. Both of those are
+ * compile-time constants at every use, so the division costs nothing. */
+#define GEX_WGPU_PACKED_IMAGE_HEADER_WORDS_PADDED 8
 /* All of them, in one block indexed by slot. */
-#define GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES \
-   (GEX_WGPU_MAX_SHADER_IMAGES * GEX_WGPU_PACKED_IMAGE_HEADER_WORDS * 4)
+#define GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES              \
+   (GEX_WGPU_MAX_SHADER_IMAGES *                         \
+    GEX_WGPU_PACKED_IMAGE_HEADER_WORDS_PADDED * 4)
 
 /* How many 32-bit words a texel of a buffer-texture format occupies, or 0 for
  * a format this driver cannot serve as one.
@@ -1769,6 +1775,9 @@ struct gex_wgpu_context {
       uint32_t height;
       uint32_t layers;
       uint32_t row_bytes;
+      /* Where this view's slices start in the resource's packed buffer, which
+       * holds every layer of the level. */
+      uint64_t buffer_offset;
       /* Not GEX_WGPU_MAX_SHADER_IMAGES: the bound is per *pass*, not per
        * draw, and the entries are keyed by level and first layer as well as
        * by buffer -- so one pass that rebinds an image at several levels
@@ -3797,16 +3806,27 @@ gex_wgpu_packed_image_header_block(nir_shader *nir, const char *name,
     * and eight images is sixteen, against a device that grants ten per stage.
     * The headers are driver-written metadata, so one buffer indexed by slot
     * serves them all and eight images cost nine buffers instead. */
+   /* A *uniform* block, not a storage one, and that is the point: a packed
+    * image already costs a storage buffer for its data, and the device grants
+    * ten per stage. Eight images plus this header plus the dispatch's own
+    * params and vertex buffer came to eleven. The header is read-only driver
+    * metadata half a kilobyte long, which is what uniform buffers are for,
+    * and they have a limit of their own.
+    *
+    * Safe to create here because this pass runs *after*
+    * gex_wgpu_lower_gallium_ubos: a synthetic uniform block made now never
+    * meets the lowering that numbers Gallium's own. */
    const struct glsl_type *words = glsl_array_type(
-      glsl_uint_type(),
-      GEX_WGPU_MAX_SHADER_IMAGES * GEX_WGPU_PACKED_IMAGE_HEADER_WORDS, 4);
+      glsl_uvec4_type(),
+      GEX_WGPU_MAX_SHADER_IMAGES *
+      GEX_WGPU_PACKED_IMAGE_HEADER_WORDS_PADDED / 4, 16);
    struct glsl_struct_field field = {0};
    field.type = words;
    field.name = "data";
    const struct glsl_type *block =
       glsl_interface_type(&field, 1, GLSL_INTERFACE_PACKING_STD430, false,
                           name);
-   nir_variable *var = nir_variable_create(nir, nir_var_mem_ssbo, block, name);
+   nir_variable *var = nir_variable_create(nir, nir_var_mem_ubo, block, name);
    var->interface_type = block;
    var->data.binding = binding;
    var->data.driver_location = 0;
@@ -3815,15 +3835,20 @@ gex_wgpu_packed_image_header_block(nir_shader *nir, const char *name,
    return var;
 }
 
-/* A word of the header the driver wrote for this image. */
+/* A word of the header the driver wrote for this image.
+ *
+ * The block is an array of uvec4, because a uniform array has a 16-byte
+ * stride, so a word is element `word / 4` component `word % 4`. Both are
+ * compile-time constants at every call. */
 static nir_def *
 gex_wgpu_packed_image_header(nir_builder *b, nir_variable *block,
                              unsigned word)
 {
-   return nir_load_deref(
+   nir_def *quad = nir_load_deref(
       b, nir_build_deref_array(
             b, nir_build_deref_struct(b, nir_build_deref_var(b, block), 0),
-            nir_imm_int(b, word)));
+            nir_imm_int(b, (int)(word / 4))));
+   return nir_channel(b, quad, word % 4);
 }
 
 /* Byte offset of a texel from the start of the buffer.
@@ -4247,7 +4272,8 @@ gex_wgpu_apply_packed_images(nir_shader *nir, unsigned count,
       block->data.descriptor_set = set;
       data->data.descriptor_set = set;
       state.block[slot] = block;
-      state.base_word[slot] = slot * GEX_WGPU_PACKED_IMAGE_HEADER_WORDS;
+      state.base_word[slot] =
+         slot * GEX_WGPU_PACKED_IMAGE_HEADER_WORDS_PADDED;
       state.data[slot] = data;
       state.format[slot] = formats[i];
       state.mask |= 1u << slot;
@@ -5224,7 +5250,8 @@ static WGPUBuffer gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx,
                                              const struct pipe_image_view *iv,
                                              enum pipe_format format,
                                              bool seed, uint64_t *size_out,
-                                             WGPUBuffer *header_out);
+                                             WGPUBuffer *header_out,
+                                             uint64_t *offset_out);
 static WGPUBuffer gex_wgpu_packed_image_scratch(struct gex_wgpu_context *ctx,
                                                 bool header);
 static void gex_wgpu_packed_image_seed(struct gex_wgpu_context *ctx,
@@ -21074,7 +21101,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       const struct pipe_image_view *iv =
          &ctx->shader_images[MESA_SHADER_COMPUTE][slot];
       WGPUBuffer buffer = NULL, header = NULL;
-      uint64_t size = 0;
+      uint64_t size = 0, data_offset = 0;
       if (!gex_wgpu_image_is_bound(iv)) {
          buffer = gex_wgpu_packed_image_scratch(ctx, false);
          header = gex_wgpu_packed_image_scratch(ctx, true);
@@ -21082,7 +21109,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       } else {
          buffer = gex_wgpu_packed_image_bind(
             ctx, slot, iv, compute->images.packed_formats[i],
-            compute->images.packed_read[i], &size, &header);
+            compute->images.packed_read[i], &size, &header, &data_offset);
       }
       if (!buffer || !header) {
          static bool said;
@@ -21105,14 +21132,15 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
             : compute->images.packed_bindings[i];
          entries[count].visibility = WGPUShaderStage_Compute;
          entries[count].buffer.type =
-            half && compute->images.packed_write[i]
+            !half ? WGPUBufferBindingType_Uniform
+            : compute->images.packed_write[i]
                ? WGPUBufferBindingType_Storage
                : WGPUBufferBindingType_ReadOnlyStorage;
          entries[count].buffer.hasDynamicOffset = false;
          bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          bindings[count].binding = entries[count].binding;
          bindings[count].buffer = half ? buffer : header;
-         bindings[count].offset = 0;
+         bindings[count].offset = half ? data_offset : 0;
          bindings[count].size =
             half ? size : GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
          ++count;
@@ -27314,7 +27342,7 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       const struct pipe_image_view *iv =
          &ctx->shader_images[MESA_SHADER_VERTEX][slot];
       WGPUBuffer packed = NULL, header = NULL;
-      uint64_t packed_size = 0;
+      uint64_t packed_size = 0, data_offset = 0;
       if (!gex_wgpu_image_is_bound(iv)) {
          packed = gex_wgpu_packed_image_scratch(ctx, false);
          header = gex_wgpu_packed_image_scratch(ctx, true);
@@ -27322,7 +27350,8 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       } else {
          packed = gex_wgpu_packed_image_bind(
             ctx, slot, iv, ctx->vs->capture_images.packed_formats[i],
-            ctx->vs->capture_images.packed_read[i], &packed_size, &header);
+            ctx->vs->capture_images.packed_read[i], &packed_size, &header,
+            &data_offset);
       }
       if (!packed || !header) {
          fprintf(stderr, "gex-wgpu: vertex capture declined (no buffer for "
@@ -27343,14 +27372,14 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
             ? GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot
             : ctx->vs->capture_images.packed_bindings[i];
          ubo_entries[ubo_total].visibility = WGPUShaderStage_Compute;
-         ubo_entries[ubo_total].buffer.type = half
-            ? WGPUBufferBindingType_Storage
-            : WGPUBufferBindingType_ReadOnlyStorage;
+         ubo_entries[ubo_total].buffer.type =
+            half ? WGPUBufferBindingType_Storage
+                 : WGPUBufferBindingType_Uniform;
          ubo_bindings[ubo_total] =
             (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          ubo_bindings[ubo_total].binding = ubo_entries[ubo_total].binding;
          ubo_bindings[ubo_total].buffer = half ? packed : header;
-         ubo_bindings[ubo_total].offset = 0;
+         ubo_bindings[ubo_total].offset = half ? data_offset : 0;
          ubo_bindings[ubo_total].size =
             half ? packed_size : GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
          ++ubo_total;
@@ -27729,7 +27758,7 @@ gex_wgpu_bind_stage_packed_images(struct gex_wgpu_context *ctx,
       const unsigned slot = images->packed_slots[i];
       const struct pipe_image_view *iv = &ctx->shader_images[stage][slot];
       WGPUBuffer buffer = NULL, header = NULL;
-      uint64_t size = 0;
+      uint64_t size = 0, data_offset = 0;
       if (!gex_wgpu_image_is_bound(iv)) {
          buffer = gex_wgpu_packed_image_scratch(ctx, false);
          header = gex_wgpu_packed_image_scratch(ctx, true);
@@ -27738,7 +27767,7 @@ gex_wgpu_bind_stage_packed_images(struct gex_wgpu_context *ctx,
          buffer = gex_wgpu_packed_image_bind(ctx, slot, iv,
                                              images->packed_formats[i],
                                              images->packed_read[i], &size,
-                                             &header);
+                                             &header, &data_offset);
       }
       if (!buffer || !header) {
          fprintf(stderr, "gex-wgpu: %s declined (no buffer for packed image "
@@ -27760,12 +27789,16 @@ gex_wgpu_bind_stage_packed_images(struct gex_wgpu_context *ctx,
             ? GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot
             : images->packed_bindings[i];
          group->buffer[at] = half ? buffer : header;
-         group->offset[at] = 0;
+         group->offset[at] = half ? data_offset : 0;
          group->size[at] = half ? size : GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
-         group->storage_mask |= UINT64_C(1) << at;
-         /* The header is read-only; the data is what the shader packs into. */
-         if (!half)
-            group->readonly_mask |= UINT64_C(1) << at;
+         /* The header is a *uniform* buffer and the data a storage one, and
+          * the layout has to say which: an entry with no mask is uniform. Not
+          * a saving so much as a requirement -- the module declares the block
+          * `var<uniform>`, and a layout that calls the same binding storage
+          * is an invalid pipeline, not a slow one. */
+         if (half) {
+            group->storage_mask |= UINT64_C(1) << at;
+         }
          ++group->count;
       }
    }
@@ -27943,6 +27976,18 @@ gex_wgpu_dispatch(struct gex_wgpu_context *ctx, WGPUShaderModule module,
             said = true;
             fprintf(stderr, "gex-wgpu: dispatch declined (%u storage buffers, "
                     "the device takes %u per stage)\n", wanted, have);
+            for (int gi = 0; gi < 2; ++gi) {
+               const struct gex_wgpu_bindings *g = gi ? g1 : g0;
+               if (!g)
+                  continue;
+               fprintf(stderr, "gex-wgpu:   group %d storage bindings:", gi);
+               for (unsigned i = 0; i < g->count; ++i)
+                  if ((g->storage_mask & (UINT64_C(1) << i)) &&
+                      !(g->texture_mask & (UINT64_C(1) << i)) &&
+                      !(g->sampler_mask & (UINT64_C(1) << i)))
+                     fprintf(stderr, " %u", g->binding[i]);
+               fprintf(stderr, "\n");
+            }
          }
          ctx->dispatch_declined = true;
          return false;
@@ -31801,7 +31846,7 @@ gex_wgpu_packed_image_write_header(struct gex_wgpu_context *ctx, unsigned slot,
    if (!ctx->packed_image_headers) {
       WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
       desc.size = GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
-      desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+      desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
       ctx->packed_image_headers =
          wgpuDeviceCreateBuffer(screen->device, &desc);
       if (!ctx->packed_image_headers)
@@ -31810,10 +31855,12 @@ gex_wgpu_packed_image_write_header(struct gex_wgpu_context *ctx, unsigned slot,
    /* A queue write is ordered against the submit that follows, so writing
     * every bound image's header before the batch goes out is enough -- the
     * same rule the persistent mappings rest on. */
+   uint32_t padded[GEX_WGPU_PACKED_IMAGE_HEADER_WORDS_PADDED] = {0};
+   memcpy(padded, words, GEX_WGPU_PACKED_IMAGE_HEADER_WORDS * 4);
    wgpuQueueWriteBuffer(
       screen->queue, ctx->packed_image_headers,
-      (uint64_t)slot * GEX_WGPU_PACKED_IMAGE_HEADER_WORDS * 4, words,
-      GEX_WGPU_PACKED_IMAGE_HEADER_WORDS * 4);
+      (uint64_t)slot * GEX_WGPU_PACKED_IMAGE_HEADER_WORDS_PADDED * 4, padded,
+      sizeof(padded));
    return ctx->packed_image_headers;
 }
 
@@ -31821,8 +31868,11 @@ static WGPUBuffer
 gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx, unsigned slot,
                            const struct pipe_image_view *iv,
                            enum pipe_format format, bool seed,
-                           uint64_t *size_out, WGPUBuffer *header_out)
+                           uint64_t *size_out, WGPUBuffer *header_out,
+                           uint64_t *offset_out)
 {
+   if (offset_out)
+      *offset_out = 0;
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
    struct pipe_resource *resource = iv->resource;
    struct gex_wgpu_resource *gex = gex_resource(resource);
@@ -31888,7 +31938,20 @@ gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx, unsigned slot,
       MAX2(iv->u.tex.last_layer - iv->u.tex.first_layer + 1, 1);
    const uint32_t row_bytes = align(width * bytes, 256);
    const uint64_t slice_bytes = (uint64_t)row_bytes * height;
-   const uint64_t total = slice_bytes * layers;
+   /* Every layer of the level, not just the bound ones -- the buffer belongs
+    * to the *resource*, and two image units on one texture are ordinary GL.
+    * Sized to the bound range, both units got one slice's worth at offset
+    * zero: the second unit's copy-in overwrote the first's, and both bindings
+    * covered the same range, which WebGPU refuses for a writable pair. Now
+    * each view is bound its own slice range, which is disjoint by
+    * construction and 256-aligned because row_bytes is. */
+   const uint32_t level_layers =
+      resource->target == PIPE_TEXTURE_3D
+         ? MAX2(u_minify(resource->depth0, level), 1)
+         : MAX2(resource->array_size, 1);
+   const uint64_t buffer_offset =
+      (uint64_t)MIN2(iv->u.tex.first_layer, level_layers - 1) * slice_bytes;
+   const uint64_t total = slice_bytes * MAX2(level_layers, layers);
 
    if (gex->packed_image_buffer && gex->packed_image_bytes < total) {
       wgpuBufferRelease(gex->packed_image_buffer);
@@ -31933,7 +31996,8 @@ gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx, unsigned slot,
       if (ctx->packed_copies[i].buffer == gex->packed_image_buffer &&
           ctx->packed_copies[i].level == level &&
           ctx->packed_copies[i].first_layer == iv->u.tex.first_layer) {
-         if (size_out) *size_out = total;
+         if (size_out) *size_out = slice_bytes * layers;
+         if (offset_out) *offset_out = buffer_offset;
          return gex->packed_image_buffer;         /* header already handed back */
       }
    }
@@ -31945,7 +32009,8 @@ gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx, unsigned slot,
                  "pass; the rest are not copied back\n",
                  (unsigned)ARRAY_SIZE(ctx->packed_copies));
       }
-      if (size_out) *size_out = total;
+      if (size_out) *size_out = slice_bytes * layers;
+      if (offset_out) *offset_out = buffer_offset;
       return gex->packed_image_buffer;
    }
    const unsigned at = ctx->packed_copy_count++;
@@ -31967,7 +32032,9 @@ gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx, unsigned slot,
    ctx->packed_copies[at].height = height;
    ctx->packed_copies[at].layers = layers;
    ctx->packed_copies[at].row_bytes = row_bytes;
-   if (size_out) *size_out = total;
+   ctx->packed_copies[at].buffer_offset = buffer_offset;
+   if (size_out) *size_out = slice_bytes * layers;
+   if (offset_out) *offset_out = buffer_offset;
    return gex->packed_image_buffer;
 }
 
@@ -32040,6 +32107,14 @@ gex_wgpu_packed_image_seed(struct gex_wgpu_context *ctx,
       ? 1 : MAX2(u_minify(iv->resource->height0, level), 1);
    const uint32_t layers =
       MAX2(iv->u.tex.last_layer - iv->u.tex.first_layer + 1, 1);
+   /* The same slice range the binding covers -- see gex_wgpu_packed_image_bind. */
+   const uint32_t level_layers =
+      iv->resource->target == PIPE_TEXTURE_3D
+         ? MAX2(u_minify(iv->resource->depth0, level), 1)
+         : MAX2(iv->resource->array_size, 1);
+   const uint64_t buffer_offset =
+      (uint64_t)MIN2(iv->u.tex.first_layer, level_layers - 1) *
+      align(width * bytes, 256) * height;
    /* Whatever the texture holds has to have reached the queue first. */
    gex_wgpu_submit_pending(ctx);
    WGPUCommandEncoder encoder =
@@ -32053,7 +32128,7 @@ gex_wgpu_packed_image_seed(struct gex_wgpu_context *ctx,
    from.aspect = WGPUTextureAspect_All;
    WGPUTexelCopyBufferInfo into = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
    into.buffer = gex->packed_image_buffer;
-   into.layout.offset = 0;
+   into.layout.offset = buffer_offset;
    into.layout.bytesPerRow = align(width * bytes, 256);
    into.layout.rowsPerImage = height;
    const WGPUExtent3D extent = {width, height, layers};
@@ -32600,7 +32675,7 @@ gex_wgpu_flush_packed_images(struct gex_wgpu_context *ctx,
          continue;
       WGPUTexelCopyBufferInfo from = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
       from.buffer = ctx->packed_copies[i].buffer;
-      from.layout.offset = 0;
+      from.layout.offset = ctx->packed_copies[i].buffer_offset;
       from.layout.bytesPerRow = ctx->packed_copies[i].row_bytes;
       from.layout.rowsPerImage = ctx->packed_copies[i].height;
       WGPUTexelCopyTextureInfo into = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
@@ -37918,7 +37993,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             : ctx->fs->packed_image_bindings[i];
          fragment_layout_entries[at].visibility = WGPUShaderStage_Fragment;
          fragment_layout_entries[at].buffer.type =
-            half && ctx->fs->packed_image_write[i]
+            !half ? WGPUBufferBindingType_Uniform
+            : ctx->fs->packed_image_write[i]
                ? WGPUBufferBindingType_Storage
                : WGPUBufferBindingType_ReadOnlyStorage;
          fragment_layout_entries[at].buffer.hasDynamicOffset = false;
@@ -38557,7 +38633,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const struct pipe_image_view *iv =
             &ctx->shader_images[MESA_SHADER_FRAGMENT][slot];
          WGPUBuffer buffer = NULL, header = NULL;
-         uint64_t size = 0;
+         uint64_t size = 0, data_offset = 0;
          if (!gex_wgpu_image_is_bound(iv)) {
             /* An image unit bound to an incomplete texture discards its
              * stores and the draw still happens -- the same rule the storage
@@ -38570,7 +38646,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          } else {
             buffer = gex_wgpu_packed_image_bind(
                ctx, slot, iv, ctx->fs->packed_image_formats[i],
-               ctx->fs->packed_image_read[i], &size, &header);
+               ctx->fs->packed_image_read[i], &size, &header,
+               &data_offset);
          }
          if (!buffer || !header) {
             static bool said;
@@ -38592,7 +38669,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                ? GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot
                : ctx->fs->packed_image_bindings[i];
             entries[at].buffer = half ? buffer : header;
-            entries[at].offset = 0;
+            entries[at].offset = half ? data_offset : 0;
             entries[at].size =
                half ? size : GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
          }
