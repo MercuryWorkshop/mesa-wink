@@ -966,6 +966,11 @@ struct gex_wgpu_screen {
    struct {
       WGPUTextureViewDimension dimension;
       WGPUTextureFormat format;
+      /* Part of the key, not decoration. One texture cannot stand in for both
+       * a read-only image unit and a write-only one in the same pass: WebGPU
+       * calls that "writable usage and another usage in the same
+       * synchronization scope" and invalidates the command buffer. */
+      WGPUStorageTextureAccess access;
       WGPUTexture texture;
       WGPUTextureView view;
    } default_images[16];
@@ -4406,7 +4411,7 @@ static WGPUTexture gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
 static bool gex_wgpu_image_also_sampled(const struct gex_wgpu_context *ctx,
                                         const struct pipe_resource *resource,
                                         bool compute);
-static void gex_wgpu_trace_buffer_aliasing(
+static bool gex_wgpu_trace_buffer_aliasing(
    const char *where, const WGPUBindGroupLayoutEntry *layout,
    const WGPUBindGroupEntry *bindings, unsigned count);
 static void gex_wgpu_trace_buffer_aliasing_reset(void);
@@ -11981,7 +11986,8 @@ gex_wgpu_set_vertex_buffers(struct pipe_context *pipe, unsigned count,
 static WGPUTextureView
 gex_wgpu_default_storage_view(struct gex_wgpu_screen *screen,
                               WGPUTextureViewDimension dimension,
-                              WGPUTextureFormat format);
+                              WGPUTextureFormat format,
+                              WGPUStorageTextureAccess access);
 
 static WGPUBuffer
 gex_wgpu_placeholder_storage(struct gex_wgpu_context *ctx, uint64_t least)
@@ -13544,7 +13550,22 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
    if (samples <= 1 &&
        gex_wgpu_storage_texture_format(gex_wgpu_stored_format(templ->format)) !=
           WGPUTextureFormat_Undefined)
-      desc.usage |= WGPUTextureUsage_StorageBinding;
+      desc.usage |= WGPUTextureUsage_StorageBinding |
+                    /* And bindable, by the same argument one step further on.
+                     * A *read-only* image is not a storage texture here at
+                     * all: Tint lowers a SPIR-V storage image that is only
+                     * read to a plain texture_2d<T>, read with textureLoad,
+                     * so the binding wants TextureBinding and not
+                     * StorageBinding. A texture created for image use alone
+                     * -- no PIPE_BIND_SAMPLER_VIEW, no render target -- had
+                     * neither, and the bind group was rejected:
+                     *
+                     *   [TextureView of Texture] usage (CopyDst|
+                     *   StorageBinding) doesn't include TextureBinding
+                     *
+                     * Anything that may be bound as an image may be bound as
+                     * a read-only one, so the two usages travel together. */
+                    WGPUTextureUsage_TextureBinding;
    if (templ->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL))
       desc.usage |= WGPUTextureUsage_RenderAttachment |
                     /* Sampled as well as rendered into, whether or not
@@ -18880,7 +18901,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
           * and discards its stores rather than being an error. */
          WGPUTextureView stand_in = gex_wgpu_default_storage_view(
             screen, compute->image_dimensions[i],
-            gex_wgpu_storage_texture_format(compute->image_formats[i]));
+            gex_wgpu_storage_texture_format(compute->image_formats[i]),
+            compute->image_access[i]);
          if (!stand_in) {
             static bool said;
             if (!said) {
@@ -19233,7 +19255,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    /* After the rewrite, so what it reports is what is actually submitted --
     * reporting the state before it just names every case the fix handles. */
    gex_wgpu_trace_buffer_aliasing_reset();
-   gex_wgpu_trace_buffer_aliasing("compute", entries, bindings, count);
+   if (gex_wgpu_trace_buffer_aliasing("compute", entries, bindings, count))
+      goto release_views;
    if (getenv("GEX_WGPU_COMPUTE_LAYOUT_TRACE")) {
       unsigned storage = 0, uniform = 0;
       for (unsigned i = 0; i < count; ++i) {
@@ -27619,14 +27642,16 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
 static WGPUTextureView
 gex_wgpu_default_storage_view(struct gex_wgpu_screen *screen,
                               WGPUTextureViewDimension dimension,
-                              WGPUTextureFormat format)
+                              WGPUTextureFormat format,
+                              WGPUStorageTextureAccess access)
 {
    if (format == WGPUTextureFormat_Undefined)
       return NULL;
    simple_mtx_lock(&screen->cache_lock);
    for (unsigned i = 0; i < screen->default_image_count; ++i)
       if (screen->default_images[i].dimension == dimension &&
-          screen->default_images[i].format == format) {
+          screen->default_images[i].format == format &&
+          screen->default_images[i].access == access) {
          const WGPUTextureView gex_ret = screen->default_images[i].view;
          simple_mtx_unlock(&screen->cache_lock);
          return gex_ret;
@@ -27649,7 +27674,13 @@ gex_wgpu_default_storage_view(struct gex_wgpu_screen *screen,
    desc.format = format;
    desc.mipLevelCount = 1;
    desc.sampleCount = 1;
-   desc.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_CopyDst;
+   /* Bindable as well as storable: a *read-only* image is not a storage
+    * texture in WGSL at all -- Tint lowers one to a plain texture_2d<T> read
+    * with textureLoad -- so the stand-in for an unbound read-only image unit
+    * is asked for as a sampled binding, and without this the bind group was
+    * rejected for the placeholder rather than for anything the shader did. */
+   desc.usage = WGPUTextureUsage_StorageBinding | WGPUTextureUsage_CopyDst |
+                WGPUTextureUsage_TextureBinding;
    WGPUTexture texture = wgpuDeviceCreateTexture(screen->device, &desc);
    if (!texture) {
       simple_mtx_unlock(&screen->cache_lock);
@@ -27669,6 +27700,7 @@ gex_wgpu_default_storage_view(struct gex_wgpu_screen *screen,
    const unsigned i = screen->default_image_count++;
    screen->default_images[i].dimension = dimension;
    screen->default_images[i].format = format;
+   screen->default_images[i].access = access;
    screen->default_images[i].texture = texture;
    screen->default_images[i].view = view;
    simple_mtx_unlock(&screen->cache_lock);
@@ -28289,7 +28321,17 @@ gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx,
       return gex->packed_image_buffer;
    }
    const unsigned at = ctx->packed_copy_count++;
-   ctx->packed_copies[at].resource = resource;
+   /* A *reference*, not a bare pointer. The copy outlives the draw that asked
+    * for it -- a texture copy cannot be recorded inside a render pass, so it
+    * waits for the pass to close -- and the thing that normally keeps the
+    * resource alive until then is the batch, which the draw touches at its
+    * *end*. A draw that declines after reaching here never gets there, so the
+    * resource could be freed with the case that made it and the flush would
+    * copy into a dangling texture. Dawn does not survive that: it crashes
+    * inside ValidateObject formatting the dead object's label, in a later
+    * case, with nothing to connect it to the draw that declined. */
+   ctx->packed_copies[at].resource = NULL;
+   pipe_resource_reference(&ctx->packed_copies[at].resource, resource);
    ctx->packed_copies[at].buffer = gex->packed_image_buffer;
    ctx->packed_copies[at].level = level;
    ctx->packed_copies[at].first_layer = iv->u.tex.first_layer;
@@ -28551,14 +28593,37 @@ gex_wgpu_trace_buffer_aliasing_reset(void)
    gex_wgpu_alias_watch_count = 0;
 }
 
-static void
+static bool
 gex_wgpu_trace_buffer_aliasing(const char *where,
                                const WGPUBindGroupLayoutEntry *layout,
                                const WGPUBindGroupEntry *bindings,
                                unsigned count)
 {
-   if (!getenv("GEX_WGPU_ALIAS_TRACE"))
-      return;
+   const bool trace = getenv("GEX_WGPU_ALIAS_TRACE") != NULL;
+   /* Two *writable* storage bindings over one range is the case with no
+    * repair -- the read-only half of a mixed pair can be snapshotted, and is,
+    * but neither half of this one can be. It has to be reported, because
+    * WebGPU does not merely reject the draw:
+    *
+    *   Writable storage buffer binding aliasing found between [BindGroup] set
+    *   at bind group index 2, binding index 3, and ... binding index 4, with
+    *   overlapping ranges
+    *
+    * and that invalidates the command buffer, taking the draws recorded
+    * beside it. So the caller declines instead.
+    *
+    * Cheap when there is nothing to find: a group with fewer than two
+    * writable storage bindings cannot contribute to a pair, and almost every
+    * draw has none at all, so the quadratic scan below is reached only by the
+    * shaders that could actually collide. */
+   bool writable_pair = false;
+   unsigned writable = 0;
+   for (unsigned i = 0; i < count; ++i)
+      if (bindings[i].buffer &&
+          layout[i].buffer.type == WGPUBufferBindingType_Storage)
+         ++writable;
+   if (!trace && !writable && !gex_wgpu_alias_watch_count)
+      return false;
    for (unsigned i = 0; i < count; ++i) {
       if (!bindings[i].buffer)
          continue;
@@ -28579,7 +28644,23 @@ gex_wgpu_trace_buffer_aliasing(const char *where,
          if (layout[i].buffer.type != WGPUBufferBindingType_Storage &&
              seen->type != WGPUBufferBindingType_Storage)
             continue;
-         if (layout[i].buffer.type == seen->type)
+         if (layout[i].buffer.type == seen->type) {
+            /* Storage beside Storage: the pair the caller must decline.
+             * Identical *read-only* bindings are fine and fall out here. */
+            if (layout[i].buffer.type == WGPUBufferBindingType_Storage) {
+               writable_pair = true;
+               static bool said;
+               if (!said) {
+                  said = true;
+                  fprintf(stderr, "gex-wgpu: draw declined (%s binding %u and "
+                          "%s binding %u are both writable over one range of "
+                          "the same buffer)\n", where, bindings[i].binding,
+                          seen->where, seen->binding);
+               }
+            }
+            continue;
+         }
+         if (!trace)
             continue;
          fprintf(stderr, "gex-alias: buffer %p at %s binding %u (type %u, "
                  "%llu+%llu) and %s binding %u (type %u, %llu+%llu)\n",
@@ -28591,7 +28672,11 @@ gex_wgpu_trace_buffer_aliasing(const char *where,
                  (unsigned long long)seen->offset,
                  (unsigned long long)seen->size);
       }
-      if (gex_wgpu_alias_watch_count < ARRAY_SIZE(gex_wgpu_alias_watch)) {
+      /* Recorded when tracing, and otherwise only for the writable bindings
+       * the check above cares about. */
+      if ((trace ||
+           layout[i].buffer.type == WGPUBufferBindingType_Storage) &&
+          gex_wgpu_alias_watch_count < ARRAY_SIZE(gex_wgpu_alias_watch)) {
          struct gex_wgpu_alias_watch *slot =
             &gex_wgpu_alias_watch[gex_wgpu_alias_watch_count++];
          slot->buffer = bindings[i].buffer;
@@ -28602,6 +28687,7 @@ gex_wgpu_trace_buffer_aliasing(const char *where,
          slot->binding = bindings[i].binding;
       }
    }
+   return writable_pair;
 }
 
 /* Whether this resource is also bound as a sampled texture for the work
@@ -28865,6 +28951,8 @@ gex_wgpu_flush_packed_images(struct gex_wgpu_context *ctx,
       return;
    if (!encoder) {
       /* Nothing to record onto means nothing recorded the work either. */
+      for (unsigned i = 0; i < ctx->packed_copy_count; ++i)
+         pipe_resource_reference(&ctx->packed_copies[i].resource, NULL);
       ctx->packed_copy_count = 0;
       return;
    }
@@ -28892,6 +28980,8 @@ gex_wgpu_flush_packed_images(struct gex_wgpu_context *ctx,
        * it holds something newer than it last saw. */
       ++gex->write_serial;
    }
+   for (unsigned i = 0; i < ctx->packed_copy_count; ++i)
+      pipe_resource_reference(&ctx->packed_copies[i].resource, NULL);
    ctx->packed_copy_count = 0;
 }
 
@@ -34487,8 +34577,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          gex_wgpu_add_dynamic_offset(&dynamic[1], GEX_WGPU_DRAW_PARAMS_BINDING,
                                      draw_params_offset);
       }
-      gex_wgpu_trace_buffer_aliasing("vertex", vertex_layout_entries, entries,
-                                     vertex_group_count);
+      if (gex_wgpu_trace_buffer_aliasing("vertex", vertex_layout_entries,
+                                        entries, vertex_group_count))
+         return;
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[1];
       bind_desc.entryCount = vertex_group_count;
@@ -34582,7 +34673,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             entries[at].binding = ctx->fs->image_bindings[i];
             entries[at].textureView = gex_wgpu_default_storage_view(
                screen, ctx->fs->image_dimensions[i],
-               gex_wgpu_storage_texture_format(ctx->fs->image_formats[i]));
+               gex_wgpu_storage_texture_format(ctx->fs->image_formats[i]),
+               ctx->fs->image_access[i]);
             if (!entries[at].textureView) {
                static bool said;
                if (!said) {
@@ -34737,8 +34829,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                half ? size : GEX_WGPU_PACKED_IMAGE_HEADER_BYTES;
          }
       }
-      gex_wgpu_trace_buffer_aliasing("fragment", fragment_layout_entries,
-                                     entries, fragment_group_count);
+      if (gex_wgpu_trace_buffer_aliasing("fragment", fragment_layout_entries,
+                                        entries, fragment_group_count))
+         return;
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[2];
       bind_desc.entryCount = fragment_group_count;
