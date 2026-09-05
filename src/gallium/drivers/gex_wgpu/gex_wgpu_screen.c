@@ -1647,8 +1647,15 @@ struct gex_wgpu_context {
    struct pipe_resource
       *divisor_expanded[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
    uint32_t divisor_saved_offset[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
-   struct pipe_resource *persistent[8];
+   /* Every persistently mapped buffer, grown as the application makes them.
+    * This was a fixed eight, and the ninth onwards were *silently* not kept
+    * coherent -- their writes never reached the device. Minecraft's GUI draws
+    * from a pool of them, which is why its title screen had no panorama and
+    * no text while the logo and the buttons were there: the elements whose
+    * buffer happened to land past the eighth slot drew from stale memory. */
+   struct pipe_resource **persistent;
    unsigned persistent_count;
+   unsigned persistent_capacity;
    /* ARB_shader_draw_parameters, captured at the outermost draw_vbo before
     * any rewrite can fold the base vertex into an index list. */
    uint32_t draw_base_vertex;
@@ -32188,15 +32195,26 @@ gex_wgpu_track_persistent_map(struct gex_wgpu_context *ctx,
    }
    if (!add)
       return;
-   if (ctx->persistent_count >= ARRAY_SIZE(ctx->persistent)) {
-      static bool said;
-      if (!said) {
-         said = true;
-         fprintf(stderr, "gex-wgpu: more than %u persistent buffer mappings; "
-                 "the rest are not kept coherent\n",
-                 (unsigned)ARRAY_SIZE(ctx->persistent));
+   if (ctx->persistent_count >= ctx->persistent_capacity) {
+      const unsigned want = ctx->persistent_capacity ?
+         ctx->persistent_capacity * 2 : 16;
+      struct pipe_resource **grown =
+         realloc(ctx->persistent, want * sizeof(*grown));
+      if (!grown) {
+         /* Out of memory is the only reason left to drop one, and dropping
+          * one means an application's writes stop arriving -- so say which
+          * one, once, rather than leaving a picture quietly wrong. */
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: out of memory tracking persistent "
+                    "buffer mappings at %u; the rest are not kept coherent\n",
+                    ctx->persistent_count);
+         }
+         return;
       }
-      return;
+      ctx->persistent = grown;
+      ctx->persistent_capacity = want;
    }
    ctx->persistent[ctx->persistent_count++] = resource;
 }
@@ -38652,6 +38670,9 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
 {
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   free(ctx->persistent);
+   ctx->persistent = NULL;
+   ctx->persistent_count = ctx->persistent_capacity = 0;
    for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
       pipe_so_target_reference(&ctx->so_targets[i], NULL);
    pipe_resource_reference(&ctx->uploaded_indices, NULL);
