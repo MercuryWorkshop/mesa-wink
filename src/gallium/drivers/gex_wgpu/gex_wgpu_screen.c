@@ -25050,6 +25050,16 @@ gex_wgpu_blocks_to_group_one(nir_shader *nir)
           (var->data.binding < GEX_WGPU_STORAGE_UBO_FIRST_BINDING ||
            var->data.binding >= GEX_WGPU_SSBO_FIRST_BINDING))
          continue;
+      /* And a *uniform* block belongs to group one only if it is one of the
+       * application's constant buffers. The pass has one of its own now --
+       * the packed images' shared header, which used to be a storage block
+       * and was excluded by the range test above until it became uniform.
+       * Moving it left the module reading @group(1) @binding(120) while the
+       * dispatch bound it in group zero, so the pipeline was invalid and
+       * every emulated stage's packed image store silently did nothing. */
+      if (var->data.mode == nir_var_mem_ubo &&
+          var->data.binding >= GEX_WGPU_MAX_CONSTANT_BUFFERS)
+         continue;
       var->data.descriptor_set = 1;
    }
 }
