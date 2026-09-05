@@ -2129,6 +2129,11 @@ struct gex_wgpu_shader {
     * be dispatched for the side effects even with no transform feedback
     * bound, and the copy that rasterises has had those writes stripped. */
    bool writes_storage;
+   /* The rasterising copy of this vertex shader computes the wrong thing --
+    * an atomic it cannot perform reads as zero -- so no draw that would
+    * rasterise it may run. Its stores still happen, in the capture dispatch.
+    * See gex_wgpu_strip_storage_writes. */
+   bool raster_invalid;
    struct gex_wgpu_capture_variant *captures;
    /* A clone kept for the compute variants that feed a geometry shader, and
     * those variants. Separate from capture_nir because a vertex shader can
@@ -10407,7 +10412,8 @@ gex_wgpu_writes_storage(nir_shader *nir, uint32_t direct_images)
  * shape is how Tint and Mesa have been made to abort before.
  */
 static bool
-gex_wgpu_strip_storage_writes(nir_shader *nir, uint32_t direct_images)
+gex_wgpu_strip_storage_writes(nir_shader *nir, uint32_t direct_images,
+                              bool *raster_invalid)
 {
    bool progress = false;
    nir_foreach_function_impl(impl, nir) {
@@ -10461,10 +10467,31 @@ gex_wgpu_strip_storage_writes(nir_shader *nir, uint32_t direct_images)
             if (!storage)
                continue;
             if (atomic && !nir_def_is_unused(&intr->def)) {
-               fprintf(stderr, "gex-wgpu: vertex shader declined: an atomic "
-                       "on a storage block whose result it uses; the "
-                       "rasterising copy cannot drop it\n");
-               return false;
+               /* The rasterising copy cannot perform this atomic -- Tint will
+                * not have it in the vertex stage -- and cannot drop it
+                * either, because the shader uses what it returned.
+                *
+                * Refusing the whole *shader* was too strong. That failed the
+                * link, so glUseProgram errored and the application never got
+                * to run the side effects at all; yet it is only the
+                * rasterising copy that has the problem, while the compute
+                * clone keeps the atomic and performs it for real. A vertex
+                * shader like this is usually run under GL_RASTERIZER_DISCARD
+                * precisely because only its stores matter -- which is how the
+                * CTS drives it, and those cases died at the link.
+                *
+                * So this copy is left arithmetically wrong -- the atomic
+                * reads as zero -- and the shader is marked unrasterisable.
+                * That is not "close enough" in the sense this driver refuses
+                * elsewhere: nothing can observe the wrong value, because
+                * every draw that would rasterise it is declined by name at
+                * the draw, and a draw that would not never runs this copy. */
+               nir_builder b = nir_builder_at(nir_before_instr(instr));
+               nir_def_rewrite_uses(&intr->def,
+                                    nir_imm_intN_t(&b, 0,
+                                                   intr->def.bit_size));
+               if (raster_invalid)
+                  *raster_invalid = true;
             }
             nir_instr_remove(instr);
             touched = progress = true;
@@ -10795,7 +10822,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    /* After the clone, so the capture keeps them. Declining here rather than
     * letting Tint refuse the module means the reason names itself. */
    if (vs_writes_storage &&
-       !gex_wgpu_strip_storage_writes(nir, vs_direct_images)) {
+       !gex_wgpu_strip_storage_writes(nir, vs_direct_images,
+                                      &shader->raster_invalid)) {
       ralloc_free(nir);
       FREE(shader);
       return NULL;
@@ -35851,6 +35879,24 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * pass instead, which is the only thing that knows how much of the
        * draw actually fit in the bound buffers. */
       gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_GENERATED, prims);
+   }
+
+   /* A vertex shader whose rasterising copy could not be built runs for its
+    * stores and nothing else. Declined here rather than at the link, so the
+    * stores below still happen; under GL_RASTERIZER_DISCARD, which is how
+    * such a shader is normally driven, this is never reached at all. */
+   if (!discard && ctx->vs && ctx->vs->raster_invalid) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: draw declined (this vertex shader uses "
+                 "the result of an image or buffer atomic, which the "
+                 "rasterising copy cannot perform; its stores still run, but "
+                 "it may only be drawn with GL_RASTERIZER_DISCARD)\n");
+      }
+      if (ctx->vs->capture_nir)
+         (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
+      return;
    }
 
    /* Tessellation replaces this draw with five passes of its own, the last
