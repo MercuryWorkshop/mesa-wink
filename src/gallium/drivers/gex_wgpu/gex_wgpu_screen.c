@@ -18221,8 +18221,20 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
    const WGPUTextureFormat depth_wgpu =
       depth ? gex_wgpu_texture_format(resource->format)
             : WGPUTextureFormat_Undefined;
+   /* A stencil-only texture is `stencil8`, which WebGPU copies to a buffer
+    * like any other single-plane format -- there is no depth to resolve, and
+    * sending it to the resolve made a DepthOnly view of a Stencil8 texture:
+    *
+    *   Texture format (TextureFormat::Stencil8) does not have the texture
+    *   view's selected aspect (TextureAspect::DepthOnly)
+    *
+    * which is a validation error, so the readback threw a GL error and
+    * KHR-GL46.direct_state_access's renderbuffer cases came back as
+    * InternalError with nothing logged. */
+   const bool stencil_only = gex_wgpu_is_stencil_only_format(resource->format);
    bool packed_depth = false;
-   if (depth && depth_wgpu != WGPUTextureFormat_Depth16Unorm &&
+   if (depth && !stencil_only &&
+       depth_wgpu != WGPUTextureFormat_Depth16Unorm &&
        depth_wgpu != WGPUTextureFormat_Depth32Float)
       packed_depth = true;
    /* `box->z` is a cube face, an array layer or a depth slice, and the copy
@@ -18377,8 +18389,11 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
     * bytes -- `gl44-msaa-depth-blit-probe` read zeros out of a texture a
     * resolve had demonstrably just written a constant into, from the same
     * pipe_resource and the same WGPUTexture. */
+   /* A combined depth-stencil texture needs the aspect named; a stencil-only
+    * one has just the one plane and must not name DepthOnly for it. */
    source.aspect =
-      depth && util_format_has_stencil(util_format_description(resource->format))
+      depth && !stencil_only &&
+      util_format_has_stencil(util_format_description(resource->format))
          ? WGPUTextureAspect_DepthOnly : WGPUTextureAspect_All;
    WGPUTexelCopyBufferInfo destination = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
    destination.buffer = readback;
@@ -19113,6 +19128,21 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
    const bool clear_three_d = resource->target == PIPE_TEXTURE_3D;
    WGPUTextureViewDescriptor clear_view = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   /* The *surface's* format, which the draw path has always named here and
+    * this one never did. It matters for exactly one pair, and that pair is
+    * how GL_FRAMEBUFFER_SRGB is expressed: with it disabled, st/mesa attaches
+    * an sRGB texture through a linear surface, and a view left to default to
+    * the texture's own format is an sRGB view -- so WebGPU encoded the clear
+    * value on the way in. A clear to 0.25 read back as 0.537255, which is
+    * srgb_encode(0.25) exactly, and nothing anywhere reported a problem.
+    *
+    * Only for the sRGB pair. Any other disagreement either goes to a scratch
+    * texture of the surface's format below, or is not a view WebGPU would
+    * make: resource_create declares the sRGB counterpart in viewFormats and
+    * nothing else. */
+   if (dst->format != resource->format &&
+       util_format_linear(dst->format) == util_format_linear(resource->format))
+      clear_view.format = gex_wgpu_texture_format(dst->format);
    clear_view.dimension = clear_three_d ? WGPUTextureViewDimension_3D
                                         : WGPUTextureViewDimension_2D;
    clear_view.baseMipLevel = level;
