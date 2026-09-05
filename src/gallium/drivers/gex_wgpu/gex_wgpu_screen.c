@@ -2319,10 +2319,37 @@ struct gex_wgpu_capture_layout {
  * does not expose here anyway. Unwritten index slots stay zero, which is three
  * equal indices, which is a degenerate triangle that rasterizes nothing.
  */
+/* One compiled geometry module for one set of bound sampler state.
+ *
+ * An integer texture cannot be *sampled* in WGSL -- Tint says "sampled image
+ * must have float component type" -- so `texture()` on an isampler2D has to
+ * become a fetch, and a fetch has to do the wrap, the filter and the swizzle
+ * itself. All three are bound state, so the module that does it is bound state
+ * too. The fragment, vertex and compute paths have each had this for a while;
+ * this is the geometry stage catching up, keyed exactly as the compute one is.
+ *
+ * The base module is still built once at shader creation and is what almost
+ * every shader uses: gex_wgpu_gs_module returns it untouched unless the shader
+ * samples an integer texture. */
+struct gex_wgpu_gs_variant {
+   struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
+   uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
+   uint8_t targets[GEX_WGPU_MAX_SAMPLERS];
+   uint8_t first_level[GEX_WGPU_MAX_SAMPLERS];
+   uint8_t last_level[GEX_WGPU_MAX_SAMPLERS];
+   WGPUShaderModule module;
+   struct gex_wgpu_gs_variant *next;
+};
+
 struct gex_wgpu_gs {
    /* The sampled textures this geometry shader declares; see
     * gex_wgpu_collect_stage_textures. */
    struct gex_wgpu_stage_textures textures;
+   /* Which of those are sampled as integers, and the modules built for them.
+    * Empty for almost every shader, in which case the base module is used
+    * directly and none of this costs anything. */
+   uint16_t integer_sampled_slots;
+   struct gex_wgpu_gs_variant *variants;
    /* And the images. GL 4.2 puts image uniforms in every stage, and this one
     * runs as a compute pass, where WebGPU allows a writable storage texture
     * -- so nothing but the table and the binding was missing. See
@@ -2498,6 +2525,13 @@ struct gex_wgpu_varying_variant {
     * gex_wgpu_varying_variant_get. Filled by gex_wgpu_collect_stage_textures,
     * exactly as the compute-emulated stages fill theirs. */
    struct gex_wgpu_stage_textures textures;
+   /* The sampler state this module was lowered against, and compared only
+    * when the shader samples an integer texture -- WGSL cannot sample one, so
+    * the fetch that replaces it bakes in the wrap, filter and swizzle. For
+    * every other shader these are unread and the first variant matches. */
+   struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
+   uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
+   uint8_t targets[GEX_WGPU_MAX_SAMPLERS];
    /* And its images. A vertex shader may have them now, and after the
     * storage-write strip they are read-only here -- Tint lowers such an
     * image to a sampled texture, which is legal in any stage. Left at the
@@ -22841,8 +22875,32 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
     * compute range below and the dispatch binds them from the vertex stage's
     * own sampler state. */
    for (struct gex_wgpu_varying_variant *v = vs->varyings; v; v = v->next) {
-      if (!memcmp(&v->vertex_layout, vertex, sizeof(*vertex)) &&
-          !memcmp(&v->varyings, varyings, sizeof(*varyings)))
+      if (memcmp(&v->vertex_layout, vertex, sizeof(*vertex)) ||
+          memcmp(&v->varyings, varyings, sizeof(*varyings)))
+         continue;
+      if (!vs->integer_sampled_slots)
+         return v;
+      /* An integer-sampling shader's module is specific to the state it was
+       * lowered against, so the layouts matching is not enough. */
+      bool match = true;
+      for (unsigned i = 0; match && i < v->textures.count; ++i) {
+         const unsigned slot = v->textures.slots[i];
+         const struct pipe_sampler_view *view = ctx->vertex_sampler_views[slot];
+         const uint8_t swizzle[4] = {
+            gex_wgpu_effective_view_swizzle(view, 0),
+            gex_wgpu_effective_view_swizzle(view, 1),
+            gex_wgpu_effective_view_swizzle(view, 2),
+            gex_wgpu_effective_view_swizzle(view, 3),
+         };
+         if (ctx->vertex_samplers[slot])
+            match = memcmp(&v->sampler_keys[slot],
+                           &ctx->vertex_samplers[slot]->state,
+                           sizeof(v->sampler_keys[slot])) == 0;
+         match = match && memcmp(v->swizzles[slot], swizzle,
+                                 sizeof(swizzle)) == 0 &&
+                 v->targets[slot] == (view ? view->target : 0xffu);
+      }
+      if (match)
          return v;
    }
    if (!vs->varying_nir) {
@@ -22969,6 +23027,35 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
          ralloc_free(nir);
          FREE(variant);
          return NULL;
+      }
+   }
+
+   /* An integer texture cannot be sampled in WGSL, so `texture()` on one has
+    * to become a fetch that applies the wrap, filter and swizzle itself --
+    * all of it bound state, which is why this module is keyed on that state
+    * above. Without this the module reaches Tint and comes back "sampled
+    * image must have float component type", and the geometry or tessellation
+    * draw that wanted it declines. */
+   if (vs->integer_sampled_slots) {
+      if (!gex_wgpu_lower_texture_variant(nir, variant->textures.count,
+                                          variant->textures.slots,
+                                          vs->integer_sampled_slots,
+                                          ctx->vertex_samplers,
+                                          ctx->vertex_sampler_views)) {
+         ralloc_free(nir);
+         FREE(variant);
+         return NULL;
+      }
+      for (unsigned i = 0; i < variant->textures.count; ++i) {
+         const unsigned slot = variant->textures.slots[i];
+         const struct pipe_sampler_view *view =
+            ctx->vertex_sampler_views[slot];
+         if (ctx->vertex_samplers[slot])
+            variant->sampler_keys[slot] = ctx->vertex_samplers[slot]->state;
+         for (unsigned channel = 0; channel < 4; ++channel)
+            variant->swizzles[slot][channel] =
+               gex_wgpu_effective_view_swizzle(view, channel);
+         variant->targets[slot] = view ? (uint8_t)view->target : 0xffu;
       }
    }
 
@@ -24097,10 +24184,14 @@ gex_wgpu_blocks_to_group_one(nir_shader *nir)
       var->data.descriptor_set = 1;
    }
 }
+/* `pre` is a clone the caller has already lowered -- the integer-texture
+ * variant path hands one in. NULL means take a fresh clone, which is what
+ * shader creation does. Either way this owns it from here. */
 static WGPUShaderModule
-gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs)
+gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs,
+                         nir_shader *pre)
 {
-   nir_shader *nir = nir_shader_clone(NULL, gs->nir);
+   nir_shader *nir = pre ? pre : nir_shader_clone(NULL, gs->nir);
    if (!nir)
       return NULL;
 
@@ -24201,6 +24292,95 @@ gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs)
    free(error);
    return module;
 }
+
+/* The geometry module to dispatch, for the sampler state bound right now.
+ *
+ * Almost always the base module: only a shader that *samples an integer
+ * texture* needs anything else, because WGSL cannot sample one and the fetch
+ * that replaces it has to apply the wrap, filter and swizzle itself -- all
+ * bound state. Keyed and cached exactly as gex_wgpu_compute_module is; see the
+ * note on struct gex_wgpu_gs_variant.
+ *
+ * Returns NULL only when a variant was needed and could not be built, which
+ * the caller must treat as a decline rather than a failure. */
+static WGPUShaderModule
+gex_wgpu_gs_module(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs)
+{
+   if (!gs->integer_sampled_slots)
+      return gs->module;
+
+   const int stage = gex_wgpu_compute_stage_index(MESA_SHADER_GEOMETRY);
+   if (stage < 0)
+      return gs->module;
+   struct gex_wgpu_sampler *const *samplers = ctx->stage_samplers[stage];
+   struct pipe_sampler_view *const *views = ctx->stage_sampler_views[stage];
+
+   for (struct gex_wgpu_gs_variant *cached = gs->variants; cached;
+        cached = cached->next) {
+      bool match = true;
+      for (unsigned i = 0; match && i < gs->textures.count; ++i) {
+         const unsigned slot = gs->textures.slots[i];
+         const struct pipe_sampler_view *view = views[slot];
+         const uint8_t swizzle[4] = {
+            gex_wgpu_effective_view_swizzle(view, 0),
+            gex_wgpu_effective_view_swizzle(view, 1),
+            gex_wgpu_effective_view_swizzle(view, 2),
+            gex_wgpu_effective_view_swizzle(view, 3),
+         };
+         if (samplers[slot])
+            match = memcmp(&cached->sampler_keys[slot], &samplers[slot]->state,
+                           sizeof(cached->sampler_keys[slot])) == 0;
+         match = match && memcmp(cached->swizzles[slot], swizzle,
+                                 sizeof(swizzle)) == 0 &&
+                 cached->targets[slot] == (view ? view->target : 0xffu) &&
+                 cached->first_level[slot] ==
+                    (view ? (uint8_t)view->u.tex.first_level : 0u) &&
+                 cached->last_level[slot] ==
+                    (view ? (uint8_t)view->u.tex.last_level : 0u);
+      }
+      if (match)
+         return cached->module;
+   }
+
+   nir_shader *clone = nir_shader_clone(NULL, gs->nir);
+   if (!clone)
+      return NULL;
+   if (!gex_wgpu_lower_texture_variant(clone, gs->textures.count,
+                                       gs->textures.slots,
+                                       gs->integer_sampled_slots,
+                                       samplers, views)) {
+      ralloc_free(clone);
+      return NULL;
+   }
+   WGPUShaderModule module = gex_wgpu_gs_build_module(&ctx->base, gs, clone);
+   if (!module)
+      return NULL;
+
+   struct gex_wgpu_gs_variant *cached = CALLOC_STRUCT(gex_wgpu_gs_variant);
+   if (!cached) {
+      /* Uncached but usable would leak one module per draw, which is worse
+       * than compiling one per draw; the compute path says the same. */
+      wgpuShaderModuleRelease(module);
+      return NULL;
+   }
+   for (unsigned i = 0; i < gs->textures.count; ++i) {
+      const unsigned slot = gs->textures.slots[i];
+      const struct pipe_sampler_view *view = views[slot];
+      if (samplers[slot])
+         cached->sampler_keys[slot] = samplers[slot]->state;
+      for (unsigned channel = 0; channel < 4; ++channel)
+         cached->swizzles[slot][channel] =
+            gex_wgpu_effective_view_swizzle(view, channel);
+      cached->targets[slot] = view ? (uint8_t)view->target : 0xffu;
+      cached->first_level[slot] = view ? (uint8_t)view->u.tex.first_level : 0u;
+      cached->last_level[slot] = view ? (uint8_t)view->u.tex.last_level : 0u;
+   }
+   cached->module = module;
+   cached->next = gs->variants;
+   gs->variants = cached;
+   return module;
+}
+
 
 static void
 gex_wgpu_delete_tes_state(struct pipe_context *pipe, void *state);
@@ -25457,6 +25637,12 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
          FREE(gs);
          return NULL;
       }
+      /* Derived rather than collected: the sample type already says which
+       * slots are integer, and gex_wgpu_lower_texture_variant wants a mask. */
+      for (unsigned i = 0; i < gs->textures.count; ++i)
+         if (gs->textures.sample_types[i] == WGPUTextureSampleType_Uint ||
+             gs->textures.sample_types[i] == WGPUTextureSampleType_Sint)
+            gs->integer_sampled_slots |= 1u << gs->textures.slots[i];
    }
    gs->max_vertices = nir->info.gs.vertices_out;
    gs->output_prim = nir->info.gs.output_primitive;
@@ -25608,7 +25794,15 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
                  glsl_get_type_name(var->type));
    }
    gs->nir = nir;
-   gs->module = gex_wgpu_gs_build_module(pipe, gs);
+   /* No base module when the shader samples an integer texture: compiling one
+    * would fail anyway -- Tint refuses a sampled image with a non-float
+    * component type -- and a failure here refuses the whole *shader*, so the
+    * link dies for want of a module the draw was never going to use. The
+    * variant built against the bound sampler state is the only module such a
+    * shader ever has; see gex_wgpu_gs_module. The compute path skips its base
+    * module for the same reason and says so in the same words. */
+   gs->module = gs->integer_sampled_slots
+      ? NULL : gex_wgpu_gs_build_module(pipe, gs, NULL);
 
    struct pipe_shader_state passthrough_state = {0};
    passthrough_state.type = PIPE_SHADER_IR_NIR;
@@ -25653,7 +25847,8 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
    gs->passthrough_elements = ctx->base.create_vertex_elements_state(
       &ctx->base, element_count, elements);
 
-   if (!gs->module || !gs->passthrough || !gs->passthrough_elements) {
+   if ((!gs->module && !gs->integer_sampled_slots) || !gs->passthrough ||
+       !gs->passthrough_elements) {
       /* Named, because all three failures reach the application as an empty
        * link log and there is nothing else to go on. */
       gex_wgpu_set_compile_error(
@@ -25687,6 +25882,14 @@ gex_wgpu_delete_gs_state(struct pipe_context *pipe, void *state)
    struct gex_wgpu_gs *gs = state;
    if (!gs)
       return;
+   for (struct gex_wgpu_gs_variant *v = gs->variants; v;) {
+      struct gex_wgpu_gs_variant *next = v->next;
+      if (v->module)
+         wgpuShaderModuleRelease(v->module);
+      FREE(v);
+      v = next;
+   }
+   gs->variants = NULL;
    if (gs->module)
       wgpuShaderModuleRelease(gs->module);
    if (gs->xfb_module)
@@ -28751,8 +28954,15 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
         gex_wgpu_bind_constants(ctx, &gs_group1, MESA_SHADER_GEOMETRY,
                                 gs->ubo_count, gs->ubo_slots, gs->ubo_bindings,
                                 gs->ubo_storage_mask);
+   WGPUShaderModule gs_module = ok ? gex_wgpu_gs_module(ctx, gs) : NULL;
+   if (ok && !gs_module) {
+      for (unsigned i = 0; i < gs_image_view_count; ++i)
+         wgpuTextureViewRelease(gs_image_views[i]);
+      pipe_resource_reference(&gs_param_buffer, NULL);
+      GEX_GS_DECLINE("no geometry module for the bound sampler state");
+   }
    if (ok)
-      ok = gex_wgpu_dispatch(ctx, gs->module, &gs_group0, &gs_group1,
+      ok = gex_wgpu_dispatch(ctx, gs_module, &gs_group0, &gs_group1,
                              ctx->gs_indices,
                              DIV_ROUND_UP(runs, GEX_WGPU_GS_GROUP));
    for (unsigned i = 0; i < gs_image_view_count; ++i)
