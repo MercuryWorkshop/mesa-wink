@@ -259,6 +259,16 @@ create_device(void)
        * Asked for at twice maxUniformBuffersPerShaderStage, because both
        * stages contribute to one layout. */
       GEX_WANT(maxDynamicUniformBuffersPerPipelineLayout, 32);
+      /* Asked for sixteen and this adapter grants ten, which is its own
+       * maximum rather than a tier nobody opted into: requesting
+       * WGPUFeatureLevel_Core explicitly on the adapter, instead of leaving
+       * it Undefined, changes nothing -- measured on 2026-09-05 with
+       * GEX_WGPU_LIMIT_TRACE, which prints what the adapter offers beside
+       * what was asked. So a shader wanting eleven storage buffers in one
+       * stage is refused by the device, not by this driver, and
+       * direct_state_access.vertex_arrays_enable_disable_attributes is that.
+       * The usual suspicion -- see the note about asking for limits -- does
+       * not apply here. */
       GEX_WANT(maxStorageBuffersPerShaderStage, 16);
       GEX_WANT(maxStorageBuffersInVertexStage, 16);
       GEX_WANT(maxStorageBuffersInFragmentStage, 16);
@@ -309,10 +319,15 @@ create_device(void)
 #undef GEX_WANT
       if (getenv("GEX_WGPU_LIMIT_TRACE"))
          fprintf(stderr, "gex-limits: adapter colour bytes/sample %u "
-                 "(asked %u), storage textures/stage %u\n",
+                 "(asked %u), storage textures/stage %u, storage "
+                 "buffers/stage %u (asked %u) vertex %u fragment %u\n",
                  adapter_limits.maxColorAttachmentBytesPerSample,
                  limits.maxColorAttachmentBytesPerSample,
-                 adapter_limits.maxStorageTexturesPerShaderStage);
+                 adapter_limits.maxStorageTexturesPerShaderStage,
+                 adapter_limits.maxStorageBuffersPerShaderStage,
+                 limits.maxStorageBuffersPerShaderStage,
+                 adapter_limits.maxStorageBuffersInVertexStage,
+                 adapter_limits.maxStorageBuffersInFragmentStage);
       fprintf(stderr,
               "gex-wgpu: adapter compute limits invocations/workgroup %u "
               "workgroup %ux%ux%u shared %uB (asking for %u)\n",
