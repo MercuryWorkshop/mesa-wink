@@ -76,8 +76,24 @@ extern void gex_wgpu_jspi_signal(void);
  * the read is a texelFetch at gl_FragCoord. */
 #define GEX_WGPU_LOGICOP_BINDING (2 * GEX_WGPU_MAX_SAMPLERS)
 
-/* Application shader images, again in a range of their own. */
-#define GEX_WGPU_MAX_SHADER_IMAGES 8
+/* Application shader images, again in a range of their own.
+ *
+ * Sixteen, not eight, and the difference is that *most images are not storage
+ * textures*. This adapter grants eight storage textures per stage and that is
+ * its own maximum, not a limit nobody asked for -- but a read-only image is
+ * bound as a sampled texture instead, and there are sixteen of those. A shader
+ * declaring eight read-only images and one it writes needs one storage texture
+ * and eight sampled ones, which fits comfortably; counting them all against
+ * the storage-texture figure is what did not.
+ *
+ * KHR-GL46.shader_image_load_store's ten `basic-allTargets-*` cases are
+ * exactly that shape -- eight targets read plus a result written -- and Mesa
+ * refused them at link with "Too many compute shader image uniforms (9 > 8)",
+ * which is this cap and not the platform.
+ *
+ * The writable count is still bounded by what the device grants; see the
+ * refusal beside screen->max_storage_textures. */
+#define GEX_WGPU_MAX_SHADER_IMAGES 16
 #define GEX_WGPU_IMAGE_FIRST_BINDING \
    (GEX_WGPU_SSBO_FIRST_BINDING + GEX_WGPU_MAX_SHADER_BUFFERS)
 /* Texture buffers -- GL's `samplerBuffer`, core since GL 3.1. WebGPU has no
@@ -1366,6 +1382,11 @@ struct gex_wgpu_screen {
     * blocks. The vertex figure above is counted separately because WGSL
     * allows only the read-only kind there. */
    uint32_t max_storage_buffers;
+   /* Storage textures the device grants per stage. Only images the shader
+    * *writes* cost one of these -- a read-only image is bound as a sampled
+    * texture -- so this bounds the writable count rather than the declared
+    * one; see GEX_WGPU_MAX_SHADER_IMAGES. */
+   uint32_t max_storage_textures;
    uint32_t max_storage_buffer_size;
 };
 
@@ -11063,6 +11084,30 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
                      "exist", var->name ? var->name : "(anon)",
                      (unsigned)glsl_get_sampler_dim(image_glsl),
                      glsl_sampler_type_is_array(image_glsl) ? " array" : "");
+            ralloc_free(nir);
+            FREE(shader);
+            gex_wgpu_set_compile_error(mutable_state, detail);
+            return NULL;
+         }
+      }
+      /* A written image costs a storage texture, and the device grants fewer
+       * of those than this driver allows images -- deliberately, since a
+       * read-only image is a sampled texture instead. Over the device's
+       * figure the bind group layout is simply invalid, which drops the draw
+       * with a Dawn message about a binding rather than about the shader, so
+       * say it here instead. */
+      if (!no_write) {
+         unsigned written = 1;
+         for (unsigned i = 0; i < shader->image_count; ++i)
+            if (shader->image_access[i] != WGPUStorageTextureAccess_ReadOnly)
+               ++written;
+         const uint32_t granted = gex_screen(pipe->screen)->max_storage_textures;
+         if (written > granted) {
+            char detail[176];
+            snprintf(detail, sizeof(detail),
+                     "gex_wgpu shader writes %u images and this device grants "
+                     "%u storage textures per stage (read-only images do not "
+                     "count against it)", written, granted);
             ralloc_free(nir);
             FREE(shader);
             gex_wgpu_set_compile_error(mutable_state, detail);
@@ -27287,7 +27332,8 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
 /* A dispatch's own blocks plus, for the compute-emulated stages, a texture
  * and a sampler for every unit. The masks below are 64-bit for this reason. */
 #define GEX_WGPU_MAX_GROUP_BINDINGS \
-   (GEX_WGPU_MAX_CONSTANT_BUFFERS + 8 + 2 * GEX_WGPU_MAX_SAMPLERS)
+   (GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_IMAGES + \
+    2 * GEX_WGPU_MAX_SAMPLERS)
 struct gex_wgpu_bindings {
    unsigned count;
    uint64_t storage_mask;
@@ -40331,6 +40377,7 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->max_uniform_buffers = 12;      /* WebGPU's guaranteed minimum */
    screen->max_storage_buffers_vertex = 0;
    screen->max_storage_buffers = 0;
+   screen->max_storage_textures = GEX_WGPU_MAX_SHADER_IMAGES;
    screen->max_storage_buffer_size = 0;
    const bool got_limits =
       wgpuDeviceGetLimits(device, &limits) == WGPUStatus_Success;
@@ -40361,6 +40408,10 @@ gex_wgpu_screen_create(WGPUDevice device)
       screen->max_storage_buffers =
          limits.maxStorageBuffersPerShaderStage == WGPU_LIMIT_U32_UNDEFINED
             ? 0 : limits.maxStorageBuffersPerShaderStage;
+      screen->max_storage_textures =
+         limits.maxStorageTexturesPerShaderStage == WGPU_LIMIT_U32_UNDEFINED
+            ? GEX_WGPU_MAX_SHADER_IMAGES
+            : limits.maxStorageTexturesPerShaderStage;
       screen->max_storage_buffer_size =
          limits.maxStorageBufferBindingSize == WGPU_LIMIT_U64_UNDEFINED
             ? 0 : (uint32_t)MIN2(limits.maxStorageBufferBindingSize,
