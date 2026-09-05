@@ -9465,14 +9465,32 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
           * from zero. */
          const unsigned expected_texture_set =
             expected_stage == MESA_SHADER_VERTEX ? 3 : 0;
-         if (shader->texture_count >= GEX_WGPU_MAX_SAMPLERS ||
-             slot >= GEX_WGPU_MAX_SAMPLERS || duplicate ||
-             view_dimension == WGPUTextureViewDimension_Undefined ||
-             var->data.descriptor_set != expected_texture_set) {
+         /* Named, because five different things reach here and the message
+          * used to say only that one of them had. A link failure is all the
+          * application sees, so "invalid or duplicate texture binding" was
+          * the entire diagnosis available for a shape WGSL simply has no type
+          * for -- a multisampled *array* texture is the one that sends real
+          * shaders here, since texture_multisampled_2d_array does not exist. */
+         const char *why =
+            shader->texture_count >= GEX_WGPU_MAX_SAMPLERS
+               ? "gex_wgpu more textures than the driver's maximum"
+            : slot >= GEX_WGPU_MAX_SAMPLERS
+               ? "gex_wgpu a texture unit above the driver's maximum"
+            : duplicate
+               ? "gex_wgpu two textures claim one unit or one binding"
+            : view_dimension == WGPUTextureViewDimension_Undefined
+               ? (multisampled && is_array
+                     ? "gex_wgpu a multisampled array texture, which WGSL has "
+                       "no type for"
+                     : "gex_wgpu a texture shape WGSL has no view dimension "
+                       "for")
+            : var->data.descriptor_set != expected_texture_set
+               ? "gex_wgpu a texture in the wrong descriptor set"
+               : NULL;
+         if (why) {
             ralloc_free(nir);
             FREE(shader);
-            gex_wgpu_set_compile_error(
-               mutable_state, "gex_wgpu invalid or duplicate texture binding");
+            gex_wgpu_set_compile_error(mutable_state, why);
             return NULL;
          }
          shader->texture_slots[shader->texture_count] = slot;
@@ -12811,6 +12829,12 @@ gex_wgpu_view_target_ok(enum pipe_texture_target view,
              view == PIPE_TEXTURE_CUBE || view == PIPE_TEXTURE_CUBE_ARRAY;
    case PIPE_TEXTURE_1D_ARRAY:
       return view == PIPE_TEXTURE_1D;
+   case PIPE_TEXTURE_1D:
+      /* The other half of VIEW_CLASS_1D, which the array case above already
+       * had. GL's view classes are symmetric and this one was not: a
+       * one-layer array view of a 1D texture is exactly what st builds for an
+       * immutable 1D texture, the same shape the 2D case below exists for. */
+      return view == PIPE_TEXTURE_1D_ARRAY;
    case PIPE_TEXTURE_2D:
       /* A single-layer array view of a 2D texture, which is how st spells a
        * one-layer view of an immutable texture. */
@@ -14255,9 +14279,10 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
          said = true;                                                          \
          fprintf(stderr,                                                       \
                  "gex-wgpu: sampler view refused (%s) format=%s texture=%s "   \
-                 "target=%u levels=%u..%u layers=%u..%u\n",                    \
+                 "target=%u->%u levels=%u..%u layers=%u..%u\n",                \
                  why, util_format_short_name(templ->format),                   \
                  util_format_short_name(texture->format), texture->target,     \
+                 templ->target,                                                \
                  templ->u.tex.first_level, templ->u.tex.last_level,            \
                  templ->u.tex.first_layer, templ->u.tex.last_layer);           \
       }                                                                        \
@@ -14390,15 +14415,25 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
           templ->u.tex.last_layer != texture->depth0 - 1))) ||
        /* A *cube* view must cover six faces; an array or 2D view of a cube
         * texture may cover any range of them, which is how a shader filters a
-        * cube map by hand. */
+        * cube map by hand.
+        *
+        * Six faces, not faces zero to five. Where they begin in the parent is
+        * the parent's numbering and not the view's -- a cube view of layers
+        * 1..6 of a 2D array is ordinary ARB_texture_view, and WebGPU takes
+        * any baseArrayLayer with an arrayLayerCount of six. */
        (templ->target == PIPE_TEXTURE_CUBE &&
-        (templ->u.tex.first_layer != 0 || templ->u.tex.last_layer != 5))) {
+        templ->u.tex.last_layer - templ->u.tex.first_layer + 1 != 6)) {
       GEX_SAMPLER_VIEW_REFUSED("shape or format");
       return NULL;
    }
+   /* WebGPU asks a cube-array view for a layer *count* that is a multiple of
+    * six; where those six faces start in the parent is not its business, and
+    * baseArrayLayer takes any valid value. Demanding a multiple of six there
+    * as well refused the ordinary ARB_texture_view case -- a cube-array view
+    * of layers 1..12 of a 2D array, whose own layer numbering starts at zero
+    * whatever the parent's does. */
    if (templ->target == PIPE_TEXTURE_CUBE_ARRAY &&
-       (templ->u.tex.first_layer % 6 != 0 ||
-        (templ->u.tex.last_layer + 1) % 6 != 0)) {
+       (templ->u.tex.last_layer - templ->u.tex.first_layer + 1) % 6 != 0) {
       GEX_SAMPLER_VIEW_REFUSED("cube-array layer range");
       return NULL;
    }
