@@ -13742,7 +13742,18 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
       if ((bind & PIPE_BIND_SAMPLER_VIEW) &&
           gex_wgpu_buffer_texture_code(format) == 0)
          return false;
-      if (bind == PIPE_BIND_VERTEX_BUFFER && format != PIPE_FORMAT_NONE) {
+      /* `&`, not `==`: a query naming several binds has to satisfy all of
+       * them, and st/mesa does ask about a buffer that is both a vertex
+       * buffer and a texture buffer. Written as an exact compare, such a
+       * query skipped this check entirely and the format was claimed
+       * unconditionally -- which is the SuperTuxKart failure described just
+       * above, and it came back the moment the buffer-texture table widened
+       * from twelve formats to thirty-nine: before that, the sampler-view
+       * check above happened to reject those queries first. Minecraft 26.2
+       * lost its panorama and every piece of text to it, with no error from
+       * anything, because u_vbuf stopped translating formats this driver's
+       * vertex layout cannot express. */
+      if ((bind & PIPE_BIND_VERTEX_BUFFER) && format != PIPE_FORMAT_NONE) {
          unsigned vertex_size, vertex_alignment;
          if (!gex_wgpu_vertex_format(format, &vertex_size, &vertex_alignment))
             return false;
@@ -34191,13 +34202,25 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * screen from "the draw never happened", which is what most of this
        * application's draws look like. */
       {
+         /* Env-gated, like every other diagnostic in this driver. This one
+          * was not, so it ran in every process that ever bound a vertex
+          * shader: roughly 250 lines of matrices, constant-buffer contents
+          * and per-element fetches for each of the first 24 distinct vertex
+          * shaders, in any application. Three quarters of Minecraft's launch
+          * log was this dump, which buries the messages meant to be read --
+          * and its "(unbound)" for an element whose buffer has no CPU shadow
+          * reads as a real unbound buffer when it is only a limit of the
+          * dump. Cached rather than called per draw. */
+         static int want_state = -1;
+         if (want_state < 0)
+            want_state = getenv("GEX_WGPU_VS_STATE_LOG") ? 1 : 0;
          /* Once per distinct shader shape, not per draw: the first eight
           * draws of a frame are all the same two-attribute UI quad, and say
           * nothing about the geometry that matters. */
          static uint64_t seen_shapes[24];
          static unsigned seen_count;
          bool fresh = false;
-         if (ctx->vertex_elements) {
+         if (want_state && ctx->vertex_elements) {
             /* Keyed on the shader itself, not on its input mask and element
              * count: two different shaders share those often enough that the
              * one responsible for most of the frame -- 53,240 draws of 91,000
