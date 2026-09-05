@@ -980,6 +980,125 @@ struct gex_wgpu_stage_images {
    bool packed_write[GEX_WGPU_MAX_SHADER_IMAGES];
 };
 
+/* The images a compute or compute-emulated stage declares.
+ *
+ * Lifted out of create_compute_state so the geometry stage can have the same
+ * table: it runs as a compute pass, so a writable storage texture is legal
+ * there, and the collection was the only thing it lacked. `stage` names the
+ * caller in the refusals, which are by name on purpose -- substituting the
+ * nearest shape for one WebGPU has no storage texture for aborts inside Tint
+ * rather than here. */
+static bool
+gex_wgpu_collect_stage_images(nir_shader *nir,
+                              struct gex_wgpu_stage_images *out,
+                              const char *stage)
+{
+   memset(out, 0, sizeof(*out));
+   /* The same collection the graphics stages do, with the same two refusals:
+    * WebGPU allows read_write storage only on the 32-bit single-channel
+    * formats, and not every GL image format is a WebGPU storage texture. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_image) {
+      const struct glsl_type *image_type = glsl_without_array(var->type);
+      if (!glsl_type_is_image(image_type))
+         continue;
+      if (out->count >= GEX_WGPU_MAX_SHADER_IMAGES) {
+         fprintf(stderr, "gex-wgpu: %s shader rejected: more than %u "
+                 "images\n", stage, (unsigned)GEX_WGPU_MAX_SHADER_IMAGES);
+         return false;
+      }
+      const enum pipe_format image_format = var->data.image.format;
+      const bool no_write = (var->data.access & ACCESS_NON_WRITEABLE) != 0;
+      const bool no_read = (var->data.access & ACCESS_NON_READABLE) != 0;
+      /* Before both refusals below, because it lifts both of them here: a
+       * dispatch can copy the texture into the buffer beforehand, so a read
+       * image is servable and neither the format's absence from WebGPU's
+       * storage list nor its lack of read_write access is fatal. */
+      if (gex_wgpu_image_is_packed(
+             image_format, no_read, no_write,
+             glsl_get_sampler_dim(image_type), true,
+             gex_wgpu_image_has_atomic(nir, var->data.driver_location))) {
+         const unsigned at = out->packed_count;
+         const unsigned slot = var->data.driver_location;
+         if (slot >= GEX_WGPU_MAX_SHADER_IMAGES) {
+            fprintf(stderr, "gex-wgpu: %s packed image slot=%u above "
+                    "max=%u\n", stage, slot, (unsigned)GEX_WGPU_MAX_SHADER_IMAGES);
+            return false;
+         }
+         out->packed_slots[at] = (uint8_t)slot;
+         out->packed_bindings[at] =
+            GEX_WGPU_PACKED_IMAGE_FIRST_BINDING + slot;
+         out->packed_formats[at] = image_format;
+         /* An atomic reads as well as writes; see the graphics path. */
+         out->packed_read[at] =
+            !no_read || gex_wgpu_image_has_atomic(nir,
+                                                  var->data.driver_location);
+         out->packed_write[at] = !no_write ||
+            gex_wgpu_image_has_atomic(nir, var->data.driver_location);
+         ++out->packed_count;
+         continue;
+      }
+      if (!no_write && !no_read &&
+          !gex_wgpu_storage_format_is_read_write(image_format)) {
+         fprintf(stderr, "gex-wgpu: %s image '%s' is read *and* written, "
+                 "which WebGPU allows only for r32ui/r32i/r32f (this is %s)\n", stage,
+                 var->name ? var->name : "(anon)",
+                 util_format_short_name(image_format));
+         return false;
+      }
+      /* No format qualifier at all is not the same as a format WebGPU cannot
+       * store: it is a format that is not known *yet*. GLSL permits it only
+       * on a write-only image, and the format then comes from the image unit
+       * at dispatch. Resolved there; see unformatted_images. */
+      const bool unformatted = image_format == PIPE_FORMAT_NONE && no_read;
+      /* Read-only needs no storage format; see the note in the graphics
+       * path's copy of this check. */
+      if (!no_write && !unformatted &&
+          gex_wgpu_storage_texture_format(image_format) ==
+          WGPUTextureFormat_Undefined) {
+         fprintf(stderr, "gex-wgpu: %s image '%s' has format %s, which "
+                 "WebGPU cannot take as a storage texture (and it is written, "
+                 "so it cannot be a sampled one either)\n", stage,
+                 var->name ? var->name : "(anon)",
+                 util_format_short_name(image_format));
+         return false;
+      }
+      const unsigned at = out->count;
+      out->slots[at] = (uint8_t)var->data.driver_location;
+      out->bindings[at] = var->data.binding;
+      out->formats[at] = image_format;
+      out->access[at] = no_read ? WGPUStorageTextureAccess_WriteOnly
+                                : no_write ? WGPUStorageTextureAccess_ReadOnly
+                                           : WGPUStorageTextureAccess_ReadWrite;
+      const enum glsl_sampler_dim dim = glsl_get_sampler_dim(image_type);
+      out->dimensions[at] =
+         gex_wgpu_image_view_dimension(dim,
+                                       glsl_sampler_type_is_array(image_type));
+      if (getenv("GEX_WGPU_IMAGE_LOG"))
+         fprintf(stderr, "gex-image: %s '%s' slot=%u binding=%u "
+                 "access=0x%x fmt=%s -> %s\n", stage,
+                 var->name ? var->name : "(anon)",
+                 (unsigned)out->slots[at],
+                 out->bindings[at], (unsigned)var->data.access,
+                 util_format_short_name(image_format),
+                 out->access[at] == WGPUStorageTextureAccess_ReadOnly
+                    ? "ReadOnly"
+                 : out->access[at] ==
+                      WGPUStorageTextureAccess_WriteOnly ? "WriteOnly"
+                                                         : "ReadWrite");
+      if (unformatted)
+         out->unformatted |= (uint16_t)1u << at;
+      if (out->dimensions[at] == WGPUTextureViewDimension_Undefined) {
+         fprintf(stderr, "gex-wgpu: %s image '%s' is a shape WGSL has no "
+                 "storage texture for (dim %u%s); only 1d, 2d, 2d array and "
+                 "3d exist\n", stage, var->name ? var->name : "(anon)", (unsigned)dim,
+                 glsl_sampler_type_is_array(image_type) ? " array" : "");
+         return false;
+      }
+      ++out->count;
+   }
+   return true;
+}
+
 /* Spelled as a literal above because it is used in binding arithmetic before
  * this point; kept honest here rather than by hoping. */
 static_assert(GEX_WGPU_MAX_BUFFER_TEXTURES == GEX_WGPU_MAX_SAMPLERS,
@@ -1928,6 +2047,11 @@ struct gex_wgpu_shader {
    /* A clone of the vertex shader kept for building transform feedback
     * compute variants, and the variants built from it so far. */
    nir_shader *capture_nir;
+   /* The images that clone stores through, collected before the rasterising
+    * copy loses them. Tint refuses a write-access storage texture in the
+    * vertex stage, so the store can only happen in the dispatch, and the
+    * dispatch needs its own table to bind from. */
+   struct gex_wgpu_stage_images capture_images;
    /* This vertex shader writes a storage block, so its capture variant has to
     * be dispatched for the side effects even with no transform feedback
     * bound, and the copy that rasterises has had those writes stripped. */
@@ -9644,6 +9768,18 @@ gex_wgpu_writes_storage(nir_shader *nir)
             case nir_intrinsic_store_ssbo:
             case nir_intrinsic_ssbo_atomic:
             case nir_intrinsic_ssbo_atomic_swap:
+            /* An image store is the same problem with a harder wall in front
+             * of it: Tint refuses a *write*-access storage texture in the
+             * vertex stage outright -- "storage texture with 'write' access
+             * mode cannot be used by vertex pipeline stage" -- so the
+             * rasterising copy cannot merely afford to drop the store, it has
+             * to. The compute dispatch performs it. */
+            case nir_intrinsic_image_deref_store:
+            case nir_intrinsic_image_deref_atomic:
+            case nir_intrinsic_image_deref_atomic_swap:
+            case nir_intrinsic_image_store:
+            case nir_intrinsic_image_atomic:
+            case nir_intrinsic_image_atomic_swap:
                return true;
             case nir_intrinsic_store_deref:
             case nir_intrinsic_deref_atomic:
@@ -9695,7 +9831,15 @@ gex_wgpu_strip_storage_writes(nir_shader *nir)
                atomic = storage = true;
                break;
             case nir_intrinsic_store_ssbo:
+            case nir_intrinsic_image_deref_store:
+            case nir_intrinsic_image_store:
                storage = true;
+               break;
+            case nir_intrinsic_image_deref_atomic:
+            case nir_intrinsic_image_deref_atomic_swap:
+            case nir_intrinsic_image_atomic:
+            case nir_intrinsic_image_atomic_swap:
+               atomic = storage = true;
                break;
             case nir_intrinsic_deref_atomic:
             case nir_intrinsic_deref_atomic_swap:
@@ -9741,6 +9885,13 @@ gex_wgpu_strip_storage_writes(nir_shader *nir)
        * it is honest, because after this pass the shader only ever reads. */
       nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo)
          var->data.access |= ACCESS_NON_WRITEABLE;
+      /* An image is *removed* instead, where a block is kept and made
+       * read-only. Nothing needs it to stay: the dispatch binds images from
+       * the table collected off the clone, before these stores were stripped,
+       * rather than from this copy's own. And keeping it would defeat the
+       * point -- a declared write-access storage texture is what Tint refuses
+       * in the vertex stage, whether or not this copy still stores to it. */
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_image, NULL);
       nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    }
    return true;
@@ -9963,6 +10114,19 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    if (expected_stage == MESA_SHADER_VERTEX &&
        ((nir->xfb_info && nir->xfb_info->output_count) || vs_writes_storage))
       shader->capture_nir = nir_shader_clone(NULL, nir);
+   /* Off the clone, and before the strip below: what rasterises is about to
+    * lose these entirely. A packed vertex image is refused rather than bound
+    * as something else -- it wants a buffer copied into and out of the
+    * texture around the pass, and this dispatch has nowhere to do that. */
+   if (shader->capture_nir &&
+       (!gex_wgpu_collect_stage_images(shader->capture_nir,
+                                       &shader->capture_images, "vertex") ||
+        shader->capture_images.packed_count)) {
+      ralloc_free(shader->capture_nir);
+      ralloc_free(nir);
+      FREE(shader);
+      return NULL;
+   }
    shader->writes_storage = vs_writes_storage;
    /* After the clone, so the capture keeps them. Declining here rather than
     * letting Tint refuse the module means the reason names itself. */
@@ -18786,124 +18950,6 @@ gex_wgpu_collect_stage_textures(nir_shader *nir,
    return true;
 }
 
-/* The images a compute or compute-emulated stage declares.
- *
- * Lifted out of create_compute_state so the geometry stage can have the same
- * table: it runs as a compute pass, so a writable storage texture is legal
- * there, and the collection was the only thing it lacked. `stage` names the
- * caller in the refusals, which are by name on purpose -- substituting the
- * nearest shape for one WebGPU has no storage texture for aborts inside Tint
- * rather than here. */
-static bool
-gex_wgpu_collect_stage_images(nir_shader *nir,
-                              struct gex_wgpu_stage_images *out,
-                              const char *stage)
-{
-   memset(out, 0, sizeof(*out));
-   /* The same collection the graphics stages do, with the same two refusals:
-    * WebGPU allows read_write storage only on the 32-bit single-channel
-    * formats, and not every GL image format is a WebGPU storage texture. */
-   nir_foreach_variable_with_modes(var, nir, nir_var_image) {
-      const struct glsl_type *image_type = glsl_without_array(var->type);
-      if (!glsl_type_is_image(image_type))
-         continue;
-      if (out->count >= GEX_WGPU_MAX_SHADER_IMAGES) {
-         fprintf(stderr, "gex-wgpu: %s shader rejected: more than %u "
-                 "images\n", stage, (unsigned)GEX_WGPU_MAX_SHADER_IMAGES);
-         return false;
-      }
-      const enum pipe_format image_format = var->data.image.format;
-      const bool no_write = (var->data.access & ACCESS_NON_WRITEABLE) != 0;
-      const bool no_read = (var->data.access & ACCESS_NON_READABLE) != 0;
-      /* Before both refusals below, because it lifts both of them here: a
-       * dispatch can copy the texture into the buffer beforehand, so a read
-       * image is servable and neither the format's absence from WebGPU's
-       * storage list nor its lack of read_write access is fatal. */
-      if (gex_wgpu_image_is_packed(
-             image_format, no_read, no_write,
-             glsl_get_sampler_dim(image_type), true,
-             gex_wgpu_image_has_atomic(nir, var->data.driver_location))) {
-         const unsigned at = out->packed_count;
-         const unsigned slot = var->data.driver_location;
-         if (slot >= GEX_WGPU_MAX_SHADER_IMAGES) {
-            fprintf(stderr, "gex-wgpu: %s packed image slot=%u above "
-                    "max=%u\n", stage, slot, (unsigned)GEX_WGPU_MAX_SHADER_IMAGES);
-            return false;
-         }
-         out->packed_slots[at] = (uint8_t)slot;
-         out->packed_bindings[at] =
-            GEX_WGPU_PACKED_IMAGE_FIRST_BINDING + slot;
-         out->packed_formats[at] = image_format;
-         /* An atomic reads as well as writes; see the graphics path. */
-         out->packed_read[at] =
-            !no_read || gex_wgpu_image_has_atomic(nir,
-                                                  var->data.driver_location);
-         out->packed_write[at] = !no_write ||
-            gex_wgpu_image_has_atomic(nir, var->data.driver_location);
-         ++out->packed_count;
-         continue;
-      }
-      if (!no_write && !no_read &&
-          !gex_wgpu_storage_format_is_read_write(image_format)) {
-         fprintf(stderr, "gex-wgpu: %s image '%s' is read *and* written, "
-                 "which WebGPU allows only for r32ui/r32i/r32f (this is %s)\n", stage,
-                 var->name ? var->name : "(anon)",
-                 util_format_short_name(image_format));
-         return false;
-      }
-      /* No format qualifier at all is not the same as a format WebGPU cannot
-       * store: it is a format that is not known *yet*. GLSL permits it only
-       * on a write-only image, and the format then comes from the image unit
-       * at dispatch. Resolved there; see unformatted_images. */
-      const bool unformatted = image_format == PIPE_FORMAT_NONE && no_read;
-      /* Read-only needs no storage format; see the note in the graphics
-       * path's copy of this check. */
-      if (!no_write && !unformatted &&
-          gex_wgpu_storage_texture_format(image_format) ==
-          WGPUTextureFormat_Undefined) {
-         fprintf(stderr, "gex-wgpu: %s image '%s' has format %s, which "
-                 "WebGPU cannot take as a storage texture (and it is written, "
-                 "so it cannot be a sampled one either)\n", stage,
-                 var->name ? var->name : "(anon)",
-                 util_format_short_name(image_format));
-         return false;
-      }
-      const unsigned at = out->count;
-      out->slots[at] = (uint8_t)var->data.driver_location;
-      out->bindings[at] = var->data.binding;
-      out->formats[at] = image_format;
-      out->access[at] = no_read ? WGPUStorageTextureAccess_WriteOnly
-                                : no_write ? WGPUStorageTextureAccess_ReadOnly
-                                           : WGPUStorageTextureAccess_ReadWrite;
-      const enum glsl_sampler_dim dim = glsl_get_sampler_dim(image_type);
-      out->dimensions[at] =
-         gex_wgpu_image_view_dimension(dim,
-                                       glsl_sampler_type_is_array(image_type));
-      if (getenv("GEX_WGPU_IMAGE_LOG"))
-         fprintf(stderr, "gex-image: %s '%s' slot=%u binding=%u "
-                 "access=0x%x fmt=%s -> %s\n", stage,
-                 var->name ? var->name : "(anon)",
-                 (unsigned)out->slots[at],
-                 out->bindings[at], (unsigned)var->data.access,
-                 util_format_short_name(image_format),
-                 out->access[at] == WGPUStorageTextureAccess_ReadOnly
-                    ? "ReadOnly"
-                 : out->access[at] ==
-                      WGPUStorageTextureAccess_WriteOnly ? "WriteOnly"
-                                                         : "ReadWrite");
-      if (unformatted)
-         out->unformatted |= (uint16_t)1u << at;
-      if (out->dimensions[at] == WGPUTextureViewDimension_Undefined) {
-         fprintf(stderr, "gex-wgpu: %s image '%s' is a shape WGSL has no "
-                 "storage texture for (dim %u%s); only 1d, 2d, 2d array and "
-                 "3d exist\n", stage, var->name ? var->name : "(anon)", (unsigned)dim,
-                 glsl_sampler_type_is_array(image_type) ? " array" : "");
-         return false;
-      }
-      ++out->count;
-   }
-   return true;
-}
 
 /* Whether a shader samples a texture at all.
  *
@@ -25839,6 +25885,42 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       ubo_bindings[ubo_total].buffer = sb_buffer;
       ubo_bindings[ubo_total].offset = sb_offset;
       ubo_bindings[ubo_total].size = ALIGN_POT(sb_size, 4);
+      ++ubo_total;
+   }
+
+   /* And the vertex stage's images, in the same group for the same reason:
+    * the graphics vertex stage puts them in descriptor set 1, so the compute
+    * clone declares them there too. This dispatch is the only place they can
+    * be written at all -- Tint refuses a write-access storage texture in a
+    * vertex shader, so the rasterising copy has none. */
+   WGPUTextureView capture_image_views[GEX_WGPU_MAX_SHADER_IMAGES];
+   unsigned capture_image_view_count = 0;
+   for (unsigned i = 0; i < ctx->vs->capture_images.count; ++i) {
+      WGPUTextureView view = NULL;
+      bool owned = false;
+      if (!gex_wgpu_stage_image_view(ctx, MESA_SHADER_VERTEX,
+                                     &ctx->vs->capture_images, i,
+                                     "vertex capture", &view, &owned)) {
+         for (unsigned r = 0; r < capture_image_view_count; ++r)
+            wgpuTextureViewRelease(capture_image_views[r]);
+         gex_fail(ctx);
+         return false;
+      }
+      if (owned)
+         capture_image_views[capture_image_view_count++] = view;
+      ubo_entries[ubo_total] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      ubo_entries[ubo_total].binding = ctx->vs->capture_images.bindings[i];
+      ubo_entries[ubo_total].visibility = WGPUShaderStage_Compute;
+      ubo_entries[ubo_total].storageTexture.access =
+         ctx->vs->capture_images.access[i];
+      ubo_entries[ubo_total].storageTexture.format =
+         gex_wgpu_storage_texture_format(ctx->vs->capture_images.formats[i]);
+      ubo_entries[ubo_total].storageTexture.viewDimension =
+         ctx->vs->capture_images.dimensions[i];
+      ubo_bindings[ubo_total] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      ubo_bindings[ubo_total].binding = ctx->vs->capture_images.bindings[i];
+      ubo_bindings[ubo_total].textureView = view;
       ++ubo_total;
    }
 
@@ -38611,7 +38693,8 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
           * that binds a vertex image stores through it. */
          stages[i] == MESA_SHADER_GEOMETRY ||
          stages[i] == MESA_SHADER_TESS_CTRL ||
-         stages[i] == MESA_SHADER_TESS_EVAL ? GEX_WGPU_MAX_SHADER_IMAGES : 0;
+         stages[i] == MESA_SHADER_TESS_EVAL ||
+         stages[i] == MESA_SHADER_VERTEX ? GEX_WGPU_MAX_SHADER_IMAGES : 0;
       caps->max_hw_atomic_counters = 0;
       caps->max_hw_atomic_counter_buffers = 0;
       caps->supported_irs = 1 << PIPE_SHADER_IR_NIR;
