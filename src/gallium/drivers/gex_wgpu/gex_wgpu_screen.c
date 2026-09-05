@@ -27212,12 +27212,38 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
          (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       ubo_entries[ubo_total].binding = ctx->vs->capture_images.bindings[i];
       ubo_entries[ubo_total].visibility = WGPUShaderStage_Compute;
-      ubo_entries[ubo_total].storageTexture.access =
-         ctx->vs->capture_images.access[i];
-      ubo_entries[ubo_total].storageTexture.format =
-         gex_wgpu_storage_texture_format(ctx->vs->capture_images.formats[i]);
-      ubo_entries[ubo_total].storageTexture.viewDimension =
-         ctx->vs->capture_images.dimensions[i];
+      /* A read-only image is a *sampled* texture binding, not a storage one:
+       * Tint lowers a SPIR-V storage image that is only read to a plain
+       * texture_2d<T>. This dispatch builds its layout by hand rather than
+       * through gex_wgpu_bindings, so it was the one image path that never
+       * learned it -- every non-compute basic-allTargets case failed with
+       *
+       *   Binding type in the shader (texture) doesn't match the type in the
+       *   layout (storageTexture).
+       *
+       * and the two paths that *had* learned it are why the compute ones
+       * passed. Three sites, one rule; this was the third. */
+      const enum pipe_format capture_format =
+         ctx->vs->capture_images.formats[i];
+      if (ctx->vs->capture_images.access[i] ==
+          WGPUStorageTextureAccess_ReadOnly) {
+         ubo_entries[ubo_total].texture.sampleType =
+            util_format_is_pure_uint(capture_format)
+               ? WGPUTextureSampleType_Uint
+            : util_format_is_pure_sint(capture_format)
+               ? WGPUTextureSampleType_Sint
+               : WGPUTextureSampleType_UnfilterableFloat;
+         ubo_entries[ubo_total].texture.viewDimension =
+            ctx->vs->capture_images.dimensions[i];
+         ubo_entries[ubo_total].texture.multisampled = false;
+      } else {
+         ubo_entries[ubo_total].storageTexture.access =
+            ctx->vs->capture_images.access[i];
+         ubo_entries[ubo_total].storageTexture.format =
+            gex_wgpu_storage_texture_format(capture_format);
+         ubo_entries[ubo_total].storageTexture.viewDimension =
+            ctx->vs->capture_images.dimensions[i];
+      }
       ubo_bindings[ubo_total] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       ubo_bindings[ubo_total].binding = ctx->vs->capture_images.bindings[i];
       ubo_bindings[ubo_total].textureView = view;
