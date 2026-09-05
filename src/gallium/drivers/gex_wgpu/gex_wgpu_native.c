@@ -246,6 +246,19 @@ create_device(void)
           adapter_limits.field > 0)                                         \
          limits.field = MIN2(adapter_limits.field, (uint32_t)(value))
       GEX_WANT(maxUniformBuffersPerShaderStage, 16);
+      /* A uniform block is bound with a dynamic offset here -- one buffer
+       * serves many draws from the constant ring -- so a pipeline layout's
+       * *dynamic* uniform buffer count is the vertex and fragment stages'
+       * blocks added together, and WebGPU defaults that to 8 while allowing
+       * 16 per stage. Dawn names the fix in the message itself:
+       *
+       *   The number of dynamic uniform buffers (11) exceeds the maximum
+       *   per-pipeline-layout limit (8). This adapter supports a higher
+       *   maxDynamicUniformBuffersPerPipelineLayout of 16
+       *
+       * Asked for at twice maxUniformBuffersPerShaderStage, because both
+       * stages contribute to one layout. */
+      GEX_WANT(maxDynamicUniformBuffersPerPipelineLayout, 32);
       GEX_WANT(maxStorageBuffersPerShaderStage, 16);
       GEX_WANT(maxStorageBuffersInVertexStage, 16);
       GEX_WANT(maxStorageBuffersInFragmentStage, 16);

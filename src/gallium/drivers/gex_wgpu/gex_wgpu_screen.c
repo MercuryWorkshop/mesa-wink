@@ -4194,6 +4194,18 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
       if (var->data.driver_location < uniform_slots)
          continue;
       var->data.mode = nir_var_mem_ssbo;
+      /* And read-only, which a uniform block is by definition. Saying so is
+       * not cosmetic here: WGSL forbids a read_write storage binding in the
+       * vertex stage outright, and Tint refuses the module for it --
+       *
+       *   var with 'storage' address space and 'read_write' access mode
+       *   cannot be used by vertex pipeline stage
+       *
+       * -- so a vertex shader with more uniform blocks than the device's
+       * limit did not compile at all, however little it did with them.
+       * KHR-GL45.shading_language_420pack.binding_uniform_block_array is
+       * exactly that shader. */
+      var->data.access |= ACCESS_NON_WRITEABLE;
       moved = true;
    }
    if (moved)
@@ -22427,6 +22439,39 @@ gex_wgpu_line_varyings(struct gex_wgpu_context *ctx,
    }
 }
 
+/* Move a compute-emulated stage's own constant buffers to group one.
+ *
+ * A dispatch has two groups: zero for the pass's own buffers and one for the
+ * shader's. The stamp these blocks arrived with is the *graphics* one -- set 2
+ * for every stage that is not the vertex shader -- and a pipeline whose entry
+ * point names a group its layout has no entry for is invalid, which loses the
+ * command buffer rather than the dispatch.
+ *
+ * Storage blocks are included, but *only* those in the spilled-uniform
+ * binding range [GEX_WGPU_STORAGE_UBO_FIRST_BINDING, SSBO_FIRST). Those are
+ * uniform blocks that overflowed the device's uniform buffer limit; they are
+ * bound from ctx->constant_buffers with the rest of group one and are in
+ * storage mode for no other reason.
+ *
+ * The range matters in both directions. A real application storage block
+ * numbers above it and keeps its own binding. And the *pass's own* blocks --
+ * the capture parameters, the emitted vertices, the per-primitive counts --
+ * number from zero, are storage blocks too, and belong in group zero; a first
+ * version of this tested only "below SSBO_FIRST" and moved all of them, which
+ * invalidated every emulated-stage pipeline in the run.
+ */
+static void
+gex_wgpu_blocks_to_group_one(nir_shader *nir)
+{
+   nir_foreach_variable_with_modes(var, nir,
+                                   nir_var_mem_ubo | nir_var_mem_ssbo) {
+      if (var->data.mode == nir_var_mem_ssbo &&
+          (var->data.binding < GEX_WGPU_STORAGE_UBO_FIRST_BINDING ||
+           var->data.binding >= GEX_WGPU_SSBO_FIRST_BINDING))
+         continue;
+      var->data.descriptor_set = 1;
+   }
+}
 static WGPUShaderModule
 gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs)
 {
@@ -22452,8 +22497,7 @@ gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs)
    /* The shader's own constant buffers move to group one, so group zero is
     * this pass's buffers alone -- the same split the vertex compute pass
     * uses, so one dispatch shape serves both. */
-   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo)
-      var->data.descriptor_set = 1;
+   gex_wgpu_blocks_to_group_one(nir);
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    state.verts_in_prim =
@@ -23003,8 +23047,7 @@ static WGPUShaderModule
 gex_wgpu_tcs_module(struct pipe_context *pipe, nir_shader *nir,
                     struct gex_wgpu_tcs *tcs)
 {
-   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo)
-      var->data.descriptor_set = 1;
+   gex_wgpu_blocks_to_group_one(nir);
 
    struct gex_wgpu_tess_lowering state = {0};
    state.in_layout = &tcs->inputs;
@@ -23053,8 +23096,7 @@ gex_wgpu_tes_module(struct pipe_context *pipe, nir_shader *nir,
                     const struct gex_wgpu_varying_layout *tcs_outputs,
                     const struct gex_wgpu_varying_layout *tcs_patch_outputs)
 {
-   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo)
-      var->data.descriptor_set = 1;
+   gex_wgpu_blocks_to_group_one(nir);
 
    struct gex_wgpu_tess_lowering state = {0};
    state.evaluation = true;
@@ -24656,8 +24698,19 @@ gex_wgpu_bind_constants(struct gex_wgpu_context *ctx,
          group->size[at] =
             MIN2((uint64_t)ALIGN_POT(constant->buffer_size, 16), left);
       }
-      if (storage_mask & (UINT64_C(1) << i))
+      if (storage_mask & (UINT64_C(1) << i)) {
          group->storage_mask |= UINT64_C(1) << at;
+         /* And read-only with it. Everything bound here is a *uniform* block,
+          * which GL never lets a shader write; the spill declares it
+          * `var<storage, read>` for that reason, and a layout that said
+          * plain Storage disagreed with the module:
+          *
+          *   The buffer type in the shader (BufferBindingType::ReadOnlyStorage)
+          *   is not compatible with the type in the layout
+          *   (BufferBindingType::Storage).
+          */
+         group->readonly_mask |= UINT64_C(1) << at;
+      }
    }
    return true;
 }
@@ -33662,11 +33715,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       vertex_layout_entries[i].binding = ctx->vs->ubo_bindings[i];
       vertex_layout_entries[i].visibility = WGPUShaderStage_Vertex;
-      /* Storage, not ReadOnlyStorage, even though the shader only reads it:
-       * the emitter declares every storage buffer read_write, and WebGPU
-       * rejects a layout that disagrees with the shader's declaration. */
+      /* ReadOnlyStorage: a spilled block is a *uniform* block that overflowed
+       * the device's uniform buffer limit, so GL never lets the shader write
+       * it and the spill declares it `var<storage, read>`. The layout has to
+       * say the same thing or WebGPU refuses the pipeline for disagreeing
+       * with the module. (It used to say plain Storage, because the emitter
+       * used to declare every storage buffer read_write -- which is also why
+       * such a shader could not be used in the vertex stage at all: WGSL
+       * forbids a writable storage binding there.) */
       vertex_layout_entries[i].buffer.type = storage
-         ? WGPUBufferBindingType_Storage : WGPUBufferBindingType_Uniform;
+         ? WGPUBufferBindingType_ReadOnlyStorage
+         : WGPUBufferBindingType_Uniform;
       /* The offset comes from the draw, not the bind group: uniforms are
        * sub-allocated from one ring, so the buffer and size repeat while the
        * offset does not. Baking the offset in would make a distinct bind
@@ -33741,11 +33800,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       fragment_layout_entries[i].binding = ctx->fs->ubo_bindings[i];
       fragment_layout_entries[i].visibility = WGPUShaderStage_Fragment;
-      /* Storage, not ReadOnlyStorage, even though the shader only reads it:
-       * the emitter declares every storage buffer read_write, and WebGPU
-       * rejects a layout that disagrees with the shader's declaration. */
+      /* ReadOnlyStorage: a spilled block is a *uniform* block that overflowed
+       * the device's uniform buffer limit, so GL never lets the shader write
+       * it and the spill declares it `var<storage, read>`. The layout has to
+       * say the same thing or WebGPU refuses the pipeline for disagreeing
+       * with the module. (It used to say plain Storage, because the emitter
+       * used to declare every storage buffer read_write -- which is also why
+       * such a shader could not be used in the vertex stage at all: WGSL
+       * forbids a writable storage binding there.) */
       fragment_layout_entries[i].buffer.type = storage
-         ? WGPUBufferBindingType_Storage : WGPUBufferBindingType_Uniform;
+         ? WGPUBufferBindingType_ReadOnlyStorage
+         : WGPUBufferBindingType_Uniform;
       /* The offset comes from the draw, not the bind group: uniforms are
        * sub-allocated from one ring, so the buffer and size repeat while the
        * offset does not. Baking the offset in would make a distinct bind
