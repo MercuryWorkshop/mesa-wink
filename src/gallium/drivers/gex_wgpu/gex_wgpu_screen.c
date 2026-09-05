@@ -2186,6 +2186,11 @@ struct gex_wgpu_varying_variant {
    struct gex_wgpu_varying_layout varyings;
    WGPUShaderModule module;
    unsigned vb_mask;
+   /* The vertex shader's own textures, renumbered into the compute range and
+    * bound into the dispatch's single group -- see the renumbering in
+    * gex_wgpu_varying_variant_get. Filled by gex_wgpu_collect_stage_textures,
+    * exactly as the compute-emulated stages fill theirs. */
+   struct gex_wgpu_stage_textures textures;
    struct gex_wgpu_varying_variant *next;
 };
 
@@ -7356,6 +7361,46 @@ gex_wgpu_is_64_bit_alu(const nir_instr *instr, const void *data)
    return false;
 }
 
+/* An undefined value is the fourth construct with a bit size that no ALU
+ * lowering reaches. nir_lower_int64 rewrites operations; an undef is not one,
+ * so a 64-bit one walks straight through and reaches the emitter as
+ * OpUndef %ulong -- and Tint refuses the module for the type, exactly as it
+ * would for a real 64-bit operation. It is not a rare shape either: the fp64
+ * builtin tests reach one whenever a value is conditionally assigned, and
+ * unpack_64_2x32_split reads it, which is what kept it alive through DCE.
+ *
+ * Rebuilding it as a pack of two 32-bit undefs says the same thing in a type
+ * the emitter can spell, and the fold that follows cancels the pack against
+ * those unpacks. */
+static bool
+gex_wgpu_split_64bit_undef(nir_shader *nir)
+{
+   bool any = false;
+   nir_foreach_function_impl(impl, nir) {
+      bool progress = false;
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_undef)
+               continue;
+            nir_undef_instr *undef = nir_instr_as_undef(instr);
+            if (undef->def.bit_size != 64)
+               continue;
+            b.cursor = nir_after_instr(instr);
+            nir_def *parts[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned c = 0; c < undef->def.num_components; ++c)
+               parts[c] = nir_pack_64_2x32_split(&b, nir_undef(&b, 1, 32),
+                                                 nir_undef(&b, 1, 32));
+            nir_def_replace(&undef->def,
+                            nir_vec(&b, parts, undef->def.num_components));
+            progress = true;
+         }
+      }
+      any |= nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return any;
+}
+
 static WGPUShaderModule
 gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
                      enum mesa_shader_stage stage, bool flip_y,
@@ -7710,11 +7755,22 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
        * is what the fp64 builtin tests do for a dvec3 and not for a dvec2.
        * Flattening the indexing and re-running vars-to-ssa dissolves it into
        * values the lowering below can see. */
+      /* And a 64-bit *register* is not an operation either. The emitter gives
+       * every register an OpVariable in the Function storage class, so a
+       * 64-bit one reaches Tint as OpTypePointer Function %ulong -- the same
+       * refusal a local variable earns, from a construct the ALU lowering
+       * below cannot reach, because nir_lower_int64 rewrites SSA defs and a
+       * register is not one. That is what survived here: seven
+       * pack_64_2x32_split results, every one of them consumed by a
+       * store_reg. Putting the shader back into SSA first turns those stores
+       * into values, and then the pack/unpack pairs fold. */
+      NIR_PASS(_, nir, nir_lower_reg_intrinsics_to_ssa);
       NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
                nir_var_function_temp, UINT32_MAX);
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
       NIR_PASS(_, nir, nir_lower_alu_to_scalar, gex_wgpu_is_64_bit_alu, NULL);
       NIR_PASS(_, nir, nir_lower_int64);
+      NIR_PASS(_, nir, gex_wgpu_split_64bit_undef);
       /* The lowering *represents* its results with pack_64_2x32_split and
        * unpack_64_2x32_split, so it leaves 64-bit values behind by
        * construction and expects an optimiser to fold the pairs away. Without
@@ -7724,11 +7780,75 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
       bool progress;
       do {
          progress = false;
+         /* A phi is the third construct the ALU lowering cannot reach: it
+          * merges two 64-bit values and stays 64-bit, and the emitter types
+          * it accordingly. This splits each into a pair of 32-bit phis, whose
+          * sources are unpacks of the packs above -- which is why it belongs
+          * inside the loop rather than before it, so the fold that follows
+          * can cancel the two against each other. */
+         NIR_PASS(progress, nir, nir_lower_64bit_phis);
          NIR_PASS(progress, nir, nir_opt_copy_prop);
          NIR_PASS(progress, nir, nir_opt_algebraic);
          NIR_PASS(progress, nir, nir_opt_constant_folding);
          NIR_PASS(progress, nir, nir_opt_dce);
       } while (progress);
+      /* And hand the emitter back the form it requires. nir_to_spirv has no
+       * case for a phi -- it asserts outright -- so a shader reaches it out
+       * of SSA, with phi webs held in registers. That is why the 64-bit
+       * values were in registers to begin with, and taking them out of that
+       * form above is only borrowed for the length of the lowering. The
+       * registers rebuilt here are 32-bit, because the phis they come from
+       * are. */
+      NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
+      if (getenv("GEX_WGPU_INT64_LOG")) {
+         nir_foreach_variable_in_shader(var, nir)
+            if (glsl_type_contains_64bit(var->type))
+               fprintf(stderr, "gex-int64: variable '%s' mode=0x%x type=%s\n",
+                       var->name ? var->name : "(anon)",
+                       (unsigned)var->data.mode, glsl_get_type_name(var->type));
+         nir_foreach_function_impl(impl, nir) {
+            nir_foreach_block(block, impl)
+               nir_foreach_instr(instr, block) {
+                  if (instr->type == nir_instr_type_alu) {
+                     nir_alu_instr *x = nir_instr_as_alu(instr);
+                     if (x->def.bit_size == 64)
+                        fprintf(stderr, "gex-int64: alu %s def64\n",
+                                nir_op_infos[x->op].name);
+                     for (unsigned i = 0;
+                          i < nir_op_infos[x->op].num_inputs; ++i)
+                        if (x->src[i].src.ssa->bit_size == 64)
+                           fprintf(stderr, "gex-int64: alu %s src%u 64\n",
+                                   nir_op_infos[x->op].name, i);
+                  } else if (instr->type == nir_instr_type_intrinsic) {
+                     nir_intrinsic_instr *x = nir_instr_as_intrinsic(instr);
+                     const char *nm =
+                        nir_intrinsic_infos[x->intrinsic].name;
+                     if (nir_intrinsic_infos[x->intrinsic].has_dest &&
+                         x->def.bit_size == 64)
+                        fprintf(stderr, "gex-int64: intr %s def64\n", nm);
+                     for (unsigned i = 0;
+                          i < nir_intrinsic_infos[x->intrinsic].num_srcs; ++i)
+                        if (x->src[i].ssa->bit_size == 64)
+                           fprintf(stderr, "gex-int64: intr %s src%u 64\n",
+                                   nm, i);
+                     if (x->intrinsic == nir_intrinsic_decl_reg &&
+                         nir_intrinsic_bit_size(x) == 64)
+                        fprintf(stderr, "gex-int64: decl_reg 64\n");
+                  } else if (instr->type == nir_instr_type_load_const) {
+                     if (nir_instr_as_load_const(instr)->def.bit_size == 64)
+                        fprintf(stderr, "gex-int64: load_const 64\n");
+                  } else if (instr->type == nir_instr_type_phi) {
+                     if (nir_instr_as_phi(instr)->def.bit_size == 64)
+                        fprintf(stderr, "gex-int64: phi 64\n");
+                  } else if (instr->type == nir_instr_type_undef) {
+                     if (nir_instr_as_undef(instr)->def.bit_size == 64)
+                        fprintf(stderr, "gex-int64: undef 64\n");
+                  }
+               }
+         }
+         fprintf(stderr, "gex-int64: end of stage %u\n",
+                 (unsigned)nir->info.stage);
+      }
    }
    /* Word indices, not byte offsets; see the note above. Last, so anything
     * this file added earlier is scaled too. */
@@ -13196,10 +13316,20 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
       struct gex_wgpu_resource *resource = CALLOC_STRUCT(gex_wgpu_resource);
       if (!resource)
          return NULL;
-      resource->allocation_size =
-         ALIGN_POT((uint64_t)templ->width0,
-                   (templ->bind & PIPE_BIND_CONSTANT_BUFFER) || !templ->bind
-                      ? 16 : 4);
+      /* Sixteen for every buffer, not only the ones created as constant
+       * buffers. A GL buffer object is retargetable -- the same reason the
+       * usage union below asks for everything -- so a buffer made with
+       * GL_ARRAY_BUFFER may be bound to a uniform block later, and WebGPU
+       * rounds a uniform binding's size up to 16 and then refuses a buffer
+       * that cannot cover it:
+       *
+       *   bound with size 12 at group 1, binding 2 is too small. The pipeline
+       *   requires a buffer binding which is at least 16 bytes.
+       *
+       * That is a validation error, so it takes the command buffer and
+       * everything recorded with it, not just the draw. Twelve bytes of slack
+       * per buffer is the whole cost. */
+      resource->allocation_size = ALIGN_POT((uint64_t)templ->width0, 16);
       /* No shadow yet -- gex_wgpu_shadow_ensure allocates one if anything
        * turns out to need it. */
       WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
@@ -17760,6 +17890,16 @@ struct gex_wgpu_compute_state {
     * sampling keeps the old path exactly -- one module, built once, at
     * creation. */
    uint16_t integer_sampled_slots;
+   /* Images the shader declared with no format qualifier, as a bit per index
+    * into image_slots. GLSL allows that only on a `writeonly` image, and GL
+    * then says the store converts to the *image unit's* format -- so the
+    * format is bound state, exactly like a buffer texture's texel width, and
+    * such a shader gets the same treatment: no base module, and one variant
+    * per set of resolved formats. It used to be refused outright, which cost
+    * 250 of shading_language_420pack's cases -- every one of them a test of
+    * something else entirely that happened to use `writeonly uniform image2D`
+    * as its output. */
+   uint16_t unformatted_images;
    /* Buffer textures, which are not textures as far as WebGPU is concerned:
     * a samplerBuffer becomes a read-only storage buffer and its texelFetch
     * becomes word loads. The texel word count comes from the *bound* view's
@@ -17780,6 +17920,7 @@ struct gex_wgpu_compute_state {
  * decide the shape it lowers to. */
 struct gex_wgpu_compute_variant {
    uint8_t buftex_words[GEX_WGPU_MAX_BUFFER_TEXTURES];
+   enum pipe_format image_formats[GEX_WGPU_MAX_SHADER_IMAGES];
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
    uint8_t targets[GEX_WGPU_MAX_SAMPLERS];
@@ -17966,9 +18107,14 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
          FREE(compute);
          return NULL;
       }
+      /* No format qualifier at all is not the same as a format WebGPU cannot
+       * store: it is a format that is not known *yet*. GLSL permits it only
+       * on a write-only image, and the format then comes from the image unit
+       * at dispatch. Resolved there; see unformatted_images. */
+      const bool unformatted = image_format == PIPE_FORMAT_NONE && no_read;
       /* Read-only needs no storage format; see the note in the graphics
        * path's copy of this check. */
-      if (!no_write &&
+      if (!no_write && !unformatted &&
           gex_wgpu_storage_texture_format(image_format) ==
           WGPUTextureFormat_Undefined) {
          fprintf(stderr, "gex-wgpu: compute image '%s' has format %s, which "
@@ -17991,6 +18137,8 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
       compute->image_dimensions[at] =
          gex_wgpu_image_view_dimension(dim,
                                        glsl_sampler_type_is_array(image_type));
+      if (unformatted)
+         compute->unformatted_images |= (uint16_t)1u << at;
       if (compute->image_dimensions[at] == WGPUTextureViewDimension_Undefined) {
          fprintf(stderr, "gex-wgpu: compute image '%s' is a shape WGSL has no "
                  "storage texture for (dim %u%s); only 1d, 2d, 2d array and "
@@ -18233,7 +18381,8 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
          return NULL;
       }
    }
-   if (compute->integer_sampled_slots || compute->buftex_count) {
+   if (compute->integer_sampled_slots || compute->buftex_count ||
+       compute->unformatted_images) {
       /* No base module. Compiling one would fail anyway -- Tint's SPIR-V
        * reader refuses a sampled image with a non-float component type, and a
        * samplerBuffer reaches SPIR-V as dimension Buffer, which it refuses
@@ -18258,12 +18407,51 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
    return compute;
 }
 
+/* Fill in the format of every image the shader declared without one, from the
+ * image unit bound to it. Called once at the top of a dispatch, so both the
+ * module lookup below and the bind group layout read the same answer.
+ *
+ * Returns false with a named reason rather than substituting a nearby format:
+ * a storage view over a format WebGPU will not take is rejected by the device,
+ * and the message that comes back names a bind group rather than the image.
+ * An unbound unit is not that case -- GL says its stores are discarded, so any
+ * format serves, and the stand-in view is built as rgba8 already. */
+static bool
+gex_wgpu_resolve_unformatted_images(struct gex_wgpu_context *ctx,
+                                    struct gex_wgpu_compute_state *compute)
+{
+   for (unsigned i = 0; i < compute->image_count; ++i) {
+      if (!(compute->unformatted_images & ((uint16_t)1u << i)))
+         continue;
+      const struct pipe_image_view *iv =
+         &ctx->shader_images[MESA_SHADER_COMPUTE][compute->image_slots[i]];
+      enum pipe_format format =
+         iv->resource ? iv->format : PIPE_FORMAT_R8G8B8A8_UNORM;
+      if (gex_wgpu_storage_texture_format(format) ==
+          WGPUTextureFormat_Undefined) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: dispatch declined (image unit %u is "
+                    "%s, which WebGPU cannot take as a storage texture, and "
+                    "the shader declared no format to store through)\n",
+                    compute->image_slots[i],
+                    util_format_short_name(format));
+         }
+         return false;
+      }
+      compute->image_formats[i] = format;
+   }
+   return true;
+}
+
 /* The module this dispatch's sampler state calls for. */
 static WGPUShaderModule
 gex_wgpu_compute_module(struct gex_wgpu_context *ctx,
                         struct gex_wgpu_compute_state *compute)
 {
-   if (!compute->integer_sampled_slots && !compute->buftex_count)
+   if (!compute->integer_sampled_slots && !compute->buftex_count &&
+       !compute->unformatted_images)
       return compute->module;
 
    /* The texel word count of each bound buffer texture, which the lowering
@@ -18275,7 +18463,9 @@ gex_wgpu_compute_module(struct gex_wgpu_context *ctx,
    for (struct gex_wgpu_compute_variant *cached = compute->variants; cached;
         cached = cached->next) {
       bool match = memcmp(cached->buftex_words, want_buftex,
-                          sizeof(want_buftex)) == 0;
+                          sizeof(want_buftex)) == 0 &&
+                   memcmp(cached->image_formats, compute->image_formats,
+                          sizeof(cached->image_formats)) == 0;
       for (unsigned i = 0; match && i < compute->texture_count; ++i) {
          const unsigned slot = compute->texture_slots[i];
          const struct pipe_sampler_view *view =
@@ -18306,6 +18496,18 @@ gex_wgpu_compute_module(struct gex_wgpu_context *ctx,
       compute->nir ? nir_shader_clone(NULL, compute->nir) : NULL;
    if (!clone)
       return NULL;
+   /* The emitter takes the storage image's format from the variable, so the
+    * resolved format has to be written back onto it -- an image left as
+    * PIPE_FORMAT_NONE reaches SPIR-V as an Unknown format, which is a
+    * different capability and not one WGSL has. */
+   if (compute->unformatted_images) {
+      nir_foreach_variable_with_modes(var, clone, nir_var_image) {
+         for (unsigned i = 0; i < compute->image_count; ++i)
+            if ((compute->unformatted_images & ((uint16_t)1u << i)) &&
+                compute->image_slots[i] == var->data.driver_location)
+               var->data.image.format = compute->image_formats[i];
+      }
+   }
    if (!gex_wgpu_lower_texture_variant(clone, compute->texture_count,
                                        compute->texture_slots,
                                        compute->integer_sampled_slots,
@@ -18368,6 +18570,8 @@ gex_wgpu_compute_module(struct gex_wgpu_context *ctx,
       cached->last_level[slot] = view ? (uint8_t)view->u.tex.last_level : 0u;
    }
    memcpy(cached->buftex_words, want_buftex, sizeof(cached->buftex_words));
+   memcpy(cached->image_formats, compute->image_formats,
+          sizeof(cached->image_formats));
    cached->module = module;
    cached->next = compute->variants;
    compute->variants = cached;
@@ -18486,6 +18690,11 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       }
       return;
    }
+
+   /* Before anything reads compute->image_formats -- the bind group layout
+    * and the module both do, and they have to agree. */
+   if (!gex_wgpu_resolve_unformatted_images(ctx, compute))
+      return;
 
    /* glDispatchComputeIndirect: the workgroup counts live in a buffer.
     *
@@ -21126,20 +21335,10 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
     * KHR-GL44.texture_view cases reached it. Checking here covers all of
     * them, including whichever is added next.
     *
-    * Lifting this needs what the compute path got: the variant's textures
-    * remapped into group zero and bound by the dispatch. Until then a
-    * geometry or tessellation draw whose vertex shader samples is declined
-    * rather than mis-submitted. */
-   if (vs->texture_count || vs->sampler_count) {
-      static bool said;
-      if (!said) {
-         said = true;
-         fprintf(stderr, "gex-wgpu: no capture variant for a vertex shader "
-                         "that samples a texture (%u textures, %u samplers)\n",
-                 vs->texture_count, vs->sampler_count);
-      }
-      return NULL;
-   }
+    * Lifted by doing exactly that: the split has already made a texture and
+    * a sampler variable per unit, so the variant renumbers them into the
+    * compute range below and the dispatch binds them from the vertex stage's
+    * own sampler state. */
    for (struct gex_wgpu_varying_variant *v = vs->varyings; v; v = v->next) {
       if (!memcmp(&v->vertex_layout, vertex, sizeof(*vertex)) &&
           !memcmp(&v->varyings, varyings, sizeof(*varyings)))
@@ -21219,6 +21418,21 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
     * They become ordinary private variables instead. */
    nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
       var->data.mode = nir_var_shader_temp;
+   /* This module is dispatched, and a dispatch has one bind group, number
+    * zero. The split stamped these into set 3 because they were a *vertex*
+    * shader's, and a pipeline whose entry point uses group 3 with no layout
+    * for it is invalid -- which loses the whole command buffer, not the draw.
+    * The numbering is the same arithmetic the split does for a compute
+    * stage. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      const bool texture = glsl_type_is_texture(type);
+      if (!texture && !glsl_type_is_sampler(type))
+         continue;
+      var->data.descriptor_set = 0;
+      var->data.binding = GEX_WGPU_COMPUTE_TEXTURE_FIRST_BINDING +
+                          2 * var->data.driver_location + (texture ? 0u : 1u);
+   }
    nir_fixup_deref_modes(nir);
    nir_remove_dead_variables(nir, nir_var_shader_in | nir_var_system_value,
                              NULL);
@@ -21236,6 +21450,16 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    variant->vertex_layout = *vertex;
    variant->varyings = *varyings;
    variant->vb_mask = state.vb_mask;
+   {
+      const char *why = NULL;
+      if (!gex_wgpu_collect_stage_textures(nir, &variant->textures, &why)) {
+         fprintf(stderr, "gex-wgpu: no capture variant for a vertex shader "
+                 "that samples (%s)\n", why ? why : "unknown");
+         ralloc_free(nir);
+         FREE(variant);
+         return NULL;
+      }
+   }
 
    char *error = NULL;
    variant->module = gex_wgpu_compile_nir(&ctx->base, nir,
@@ -24087,28 +24311,25 @@ gex_wgpu_bind_storage(struct gex_wgpu_bindings *group, uint32_t binding,
  * later draw still works.
  */
 static bool
-gex_wgpu_bind_stage_textures(struct pipe_context *pipe, int stage_index,
-                             const struct gex_wgpu_stage_textures *textures,
-                             struct gex_wgpu_bindings *group)
+gex_wgpu_bind_textures_from(struct pipe_context *pipe,
+                            struct pipe_sampler_view * const *views,
+                            struct gex_wgpu_sampler * const *samplers,
+                            const struct gex_wgpu_stage_textures *textures,
+                            struct gex_wgpu_bindings *group)
 {
-   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
-   if (stage_index < 0)
-      return true;
    for (unsigned i = 0; i < textures->count; ++i) {
       const unsigned slot = textures->slots[i];
       struct gex_wgpu_sampler_view *view =
-         (struct gex_wgpu_sampler_view *)
-            ctx->stage_sampler_views[stage_index][slot];
+         (struct gex_wgpu_sampler_view *)views[slot];
       if (!view || group->count + 2 > GEX_WGPU_MAX_GROUP_BINDINGS) {
          if (getenv("GEX_WGPU_STAGE_TEXTURE_LOG"))
-            fprintf(stderr, "gex-wgpu: stage %d texture %u %s\n", stage_index,
+            fprintf(stderr, "gex-wgpu: stage texture %u %s\n",
                     slot, view ? "has no room in the group"
                                : "has no view bound");
          return false;
       }
       gex_wgpu_sampler_view_refresh(pipe, view);
-      const struct gex_wgpu_sampler *sampler =
-         ctx->stage_samplers[stage_index][slot];
+      const struct gex_wgpu_sampler *sampler = samplers[slot];
       /* The same rule the draw and compute paths apply: a depth view read by
        * a shader that declared a plain sampler is served as unfilterable
        * float with a non-filtering sampler, because that is all WebGPU
@@ -24151,12 +24372,41 @@ gex_wgpu_bind_stage_textures(struct pipe_context *pipe, int stage_index,
          : NULL;
       if (!group->sampler[at]) {
          if (getenv("GEX_WGPU_STAGE_TEXTURE_LOG"))
-            fprintf(stderr, "gex-wgpu: stage %d sampler %u has no state\n",
-                    stage_index, slot);
+            fprintf(stderr, "gex-wgpu: stage sampler %u has no state\n", slot);
          return false;
       }
    }
    return true;
+}
+
+/* The three compute-emulated stages keep their sampler state in
+ * gex_wgpu_context::stage_sampler_views; the vertex shader's capture variants
+ * use the vertex stage's own, through the same helper. */
+static bool
+gex_wgpu_bind_stage_textures(struct pipe_context *pipe, int stage_index,
+                             const struct gex_wgpu_stage_textures *textures,
+                             struct gex_wgpu_bindings *group)
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   if (stage_index < 0)
+      return true;
+   return gex_wgpu_bind_textures_from(pipe,
+                                      ctx->stage_sampler_views[stage_index],
+                                      ctx->stage_samplers[stage_index],
+                                      textures, group);
+}
+
+/* The textures a vertex shader run as a compute pass samples. Every path that
+ * dispatches a varying variant needs this, and forgetting it is not a wrong
+ * picture but an invalid pipeline, which loses the whole command buffer. */
+static bool
+gex_wgpu_bind_varying_textures(struct gex_wgpu_context *ctx,
+                               const struct gex_wgpu_varying_variant *variant,
+                               struct gex_wgpu_bindings *group)
+{
+   return gex_wgpu_bind_textures_from(&ctx->base, ctx->vertex_sampler_views,
+                                      ctx->vertex_samplers,
+                                      &variant->textures, group);
 }
 
 static WGPUBindGroupLayout
@@ -24394,7 +24644,18 @@ gex_wgpu_bind_constants(struct gex_wgpu_context *ctx,
       group->binding[at] = ubo_bindings[i];
       group->buffer[at] = gex_resource(constant->buffer)->buffer;
       group->offset[at] = constant->buffer_offset;
-      group->size[at] = constant->buffer_size;
+      /* Rounded up for the same reason the allocation is: WebGPU pads a
+       * uniform binding to 16 and compares the buffer against the padded
+       * size. Clamped to what is actually there, so a binding near the end of
+       * a buffer asks for no more than the buffer has. */
+      {
+         const uint64_t allocated =
+            gex_resource(constant->buffer)->allocation_size;
+         const uint64_t left = allocated > constant->buffer_offset
+            ? allocated - constant->buffer_offset : 0;
+         group->size[at] =
+            MIN2((uint64_t)ALIGN_POT(constant->buffer_size, 16), left);
+      }
       if (storage_mask & (UINT64_C(1) << i))
          group->storage_mask |= UINT64_C(1) << at;
    }
@@ -25004,6 +25265,7 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
       gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_INDEX_BINDING,
                             slot_table);
    bool ok = vs_params &&
+             gex_wgpu_bind_varying_textures(ctx, variant, &vs_group0) &&
              gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
                                      ctx->vs->ubo_count, ctx->vs->ubo_slots,
                                      ctx->vs->ubo_bindings,
@@ -25891,6 +26153,7 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
       gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_INDEX_BINDING,
                             slot_table);
    bool ok = vs_params &&
+             gex_wgpu_bind_varying_textures(ctx, variant, &vs_group0) &&
              gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
                                      ctx->vs->ubo_count, ctx->vs->ubo_slots,
                                      ctx->vs->ubo_bindings,
@@ -26408,8 +26671,6 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
 
    if (!tes)
       GEX_TESS_DECLINE("a patch draw with no evaluation shader");
-   if (ctx->gs)
-      GEX_TESS_DECLINE("a geometry shader after tessellation");
    if (info->index_size || info->instance_count != 1) {
       if (getenv("GEX_WGPU_TESS_LOG"))
          fprintf(stderr, "gex-wgpu: tess decline detail isz=%u inst=%u "
@@ -26510,6 +26771,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
                          vs_params);
    bool ok = vs_params &&
+             gex_wgpu_bind_varying_textures(ctx, vs_variant, &vs_group0) &&
              gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
                                      ctx->vs->ubo_count, ctx->vs->ubo_slots,
                                      ctx->vs->ubo_bindings,
@@ -26760,7 +27022,14 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
     * tessellation_control_to_tessellation_evaluation family: every one of
     * them reads its result back through feedback, so all of them read zeroes
     * and blamed whichever value they checked first. */
-   if (ctx->so_target_count && tes->xfb) {
+   if (ctx->gs) {
+      /* Unless a geometry shader follows, in which case *it* is the last
+       * stage before rasterization and the one GL records. Pass five leaves
+       * ctx->gs bound, so the draw it issues re-enters the geometry path,
+       * which does its own capture and its own primitive count -- doing
+       * either here as well would record the wrong stage and count it twice.
+       */
+   } else if (ctx->so_target_count && tes->xfb) {
       if (!gex_wgpu_tes_capture(ctx, tes, index_count, per_prim))
          return false;
    } else if (ctx->active_queries[GEX_WGPU_QUERY_GENERATED]) {
@@ -29515,6 +29784,7 @@ gex_wgpu_capture_positions(struct gex_wgpu_context *ctx, unsigned first,
    gex_wgpu_bind_storage(&group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
                          param_buffer);
    bool ok = param_buffer &&
+             gex_wgpu_bind_varying_textures(ctx, variant, &group0) &&
              gex_wgpu_bind_constants(ctx, &group1, MESA_SHADER_VERTEX,
                                      ctx->vs->ubo_count, ctx->vs->ubo_slots,
                                      ctx->vs->ubo_bindings,
@@ -30433,7 +30703,8 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
        * agree or the binding does not match the shader at all. */
       gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_INDEX_BINDING,
                             slot_table);
-      ok = gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
+      ok = gex_wgpu_bind_varying_textures(ctx, variant, &vs_group0) &&
+           gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
                                    ctx->vs->ubo_count, ctx->vs->ubo_slots,
                                    ctx->vs->ubo_bindings,
                                    ctx->vs->ubo_storage_mask) &&
