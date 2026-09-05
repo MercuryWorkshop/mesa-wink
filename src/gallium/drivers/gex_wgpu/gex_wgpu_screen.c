@@ -14084,8 +14084,31 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
       target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_RECT ||
       target == PIPE_TEXTURE_2D_ARRAY || target == PIPE_TEXTURE_CUBE ||
       target == PIPE_TEXTURE_CUBE_ARRAY;
+   /* PIPE_BIND_BLENDABLE, which this driver had never accounted for at all --
+    * the constant appeared nowhere in it, so every query carrying the bit was
+    * refused as "bad binds" however ordinary the format.
+    *
+    * st/mesa asks with it to decide whether a colour format may be blended,
+    * and a "no" is not confined to blending: the format stops being usable as
+    * a render target in that configuration, so the framebuffer is incomplete
+    * and a clear fails with GL_INVALID_FRAMEBUFFER_OPERATION. Twenty-seven
+    * cases of es_31_compatibility.sample_variables.mask.rgba32f died that
+    * way, before a single sample mask was read.
+    *
+    * WebGPU blends every renderable format except the pure-integer ones, and
+    * the 32-bit float set only with Float32Blendable -- which this device
+    * grants and the screen already records, having asked for it precisely so
+    * that "the formats stay unadvertised rather than becoming a validation
+    * error the first time something blends one". */
+   const WGPUTextureFormat blend_format = gex_wgpu_texture_format(format);
+   const bool blendable = renderable && !util_format_is_pure_integer(format) &&
+      (gex_screen(screen)->float32_blendable ||
+       (blend_format != WGPUTextureFormat_R32Float &&
+        blend_format != WGPUTextureFormat_RG32Float &&
+        blend_format != WGPUTextureFormat_RGBA32Float));
    const unsigned allowed = renderable && renderable_target
-      ? PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW | present_binds
+      ? PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW | present_binds |
+        (blendable ? (unsigned)PIPE_BIND_BLENDABLE : 0u)
       : PIPE_BIND_SAMPLER_VIEW | present_binds;
 
    /* WebGPU guarantees 4x multisampling for renderable formats, and only 4x:
