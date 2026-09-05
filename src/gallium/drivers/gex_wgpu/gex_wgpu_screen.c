@@ -18065,9 +18065,15 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
     * not check: it carries on from a NULL map and asks for a buffer of a size
     * computed from nothing, which is how this surfaced -- a negative map width
     * and a 2.3 GB allocation several calls later. SuperTuxKart reads back cube
-    * face 1 for its skybox. A multi-slice read is still refused: it would need
-    * a staging buffer per slice, and nothing asks. */
-   if (level > resource->last_level || box->depth != 1 ||
+    * face 1 for its skybox.
+    *
+    * Several slices at once are served too, and need no staging buffer each:
+    * one CopyTextureToBuffer carries `depthOrArrayLayers` slices, laid out
+    * `rowsPerImage` rows apart, so the whole read is one copy and one map.
+    * glGetTexImage of a 3D texture or of a whole array asks for exactly that
+    * -- refusing it returned a NULL map that st/mesa does not check. */
+   if (level > resource->last_level || box->depth < 1 ||
+       (packed_depth && box->depth != 1) ||
        /* The packed-depth branch below resolves through a render pass that
         * has no notion of a slice, so a non-zero one there would quietly read
         * layer zero. Refused rather than mis-served; the copy path underneath
@@ -18079,8 +18085,15 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
        (uint64_t)(unsigned)box->x + (unsigned)box->width >
           u_minify(resource->width0, level) ||
        (uint64_t)(unsigned)box->y + (unsigned)box->height >
-          u_minify(resource->height0, level))
-      GEX_MAP_REFUSE("read path supports one layer of a sized format, in bounds");
+          u_minify(resource->height0, level) ||
+       /* And in bounds in z, which nothing checked: a copy past the last
+        * slice is a Dawn validation error, which costs the command buffer
+        * rather than this call. */
+       (uint64_t)(unsigned)box->z + (unsigned)box->depth >
+          (resource->target == PIPE_TEXTURE_3D
+              ? MAX2(u_minify(resource->depth0, level), 1u)
+              : MAX2(resource->array_size, 1u)))
+      GEX_MAP_REFUSE("read path supports slices of a sized format, in bounds");
 #undef GEX_MAP_REFUSE
 
    /* A packed depth format cannot be copied out, so it is resolved through a
@@ -18162,8 +18175,17 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
       ? read_row_blocks * read_block_bytes
       : (uint32_t)box->width * pixel_bytes;
    const uint32_t copy_rows = read_compressed ? read_col_blocks : copy_height;
+   /* Rows of the *transfer*, which is the requested box rather than the whole
+    * subresource a depth read has to stage. They differ only for depth, and
+    * only mattered once a transfer could hold more than one slice: the layer
+    * stride is what the caller steps by, and a depth read was reporting the
+    * level's height for a box that may be shorter. */
+   const uint32_t transfer_rows =
+      read_compressed ? read_col_blocks : (uint32_t)box->height;
    const uint32_t bytes_per_row = (tight_row + 255u) & ~255u;
-   const uint64_t readback_size = (uint64_t)bytes_per_row * copy_rows;
+   const uint32_t copy_slices = (uint32_t)box->depth;
+   const uint64_t slice_bytes = (uint64_t)bytes_per_row * copy_rows;
+   const uint64_t readback_size = slice_bytes * copy_slices;
    WGPUBufferDescriptor buffer_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
    buffer_desc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
    buffer_desc.size = readback_size;
@@ -18202,7 +18224,7 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
    WGPUExtent3D extent = {
       read_compressed ? read_row_blocks * read_block_w : copy_width,
       read_compressed ? read_col_blocks * read_block_h : copy_height,
-      1,
+      copy_slices,
    };
    wgpuCommandEncoderCopyTextureToBuffer(encoder, &source, &destination, &extent);
    WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, NULL);
@@ -18257,14 +18279,17 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
          transfer->base.usage = usage;
          transfer->base.box = *box;
          transfer->base.stride = transfer_row;
-         transfer->base.layer_stride = (uint64_t)transfer_row * copy_rows;
-         transfer->data = MALLOC(transfer->base.layer_stride);
+         transfer->base.layer_stride = (uint64_t)transfer_row * transfer_rows;
+         transfer->data =
+            MALLOC(transfer->base.layer_stride * copy_slices);
          if (transfer->data && read_backing != PIPE_FORMAT_NONE)
-            util_format_translate(resource->format, transfer->data,
-                                  transfer->base.stride, 0, 0,
-                                  read_backing, mapped, bytes_per_row, 0, 0,
-                                  (unsigned)box->width,
-                                  (unsigned)box->height);
+            for (uint32_t z = 0; z < copy_slices; ++z)
+               util_format_translate(
+                  resource->format,
+                  (uint8_t *)transfer->data + z * transfer->base.layer_stride,
+                  transfer->base.stride, 0, 0,
+                  read_backing, mapped + z * slice_bytes, bytes_per_row, 0, 0,
+                  (unsigned)box->width, (unsigned)box->height);
          else if (transfer->data) {
             /* The staging buffer holds `copy_width x copy_height` starting at
              * `copy_x, copy_y`, which for a depth read is the whole level
@@ -18273,12 +18298,15 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
             const uint64_t skip_x =
                (uint64_t)((uint32_t)box->x - copy_x) * gpu_pixel_bytes;
             const uint32_t skip_y = (uint32_t)box->y - copy_y;
-            const uint32_t rows = read_compressed
-               ? copy_rows : (uint32_t)box->height;
-            for (unsigned row = 0; row < rows; ++row)
-               memcpy((uint8_t *)transfer->data + row * transfer->base.stride,
-                      mapped + (uint64_t)(row + skip_y) * bytes_per_row + skip_x,
-                      transfer->base.stride);
+            const uint32_t rows = transfer_rows;
+            for (uint32_t z = 0; z < copy_slices; ++z)
+               for (unsigned row = 0; row < rows; ++row)
+                  memcpy((uint8_t *)transfer->data +
+                            z * transfer->base.layer_stride +
+                            row * transfer->base.stride,
+                         mapped + z * slice_bytes +
+                            (uint64_t)(row + skip_y) * bytes_per_row + skip_x,
+                         transfer->base.stride);
          }
       }
    }
