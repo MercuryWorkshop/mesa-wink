@@ -10778,7 +10778,15 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       return NULL;
    }
    uint16_t texture_slots_used = 0, sampler_slots_used = 0;
-   uint8_t shadow_slots = 0, float_slots = 0, uint_slots = 0, sint_slots = 0;
+   /* One bit per sampler slot, so these must be as wide as the slot space.
+    * They were uint8_t, and `1u << slot` for slots 8..15 was truncated away
+    * silently: every unit from eight up kept the default Float sample type,
+    * gex_wgpu_unusable_texture_slots then found Float declared against an
+    * integer view, called the slot unsatisfiable, and gex_wgpu_omit_textures
+    * rewrote its fetches to zero. A `usampler2D s[16]` read units 0..7 and
+    * zero above -- and so did
+    * KHR-GL45.geometry_shader.limits.max_combined_texture_units. */
+   uint16_t shadow_slots = 0, float_slots = 0, uint_slots = 0, sint_slots = 0;
    /* Which texture op made the metadata invalid, if one did. The masks alone
     * cannot say: the refusals below happen before a slot is recorded, so a
     * rejected shader printed three perfectly consistent masks. Numeric
@@ -10919,8 +10927,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    if (!descriptors_valid) {
       fprintf(stderr,
               "gex-wgpu: texture metadata invalid (texop=%d) textures=%u samplers=%u "
-              "texture-used=0x%02x sampler-used=0x%02x shadow=0x%02x "
-              "float=0x%02x uint=0x%02x sint=0x%02x\n",
+              "texture-used=0x%04x sampler-used=0x%04x shadow=0x%04x "
+              "float=0x%04x uint=0x%04x sint=0x%04x\n",
               descriptors_valid_op,
               shader->texture_count, shader->sampler_count,
               texture_slots_used, sampler_slots_used, shadow_slots,
