@@ -11993,6 +11993,57 @@ gex_wgpu_set_scissor_states(struct pipe_context *pipe, unsigned start_slot,
    }
 }
 
+/* The same vertex format with the signedness the shader asked for.
+ *
+ * GL lets an integer attribute's buffer type and its shader declaration
+ * disagree in signedness: `glVertexAttribIPointer(..., GL_UNSIGNED_SHORT, ...)`
+ * feeding an `ivec2` is ordinary, and the bits are simply reinterpreted.
+ * WebGPU compares the two and rejects the pipeline:
+ *
+ *   Attribute base type (Uint for VertexFormat::Uint16x2) does not match the
+ *   shader's base type (Sint) in location (0).
+ *
+ * Since the two formats differ only in how the same bytes are read, naming the
+ * one the shader declared is the whole fix. Anything that is not an integer
+ * pair is returned unchanged -- a float format against an integer input is a
+ * real mismatch GL would not have allowed.
+ */
+static WGPUVertexFormat
+gex_wgpu_vertex_format_signed_as(WGPUVertexFormat format, bool want_sint,
+                                 bool want_uint)
+{
+   if (want_sint == want_uint)
+      return format;                   /* neither, or a shader that is both */
+   if (want_sint) {
+      switch (format) {
+      case WGPUVertexFormat_Uint8:    return WGPUVertexFormat_Sint8;
+      case WGPUVertexFormat_Uint8x2:  return WGPUVertexFormat_Sint8x2;
+      case WGPUVertexFormat_Uint8x4:  return WGPUVertexFormat_Sint8x4;
+      case WGPUVertexFormat_Uint16:   return WGPUVertexFormat_Sint16;
+      case WGPUVertexFormat_Uint16x2: return WGPUVertexFormat_Sint16x2;
+      case WGPUVertexFormat_Uint16x4: return WGPUVertexFormat_Sint16x4;
+      case WGPUVertexFormat_Uint32:   return WGPUVertexFormat_Sint32;
+      case WGPUVertexFormat_Uint32x2: return WGPUVertexFormat_Sint32x2;
+      case WGPUVertexFormat_Uint32x3: return WGPUVertexFormat_Sint32x3;
+      case WGPUVertexFormat_Uint32x4: return WGPUVertexFormat_Sint32x4;
+      default: return format;
+      }
+   }
+   switch (format) {
+   case WGPUVertexFormat_Sint8:    return WGPUVertexFormat_Uint8;
+   case WGPUVertexFormat_Sint8x2:  return WGPUVertexFormat_Uint8x2;
+   case WGPUVertexFormat_Sint8x4:  return WGPUVertexFormat_Uint8x4;
+   case WGPUVertexFormat_Sint16:   return WGPUVertexFormat_Uint16;
+   case WGPUVertexFormat_Sint16x2: return WGPUVertexFormat_Uint16x2;
+   case WGPUVertexFormat_Sint16x4: return WGPUVertexFormat_Uint16x4;
+   case WGPUVertexFormat_Sint32:   return WGPUVertexFormat_Uint32;
+   case WGPUVertexFormat_Sint32x2: return WGPUVertexFormat_Uint32x2;
+   case WGPUVertexFormat_Sint32x3: return WGPUVertexFormat_Uint32x3;
+   case WGPUVertexFormat_Sint32x4: return WGPUVertexFormat_Uint32x4;
+   default: return format;
+   }
+}
+
 static WGPUVertexFormat
 gex_wgpu_vertex_format(enum pipe_format format, unsigned *size,
                        unsigned *alignment)
@@ -20763,6 +20814,28 @@ gex_wgpu_resolve(struct pipe_context *pipe, struct pipe_resource *dst,
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
+   /* An integer format cannot be a resolve target. WebGPU grants the resolve
+    * capability to the filterable formats only -- averaging samples is what a
+    * resolve *is*, and there is no defined average of two integers -- and it
+    * rejects the attachment by name:
+    *
+    *   The resolve target [TextureView] format (TextureFormat::R32Uint) does
+    *   not support being used as resolve target.
+    *
+    * Refused here rather than there, because there it is a validation error
+    * that invalidates the command buffer and takes whatever else was recorded
+    * with it. 48 of KHR-GL45.direct_state_access's error lines were this. */
+   if (util_format_is_pure_integer(src->format) ||
+       util_format_is_pure_integer(dst->format)) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: resolve refused: %s is an integer format, "
+                 "which WebGPU cannot resolve\n",
+                 util_format_short_name(src->format));
+      }
+      return false;
+   }
    if (dst->format != src->format || dst_level != 0 || src_level != 0) {
       static bool said;
       if (!said) {
@@ -33899,8 +33972,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          vertex_attributes[slot][attribute] =
             (WGPUVertexAttribute)WGPU_VERTEX_ATTRIBUTE_INIT;
          unsigned size, alignment;
-         vertex_attributes[slot][attribute].format = gex_wgpu_vertex_format(
-            element->src_format, &size, &alignment);
+         /* With the shader's own signedness: GL lets the buffer type and the
+          * declaration disagree, WebGPU does not, and the bytes are the
+          * same. */
+         vertex_attributes[slot][attribute].format =
+            gex_wgpu_vertex_format_signed_as(
+               gex_wgpu_vertex_format(element->src_format, &size, &alignment),
+               (ctx->vs->vertex_locations_sint & BITFIELD64_BIT(location)) != 0,
+               (ctx->vs->vertex_locations_uint & BITFIELD64_BIT(location)) != 0);
          vertex_attributes[slot][attribute].offset = element->src_offset;
          vertex_attributes[slot][attribute].shaderLocation = location;
          supplied_locations |= BITFIELD64_BIT(location);
