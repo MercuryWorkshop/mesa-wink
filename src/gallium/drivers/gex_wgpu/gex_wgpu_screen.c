@@ -2208,6 +2208,12 @@ struct gex_wgpu_varying_variant {
 
 struct gex_wgpu_capture_variant {
    struct gex_wgpu_capture_layout layout;
+   /* The vertex shader's own textures, renumbered into the compute range --
+    * the same treatment gex_wgpu_varying_variant carries, for the same
+    * reason. Transform feedback from a shader that samples reaches this one:
+    * KHR-GL45.texture_view's reference_counting and coherency both sample a
+    * view in the vertex stage and read the answer back through feedback. */
+   struct gex_wgpu_stage_textures textures;
    WGPUShaderModule module;
    unsigned so_mask;
    uint32_t so_bindings[GEX_WGPU_MAX_SO_BUFFERS];
@@ -21214,19 +21220,12 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
                              struct gex_wgpu_shader *vs,
                              const struct gex_wgpu_capture_layout *layout)
 {
-   /* The same reason the varying variant declines one: a vertex stage's
-    * texture and sampler live in descriptor set 3, and a compute dispatch has
-    * only group zero, so the pipeline is invalid and takes the command buffer
-    * with it. Transform feedback reaches this one. */
-   if (vs->texture_count || vs->sampler_count) {
-      static bool said;
-      if (!said) {
-         said = true;
-         fprintf(stderr, "gex-wgpu: no capture variant for a vertex shader "
-                         "that samples a texture (transform feedback)\n");
-      }
-      return NULL;
-   }
+   /* A vertex stage's texture and sampler live in descriptor set 3 and a
+    * compute dispatch has only group zero, so this used to decline. Lifted
+    * the way the varying variant's was: the split has already made a texture
+    * and a sampler variable per unit, so they are renumbered into the compute
+    * range below and the dispatch binds them from the vertex stage's own
+    * sampler state. */
    for (struct gex_wgpu_capture_variant *v = vs->captures; v; v = v->next)
       if (!memcmp(&v->layout, layout, sizeof(*layout)))
          return v;
@@ -21312,6 +21311,17 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
    nir->info.workgroup_size_variable = false;
    nir->info.num_ssbos = GEX_WGPU_CAPTURE_INDEX_BINDING + 1;
    nir->xfb_info = NULL;
+   /* Group zero, with the compute-stage numbering; see the same loop in
+    * gex_wgpu_varying_variant_get for why it is not optional. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      const bool texture = glsl_type_is_texture(type);
+      if (!texture && !glsl_type_is_sampler(type))
+         continue;
+      var->data.descriptor_set = 0;
+      var->data.binding = GEX_WGPU_COMPUTE_TEXTURE_FIRST_BINDING +
+                          2 * var->data.driver_location + (texture ? 0u : 1u);
+   }
    nir_remove_dead_variables(
       nir, nir_var_shader_in | nir_var_shader_out | nir_var_system_value, NULL);
    nir_fixup_deref_types(nir);
@@ -21322,6 +21332,16 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
    if (!variant) {
       ralloc_free(nir);
       return NULL;
+   }
+   {
+      const char *why = NULL;
+      if (!gex_wgpu_collect_stage_textures(nir, &variant->textures, &why)) {
+         fprintf(stderr, "gex-wgpu: no capture variant for a vertex shader "
+                 "that samples (%s)\n", why ? why : "unknown");
+         ralloc_free(nir);
+         FREE(variant);
+         return NULL;
+      }
    }
    variant->layout = *layout;
    variant->so_mask = state.so_mask;
@@ -24163,10 +24183,14 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       ctx->vs->capture_nir ? ctx->vs->capture_nir->xfb_info : NULL;
    unsigned writable_prims = prims;
 
+   /* Room for the shader's own textures and samplers as well: a vertex shader
+    * that samples can be captured now, and each unit costs two entries. */
    WGPUBindGroupLayoutEntry entries[GEX_WGPU_MAX_SO_BUFFERS +
-                                   GEX_WGPU_MAX_VERTEX_BUFFERS + 2];
+                                   GEX_WGPU_MAX_VERTEX_BUFFERS + 2 +
+                                   2 * GEX_WGPU_MAX_SAMPLERS];
    WGPUBindGroupEntry bindings[GEX_WGPU_MAX_SO_BUFFERS +
-                               GEX_WGPU_MAX_VERTEX_BUFFERS + 2];
+                               GEX_WGPU_MAX_VERTEX_BUFFERS + 2 +
+                               2 * GEX_WGPU_MAX_SAMPLERS];
    unsigned count = 0;
 
    for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
@@ -24290,6 +24314,83 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    bindings[count].size = table_desc.size;
    ++count;
 
+   /* The shader's own textures, from the vertex stage's sampler state. This
+    * dispatch builds its layout by hand rather than through
+    * gex_wgpu_bindings, so the pair of entries per unit is appended here. */
+   for (unsigned i = 0; i < variant->textures.count; ++i) {
+      const unsigned slot = variant->textures.slots[i];
+      struct gex_wgpu_sampler_view *view =
+         (struct gex_wgpu_sampler_view *)ctx->vertex_sampler_views[slot];
+      const struct gex_wgpu_sampler *sampler = ctx->vertex_samplers[slot];
+      if (!view) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: capture declined (vertex texture unit "
+                    "%u has no view bound)\n", slot);
+         }
+         wgpuBufferRelease(params_buffer);
+         return false;
+      }
+      gex_wgpu_sampler_view_refresh(&ctx->base, view);
+      /* The same depth rule the other binders apply: a depth view read by a
+       * shader that declared a plain sampler is unfilterable float with a
+       * non-filtering sampler, because that is all WebGPU has for it. */
+      WGPUTextureSampleType sample_type = variant->textures.sample_types[i];
+      if (gex_wgpu_format_sample_type(view->base.format) ==
+             WGPUTextureSampleType_Depth &&
+          sample_type == WGPUTextureSampleType_Float &&
+          (!sampler ||
+           sampler->state.compare_mode != PIPE_TEX_COMPARE_R_TO_TEXTURE))
+         sample_type = WGPUTextureSampleType_UnfilterableFloat;
+      WGPUTextureView texture_view =
+         gex_wgpu_stage_texture_view(&view->base,
+                                     variant->textures.dimensions[i]);
+      const WGPUSamplerBindingType sampler_type =
+         sample_type == WGPUTextureSampleType_Depth
+            ? WGPUSamplerBindingType_Comparison
+         : sample_type == WGPUTextureSampleType_Float
+            ? WGPUSamplerBindingType_Filtering
+            : WGPUSamplerBindingType_NonFiltering;
+      WGPUSampler wgpu_sampler = NULL;
+      if (sampler)
+         wgpu_sampler =
+            (sampler_type == WGPUSamplerBindingType_NonFiltering &&
+             sampler->nonfiltering) ? sampler->nonfiltering
+                                    : sampler->sampler;
+      if (!texture_view || !wgpu_sampler) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: capture declined (vertex texture unit "
+                    "%u has no %s)\n", slot,
+                    texture_view ? "sampler state" : "view");
+         }
+         wgpuBufferRelease(params_buffer);
+         return false;
+      }
+      entries[count] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entries[count].binding = variant->textures.bindings[i];
+      entries[count].visibility = WGPUShaderStage_Compute;
+      entries[count].texture.sampleType = sample_type;
+      entries[count].texture.viewDimension = variant->textures.dimensions[i];
+      entries[count].texture.multisampled = variant->textures.multisampled[i];
+      bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      bindings[count].binding = variant->textures.bindings[i];
+      bindings[count].textureView = texture_view;
+      ++count;
+      entries[count] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entries[count].binding = variant->textures.sampler_bindings[i];
+      entries[count].visibility = WGPUShaderStage_Compute;
+      entries[count].sampler.type = sampler_type;
+      bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      bindings[count].binding = variant->textures.sampler_bindings[i];
+      bindings[count].sampler = wgpu_sampler;
+      ++count;
+   }
+
    /* The variant is a clone of the vertex shader, so it kept that shader's
     * constant buffers, which live in their own descriptor set -- group 1 for
     * a vertex stage. Without them a capturing shader that reads any uniform
@@ -24319,6 +24420,18 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
          gex_wgpu_constant_binding_size(constant, ctx->vs->ubo_required[i]);
    }
 
+   /* Two writable storage bindings over one range is refused by WebGPU with a
+    * validation error, which takes the command buffer -- so this path checks
+    * for it too. It builds its layout by hand rather than through
+    * gex_wgpu_bindings, so it was the one dispatch the check did not cover,
+    * and that only mattered once a capturing shader that samples could run at
+    * all: before, such a shader was refused and the aliasing never happened.
+    * Two feedback targets on one buffer is the shape that reaches it. */
+   gex_wgpu_trace_buffer_aliasing_reset();
+   if (gex_wgpu_trace_buffer_aliasing("capture", entries, bindings, count)) {
+      wgpuBufferRelease(params_buffer);
+      return false;
+   }
    WGPUBindGroupLayoutDescriptor layout_desc =
       WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    layout_desc.entryCount = count;
