@@ -17565,6 +17565,44 @@ gex_wgpu_get_device_reset_status(struct pipe_context *pipe)
    return PIPE_NO_RESET;
 }
 
+/* Whether WebGPU can make the view an image binding asks for.
+ *
+ * A 3D texture has one array layer and no view of a single slice, so GL's
+ * non-layered binding of one z-slice as an `image2D` has no expression here.
+ * Both image paths already declined that -- but they declined it by testing
+ * whether wgpuTextureCreateView returned null, and Dawn does not return null
+ * for it. It raises a validation error:
+ *
+ *   Texture view array layer range (baseArrayLayer: 1, arrayLayerCount: 1)
+ *   exceeds the texture's array layer count (1).
+ *
+ * which invalidates the view, then the bind group layout, then the pipeline,
+ * then the command buffer and everything recorded with it. So the combination
+ * has to be recognised *before* the view is asked for -- "unimplemented" and
+ * "the API will tell me" are different states, and only the first is safe.
+ */
+static bool
+gex_wgpu_image_view_fits(WGPUTexture texture,
+                         const WGPUTextureViewDescriptor *desc)
+{
+   const bool volume =
+      wgpuTextureGetDimension(texture) == WGPUTextureDimension_3D;
+   /* The slice case says itself twice. Dawn rejects the layer range *and*
+    * the dimension:
+    *
+    *   The dimension (TextureViewDimension::e2D) of the texture view is not
+    *   compatible with the dimension (TextureDimension::e3D) of [Texture]
+    *
+    * so both have to be tested; fixing only the range left the second. */
+   if (volume)
+      return desc->dimension == WGPUTextureViewDimension_3D ||
+             desc->dimension == WGPUTextureViewDimension_Undefined;
+   if (desc->dimension == WGPUTextureViewDimension_3D)
+      return false;
+   return (uint64_t)desc->baseArrayLayer + desc->arrayLayerCount <=
+          wgpuTextureGetDepthOrArrayLayers(texture);
+}
+
 static bool
 gex_wgpu_collect_stage_textures(nir_shader *nir,
                                 struct gex_wgpu_stage_textures *out,
@@ -18915,7 +18953,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
             view_desc.baseArrayLayer = 0;
       }
       WGPUTextureView image_view =
-         wgpuTextureCreateView(image_texture, &view_desc);
+         gex_wgpu_image_view_fits(image_texture, &view_desc)
+            ? wgpuTextureCreateView(image_texture, &view_desc) : NULL;
       if (!image_view) {
          /* Also declined. The view WebGPU would not make is a combination it
           * does not express -- a slice of a 3D texture bound as a
@@ -19214,6 +19253,31 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
                  compute->bindings[i].binding, compute->bindings[i].slot,
                  compute->bindings[i].kind, (int)compute->bindings[i].readonly,
                  compute->bindings[i].required);
+   }
+   /* Counted before the layout is asked for, not after. WebGPU rejects a
+    * layout with more storage buffers than the stage takes, and the rejection
+    * is a validation error that invalidates the pipeline and the command
+    * buffer with it -- so an over-limit dispatch would take the work recorded
+    * beside it down too. The cap deliberately over-reports max_shader_buffers
+    * (see gex_wgpu_init_shader_caps), so a shader combining storage blocks,
+    * buffer textures and packed images can reach the real limit. */
+   {
+      unsigned storage_buffers = 0;
+      for (unsigned i = 0; i < count; ++i)
+         if (entries[i].buffer.type == WGPUBufferBindingType_Storage ||
+             entries[i].buffer.type == WGPUBufferBindingType_ReadOnlyStorage)
+            ++storage_buffers;
+      if (screen->max_storage_buffers &&
+          storage_buffers > screen->max_storage_buffers) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: dispatch declined (%u storage buffers, "
+                    "the device takes %u per stage)\n", storage_buffers,
+                    screen->max_storage_buffers);
+         }
+         return;
+      }
    }
    WGPUBindGroupLayoutDescriptor layout_desc =
       WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
@@ -23386,6 +23450,16 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
        * draw path declines by name. The refusal here is accurate about what
        * it sees, but the cause is downstream of it. */
       refusal = "gex_wgpu tessellation evaluation shader writes nothing";
+      if (getenv("GEX_WGPU_TESS_LOG")) {
+         fprintf(stderr, "gex-tes: no outputs; variables follow\n");
+         nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
+            fprintf(stderr, "gex-tes:   out '%s' loc=%u type=%s\n",
+                    var->name ? var->name : "(anon)",
+                    (unsigned)var->data.location,
+                    glsl_get_type_name(var->type));
+         fprintf(stderr, "gex-tes: outputs_written=0x%llx\n",
+                 (unsigned long long)nir->info.outputs_written);
+      }
    }
    if (refusal) {
       gex_wgpu_set_compile_error(mutable_state, refusal);
@@ -24548,6 +24622,25 @@ gex_wgpu_group(WGPUDevice device, WGPUBindGroupLayout layout,
 
 /* Run one compute pass over two bind groups, optionally zeroing a buffer
  * first so the same command encoder carries both. */
+/* How many storage buffer bindings a group asks for. A dispatch has two
+ * groups but one *stage*, so WebGPU adds them and compares the total against
+ * maxStorageBuffersPerShaderStage -- and rejects the layout when it is over,
+ * which invalidates the pipeline and the command buffer with it rather than
+ * failing the dispatch. The driver over-reports max_shader_buffers on purpose
+ * (see the cap), so a shader using the maximum of several kinds at once can
+ * reach this; it has to be declined rather than submitted. */
+static unsigned
+gex_wgpu_group_storage_buffers(const struct gex_wgpu_bindings *group)
+{
+   unsigned n = 0;
+   for (unsigned i = 0; i < group->count; ++i)
+      if ((group->storage_mask & (UINT64_C(1) << i)) &&
+          !(group->texture_mask & (UINT64_C(1) << i)) &&
+          !(group->sampler_mask & (UINT64_C(1) << i)))
+         ++n;
+   return n;
+}
+
 static bool
 gex_wgpu_dispatch(struct gex_wgpu_context *ctx, WGPUShaderModule module,
                   const struct gex_wgpu_bindings *g0,
@@ -24555,6 +24648,20 @@ gex_wgpu_dispatch(struct gex_wgpu_context *ctx, WGPUShaderModule module,
                   struct pipe_resource *zero, unsigned workgroups)
 {
    GEX_DEVICE_GUARD(gex_screen(ctx->base.screen));
+   {
+      const unsigned wanted = gex_wgpu_group_storage_buffers(g0) +
+                              gex_wgpu_group_storage_buffers(g1);
+      const unsigned have = gex_screen(ctx->base.screen)->max_storage_buffers;
+      if (have && wanted > have) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: dispatch declined (%u storage buffers, "
+                    "the device takes %u per stage)\n", wanted, have);
+         }
+         return false;
+      }
+   }
    /* Submits its own command buffer, so anything already recorded has to
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending(ctx);
@@ -27803,6 +27910,28 @@ gex_wgpu_cache_hash(const void *data, size_t bytes)
       h *= 16777619u;
    }
    return h ? h : 1u;
+}
+
+/* How many of a layout's entries are storage buffers.
+ *
+ * WebGPU refuses a layout with more of them than the stage takes, and the
+ * refusal is a validation error -- it invalidates the pipeline and then the
+ * command buffer, so the draws recorded beside it are lost too. The cap
+ * over-reports max_shader_buffers deliberately (see
+ * gex_wgpu_init_shader_caps), so a shader combining storage blocks, buffer
+ * textures and packed images can reach the real limit; the draw declines by
+ * name instead. Declines, and does not latch: this is a device limit, not a
+ * driver failure, and latching would cost every case after it. */
+static unsigned
+gex_wgpu_layout_storage_buffers(const WGPUBindGroupLayoutEntry *entries,
+                                unsigned count)
+{
+   unsigned n = 0;
+   for (unsigned i = 0; i < count; ++i)
+      if (entries[i].buffer.type == WGPUBufferBindingType_Storage ||
+          entries[i].buffer.type == WGPUBufferBindingType_ReadOnlyStorage)
+         ++n;
+   return n;
 }
 
 static WGPUBindGroupLayout
@@ -33970,6 +34099,21 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          desc.entryCount = ctx->vs->texture_count + ctx->vs->sampler_count;
          desc.entries = vertex_texture_entries;
       }
+      {
+         const unsigned storage_buffers =
+            gex_wgpu_layout_storage_buffers(desc.entries, desc.entryCount);
+         if (screen->max_storage_buffers &&
+             storage_buffers > screen->max_storage_buffers) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: draw declined (group %u wants %u "
+                       "storage buffers, the device takes %u per stage)\n",
+                       group, storage_buffers, screen->max_storage_buffers);
+            }
+            return;
+         }
+      }
       /* Owned by the screen's cache, so nothing here releases it. */
       group_layouts[group] =
          gex_wgpu_cached_bind_group_layout(screen, desc.entries,
@@ -34502,7 +34646,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             if (desc.dimension != WGPUTextureViewDimension_3D)
                desc.baseArrayLayer = 0;
          }
-         WGPUTextureView view = wgpuTextureCreateView(image_texture, &desc);
+         WGPUTextureView view =
+            gex_wgpu_image_view_fits(image_texture, &desc)
+               ? wgpuTextureCreateView(image_texture, &desc) : NULL;
          if (!view) {
             /* A view WebGPU will not make is a combination it cannot express
              * -- one slice of a 3D texture bound as a non-layered image2D is
@@ -36374,8 +36520,19 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
        * stage has image uniforms and image_store_formatted is set, and gates
        * compute behind that and behind atomic counters.
        *
-       * Not the vertex stage: WGSL forbids a writable storage *texture* there
-       * for the same reason it forbids a writable storage buffer. */
+       * Not the vertex stage, and this is measured rather than assumed: with
+       * the cap raised, the shader reaches Tint and Tint refuses it by name --
+       *
+       *   storage texture with 'write' access mode cannot be used by vertex
+       *   pipeline stage
+       *
+       * -- so the honest failure is the linker's "Too many vertex shader
+       * image uniforms", which happens before any shader is built. A vertex
+       * image that is only *read* would be expressible, since Tint lowers a
+       * read-only storage image to a sampled texture; nothing needs it yet,
+       * because every CTS case that binds a vertex image stores through it
+       * too. gl44-stage-image-probe records both this and the geometry stage,
+       * which is unimplemented rather than blocked. */
       /* Fragment and compute. It was fragment-only because launch_grid bound
        * storage buffers and nothing else, so a compute image would have been
        * declared with no entry behind it; launch_grid now builds a view and a
