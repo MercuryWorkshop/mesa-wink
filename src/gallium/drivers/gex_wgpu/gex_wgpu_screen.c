@@ -7885,6 +7885,11 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, gex_wgpu_scale_shared_offset,
             nir_metadata_control_flow, NULL);
    struct spirv_shader *spirv = nir_to_spirv(nir, &info);
+   /* Kept before the free: the dump below wants it, and reading it back off
+    * the freed shader is what printed "stage=4294967264". Harmless in effect
+    * -- it is a diagnostic line -- but it is a read of freed memory on a path
+    * anyone debugging a shader turns on. */
+   const unsigned dumped_stage = (unsigned)nir->info.stage;
    ralloc_free(nir);
    if (!spirv) {
       *error_out = strdup("Mesa NIR to SPIR-V failed");
@@ -7935,7 +7940,7 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
       if (dumped < (getenv("GEX_WGPU_DUMP_VS") ? 16u : 1u)) {
          ++dumped;
          const size_t len = strlen(wgsl);
-         fprintf(stderr, "gex-wgpu: scene vs WGSL (%zu bytes) stage=%u follows\n", len, (unsigned)nir->info.stage);
+         fprintf(stderr, "gex-wgpu: scene vs WGSL (%zu bytes) stage=%u follows\n", len, dumped_stage);
          for (size_t at = 0; at < len; at += 160) {
             char chunk[161];
             const size_t n = MIN2((size_t)160, len - at);
@@ -24954,7 +24959,17 @@ gex_wgpu_ensure_buffer(struct gex_wgpu_context *ctx,
                        struct pipe_resource **slot, unsigned size,
                        unsigned bind)
 {
-   if (*slot && gex_resource(*slot)->allocation_size >= size)
+   /* Against width0, the *logical* size, not the padded allocation.
+    *
+    * Every buffer allocation is rounded up to 16 (a GL buffer object is
+    * retargetable and WebGPU pads a uniform binding to 16), so an 8-byte
+    * buffer reports allocation_size 16 and satisfied a request for 16 while
+    * its width0 stayed 8. The rest of the driver reads width0: the index
+    * range check in draw_vbo_inner compares against it, found a 4-index draw
+    * running past a 2-index buffer, and *latched* -- which cost fourteen of
+    * KHR-GL45.transform_feedback's cases, none of them related to indices.
+    * The padding is real memory but it is not size anyone asked for. */
+   if (*slot && (*slot)->width0 >= size)
       return true;
    pipe_resource_reference(slot, NULL);
    struct pipe_resource templ;
@@ -32735,7 +32750,28 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                 info->index_size +
              (uint64_t)draws[0].count * info->index_size >
                 index_resource->width0) {
-         gex_fail(ctx);
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: index range past the buffer: offset=%u "
+                    "start=%u count=%u size=%u width0=%u uploaded=%d mode=%u "
+                    "whose=%s gs_rast=%d tess_rast=%d\n",
+                    index_upload_offset, draws[0].start, draws[0].count,
+                    info->index_size,
+                    index_resource ? index_resource->width0 : 0u,
+                    (int)(uploaded_index_resource != NULL),
+                    (unsigned)info->mode,
+                    index_resource == ctx->gs_indices ? "gs_indices"
+                    : index_resource == ctx->tess_indices ? "tess_indices"
+                                                          : "application",
+                    (int)ctx->gs_rasterizing, (int)ctx->tess_rasterizing);
+         }
+         /* Declined, not latched. This is a real defect wherever it happens
+          * -- a draw reading past its own index buffer -- and the message
+          * above says so loudly enough. Latching made one such draw cost
+          * fourteen unrelated cases in KHR-GL45.transform_feedback, which is
+          * how the buffer-growth bug behind it stayed hidden: the family
+          * looked broken in general rather than after one point. */
          return;
       }
    }
