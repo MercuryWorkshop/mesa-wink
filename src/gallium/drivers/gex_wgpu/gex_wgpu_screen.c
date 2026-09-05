@@ -7879,6 +7879,43 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    };
    gex_wgpu_tex_log(nir, "entry");
    NIR_PASS(_, nir, nir_lower_tex, &texture_options);
+
+   /* ARB_shader_group_vote, with the invocation group defined as one
+    * invocation.
+    *
+    * The three ballots reach NIR as vote_any, vote_all and vote_ieq, and the
+    * chain that would carry them to the device is complete but for one link:
+    * zink's emitter has SpvOpGroupNonUniformAny/All/AllEqual, the device
+    * grants WGPUFeatureName_Subgroups, and WGSL has subgroupAny and
+    * subgroupAll -- but Tint's SPIR-V *reader* has never heard of the opcodes
+    * (they appear in its writer and nowhere else), so a shader using them is
+    * refused outright and the program fails to link.
+    *
+    * GL's group is implementation-defined and may be a single invocation, so
+    * the ballots are answerable without any subgroup operation at all:
+    * anyInvocationARB and allInvocationsARB are then the value itself, and
+    * allInvocationsEqualARB is true. That is what nir_lower_subgroups does
+    * with lower_vote_trivial, and it is what zink itself does for a stage the
+    * device does not support subgroups in -- while still claiming the
+    * extension. Nothing OpGroupNonUniform is emitted, so Tint's reader is
+    * never asked.
+    *
+    * This is a real behavioural difference from a driver that votes in wider
+    * groups, not merely an implementation detail: llvmpipe answers
+    * allInvocationsARB of a condition only one invocation sees with false,
+    * and this answers true. gl44-group-vote-probe's `all_mixed` case exists
+    * to say so out loud. It is claimed only because
+    * KHR-GL45.shader_group_vote's five cases accept it; see the note beside
+    * caps->shader_group_vote. */
+   {
+      const nir_lower_subgroups_options vote_options = {
+         .subgroup_size = 1,
+         .ballot_bit_size = 32,
+         .ballot_components = 1,
+         .lower_vote_trivial = true,
+      };
+      NIR_PASS(_, nir, nir_lower_subgroups, &vote_options);
+   }
    gex_wgpu_tex_log(nir, "post-lower-tex");
    bool lowered_texture_declaration = false;
    nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
@@ -37299,8 +37336,15 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * sixtieth of a 24-bit depth unit and so should round the pull away and
     * make it lose. llvmpipe loses it; this driver still wins it, with the same
     * clamp reaching the descriptor. The depth bias itself works, so it is the
-    * clamp alone that is ignored -- Vulkan gates a non-zero depthBiasClamp on
-    * a device feature, which is the likeliest place for it to be dropped.
+    * clamp alone that is ignored. Re-measured on 2026-09-05 against a newer
+    * Dawn, on the guess that it had since been implemented, and it has not:
+    * `offset_clamp_rounds_away` still draws the pull it should have rounded
+    * away. The guess about *where* it is dropped was wrong, though, and worth
+    * correcting -- Dawn's Vulkan backend enables the device feature
+    * (DeviceVk.cpp: `usedKnobs.features.depthBiasClamp = VK_TRUE`) and hands
+    * the value to the pipeline (RenderPipelineVk.cpp:
+    * `rasterization.depthBiasClamp = GetDepthBiasClamp()`), and this adapter
+    * is Vulkan on RADV, so it is dropped somewhere past both.
     *
     * Claiming an extension whose effect is silently absent is worse than not
     * having it: an application asking for a clamp would get an unclamped
@@ -37308,23 +37352,33 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * honours it, and the browser side is untested besides -- the guest
     * exports no glPolygonOffsetClampEXT, and adding one shifts the opcode
     * numbering the guest and host share. */
-   /* ARB_shader_group_vote is *not* claimed, and the reason is one link in a
-    * chain that is otherwise complete. anyInvocationARB and its two
-    * companions are subgroup ballots: Mesa's GLSL gives them as
-    * nir_intrinsic_vote_any, vote_all and vote_ieq; zink's emitter has
-    * SpvOpGroupNonUniformAny, All and AllEqual for exactly those; the device
-    * grants WGPUFeatureName_Subgroups, which is requested with the other
-    * optional features; and WGSL has subgroupAny and subgroupAll.
+   /* ARB_shader_group_vote, one of the six, is claimed -- but not by the
+    * route that looked obvious, and the difference is worth stating.
     *
-    * Tint's SPIR-V *reader* does not:
+    * anyInvocationARB and its two companions are subgroup ballots: Mesa's
+    * GLSL gives them as nir_intrinsic_vote_any, vote_all and vote_ieq; zink's
+    * emitter has SpvOpGroupNonUniformAny, All and AllEqual for exactly those;
+    * the device grants WGPUFeatureName_Subgroups; and WGSL has subgroupAny
+    * and subgroupAll. Every link but one.
+    *
+    * Tint's SPIR-V *reader* does not know the opcodes -- they appear in its
+    * writer and nowhere else in the tree --
     *
     *   Tint rejected SPIR-V: error: unhandled instruction with opcode 335:
     *   %27 = OpGroupNonUniformAny %24 %26 %25
     *
-    * -- so the shader is refused and the program fails, which is worse than
-    * not having the extension. Measured with gl44-group-vote-probe, which
-    * skips cleanly while the cap is off and is ready for the day the reader
-    * learns them. */
+    * -- so carrying a real ballot through is not available. What is available
+    * is the other reading of the spec: GL leaves the invocation group
+    * implementation-defined and a group of one is legal, which makes the
+    * ballots answerable with no subgroup operation at all. The lowering is in
+    * gex_wgpu_compile_nir; see the long note there.
+    *
+    * That is a behavioural difference, not a detail. llvmpipe answers
+    * allInvocationsARB of a condition only one invocation sees with false and
+    * this answers true, and gl44-group-vote-probe's `all_mixed` case exists
+    * to say so -- which is why that probe is an expected DIFF rather than a
+    * regression. It is claimed because KHR-GL45.shader_group_vote's five
+    * cases accept it, measured rather than assumed. */
    /* ARB_gl_spirv and ARB_spirv_extensions, two more of the six: an
     * application may hand GL a SPIR-V module instead of GLSL source.
     *
@@ -37334,6 +37388,12 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * which is why this is a claim rather than a feature; what makes it worth
     * claiming rather than assuming is gl44-spirv-probe, which hands over a
     * real module and checks the pixel. */
+   /* Claimed on the strength of the lowering in gex_wgpu_compile_nir, which
+    * answers the ballots for a group of one invocation -- legal, because GL
+    * leaves the group implementation-defined, and precisely what zink does
+    * for a stage its device lacks subgroup support in. Measured against
+    * KHR-GL45.shader_group_vote's five cases rather than assumed. */
+   caps->shader_group_vote = true;
    caps->gl_spirv = true;
    /* ARB_indirect_parameters, another of the six: glMultiDrawArraysIndirect-
     * Count takes the *number of draws* from a buffer as well as the draws
