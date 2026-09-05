@@ -22218,6 +22218,27 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
    if (!nir)
       return NULL;
 
+   /* Every storage block this shader brought with it becomes writable, so the
+    * dispatch can bind them all alike. It declares them
+    * BufferBindingType::Storage, and a block the shader only *reads* would
+    * otherwise reach the emitter as ReadOnlyStorage and fail validation --
+    *
+    *   The buffer type in the shader (BufferBindingType::ReadOnlyStorage) is
+    *   not compatible with the type in the layout (BufferBindingType::Storage)
+    *
+    * -- invalidating the pipeline and the command buffer with it, which is
+    * five cases of shader_storage_buffer_object. Declaring a block read_write
+    * that is only read is legal in compute and costs nothing.
+    *
+    * *Here*, and not just before the compile, which is where this was first
+    * written. By then the pass has added blocks of its own -- the params, the
+    * index table, the feedback targets -- and gex_capture_index is created
+    * read-only on purpose. Sweeping those up too cost three cases of
+    * transform_feedback and transform_feedback3, which is what the CTS gate
+    * is for. Only the clone's own blocks exist at this point. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo)
+      var->data.access &= ~(unsigned)ACCESS_NON_WRITEABLE;
+
    struct gex_wgpu_capture state = {0};
    state.layout = layout;
    state.params = gex_wgpu_word_block(nir, "gex_capture_params",
