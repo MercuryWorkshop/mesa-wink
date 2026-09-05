@@ -2098,6 +2098,42 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
     * with "Result type (OpTypeBool) does not match the type that results from
     * indexing into the composite (OpTypeFloat)". A wide source is a 0/~0
     * integer, so the conversion is a comparison against zero. */
+   /* A 1-bit NIR boolean widened to a 32-bit one, which is the opposite of
+    * b2b1 below and *not* the identity.
+    *
+    * A wide NIR boolean is a 0/~0 integer here -- the note on b2b1 says so --
+    * so the result has to be those bits and has to be recorded as an integer.
+    * Sharing b2b1's case, which produces a SPIR-V bool, was tried first and
+    * is wrong in a way that only shows up downstream: the consumer bitcasts
+    * the value, and Tint rejects
+    *
+    *   Expected input to be a pointer or int or float vector or scalar:
+    *   Bitcast  %159 = OpBitcast %float %155
+    *
+    * because %155 is an OpTypeBool. The same trap the b2b1 note describes,
+    * from the other side.
+    *
+    * Before any of this the default arm fired -- "emit_alu: not implemented
+    * (b2b32)" and then an assertion, which aborts the *process* rather than
+    * failing one shader. Alacritty dies that way on startup, which is how
+    * this was found; tests/gates/app-candidates.sh reported it as exit 134. */
+   case nir_op_b2b32: {
+      assert(nir_op_infos[alu->op].num_inputs == 1);
+      const unsigned src_bits = nir_src_bit_size(alu->src[0].src);
+      if (src_bits != 1 && stype[0] != nir_type_bool) {
+         /* Already the wide 0/~0 value this op is asked to produce. */
+         result = src[0];
+         atype = stype[0];
+         break;
+      }
+      atype = nir_type_int;
+      result = emit_select(ctx, get_ivec_type(ctx, bit_size, num_components),
+                           src[0],
+                           get_ivec_constant(ctx, bit_size, num_components, -1),
+                           get_ivec_constant(ctx, bit_size, num_components, 0));
+      break;
+   }
+
    case nir_op_b2b1: {
       assert(nir_op_infos[alu->op].num_inputs == 1);
       const unsigned src_bits = nir_src_bit_size(alu->src[0].src);
