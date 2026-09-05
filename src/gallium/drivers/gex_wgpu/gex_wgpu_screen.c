@@ -29616,11 +29616,22 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
     * because a storage binding does. */
    const unsigned vs_stride =
       MAX2(gex_wgpu_varying_stride(&gs->inputs), 16u);
-   const unsigned gs_stride = gex_wgpu_varying_stride(&gs->outputs);
+   /* A geometry shader with no outputs at all is legal and is not nothing to
+    * do: GL lets one never call EmitVertex, and such a shader exists purely
+    * for its side effects -- KHR-GL46.shader_image_load_store's geometry
+    * cases are twenty imageStores and no emit. Declining here ran none of
+    * them and the test read back an untouched image.
+    *
+    * So the passes below still run, and only the *rasterizing* one is
+    * skipped, because there is genuinely no primitive: see the early return
+    * before pass five. The buffer still needs a size, as with a zero input
+    * stride above, because a storage binding does. */
+   const unsigned gs_stride =
+      MAX2(gex_wgpu_varying_stride(&gs->outputs), 16u);
    const unsigned index_count =
       runs * gs->max_output_prims * gs->indices_per_prim;
-   if (!prims || !index_count || !gs_stride)
-      GEX_GS_DECLINE("nothing to draw, or a geometry shader with no outputs");
+   if (!prims || !index_count)
+      GEX_GS_DECLINE("nothing to draw");
 
    struct gex_wgpu_capture_layout layout;
    memset(&layout, 0, sizeof(layout));
@@ -29869,6 +29880,13 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
       gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_GENERATED,
                          gex_wgpu_gs_generated(ctx, prims));
    }
+
+   /* A shader that declares no output emits no vertex, so there is nothing
+    * to rasterize and no passthrough to build one from -- its element state
+    * would have no attributes and its vertex shader no position. The stores
+    * it exists for have already happened, in pass two. */
+   if (!gs->outputs.count)
+      return true;
 
    /* Pass five: rasterize what the geometry shader wrote. The passthrough
     * vertex shader and its element state stand in for the application's for
