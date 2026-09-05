@@ -2257,6 +2257,10 @@ struct gex_wgpu_tcs {
    /* The sampled textures this tessellation control shader declares; see
     * gex_wgpu_collect_stage_textures. */
    struct gex_wgpu_stage_textures textures;
+   /* And its images; see gex_wgpu_collect_stage_images. This stage
+    * runs as a compute pass too, so a writable storage texture is
+    * legal in it for the same reason it is in the geometry one. */
+   struct gex_wgpu_stage_images images;
    struct gex_wgpu_varying_layout inputs;
    struct gex_wgpu_varying_layout outputs;
    struct gex_wgpu_varying_layout patch_outputs;
@@ -2295,6 +2299,10 @@ struct gex_wgpu_tes {
    /* The sampled textures this tessellation evaluation shader declares; see
     * gex_wgpu_collect_stage_textures. */
    struct gex_wgpu_stage_textures textures;
+   /* And its images; see gex_wgpu_collect_stage_images. This stage
+    * runs as a compute pass too, so a writable storage texture is
+    * legal in it for the same reason it is in the geometry one. */
+   struct gex_wgpu_stage_images images;
    struct gex_wgpu_varying_layout inputs;
    struct gex_wgpu_varying_layout patch_inputs;
    struct gex_wgpu_varying_layout outputs;
@@ -24697,6 +24705,21 @@ gex_wgpu_create_tcs_state(struct pipe_context *pipe,
       FREE(tcs);
       return NULL;
    }
+   /* After lower_gallium_ubos, which is what assigns image bindings, and in
+    * group zero, which is where the dispatch binds them -- see the geometry
+    * stage's copy of this for what each mistake looks like. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_image)
+      var->data.descriptor_set = 0;
+   if (!gex_wgpu_collect_stage_images(nir, &tcs->images,
+                                      "tessellation control") ||
+       tcs->images.packed_count) {
+      gex_wgpu_set_compile_error(
+         mutable_state,
+         "gex_wgpu cannot serve an image in the tessellation control stage");
+      ralloc_free(nir);
+      FREE(tcs);
+      return NULL;
+   }
    gex_wgpu_tess_collect_ubos(nir, &tcs->ubo_count, tcs->ubo_slots,
                               tcs->ubo_bindings, tcs->ubo_required,
                               &tcs->ubo_storage_mask);
@@ -24836,6 +24859,22 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
       tes->xfb = malloc(bytes);
       if (tes->xfb)
          memcpy(tes->xfb, nir->xfb_info, bytes);
+   }
+   /* After lower_gallium_ubos, which is what assigns image bindings, and in
+    * group zero, which is where the dispatch binds them -- see the geometry
+    * stage's copy of this for what each mistake looks like. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_image)
+      var->data.descriptor_set = 0;
+   if (!gex_wgpu_collect_stage_images(nir, &tes->images,
+                                      "tessellation evaluation") ||
+       tes->images.packed_count) {
+      gex_wgpu_set_compile_error(
+         mutable_state,
+         "gex_wgpu cannot serve an image in the tessellation evaluation "
+         "stage");
+      ralloc_free(nir);
+      FREE(tes);
+      return NULL;
    }
    gex_wgpu_tess_collect_ubos(nir, &tes->ubo_count, tes->ubo_slots,
                               tes->ubo_bindings, tes->ubo_required,
@@ -28844,16 +28883,23 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                          ctx->tess_patch_out);
    gex_wgpu_bind_storage(&tcs_group0, GEX_WGPU_TCS_LEVEL_BINDING,
                          ctx->tess_levels);
+   WGPUTextureView tcs_image_views[GEX_WGPU_MAX_SHADER_IMAGES];
+   unsigned tcs_image_view_count = 0;
    ok = tcs_param_buffer &&
         gex_wgpu_bind_stage_textures(&ctx->base,
                                      gex_wgpu_compute_stage_index(MESA_SHADER_TESS_CTRL),
                                      &tcs->textures, &tcs_group0) &&
+        gex_wgpu_bind_stage_images(ctx, MESA_SHADER_TESS_CTRL, &tcs->images,
+                                   "tcs dispatch", &tcs_group0,
+                                   tcs_image_views, &tcs_image_view_count) &&
         gex_wgpu_bind_constants(ctx, &tcs_group1, MESA_SHADER_TESS_CTRL,
                                 tcs->ubo_count, tcs->ubo_slots,
                                 tcs->ubo_bindings, tcs->ubo_storage_mask);
    if (ok)
       ok = gex_wgpu_dispatch(ctx, tcs->module, &tcs_group0, &tcs_group1,
                              ctx->tess_levels, patches);
+   for (unsigned i = 0; i < tcs_image_view_count; ++i)
+      wgpuTextureViewRelease(tcs_image_views[i]);
    pipe_resource_reference(&tcs_param_buffer, NULL);
    if (!ok) {
       free(default_levels);
@@ -28998,10 +29044,15 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                          ctx->tess_coords);
    gex_wgpu_bind_storage(&tes_group0, GEX_WGPU_TES_OUT_BINDING,
                          ctx->tess_vertices);
+   WGPUTextureView tes_image_views[GEX_WGPU_MAX_SHADER_IMAGES];
+   unsigned tes_image_view_count = 0;
    ok = tes_param_buffer &&
         gex_wgpu_bind_stage_textures(&ctx->base,
                                      gex_wgpu_compute_stage_index(MESA_SHADER_TESS_EVAL),
                                      &tes->textures, &tes_group0) &&
+        gex_wgpu_bind_stage_images(ctx, MESA_SHADER_TESS_EVAL, &tes->images,
+                                   "tes dispatch", &tes_group0,
+                                   tes_image_views, &tes_image_view_count) &&
         gex_wgpu_bind_constants(ctx, &tes_group1, MESA_SHADER_TESS_EVAL,
                                 tes->ubo_count, tes->ubo_slots,
                                 tes->ubo_bindings, tes->ubo_storage_mask);
@@ -29009,6 +29060,8 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
       ok = gex_wgpu_dispatch(ctx, variant->module, &tes_group0, &tes_group1,
                              NULL,
                              DIV_ROUND_UP(vertex_count, GEX_WGPU_TESS_GROUP));
+   for (unsigned i = 0; i < tes_image_view_count; ++i)
+      wgpuTextureViewRelease(tes_image_views[i]);
    pipe_resource_reference(&tes_param_buffer, NULL);
    if (!ok) {
       gex_fail(ctx);
@@ -38556,7 +38609,9 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
           * refuses one by name -- "storage texture with 'write' access mode
           * cannot be used by vertex pipeline stage" -- and every CTS case
           * that binds a vertex image stores through it. */
-         stages[i] == MESA_SHADER_GEOMETRY ? GEX_WGPU_MAX_SHADER_IMAGES : 0;
+         stages[i] == MESA_SHADER_GEOMETRY ||
+         stages[i] == MESA_SHADER_TESS_CTRL ||
+         stages[i] == MESA_SHADER_TESS_EVAL ? GEX_WGPU_MAX_SHADER_IMAGES : 0;
       caps->max_hw_atomic_counters = 0;
       caps->max_hw_atomic_counter_buffers = 0;
       caps->supported_irs = 1 << PIPE_SHADER_IR_NIR;
