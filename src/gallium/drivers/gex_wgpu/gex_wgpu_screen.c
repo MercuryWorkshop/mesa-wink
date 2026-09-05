@@ -24999,6 +24999,16 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
          ralloc_free(nir);
       return NULL;
    }
+   if (getenv("GEX_WGPU_TESS_LOG")) {
+      unsigned outs = 0;
+      nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
+         ++outs;
+      fprintf(stderr, "gex-tes: create: out vars=%u written=0x%llx point_mode="
+              "%d spacing=%u domain=%u\n", outs,
+              (unsigned long long)nir->info.outputs_written,
+              (int)nir->info.tess.point_mode, nir->info.tess.spacing,
+              nir->info.tess._primitive_mode);
+   }
    /* The same split the control stage needs; see the note there. */
    if (!gex_wgpu_lower_dynamic_sampler_index(nir) ||
        !gex_wgpu_split_combined_samplers(nir)) {
@@ -25060,12 +25070,18 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
             !gex_wgpu_collect_varyings(nir, nir_var_shader_out, &tes->outputs))
       refusal = "gex_wgpu could not lay out tessellation evaluation varyings";
    else if (!tes->outputs.count) {
-      /* Mesa removes an output the next stage does not read, so a shader that
-       * writes only gl_PointSize arrives empty when a geometry shader follows
-       * it -- and a geometry shader after tessellation is a combination the
-       * draw path declines by name. The refusal here is accurate about what
-       * it sees, but the cause is downstream of it. */
-      refusal = "gex_wgpu tessellation evaluation shader writes nothing";
+      /* Mesa removes an output the next stage does not read, so this stage can
+       * arrive with nothing at all -- KHR-GL45.shading_language_420pack's
+       * line_numbering is one, its `tes_gs_result` gone before the driver sees
+       * the shader.
+       *
+       * That used to be refused here, which made the *link* fail. Nothing in
+       * GL requires an evaluation shader to write anything, and llvmpipe links
+       * the same program without complaint, so refusing said more than the
+       * specification does -- and the shader is not even undrawable. It
+       * generates vertices and nothing else, which is all a geometry shader
+       * writing its own gl_Position needs from it. The draw gives its output
+       * buffer the same minimum stride the other three already take. */
       if (getenv("GEX_WGPU_TESS_LOG")) {
          fprintf(stderr, "gex-tes: no outputs; variables follow\n");
          nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
@@ -29195,6 +29211,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
 
    if (!tes)
       GEX_TESS_DECLINE("a patch draw with no evaluation shader");
+
    if (info->index_size || info->instance_count != 1) {
       if (getenv("GEX_WGPU_TESS_LOG"))
          fprintf(stderr, "gex-wgpu: tess decline detail isz=%u inst=%u "
@@ -29226,9 +29243,17 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    const unsigned out_stride = MAX2(gex_wgpu_varying_stride(producer), 16u);
    const unsigned patch_stride =
       MAX2(gex_wgpu_varying_stride(producer_patch), 16u);
-   const unsigned tes_stride = gex_wgpu_varying_stride(&tes->outputs);
-   if (!tes_stride)
-      GEX_TESS_DECLINE("an evaluation shader with no outputs");
+   /* A minimum, like the three strides above, rather than a decline. An
+    * evaluation shader with no outputs is meaningful: it generates vertices
+    * and nothing else, which is exactly what an isolines/point_mode stage
+    * feeding a geometry shader that writes its own gl_Position does --
+    * KHR-GL45.shading_language_420pack.line_numbering is that program, and
+    * Mesa strips the one varying it declares because nothing downstream
+    * survives to read it. The buffer is allocated and left unwritten; the
+    * consumer reads none of it. A zero stride would only have meant a
+    * zero-sized buffer, which WebGPU refuses. */
+   const unsigned tes_stride = MAX2(gex_wgpu_varying_stride(&tes->outputs),
+                                    16u);
 
    struct gex_wgpu_tes_variant *variant = gex_wgpu_tes_variant_get(
       &ctx->base, tes, producer, producer_patch, verts_per_patch);
