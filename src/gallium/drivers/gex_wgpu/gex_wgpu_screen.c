@@ -12696,9 +12696,10 @@ gex_wgpu_create_vertex_elements_state(struct pipe_context *pipe,
    if (num_elements == 0) {
       struct gex_wgpu_vertex_elements *empty =
          CALLOC_STRUCT(gex_wgpu_vertex_elements);
+      if (unlikely(getenv("GEX_WGPU_VS_STATE_LOG") != NULL))
+         fprintf(stderr, "gex-wgpu: create velems n=0 -> %p\n", empty);
       return empty;
    }
-   bool buffers_used[8] = {0};
    unsigned highest_buffer = 0;
    for (unsigned i = 0; i < num_elements; ++i) {
       unsigned size, alignment;
@@ -12736,7 +12737,6 @@ gex_wgpu_create_vertex_elements_state(struct pipe_context *pipe,
          return NULL;
       }
       const unsigned buffer = elements[i].vertex_buffer_index;
-      buffers_used[buffer] = true;
       highest_buffer = MAX2(highest_buffer, buffer);
       for (unsigned previous = 0; previous < i; ++previous) {
          if (elements[previous].vertex_buffer_index != buffer)
@@ -12778,13 +12778,23 @@ gex_wgpu_create_vertex_elements_state(struct pipe_context *pipe,
          }
       }
    }
-   for (unsigned buffer = 0; buffer <= highest_buffer; ++buffer)
-      if (!buffers_used[buffer]) {
-         fprintf(stderr,
-                 "gex-wgpu: vertex buffer slot %u unreferenced below "
-                 "highest %u\n", buffer, highest_buffer);
-         return NULL;
-      }
+   /* A gap in the Gallium buffer indices is not a reason to refuse, and a
+    * refusal here is not a refusal the caller sees: cso binds the NULL, and
+    * the next draw runs with no vertex layout at all, every attribute reading
+    * (0,0,0,1). Alacritty drew a window and no glyphs for exactly that.
+    *
+    * The gap does not come from the application -- st compacts the binding
+    * numbers it is given, explicit `glVertexAttribBinding` included. It comes
+    * from u_vbuf, which reserves one fallback slot per step mode for the
+    * attributes it has to translate. Alacritty's glyph layout is five
+    * per-instance attributes in one buffer, one of them three bytes of colour
+    * that WebGPU has no format for, so u_vbuf moves that one to its
+    * per-instance slot and leaves the per-vertex slot it reserved unused:
+    * `buf0 buf0 buf2 buf0 buf0`.
+    *
+    * Nothing downstream needs them dense. The pipeline assigns its own WebGPU
+    * slots from the elements that exist (see `vb_slot`), so an unreferenced
+    * index simply never gets one. */
    struct gex_wgpu_vertex_elements *state =
       CALLOC_STRUCT(gex_wgpu_vertex_elements);
    if (state) {
@@ -12797,6 +12807,17 @@ gex_wgpu_create_vertex_elements_state(struct pipe_context *pipe,
          state->any_unpack |= state->unpack[i] != GEX_WGPU_UNPACK_NONE;
       }
    }
+   if (unlikely(getenv("GEX_WGPU_VS_STATE_LOG") != NULL)) {
+      /* The buffer indices, because they are not necessarily dense: u_vbuf
+       * reserves a slot per step mode for the attributes it has to translate,
+       * so a layout with nothing per-vertex to translate leaves that slot
+       * unreferenced. Printing them is what identified alacritty's layout. */
+      fprintf(stderr, "gex-wgpu: create velems n=%u ->", num_elements);
+      for (unsigned i = 0; i < num_elements; ++i)
+         fprintf(stderr, " buf%u(div=%u)", elements[i].vertex_buffer_index,
+                 elements[i].instance_divisor);
+      fprintf(stderr, " %p\n", (void *)state);
+   }
    return state;
 }
 
@@ -12804,6 +12825,8 @@ static void
 gex_wgpu_bind_vertex_elements_state(struct pipe_context *pipe, void *state)
 {
    GEX_ENTRY_TIMER();
+   if (unlikely(getenv("GEX_WGPU_VS_STATE_LOG") != NULL))
+      fprintf(stderr, "gex-wgpu: bind velems %p\n", state);
    ((struct gex_wgpu_context *)pipe)->vertex_elements = state;
 }
 
@@ -34706,7 +34729,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          static uint64_t seen_shapes[24];
          static unsigned seen_count;
          bool fresh = false;
-         if (want_state && ctx->vertex_elements) {
+         /* `ctx->vertex_elements` is *not* required in order to report. It
+          * used to be, and that made this blind to the one case most worth
+          * reporting: a draw whose shader declares attributes while no
+          * element state is bound at all, so every attribute reads the
+          * default (0,0,0,1) and the geometry collapses with nothing said.
+          * Alacritty's glyph draws are exactly that -- `drawIndexed count=6
+          * inst=29` with no vertex buffer in the command log and a
+          * five-attribute shader -- and this guard is why they never showed
+          * up here. */
+         if (want_state) {
             /* Keyed on the shader itself, not on its input mask and element
              * count: two different shaders share those often enough that the
              * one responsible for most of the frame -- 53,240 draws of 91,000
@@ -34724,14 +34756,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          if (fresh) {
             fprintf(stderr,
                     "gex-wgpu: vs %p inputs 0x%llx supplied 0x%llx missing 0x%llx "
-                    "(elements=%u slots=%u) vp=%.0f,%.0f %.0fx%.0f depth=%.2f..%.2f "
+                    "(elements=%d slots=%u) vp=%.0f,%.0f %.0fx%.0f depth=%.2f..%.2f "
                     "flip=%d fold=%d scissor=%d %d,%d %dx%d fb=%ux%u "
                     "depthtest=%d func=%d write=%d cfmt=%d srgb=%d\n",
                     (void *)ctx->vs,
                     (unsigned long long)ctx->vs->vertex_locations,
                     (unsigned long long)supplied_locations,
                     (unsigned long long)missing,
-                    ctx->vertex_elements->count, vb_slot_count,
+                    ctx->vertex_elements ? (int)ctx->vertex_elements->count : -1,
+                    vb_slot_count,
                     viewport_x, viewport_y, viewport_width, viewport_height,
                     min_depth, max_depth, (int)vertex_flipped,
                     (int)fold_viewport, (int)scissor_enabled,
@@ -34790,7 +34823,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
              * zero as halves while its byte pattern looked like f32 1.0
              * straddling the field, so the question is where the real fields
              * begin -- and only the unstructured bytes answer that. */
-            if (ctx->vertex_elements->count &&
+            if (ctx->vertex_elements && ctx->vertex_elements->count &&
                 ctx->vertex_elements->elements[0].vertex_buffer_index <
                    GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS) {
                const unsigned b0 =
@@ -34827,7 +34860,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
              * origin and the primitives have no area -- which rasterises
              * nothing, with every input and the matrix still perfectly valid.
              * Printed as f32 this field looked like noise and was skipped. */
-            for (unsigned e = 0; e < ctx->vertex_elements->count; ++e) {
+            for (unsigned e = 0;
+                 ctx->vertex_elements && e < ctx->vertex_elements->count; ++e) {
                const struct pipe_vertex_element *el =
                   &ctx->vertex_elements->elements[e];
                if (el->src_format != PIPE_FORMAT_R16G16B16A16_FLOAT)
@@ -34862,7 +34896,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
              * computes its position as `i_position * i_scale + i_origin`, so
              * whether those arrive as sensible numbers is the whole question,
              * and nothing upstream of the fetch can answer it. */
-            for (unsigned e = 0; e < ctx->vertex_elements->count; ++e) {
+            for (unsigned e = 0;
+                 ctx->vertex_elements && e < ctx->vertex_elements->count; ++e) {
                const struct pipe_vertex_element *el =
                   &ctx->vertex_elements->elements[e];
                const unsigned b = el->vertex_buffer_index;
