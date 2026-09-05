@@ -2005,6 +2005,14 @@ struct gex_wgpu_shader {
    enum pipe_format image_formats[GEX_WGPU_MAX_SHADER_IMAGES];
    WGPUStorageTextureAccess image_access[GEX_WGPU_MAX_SHADER_IMAGES];
    WGPUTextureViewDimension image_dimensions[GEX_WGPU_MAX_SHADER_IMAGES];
+   /* Declared with no format qualifier, which GLSL permits only on a
+    * write-only image; the format comes from the image unit at draw time.
+    * The compute side has carried this since shading_language_420pack needed
+    * it -- see gex_wgpu_resolve_unformatted_images -- and a graphics stage
+    * recorded PIPE_FORMAT_NONE and carried it into the bind group layout,
+    * where it becomes an Undefined storage format and the layout is
+    * rejected. */
+   uint16_t unformatted_images;
    /* Images WebGPU has no storage texture for, served through a storage
     * buffer instead -- see GEX_WGPU_PACKED_IMAGE_FIRST_BINDING. They are
     * counted separately because by the time the layout is built they are not
@@ -2204,6 +2212,11 @@ struct gex_wgpu_shader_variant {
    /* The polygon offset this variant computes itself, and the state it baked
     * in as immediates; see gex_wgpu_lower_polygon_offset_clamp. All four are
     * part of the key because all four are constants in the shader. */
+   /* The storage formats this variant's images were resolved to, for the ones
+    * the shader declared without a format qualifier. The emitter takes an
+    * image's format from the variable, so a different bound unit is a
+    * different module. */
+   enum pipe_format image_formats[GEX_WGPU_MAX_SHADER_IMAGES];
    bool offset_clamp;
    float offset_clamp_factor;
    float offset_clamp_units;
@@ -6815,14 +6828,45 @@ gex_wgpu_fit_varyings(nir_shader *nir, const uint8_t *want)
  * offset it before the shader ran -- so a shader that both uses a clamped
  * offset and reads its own window z sees the pre-offset value.
  */
+/* The storage format a graphics-stage image is really bound with.
+ *
+ * For an image the shader declared a format on, that format. For one declared
+ * without -- which GLSL permits only on a write-only image -- GL says the
+ * store converts to the *image unit's* format, so it comes from the bound
+ * view. Both the module and the bind group layout have to agree on it, which
+ * is why they ask here rather than each deciding.
+ *
+ * An unbound unit falls back to rgba8: something has to be named, the draw
+ * stores nowhere, and this is what the compute path picks for the same
+ * reason. */
+static enum pipe_format
+gex_wgpu_stage_image_format(const struct gex_wgpu_context *ctx,
+                            const struct gex_wgpu_shader *shader,
+                            mesa_shader_stage stage, unsigned i)
+{
+   if (!(shader->unformatted_images & ((uint16_t)1u << i)))
+      return shader->image_formats[i];
+   const struct pipe_image_view *iv =
+      &ctx->shader_images[stage][shader->image_slots[i]];
+   return iv->resource ? iv->format : PIPE_FORMAT_R8G8B8A8_UNORM;
+}
+
 /* Whether this draw's polygon offset has to be done in the shader.
  *
  * Only a finite, non-zero clamp needs it: zero and infinity clamp nothing, so
  * the fixed-function bias is already exactly right for them, and a shader that
  * writes its own gl_FragDepth overrides the offset in GL as well. */
 static bool
-gex_wgpu_offset_clamp_in_shader(const struct gex_wgpu_context *ctx)
+gex_wgpu_offset_clamp_in_shader(const struct gex_wgpu_context *ctx,
+                                bool drawing_triangles)
 {
+   /* GL offsets *polygons*. The fixed-function path already refuses a point
+    * or line topology, and the shader has to refuse the same ones -- baking
+    * the offset into a module that a line draw then uses would offset
+    * geometry GL leaves alone, and an application that leaves
+    * GL_POLYGON_OFFSET_FILL enabled while drawing lines is ordinary. */
+   if (!drawing_triangles)
+      return false;
    if (!ctx->rasterizer || !ctx->rasterizer->depth_bias_enabled || !ctx->depth)
       return false;
    const float clamp_value = ctx->rasterizer->depth_bias_clamp;
@@ -10985,7 +11029,13 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
        * format. Blender's EEVEE reads r11f_g11f_b10f images, and refusing
        * them here failed its shaders at link time and took the process with
        * them. */
-      if (!no_write &&
+      /* Not for an image declared with no format qualifier: there is nothing
+       * to represent yet, because GL takes the format from the image unit at
+       * draw time and gex_wgpu_stage_image_format resolves it there. Refusing
+       * here rejected the whole shader -- the compute collect has excluded the
+       * same case since it was first written. */
+      const bool unformatted = format == PIPE_FORMAT_NONE && no_read;
+      if (!no_write && !unformatted &&
           gex_wgpu_storage_texture_format(format) ==
           WGPUTextureFormat_Undefined) {
          char detail[160];
@@ -11020,6 +11070,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          }
       }
       const unsigned at = shader->image_count;
+      if (unformatted)
+         shader->unformatted_images |= (uint16_t)1u << at;
       shader->image_slots[at] = (uint8_t)var->data.driver_location;
       shader->image_bindings[at] = var->data.binding;
       shader->image_formats[at] = format;
@@ -11513,9 +11565,15 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
               shader->packed_image_count, shader->buftex_count,
               shader->ssbo_count, shader->ubo_count, shader->texture_count,
               shader->integer_sampled_slots);
+   /* unformatted_images belongs here for the same reason the texel word count
+    * does: the format is per-draw state, so there is no module that can be
+    * built now. Without this the base module is compiled with the format
+    * still PIPE_FORMAT_NONE and Tint rejects it at *link* time -- "writing to
+    * other than storage texture: OpImageWrite" -- before any draw can
+    * specialize it. */
    const bool deferred_integer_sampling =
       (shader->integer_sampled_slots != 0 || shader->buftex_count != 0 ||
-       shader->reads_sample_pos) &&
+       shader->unformatted_images != 0 || shader->reads_sample_pos) &&
       (expected_stage == MESA_SHADER_FRAGMENT ||
        expected_stage == MESA_SHADER_VERTEX);
    if (deferred_integer_sampling)
@@ -11940,6 +11998,7 @@ gex_wgpu_unusable_texture_slots(struct gex_wgpu_context *ctx)
 
 static WGPUShaderModule
 gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
+                         bool drawing_triangles,
                          uint16_t *omitted_out)
 {
    /* Declining, not latching. This returns NULL and draw_vbo checks it, so
@@ -12075,11 +12134,36 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       }
    }
 
-   /* glPolygonStipple, applied as a discard against the pattern. */
-   const bool want_stipple = ctx->rasterizer && ctx->rasterizer->poly_stipple &&
+   /* glPolygonStipple, applied as a discard against the pattern -- and only
+    * to polygons, which is what the name says and what the spec means by it.
+    * GL_POLYGON_STIPPLE is context state rather than per-draw, so a program
+    * that enables it and then draws lines or points is ordinary, and those
+    * primitives must come through unstippled. The same reasoning, and the
+    * same topology test, as the depth bias below.
+    *
+    * The topology, not the GL primitive, and that is a real if narrow
+    * trade. GL stipples a polygon that glPolygonMode rasterizes as lines, and
+    * this driver replays such a polygon as a line draw -- so that case now
+    * loses its stipple, where before every line draw wrongly gained one. The
+    * commoner shape wins: stipple left enabled while other geometry is drawn
+    * is the classic accident, and deliberately wireframing while stippling is
+    * not. If it ever matters, the discriminator is the fill mode -- a line
+    * topology while fill_mode is PIPE_POLYGON_MODE_LINE means those lines are
+    * polygon edges -- and the depth bias above would want the same treatment
+    * at the same time, since it has always had this property too. */
+   const bool want_stipple = drawing_triangles && ctx->rasterizer &&
+                             ctx->rasterizer->poly_stipple &&
                              ctx->poly_stipple_set;
+   /* The bound format of every image this shader declared without one. */
+   enum pipe_format want_image_formats[GEX_WGPU_MAX_SHADER_IMAGES];
+   for (unsigned i = 0; i < fs->image_count; ++i)
+      want_image_formats[i] =
+         gex_wgpu_stage_image_format(ctx, fs, MESA_SHADER_FRAGMENT, i);
+   for (unsigned i = fs->image_count; i < GEX_WGPU_MAX_SHADER_IMAGES; ++i)
+      want_image_formats[i] = PIPE_FORMAT_NONE;
    /* ARB_polygon_offset_clamp, when the platform will not clamp for us. */
-   const bool want_offset_clamp = gex_wgpu_offset_clamp_in_shader(ctx);
+   const bool want_offset_clamp =
+      gex_wgpu_offset_clamp_in_shader(ctx, drawing_triangles);
    const float offset_clamp_factor =
       want_offset_clamp ? ctx->rasterizer->depth_bias_slope : 0.0f;
    const float offset_clamp_units =
@@ -12109,7 +12193,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
        line_edge_location == ~0u && !fs->buftex_count &&
        !want_sample_positions && !want_logicop && !want_ignore_sample_mask &&
-       !want_omit_slots && !want_offset_clamp)
+       !want_omit_slots && !want_offset_clamp && !fs->unformatted_images)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -12217,7 +12301,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
       want_sample_positions != 0 || want_logicop != 0 ||
-      want_ignore_sample_mask || want_omit_slots != 0 || want_offset_clamp;
+      want_ignore_sample_mask || want_omit_slots != 0 || want_offset_clamp ||
+      fs->unformatted_images != 0;
    if (!needs_variant && !fs->buftex_count)
       return fs->module;
 
@@ -12239,6 +12324,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->poly_stipple == want_stipple &&
                    cached->ignore_sample_mask == want_ignore_sample_mask &&
                    cached->omitted_slots == want_omit_slots &&
+                   memcmp(cached->image_formats, want_image_formats,
+                          sizeof(cached->image_formats)) == 0 &&
                    cached->offset_clamp == want_offset_clamp &&
                    (!want_offset_clamp ||
                     (cached->offset_clamp_factor == offset_clamp_factor &&
@@ -12348,6 +12435,19 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * would otherwise see the load this adds. */
    if (want_stipple)
       gex_wgpu_lower_poly_stipple(variant, ctx->poly_stipple);
+   /* The emitter takes a storage image's format from the variable, so the
+    * resolved format has to be written back onto it -- an image left as
+    * PIPE_FORMAT_NONE reaches SPIR-V as an Unknown format, which is a
+    * different capability and not one WGSL has. The same write-back the
+    * compute variant does. */
+   if (fs->unformatted_images) {
+      nir_foreach_variable_with_modes(var, variant, nir_var_image) {
+         for (unsigned i = 0; i < fs->image_count; ++i)
+            if ((fs->unformatted_images & ((uint16_t)1u << i)) &&
+                fs->image_slots[i] == var->data.driver_location)
+               var->data.image.format = want_image_formats[i];
+      }
+   }
    if (want_offset_clamp)
       gex_wgpu_lower_polygon_offset_clamp(variant, offset_clamp_factor,
                                           offset_clamp_units,
@@ -12416,6 +12516,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->poly_stipple = want_stipple;
    cached->ignore_sample_mask = want_ignore_sample_mask;
    cached->omitted_slots = want_omit_slots;
+   memcpy(cached->image_formats, want_image_formats,
+          sizeof(cached->image_formats));
    cached->offset_clamp = want_offset_clamp;
    cached->offset_clamp_factor = offset_clamp_factor;
    cached->offset_clamp_units = offset_clamp_units;
@@ -36223,8 +36325,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* Slots this variant dropped because the bound state could not satisfy
     * their declaration; their bindings must be left out of the group too. */
    uint16_t omitted_texture_slots = 0;
+   const WGPUPrimitiveTopology fs_topology = gex_wgpu_topology(info->mode);
    fragment.module = gex_wgpu_fragment_module(
-      ctx, gex_wgpu_topology(info->mode) == WGPUPrimitiveTopology_PointList,
+      ctx, fs_topology == WGPUPrimitiveTopology_PointList,
+      fs_topology == WGPUPrimitiveTopology_TriangleList ||
+      fs_topology == WGPUPrimitiveTopology_TriangleStrip,
       &omitted_texture_slots);
    if (gex_timing) gex_wgpu_time_fsmod += os_time_get_nano() - t_fsmod_start;
    if (!fragment.module)
@@ -36747,7 +36852,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          /* Unless the fragment shader is computing the whole offset itself,
           * which it does when a finite clamp is set -- applying both would
           * offset twice. */
-         if (!gex_wgpu_offset_clamp_in_shader(ctx)) {
+         if (!gex_wgpu_offset_clamp_in_shader(ctx, true)) {
             depth_state.depthBias = ctx->rasterizer->depth_bias;
             depth_state.depthBiasSlopeScale = ctx->rasterizer->depth_bias_slope;
             depth_state.depthBiasClamp = ctx->rasterizer->depth_bias_clamp;
@@ -37505,8 +37610,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        *
        * So the layout follows what the shader was compiled into rather than
        * what GL called it. */
+      const enum pipe_format resolved =
+         gex_wgpu_stage_image_format(ctx, ctx->fs, MESA_SHADER_FRAGMENT, i);
       if (ctx->fs->image_access[i] == WGPUStorageTextureAccess_ReadOnly) {
-         const enum pipe_format format = ctx->fs->image_formats[i];
+         const enum pipe_format format = resolved;
          fragment_layout_entries[at].texture.sampleType =
             util_format_is_pure_uint(format) ? WGPUTextureSampleType_Uint
             : util_format_is_pure_sint(format) ? WGPUTextureSampleType_Sint
@@ -37518,7 +37625,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          fragment_layout_entries[at].storageTexture.access =
             ctx->fs->image_access[i];
          fragment_layout_entries[at].storageTexture.format =
-            gex_wgpu_storage_texture_format(ctx->fs->image_formats[i]);
+            gex_wgpu_storage_texture_format(resolved);
          fragment_layout_entries[at].storageTexture.viewDimension =
             ctx->fs->image_dimensions[i];
       }
@@ -38064,7 +38171,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             entries[at].binding = ctx->fs->image_bindings[i];
             entries[at].textureView = gex_wgpu_default_storage_view(
                screen, ctx->fs->image_dimensions[i],
-               gex_wgpu_storage_texture_format(ctx->fs->image_formats[i]),
+               gex_wgpu_storage_texture_format(
+                  gex_wgpu_stage_image_format(ctx, ctx->fs,
+                                              MESA_SHADER_FRAGMENT, i)),
                ctx->fs->image_access[i]);
             if (!entries[at].textureView) {
                static bool said;
@@ -38110,10 +38219,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          }
          WGPUTextureViewDescriptor desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
          /* The sampled format for a read-only image; see the compute path. */
+         /* The resolved format, so this view, the layout and the module all
+          * name the same one for an image the shader declared without a
+          * format qualifier. */
+         const enum pipe_format view_format =
+            gex_wgpu_stage_image_format(ctx, ctx->fs, MESA_SHADER_FRAGMENT, i);
          desc.format =
             ctx->fs->image_access[i] == WGPUStorageTextureAccess_ReadOnly
-               ? gex_wgpu_texture_format(ctx->fs->image_formats[i])
-               : gex_wgpu_storage_texture_format(ctx->fs->image_formats[i]);
+               ? gex_wgpu_texture_format(view_format)
+               : gex_wgpu_storage_texture_format(view_format);
          desc.dimension = ctx->fs->image_dimensions[i];
          desc.baseMipLevel = iv->u.tex.level;
          desc.mipLevelCount = 1;
