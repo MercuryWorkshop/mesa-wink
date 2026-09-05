@@ -8428,6 +8428,237 @@ gex_wgpu_capture_drop_output(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+/* Turn a sampler array indexed by a value the compiler could not fold into a
+ * chain of constant ones.
+ *
+ * `texture(samplers[i], c)` with a variable `i` is ordinary GLSL -- a texture
+ * atlas, a material array, any shader that loops over its inputs -- and WGSL
+ * has no sampler arrays at all, so the index cannot survive into the module in
+ * any form. It can be *unrolled*, though: the array is a known, small number
+ * of units, so the instruction becomes one copy per unit under a comparison
+ * against the index, and each copy names its unit as a constant.
+ *
+ * The result lands in a function temporary rather than a phi web, because the
+ * builder makes that far easier to get right; vars_to_ssa turns it back into
+ * values immediately afterwards.
+ *
+ * Refuses, by returning false, when the array's size cannot be established --
+ * which leaves the caller's existing refusal in place rather than guessing at
+ * a bound and reading a unit nothing is bound to.
+ */
+static bool
+gex_wgpu_lower_dynamic_sampler_index(nir_shader *nir)
+{
+   bool any = false;
+   nir_foreach_function_impl(impl, nir) {
+      /* Collected first, then rewritten: nir_push_if splits the block the
+       * instruction is in, so rewriting during the walk would be iterating a
+       * list while cutting it in half. */
+      nir_tex_instr *found[64];
+      unsigned count = 0;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            bool dynamic =
+               nir_tex_instr_src_index(tex, nir_tex_src_texture_offset) >= 0 ||
+               nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset) >= 0;
+            /* And the deref spelling, which is what reaches the compute and
+             * emulated stages: the samplers have not been lowered to indices
+             * there, so a dynamic index is an array deref rather than an
+             * offset. Both forms exist in this driver and both had to be
+             * refused before. */
+            const int deref_at =
+               nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+            if (!dynamic && deref_at >= 0) {
+               nir_deref_instr *deref =
+                  nir_def_as_deref(tex->src[deref_at].src.ssa);
+               dynamic = deref->deref_type == nir_deref_type_array &&
+                         !nir_src_is_const(deref->arr.index);
+            }
+            if (!dynamic)
+               continue;
+            if (count >= ARRAY_SIZE(found)) {
+               if (getenv("GEX_WGPU_SPLIT_LOG"))
+                  fprintf(stderr, "gex-split: too many dynamic samplers\n");
+               return false;
+            }
+            found[count++] = tex;
+         }
+      }
+      if (!count)
+         continue;
+
+      nir_builder b = nir_builder_create(impl);
+      for (unsigned f = 0; f < count; ++f) {
+         nir_tex_instr *tex = found[f];
+         const int at =
+            nir_tex_instr_src_index(tex, nir_tex_src_texture_offset);
+         const int sampler_at =
+            nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset);
+         const int deref_at =
+            nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+         const int sampler_deref_at =
+            nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+
+         nir_def *index = NULL;
+         unsigned units = 0;
+         nir_deref_instr *parent = NULL;
+         /* The array this instruction indexes, when it still has a deref --
+          * needed in both forms, because an offset-form instruction can carry
+          * a deref as well. */
+         nir_deref_instr *array_parent = NULL;
+         if (deref_at >= 0) {
+            nir_deref_instr *d = nir_def_as_deref(tex->src[deref_at].src.ssa);
+            if (d->deref_type == nir_deref_type_array) {
+               nir_deref_instr *p = nir_deref_instr_parent(d);
+               if (p && p->deref_type == nir_deref_type_var)
+                  array_parent = p;
+            }
+         }
+         if (at >= 0 || sampler_at >= 0) {
+            /* GL couples the two: a combined sampler is one unit, so the
+             * texture and sampler offsets name the same element even when
+             * they are two SSA values that computed it separately -- which
+             * they routinely are, because nothing has CSE'd them yet.
+             * Requiring the *same value* refused every real case; requiring
+             * the same base unit is the condition that actually matters, and
+             * a shader that had separated them would fail it. */
+            if (at >= 0 && sampler_at >= 0 &&
+                tex->texture_index != tex->sampler_index) {
+               if (getenv("GEX_WGPU_SPLIT_LOG"))
+                  fprintf(stderr, "gex-split: texture unit %u and sampler "
+                          "unit %u are not one combined sampler\n",
+                          tex->texture_index, tex->sampler_index);
+               return false;
+            }
+            index = at >= 0 ? tex->src[at].src.ssa
+                            : tex->src[sampler_at].src.ssa;
+            const unsigned base =
+               at >= 0 ? tex->texture_index : tex->sampler_index;
+            nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+               const struct glsl_type *type = glsl_without_array(var->type);
+               if (!glsl_type_is_sampler(type) && !glsl_type_is_texture(type))
+                  continue;
+               if (var->type == type || !glsl_type_is_array(var->type))
+                  continue;
+               const unsigned length = glsl_get_length(var->type);
+               if (var->data.binding <= base &&
+                   base < var->data.binding + length) {
+                  units = length - (base - var->data.binding);
+                  break;
+               }
+            }
+         } else {
+            nir_deref_instr *deref =
+               nir_def_as_deref(tex->src[deref_at].src.ssa);
+            index = deref->arr.index.ssa;
+            parent = array_parent;
+            if (!parent) {
+               if (getenv("GEX_WGPU_SPLIT_LOG"))
+                  fprintf(stderr, "gex-split: a dynamic deref with no array "
+                          "variable behind it\n");
+               return false;
+            }
+            units = glsl_type_is_array(parent->var->type)
+                       ? glsl_get_length(parent->var->type) : 0;
+            /* Both derefs must name the same array, which a combined sampler
+             * guarantees. */
+            if (sampler_deref_at >= 0 &&
+                tex->src[sampler_deref_at].src.ssa !=
+                   tex->src[deref_at].src.ssa)
+               return false;
+         }
+         if (getenv("GEX_WGPU_SPLIT_LOG"))
+            fprintf(stderr, "gex-split: unrolling a dynamic sampler index "
+                    "over %u unit(s) (%s form)\n", units,
+                    parent ? "deref" : "offset");
+         if (units < 2 || units > GEX_WGPU_MAX_SAMPLERS) {
+            if (getenv("GEX_WGPU_SPLIT_LOG"))
+               fprintf(stderr, "gex-split: %u units is outside what can be "
+                       "unrolled\n", units);
+            return false;
+         }
+
+         const nir_component_mask_t mask =
+            nir_component_mask(tex->def.num_components);
+         b.cursor = nir_before_instr(&tex->instr);
+         nir_variable *result = nir_local_variable_create(
+            impl,
+            glsl_vector_type(nir_get_glsl_base_type_for_nir_type(tex->dest_type),
+                             tex->def.num_components),
+            "gex_sampler_pick");
+         /* Zero rather than undef: an index outside the array is undefined in
+          * GL, and a value is friendlier than an undef the optimiser may
+          * propagate somewhere surprising. */
+         nir_store_var(&b, result,
+                       nir_imm_zero(&b, tex->def.num_components,
+                                    tex->def.bit_size), mask);
+         for (unsigned u = 0; u < units; ++u) {
+            nir_push_if(&b, nir_ieq_imm(&b, index, (int)u));
+            nir_tex_instr *copy =
+               nir_instr_as_tex(nir_instr_clone(nir, &tex->instr));
+            copy->texture_index = tex->texture_index + u;
+            copy->sampler_index = tex->sampler_index + u;
+            /* The constant deref, built before the copy is inserted so it
+             * dominates it. Only when there is a deref to replace: after
+             * st/mesa's sampler lowering the graphics stages have offsets
+             * instead, and the compute and emulated stages have both. */
+            nir_deref_instr *fixed =
+               array_parent ? nir_build_deref_array_imm(&b, array_parent,
+                                                        (int64_t)u) : NULL;
+            /* Inserted *before* the sources are touched: a clone's sources
+             * are not linked into any use list until the instruction is in a
+             * block, and removing one from an instruction that is not
+             * anywhere yet walks a list node whose prev is null. */
+            nir_builder_instr_insert(&b, &copy->instr);
+            if (fixed) {
+               const int copy_deref =
+                  nir_tex_instr_src_index(copy, nir_tex_src_texture_deref);
+               if (copy_deref >= 0)
+                  nir_src_rewrite(&copy->src[copy_deref].src, &fixed->def);
+               const int copy_sampler_deref =
+                  nir_tex_instr_src_index(copy, nir_tex_src_sampler_deref);
+               if (copy_sampler_deref >= 0)
+                  nir_src_rewrite(&copy->src[copy_sampler_deref].src,
+                                  &fixed->def);
+            }
+            /* And the offsets go, whichever form the index arrived in: an
+             * instruction carrying both a constant deref and a dynamic offset
+             * is still dynamic as far as the split is concerned, which is
+             * exactly the case that kept refusing after the first version of
+             * this only fixed one of the two. */
+            for (;;) {
+               const int c =
+                  nir_tex_instr_src_index(copy, nir_tex_src_texture_offset);
+               if (c < 0) break;
+               nir_tex_instr_remove_src(copy, c);
+            }
+            for (;;) {
+               const int c =
+                  nir_tex_instr_src_index(copy, nir_tex_src_sampler_offset);
+               if (c < 0) break;
+               nir_tex_instr_remove_src(copy, c);
+            }
+            nir_store_var(&b, result, &copy->def, mask);
+            nir_pop_if(&b, NULL);
+         }
+         /* The builder now sits after the last if and before the original
+          * instruction, which is where the answer is ready. */
+         nir_def *picked = nir_load_var(&b, result);
+         nir_def_replace(&tex->def, picked);
+         any = true;
+      }
+      nir_progress(true, impl, nir_metadata_none);
+   }
+   if (any) {
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+   return true;
+}
+
 /* Split each combined sampler into a texture and a bare sampler.
  *
  * tgsi_to_nir makes one glsl_sampler_type variable per sampler unit, and both
@@ -8469,8 +8700,17 @@ gex_wgpu_split_combined_samplers(nir_shader *nir)
                continue;
             nir_tex_instr *tex = nir_instr_as_tex(instr);
             if (nir_tex_instr_src_index(tex, nir_tex_src_texture_offset) >= 0 ||
-                nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset) >= 0)
+                nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset) >= 0) {
+               /* Named, because "could not split a combined sampler" was one
+                * message for four different shapes and the application sees
+                * only a failed link. This one is a sampler array indexed by a
+                * value the compiler could not fold -- `tex[i]` in a loop that
+                * did not unroll. */
+               if (getenv("GEX_WGPU_SPLIT_LOG"))
+                  fprintf(stderr, "gex-split: a texture instruction indexes "
+                          "its sampler dynamically\n");
                return false;
+            }
          }
       }
    }
@@ -8492,15 +8732,26 @@ gex_wgpu_split_combined_samplers(nir_shader *nir)
          if (!glsl_type_is_array(var->type) ||
              glsl_type_is_unsized_array(var->type) ||
              glsl_get_length(var->type) < 1 ||
-             glsl_get_array_element(var->type) != type)
+             glsl_get_array_element(var->type) != type) {
+            if (getenv("GEX_WGPU_SPLIT_LOG"))
+               fprintf(stderr, "gex-split: '%s' is a sampler shape that is "
+                       "not a plain one-dimensional array\n",
+                       var->name ? var->name : "(anon)");
             return false;
+         }
          units = glsl_get_length(var->type);
       }
       const unsigned slot = var->data.binding;
       if (count + units > GEX_WGPU_MAX_SAMPLERS ||
           slot + units > GEX_WGPU_MAX_SAMPLERS ||
-          retire_count >= GEX_WGPU_MAX_SAMPLERS)
+          retire_count >= GEX_WGPU_MAX_SAMPLERS) {
+         if (getenv("GEX_WGPU_SPLIT_LOG"))
+            fprintf(stderr, "gex-split: '%s' wants units %u..%u, past the "
+                    "driver's %u (seen %u so far)\n",
+                    var->name ? var->name : "(anon)", slot,
+                    slot + units - 1, (unsigned)GEX_WGPU_MAX_SAMPLERS, count);
          return false;
+      }
 
       /* Set 3 for the vertex stage, 0 for the fragment stage. The two
        * shaders number their bindings independently, so they cannot share a
@@ -8580,13 +8831,21 @@ gex_wgpu_split_combined_samplers(nir_shader *nir)
                   nir_def_as_deref(tex->src[have_deref].src.ssa);
                unsigned elem = 0;
                if (deref->deref_type == nir_deref_type_array) {
-                  if (!nir_src_is_const(deref->arr.index))
+                  if (!nir_src_is_const(deref->arr.index)) {
+                     if (getenv("GEX_WGPU_SPLIT_LOG"))
+                        fprintf(stderr, "gex-split: a surviving deref still "
+                                "indexes dynamically\n");
                      return false;   /* dynamic: give up whole, as above */
+                  }
                   elem = nir_src_as_uint(deref->arr.index);
                   deref = nir_deref_instr_parent(deref);
                }
-               if (deref->deref_type != nir_deref_type_var)
+               if (deref->deref_type != nir_deref_type_var) {
+                  if (getenv("GEX_WGPU_SPLIT_LOG"))
+                     fprintf(stderr, "gex-split: a deref that is not a "
+                             "variable (type %u)\n", (unsigned)deref->deref_type);
                   return false;
+               }
                nir_variable *origin = deref->var;
                unsigned k = 0;
                while (k < count && !(split_origin[k] == origin &&
@@ -8972,7 +9231,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * away, so the texture metadata came out empty and the shader was rejected
     * as having "no dereferenced texture slots". That rejected all 162 cases
     * of texture_repeat_mode over an ordinary `texture(texture0, texCoord)`. */
-   if (nir && !gex_wgpu_split_combined_samplers(nir)) {
+   if (nir && (!gex_wgpu_lower_dynamic_sampler_index(nir) ||
+               !gex_wgpu_split_combined_samplers(nir))) {
       gex_wgpu_set_compile_error(
          mutable_state, "gex_wgpu could not split a combined sampler");
       ralloc_free(nir);
@@ -18130,7 +18390,8 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
     * the shader arrives. Only the graphics path ran this, so a compute shader
     * that samples anything reached the emitter with no texture deref on its
     * tex instructions and asserted there, killing the application. */
-   if (!gex_wgpu_split_combined_samplers(nir)) {
+   if (!gex_wgpu_lower_dynamic_sampler_index(nir) ||
+       !gex_wgpu_split_combined_samplers(nir)) {
       fprintf(stderr, "gex-wgpu: compute shader rejected: could not split a "
                       "combined sampler\n");
       ralloc_free(nir);
@@ -23426,7 +23687,8 @@ gex_wgpu_create_tcs_state(struct pipe_context *pipe,
     * This is the third stage to need it -- compute, then geometry, now the
     * two tessellation stages -- so it belongs with whatever creates a shader,
     * not with the graphics path only. */
-   if (!gex_wgpu_split_combined_samplers(nir)) {
+   if (!gex_wgpu_lower_dynamic_sampler_index(nir) ||
+       !gex_wgpu_split_combined_samplers(nir)) {
       gex_wgpu_set_compile_error(
          mutable_state, "gex_wgpu could not split a combined sampler");
       ralloc_free(nir);
@@ -23525,7 +23787,8 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
       return NULL;
    }
    /* The same split the control stage needs; see the note there. */
-   if (!gex_wgpu_split_combined_samplers(nir)) {
+   if (!gex_wgpu_lower_dynamic_sampler_index(nir) ||
+       !gex_wgpu_split_combined_samplers(nir)) {
       gex_wgpu_set_compile_error(
          mutable_state, "gex_wgpu could not split a combined sampler");
       ralloc_free(nir);
@@ -23766,7 +24029,8 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
     * the tessellation control stage. A geometry shader that samples a texture
     * otherwise reaches the SPIR-V emitter with a tex instruction carrying no
     * texture deref. */
-   if (!gex_wgpu_split_combined_samplers(nir)) {
+   if (!gex_wgpu_lower_dynamic_sampler_index(nir) ||
+       !gex_wgpu_split_combined_samplers(nir)) {
       gex_wgpu_set_compile_error(
          mutable_state, "gex_wgpu could not split a combined sampler");
       ralloc_free(nir);
