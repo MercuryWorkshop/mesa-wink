@@ -1268,6 +1268,11 @@ struct gex_wgpu_context {
     * map renders each cascade into one layer of a depth array. */
    unsigned depth_level;
    unsigned depth_layer;
+   /* How many layers every attachment has in common, so a geometry shader
+    * writing gl_Layer knows what range it may route into. One when nothing is
+    * layered, which is every ordinary framebuffer. See
+    * gex_wgpu_gs_route_layers. */
+   unsigned fb_layer_count;
    /* How this draw expands its points into quads, decided in draw_vbo_inner
     * and read by the pipeline builder and the draw itself. Inactive for every
     * draw that is not wide points. See gex_wgpu_lower_wide_point. */
@@ -13166,7 +13171,20 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
     * screen" before a single GL call. */
    const unsigned present_binds = PIPE_BIND_DISPLAY_TARGET |
                                   PIPE_BIND_SCANOUT | PIPE_BIND_SHARED;
-   const unsigned allowed = renderable && target == PIPE_TEXTURE_2D
+   /* An array or cube texture is a render target too. WebGPU renders into one
+    * of its layers through a view with baseArrayLayer, which is exactly what
+    * GL's layered attachment is -- so restricting the render-target bind to
+    * PIPE_TEXTURE_2D refused every layered framebuffer at the point st asked
+    * whether the *texture* could exist, long before anything drew.
+    *
+    * Not 3D: WebGPU has no 2D view of one slice of a volume, so a 3D texture
+    * still cannot be attached. That is a real gap and it declines by name in
+    * the view path rather than being claimed here. */
+   const bool renderable_target =
+      target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_RECT ||
+      target == PIPE_TEXTURE_2D_ARRAY || target == PIPE_TEXTURE_CUBE ||
+      target == PIPE_TEXTURE_CUBE_ARRAY;
+   const unsigned allowed = renderable && renderable_target
       ? PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW | present_binds
       : PIPE_BIND_SAMPLER_VIEW | present_binds;
 
@@ -20834,16 +20852,25 @@ gex_wgpu_clear(struct pipe_context *pipe, unsigned buffers,
           * tri-fbo-tex-mip divergence, where both software references agree
           * and this driver drew a black background. */
          const unsigned level = ctx->color_levels[i];
-         struct pipe_surface surface = {0};
-         surface.texture = resource;
-         surface.format = ctx->color_formats[i];
-         surface.level = level;
-         surface.first_layer = ctx->color_layers[i];
-         surface.last_layer = ctx->color_layers[i];
-         gex_wgpu_clear_render_target(pipe, &surface, color, 0, 0,
-                                      u_minify(resource->width0, level),
-                                      u_minify(resource->height0, level),
-                                      false);
+         /* Every layer, not just the one the pass renders into. GL clears the
+          * whole of a layered attachment, and clearing only the bound layer
+          * left the other cascades or cube faces holding whatever was there
+          * -- which is what KHR-GL45.geometry_shader's layered_framebuffer
+          * cases read back. One clear per layer; fb_layer_count is 1 for
+          * every ordinary framebuffer, so this is the same single clear
+          * there. */
+         for (unsigned layer = 0; layer < ctx->fb_layer_count; ++layer) {
+            struct pipe_surface surface = {0};
+            surface.texture = resource;
+            surface.format = ctx->color_formats[i];
+            surface.level = level;
+            surface.first_layer = ctx->color_layers[i] + layer;
+            surface.last_layer = surface.first_layer;
+            gex_wgpu_clear_render_target(pipe, &surface, color, 0, 0,
+                                         u_minify(resource->width0, level),
+                                         u_minify(resource->height0, level),
+                                         false);
+         }
       }
    }
 
@@ -20854,17 +20881,19 @@ gex_wgpu_clear(struct pipe_context *pipe, unsigned buffers,
        * slice too -- a cascaded shadow map is exactly that -- and clearing
        * level zero instead cleared a cascade nobody was drawing into. */
       struct pipe_resource *resource = ctx->depth;
-      struct pipe_surface surface = {0};
-      surface.texture = resource;
-      surface.format = resource->format;
-      surface.level = ctx->depth_level;
-      surface.first_layer = ctx->depth_layer;
-      surface.last_layer = ctx->depth_layer;
-      gex_wgpu_clear_depth_stencil(pipe, &surface, depth_stencil, depth,
-                                   stencil, 0, 0,
-                                   u_minify(resource->width0, ctx->depth_level),
-                                   u_minify(resource->height0, ctx->depth_level),
-                                   false);
+      /* Every layer, as above. */
+      for (unsigned layer = 0; layer < ctx->fb_layer_count; ++layer) {
+         struct pipe_surface surface = {0};
+         surface.texture = resource;
+         surface.format = resource->format;
+         surface.level = ctx->depth_level;
+         surface.first_layer = ctx->depth_layer + layer;
+         surface.last_layer = surface.first_layer;
+         gex_wgpu_clear_depth_stencil(
+            pipe, &surface, depth_stencil, depth, stencil, 0, 0,
+            u_minify(resource->width0, ctx->depth_level),
+            u_minify(resource->height0, ctx->depth_level), false);
+      }
    }
 }
 
@@ -20890,6 +20919,8 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
    enum pipe_format color_formats[GEX_WGPU_MAX_COLOR_TARGETS] = {0};
    unsigned color_levels[GEX_WGPU_MAX_COLOR_TARGETS] = {0};
    unsigned color_layers[GEX_WGPU_MAX_COLOR_TARGETS] = {0};
+   /* The narrowest layer range any attachment offers; ~0u until one is seen. */
+   unsigned layers_available = ~0u;
    unsigned color_count = 0;
    struct pipe_resource *depth = NULL;
    if (state && state->nr_cbufs) {
@@ -20983,18 +21014,13 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
              * stopped every later draw. Blender's EEVEE attaches a two-layer
              * 1x1 r32_float target early in its setup, so the refusal cost
              * everything after it. */
-            if (surface->first_layer != surface->last_layer) {
-               static bool said;
-               if (!said) {
-                  said = true;
-                  fprintf(stderr,
-                          "gex-wgpu: colour target %u is layered (%u..%u of "
-                          "%s); rasterizing layer %u only\n", i,
-                          surface->first_layer, surface->last_layer,
-                          util_format_short_name(surface->format),
-                          surface->first_layer);
-               }
-            }
+            /* How many layers this attachment offers. A geometry shader
+             * that writes gl_Layer is routed across them one pass each; with
+             * nothing writing it, GL says the layer is zero, which is the
+             * first of the range and what a single pass renders into. */
+            layers_available =
+               MIN2(layers_available,
+                    surface->last_layer - surface->first_layer + 1);
             colors[i] = surface->texture;
             color_formats[i] = surface->format;
             color_levels[i] = surface->level;
@@ -21061,8 +21087,12 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
     * same thing as GL here through baseMipLevel and baseArrayLayer; the view
     * built for the pass carries them. */
    unsigned depth_level = 0, depth_layer = 0;
+   /* A layered depth attachment is accepted the way a layered colour one is,
+    * and for the same reason: the pass renders into one layer of it and a
+    * geometry shader writing gl_Layer moves through the range. Rejecting it
+    * declined the context, which is what KHR-GL45.geometry_shader's
+    * layered_framebuffer depth and stencil cases hit. */
    if (zs_attachable &&
-       state->zsbuf.first_layer == state->zsbuf.last_layer &&
        state->zsbuf.level <= state->zsbuf.texture->last_level &&
        state->width <= u_minify(state->zsbuf.texture->width0,
                                 state->zsbuf.level) &&
@@ -21071,6 +21101,9 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
       depth = state->zsbuf.texture;
       depth_level = state->zsbuf.level;
       depth_layer = state->zsbuf.first_layer;
+      layers_available =
+         MIN2(layers_available,
+              state->zsbuf.last_layer - state->zsbuf.first_layer + 1);
       /* Same as the colour targets above: attached, so it has contents. A
        * shadow map is written only by being rendered into, and counting that
        * as "nothing ever wrote it" made the unwritten-texture warning report
@@ -21178,6 +21211,8 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
    pipe_resource_reference(&ctx->depth, depth);
    ctx->depth_level = depth_level;
    ctx->depth_layer = depth_layer;
+   ctx->fb_layer_count =
+      layers_available == ~0u ? 1u : MAX2(1u, layers_available);
    /* From the framebuffer, not from the colour count: a depth-only pass has
     * no colour attachment and still has a size, and taking zero here made
     * every viewport look out of bounds. */
@@ -25032,6 +25067,147 @@ gex_wgpu_bind_constants(struct gex_wgpu_context *ctx,
    return true;
 }
 
+/* The same for gl_Layer: sort the geometry shader's output triangles by the
+ * layer each one asked for and draw them in runs, with that layer installed as
+ * every attachment's.
+ *
+ * WebGPU attaches one array layer at a time, so layered rendering has to be
+ * one pass per layer -- which is exactly the shape the viewport routing beside
+ * this already has, and the render pass key already includes the attachment
+ * layer, so moving ctx->color_layers between draws opens the next pass on its
+ * own. loadOp is always Load, so a later layer's pass does not disturb an
+ * earlier one's.
+ *
+ * The layer is read from the *first* index of each triangle, with the same
+ * caveat the viewport routing carries: GL takes it from the provoking vertex,
+ * and a shader writing different layers on one triangle's vertices can
+ * disagree by a vertex. Nothing real does that.
+ *
+ * Returns false having drawn nothing, in which case the caller draws the whole
+ * list into the bound layer -- which is what GL says an unrouted primitive
+ * gets.
+ */
+static bool
+gex_wgpu_gs_route_layers(struct gex_wgpu_context *ctx,
+                         struct gex_wgpu_gs *gs, unsigned index_count,
+                         struct pipe_draw_info *raster,
+                         unsigned drawid_offset)
+{
+   const unsigned stride = gex_wgpu_varying_stride(&gs->outputs);
+   const unsigned triangles = index_count / 3;
+   const unsigned layer_count = ctx->fb_layer_count;
+   if (!triangles || !stride || layer_count < 2 || gs->layer_slot < 0)
+      return false;
+
+   uint32_t *indices = MALLOC(index_count * 4);
+   uint16_t *which = MALLOC(triangles * sizeof(uint16_t));
+   unsigned *counts = CALLOC(layer_count, sizeof(unsigned));
+   unsigned *starts = MALLOC(layer_count * sizeof(unsigned));
+   unsigned *fill = MALLOC(layer_count * sizeof(unsigned));
+   if (!indices || !which || !counts || !starts || !fill)
+      goto give_up;
+
+   {
+      struct pipe_transfer *transfer = NULL;
+      const uint32_t *mapped = pipe_buffer_map_range(
+         &ctx->base, ctx->gs_indices, 0, index_count * 4, PIPE_MAP_READ,
+         &transfer);
+      if (!mapped)
+         goto give_up;
+      memcpy(indices, mapped, index_count * 4);
+      pipe_buffer_unmap(&ctx->base, transfer);
+   }
+
+   const unsigned vertex_bytes =
+      gex_resource(ctx->gs_vertices)->allocation_size;
+   struct pipe_transfer *vtransfer = NULL;
+   const uint8_t *vertices = pipe_buffer_map_range(
+      &ctx->base, ctx->gs_vertices, 0, vertex_bytes, PIPE_MAP_READ,
+      &vtransfer);
+   if (!vertices)
+      goto give_up;
+   const unsigned slot_byte = (unsigned)gs->layer_slot * 16;
+   /* 0xffff marks a triangle to drop -- three equal indices, which is how the
+    * emit path fills a slot no primitive reached. */
+   for (unsigned t = 0; t < triangles; ++t) {
+      const uint32_t first = indices[t * 3];
+      const uint64_t at = (uint64_t)first * stride + slot_byte;
+      if ((first == indices[t * 3 + 1] && first == indices[t * 3 + 2]) ||
+          at + 4 > vertex_bytes) {
+         which[t] = 0xffffu;
+         continue;
+      }
+      uint32_t layer;
+      memcpy(&layer, vertices + at, sizeof(layer));
+      /* GL leaves an out-of-range gl_Layer undefined; clamping keeps it
+       * inside the attachment rather than dropping the primitive, which is
+       * what the viewport routing does with its own index. */
+      which[t] = (uint16_t)MIN2(layer, (uint32_t)layer_count - 1);
+      ++counts[which[t]];
+   }
+   pipe_buffer_unmap(&ctx->base, vtransfer);
+
+   unsigned at = 0;
+   for (unsigned l = 0; l < layer_count; ++l) {
+      starts[l] = at;
+      at += counts[l] * 3;
+   }
+   const unsigned kept = at;
+   if (!kept) {
+      FREE(indices); FREE(which); FREE(counts); FREE(starts); FREE(fill);
+      return true;                      /* every triangle was degenerate */
+   }
+
+   uint32_t *sorted = MALLOC(kept * 4);
+   if (!sorted)
+      goto give_up;
+   memcpy(fill, starts, layer_count * sizeof(unsigned));
+   for (unsigned t = 0; t < triangles; ++t) {
+      if (which[t] == 0xffffu)
+         continue;
+      unsigned *slot = &fill[which[t]];
+      memcpy(sorted + *slot, indices + t * 3, 3 * sizeof(uint32_t));
+      *slot += 3;
+   }
+   gex_wgpu_buffer_subdata(&ctx->base, ctx->gs_indices, PIPE_MAP_WRITE, 0,
+                           kept * 4, sorted);
+   FREE(sorted);
+
+   /* One draw per layer that got any triangles, with that layer installed on
+    * every attachment for the length of it. The saved values are the bases
+    * the framebuffer was bound at, which gl_Layer indexes from. */
+   unsigned saved_colors[GEX_WGPU_MAX_COLOR_TARGETS];
+   for (unsigned i = 0; i < GEX_WGPU_MAX_COLOR_TARGETS; ++i)
+      saved_colors[i] = ctx->color_layers[i];
+   const unsigned saved_depth = ctx->depth_layer;
+   unsigned passes = 0;
+   for (unsigned l = 0; l < layer_count; ++l) {
+      if (!counts[l])
+         continue;
+      for (unsigned i = 0; i < ctx->color_count; ++i)
+         ctx->color_layers[i] = saved_colors[i] + l;
+      ctx->depth_layer = saved_depth + l;
+      struct pipe_draw_start_count_bias run;
+      memset(&run, 0, sizeof(run));
+      run.start = starts[l];
+      run.count = counts[l] * 3;
+      gex_wgpu_draw_vbo(&ctx->base, raster, drawid_offset, NULL, &run, 1);
+      ++passes;
+   }
+   for (unsigned i = 0; i < GEX_WGPU_MAX_COLOR_TARGETS; ++i)
+      ctx->color_layers[i] = saved_colors[i];
+   ctx->depth_layer = saved_depth;
+   if (getenv("GEX_WGPU_GS_LOG"))
+      fprintf(stderr, "gex-wgpu: gs routed %u triangles through %u layer(s) "
+              "of %u\n", kept / 3, passes, layer_count);
+   FREE(indices); FREE(which); FREE(counts); FREE(starts); FREE(fill);
+   return true;
+
+give_up:
+   FREE(indices); FREE(which); FREE(counts); FREE(starts); FREE(fill);
+   return false;
+}
+
 /* Sort the geometry shader's output triangles by the viewport each one asked
  * for, and draw them in runs.
  *
@@ -26669,6 +26845,16 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
        index_count % 3 == 0)
       routed = gex_wgpu_gs_route_viewports(ctx, gs, index_count,
                                            &raster, drawid_offset);
+   /* And by gl_Layer, which is the same sort against a different piece of
+    * state -- the attachment's array layer rather than the viewport. Only
+    * when the framebuffer actually has layers to route into; with one layer
+    * GL says every primitive lands on it, which the ordinary draw below
+    * already does. Viewport routing wins if a shader writes both, because it
+    * has already redrawn the list and sorted it. */
+   if (!routed && gs->layer_slot >= 0 && ctx->fb_layer_count > 1 &&
+       raster.mode == MESA_PRIM_TRIANGLES && index_count % 3 == 0)
+      routed = gex_wgpu_gs_route_layers(ctx, gs, index_count,
+                                        &raster, drawid_offset);
    if (!routed)
       gex_wgpu_draw_vbo(&ctx->base, &raster, drawid_offset, NULL, &raster_draw,
                         1);
