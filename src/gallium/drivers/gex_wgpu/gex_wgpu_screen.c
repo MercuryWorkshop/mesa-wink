@@ -1896,6 +1896,10 @@ struct gex_wgpu_shader {
    /* A clone of the vertex shader kept for building transform feedback
     * compute variants, and the variants built from it so far. */
    nir_shader *capture_nir;
+   /* This vertex shader writes a storage block, so its capture variant has to
+    * be dispatched for the side effects even with no transform feedback
+    * bound, and the copy that rasterises has had those writes stripped. */
+   bool writes_storage;
    struct gex_wgpu_capture_variant *captures;
    /* A clone kept for the compute variants that feed a geometry shader, and
     * those variants. Separate from capture_nir because a vertex shader can
@@ -9575,6 +9579,128 @@ gex_wgpu_ignore_sample_mask(nir_shader *nir)
                                      nir_metadata_control_flow, NULL);
 }
 
+/* Does this shader write a storage block?
+ *
+ * WGSL forbids `var<storage, read_write>` in the vertex stage outright, so a
+ * vertex shader that stores to an SSBO is refused by Tint and the program
+ * fails to link. Both spellings have to be counted: the block-number
+ * intrinsics st/mesa emits, and the deref form that survives in shaders whose
+ * accesses were never lowered away. */
+static bool
+gex_wgpu_writes_storage(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_store_ssbo:
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+               return true;
+            case nir_intrinsic_store_deref:
+            case nir_intrinsic_deref_atomic:
+            case nir_intrinsic_deref_atomic_swap: {
+               nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+               nir_variable *var =
+                  deref ? nir_deref_instr_get_variable(deref) : NULL;
+               if (var && var->data.mode == nir_var_mem_ssbo)
+                  return true;
+               break;
+            }
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
+/* Delete a vertex shader's storage writes, for the copy that rasterises.
+ *
+ * The writes still happen: the same shader is dispatched as compute first,
+ * exactly as transform feedback already does and for the same reason. What
+ * rasterises does not need them, because a store has no result -- so removing
+ * them leaves the positions and varyings identical and lets Tint accept the
+ * module.
+ *
+ * An atomic is different: it returns the old value, and a shader that uses
+ * that value would compute something else without it. Refuses in that case
+ * rather than substituting, which is the standing rule here -- the nearest
+ * shape is how Tint and Mesa have been made to abort before.
+ */
+static bool
+gex_wgpu_strip_storage_writes(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      bool touched = false;
+      nir_foreach_block_safe(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            bool atomic = false, storage = false;
+            switch (intr->intrinsic) {
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+               atomic = storage = true;
+               break;
+            case nir_intrinsic_store_ssbo:
+               storage = true;
+               break;
+            case nir_intrinsic_deref_atomic:
+            case nir_intrinsic_deref_atomic_swap:
+            case nir_intrinsic_store_deref: {
+               nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+               nir_variable *var =
+                  deref ? nir_deref_instr_get_variable(deref) : NULL;
+               if (!var || var->data.mode != nir_var_mem_ssbo)
+                  continue;
+               storage = true;
+               atomic = intr->intrinsic != nir_intrinsic_store_deref;
+               break;
+            }
+            default:
+               continue;
+            }
+            if (!storage)
+               continue;
+            if (atomic && !nir_def_is_unused(&intr->def)) {
+               fprintf(stderr, "gex-wgpu: vertex shader declined: an atomic "
+                       "on a storage block whose result it uses; the "
+                       "rasterising copy cannot drop it\n");
+               return false;
+            }
+            nir_instr_remove(instr);
+            touched = progress = true;
+         }
+      }
+      nir_progress(touched, impl, nir_metadata_control_flow);
+   }
+   if (progress) {
+      NIR_PASS(_, nir, nir_opt_dce);
+      /* The blocks stay *declared*, and become read-only.
+       *
+       * Removing them once the stores are gone is the obvious move and is
+       * wrong twice over. It is what tells this shader's collection pass how
+       * many storage blocks there are and at which bindings, and the capture
+       * dispatch reads exactly that to bind the buffers its compute copy
+       * writes -- delete them and the dispatch binds nothing, the module asks
+       * for a binding the layout has not got, and the whole command buffer
+       * goes with the invalid pipeline. Marking them read-only is what lets
+       * them stay: `var<storage, read>` is allowed in the vertex stage, and
+       * it is honest, because after this pass the shader only ever reads. */
+      nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo)
+         var->data.access |= ACCESS_NON_WRITEABLE;
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   }
+   return true;
+}
+
 static bool
 gex_wgpu_neutralise_cull_distances(nir_shader *nir)
 {
@@ -9782,9 +9908,24 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * the compute variant that does the capturing, because WGSL will not let
     * the vertex stage write a storage buffer at all. The clone is taken now,
     * before the render path lowers anything into vertex-stage terms. */
-   if (expected_stage == MESA_SHADER_VERTEX && nir->xfb_info &&
-       nir->xfb_info->output_count)
+   /* ...and for the same reason, a vertex shader that writes a storage block
+    * of its own. Tint refuses `var<storage, read_write>` in the vertex stage
+    * whether the stores came from feedback or from the application, so the
+    * answer is the same: keep the stores in the compute clone, and take them
+    * out of what rasterises. */
+   const bool vs_writes_storage =
+      expected_stage == MESA_SHADER_VERTEX && gex_wgpu_writes_storage(nir);
+   if (expected_stage == MESA_SHADER_VERTEX &&
+       ((nir->xfb_info && nir->xfb_info->output_count) || vs_writes_storage))
       shader->capture_nir = nir_shader_clone(NULL, nir);
+   shader->writes_storage = vs_writes_storage;
+   /* After the clone, so the capture keeps them. Declining here rather than
+    * letting Tint refuse the module means the reason names itself. */
+   if (vs_writes_storage && !gex_wgpu_strip_storage_writes(nir)) {
+      ralloc_free(nir);
+      FREE(shader);
+      return NULL;
+   }
    /* And a clone for the compute variants that feed a geometry shader. Taken
     * unconditionally because whether one will be bound is not known here. */
    if (expected_stage == MESA_SHADER_VERTEX)
@@ -22093,8 +22234,16 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
                               nir_metadata_control_flow, &state);
    nir_shader_intrinsics_pass(nir, gex_wgpu_capture_builtin,
                               nir_metadata_control_flow, &state);
-   nir_shader_intrinsics_pass(nir, gex_wgpu_capture_store,
-                              nir_metadata_control_flow, &state);
+   /* Only when there is something to capture. This variant used to be built
+    * for transform feedback alone, so gex_wgpu_capture_store could read
+    * `shader->xfb_info->output_count` without asking whether the shader had
+    * any -- and it segfaulted the moment a vertex shader that merely writes a
+    * storage block wanted the same dispatch for its side effects. That shader
+    * has no outputs to record; it wants the pass run for the stores it
+    * already contains, and nothing added. */
+   if (nir->xfb_info && nir->xfb_info->output_count)
+      nir_shader_intrinsics_pass(nir, gex_wgpu_capture_store,
+                                 nir_metadata_control_flow, &state);
    nir_shader_intrinsics_pass(nir, gex_wgpu_capture_drop_output,
                               nir_metadata_control_flow, &state);
    if (getenv("GEX_WGPU_XFB_DEBUG")) {
@@ -22109,7 +22258,11 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
                  dbg->outputs[o].offset, dbg->outputs[o].component_mask,
                  dbg->buffers[dbg->outputs[o].buffer].stride);
    }
-   if (state.failed || !state.so_mask) {
+   /* No feedback buffer written is a reason to give up only when feedback is
+    * what the dispatch was for. A vertex shader that writes a storage block
+    * wants this variant for the stores it already contains, and records
+    * nothing, so its so_mask is legitimately zero. */
+   if (state.failed || (!state.so_mask && !vs->writes_storage)) {
       ralloc_free(nir);
       return NULL;
    }
@@ -25246,8 +25399,10 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
     * constant buffers, which live in their own descriptor set -- group 1 for
     * a vertex stage. Without them a capturing shader that reads any uniform
     * would reference a group the dispatch never bound. */
-   WGPUBindGroupLayoutEntry ubo_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS];
-   WGPUBindGroupEntry ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   WGPUBindGroupLayoutEntry ubo_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
+                                        GEX_WGPU_MAX_SHADER_BUFFERS];
+   WGPUBindGroupEntry ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS +
+                                   GEX_WGPU_MAX_SHADER_BUFFERS];
    const unsigned ubo_count = ctx->vs->ubo_count;
    for (unsigned i = 0; i < ubo_count; ++i) {
       const unsigned slot = ctx->vs->ubo_slots[i];
@@ -25271,6 +25426,52 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
          gex_wgpu_constant_binding_size(constant, ctx->vs->ubo_required[i]);
    }
 
+   /* The vertex stage's storage blocks belong in the same group, and until a
+    * shader that writes one wanted this dispatch there was never one to bind:
+    * transform feedback's stores are added by the capture pass and go to the
+    * feedback targets in group 0. The module puts them exactly where the
+    * graphics vertex stage does -- group 1 at ssbo_bindings[i] -- so without
+    * this the pipeline is invalid with "Binding doesn't exist in
+    * BindGroupLayoutInternal" and the whole command buffer goes with it.
+    *
+    * Writable, unlike the graphics side's read-only aliasing dance: this
+    * dispatch is the pass whose entire purpose is to perform the writes, and
+    * it submits on its own. */
+   unsigned ubo_total = ubo_count;
+   for (unsigned i = 0; i < ctx->vs->ssbo_count; ++i) {
+      const unsigned slot = ctx->vs->ssbo_slots[i];
+      const struct pipe_shader_buffer *sb =
+         &ctx->shader_buffers[MESA_SHADER_VERTEX][slot];
+      WGPUBuffer sb_buffer;
+      uint64_t sb_offset, sb_size;
+      if (sb->buffer) {
+         sb_buffer = gex_resource(sb->buffer)->buffer;
+         sb_offset = sb->buffer_offset;
+         sb_size = sb->buffer_size;
+      } else {
+         /* Zeros, as robust_buffer_access_behavior promises for a block with
+          * nothing bound -- the same answer the draw path gives. */
+         sb_buffer = gex_wgpu_placeholder_storage(ctx, 0);
+         sb_offset = 0;
+         sb_size = ctx->placeholder_storage->width0;
+         if (!sb_buffer) {
+            gex_fail(ctx);
+            return false;
+         }
+      }
+      ubo_entries[ubo_total] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      ubo_entries[ubo_total].binding = ctx->vs->ssbo_bindings[i];
+      ubo_entries[ubo_total].visibility = WGPUShaderStage_Compute;
+      ubo_entries[ubo_total].buffer.type = WGPUBufferBindingType_Storage;
+      ubo_bindings[ubo_total] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      ubo_bindings[ubo_total].binding = ctx->vs->ssbo_bindings[i];
+      ubo_bindings[ubo_total].buffer = sb_buffer;
+      ubo_bindings[ubo_total].offset = sb_offset;
+      ubo_bindings[ubo_total].size = ALIGN_POT(sb_size, 4);
+      ++ubo_total;
+   }
+
    /* Two writable storage bindings over one range is refused by WebGPU with a
     * validation error, which takes the command buffer -- so this path checks
     * for it too. It builds its layout by hand rather than through
@@ -25291,7 +25492,7 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       wgpuDeviceCreateBindGroupLayout(screen->device, &layout_desc);
    WGPUBindGroupLayoutDescriptor ubo_layout_desc =
       WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
-   ubo_layout_desc.entryCount = ubo_count;
+   ubo_layout_desc.entryCount = ubo_total;
    ubo_layout_desc.entries = ubo_entries;
    WGPUBindGroupLayout ubo_layout =
       wgpuDeviceCreateBindGroupLayout(screen->device, &ubo_layout_desc);
@@ -25318,7 +25519,7 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    WGPUBindGroup group = wgpuDeviceCreateBindGroup(screen->device, &group_desc);
    WGPUBindGroupDescriptor ubo_group_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
    ubo_group_desc.layout = ubo_layout;
-   ubo_group_desc.entryCount = ubo_count;
+   ubo_group_desc.entryCount = ubo_total;
    ubo_group_desc.entries = ubo_bindings;
    WGPUBindGroup ubo_group =
       wgpuDeviceCreateBindGroup(screen->device, &ubo_group_desc);
@@ -33493,7 +33694,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* The draw goes ahead whether or not the capture could run. A capture
     * this driver cannot do is one case's wrong answer; abandoning the draw
     * as well made it two, and the second was silent. */
-   if (ctx->so_target_count && ctx->vs->capture_nir)
+   /* ...and a vertex shader that writes a storage block of its own needs the
+    * same dispatch even with no feedback bound: that pass is where its stores
+    * actually happen, the rasterising copy having had them stripped. */
+   if ((ctx->so_target_count || ctx->vs->writes_storage) &&
+       ctx->vs->capture_nir)
       (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
    if (discard)
       return;
