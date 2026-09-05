@@ -850,6 +850,13 @@ struct gex_wgpu_stage_textures {
    uint32_t sampler_bindings[GEX_WGPU_MAX_SAMPLERS];
    WGPUTextureViewDimension dimensions[GEX_WGPU_MAX_SAMPLERS];
    WGPUTextureSampleType sample_types[GEX_WGPU_MAX_SAMPLERS];
+   /* Part of the layout, not of the sample type. WebGPU checks it against the
+    * bound view and rejects the pair by name -- "Binding multisampled flag
+    * (0) doesn't match the layout's multisampled flag (1)" -- so a
+    * sampler2DMS in one of these stages produced an invalid pipeline and took
+    * the command buffer with it. The collector already worked this out for
+    * the sample type and then threw it away. */
+   bool multisampled[GEX_WGPU_MAX_SAMPLERS];
 };
 
 /* Spelled as a literal above because it is used in binding arithmetic before
@@ -17718,6 +17725,7 @@ gex_wgpu_collect_stage_textures(nir_shader *nir,
          : (sint_slots & (1u << slot)) ? WGPUTextureSampleType_Sint
          : multisampled ? WGPUTextureSampleType_UnfilterableFloat
                         : WGPUTextureSampleType_Float;
+      out->multisampled[out->count] = multisampled;
       ++out->count;
    }
    return true;
@@ -24394,6 +24402,9 @@ struct gex_wgpu_bindings {
     * only bind buffers -- so a geometry or tessellation shader that sampled a
     * texture had to be refused. */
    uint64_t texture_mask;
+   /* Which of those are multisampled; the layout must say so or WebGPU
+    * refuses the binding against it. */
+   uint64_t multisampled_mask;
    uint64_t sampler_mask;
    WGPUTextureView view[GEX_WGPU_MAX_GROUP_BINDINGS];
    WGPUSampler sampler[GEX_WGPU_MAX_GROUP_BINDINGS];
@@ -24486,6 +24497,8 @@ gex_wgpu_bind_textures_from(struct pipe_context *pipe,
       unsigned at = group->count++;
       group->binding[at] = textures->bindings[i];
       group->texture_mask |= UINT64_C(1) << at;
+      if (textures->multisampled[i])
+         group->multisampled_mask |= UINT64_C(1) << at;
       group->sample_type[at] = sample_type;
       group->view_dimension[at] = textures->dimensions[i];
       group->view[at] =
@@ -24504,10 +24517,19 @@ gex_wgpu_bind_textures_from(struct pipe_context *pipe,
             ? WGPUSamplerBindingType_Filtering
             : WGPUSamplerBindingType_NonFiltering;
       /* A slot with no sampler state bound still needs one, and the
-       * texture's own default is what st/mesa would have sent. */
+       * texture's own default is what st/mesa would have sent.
+       *
+       * The non-filtering twin goes with the *binding type*, not with the
+       * depth case alone. An integer or multisampled texture is
+       * UnfilterableFloat/Uint/Sint here, so its binding is NonFiltering, and
+       * WebGPU then refuses the application's ordinary sampler against it:
+       * "Filtering sampler is incompatible with non-filtering sampler
+       * binding". Depth was simply the first shape to reach it. */
+      const bool wants_nonfiltering =
+         group->sampler_type[at] == WGPUSamplerBindingType_NonFiltering;
       group->sampler[at] = sampler
-         ? (depth_as_float && sampler->nonfiltering ? sampler->nonfiltering
-                                                    : sampler->sampler)
+         ? (wants_nonfiltering && sampler->nonfiltering
+               ? sampler->nonfiltering : sampler->sampler)
          : NULL;
       if (!group->sampler[at]) {
          if (getenv("GEX_WGPU_STAGE_TEXTURE_LOG"))
@@ -24565,6 +24587,8 @@ gex_wgpu_group_layout(WGPUDevice device, const struct gex_wgpu_bindings *group)
       if (group->texture_mask & (UINT64_C(1) << i)) {
          entries[i].texture.sampleType = group->sample_type[i];
          entries[i].texture.viewDimension = group->view_dimension[i];
+         entries[i].texture.multisampled =
+            (group->multisampled_mask & (UINT64_C(1) << i)) != 0;
          continue;
       }
       if (group->sampler_mask & (UINT64_C(1) << i)) {
@@ -26335,8 +26359,20 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    if (slot_table)
       gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_INDEX_BINDING,
                             slot_table);
+   /* Separately, and before the chain below, because a texture the capture
+    * pass cannot bind is a *decline* and not a driver failure. Until the
+    * capture learned to sample, such a shader was refused when its variant
+    * was built -- which declined -- so folding the bind into the chain that
+    * ends in gex_fail turned that decline into a context latch, and a latch
+    * costs every case after it. KHR-GL45.texture_view found it: a sampler
+    * view the driver would not make left the slot empty, and the whole
+    * family died on the first one. */
+   if (!gex_wgpu_bind_varying_textures(ctx, variant, &vs_group0)) {
+      pipe_resource_reference(&vs_params, NULL);
+      pipe_resource_reference(&slot_table, NULL);
+      GEX_GS_DECLINE("a texture the vertex capture pass reads is unbound");
+   }
    bool ok = vs_params &&
-             gex_wgpu_bind_varying_textures(ctx, variant, &vs_group0) &&
              gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
                                      ctx->vs->ubo_count, ctx->vs->ubo_slots,
                                      ctx->vs->ubo_bindings,
@@ -26953,8 +26989,19 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                          ctx->tess_vs_out);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
                          vs_params);
+   /* Separately, and before the chain below, because a texture the capture
+    * pass cannot bind is a *decline* and not a driver failure. Until the
+    * capture learned to sample, such a shader was refused when its variant
+    * was built -- which declined -- so folding the bind into the chain that
+    * ends in gex_fail turned that decline into a context latch, and a latch
+    * costs every case after it. KHR-GL45.texture_view found it: a sampler
+    * view the driver would not make left the slot empty, and the whole
+    * family died on the first one. */
+   if (!gex_wgpu_bind_varying_textures(ctx, vs_variant, &vs_group0)) {
+      pipe_resource_reference(&vs_params, NULL);
+      GEX_TESS_DECLINE("a texture the vertex capture pass reads is unbound");
+   }
    bool ok = vs_params &&
-             gex_wgpu_bind_varying_textures(ctx, vs_variant, &vs_group0) &&
              gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
                                      ctx->vs->ubo_count, ctx->vs->ubo_slots,
                                      ctx->vs->ubo_bindings,
@@ -28891,7 +28938,12 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
    }
    if (ctx->alias_copy_count < ARRAY_SIZE(ctx->alias_copies)) {
       const unsigned at = ctx->alias_copy_count++;
-      ctx->alias_copies[at].resource = resource;
+      /* A reference, for the reason gex_wgpu_packed_image_scratch takes one:
+       * this copy outlives the draw that asked for it, and a draw that
+       * declines never reaches the batch that would otherwise keep the
+       * resource alive. */
+      ctx->alias_copies[at].resource = NULL;
+      pipe_resource_reference(&ctx->alias_copies[at].resource, resource);
       ctx->alias_copies[at].level = level;
       ctx->alias_copies[at].first_layer = iv->u.tex.first_layer;
    }
@@ -28906,6 +28958,8 @@ gex_wgpu_flush_image_aliases(struct gex_wgpu_context *ctx,
    if (!ctx->alias_copy_count)
       return;
    if (!encoder) {
+      for (unsigned i = 0; i < ctx->alias_copy_count; ++i)
+         pipe_resource_reference(&ctx->alias_copies[i].resource, NULL);
       ctx->alias_copy_count = 0;
       return;
    }
@@ -28937,6 +28991,8 @@ gex_wgpu_flush_image_aliases(struct gex_wgpu_context *ctx,
       wgpuCommandEncoderCopyBufferToTexture(encoder, &through, &into, &extent);
       ++gex->write_serial;
    }
+   for (unsigned i = 0; i < ctx->alias_copy_count; ++i)
+      pipe_resource_reference(&ctx->alias_copies[i].resource, NULL);
    ctx->alias_copy_count = 0;
 }
 
