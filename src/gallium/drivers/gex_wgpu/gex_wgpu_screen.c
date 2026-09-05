@@ -2082,6 +2082,14 @@ struct gex_wgpu_gs {
    uint32_t passthrough_skip;
    unsigned max_output_prims;
    unsigned indices_per_prim;
+   /* layout(invocations = N): every input primitive is run N times, with
+    * gl_InvocationID telling the shader which run it is. The compute pass
+    * dispatches prims * invocations invocations and divides the flat id back
+    * into the two -- the quotient picks the input primitive, the remainder is
+    * gl_InvocationID -- while the *output* slice stays one per compute
+    * invocation, which is what makes the emit path need no change at all.
+    * One for a shader that does not ask for it, so the arithmetic folds. */
+   unsigned invocations;
    /* What this shader captures, kept because the module build below clears
     * nir->xfb_info once the geometry shader has become a compute shader --
     * and the capture pass, which is built lazily on the first draw that
@@ -21750,8 +21758,12 @@ gex_wgpu_gs_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *vertex = deref->arr.index.ssa;
+   /* The input primitive, not the compute invocation: with instancing there
+    * are `invocations` of the latter per one of the former. */
    nir_def *index =
-      nir_iadd(b, nir_imul_imm(b, gex_wgpu_gs_invocation(b),
+      nir_iadd(b, nir_imul_imm(b,
+                               nir_udiv_imm(b, gex_wgpu_gs_invocation(b),
+                                            state->gs->invocations),
                                state->gs->verts_per_input_prim),
                vertex);
    nir_def *byte =
@@ -21917,15 +21929,17 @@ gex_wgpu_gs_builtin(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_load_primitive_id: {
       nir_deref_instr *words = gex_wgpu_block_words(b, state->params);
       value = nir_iadd(
-         b, gex_wgpu_gs_invocation(b),
+         b, nir_udiv_imm(b, gex_wgpu_gs_invocation(b),
+                         state->gs->invocations),
          nir_load_deref(b, nir_build_deref_array(
                               b, words,
                               nir_imm_int(b, GEX_WGPU_GS_PARAM_ID_BASE))));
       break;
    }
    case nir_intrinsic_load_invocation_id:
-      /* Geometry shader instancing is refused when the shader is created. */
-      value = nir_imm_int(b, 0);
+      /* The remainder: which run of this primitive this invocation is. */
+      value = nir_umod_imm(b, gex_wgpu_gs_invocation(b),
+                           state->gs->invocations);
       break;
    default:
       return false;
@@ -23821,8 +23835,6 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       refusal = "gex_wgpu geometry shaders must output points, a line strip or a triangle strip";
    else if (!input_kind)
       refusal = "gex_wgpu geometry shaders must take points, lines or triangles";
-   else if (nir->info.gs.invocations > 1)
-      refusal = "gex_wgpu does not implement geometry shader instancing";
    else if (nir->info.gs.active_stream_mask & ~1u)
       refusal = "gex_wgpu geometry shaders may only write stream zero";
    /* A triangle strip needs three vertices before it closes anything; a line
@@ -23878,6 +23890,7 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
     * stride of the fetch into the captured vertex-shader outputs. */
    gs->verts_per_input_prim = input_kind->verts;
    gs->input_list_prim = input_kind->list;
+   gs->invocations = MAX2(1u, (unsigned)nir->info.gs.invocations);
    gs->indices_per_prim = output_kind->indices;
    gs->max_output_prims =
       gs->max_vertices - (output_kind->least_vertices - 1);
@@ -26540,6 +26553,15 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
        captured / instances != assembled ||
        assembled / gs->verts_per_input_prim != prims_per_instance)
       GEX_GS_DECLINE("an instanced draw too large to lay out");
+   /* How many times the shader body runs, which is the *primitive* count
+    * multiplied by layout(invocations = N). Every buffer the pass writes is
+    * sized in these -- one output slice, one emitted-count slot and one run
+    * of indices each -- while `prims` stays the number of input primitives,
+    * which is what gl_PrimitiveIDIn counts and what the primitive-id base
+    * advances by. Equal for a shader that does not use instancing. */
+   const unsigned runs = prims * gs->invocations;
+   if (runs / gs->invocations != prims)
+      GEX_GS_DECLINE("an instanced geometry shader too large to lay out");
    /* A draw whose topology is the shader's own and that names its vertices
     * directly needs no assembly: slot N is vertex N. Everything else -- a
     * strip, a fan, a loop, any indexed draw -- is resolved into a table. */
@@ -26553,7 +26575,7 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
       MAX2(gex_wgpu_varying_stride(&gs->inputs), 16u);
    const unsigned gs_stride = gex_wgpu_varying_stride(&gs->outputs);
    const unsigned index_count =
-      prims * gs->max_output_prims * gs->indices_per_prim;
+      runs * gs->max_output_prims * gs->indices_per_prim;
    if (!prims || !index_count || !gs_stride)
       GEX_GS_DECLINE("nothing to draw, or a geometry shader with no outputs");
 
@@ -26655,15 +26677,15 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
        !gex_wgpu_ensure_buffer(ctx, &ctx->gs_vs_out, captured * vs_stride,
                                PIPE_BIND_SHADER_BUFFER) ||
        !gex_wgpu_ensure_buffer(ctx, &ctx->gs_vertices,
-                               prims * gs->max_vertices * gs_stride,
+                               runs * gs->max_vertices * gs_stride,
                                PIPE_BIND_VERTEX_BUFFER |
                                PIPE_BIND_SHADER_BUFFER) ||
        !gex_wgpu_ensure_buffer(ctx, &ctx->gs_indices, index_count * 4,
                                PIPE_BIND_INDEX_BUFFER |
                                PIPE_BIND_SHADER_BUFFER) ||
-       !gex_wgpu_ensure_buffer(ctx, &ctx->gs_counts, prims * 4,
+       !gex_wgpu_ensure_buffer(ctx, &ctx->gs_counts, runs * 4,
                                PIPE_BIND_SHADER_BUFFER) ||
-       !gex_wgpu_ensure_buffer(ctx, &ctx->gs_offsets, (prims + 1) * 4,
+       !gex_wgpu_ensure_buffer(ctx, &ctx->gs_offsets, (runs + 1) * 4,
                                PIPE_BIND_SHADER_BUFFER))
       GEX_GS_DECLINE("could not build the variant or its buffers");
 
@@ -26732,7 +26754,7 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
     * primitive. The index buffer is zeroed first, so a slot no invocation
     * writes holds three equal indices -- a degenerate triangle. */
    uint32_t gs_params[GEX_WGPU_GS_PARAM_WORDS] = {0};
-   gs_params[GEX_WGPU_GS_PARAM_PRIMITIVES] = prims;
+   gs_params[GEX_WGPU_GS_PARAM_PRIMITIVES] = runs;
    gs_params[GEX_WGPU_GS_PARAM_ID_BASE] =
       ctx->gs_primitive_base_active ? ctx->gs_primitive_base : 0;
    if (ctx->gs_primitive_base_active)
@@ -26759,7 +26781,7 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    if (ok)
       ok = gex_wgpu_dispatch(ctx, gs->module, &gs_group0, &gs_group1,
                              ctx->gs_indices,
-                             DIV_ROUND_UP(prims, GEX_WGPU_GS_GROUP));
+                             DIV_ROUND_UP(runs, GEX_WGPU_GS_GROUP));
    pipe_resource_reference(&gs_param_buffer, NULL);
    if (!ok) {
       gex_fail(ctx);
@@ -26770,14 +26792,14 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
     * a draw with a geometry shader -- the geometry stage is the last one
     * before rasterization, so its output is the captured one. */
    if (ctx->so_target_count && gs->xfb) {
-      if (!gex_wgpu_gs_capture(ctx, gs, prims))
+      if (!gex_wgpu_gs_capture(ctx, gs, runs))
          return false;
    } else if (ctx->active_queries[GEX_WGPU_QUERY_GENERATED]) {
       /* GL_PRIMITIVES_GENERATED counts the last stage before rasterization,
        * so with a geometry shader bound it is that stage's output and not the
        * draw's vertex count -- a number only the geometry pass has. Nothing
        * is being recorded here, so the scan runs for the total alone. */
-      if (!gex_wgpu_gs_scan(ctx, prims))
+      if (!gex_wgpu_gs_scan(ctx, runs))
          return false;
       /* Only what was produced: nothing is recorded, so the written count
        * this draw contributes is zero and its query is left alone. */
