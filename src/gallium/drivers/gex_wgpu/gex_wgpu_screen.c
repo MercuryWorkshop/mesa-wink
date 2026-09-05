@@ -948,6 +948,38 @@ struct gex_wgpu_stage_textures {
    bool multisampled[GEX_WGPU_MAX_SAMPLERS];
 };
 
+/* The images one stage declares, in the form the bind group layout needs.
+ *
+ * Shared by the compute stage and the compute-emulated ones. GL puts image
+ * uniforms in every stage; the emulated stages run as compute passes, where a
+ * writable storage texture is allowed, so nothing but the collection and the
+ * binding stood between the geometry stage and the images it is entitled to.
+ *
+ * Three fields per image because WGSL puts format, access and view dimension
+ * all in the storage texture's type, and the layout has to name exactly the
+ * same ones or the device rejects the group. */
+struct gex_wgpu_stage_images {
+   unsigned count;
+   uint8_t slots[GEX_WGPU_MAX_SHADER_IMAGES];
+   uint32_t bindings[GEX_WGPU_MAX_SHADER_IMAGES];
+   enum pipe_format formats[GEX_WGPU_MAX_SHADER_IMAGES];
+   WGPUStorageTextureAccess access[GEX_WGPU_MAX_SHADER_IMAGES];
+   WGPUTextureViewDimension dimensions[GEX_WGPU_MAX_SHADER_IMAGES];
+   /* Declared with no format qualifier, which GLSL permits only on a
+    * write-only image; the format comes from the image unit at dispatch. See
+    * gex_wgpu_resolve_unformatted_images. */
+   uint16_t unformatted;
+   /* Images served through a storage buffer the shader packs, because WebGPU
+    * has no storage texture for the format, or no read_write access for it.
+    * See GEX_WGPU_PACKED_IMAGE_FIRST_BINDING. */
+   unsigned packed_count;
+   uint8_t packed_slots[GEX_WGPU_MAX_SHADER_IMAGES];
+   uint32_t packed_bindings[GEX_WGPU_MAX_SHADER_IMAGES];
+   enum pipe_format packed_formats[GEX_WGPU_MAX_SHADER_IMAGES];
+   bool packed_read[GEX_WGPU_MAX_SHADER_IMAGES];
+   bool packed_write[GEX_WGPU_MAX_SHADER_IMAGES];
+};
+
 /* Spelled as a literal above because it is used in binding arithmetic before
  * this point; kept honest here rather than by hoping. */
 static_assert(GEX_WGPU_MAX_BUFFER_TEXTURES == GEX_WGPU_MAX_SAMPLERS,
@@ -2147,6 +2179,11 @@ struct gex_wgpu_gs {
    /* The sampled textures this geometry shader declares; see
     * gex_wgpu_collect_stage_textures. */
    struct gex_wgpu_stage_textures textures;
+   /* And the images. GL 4.2 puts image uniforms in every stage, and this one
+    * runs as a compute pass, where WebGPU allows a writable storage texture
+    * -- so nothing but the table and the binding was missing. See
+    * gex_wgpu_collect_stage_images. */
+   struct gex_wgpu_stage_images images;
    nir_shader *nir;
    /* What the geometry shader reads from the vertex shader, and what it
     * writes for the rasterization draw. */
@@ -18741,6 +18778,125 @@ gex_wgpu_collect_stage_textures(nir_shader *nir,
    return true;
 }
 
+/* The images a compute or compute-emulated stage declares.
+ *
+ * Lifted out of create_compute_state so the geometry stage can have the same
+ * table: it runs as a compute pass, so a writable storage texture is legal
+ * there, and the collection was the only thing it lacked. `stage` names the
+ * caller in the refusals, which are by name on purpose -- substituting the
+ * nearest shape for one WebGPU has no storage texture for aborts inside Tint
+ * rather than here. */
+static bool
+gex_wgpu_collect_stage_images(nir_shader *nir,
+                              struct gex_wgpu_stage_images *out,
+                              const char *stage)
+{
+   memset(out, 0, sizeof(*out));
+   /* The same collection the graphics stages do, with the same two refusals:
+    * WebGPU allows read_write storage only on the 32-bit single-channel
+    * formats, and not every GL image format is a WebGPU storage texture. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_image) {
+      const struct glsl_type *image_type = glsl_without_array(var->type);
+      if (!glsl_type_is_image(image_type))
+         continue;
+      if (out->count >= GEX_WGPU_MAX_SHADER_IMAGES) {
+         fprintf(stderr, "gex-wgpu: %s shader rejected: more than %u "
+                 "images\n", stage, (unsigned)GEX_WGPU_MAX_SHADER_IMAGES);
+         return false;
+      }
+      const enum pipe_format image_format = var->data.image.format;
+      const bool no_write = (var->data.access & ACCESS_NON_WRITEABLE) != 0;
+      const bool no_read = (var->data.access & ACCESS_NON_READABLE) != 0;
+      /* Before both refusals below, because it lifts both of them here: a
+       * dispatch can copy the texture into the buffer beforehand, so a read
+       * image is servable and neither the format's absence from WebGPU's
+       * storage list nor its lack of read_write access is fatal. */
+      if (gex_wgpu_image_is_packed(
+             image_format, no_read, no_write,
+             glsl_get_sampler_dim(image_type), true,
+             gex_wgpu_image_has_atomic(nir, var->data.driver_location))) {
+         const unsigned at = out->packed_count;
+         const unsigned slot = var->data.driver_location;
+         if (slot >= GEX_WGPU_MAX_SHADER_IMAGES) {
+            fprintf(stderr, "gex-wgpu: %s packed image slot=%u above "
+                    "max=%u\n", stage, slot, (unsigned)GEX_WGPU_MAX_SHADER_IMAGES);
+            return false;
+         }
+         out->packed_slots[at] = (uint8_t)slot;
+         out->packed_bindings[at] =
+            GEX_WGPU_PACKED_IMAGE_FIRST_BINDING + slot;
+         out->packed_formats[at] = image_format;
+         /* An atomic reads as well as writes; see the graphics path. */
+         out->packed_read[at] =
+            !no_read || gex_wgpu_image_has_atomic(nir,
+                                                  var->data.driver_location);
+         out->packed_write[at] = !no_write ||
+            gex_wgpu_image_has_atomic(nir, var->data.driver_location);
+         ++out->packed_count;
+         continue;
+      }
+      if (!no_write && !no_read &&
+          !gex_wgpu_storage_format_is_read_write(image_format)) {
+         fprintf(stderr, "gex-wgpu: %s image '%s' is read *and* written, "
+                 "which WebGPU allows only for r32ui/r32i/r32f (this is %s)\n", stage,
+                 var->name ? var->name : "(anon)",
+                 util_format_short_name(image_format));
+         return false;
+      }
+      /* No format qualifier at all is not the same as a format WebGPU cannot
+       * store: it is a format that is not known *yet*. GLSL permits it only
+       * on a write-only image, and the format then comes from the image unit
+       * at dispatch. Resolved there; see unformatted_images. */
+      const bool unformatted = image_format == PIPE_FORMAT_NONE && no_read;
+      /* Read-only needs no storage format; see the note in the graphics
+       * path's copy of this check. */
+      if (!no_write && !unformatted &&
+          gex_wgpu_storage_texture_format(image_format) ==
+          WGPUTextureFormat_Undefined) {
+         fprintf(stderr, "gex-wgpu: %s image '%s' has format %s, which "
+                 "WebGPU cannot take as a storage texture (and it is written, "
+                 "so it cannot be a sampled one either)\n", stage,
+                 var->name ? var->name : "(anon)",
+                 util_format_short_name(image_format));
+         return false;
+      }
+      const unsigned at = out->count;
+      out->slots[at] = (uint8_t)var->data.driver_location;
+      out->bindings[at] = var->data.binding;
+      out->formats[at] = image_format;
+      out->access[at] = no_read ? WGPUStorageTextureAccess_WriteOnly
+                                : no_write ? WGPUStorageTextureAccess_ReadOnly
+                                           : WGPUStorageTextureAccess_ReadWrite;
+      const enum glsl_sampler_dim dim = glsl_get_sampler_dim(image_type);
+      out->dimensions[at] =
+         gex_wgpu_image_view_dimension(dim,
+                                       glsl_sampler_type_is_array(image_type));
+      if (getenv("GEX_WGPU_IMAGE_LOG"))
+         fprintf(stderr, "gex-image: %s '%s' slot=%u binding=%u "
+                 "access=0x%x fmt=%s -> %s\n", stage,
+                 var->name ? var->name : "(anon)",
+                 (unsigned)out->slots[at],
+                 out->bindings[at], (unsigned)var->data.access,
+                 util_format_short_name(image_format),
+                 out->access[at] == WGPUStorageTextureAccess_ReadOnly
+                    ? "ReadOnly"
+                 : out->access[at] ==
+                      WGPUStorageTextureAccess_WriteOnly ? "WriteOnly"
+                                                         : "ReadWrite");
+      if (unformatted)
+         out->unformatted |= (uint16_t)1u << at;
+      if (out->dimensions[at] == WGPUTextureViewDimension_Undefined) {
+         fprintf(stderr, "gex-wgpu: %s image '%s' is a shape WGSL has no "
+                 "storage texture for (dim %u%s); only 1d, 2d, 2d array and "
+                 "3d exist\n", stage, var->name ? var->name : "(anon)", (unsigned)dim,
+                 glsl_sampler_type_is_array(image_type) ? " array" : "");
+         return false;
+      }
+      ++out->count;
+   }
+   return true;
+}
+
 /* Whether a shader samples a texture at all.
  *
  * The geometry and tessellation stages run as *compute* passes here, and
@@ -18927,28 +19083,12 @@ struct gex_wgpu_compute_state {
    unsigned binding_count;
    struct gex_wgpu_compute_binding
       bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_BUFFERS];
-   /* Shader images, carried with their format, access and dimension for the
-    * same reason the graphics stages carry them: WGSL puts all three in the
-    * storage texture's type and the bind group layout has to name the same
-    * ones. launch_grid used to bind storage buffers and nothing else, so
-    * max_shader_images was fragment-only and ARB_shader_image_load_store
-    * stopped at the fragment stage. */
-   unsigned image_count;
-   uint8_t image_slots[GEX_WGPU_MAX_SHADER_IMAGES];
-   uint32_t image_bindings[GEX_WGPU_MAX_SHADER_IMAGES];
-   enum pipe_format image_formats[GEX_WGPU_MAX_SHADER_IMAGES];
-   WGPUStorageTextureAccess image_access[GEX_WGPU_MAX_SHADER_IMAGES];
-   WGPUTextureViewDimension image_dimensions[GEX_WGPU_MAX_SHADER_IMAGES];
-   /* Images served through a storage buffer -- see
-    * GEX_WGPU_PACKED_IMAGE_FIRST_BINDING. A dispatch takes the read case as
-    * well as the write-only one, because the copy in needs no pass broken
-    * open. */
-   unsigned packed_image_count;
-   uint8_t packed_image_slots[GEX_WGPU_MAX_SHADER_IMAGES];
-   uint32_t packed_image_bindings[GEX_WGPU_MAX_SHADER_IMAGES];
-   enum pipe_format packed_image_formats[GEX_WGPU_MAX_SHADER_IMAGES];
-   bool packed_image_read[GEX_WGPU_MAX_SHADER_IMAGES];
-   bool packed_image_write[GEX_WGPU_MAX_SHADER_IMAGES];
+   /* Shader images. launch_grid used to bind storage buffers and nothing
+    * else, so a compute image would have been declared with no entry behind
+    * it and max_shader_images was fragment-only; it now builds a view and a
+    * layout entry per image the way the graphics stages do. The table is
+    * shared with the compute-emulated stages, which need the same one. */
+   struct gex_wgpu_stage_images images;
    /* Sampled textures, which a compute shader may have like any other stage.
     * GL 4.3's compute shaders sample as freely as a fragment shader does, and
     * a renderer doing its post-processing in compute does little else. This
@@ -18988,7 +19128,7 @@ struct gex_wgpu_compute_state {
     * 250 of shading_language_420pack's cases -- every one of them a test of
     * something else entirely that happened to use `writeonly uniform image2D`
     * as its output. */
-   uint16_t unformatted_images;
+   /* (the mask itself lives in `images.unformatted`.) */
    /* Buffer textures, which are not textures as far as WebGPU is concerned:
     * a samplerBuffer becomes a read-only storage buffer and its texelFetch
     * becomes word loads. The texel word count comes from the *bound* view's
@@ -19140,117 +19280,10 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
       ++compute->binding_count;
    }
 
-   /* The same collection the graphics stages do, with the same two refusals:
-    * WebGPU allows read_write storage only on the 32-bit single-channel
-    * formats, and not every GL image format is a WebGPU storage texture. */
-   nir_foreach_variable_with_modes(var, nir, nir_var_image) {
-      const struct glsl_type *image_type = glsl_without_array(var->type);
-      if (!glsl_type_is_image(image_type))
-         continue;
-      if (compute->image_count >= GEX_WGPU_MAX_SHADER_IMAGES) {
-         fprintf(stderr, "gex-wgpu: compute shader rejected: more than %u "
-                 "images\n", (unsigned)GEX_WGPU_MAX_SHADER_IMAGES);
-         ralloc_free(nir);
-         FREE(compute);
-         return NULL;
-      }
-      const enum pipe_format image_format = var->data.image.format;
-      const bool no_write = (var->data.access & ACCESS_NON_WRITEABLE) != 0;
-      const bool no_read = (var->data.access & ACCESS_NON_READABLE) != 0;
-      /* Before both refusals below, because it lifts both of them here: a
-       * dispatch can copy the texture into the buffer beforehand, so a read
-       * image is servable and neither the format's absence from WebGPU's
-       * storage list nor its lack of read_write access is fatal. */
-      if (gex_wgpu_image_is_packed(
-             image_format, no_read, no_write,
-             glsl_get_sampler_dim(image_type), true,
-             gex_wgpu_image_has_atomic(nir, var->data.driver_location))) {
-         const unsigned at = compute->packed_image_count;
-         const unsigned slot = var->data.driver_location;
-         if (slot >= GEX_WGPU_MAX_SHADER_IMAGES) {
-            fprintf(stderr, "gex-wgpu: compute packed image slot=%u above "
-                    "max=%u\n", slot, (unsigned)GEX_WGPU_MAX_SHADER_IMAGES);
-            ralloc_free(nir);
-            FREE(compute);
-            return NULL;
-         }
-         compute->packed_image_slots[at] = (uint8_t)slot;
-         compute->packed_image_bindings[at] =
-            GEX_WGPU_PACKED_IMAGE_FIRST_BINDING + slot;
-         compute->packed_image_formats[at] = image_format;
-         /* An atomic reads as well as writes; see the graphics path. */
-         compute->packed_image_read[at] =
-            !no_read || gex_wgpu_image_has_atomic(nir,
-                                                  var->data.driver_location);
-         compute->packed_image_write[at] = !no_write ||
-            gex_wgpu_image_has_atomic(nir, var->data.driver_location);
-         ++compute->packed_image_count;
-         continue;
-      }
-      if (!no_write && !no_read &&
-          !gex_wgpu_storage_format_is_read_write(image_format)) {
-         fprintf(stderr, "gex-wgpu: compute image '%s' is read *and* written, "
-                 "which WebGPU allows only for r32ui/r32i/r32f (this is %s)\n",
-                 var->name ? var->name : "(anon)",
-                 util_format_short_name(image_format));
-         ralloc_free(nir);
-         FREE(compute);
-         return NULL;
-      }
-      /* No format qualifier at all is not the same as a format WebGPU cannot
-       * store: it is a format that is not known *yet*. GLSL permits it only
-       * on a write-only image, and the format then comes from the image unit
-       * at dispatch. Resolved there; see unformatted_images. */
-      const bool unformatted = image_format == PIPE_FORMAT_NONE && no_read;
-      /* Read-only needs no storage format; see the note in the graphics
-       * path's copy of this check. */
-      if (!no_write && !unformatted &&
-          gex_wgpu_storage_texture_format(image_format) ==
-          WGPUTextureFormat_Undefined) {
-         fprintf(stderr, "gex-wgpu: compute image '%s' has format %s, which "
-                 "WebGPU cannot take as a storage texture (and it is written, "
-                 "so it cannot be a sampled one either)\n",
-                 var->name ? var->name : "(anon)",
-                 util_format_short_name(image_format));
-         ralloc_free(nir);
-         FREE(compute);
-         return NULL;
-      }
-      const unsigned at = compute->image_count;
-      compute->image_slots[at] = (uint8_t)var->data.driver_location;
-      compute->image_bindings[at] = var->data.binding;
-      compute->image_formats[at] = image_format;
-      compute->image_access[at] = no_read ? WGPUStorageTextureAccess_WriteOnly
-                                : no_write ? WGPUStorageTextureAccess_ReadOnly
-                                           : WGPUStorageTextureAccess_ReadWrite;
-      const enum glsl_sampler_dim dim = glsl_get_sampler_dim(image_type);
-      compute->image_dimensions[at] =
-         gex_wgpu_image_view_dimension(dim,
-                                       glsl_sampler_type_is_array(image_type));
-      if (getenv("GEX_WGPU_IMAGE_LOG"))
-         fprintf(stderr, "gex-image: compute '%s' slot=%u binding=%u "
-                 "access=0x%x fmt=%s -> %s\n",
-                 var->name ? var->name : "(anon)",
-                 (unsigned)compute->image_slots[at],
-                 compute->image_bindings[at], (unsigned)var->data.access,
-                 util_format_short_name(image_format),
-                 compute->image_access[at] == WGPUStorageTextureAccess_ReadOnly
-                    ? "ReadOnly"
-                 : compute->image_access[at] ==
-                      WGPUStorageTextureAccess_WriteOnly ? "WriteOnly"
-                                                         : "ReadWrite");
-      if (unformatted)
-         compute->unformatted_images |= (uint16_t)1u << at;
-      if (compute->image_dimensions[at] == WGPUTextureViewDimension_Undefined) {
-         fprintf(stderr, "gex-wgpu: compute image '%s' is a shape WGSL has no "
-                 "storage texture for (dim %u%s); only 1d, 2d, 2d array and "
-                 "3d exist\n", var->name ? var->name : "(anon)", (unsigned)dim,
-                 glsl_sampler_type_is_array(image_type) ? " array" : "");
-         ralloc_free(nir);
-         FREE(compute);
-         return NULL;
-      }
-      ++compute->image_count;
+   if (!gex_wgpu_collect_stage_images(nir, &compute->images, "compute")) {
+      ralloc_free(nir);
+      FREE(compute);
+      return NULL;
    }
 
    if (getenv("GEX_WGPU_COMPUTE_LAYOUT_TRACE")) {
@@ -19469,12 +19502,12 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
    /* Before the module and before the NIR is retained for variants, so a
     * variant inherits the lowering and no path still declares an image
     * variable the layout has no entry for. */
-   if (compute->packed_image_count) {
+   if (compute->images.packed_count) {
       char why[176] = {0};
       if (!gex_wgpu_apply_packed_images(
-             nir, compute->packed_image_count, compute->packed_image_slots,
-             compute->packed_image_bindings, compute->packed_image_formats,
-             compute->packed_image_write, MESA_SHADER_COMPUTE, why,
+             nir, compute->images.packed_count, compute->images.packed_slots,
+             compute->images.packed_bindings, compute->images.packed_formats,
+             compute->images.packed_write, MESA_SHADER_COMPUTE, why,
              sizeof(why))) {
          fprintf(stderr, "gex-wgpu: compute packed image lowering: %s\n",
                  why[0] ? why : "failed");
@@ -19484,7 +19517,7 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
       }
    }
    if (compute->integer_sampled_slots || compute->buftex_count ||
-       compute->unformatted_images) {
+       compute->images.unformatted) {
       /* No base module. Compiling one would fail anyway -- Tint's SPIR-V
        * reader refuses a sampled image with a non-float component type, and a
        * samplerBuffer reaches SPIR-V as dimension Buffer, which it refuses
@@ -19518,15 +19551,110 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
  * and the message that comes back names a bind group rather than the image.
  * An unbound unit is not that case -- GL says its stores are discarded, so any
  * format serves, and the stand-in view is built as rgba8 already. */
+/* The view one shader image binds through, and whether the caller owns it.
+ *
+ * Shared by launch_grid and the compute-emulated stages, because the rules
+ * belong to the image unit rather than to the stage: an unbound unit reads
+ * zero and discards its stores, a format outside the resource's own class
+ * needs an alias of its own, and a combination WebGPU will not make a view of
+ * is declined by name rather than replaced with the nearest shape that works.
+ * `stage_name` names the caller in those declines.
+ *
+ * A stand-in belongs to the screen and must not be released; a real view is
+ * the caller's, which is what *owned says. */
+static bool
+gex_wgpu_stage_image_view(struct gex_wgpu_context *ctx,
+                          mesa_shader_stage stage,
+                          const struct gex_wgpu_stage_images *images,
+                          unsigned i, const char *stage_name,
+                          WGPUTextureView *out_view, bool *owned)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   const unsigned slot = images->slots[i];
+   const struct pipe_image_view *iv = &ctx->shader_images[stage][slot];
+   *out_view = NULL;
+   *owned = false;
+   if (!iv->resource || !gex_resource(iv->resource)->texture) {
+      /* GL says such a unit reads zero and discards its stores rather than
+       * being an error, so the binding still has to exist. */
+      *out_view = gex_wgpu_default_storage_view(
+         screen, images->dimensions[i],
+         gex_wgpu_storage_texture_format(images->formats[i]),
+         images->access[i]);
+      if (!*out_view) {
+         fprintf(stderr, "gex-wgpu: %s declined (no stand-in for image %u)\n",
+                 stage_name, slot);
+         return false;
+      }
+      return true;
+   }
+   /* An image bound at another format in its class needs a texture of its
+    * own, exactly as in the draw path; see gex_wgpu_image_alias. */
+   WGPUTexture image_texture = gex_resource(iv->resource)->texture;
+   if (gex_wgpu_texture_format(gex_wgpu_stored_format(iv->format)) !=
+       gex_wgpu_texture_format(gex_wgpu_stored_format(iv->resource->format)) ||
+       (images->access[i] != WGPUStorageTextureAccess_ReadOnly &&
+        gex_wgpu_image_also_sampled(ctx, iv->resource, true))) {
+      image_texture = gex_wgpu_image_alias(
+         ctx, iv, images->access[i] != WGPUStorageTextureAccess_WriteOnly);
+      if (!image_texture) {
+         fprintf(stderr, "gex-wgpu: %s declined (no alias for image %u at %s "
+                 "over %s)\n", stage_name, slot,
+                 util_format_short_name(iv->format),
+                 util_format_short_name(iv->resource->format));
+         return false;
+      }
+   }
+   WGPUTextureViewDescriptor view_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   /* A read-only image binds as a sampled texture, so its view carries the
+    * ordinary sampled format -- which exists for formats WebGPU has no
+    * storage texture for. Using the storage table here would give Undefined
+    * and a view of the wrong format, or none. */
+   view_desc.format = images->access[i] == WGPUStorageTextureAccess_ReadOnly
+      ? gex_wgpu_texture_format(images->formats[i])
+      : gex_wgpu_storage_texture_format(images->formats[i]);
+   view_desc.dimension = images->dimensions[i];
+   view_desc.baseMipLevel = iv->u.tex.level;
+   view_desc.mipLevelCount = 1;
+   if (view_desc.dimension != WGPUTextureViewDimension_3D) {
+      view_desc.baseArrayLayer = iv->u.tex.first_layer;
+      view_desc.arrayLayerCount =
+         iv->u.tex.last_layer - iv->u.tex.first_layer + 1;
+   }
+   /* An alias holds one level and the bound layers, so a view of it starts at
+    * zero whatever the image named. */
+   if (image_texture != gex_resource(iv->resource)->texture) {
+      view_desc.baseMipLevel = 0;
+      if (view_desc.dimension != WGPUTextureViewDimension_3D)
+         view_desc.baseArrayLayer = 0;
+   }
+   *out_view = gex_wgpu_image_view_fits(image_texture, &view_desc)
+      ? wgpuTextureCreateView(image_texture, &view_desc) : NULL;
+   if (!*out_view) {
+      /* The view WebGPU would not make is a combination it does not express
+       * -- a slice of a 3D texture bound as a non-layered image2D is one,
+       * since a 3D texture has one array layer and no 2D view of a slice --
+       * and that is a missing feature, not a broken device. */
+      fprintf(stderr, "gex-wgpu: %s declined (no image view for slot %u: "
+              "level %u layers %u..%u of a %u-layer %s)\n", stage_name, slot,
+              iv->u.tex.level, iv->u.tex.first_layer, iv->u.tex.last_layer,
+              iv->resource->array_size,
+              util_format_short_name(iv->resource->format));
+      return false;
+   }
+   *owned = true;
+   return true;
+}
+
 static bool
 gex_wgpu_resolve_unformatted_images(struct gex_wgpu_context *ctx,
                                     struct gex_wgpu_compute_state *compute)
 {
-   for (unsigned i = 0; i < compute->image_count; ++i) {
-      if (!(compute->unformatted_images & ((uint16_t)1u << i)))
+   for (unsigned i = 0; i < compute->images.count; ++i) {
+      if (!(compute->images.unformatted & ((uint16_t)1u << i)))
          continue;
       const struct pipe_image_view *iv =
-         &ctx->shader_images[MESA_SHADER_COMPUTE][compute->image_slots[i]];
+         &ctx->shader_images[MESA_SHADER_COMPUTE][compute->images.slots[i]];
       enum pipe_format format =
          iv->resource ? iv->format : PIPE_FORMAT_R8G8B8A8_UNORM;
       if (gex_wgpu_storage_texture_format(format) ==
@@ -19537,12 +19665,12 @@ gex_wgpu_resolve_unformatted_images(struct gex_wgpu_context *ctx,
             fprintf(stderr, "gex-wgpu: dispatch declined (image unit %u is "
                     "%s, which WebGPU cannot take as a storage texture, and "
                     "the shader declared no format to store through)\n",
-                    compute->image_slots[i],
+                    compute->images.slots[i],
                     util_format_short_name(format));
          }
          return false;
       }
-      compute->image_formats[i] = format;
+      compute->images.formats[i] = format;
    }
    return true;
 }
@@ -19553,7 +19681,7 @@ gex_wgpu_compute_module(struct gex_wgpu_context *ctx,
                         struct gex_wgpu_compute_state *compute)
 {
    if (!compute->integer_sampled_slots && !compute->buftex_count &&
-       !compute->unformatted_images)
+       !compute->images.unformatted)
       return compute->module;
 
    /* The texel word count of each bound buffer texture, which the lowering
@@ -19566,7 +19694,7 @@ gex_wgpu_compute_module(struct gex_wgpu_context *ctx,
         cached = cached->next) {
       bool match = memcmp(cached->buftex_words, want_buftex,
                           sizeof(want_buftex)) == 0 &&
-                   memcmp(cached->image_formats, compute->image_formats,
+                   memcmp(cached->image_formats, compute->images.formats,
                           sizeof(cached->image_formats)) == 0;
       for (unsigned i = 0; match && i < compute->texture_count; ++i) {
          const unsigned slot = compute->texture_slots[i];
@@ -19602,12 +19730,12 @@ gex_wgpu_compute_module(struct gex_wgpu_context *ctx,
     * resolved format has to be written back onto it -- an image left as
     * PIPE_FORMAT_NONE reaches SPIR-V as an Unknown format, which is a
     * different capability and not one WGSL has. */
-   if (compute->unformatted_images) {
+   if (compute->images.unformatted) {
       nir_foreach_variable_with_modes(var, clone, nir_var_image) {
-         for (unsigned i = 0; i < compute->image_count; ++i)
-            if ((compute->unformatted_images & ((uint16_t)1u << i)) &&
-                compute->image_slots[i] == var->data.driver_location)
-               var->data.image.format = compute->image_formats[i];
+         for (unsigned i = 0; i < compute->images.count; ++i)
+            if ((compute->images.unformatted & ((uint16_t)1u << i)) &&
+                compute->images.slots[i] == var->data.driver_location)
+               var->data.image.format = compute->images.formats[i];
       }
    }
    if (!gex_wgpu_lower_texture_variant(clone, compute->texture_count,
@@ -19672,7 +19800,7 @@ gex_wgpu_compute_module(struct gex_wgpu_context *ctx,
       cached->last_level[slot] = view ? (uint8_t)view->u.tex.last_level : 0u;
    }
    memcpy(cached->buftex_words, want_buftex, sizeof(cached->buftex_words));
-   memcpy(cached->image_formats, compute->image_formats,
+   memcpy(cached->image_formats, compute->images.formats,
           sizeof(cached->image_formats));
    cached->module = module;
    cached->next = compute->variants;
@@ -19793,7 +19921,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       return;
    }
 
-   /* Before anything reads compute->image_formats -- the bind group layout
+   /* Before anything reads compute->images.formats -- the bind group layout
     * and the module both do, and they have to agree. */
    if (!gex_wgpu_resolve_unformatted_images(ctx, compute))
       return;
@@ -19923,135 +20051,46 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    /* One view per image, built here rather than cached on the resource:
     * glBindImageTexture names a level and a layer, and the same texture may
     * be bound at different ones by successive dispatches. */
-   for (unsigned i = 0; i < compute->image_count; ++i) {
-      const unsigned slot = compute->image_slots[i];
-      const struct pipe_image_view *iv =
-         &ctx->shader_images[MESA_SHADER_COMPUTE][slot];
-      if (!iv->resource || !gex_resource(iv->resource)->texture) {
-         /* The stand-in, as in the draw path: GL says such a unit reads zero
-          * and discards its stores rather than being an error. */
-         WGPUTextureView stand_in = gex_wgpu_default_storage_view(
-            screen, compute->image_dimensions[i],
-            gex_wgpu_storage_texture_format(compute->image_formats[i]),
-            compute->image_access[i]);
-         if (!stand_in) {
-            static bool said;
-            if (!said) {
-               said = true;
-               fprintf(stderr, "gex-wgpu: dispatch declined (no stand-in for "
-                       "compute image %u)\n", slot);
-            }
-            goto release_views;
-         }
-         entries[count] =
-            (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
-         entries[count].binding = compute->image_bindings[i];
-         entries[count].visibility = WGPUShaderStage_Compute;
-         entries[count].storageTexture.access = compute->image_access[i];
-         entries[count].storageTexture.format =
-            gex_wgpu_storage_texture_format(compute->image_formats[i]);
-         entries[count].storageTexture.viewDimension =
-            compute->image_dimensions[i];
-         bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
-         bindings[count].binding = compute->image_bindings[i];
-         bindings[count].textureView = stand_in;
-         ++count;
-         continue;
-      }
-      /* An image bound at another format in its class needs a texture of its
-       * own, exactly as in the draw path; see gex_wgpu_image_alias. */
-      WGPUTexture image_texture = gex_resource(iv->resource)->texture;
-      if (gex_wgpu_texture_format(gex_wgpu_stored_format(iv->format)) !=
-          gex_wgpu_texture_format(
-             gex_wgpu_stored_format(iv->resource->format)) ||
-          (compute->image_access[i] != WGPUStorageTextureAccess_ReadOnly &&
-           gex_wgpu_image_also_sampled(ctx, iv->resource, true))) {
-         image_texture = gex_wgpu_image_alias(
-            ctx, iv,
-            compute->image_access[i] != WGPUStorageTextureAccess_WriteOnly);
-         if (!image_texture) {
-            static bool said;
-            if (!said) {
-               said = true;
-               fprintf(stderr, "gex-wgpu: dispatch declined (no alias for "
-                       "compute image %u at %s over %s)\n", slot,
-                       util_format_short_name(iv->format),
-                       util_format_short_name(iv->resource->format));
-            }
-            goto release_views;
-         }
-      }
-      WGPUTextureViewDescriptor view_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
-      /* A read-only image binds as a sampled texture, so its view carries the
-       * ordinary sampled format -- which exists for formats WebGPU has no
-       * storage texture for. Using the storage table here would give
-       * Undefined and a view of the wrong format, or none. */
-      view_desc.format =
-         compute->image_access[i] == WGPUStorageTextureAccess_ReadOnly
-            ? gex_wgpu_texture_format(compute->image_formats[i])
-            : gex_wgpu_storage_texture_format(compute->image_formats[i]);
-      view_desc.dimension = compute->image_dimensions[i];
-      view_desc.baseMipLevel = iv->u.tex.level;
-      view_desc.mipLevelCount = 1;
-      if (view_desc.dimension != WGPUTextureViewDimension_3D) {
-         view_desc.baseArrayLayer = iv->u.tex.first_layer;
-         view_desc.arrayLayerCount =
-            iv->u.tex.last_layer - iv->u.tex.first_layer + 1;
-      }
-      /* An alias holds one level and the bound layers, so a view of it starts
-       * at zero whatever the image named. */
-      if (image_texture != gex_resource(iv->resource)->texture) {
-         view_desc.baseMipLevel = 0;
-         if (view_desc.dimension != WGPUTextureViewDimension_3D)
-            view_desc.baseArrayLayer = 0;
-      }
-      WGPUTextureView image_view =
-         gex_wgpu_image_view_fits(image_texture, &view_desc)
-            ? wgpuTextureCreateView(image_texture, &view_desc) : NULL;
-      if (!image_view) {
-         /* Also declined. The view WebGPU would not make is a combination it
-          * does not express -- a slice of a 3D texture bound as a
-          * non-layered image2D is one, since a 3D texture has one array
-          * layer and no 2D view of a slice -- and that is a missing feature,
-          * not a broken device. */
-         static bool said;
-         if (!said) {
-            said = true;
-            fprintf(stderr, "gex-wgpu: dispatch declined (no image view for "
-                    "slot %u: level %u layers %u..%u of a %u-layer %s)\n",
-                    slot, iv->u.tex.level, iv->u.tex.first_layer,
-                    iv->u.tex.last_layer, iv->resource->array_size,
-                    util_format_short_name(iv->resource->format));
-         }
+   for (unsigned i = 0; i < compute->images.count; ++i) {
+      WGPUTextureView image_view = NULL;
+      bool owned = false;
+      if (!gex_wgpu_stage_image_view(ctx, MESA_SHADER_COMPUTE,
+                                     &compute->images, i, "dispatch",
+                                     &image_view, &owned))
          goto release_views;
-      }
-      image_views[image_view_count++] = image_view;
+      if (owned)
+         image_views[image_view_count++] = image_view;
       entries[count] =
          (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
-      entries[count].binding = compute->image_bindings[i];
+      entries[count].binding = compute->images.bindings[i];
       entries[count].visibility = WGPUShaderStage_Compute;
       /* A read-only image is a *sampled* texture binding, not a storage one:
        * Tint lowers a SPIR-V storage image that is only read to a plain
        * texture_2d<T>, and WebGPU rejects a storageTexture layout against
-       * that by name. The graphics path carries the same note. */
-      if (compute->image_access[i] == WGPUStorageTextureAccess_ReadOnly) {
-         const enum pipe_format image_format = compute->image_formats[i];
+       * that by name. The graphics path carries the same note.
+       *
+       * A stand-in is the exception, and deliberately so: it is a storage
+       * view over a texture of the screen's own, and it is bound as one
+       * whatever the declared access. */
+      if (owned && compute->images.access[i] ==
+                      WGPUStorageTextureAccess_ReadOnly) {
+         const enum pipe_format image_format = compute->images.formats[i];
          entries[count].texture.sampleType =
             util_format_is_pure_uint(image_format) ? WGPUTextureSampleType_Uint
             : util_format_is_pure_sint(image_format)
                  ? WGPUTextureSampleType_Sint
                  : WGPUTextureSampleType_UnfilterableFloat;
-         entries[count].texture.viewDimension = compute->image_dimensions[i];
+         entries[count].texture.viewDimension = compute->images.dimensions[i];
          entries[count].texture.multisampled = false;
       } else {
-         entries[count].storageTexture.access = compute->image_access[i];
+         entries[count].storageTexture.access = compute->images.access[i];
          entries[count].storageTexture.format =
-            gex_wgpu_storage_texture_format(compute->image_formats[i]);
+            gex_wgpu_storage_texture_format(compute->images.formats[i]);
          entries[count].storageTexture.viewDimension =
-            compute->image_dimensions[i];
+            compute->images.dimensions[i];
       }
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
-      bindings[count].binding = compute->image_bindings[i];
+      bindings[count].binding = compute->images.bindings[i];
       bindings[count].textureView = image_view;
       ++count;
    }
@@ -20097,8 +20136,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
     * each, and unlike the draw path a read image is served here: the copy
     * into the buffer goes on the encoder before the dispatch, where there is
     * no pass to break open. */
-   for (unsigned i = 0; i < compute->packed_image_count; ++i) {
-      const unsigned slot = compute->packed_image_slots[i];
+   for (unsigned i = 0; i < compute->images.packed_count; ++i) {
+      const unsigned slot = compute->images.packed_slots[i];
       const struct pipe_image_view *iv =
          &ctx->shader_images[MESA_SHADER_COMPUTE][slot];
       WGPUBuffer buffer = NULL, header = NULL;
@@ -20109,8 +20148,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          size = GEX_WGPU_PACKED_IMAGE_HEADER_BYTES;
       } else {
          buffer = gex_wgpu_packed_image_bind(
-            ctx, iv, compute->packed_image_formats[i],
-            compute->packed_image_read[i], &size, &header);
+            ctx, iv, compute->images.packed_formats[i],
+            compute->images.packed_read[i], &size, &header);
       }
       if (!buffer || !header) {
          static bool said;
@@ -20126,10 +20165,10 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
             (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
          entries[count].binding = half
             ? GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot
-            : compute->packed_image_bindings[i];
+            : compute->images.packed_bindings[i];
          entries[count].visibility = WGPUShaderStage_Compute;
          entries[count].buffer.type =
-            half && compute->packed_image_write[i]
+            half && compute->images.packed_write[i]
                ? WGPUBufferBindingType_Storage
                : WGPUBufferBindingType_ReadOnlyStorage;
          entries[count].buffer.hasDynamicOffset = false;
@@ -20308,7 +20347,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       }
       fprintf(stderr, "gex-clayout: entries=%u storage=%u uniform=%u "
               "(blocks=%u images=%u textures=%u)\n", count, storage, uniform,
-              compute->binding_count, compute->image_count,
+              compute->binding_count, compute->images.count,
               compute->texture_count);
       for (unsigned i = 0; i < compute->binding_count; ++i)
          fprintf(stderr, "gex-clayout:   block[%u] binding=%u slot=%u kind=%u "
@@ -25098,6 +25137,31 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       FREE(gs);
       return NULL;
    }
+   /* Images, which had to wait for lower_gallium_ubos: it is what assigns
+    * their bindings, and collecting before it recorded binding zero for every
+    * one of them -- GEX_WGPU_GS_PARAMS_BINDING, so the group had two entries
+    * claiming the same number and Dawn called the whole layout invalid.
+    *
+    * Group zero, too. An image is not a block, so blocks_to_group_one leaves
+    * it at the set lower_gallium_ubos gave it and the module declares
+    * @group(2), for which the dispatch's pipeline layout has no group:
+    * "The entry-point uses bindings in group 2 but [PipelineLayout] doesn't
+    * have a BindGroupLayout for this index". */
+   nir_foreach_variable_with_modes(var, nir, nir_var_image)
+      var->data.descriptor_set = 0;
+   if (!gex_wgpu_collect_stage_images(nir, &gs->images, "geometry") ||
+       /* A packed image needs a storage buffer copied into and out of the
+        * texture around the pass, which this path has nowhere to do; refused
+        * by name rather than bound as something it is not. */
+       gs->images.packed_count) {
+      gex_wgpu_set_compile_error(
+         mutable_state,
+         "gex_wgpu cannot serve an image in the geometry stage");
+      ralloc_free(nir);
+      free(gs->xfb);
+      FREE(gs);
+      return NULL;
+   }
    nir_foreach_variable_with_modes(var, nir,
                                    nir_var_mem_ubo | nir_var_mem_ssbo) {
       if (var->data.descriptor_set != 2 ||
@@ -25873,6 +25937,13 @@ struct gex_wgpu_bindings {
     * refuses the binding against it. */
    uint64_t multisampled_mask;
    uint64_t sampler_mask;
+   /* Storage textures -- shader images. A compute-emulated stage may declare
+    * them for the same reason it may sample: it runs as a compute pass, and
+    * WebGPU allows a writable storage texture there. The view lives in
+    * view[], as a sampled texture's does; only the layout differs. */
+   uint64_t image_mask;
+   WGPUStorageTextureAccess storage_access[GEX_WGPU_MAX_GROUP_BINDINGS];
+   WGPUTextureFormat storage_format[GEX_WGPU_MAX_GROUP_BINDINGS];
    WGPUTextureView view[GEX_WGPU_MAX_GROUP_BINDINGS];
    WGPUSampler sampler[GEX_WGPU_MAX_GROUP_BINDINGS];
    WGPUTextureSampleType sample_type[GEX_WGPU_MAX_GROUP_BINDINGS];
@@ -26024,6 +26095,63 @@ gex_wgpu_bind_stage_textures(struct pipe_context *pipe, int stage_index,
                                       textures, group);
 }
 
+/* The images a compute-emulated stage declares, bound into its dispatch's
+ * group. GL puts image uniforms in every stage, and these stages run as
+ * compute passes where a writable storage texture is legal -- the collection
+ * and this binding were the only things between the geometry stage and the
+ * images it is entitled to.
+ *
+ * The views this creates are the caller's: it appends them to `views` and
+ * must release them once the dispatch is recorded. */
+static bool
+gex_wgpu_bind_stage_images(struct gex_wgpu_context *ctx,
+                           mesa_shader_stage stage,
+                           const struct gex_wgpu_stage_images *images,
+                           const char *stage_name,
+                           struct gex_wgpu_bindings *group,
+                           WGPUTextureView *views, unsigned *view_count)
+{
+   for (unsigned i = 0; i < images->count; ++i) {
+      WGPUTextureView view = NULL;
+      bool owned = false;
+      if (!gex_wgpu_stage_image_view(ctx, stage, images, i, stage_name,
+                                     &view, &owned))
+         return false;
+      if (owned)
+         views[(*view_count)++] = view;
+      if (group->count >= GEX_WGPU_MAX_GROUP_BINDINGS) {
+         fprintf(stderr, "gex-wgpu: %s declined (more bindings than one group "
+                 "holds)\n", stage_name);
+         return false;
+      }
+      const unsigned at = group->count;
+      group->binding[at] = images->bindings[i];
+      group->view[at] = view;
+      group->view_dimension[at] = images->dimensions[i];
+      /* A read-only image is a *sampled* texture binding, not a storage one:
+       * Tint lowers a SPIR-V storage image that is only read to a plain
+       * texture_2d<T>, and WebGPU rejects a storageTexture layout against
+       * that by name. A stand-in is the exception, as in launch_grid: it is a
+       * storage view over a texture of the screen's own and binds as one
+       * whatever access was declared. */
+      if (owned && images->access[i] == WGPUStorageTextureAccess_ReadOnly) {
+         const enum pipe_format format = images->formats[i];
+         group->texture_mask |= UINT64_C(1) << at;
+         group->sample_type[at] =
+            util_format_is_pure_uint(format) ? WGPUTextureSampleType_Uint
+            : util_format_is_pure_sint(format) ? WGPUTextureSampleType_Sint
+                                    : WGPUTextureSampleType_UnfilterableFloat;
+      } else {
+         group->image_mask |= UINT64_C(1) << at;
+         group->storage_access[at] = images->access[i];
+         group->storage_format[at] =
+            gex_wgpu_storage_texture_format(images->formats[i]);
+      }
+      ++group->count;
+   }
+   return true;
+}
+
 /* The textures a vertex shader run as a compute pass samples. Every path that
  * dispatches a varying variant needs this, and forgetting it is not a wrong
  * picture but an invalid pipeline, which loses the whole command buffer. */
@@ -26051,6 +26179,12 @@ gex_wgpu_group_layout(WGPUDevice device, const struct gex_wgpu_bindings *group)
        * The read-only ones are the vertex buffers, and they are read-only
        * because WebGPU forbids two *writable* bindings over the same range
        * and one vertex buffer routinely feeds several attributes. */
+      if (group->image_mask & (UINT64_C(1) << i)) {
+         entries[i].storageTexture.access = group->storage_access[i];
+         entries[i].storageTexture.format = group->storage_format[i];
+         entries[i].storageTexture.viewDimension = group->view_dimension[i];
+         continue;
+      }
       if (group->texture_mask & (UINT64_C(1) << i)) {
          entries[i].texture.sampleType = group->sample_type[i];
          entries[i].texture.viewDimension = group->view_dimension[i];
@@ -26082,7 +26216,8 @@ gex_wgpu_group(WGPUDevice device, WGPUBindGroupLayout layout,
    for (unsigned i = 0; i < group->count; ++i) {
       entries[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       entries[i].binding = group->binding[i];
-      if (group->texture_mask & (UINT64_C(1) << i)) {
+      if ((group->texture_mask | group->image_mask) &
+          (UINT64_C(1) << i)) {
          entries[i].textureView = group->view[i];
          continue;
       }
@@ -28036,11 +28171,18 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_INDEX_BINDING,
                          ctx->gs_indices);
    gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_COUNT_BINDING, ctx->gs_counts);
+   /* Views this pass owns: one per image bound to a real resource. Released
+    * once the dispatch is recorded, the way launch_grid releases its own. */
+   WGPUTextureView gs_image_views[GEX_WGPU_MAX_SHADER_IMAGES];
+   unsigned gs_image_view_count = 0;
    ok = gs_param_buffer &&
         gex_wgpu_bind_stage_textures(&ctx->base,
                                      gex_wgpu_compute_stage_index(
                                         MESA_SHADER_GEOMETRY),
                                      &gs->textures, &gs_group0) &&
+        gex_wgpu_bind_stage_images(ctx, MESA_SHADER_GEOMETRY, &gs->images,
+                                   "geometry dispatch", &gs_group0,
+                                   gs_image_views, &gs_image_view_count) &&
         gex_wgpu_bind_constants(ctx, &gs_group1, MESA_SHADER_GEOMETRY,
                                 gs->ubo_count, gs->ubo_slots, gs->ubo_bindings,
                                 gs->ubo_storage_mask);
@@ -28048,6 +28190,8 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
       ok = gex_wgpu_dispatch(ctx, gs->module, &gs_group0, &gs_group1,
                              ctx->gs_indices,
                              DIV_ROUND_UP(runs, GEX_WGPU_GS_GROUP));
+   for (unsigned i = 0; i < gs_image_view_count; ++i)
+      wgpuTextureViewRelease(gs_image_views[i]);
    pipe_resource_reference(&gs_param_buffer, NULL);
    if (!ok) {
       gex_fail(ctx);
@@ -38406,7 +38550,13 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
        * count is still all st_extensions reads to turn the extension on. */
       caps->max_shader_images =
          stages[i] == MESA_SHADER_FRAGMENT ||
-         stages[i] == MESA_SHADER_COMPUTE ? GEX_WGPU_MAX_SHADER_IMAGES : 0;
+         stages[i] == MESA_SHADER_COMPUTE ||
+         /* The geometry stage runs as a compute pass, so a writable storage
+          * texture is legal there too. The vertex stage is not added: Tint
+          * refuses one by name -- "storage texture with 'write' access mode
+          * cannot be used by vertex pipeline stage" -- and every CTS case
+          * that binds a vertex image stores through it. */
+         stages[i] == MESA_SHADER_GEOMETRY ? GEX_WGPU_MAX_SHADER_IMAGES : 0;
       caps->max_hw_atomic_counters = 0;
       caps->max_hw_atomic_counter_buffers = 0;
       caps->supported_irs = 1 << PIPE_SHADER_IR_NIR;
