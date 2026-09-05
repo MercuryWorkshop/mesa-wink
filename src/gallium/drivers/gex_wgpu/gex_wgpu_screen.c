@@ -22814,14 +22814,56 @@ gex_wgpu_gs_emit(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    for (unsigned i = 0; i < gs->outputs.count; ++i) {
       nir_variable *found = NULL;
+      /* Which element of `found`'s array this slot starts at; zero for
+       * everything but the upper half of a merged clip/cull array. */
+      unsigned element_base = 0;
       nir_foreach_variable_with_modes(var, b->shader, nir_var_shader_out) {
          if (var->data.location == gs->outputs.location[i]) {
             found = var;
             break;
          }
       }
-      nir_def *value = found && glsl_type_is_vector_or_scalar(found->type)
-         ? nir_load_var(b, found) : nir_imm_zero(b, 4, 32);
+      /* The same two rules gex_wgpu_emit_varying_stores already carries, and
+       * for the same reason -- this loop is the geometry stage's copy of it
+       * and had neither.
+       *
+       * gl_ClipDistance and gl_CullDistance are merged by Mesa into one
+       * variable at CLIP_DIST0 holding up to eight floats, so there is no
+       * variable at CLIP_DIST1 to match by location, and the variable that
+       * does exist is an *array* rather than a vector -- which the old
+       * `glsl_type_is_vector_or_scalar` test rejected, falling through to
+       * zero. Both halves of the distances were therefore written as zeros
+       * into every emitted vertex, and zero does not cull: gl_CullDistance
+       * did nothing at all through a geometry shader. 48 cases of
+       * KHR-GL45.cull_distance, silent, because a capture that writes zeros
+       * and a capture that writes nothing look identical downstream. */
+      if (!found && gs->outputs.location[i] == VARYING_SLOT_CLIP_DIST1) {
+         nir_foreach_variable_with_modes(var, b->shader, nir_var_shader_out) {
+            if (var->data.location == VARYING_SLOT_CLIP_DIST0 &&
+                glsl_type_is_array(var->type) &&
+                glsl_get_length(var->type) > 4) {
+               found = var;
+               element_base = 4;
+               break;
+            }
+         }
+      }
+      nir_def *value = nir_imm_zero(b, 4, 32);
+      if (found && glsl_type_is_vector_or_scalar(found->type)) {
+         value = nir_load_var(b, found);
+      } else if (found && glsl_type_is_array(found->type) &&
+                 glsl_type_is_scalar(glsl_get_array_element(found->type))) {
+         const unsigned length = glsl_get_length(found->type);
+         nir_def *elements[4];
+         for (unsigned c = 0; c < 4; ++c) {
+            const unsigned at = element_base + c;
+            elements[c] = at < length
+               ? nir_load_deref(b, nir_build_deref_array_imm(
+                    b, nir_build_deref_var(b, found), at))
+               : nir_imm_float(b, 0.0f);
+         }
+         value = nir_vec(b, elements, 4);
+      }
       gex_wgpu_store_varying(b, state->vertices,
                              nir_iadd_imm(b, vertex_byte, i * 16), value);
    }
@@ -22963,6 +23005,39 @@ gex_wgpu_collect_varyings(nir_shader *nir, nir_variable_mode mode,
       }
       layout->location[at] = var->data.location;
       ++layout->count;
+      /* A merged clip/cull array occupies *two* varying slots.
+       *
+       * Mesa gives a shader with more than four distances between
+       * gl_ClipDistance and gl_CullDistance a single variable at CLIP_DIST0
+       * holding all of them -- `float[8]` -- and there is no variable at
+       * CLIP_DIST1 to find. Counting declared variables therefore allotted
+       * one 16-byte slot to eight floats, and components 4..7, which is the
+       * whole cull half, had nowhere to live.
+       *
+       * The consequence was silent: the capture wrote four values, the
+       * passthrough forwarded four, and the CPU cull filter read zeros for
+       * every distance above the third -- and zero does not cull, so
+       * gl_CullDistance simply did nothing through a geometry or a
+       * tessellation stage. Forty-eight cases of KHR-GL45.cull_distance, each
+       * reporting only "Primitive is expected to be culled, but one of its
+       * vertices is visible", with no message from this driver at all.
+       *
+       * gex_wgpu_emit_varying_stores already knows how to fill the second
+       * slot -- it looks back at CLIP_DIST0 with an element base of four --
+       * so what was missing was a layout that asks it to. */
+      if (var->data.location == VARYING_SLOT_CLIP_DIST0 &&
+          glsl_type_is_array(var->type) && glsl_get_length(var->type) > 4) {
+         if (layout->count >= GEX_WGPU_MAX_VARYINGS)
+            return false;
+         unsigned second = layout->count;
+         while (second > 0 &&
+                layout->location[second - 1] > VARYING_SLOT_CLIP_DIST1) {
+            layout->location[second] = layout->location[second - 1];
+            --second;
+         }
+         layout->location[second] = VARYING_SLOT_CLIP_DIST1;
+         ++layout->count;
+      }
    }
    return true;
 }
@@ -22990,10 +23065,39 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_VERTEX, pipe->screen->nir_options[MESA_SHADER_VERTEX],
       "gex-gs-passthrough");
+   /* Whether the merged clip/cull array needs a second slot, and which slot
+    * carries it.
+    *
+    * SPIR-V has *one* ClipDistance builtin, an array. Declaring a second
+    * variable at VARYING_SLOT_CLIP_DIST1 to carry components four and up
+    * gives it no builtin decoration at all, so ntv emits it as an ordinary
+    * varying and computes `location - VARYING_SLOT_VAR0` for it -- which is
+    * 18, and WebGPU allows inter-stage locations below 15 once clip_distances
+    * is in use:
+    *
+    *   Vertex output variable "gex_gs_varying2_1_1" has a location (18) that
+    *   is too large. It should be less than (15 = 16 - 1 (clip_distances))
+    *
+    * -- and the whole module is rejected. The upper half has to be written
+    * into elements 4..7 of the *same* array instead, which is the shape Mesa
+    * itself uses. This is the trap the note about gl_ViewportIndex above
+    * describes, reached from the other direction. */
+   int clip1_slot = -1;
+   for (unsigned i = 0; i < outputs->count; ++i)
+      if (outputs->location[i] == VARYING_SLOT_CLIP_DIST1 && !(skip & (1u << i)))
+         clip1_slot = (int)i;
+
    for (unsigned i = 0; i < outputs->count; ++i) {
       /* A skipped slot keeps its place in the buffer -- the stride and every
        * other slot's offset depend on it -- and simply is not forwarded. */
       if (skip & (1u << i))
+         continue;
+      /* The upper half of the merged clip/cull array is handled entirely by
+       * the CLIP_DIST0 slot below -- one SPIR-V ClipDistance array, written
+       * from two captured slots -- so this one declares neither an input nor
+       * an output here. Declaring the input twice is a conflicting location
+       * assignment and the module is rejected for it. */
+      if ((int)i == clip1_slot)
          continue;
       char name[24];
       snprintf(name, sizeof(name), "gex_gs_varying%u", i);
@@ -23014,11 +23118,11 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
        *
        * Declared the way nir_lower_clip does it, compact flag included, so
        * that ntv and Tint see what they would from an ordinary shader. */
-      const bool is_clip = outputs->location[i] == VARYING_SLOT_CLIP_DIST0 ||
-                           outputs->location[i] == VARYING_SLOT_CLIP_DIST1;
+      const bool is_clip = outputs->location[i] == VARYING_SLOT_CLIP_DIST0;
       nir_variable *out = nir_variable_create(
          b.shader, nir_var_shader_out,
-         is_clip ? glsl_array_type(glsl_float_type(), 4, sizeof(float))
+         is_clip ? glsl_array_type(glsl_float_type(),
+                                   clip1_slot >= 0 ? 8 : 4, sizeof(float))
                  : glsl_vec4_type(), name);
       out->data.location = outputs->location[i];
       out->data.driver_location = i;
@@ -23030,6 +23134,22 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
                             nir_build_deref_array_imm(
                                &b, nir_build_deref_var(&b, out), c),
                             nir_channel(&b, value, c), 0x1);
+         /* Components four and up come from the slot the producer wrote them
+          * to, into the same array. */
+         if (clip1_slot >= 0) {
+            char upper[24];
+            snprintf(upper, sizeof(upper), "gex_gs_varying%d", clip1_slot);
+            nir_variable *in_hi = nir_variable_create(
+               b.shader, nir_var_shader_in, glsl_vec4_type(), upper);
+            in_hi->data.location = VERT_ATTRIB_GENERIC0 + clip1_slot;
+            in_hi->data.driver_location = (unsigned)clip1_slot;
+            nir_def *hi = nir_load_var(&b, in_hi);
+            for (unsigned c = 0; c < 4; ++c)
+               nir_store_deref(&b,
+                               nir_build_deref_array_imm(
+                                  &b, nir_build_deref_var(&b, out), 4 + c),
+                               nir_channel(&b, hi, c), 0x1);
+         }
       } else {
          nir_store_var(&b, out, value, 0xf);
       }
@@ -24621,6 +24741,13 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
    struct pipe_shader_state passthrough_state = {0};
    passthrough_state.type = PIPE_SHADER_IR_NIR;
    passthrough_state.ir.nir = gex_wgpu_gs_passthrough_nir(pipe, &tes->outputs, 0);
+   /* The same inheritance the geometry passthrough needs; see the note there.
+    * When tessellation is bound its evaluation stage is the last one before
+    * the rasterizer, so its distances are the ones GL culls on. */
+   passthrough_state.ir.nir->info.clip_distance_array_size =
+      nir->info.clip_distance_array_size;
+   passthrough_state.ir.nir->info.cull_distance_array_size =
+      nir->info.cull_distance_array_size;
    passthrough_state.report_compile_error = true;
    tes->passthrough = gex_wgpu_create_shader_state(pipe, &passthrough_state,
                                                    MESA_SHADER_VERTEX);
@@ -24939,12 +25066,40 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       }
    }
    NIR_PASS(_, nir, nir_lower_gs_intrinsics, 0);
+   if (getenv("GEX_WGPU_GS_VARYING_LOG")) {
+      fprintf(stderr, "gex-gsvary: clip=%u cull=%u outputs:", 
+              nir->info.clip_distance_array_size,
+              nir->info.cull_distance_array_size);
+      for (unsigned i = 0; i < gs->outputs.count; ++i)
+         fprintf(stderr, " [%u]=loc%u", i, gs->outputs.location[i]);
+      fprintf(stderr, "\n");
+      nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
+         fprintf(stderr, "gex-gsvary:   out '%s' loc=%u type=%s\n",
+                 var->name ? var->name : "(anon)", var->data.location,
+                 glsl_get_type_name(var->type));
+   }
    gs->nir = nir;
    gs->module = gex_wgpu_gs_build_module(pipe, gs);
 
    struct pipe_shader_state passthrough_state = {0};
    passthrough_state.type = PIPE_SHADER_IR_NIR;
    passthrough_state.ir.nir = gex_wgpu_gs_passthrough_nir(pipe, &gs->outputs, gs->passthrough_skip);
+   /* The passthrough inherits the emulated stage's clip/cull split, or the
+    * cull filter never runs at all.
+    *
+    * gl_CullDistance is served in two halves -- the shader keeps the real
+    * distances, and gex_wgpu_cull_distance_filter reads them back and rebuilds
+    * the index list from the primitives that survive. The draw path gates that
+    * on `ctx->vs->cull_distances`, and the draw that rasterizes this stage's
+    * output comes back through it with *this* generated shader bound, whose
+    * own info says zero however many distances the stage produced.
+    *
+    * GEX_WGPU_CULL_TRACE prints a whole trace for the same test without the
+    * extra stage and nothing whatever with it, which is what located this. */
+   passthrough_state.ir.nir->info.clip_distance_array_size =
+      nir->info.clip_distance_array_size;
+   passthrough_state.ir.nir->info.cull_distance_array_size =
+      nir->info.cull_distance_array_size;
    passthrough_state.report_compile_error = true;
    gs->passthrough = gex_wgpu_create_shader_state(pipe, &passthrough_state,
                                                   MESA_SHADER_VERTEX);
