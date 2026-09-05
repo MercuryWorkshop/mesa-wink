@@ -5983,6 +5983,12 @@ gex_wgpu_lower_sampler_lod_bias_instr(nir_builder *b, nir_instr *instr,
  * the case that falls here, and the border pass could not have served its
  * pieces either.
  */
+/* An instruction one of the texture-lowering passes below produced, rather
+ * than one the application's shader wrote. It has already had the view
+ * swizzle applied by the pass that made it, so the swizzle pass -- which runs
+ * last, over everything -- must leave it alone or the swizzle lands twice. */
+#define GEX_WGPU_TEX_PASS_LOWERED 1u
+
 static bool
 gex_wgpu_lower_shadow_border_gather_instr(nir_builder *b, nir_instr *instr,
                                           void *data)
@@ -6081,6 +6087,7 @@ gex_wgpu_lower_shadow_border_gather_instr(nir_builder *b, nir_instr *instr,
       one->src[4] =
          nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_float(b, 0.0f));
       nir_def_init(&one->instr, &one->def, 1, 32);
+      one->instr.pass_flags = GEX_WGPU_TEX_PASS_LOWERED;
       nir_builder_instr_insert(b, &one->instr);
       gathered[k] = &one->def;
    }
@@ -6148,6 +6155,7 @@ gex_wgpu_lower_integer_gather_instr(nir_builder *b, nir_instr *instr,
       nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture_deref);
    txs->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
    nir_def_init(&txs->instr, &txs->def, tex->is_array ? 3 : 2, 32);
+   txs->instr.pass_flags = GEX_WGPU_TEX_PASS_LOWERED;
    nir_builder_instr_insert(b, &txs->instr);
    nir_def *size = nir_i2f32(
       b, nir_vec2(b, nir_channel(b, &txs->def, 0),
@@ -6205,6 +6213,7 @@ gex_wgpu_lower_integer_gather_instr(nir_builder *b, nir_instr *instr,
       one->src[3] =
          nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_float(b, 0.0f));
       nir_def_init(&one->instr, &one->def, 4, tex->def.bit_size);
+      one->instr.pass_flags = GEX_WGPU_TEX_PASS_LOWERED;
       nir_builder_instr_insert(b, &one->instr);
       gathered[k] = nir_channel(b, &one->def, tex->component);
    }
@@ -6223,8 +6232,21 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       nir_alu_type_get_base_type(tex->dest_type);
    if (result_type != nir_type_uint && result_type != nir_type_int)
       return false;
-   /* These are the legal integer-texture operations emitted by this pass. */
-   if (tex->op == nir_texop_txf || tex->op == nir_texop_txs)
+   /* Operations this pass does not rewrite, and must not *refuse*.
+    *
+    * A fetch needs no emulation: this pass exists because WebGPU forbids a
+    * filtering sampler on an integer texture, and a fetch does not filter. A
+    * multisample fetch is the same and more so -- a multisample texture can
+    * only ever be fetched. A query returns no texel at all.
+    *
+    * txf_ms was missing, and the cost was out of all proportion to the
+    * omission: it fell through to the refusal below, which fails the *whole*
+    * texture lowering, so the view swizzle never ran either and every integer
+    * multisample texelFetch came back in the texture's own channel order.
+    * KHR-GL46.texture_swizzle's entire integer half on both multisample
+    * targets, with one line in the log naming a "sample" that was a fetch. */
+   if (tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms ||
+       nir_tex_instr_is_query(tex))
       return false;
    /* A gather needs no emulation. This pass exists because WebGPU forbids a
     * *filtering* sampler on an integer texture, so an integer `texture()` has
@@ -6297,6 +6319,7 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
    const unsigned query_components =
       spatial_components + (tex->is_array ? 1 : 0);
    nir_def_init(&base_txs->instr, &base_txs->def, query_components, 32);
+   base_txs->instr.pass_flags = GEX_WGPU_TEX_PASS_LOWERED;
    nir_builder_instr_insert(b, &base_txs->instr);
 
    nir_def *selected_lod = zero_lod;
@@ -6341,6 +6364,7 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
          nir_tex_src_texture_deref, texture_deref);
       txs->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, selected_lod);
       nir_def_init(&txs->instr, &txs->def, query_components, 32);
+      txs->instr.pass_flags = GEX_WGPU_TEX_PASS_LOWERED;
       nir_builder_instr_insert(b, &txs->instr);
    }
    nir_def *wrapped[3];
@@ -6408,6 +6432,7 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       nir_tex_src_lod, selected_lod);
    nir_def_init(&fetch->instr, &fetch->def, tex->def.num_components,
                 tex->def.bit_size);
+   fetch->instr.pass_flags = GEX_WGPU_TEX_PASS_LOWERED;
    nir_builder_instr_insert(b, &fetch->instr);
    nir_def *result = &fetch->def;
    if (lower->integer_wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
@@ -7178,8 +7203,17 @@ gex_wgpu_lower_view_swizzle_instr(nir_builder *b, nir_instr *instr, void *data)
    if (slot >= GEX_WGPU_MAX_SAMPLERS || !table->active[slot])
       return false;
    const struct gex_wgpu_border_lowering *lower = &table->slots[slot];
-   /* The integer pass owns every instruction on an integer-sampled slot. */
-   if (lower->integer_sampled)
+   /* The integer pass owns the instructions it *rewrote*, and marks them: it
+    * applies the swizzle itself, so doing it again here would apply it twice.
+    *
+    * It does not own the whole slot, which is what this used to assume. That
+    * pass rewrites `texture()` and `textureLod()` and declines everything
+    * else by name -- a texelFetch, and a multisample fetch above all, since
+    * a multisample sampler can only ever be fetched from. Skipping those too
+    * meant every texelFetch on a slot that also had a sampler lost its view
+    * swizzle, with nothing anywhere to say so: KHR-GL46.texture_swizzle's
+    * whole integer half on the two multisample targets. */
+   if (instr->pass_flags & GEX_WGPU_TEX_PASS_LOWERED)
       return false;
    /* The nearest-border pass owns ordinary 2D float sampling; its guard is
     * repeated here rather than shared because it is the definition of what
@@ -7547,6 +7581,11 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
    }
    progress |= has_integer_cube &&
       dxil_nir_lower_int_cubemaps(nir, true);
+   /* Cleared before anything below marks one: GEX_WGPU_TEX_PASS_LOWERED is
+    * how the swizzle pass tells an instruction these passes produced from one
+    * the application wrote, and a stale flag from an earlier pass would make
+    * it skip a texel that still needs its swizzle. */
+   nir_shader_clear_pass_flags(nir);
    /* Before the sample pass, whose ordinary input is what this produces. */
    progress |= nir_shader_instructions_pass(
       nir, gex_wgpu_lower_shadow_border_gather_instr,
