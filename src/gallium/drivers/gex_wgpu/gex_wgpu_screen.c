@@ -5565,6 +5565,12 @@ struct gex_wgpu_border_lowering {
    bool mirror_t;
    bool mirror_r;
    bool linear;
+   /* A depth-comparison sampler's border is not a colour that replaces the
+    * result: the border *texel* takes part in the comparison like any other,
+    * so what the outside of the texture returns is compare_func(ref, border).
+    * Both are needed here because the comparison is baked into the variant. */
+   bool comparison;
+   uint8_t compare_func;
    bool integer_sampled;
    bool integer_array;
    bool integer_1d;
@@ -6102,7 +6108,13 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
    if ((tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
         tex->op != nir_texop_txb && tex->op != nir_texop_txd) ||
        tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_array ||
-       tex->is_shadow || tex->dest_type != nir_type_float32)
+       /* A shadow lookup is handled below, but only in its new-style form,
+        * where the reference is its own source and the result is a scalar.
+        * The old-style one carries the reference inside the coordinate and
+        * returns a vec4; it is converted before this pass, and if one ever
+        * arrives here it keeps the behaviour it had. */
+       (tex->is_shadow && !tex->is_new_style_shadow) ||
+       tex->dest_type != nir_type_float32)
       return false;
    const int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    if (coord_index < 0 || tex->coord_components != 2)
@@ -6150,8 +6162,43 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
    }
    b->cursor = nir_after_instr(instr);
    nir_def *coord = tex->src[coord_index].src.ssa;
-   nir_def *border = nir_imm_vec4(b, lower->color[0], lower->color[1],
-                                  lower->color[2], lower->color[3]);
+   nir_def *border;
+   if (tex->is_shadow) {
+      /* GL compares the reference against the border texel exactly as it does
+       * against a real one, so the value outside the texture is a 0.0/1.0
+       * comparison result and not the border colour. Getting this wrong is
+       * the whole point of the case: a shadow map clamped to a border of 1.0
+       * is how everything outside the map is made lit, and falling back to
+       * clamp-to-edge instead compares against whichever edge texel happened
+       * to be there. */
+      const int ref_index =
+         nir_tex_instr_src_index(tex, nir_tex_src_comparator);
+      if (ref_index < 0) {
+         gex_tex_lower_fail(table, "a shadow border sample with no reference");
+         return false;
+      }
+      nir_def *ref = tex->src[ref_index].src.ssa;
+      nir_def *texel = nir_imm_float(b, lower->color[0]);
+      nir_def *pass;
+      switch (lower->compare_func) {
+      case PIPE_FUNC_NEVER:    pass = nir_imm_false(b); break;
+      case PIPE_FUNC_LESS:     pass = nir_flt(b, ref, texel); break;
+      case PIPE_FUNC_EQUAL:    pass = nir_feq(b, ref, texel); break;
+      case PIPE_FUNC_LEQUAL:   pass = nir_fge(b, texel, ref); break;
+      case PIPE_FUNC_GREATER:  pass = nir_flt(b, texel, ref); break;
+      case PIPE_FUNC_NOTEQUAL: pass = nir_fneu(b, ref, texel); break;
+      case PIPE_FUNC_GEQUAL:   pass = nir_fge(b, ref, texel); break;
+      case PIPE_FUNC_ALWAYS:   pass = nir_imm_true(b); break;
+      default:
+         gex_tex_lower_fail(table, "a shadow border sample with an unknown "
+                                   "comparison function");
+         return false;
+      }
+      border = nir_b2f32(b, pass);
+   } else {
+      border = nir_imm_vec4(b, lower->color[0], lower->color[1],
+                            lower->color[2], lower->color[3]);
+   }
    nir_def *result = &tex->def;
    if ((lower->s || lower->t) && lower->linear) {
       const int texture_index =
@@ -6201,13 +6248,15 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
       }
       result = nir_bcsel(b, outside, border, &tex->def);
    }
-   nir_def *channels[4];
-   for (unsigned i = 0; i < 4; ++i) {
-      channels[i] = gex_wgpu_swizzle_channel(b, result, lower->swizzle[i]);
-      if (!channels[i])
-         return false;
+   if (!tex->is_shadow) {
+      nir_def *channels[4];
+      for (unsigned i = 0; i < 4; ++i) {
+         channels[i] = gex_wgpu_swizzle_channel(b, result, lower->swizzle[i]);
+         if (!channels[i])
+            return false;
+      }
+      result = nir_vec4(b, channels[0], channels[1], channels[2], channels[3]);
    }
-   result = nir_vec4(b, channels[0], channels[1], channels[2], channels[3]);
    nir_def_rewrite_uses_after(&tex->def, result);
    return true;
 }
@@ -6961,6 +7010,8 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
          .mirror_t = state->wrap_t == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE,
          .mirror_r = state->wrap_r == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE,
          .linear = state->min_img_filter == PIPE_TEX_FILTER_LINEAR,
+         .comparison = state->compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE,
+         .compare_func = state->compare_func,
          .integer_sampled = integer_sampled,
          .integer_array = view->target == PIPE_TEXTURE_1D_ARRAY ||
                           view->target == PIPE_TEXTURE_2D_ARRAY ||
@@ -16191,8 +16242,7 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
     * cases died that way: their reference sampler is CLAMP_TO_BORDER with
     * mip-nearest, the gather on it was left as a sampled integer image, and
     * Tint rejected the whole capture shader. */
-   if (border && (comparison ||
-                  state->min_img_filter != state->mag_img_filter ||
+   if (border && (state->min_img_filter != state->mag_img_filter ||
                   (state->min_mip_filter != PIPE_TEX_MIPFILTER_NONE &&
                    state->min_mip_filter != PIPE_TEX_MIPFILTER_NEAREST) ||
                   (!state->border_color_is_integer &&
@@ -16201,10 +16251,9 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
                     !isfinite(state->border_color.f[2]) ||
                     !isfinite(state->border_color.f[3])))))
       return gex_wgpu_sampler_refused(state,
-                                      "clamp-to-border with comparison, "
-                                      "mismatched filters, linear mip "
-                                      "filtering or a non-finite border "
-                                      "colour");
+                                      "clamp-to-border with mismatched "
+                                      "filters, linear mip filtering or a "
+                                      "non-finite border colour");
    struct pipe_sampler_state supported = {0};
    supported.wrap_s = state->wrap_s;
    supported.wrap_t = state->wrap_t;
