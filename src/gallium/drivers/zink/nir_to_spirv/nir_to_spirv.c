@@ -3424,6 +3424,23 @@ get_image_coords(struct ntv_context *ctx, const struct glsl_type *type, nir_src 
 
    nir_alu_type atype;
    SpvId spv = get_src(ctx, src, &atype);
+   /* An image coordinate is an integer, and SPIR-V enforces it:
+    *
+    *   Expected Coordinate to be int scalar or vector
+    *
+    * get_src hands back whatever type the value was last labelled with, and
+    * for a vecN that is a majority vote over its sources -- see the typeless
+    * block in emit_alu. So one shader's ivec2 store came out uint and its
+    * ivec3 store float, from the same values, purely because a different
+    * number of the components had come from a float-typed uniform load. The
+    * bits are the coordinate either way; the vote decides only the label. */
+   if (atype == nir_type_float) {
+      spv = emit_bitcast(ctx,
+                         get_uvec_type(ctx, nir_src_bit_size(*src),
+                                       src_components),
+                         spv);
+      atype = nir_type_uint;
+   }
    if (num_coords == src_components)
       return spv;
 
