@@ -2783,6 +2783,73 @@ gex_wgpu_split_64bit_ubo_load(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+/* Turn a uniform block array indexed by a value the compiler could not fold
+ * into a chain of constant ones.
+ *
+ * `uniform Block { ... } blocks[N];` indexed by a dynamically uniform
+ * expression is ARB_gpu_shader5, and everything downstream of here is keyed on
+ * a *constant* block number: gex_wgpu_lower_ubo_load reads the slot to decide
+ * which binding the load becomes, so a dynamic index was refused -- and a
+ * refusal at shader-create time is a failed link, which is the whole program
+ * gone rather than one draw.
+ *
+ * The unroll is the same answer the sampler arrays get, and cheaper to build,
+ * because a load_ubo is an intrinsic with an SSA block index rather than a
+ * deref chain: one load per block against a constant, selected by comparing
+ * the index. Block zero is the fallback, which is what an out-of-range index
+ * gets -- GL leaves that undefined.
+ *
+ * Only the block *index* is unrolled. A dynamic byte offset within a block is
+ * a different question and gex_wgpu_lower_ubo_load already handles it.
+ */
+static bool
+gex_wgpu_lower_dynamic_ubo_index_instr(nir_builder *b, nir_instr *instr,
+                                       void *data)
+{
+   const unsigned blocks = *(const unsigned *)data;
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   if (intr->intrinsic != nir_intrinsic_load_ubo ||
+       nir_src_is_const(intr->src[0]))
+      return false;
+   /* With one block there is nothing to choose between, and with none the
+    * bound is not established -- leave the caller's refusal in place rather
+    * than guess at a block nothing is bound to. */
+   if (blocks < 2)
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+   nir_def *index = intr->src[0].ssa;
+   nir_def *offset = intr->src[1].ssa;
+   nir_def *result = NULL;
+   for (unsigned i = 0; i < blocks; ++i) {
+      nir_def *one = nir_load_ubo(
+         b, intr->def.num_components, intr->def.bit_size,
+         nir_imm_int(b, i), offset,
+         .align_mul = nir_intrinsic_align_mul(intr),
+         .align_offset = nir_intrinsic_align_offset(intr),
+         .range_base = nir_intrinsic_range_base(intr),
+         .range = nir_intrinsic_range(intr));
+      result = result ? nir_bcsel(b, nir_ieq_imm(b, index, i), one, result)
+                      : one;
+   }
+   nir_def_replace(&intr->def, result);
+   return true;
+}
+
+static bool
+gex_wgpu_lower_dynamic_ubo_index(nir_shader *nir, unsigned max_ubos)
+{
+   unsigned blocks = MIN2(nir->info.num_ubos, max_ubos);
+   if (getenv("GEX_WGPU_SPLIT_LOG"))
+      fprintf(stderr, "gex-split: %u uniform block(s) to unroll a dynamic "
+              "index over\n", blocks);
+   return nir_shader_instructions_pass(
+      nir, gex_wgpu_lower_dynamic_ubo_index_instr,
+      nir_metadata_control_flow, &blocks);
+}
+
 static bool
 gex_wgpu_lower_ubo_load(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -10174,6 +10241,9 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          ralloc_free(nir);
       return NULL;
    }
+   /* Before the lowering below, which is keyed on a constant block number. */
+   gex_wgpu_lower_dynamic_ubo_index(
+      nir, gex_screen(pipe->screen)->max_uniform_buffers);
    {
       char why[160] = "";
       if (!gex_wgpu_lower_gallium_ubos(nir, expected_stage,
