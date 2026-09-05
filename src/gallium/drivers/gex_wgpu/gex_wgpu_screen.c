@@ -2444,6 +2444,13 @@ struct gex_wgpu_gs {
     * writes for the rasterization draw. */
    struct gex_wgpu_varying_layout inputs;
    struct gex_wgpu_varying_layout outputs;
+   /* Declares no output and never calls EmitVertex, so it exists only for its
+    * stores. Such a shader needs none of the three buffers the pass writes
+    * emitted geometry into, and not allocating them is what lets its images
+    * fit: the pass's own buffers come out of the same ten storage bindings
+    * the device grants, so five of them left room for five images where the
+    * shader wanted eight. */
+   bool side_effects_only;
    unsigned max_vertices;
    unsigned max_triangles;
    /* Output primitives per input primitive, and indices per output primitive.
@@ -9228,6 +9235,32 @@ struct gex_wgpu_capture {
    bool failed;
 };
 
+/* Whether a geometry shader ever emits. One that does not is legal -- GL does
+ * not require EmitVertex -- and produces no primitives at all, so the passes
+ * that write, count and index them have nothing to do. */
+static bool
+gex_wgpu_shader_emits_vertex(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_emit_vertex:
+            case nir_intrinsic_emit_vertex_with_counter:
+            case nir_intrinsic_end_primitive:
+            case nir_intrinsic_end_primitive_with_counter:
+               return true;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
 /* An unsized array of 32-bit words in an interface block.  Everything the
  * capture pass touches -- vertex data, captured output, the parameters -- is a
  * byte stream whose layout GL already fixed, so the shader only needs
@@ -10121,9 +10154,15 @@ gex_wgpu_split_combined_samplers(nir_shader *nir)
     * it would be a binding the pipeline requires and no draw provides. */
    nir_remove_dead_variables(nir, nir_var_uniform, NULL);
    nir_fixup_deref_types(nir);
-   fprintf(stderr,
-           "gex-wgpu: split %u combined sampler(s), %u rebuilt, tex=%u\n",
-           count, rewrites, tex_seen);
+   /* Behind a flag. This fires for essentially every shader an application
+    * compiles -- GLSL has nothing but combined samplers -- so unconditional
+    * it was megabytes of stderr per run, and the driver's actual refusals had
+    * to be grepped out from between them. A per-compile line is a debugging
+    * instrument, not a report. */
+   if (getenv("GEX_WGPU_SPLIT_LOG"))
+      fprintf(stderr,
+              "gex-wgpu: split %u combined sampler(s), %u rebuilt, tex=%u\n",
+              count, rewrites, tex_seen);
    return true;
 }
 
@@ -25080,14 +25119,24 @@ gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs,
                                       GEX_WGPU_GS_PARAMS_BINDING, 0, false);
    state.vs_out = gex_wgpu_word_block(nir, "gex_gs_vsout",
                                       GEX_WGPU_GS_VSOUT_BINDING, 1, false);
-   state.vertices = gex_wgpu_word_block(nir, "gex_gs_vertices",
-                                        GEX_WGPU_GS_VERTEX_BINDING, 2, false);
-   state.indices = gex_wgpu_word_block(nir, "gex_gs_indices",
-                                       GEX_WGPU_GS_INDEX_BINDING, 3, false);
-   /* Declared whether or not this draw captures. A bind group layout is part
-    * of the module, so making it conditional would mean two modules. */
-   state.counts = gex_wgpu_word_block(nir, "gex_gs_counts",
-                                      GEX_WGPU_GS_COUNT_BINDING, 4, false);
+   /* The three the pass writes emitted geometry into. A shader that declares
+    * no output and never emits has no geometry to put in them, and the
+    * lowerings that would touch them are exactly the ones that cannot run --
+    * so they are not declared at all, and the dispatch binds three fewer
+    * storage buffers out of the ten the device grants. That is what lets a
+    * side-effect geometry shader carry eight packed images. */
+   if (!gs->side_effects_only) {
+      state.vertices = gex_wgpu_word_block(nir, "gex_gs_vertices",
+                                           GEX_WGPU_GS_VERTEX_BINDING, 2,
+                                           false);
+      state.indices = gex_wgpu_word_block(nir, "gex_gs_indices",
+                                          GEX_WGPU_GS_INDEX_BINDING, 3, false);
+      /* Declared whether or not this draw captures. A bind group layout is
+       * part of the module, so making it conditional would mean two
+       * modules. */
+      state.counts = gex_wgpu_word_block(nir, "gex_gs_counts",
+                                         GEX_WGPU_GS_COUNT_BINDING, 4, false);
+   }
 
    /* The shader's own constant buffers move to group one, so group zero is
     * this pass's buffers alone -- the same split the vertex compute pass
@@ -25118,7 +25167,7 @@ gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs,
     * pass. Written at the end of the shader and before the bounds check
     * below is lowered, so `nir_lower_returns` predicates it away for an
     * invocation with no primitive exactly as it does everything else. */
-   {
+   if (state.counts) {
       nir_builder tail = nir_builder_at(nir_after_impl(impl));
       nir_deref_instr *count_words =
          gex_wgpu_block_words(&tail, state.counts);
@@ -26559,6 +26608,8 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       FREE(gs);
       return NULL;
    }
+   gs->side_effects_only =
+      gs->outputs.count == 0 && !gex_wgpu_shader_emits_vertex(nir);
    /* Images, which had to wait for lower_gallium_ubos: it is what assigns
     * their bindings, and collecting before it recorded binding zero for every
     * one of them -- GEX_WGPU_GS_PARAMS_BINDING, so the group had two entries
@@ -29893,11 +29944,17 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_PARAMS_BINDING,
                          gs_param_buffer);
    gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_VSOUT_BINDING, ctx->gs_vs_out);
-   gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_VERTEX_BINDING,
-                         ctx->gs_vertices);
-   gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_INDEX_BINDING,
-                         ctx->gs_indices);
-   gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_COUNT_BINDING, ctx->gs_counts);
+   /* Not declared by a shader that emits nothing, so not bound either: a
+    * layout entry the module does not use still costs one of the device's ten
+    * storage bindings. See gs->side_effects_only. */
+   if (!gs->side_effects_only) {
+      gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_VERTEX_BINDING,
+                            ctx->gs_vertices);
+      gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_INDEX_BINDING,
+                            ctx->gs_indices);
+      gex_wgpu_bind_storage(&gs_group0, GEX_WGPU_GS_COUNT_BINDING,
+                            ctx->gs_counts);
+   }
    /* Views this pass owns: one per image bound to a real resource. Released
     * once the dispatch is recorded, the way launch_grid releases its own. */
    WGPUTextureView gs_image_views[GEX_WGPU_MAX_SHADER_IMAGES];
@@ -29935,6 +29992,14 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
       gex_dispatch_gave_up(ctx);
       return false;
    }
+
+   /* A shader that emits nothing is finished here. Its stores happened in the
+    * pass above, and every pass below reads the emitted-primitive counts --
+    * which such a shader has no buffer for, because it writes none. Nothing
+    * is lost: no primitive was produced, so transform feedback records
+    * nothing and GL_PRIMITIVES_GENERATED counts nothing. */
+   if (gs->side_effects_only)
+      return true;
 
    /* Passes three and four: transform feedback, which is what GL records for
     * a draw with a geometry shader -- the geometry stage is the last one
