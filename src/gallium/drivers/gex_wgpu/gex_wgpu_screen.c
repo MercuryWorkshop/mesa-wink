@@ -20798,6 +20798,51 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
     *
     * Two copies through a scratch texture of the requested size say the same
     * thing, and both are ordered inside this one encoder. */
+   /* A depth or stencil copy has to take the whole subresource.
+    *
+    * WebGPU allows a partial texture-to-texture copy for colour and not for
+    * depth-stencil, and says so plainly:
+    *
+    *   Copy origin ([0,0,0]) and size ([1,1,1]) does not cover the entire
+    *   subresource (origin [0,0], size [2,2,1]) of [Texture (2x2 px,
+    *   TextureFormat::Depth24PlusStencil8)]. The entire subresource must be
+    *   copied when the format is a depth/stencil format
+    *
+    * Refused here rather than there. There it is a validation error, and a
+    * validation error invalidates the command buffer and takes whatever else
+    * was recorded with it -- the same reason the integer resolve above
+    * declines rather than letting Dawn discover it. This copy cannot be made
+    * to work by trying: it is invalid for every partial box, so nothing is
+    * lost by naming it, and a copy that does cover the level still goes
+    * through.
+    *
+    * Serving it properly means a render pass that samples the source depth
+    * and writes gl_FragDepth under a scissor, which is real work for
+    * something only KHR-GL45.direct_state_access.framebuffers_blit has asked
+    * for so far. */
+   if (util_format_is_depth_or_stencil(src->format) ||
+       util_format_is_depth_or_stencil(dst->format)) {
+      const unsigned src_w = u_minify(src->width0, src_level);
+      const unsigned src_h = u_minify(src->height0, src_level);
+      const unsigned dst_w = u_minify(dst->width0, dst_level);
+      const unsigned dst_h = u_minify(dst->height0, dst_level);
+      const unsigned w = (unsigned)abs(box->width);
+      const unsigned h = (unsigned)abs(box->height);
+      if (box->x != 0 || box->y != 0 || dstx != 0 || dsty != 0 ||
+          w != src_w || h != src_h || w != dst_w || h != dst_h) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: copy declined (a %s copy must take the "
+                    "whole subresource; asked for %ux%u at %d,%d of a %ux%u "
+                    "level into %u,%u of a %ux%u one)\n",
+                    util_format_short_name(src->format), w, h, box->x, box->y,
+                    src_w, src_h, dstx, dsty, dst_w, dst_h);
+         }
+         return false;
+      }
+   }
+
    WGPUTexture scratch = NULL;
    static int copy_log = -1;
    if (copy_log < 0) {
