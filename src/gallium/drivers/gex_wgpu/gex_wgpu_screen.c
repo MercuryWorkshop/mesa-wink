@@ -39223,11 +39223,15 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
       caps->max_shader_images =
          stages[i] == MESA_SHADER_FRAGMENT ||
          stages[i] == MESA_SHADER_COMPUTE ||
-         /* The geometry stage runs as a compute pass, so a writable storage
-          * texture is legal there too. The vertex stage is not added: Tint
-          * refuses one by name -- "storage texture with 'write' access mode
-          * cannot be used by vertex pipeline stage" -- and every CTS case
-          * that binds a vertex image stores through it. */
+         /* Every stage, and each for its own reason. The geometry and
+          * tessellation stages run as compute passes, where a writable
+          * storage texture is legal outright. The vertex stage is not -- Tint
+          * refuses one by name, "storage texture with 'write' access mode
+          * cannot be used by vertex pipeline stage" -- and reaches it through
+          * the route this driver already had for vertex storage writes: the
+          * shader is dispatched as compute for its side effects and
+          * rasterises from a copy with the stores stripped and the images
+          * removed. See gex_wgpu_strip_storage_writes. */
          stages[i] == MESA_SHADER_GEOMETRY ||
          stages[i] == MESA_SHADER_TESS_CTRL ||
          stages[i] == MESA_SHADER_TESS_EVAL ||
