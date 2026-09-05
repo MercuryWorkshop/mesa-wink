@@ -5680,6 +5680,20 @@ static uint8_t
 gex_wgpu_effective_view_swizzle(const struct pipe_sampler_view *view,
                                 unsigned channel)
 {
+   /* A slot with no view is served by a 1x1 stand-in, which carries no
+    * swizzle -- so the identity is the right answer, and asking is legitimate.
+    * The variants' cache keys ask for every slot they collected, and a view
+    * can be missing for either of two ordinary reasons: nothing was bound, or
+    * create_sampler_view refused it. KHR-GL45.texture_view does the second on
+    * purpose (an r16g16b16a16_unorm view of an r16g16b16a16_float texture),
+    * and the unguarded read segfaulted the whole run rather than failing a
+    * case. The line below it already knew this, spelling `view ? … : 0xff`. */
+   if (!view) {
+      static const uint8_t identity[4] = {
+         PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W,
+      };
+      return identity[channel & 3];
+   }
    const uint8_t requested = channel == 0 ? view->swizzle_r
                            : channel == 1 ? view->swizzle_g
                            : channel == 2 ? view->swizzle_b
@@ -5788,6 +5802,131 @@ gex_wgpu_lower_sampler_lod_bias_instr(nir_builder *b, nir_instr *instr,
  * places, which a probe using four distinct texels catches and one using a
  * constant texture does not.
  */
+/* A depth-comparison gather over a texture clamped to a border.
+ *
+ * WGSL's textureGatherCompare serves every other shadow gather natively, and
+ * this pass leaves those alone -- decomposing them would be a pure loss. What
+ * it cannot serve is a border, because each of the four texels in the
+ * footprint can fall outside the texture independently, and a border is not a
+ * property of the sample as a whole.
+ *
+ * So the gather becomes four ordinary shadow samples at the four texel
+ * centres, in GL's rotation, and each of those is then given its border by
+ * gex_wgpu_lower_nearest_border_instr in the usual way -- the same shape the
+ * integer gather below uses, and the reason both run before that pass.
+ *
+ * Shapes this cannot decompose are left as they are rather than refused. An
+ * integer gather has no native form at all, so refusing one is the honest
+ * answer; a shadow gather does, and declining the draw over a border would
+ * cost more than the border is worth. An array shadow gather with a border is
+ * the case that falls here, and the border pass could not have served its
+ * pieces either.
+ */
+static bool
+gex_wgpu_lower_shadow_border_gather_instr(nir_builder *b, nir_instr *instr,
+                                          void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->op != nir_texop_tg4 || !tex->is_shadow)
+      return false;
+
+   struct gex_wgpu_texture_lowering *table = data;
+   const int texture_src =
+      nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int sampler_src =
+      nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int ref_src = nir_tex_instr_src_index(tex, nir_tex_src_comparator);
+   if (texture_src < 0 || sampler_src < 0 || coord_src < 0 || ref_src < 0)
+      return false;
+   nir_variable *sampler_var = nir_deref_instr_get_variable(
+      nir_src_as_deref(tex->src[sampler_src].src));
+   const unsigned slot = sampler_var
+      ? sampler_var->data.driver_location : GEX_WGPU_MAX_SAMPLERS;
+   if (slot >= GEX_WGPU_MAX_SAMPLERS || !table->active[slot])
+      return false;
+   const struct gex_wgpu_border_lowering *lower = &table->slots[slot];
+   if (!lower->s && !lower->t)
+      return false;
+   /* The four pieces are *samples*, not fetches -- a depth comparison has no
+    * fetch form -- so they carry the bound sampler's filter with them. At
+    * NEAREST that returns exactly the texel whose centre they name, which is
+    * what a gather must return. At LINEAR it would blend the neighbours in,
+    * and a gather that filters is not a gather. Leave those to the native
+    * textureGatherCompare and lose only the border, which is the smaller
+    * wrong of the two. */
+   if (lower->linear)
+      return false;
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_array ||
+       tex->coord_components != 2 ||
+       nir_tex_instr_has_explicit_tg4_offsets(tex))
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+   nir_def *coord = tex->src[coord_src].src.ssa;
+   nir_def *texture_deref = tex->src[texture_src].src.ssa;
+   nir_def *sampler_deref = tex->src[sampler_src].src.ssa;
+   nir_def *ref = tex->src[ref_src].src.ssa;
+
+   nir_tex_instr *txs = nir_tex_instr_create(b->shader, 2);
+   txs->op = nir_texop_txs;
+   txs->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   txs->dest_type = nir_type_int32;
+   txs->texture_index = tex->texture_index;
+   txs->src[0] =
+      nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture_deref);
+   txs->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
+   nir_def_init(&txs->instr, &txs->def, 2, 32);
+   nir_builder_instr_insert(b, &txs->instr);
+   nir_def *size = nir_i2f32(b, &txs->def);
+
+   /* The lower-left texel of the footprint, in texel space. */
+   nir_def *corner =
+      nir_ffloor(b, nir_fadd_imm(b, nir_fmul(b, coord, size), -0.5f));
+   const int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   if (offset_src >= 0)
+      corner = nir_fadd(b, corner,
+                        nir_i2f32(b, tex->src[offset_src].src.ssa));
+
+   /* GL's rotation, as texel offsets from that corner. */
+   static const float across[4] = {0.0f, 1.0f, 1.0f, 0.0f};
+   static const float up[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+   nir_def *gathered[4];
+   for (unsigned k = 0; k < 4; ++k) {
+      nir_def *centre = nir_fdiv(
+         b, nir_fadd(b, corner,
+                     nir_imm_vec2(b, across[k] + 0.5f, up[k] + 0.5f)),
+         size);
+      /* An explicit level, for the reason the integer gather spells out: an
+       * implicit-LOD sample is illegal outside a fragment shader, and these
+       * gathers happen in a vertex shader. */
+      nir_tex_instr *one = nir_tex_instr_create(b->shader, 5);
+      one->op = nir_texop_txl;
+      one->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      one->is_shadow = true;
+      one->is_new_style_shadow = true;
+      one->coord_components = 2;
+      one->dest_type = nir_type_float32;
+      one->texture_index = tex->texture_index;
+      one->sampler_index = tex->sampler_index;
+      one->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, centre);
+      one->src[1] =
+         nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture_deref);
+      one->src[2] =
+         nir_tex_src_for_ssa(nir_tex_src_sampler_deref, sampler_deref);
+      one->src[3] = nir_tex_src_for_ssa(nir_tex_src_comparator, ref);
+      one->src[4] =
+         nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_float(b, 0.0f));
+      nir_def_init(&one->instr, &one->def, 1, 32);
+      nir_builder_instr_insert(b, &one->instr);
+      gathered[k] = &one->def;
+   }
+   nir_def_replace(&tex->def, nir_vec(b, gathered, 4));
+   return true;
+}
+
 static bool
 gex_wgpu_lower_integer_gather_instr(nir_builder *b, nir_instr *instr,
                                     void *data)
@@ -7115,6 +7254,9 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
    progress |= has_integer_cube &&
       dxil_nir_lower_int_cubemaps(nir, true);
    /* Before the sample pass, whose ordinary input is what this produces. */
+   progress |= nir_shader_instructions_pass(
+      nir, gex_wgpu_lower_shadow_border_gather_instr,
+      nir_metadata_control_flow | nir_metadata_loop_analysis, &table);
    progress |= nir_shader_instructions_pass(
       nir, gex_wgpu_lower_integer_gather_instr,
       nir_metadata_control_flow | nir_metadata_loop_analysis, &table);
@@ -22703,6 +22845,56 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
 
 /* Build, or find, the compute variant of this vertex shader for this vertex
  * layout. */
+/* Whether a compute-emulated stage's module has to be specialized against the
+ * bound sampler state at all.
+ *
+ * The varying and capture variants asked only `integer_sampled_slots`, because
+ * an integer sample is the case that makes Tint *reject* the module -- a loud
+ * failure that had to be fixed to get anywhere. Everything else the lowering
+ * does is silently wrong instead, which is why it went unnoticed: a shadow
+ * gather over a texture clamped to a border came back with clamp-to-edge
+ * results and nothing said so.
+ *
+ * This is the same set of reasons the fragment path's `needs_sampler_variant`
+ * collects, asked of one stage's slots.
+ */
+static bool
+gex_wgpu_stage_wants_texture_variant(
+   unsigned count, const uint8_t *slots, uint16_t integer_sampled_slots,
+   struct gex_wgpu_sampler *const *samplers,
+   struct pipe_sampler_view *const *views)
+{
+   for (unsigned i = 0; i < count; ++i) {
+      const unsigned slot = slots[i];
+      if (slot >= GEX_WGPU_MAX_SAMPLERS)
+         continue;
+      if (integer_sampled_slots & (1u << slot))
+         return true;
+      const struct pipe_sampler_view *view = views[slot];
+      /* st/mesa gives every depth texture a non-identity swizzle, so this is
+       * every depth sample -- which is exactly the point: the swizzle has to
+       * be applied somewhere, and nothing else in these stages applies it. */
+      if (view &&
+          (gex_wgpu_effective_view_swizzle(view, 0) != PIPE_SWIZZLE_X ||
+           gex_wgpu_effective_view_swizzle(view, 1) != PIPE_SWIZZLE_Y ||
+           gex_wgpu_effective_view_swizzle(view, 2) != PIPE_SWIZZLE_Z ||
+           gex_wgpu_effective_view_swizzle(view, 3) != PIPE_SWIZZLE_W))
+         return true;
+      const struct gex_wgpu_sampler *sampler = samplers[slot];
+      if (!sampler)
+         continue;
+      if (sampler->state.wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
+          sampler->state.wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
+          sampler->state.wrap_r == PIPE_TEX_WRAP_CLAMP_TO_BORDER ||
+          sampler->state.wrap_s == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE ||
+          sampler->state.wrap_t == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE ||
+          sampler->state.wrap_r == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE ||
+          sampler->state.lod_bias != 0.0f)
+         return true;
+   }
+   return false;
+}
+
 static struct gex_wgpu_capture_variant *
 gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
                              struct gex_wgpu_shader *vs,
@@ -22714,10 +22906,13 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
     * and a sampler variable per unit, so they are renumbered into the compute
     * range below and the dispatch binds them from the vertex stage's own
     * sampler state. */
+   const bool wants_variant = gex_wgpu_stage_wants_texture_variant(
+      vs->texture_count, vs->texture_slots, vs->integer_sampled_slots,
+      ctx->vertex_samplers, ctx->vertex_sampler_views);
    for (struct gex_wgpu_capture_variant *v = vs->captures; v; v = v->next) {
       if (memcmp(&v->layout, layout, sizeof(*layout)))
          continue;
-      if (!vs->integer_sampled_slots)
+      if (!wants_variant)
          return v;
       /* An integer-sampling shader's module is specific to the state it was
        * lowered against, so the layout matching is not enough. */
@@ -22897,7 +23092,9 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
     * transform feedback reached Tint as a sampled image and came back
     * "sampled image must have float component type" -- seven of the nine
     * KHR-GL45.gpu_shader5 failures, which are all texture_gather_offset over
-    * exactly that shape. */
+    * exactly that shape. The trigger is not integer sampling alone: a border,
+    * a mirror clamp, a LOD bias and a view swizzle all need this module
+    * specialized too, and each of those is silently wrong without it. */
    /* GEX_WGPU_CAPTEX_LOG names, per slot, whether a view and a sampler state
     * are actually there. "view=1 samp=0" is the state that hides a refused
     * sampler: the lowering reads a missing sampler as texelFetch-only and
@@ -22913,7 +23110,7 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
       }
       fprintf(stderr, "\n");
    }
-   if (vs->integer_sampled_slots) {
+   if (wants_variant) {
       if (!gex_wgpu_lower_texture_variant(nir, variant->textures.count,
                                           variant->textures.slots,
                                           vs->integer_sampled_slots,
@@ -23094,11 +23291,14 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
     * a sampler variable per unit, so the variant renumbers them into the
     * compute range below and the dispatch binds them from the vertex stage's
     * own sampler state. */
+   const bool wants_variant = gex_wgpu_stage_wants_texture_variant(
+      vs->texture_count, vs->texture_slots, vs->integer_sampled_slots,
+      ctx->vertex_samplers, ctx->vertex_sampler_views);
    for (struct gex_wgpu_varying_variant *v = vs->varyings; v; v = v->next) {
       if (memcmp(&v->vertex_layout, vertex, sizeof(*vertex)) ||
           memcmp(&v->varyings, varyings, sizeof(*varyings)))
          continue;
-      if (!vs->integer_sampled_slots)
+      if (!wants_variant)
          return v;
       /* An integer-sampling shader's module is specific to the state it was
        * lowered against, so the layouts matching is not enough. */
@@ -23256,7 +23456,7 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
     * above. Without this the module reaches Tint and comes back "sampled
     * image must have float component type", and the geometry or tessellation
     * draw that wanted it declines. */
-   if (vs->integer_sampled_slots) {
+   if (wants_variant) {
       if (!gex_wgpu_lower_texture_variant(nir, variant->textures.count,
                                           variant->textures.slots,
                                           vs->integer_sampled_slots,

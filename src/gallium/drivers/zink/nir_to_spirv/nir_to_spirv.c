@@ -4509,6 +4509,21 @@ get_src_float(struct ntv_context *ctx, nir_src *src)
       return def;
    unsigned num_components = nir_src_num_components(*src);
    unsigned bit_size = nir_src_bit_size(*src);
+   /* A NIR constant carries no type, and 0.0 and 0u are the same bits, so a
+    * float zero is as likely to have been inferred uint -- which reaches a
+    * consumer as OpBitcast %float %uint_0 rather than as OpConstant %float 0.
+    * The bits are the same either way, but a consumer that needs to *see* the
+    * value cannot: Tint rejects
+    *
+    *   OpImageSampleDrefExplicitLod ... Lod %65
+    *
+    * with "WGSL comparison sampling without derivatives requires
+    * level-of-detail 0.0", because textureSampleCompareLevel takes only a
+    * literal zero and a bitcast is not one.  Emitting the constant as a float
+    * costs nothing and reinterprets exactly the bits the bitcast would. */
+   if (num_components == 1 && nir_src_is_const(*src))
+      return get_fvec_constant(ctx, bit_size, 1,
+                               nir_src_comp_as_float(*src, 0));
    return bitcast_to_fvec(ctx, def, bit_size, num_components);
 }
 
