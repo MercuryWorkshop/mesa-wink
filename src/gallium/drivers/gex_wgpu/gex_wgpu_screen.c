@@ -217,22 +217,111 @@ extern void gex_wgpu_jspi_signal(void);
  * them here without writing it would claim a format that reads as rubbish --
  * is_format_supported is asked per format, so refusing them is visible to
  * st/mesa rather than silent. */
+static nir_def *gex_wgpu_small_float_to_float(nir_builder *b, nir_def *bits,
+                                              unsigned mantissa_bits,
+                                              bool has_sign);
+
+/* What one texel of a buffer texture looks like.
+ *
+ * A samplerBuffer is a read-only storage buffer here and texelFetch becomes
+ * word loads, so the driver has to know the texel's shape itself -- there is
+ * no format on the binding to do it. This used to be a *word count*, which
+ * meant only the 32-bit-per-component formats could be served at all; GL's
+ * table of required buffer-texture formats has three widths, and the narrower
+ * ones are the ones an application reaches for when the data is a palette or
+ * an index list.
+ *
+ * `bits` is per component. `kind` says how the bits become a value, which is
+ * the whole difference between R8UI and R8: the same byte, read as 255 or as
+ * 1.0.
+ */
+enum gex_wgpu_buftex_kind {
+   GEX_WGPU_BUFTEX_UNORM,
+   GEX_WGPU_BUFTEX_SNORM,
+   GEX_WGPU_BUFTEX_UINT,
+   GEX_WGPU_BUFTEX_SINT,
+   GEX_WGPU_BUFTEX_FLOAT,
+};
+
+struct gex_wgpu_buftex_texel {
+   uint8_t comps;
+   uint8_t bits;
+   uint8_t kind;
+};
+
+/* Indexed by the code gex_wgpu_buffer_texture_code returns, less one. */
+static const struct gex_wgpu_buftex_texel gex_wgpu_buftex_texels[] = {
+   { 1,  8, GEX_WGPU_BUFTEX_UNORM }, { 1,  8, GEX_WGPU_BUFTEX_SNORM },
+   { 1,  8, GEX_WGPU_BUFTEX_UINT },  { 1,  8, GEX_WGPU_BUFTEX_SINT },
+   { 1, 16, GEX_WGPU_BUFTEX_UNORM }, { 1, 16, GEX_WGPU_BUFTEX_SNORM },
+   { 1, 16, GEX_WGPU_BUFTEX_UINT },  { 1, 16, GEX_WGPU_BUFTEX_SINT },
+   { 1, 16, GEX_WGPU_BUFTEX_FLOAT },
+   { 1, 32, GEX_WGPU_BUFTEX_UINT },  { 1, 32, GEX_WGPU_BUFTEX_SINT },
+   { 1, 32, GEX_WGPU_BUFTEX_FLOAT },
+   { 2,  8, GEX_WGPU_BUFTEX_UNORM }, { 2,  8, GEX_WGPU_BUFTEX_SNORM },
+   { 2,  8, GEX_WGPU_BUFTEX_UINT },  { 2,  8, GEX_WGPU_BUFTEX_SINT },
+   { 2, 16, GEX_WGPU_BUFTEX_UNORM }, { 2, 16, GEX_WGPU_BUFTEX_SNORM },
+   { 2, 16, GEX_WGPU_BUFTEX_UINT },  { 2, 16, GEX_WGPU_BUFTEX_SINT },
+   { 2, 16, GEX_WGPU_BUFTEX_FLOAT },
+   { 2, 32, GEX_WGPU_BUFTEX_UINT },  { 2, 32, GEX_WGPU_BUFTEX_SINT },
+   { 2, 32, GEX_WGPU_BUFTEX_FLOAT },
+   { 3, 32, GEX_WGPU_BUFTEX_UINT },  { 3, 32, GEX_WGPU_BUFTEX_SINT },
+   { 3, 32, GEX_WGPU_BUFTEX_FLOAT },
+   { 4,  8, GEX_WGPU_BUFTEX_UNORM }, { 4,  8, GEX_WGPU_BUFTEX_SNORM },
+   { 4,  8, GEX_WGPU_BUFTEX_UINT },  { 4,  8, GEX_WGPU_BUFTEX_SINT },
+   { 4, 16, GEX_WGPU_BUFTEX_UNORM }, { 4, 16, GEX_WGPU_BUFTEX_SNORM },
+   { 4, 16, GEX_WGPU_BUFTEX_UINT },  { 4, 16, GEX_WGPU_BUFTEX_SINT },
+   { 4, 16, GEX_WGPU_BUFTEX_FLOAT },
+   { 4, 32, GEX_WGPU_BUFTEX_UINT },  { 4, 32, GEX_WGPU_BUFTEX_SINT },
+   { 4, 32, GEX_WGPU_BUFTEX_FLOAT },
+};
+
+/* One-based, so zero still means "this driver cannot serve it" -- which is
+ * what every caller already tests, and why the per-slot key can stay a byte
+ * whose meaning changed underneath it. */
 static unsigned
-gex_wgpu_buffer_texture_words(enum pipe_format format)
+gex_wgpu_buffer_texture_code(enum pipe_format format)
 {
    switch (format) {
-   case PIPE_FORMAT_R32_FLOAT:
-   case PIPE_FORMAT_R32_SINT:
-   case PIPE_FORMAT_R32_UINT:            return 1;
-   case PIPE_FORMAT_R32G32_FLOAT:
-   case PIPE_FORMAT_R32G32_SINT:
-   case PIPE_FORMAT_R32G32_UINT:         return 2;
-   case PIPE_FORMAT_R32G32B32_FLOAT:
-   case PIPE_FORMAT_R32G32B32_SINT:
-   case PIPE_FORMAT_R32G32B32_UINT:      return 3;
-   case PIPE_FORMAT_R32G32B32A32_FLOAT:
-   case PIPE_FORMAT_R32G32B32A32_SINT:
-   case PIPE_FORMAT_R32G32B32A32_UINT:   return 4;
+   case PIPE_FORMAT_R8_UNORM:            return 1;
+   case PIPE_FORMAT_R8_SNORM:            return 2;
+   case PIPE_FORMAT_R8_UINT:             return 3;
+   case PIPE_FORMAT_R8_SINT:             return 4;
+   case PIPE_FORMAT_R16_UNORM:           return 5;
+   case PIPE_FORMAT_R16_SNORM:           return 6;
+   case PIPE_FORMAT_R16_UINT:            return 7;
+   case PIPE_FORMAT_R16_SINT:            return 8;
+   case PIPE_FORMAT_R16_FLOAT:           return 9;
+   case PIPE_FORMAT_R32_UINT:            return 10;
+   case PIPE_FORMAT_R32_SINT:            return 11;
+   case PIPE_FORMAT_R32_FLOAT:           return 12;
+   case PIPE_FORMAT_R8G8_UNORM:          return 13;
+   case PIPE_FORMAT_R8G8_SNORM:          return 14;
+   case PIPE_FORMAT_R8G8_UINT:           return 15;
+   case PIPE_FORMAT_R8G8_SINT:           return 16;
+   case PIPE_FORMAT_R16G16_UNORM:        return 17;
+   case PIPE_FORMAT_R16G16_SNORM:        return 18;
+   case PIPE_FORMAT_R16G16_UINT:         return 19;
+   case PIPE_FORMAT_R16G16_SINT:         return 20;
+   case PIPE_FORMAT_R16G16_FLOAT:        return 21;
+   case PIPE_FORMAT_R32G32_UINT:         return 22;
+   case PIPE_FORMAT_R32G32_SINT:         return 23;
+   case PIPE_FORMAT_R32G32_FLOAT:        return 24;
+   case PIPE_FORMAT_R32G32B32_UINT:      return 25;
+   case PIPE_FORMAT_R32G32B32_SINT:      return 26;
+   case PIPE_FORMAT_R32G32B32_FLOAT:     return 27;
+   case PIPE_FORMAT_R8G8B8A8_UNORM:      return 28;
+   case PIPE_FORMAT_R8G8B8A8_SNORM:      return 29;
+   case PIPE_FORMAT_R8G8B8A8_UINT:       return 30;
+   case PIPE_FORMAT_R8G8B8A8_SINT:       return 31;
+   case PIPE_FORMAT_R16G16B16A16_UNORM:  return 32;
+   case PIPE_FORMAT_R16G16B16A16_SNORM:  return 33;
+   case PIPE_FORMAT_R16G16B16A16_UINT:   return 34;
+   case PIPE_FORMAT_R16G16B16A16_SINT:   return 35;
+   case PIPE_FORMAT_R16G16B16A16_FLOAT:  return 36;
+   case PIPE_FORMAT_R32G32B32A32_UINT:   return 37;
+   case PIPE_FORMAT_R32G32B32A32_SINT:   return 38;
+   case PIPE_FORMAT_R32G32B32A32_FLOAT:  return 39;
    default:                              return 0;
    }
 }
@@ -2719,26 +2808,88 @@ gex_wgpu_lower_buffer_texture(nir_builder *b, nir_instr *instr, void *data)
       return false;
    }
 
-   const unsigned n = state->words[slot];
+   const unsigned code = state->words[slot];
+   if (code > ARRAY_SIZE(gex_wgpu_buftex_texels)) {
+      state->failed = true;
+      if (!state->why[0])
+         snprintf(state->why, sizeof(state->why),
+                  "texture buffer slot %u has an unknown texel code %u", slot,
+                  code);
+      return false;
+   }
+   const struct gex_wgpu_buftex_texel texel =
+      gex_wgpu_buftex_texels[code - 1];
+   const unsigned n = texel.comps;
+   const unsigned bytes = texel.bits / 8;
    b->cursor = nir_before_instr(instr);
-   nir_def *base = nir_imul_imm(b, tex->src[coord_src].src.ssa, n);
    nir_deref_instr *words =
       nir_build_deref_struct(b, nir_build_deref_var(b, state->block[slot]), 0);
    const bool floating =
-      nir_alu_type_get_base_type(tex->def.bit_size == 32 ? tex->dest_type
-                                                         : tex->dest_type) ==
-      nir_type_float;
+      nir_alu_type_get_base_type(tex->dest_type) == nir_type_float;
+   /* The texel's first *byte*, not its first word: a narrower format packs
+    * several texels into one, so the component's word and its position inside
+    * that word both come out of the byte offset. */
+   nir_def *byte_base =
+      nir_imul_imm(b, tex->src[coord_src].src.ssa, n * bytes);
    nir_def *comp[4];
    for (unsigned k = 0; k < 4; ++k) {
-      if (k < n) {
-         comp[k] = nir_load_deref(
-            b, nir_build_deref_array(b, words, nir_iadd_imm(b, base, k)));
-      } else {
+      if (k >= n) {
          /* GL fills the components a format does not carry with (0,0,0,1) --
           * as floats for a float sampler and as integers otherwise. */
          comp[k] = floating
             ? nir_imm_float(b, k == 3 ? 1.0f : 0.0f)
             : nir_imm_int(b, k == 3 ? 1 : 0);
+         continue;
+      }
+      nir_def *at = nir_iadd_imm(b, byte_base, k * bytes);
+      nir_def *word = nir_load_deref(
+         b, nir_build_deref_array(b, words, nir_ushr_imm(b, at, 2)));
+      nir_def *raw = word;
+      if (texel.bits < 32) {
+         /* Little-endian, which is what every buffer this driver uploads is:
+          * the byte at offset o sits in bits 8*(o & 3) of its word. */
+         nir_def *shift = nir_imul_imm(b, nir_iand_imm(b, at, 3), 8);
+         raw = nir_iand_imm(b, nir_ushr(b, word, shift),
+                            (1u << texel.bits) - 1u);
+      }
+      switch (texel.kind) {
+      case GEX_WGPU_BUFTEX_UINT:
+         comp[k] = raw;
+         break;
+      case GEX_WGPU_BUFTEX_SINT:
+         /* Sign-extended by shifting the value up to the top of the word and
+          * back down arithmetically; at 32 bits it is already there. */
+         comp[k] = texel.bits == 32
+            ? raw
+            : nir_ishr_imm(b, nir_ishl_imm(b, raw, 32 - texel.bits),
+                           32 - texel.bits);
+         break;
+      case GEX_WGPU_BUFTEX_UNORM:
+         comp[k] = nir_fmul_imm(b, nir_u2f32(b, raw),
+                                1.0 / (double)((1u << texel.bits) - 1u));
+         break;
+      case GEX_WGPU_BUFTEX_SNORM: {
+         nir_def *signed_raw =
+            nir_ishr_imm(b, nir_ishl_imm(b, raw, 32 - texel.bits),
+                         32 - texel.bits);
+         /* GL's snorm maps -MAX and -MAX-1 both to -1.0, so the division is
+          * by MAX and the result is clamped rather than allowed to reach
+          * -1.0039. */
+         const double scale = (double)((1u << (texel.bits - 1)) - 1u);
+         comp[k] = nir_fmax(b, nir_fmul_imm(b, nir_i2f32(b, signed_raw),
+                                            1.0 / scale),
+                            nir_imm_float(b, -1.0f));
+         break;
+      }
+      case GEX_WGPU_BUFTEX_FLOAT:
+      default:
+         /* By hand, not with nir_unpack_half_2x16: every NIR route to a
+          * half ends in a 16-bit type and Tint's SPIR-V reader has none --
+          * "unhandled integer width: 16". gex_wgpu_small_float_to_float
+          * exists for exactly this and carries the reasoning. */
+         comp[k] = texel.bits == 16
+            ? gex_wgpu_small_float_to_float(b, raw, 10, true) : raw;
+         break;
       }
    }
    nir_def *result = nir_vec(b, comp, 4);
@@ -2764,7 +2915,7 @@ gex_wgpu_buftex_words(unsigned buftex_count, const uint8_t *buftex_slots,
       const unsigned slot = buftex_slots[i];
       const struct pipe_sampler_view *view = views[slot];
       if (view && view->target == PIPE_BUFFER)
-         words[slot] = (uint8_t)gex_wgpu_buffer_texture_words(view->format);
+         words[slot] = (uint8_t)gex_wgpu_buffer_texture_code(view->format);
    }
 }
 
@@ -13589,7 +13740,7 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
       /* A texture buffer, which is asked about per format: only the ones
        * gex_wgpu_buffer_texture_words can decode are claimed. */
       if ((bind & PIPE_BIND_SAMPLER_VIEW) &&
-          gex_wgpu_buffer_texture_words(format) == 0)
+          gex_wgpu_buffer_texture_code(format) == 0)
          return false;
       if (bind == PIPE_BIND_VERTEX_BUFFER && format != PIPE_FORMAT_NONE) {
          unsigned vertex_size, vertex_alignment;
@@ -14883,7 +15034,7 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
     * for a buffer view that union member holds the offset and size instead,
     * so a level range read out of it is nonsense. */
    if (texture && texture->target == PIPE_BUFFER) {
-      if (gex_wgpu_buffer_texture_words(templ->format) == 0) {
+      if (gex_wgpu_buffer_texture_code(templ->format) == 0) {
          GEX_SAMPLER_VIEW_REFUSED("texture buffer format needs unpacking");
          return NULL;
       }
@@ -19694,7 +19845,16 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       bindings[count].binding = compute->buftex_bindings[i];
       bindings[count].buffer = gex_resource(view->texture)->buffer;
       bindings[count].offset = view->u.buf.offset;
-      bindings[count].size = view->u.buf.size;
+      /* Rounded up to four: WebGPU wants a storage binding's size to be a multiple
+       * of four, and a buffer texture of a narrow format need not be -- five R8
+       * texels is five bytes. The allocation is 16-aligned, so the rounding never
+       * reaches past the buffer, and the extra bytes are outside every texel the
+       * shader can address.
+       *
+       *   Binding size (5) of [Buffer] isn't a multiple of 4 when binding type is
+       *   (BufferBindingType::ReadOnlyStorage).
+       */
+      bindings[count].size = ALIGN_POT(view->u.buf.size, 4);
       ++count;
    }
 
@@ -35605,7 +35765,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[at].binding = ctx->vs->buftex_bindings[i];
          entries[at].buffer = gex_resource(view->texture)->buffer;
          entries[at].offset = view->u.buf.offset;
-         entries[at].size = view->u.buf.size;
+         /* Rounded to four; see the note in the capture path. */
+         entries[at].size = ALIGN_POT(view->u.buf.size, 4);
       }
       if (ctx->vs->reads_draw_params) {
          const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
@@ -35827,7 +35988,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[at].binding = ctx->fs->buftex_bindings[i];
          entries[at].buffer = gex_resource(view->texture)->buffer;
          entries[at].offset = view->u.buf.offset;
-         entries[at].size = view->u.buf.size;
+         /* Rounded to four; see the note in the capture path. */
+         entries[at].size = ALIGN_POT(view->u.buf.size, 4);
       }
       for (unsigned i = 0; i < ctx->fs->packed_image_count; ++i) {
          const unsigned base = ctx->fs->ubo_count + ctx->fs->ssbo_count +
