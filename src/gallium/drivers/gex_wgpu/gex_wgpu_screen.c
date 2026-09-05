@@ -13942,6 +13942,11 @@ gex_wgpu_default_storage_view(struct gex_wgpu_screen *screen,
                               WGPUTextureViewDimension dimension,
                               WGPUTextureFormat format,
                               WGPUStorageTextureAccess access);
+/* And its sampled counterpart, for the stand-in a read-only image needs. */
+static WGPUTextureView
+gex_wgpu_default_texture_view(struct gex_wgpu_screen *screen,
+                              WGPUTextureViewDimension dimension,
+                              WGPUTextureSampleType sample_type);
 
 static WGPUBuffer
 gex_wgpu_placeholder_storage(struct gex_wgpu_context *ctx, uint64_t least)
@@ -20433,11 +20438,25 @@ gex_wgpu_stage_image_view(struct gex_wgpu_context *ctx,
    *owned = false;
    if (!iv->resource || !gex_resource(iv->resource)->texture) {
       /* GL says such a unit reads zero and discards its stores rather than
-       * being an error, so the binding still has to exist. */
-      *out_view = gex_wgpu_default_storage_view(
-         screen, images->dimensions[i],
-         gex_wgpu_storage_texture_format(images->formats[i]),
-         images->access[i]);
+       * being an error, so the binding still has to exist -- and it has to be
+       * the *kind* the shader declared. A read-only image is a sampled
+       * texture there, because Tint lowers a storage image that is only read
+       * to a plain texture_2d<T>, so a storage stand-in is rejected by name:
+       *
+       *   Binding type in the shader (texture) doesn't match the type in the
+       *   layout (storageTexture).
+       *
+       * which is what every non-compute basic-allTargets case died of. */
+      const enum pipe_format format = images->formats[i];
+      *out_view = images->access[i] == WGPUStorageTextureAccess_ReadOnly
+         ? gex_wgpu_default_texture_view(
+              screen, images->dimensions[i],
+              util_format_is_pure_uint(format) ? WGPUTextureSampleType_Uint
+              : util_format_is_pure_sint(format) ? WGPUTextureSampleType_Sint
+              : WGPUTextureSampleType_UnfilterableFloat)
+         : gex_wgpu_default_storage_view(
+              screen, images->dimensions[i],
+              gex_wgpu_storage_texture_format(format), images->access[i]);
       if (!*out_view) {
          fprintf(stderr, "gex-wgpu: %s declined (no stand-in for image %u)\n",
                  stage_name, slot);
@@ -20926,11 +20945,12 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
        * texture_2d<T>, and WebGPU rejects a storageTexture layout against
        * that by name. The graphics path carries the same note.
        *
-       * A stand-in is the exception, and deliberately so: it is a storage
-       * view over a texture of the screen's own, and it is bound as one
-       * whatever the declared access. */
-      if (owned && compute->images.access[i] ==
-                      WGPUStorageTextureAccess_ReadOnly) {
+       * The stand-in follows the same rule: it used to be a storage view
+       * whatever the access, which disagreed with a shader that had lowered
+       * the image to a sampled texture. gex_wgpu_stage_image_view makes a
+       * sampled stand-in for a read-only image now, so this no longer asks
+       * whether the view is owned. */
+      if (compute->images.access[i] == WGPUStorageTextureAccess_ReadOnly) {
          const enum pipe_format image_format = compute->images.formats[i];
          entries[count].texture.sampleType =
             util_format_is_pure_uint(image_format) ? WGPUTextureSampleType_Uint
@@ -27590,7 +27610,9 @@ gex_wgpu_bind_stage_images(struct gex_wgpu_context *ctx,
        * that by name. A stand-in is the exception, as in launch_grid: it is a
        * storage view over a texture of the screen's own and binds as one
        * whatever access was declared. */
-      if (owned && images->access[i] == WGPUStorageTextureAccess_ReadOnly) {
+      /* Owned or not: gex_wgpu_stage_image_view makes a sampled stand-in for
+       * a read-only image, so the layout says what the shader declared. */
+      if (images->access[i] == WGPUStorageTextureAccess_ReadOnly) {
          const enum pipe_format format = images->formats[i];
          group->texture_mask |= UINT64_C(1) << at;
          group->sample_type[at] =
