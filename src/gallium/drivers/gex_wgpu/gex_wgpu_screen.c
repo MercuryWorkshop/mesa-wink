@@ -35984,6 +35984,28 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
 
 
 
+/* Every way draw_vbo_inner can decide not to draw.
+ *
+ * There are more than forty, and each was a bare `return`: the draw does not
+ * happen and nothing anywhere says so. That is the hardest shape to diagnose
+ * here -- the application sees no error, the suite sees a buffer nobody
+ * wrote, and a frame is missing something with no thread to pull.
+ * GEX_WGPU_DRAW_DROP=1 names the line that gave up.
+ *
+ * A line number rather than a reason string on purpose: a reason has to be
+ * written forty times and will be wrong somewhere, and the line is exact and
+ * stays correct for free.
+ */
+static void
+gex_wgpu_note_draw_drop(int line)
+{
+   static int on = -1;
+   if (on < 0) on = getenv("GEX_WGPU_DRAW_DROP") ? 1 : 0;
+   if (on)
+      fprintf(stderr, "gex-wgpu: draw dropped at gex_wgpu_screen.c:%d\n", line);
+}
+#define GEX_DRAW_DROP() do { gex_wgpu_note_draw_drop(__LINE__); return; } while (0)
+
 static void
 gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                         const struct pipe_draw_info *info,
@@ -36011,7 +36033,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    if (gex_no_draw) {
       gex_wgpu_report_timing(gex_screen(pipe->screen));
-      return;
+      GEX_DRAW_DROP();
    }
    gex_wgpu_release_retired_groups(gex_screen(pipe->screen));
    /* Before any layout or bind group reads a buffer size. */
@@ -36045,7 +36067,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          if (!count)
             return;              /* nothing to draw is not a failure */
          gex_fail(ctx);
-         return;
+         GEX_DRAW_DROP();
       }
       /* A base vertex is folded in rather than passed on, for the same reason
        * as in the unfilled rewrite: the driver refuses a non-zero index_bias,
@@ -36057,7 +36079,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          if (transfer)
             pipe_buffer_unmap(pipe, transfer);
          gex_fail(ctx);
-         return;
+         GEX_DRAW_DROP();
       }
       for (unsigned i = 0; i < count; ++i) {
          if (rebase)
@@ -36081,7 +36103,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       widened_draw.index_bias = 0;
       gex_wgpu_draw_vbo(pipe, &widened, drawid_offset, NULL, &widened_draw, 1);
       FREE(wide);
-      return;
+      GEX_DRAW_DROP();
    }
 
    /* GL's default provoking vertex is the last of the primitive and WGSL's
@@ -36145,7 +36167,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        u_reduced_prim(info->mode) != MESA_PRIM_POINTS &&
        gex_wgpu_shader_has_flat_varying(ctx->fs) &&
        gex_wgpu_draw_provoking_last(pipe, info, drawid_offset, &draws[0]))
-      return;
+      GEX_DRAW_DROP();
 
    /* glPolygonMode with the faces set differently -- GL_LINE in front and
     * GL_POINT behind, say -- drawn as one pass per facing.
@@ -36176,7 +36198,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          ctx->facing_pass = CALLOC_STRUCT(gex_wgpu_rasterizer);
       if (!ctx->facing_pass) {
          gex_fail(ctx);
-         return;
+         GEX_DRAW_DROP();
       }
       ctx->facing_split = true;
       for (unsigned face = 0; face < 2; ++face) {
@@ -36200,7 +36222,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
       ctx->rasterizer = saved;
       ctx->facing_split = false;
-      return;
+      GEX_DRAW_DROP();
    }
 
    /* An unfilled polygon becomes the lines or points it would be drawn as,
@@ -36345,7 +36367,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                     &culled_draw, 1);
                FREE(culled_indices);
                FREE(culled_flat);
-               return;
+               GEX_DRAW_DROP();
             }
          }
       }
@@ -36362,7 +36384,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       FREE(culled_indices);
       FREE(culled_flat);
       if (drawn)
-         return;
+         GEX_DRAW_DROP();
       static bool said;
       if (!said) {
          said = true;
@@ -36403,7 +36425,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
         (ctx->rasterizer->line_stipple &&
          ctx->rasterizer->line_stipple_pattern != 0xffffu)) &&
        gex_wgpu_line_draw(ctx, info, drawid_offset, &draws[0]))
-      return;
+      GEX_DRAW_DROP();
 
    /* A topology WebGPU does not have is rewritten into one it does, which
     * comes straight back here as a supported mode -- but only for the
@@ -36420,7 +36442,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * the wasm module and loses every case after it. */
       if (ctx->gs) {
          gex_wgpu_gs_draw(ctx, info, drawid_offset, &draws[0]);
-         return;
+         GEX_DRAW_DROP();
       }
       /* With no geometry shader the adjacent vertices are dropped and the
        * primitive is drawn in its base form. Only once the restart split
@@ -36429,7 +36451,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           !(info->primitive_restart && info->index_size)) {
          if (!gex_wgpu_draw_adjacency(pipe, info, drawid_offset, &draws[0]))
             gex_fail(ctx);
-         return;
+         GEX_DRAW_DROP();
       }
       if (gex_wgpu_is_adjacency_prim(info->mode) &&
           (num_draws > 1 || (info->primitive_restart && info->index_size)))
@@ -36455,11 +36477,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          }
          /* Declined, not latched: latching becomes GL_OUT_OF_MEMORY in
           * st/mesa, which dEQP treats as fatal. */
-         return;
+         GEX_DRAW_DROP();
       }
       util_primconvert_draw_vbo(ctx->primconvert, info, drawid_offset, indirect,
                                 draws, num_draws);
-      return;
+      GEX_DRAW_DROP();
       }
    }
 
@@ -36485,7 +36507,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                                    : drawid_offset,
                            indirect, &draws[i], 1);
       }
-      return;
+      GEX_DRAW_DROP();
    }
 
    /* ARB_draw_indirect, resolved on the CPU.
@@ -36523,11 +36545,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       if (counted_draw.count)
          gex_wgpu_draw_vbo(pipe, &counted, drawid_offset, NULL, &counted_draw,
                            1);
-      return;
+      GEX_DRAW_DROP();
    }
    if (indirect && info && !ctx->failed) {
       util_draw_indirect(pipe, info, drawid_offset, indirect);
-      return;
+      GEX_DRAW_DROP();
    }
 
    /* gl_CullDistance, which no rasterizer state can express: the primitives
@@ -36566,7 +36588,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          gex_wgpu_draw_vbo(pipe, &culled, drawid_offset, NULL, &culled_draw, 1);
          saved_vs->cull_distances = saved_cull;
          FREE(survivors);
-         return;
+         GEX_DRAW_DROP();
       }
    }
 
@@ -36590,7 +36612,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          gex_fail(ctx);
       ctx->gs_primitive_base_active = was_active;
       ctx->gs_primitive_base = saved_base;
-      return;
+      GEX_DRAW_DROP();
    }
 
    /* GL_RASTERIZER_DISCARD: nothing reaches the framebuffer, so a draw with
@@ -36607,7 +36629,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (info && ctx->rasterizer &&
        ctx->rasterizer->cull_face == PIPE_FACE_FRONT_AND_BACK &&
        u_reduced_prim(info->mode) == MESA_PRIM_TRIANGLES)
-      return;
+      GEX_DRAW_DROP();
    const char *refusal =
       ctx->failed                                   ? "context already failed"
       : !ctx->vs                                    ? "no vertex shader"
@@ -36649,7 +36671,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * Returning early is the entire correct behaviour. */
    if (!refusal && info && draws &&
        (draws[0].count == 0 || info->instance_count == 0))
-      return;
+      GEX_DRAW_DROP();
    if (refusal) {
       /* Declined, not latched -- every reason above is a state combination
        * this backend does not serve, and not one of them touches the device.
@@ -36686,7 +36708,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                  info ? info->instance_count : 0, ctx->color_count,
                  ctx->vs ? 1 : 0, ctx->fs ? 1 : 0);
       }
-      return;
+      GEX_DRAW_DROP();
    }
    /* Gallium does not require the bound vertex-buffer count to match what the
     * element state references: st/mesa and u_vbuf both leave higher slots
@@ -36727,7 +36749,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                     (unsigned long long)ctx->vs->vertex_locations);
          }
          gex_fail(ctx);
-         return;
+         GEX_DRAW_DROP();
       }
    } else {
       for (unsigned i = 0; i < ctx->vertex_elements->count; ++i) {
@@ -36826,7 +36848,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                        (unsigned)GEX_WGPU_MAX_VERTEX_BUFFERS,
                        ctx->vertex_buffer_count);
             }
-            return;
+            GEX_DRAW_DROP();
          }
          vb_buffer[vb_slot_count] = (uint8_t)buffer;
          vb_instanced[vb_slot_count] = step != 0;
@@ -36882,7 +36904,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
       if (ctx->vs->capture_nir)
          (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
-      return;
+      GEX_DRAW_DROP();
    }
 
    /* A vertex shader's own stores happen in a compute dispatch of its own,
@@ -36914,7 +36936,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * The geometry path below has never done this, which is why it was the
        * one that behaved. */
       (void)gex_wgpu_tess_draw(ctx, info, drawid_offset, &draws[0]);
-      return;
+      GEX_DRAW_DROP();
    }
 
    /* A geometry shader replaces this draw with three passes of its own, the
@@ -36926,7 +36948,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * not the vertex stage's -- which is why this returns before the
        * capture block below, and why gex_wgpu_gs_draw does its own. */
       gex_wgpu_gs_draw(ctx, info, drawid_offset, &draws[0]);
-      return;
+      GEX_DRAW_DROP();
    }
 
    /* Transform feedback is its own compute pass, run before the draw: WGSL
@@ -36942,7 +36964,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        ctx->vs->capture_nir)
       (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
    if (discard)
-      return;
+      GEX_DRAW_DROP();
 
    /* Wide points become quads. See gex_wgpu_lower_wide_point for the shape of
     * it; what is decided here is whether this draw can take that road at all.
@@ -37187,7 +37209,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                        &ctx->uploaded_indices,
                                        &index_upload_offset, 4)) {
             gex_fail(ctx);
-            return;
+            GEX_DRAW_DROP();
          }
          uploaded_index_resource = ctx->uploaded_indices;
          index_resource = uploaded_index_resource;
@@ -37224,7 +37246,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           * fourteen unrelated cases in KHR-GL45.transform_feedback, which is
           * how the buffer-growth bug behind it stayed hidden: the family
           * looked broken in general rather than after one point. */
-         return;
+         GEX_DRAW_DROP();
       }
    }
    /* Where this draw's first index sits. An uploaded buffer already begins at
@@ -37417,7 +37439,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                     viewport_width, viewport_height, ctx->fb_width,
                     ctx->fb_height);
          }
-         return;
+         GEX_DRAW_DROP();
       }
       if (viewport_x < 0.0f || viewport_y < 0.0f ||
           viewport_x + viewport_width > ctx->fb_width ||
@@ -37444,7 +37466,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                     "gex-wgpu: draw declined (inverted depth range "
                     "%.3f..%.3f)\n", min_depth, max_depth);
          }
-         return;
+         GEX_DRAW_DROP();
       }
    }
 
@@ -37473,7 +37495,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       const uint32_t maxx = MIN2(ctx->scissor.maxx, ctx->fb_width);
       const uint32_t maxy = MIN2(ctx->scissor.maxy, ctx->fb_height);
       if (maxx <= scissor_x || maxy <= scissor_y)
-         return;
+         GEX_DRAW_DROP();
       scissor_width = maxx - scissor_x;
       scissor_height = maxy - scissor_y;
    }
@@ -37568,7 +37590,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       &omitted_texture_slots);
    if (gex_timing) gex_wgpu_time_fsmod += os_time_get_nano() - t_fsmod_start;
    if (!fragment.module)
-      return;
+      GEX_DRAW_DROP();
    fragment.entryPoint = (WGPUStringView){"main", WGPU_STRLEN};
    fragment.targetCount = ctx->color_count;
    fragment.targets = color_targets;
@@ -37583,7 +37605,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       ctx, vertex_flipped, fold_viewport ? viewport_fold : NULL,
       ctx->point_expand.active ? &wide_point : NULL);
    if (!vertex_module)
-      return;
+      GEX_DRAW_DROP();
    pipeline_desc.vertex.module = vertex_module;
    pipeline_desc.vertex.entryPoint = (WGPUStringView){"main", WGPU_STRLEN};
    WGPUVertexAttribute
@@ -38166,7 +38188,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          if (!ctx->failed)
             fprintf(stderr, "gex-wgpu: could not stage the draw parameters\n");
          gex_fail(ctx);
-         return;
+         GEX_DRAW_DROP();
       }
    }
    const unsigned vertex_group_count =
@@ -38207,7 +38229,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                     one_target ? util_format_short_name(ctx->color_formats[0])
                                : "none");
          }
-         return;
+         GEX_DRAW_DROP();
       }
    }
    /* The destination snapshot has two users -- glLogicOp and the framebuffer
@@ -38235,7 +38257,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                             "colour attachment)\n",
                     logicop ? "logic op" : "framebuffer fetch");
          }
-         return;
+         GEX_DRAW_DROP();
       }
    }
    bool missing_constant = false;
@@ -38584,7 +38606,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                        v ? util_format_short_name(v->format) : "(none)");
             }
       }
-      return;
+      GEX_DRAW_DROP();
    }
    /* One draw's groups are checked together; see
     * gex_wgpu_trace_buffer_aliasing. */
@@ -38720,7 +38742,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                     ctx->vs->ssbo_slots[i]);
          }
          gex_fail(ctx);
-         return;
+         GEX_DRAW_DROP();
       }
       vertex_layout_entries[at].buffer.type =
          WGPUBufferBindingType_ReadOnlyStorage;
@@ -38951,7 +38973,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                        "storage buffers, the device takes %u per stage)\n",
                        group, storage_buffers, screen->max_storage_buffers);
             }
-            return;
+            GEX_DRAW_DROP();
          }
       }
       /* Owned by the screen's cache, so nothing here releases it. */
@@ -38960,7 +38982,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                            desc.entryCount);
       if (!group_layouts[group]) {
          gex_fail(ctx);
-         return;
+         GEX_DRAW_DROP();
       }
    }
    if (group_count) {
@@ -38968,7 +38990,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          gex_wgpu_cached_pipeline_layout(screen, group_layouts, group_count);
       if (!explicit_pipeline_layout) {
          gex_fail(ctx);
-         return;
+         GEX_DRAW_DROP();
       }
       pipeline_desc.layout = explicit_pipeline_layout;
    }
@@ -39182,7 +39204,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                        (int)ctx->fs->texture_sample_types[i]);
             }
             gex_fail(ctx);
-            return;
+            GEX_DRAW_DROP();
          }
       }
       for (unsigned i = 0; i < ctx->fs->sampler_count; ++i) {
@@ -39296,7 +39318,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             sb_size = ctx->placeholder_storage->width0;
             if (!sb_buffer) {
                gex_fail(ctx);
-               return;
+               GEX_DRAW_DROP();
             }
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
@@ -39320,7 +39342,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                        "buffer bound\n", slot);
             }
             gex_fail(ctx);
-            return;
+            GEX_DRAW_DROP();
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = ctx->vs->buftex_bindings[i];
@@ -39345,7 +39367,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
       if (gex_wgpu_trace_buffer_aliasing("vertex", vertex_layout_entries,
                                         entries, vertex_group_count))
-         return;
+         GEX_DRAW_DROP();
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[1];
       bind_desc.entryCount = vertex_group_count;
@@ -39411,7 +39433,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             sb_size = ctx->placeholder_storage->width0;
             if (!sb_buffer) {
                gex_fail(ctx);
-               return;
+               GEX_DRAW_DROP();
             }
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
@@ -39450,7 +39472,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                   fprintf(stderr, "gex-wgpu: draw declined (no stand-in for "
                           "fragment image %u)\n", slot);
                }
-               return;
+               GEX_DRAW_DROP();
             }
             continue;
          }
@@ -39482,7 +39504,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                           util_format_short_name(iv->format),
                           util_format_short_name(iv->resource->format));
                }
-               return;
+               GEX_DRAW_DROP();
             }
          }
          WGPUTextureViewDescriptor desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
@@ -39529,7 +39551,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                        iv->resource->array_size,
                        util_format_short_name(iv->resource->format));
             }
-            return;
+            GEX_DRAW_DROP();
          }
          if (image_view_count < ARRAY_SIZE(image_views))
             image_views[image_view_count++] = view;
@@ -39550,7 +39572,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                        "buffer bound\n", slot);
             }
             gex_fail(ctx);
-            return;
+            GEX_DRAW_DROP();
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = ctx->fs->buftex_bindings[i];
@@ -39589,7 +39611,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                fprintf(stderr, "gex-wgpu: draw declined (no buffer for packed "
                        "fragment image %u)\n", slot);
             }
-            return;
+            GEX_DRAW_DROP();
          }
          for (unsigned half = 0; half < 2; ++half) {
             /* The header is one shared block, so its entry is emitted once
@@ -39609,7 +39631,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
       if (gex_wgpu_trace_buffer_aliasing("fragment", fragment_layout_entries,
                                         entries, fragment_group_count))
-         return;
+         GEX_DRAW_DROP();
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[2];
       bind_desc.entryCount = fragment_group_count;
@@ -39702,7 +39724,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       if (depth_view) wgpuTextureViewRelease(depth_view);
       /* encoder is ctx->pending_encoder, which gex_fail tears down. */
       gex_fail(ctx);
-      return;
+      GEX_DRAW_DROP();
    }
 
    WGPURenderPassColorAttachment
@@ -40120,7 +40142,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* bind_groups[] and, when cached, the pipeline belong to the screen. */
    if (!pass) {
       gex_fail(ctx);
-      return;
+      GEX_DRAW_DROP();
    }
    const int64_t t_submit_start = gex_timing ? os_time_get_nano() : 0;
    if (gex_timing)

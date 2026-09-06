@@ -64,7 +64,7 @@ gex_replay = executable(
     '-sEXPORT_ES6=1',
     '-sEXPORT_NAME=createGexMesa',
     '-sENVIRONMENT=web,worker,node',
-    '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_malloc,_free',
+    '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_setenv,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_malloc,_free',
     '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
   ],
   install : false,
@@ -170,7 +170,7 @@ if gex_emdawn_dir != ''
       # Keep the name section: st/mesa calling a hook this driver leaves NULL
       # is the expected failure here, and an index is not a diagnosis.
       '--profiling-funcs',
-      '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_malloc,_free',
+      '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_setenv,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_malloc,_free',
       '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
     ],
     install : false,
