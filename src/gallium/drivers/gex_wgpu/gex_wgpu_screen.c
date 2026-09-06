@@ -33213,6 +33213,20 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
       desc.mipLevelCount = 1;
       desc.sampleCount = 1;
       desc.usage = WGPUTextureUsage_StorageBinding |
+                   /* And bindable, for the same reason the allocation path
+                    * gives the two usages together: Tint lowers a SPIR-V
+                    * storage image that is only ever *read* to a plain
+                    * texture_2d<T> read with textureLoad, so a read-only
+                    * image binds as a sampled texture and not as a storage
+                    * one. The alias had StorageBinding alone, so a cast image
+                    * the shader only read was rejected --
+                    *
+                    *   [TextureView of Texture (R32Sint)] usage (CopySrc|
+                    *   CopyDst|StorageBinding) doesn't include TextureBinding
+                    *
+                    * -- and, as always, the message names the bind group and
+                    * the command buffer rather than this allocation. */
+                   WGPUTextureUsage_TextureBinding |
                    WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
       if (desc.format == WGPUTextureFormat_Undefined)
          return NULL;
