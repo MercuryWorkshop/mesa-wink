@@ -33534,6 +33534,20 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
       const uint32_t size = (uint32_t)(gex->allocation_size & ~3u);
       if (!size)
          continue;
+      /* The diff exists to keep the *shader's* writes to this buffer, and a
+         buffer no shader writes has none to keep. st/mesa's own uploader is
+         one of those and it is a megabyte, re-scanned at every one of the
+         45,000 submits an STK run makes: measured, that cost 54.3 FPS against
+         59.8. Same predicate as the read-back below, so the two halves agree
+         about which buffers the device touches. */
+      if (!(gex->gpu_written ||
+            (ctx->persistent[i]->bind &
+             (PIPE_BIND_STREAM_OUTPUT | PIPE_BIND_SHADER_BUFFER)))) {
+         wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow, size);
+         if (gex->bytes_written < size)
+            gex->bytes_written = size;
+         continue;
+      }
       if (gex->persistent_sent && gex->persistent_sent_size != size) {
          FREE(gex->persistent_sent);
          gex->persistent_sent = NULL;
