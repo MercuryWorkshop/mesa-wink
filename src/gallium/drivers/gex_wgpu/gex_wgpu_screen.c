@@ -3471,6 +3471,26 @@ gex_wgpu_lower_image_shape_instr(nir_builder *b, nir_instr *instr, void *data)
    if (dim == GLSL_SAMPLER_DIM_CUBE && nir_intrinsic_has_image_array(intr))
       nir_intrinsic_set_image_array(intr, true);
 
+   /* A cube array's third size component is its number of *cubes*, and the
+    * 2D array this becomes reports its number of layers -- six times as many.
+    * GL is explicit about it, and imageSize of a 12-layer cube array returned
+    * 12 where 2 belonged, which is most of KHR-GL46.shader_image_size.
+    *
+    * Only the array form: imageSize of a plain imageCube is an ivec2 and the
+    * layer count is never read. */
+   if (dim == GLSL_SAMPLER_DIM_CUBE && array &&
+       intr->intrinsic == nir_intrinsic_image_deref_size &&
+       intr->def.num_components >= 3) {
+      b->cursor = nir_after_instr(instr);
+      nir_def *cubes =
+         nir_vector_insert_imm(b, &intr->def,
+                               nir_udiv_imm(b, nir_channel(b, &intr->def, 2),
+                                            6),
+                               2);
+      nir_def_rewrite_uses_after(&intr->def, cubes);
+      return true;
+   }
+
    if (!one_d)
       return true;
    if (!one_d_array) {
@@ -3928,8 +3948,8 @@ gex_wgpu_packed_image_offset(nir_builder *b, nir_variable *block,
    }
    nir_def *at = nir_imul(
       b, layer,
-      gex_wgpu_packed_image_header(b, block,
-                                   GEX_WGPU_PACKED_IMAGE_SLICE_BYTES));
+      gex_wgpu_packed_image_header(
+         b, block, base_word + GEX_WGPU_PACKED_IMAGE_SLICE_BYTES));
    at = nir_iadd(
       b, at,
       nir_imul(b, y,
@@ -4092,15 +4112,29 @@ gex_wgpu_lower_packed_image(nir_builder *b, nir_instr *instr, void *data)
    if (intr->intrinsic == nir_intrinsic_image_deref_size) {
       /* imageSize wants texels, which the header carries: the row stride is
        * padded for the copy and is not the width. */
+      /* From *this slot's* header, not the block's first. Every packed image
+       * shares one header block now and finds its own at base_word[slot];
+       * the texel-offset path was taught that and this one was not, so
+       * imageSize of any image but slot zero reported slot zero's size. A
+       * buffer image at unit 7 answered 0 where 16 belonged, and the slice
+       * stride below had the same omission. */
+      const unsigned base = state->base_word[slot];
       nir_def *component[3] = {
-         gex_wgpu_packed_image_header(b, block, GEX_WGPU_PACKED_IMAGE_WIDTH),
-         gex_wgpu_packed_image_header(b, block, GEX_WGPU_PACKED_IMAGE_HEIGHT),
-         gex_wgpu_packed_image_header(b, block, GEX_WGPU_PACKED_IMAGE_LAYERS),
+         gex_wgpu_packed_image_header(b, block,
+                                      base + GEX_WGPU_PACKED_IMAGE_WIDTH),
+         gex_wgpu_packed_image_header(b, block,
+                                      base + GEX_WGPU_PACKED_IMAGE_HEIGHT),
+         gex_wgpu_packed_image_header(b, block,
+                                      base + GEX_WGPU_PACKED_IMAGE_LAYERS),
       };
       /* A 1D image's second component is its layer count, not its height,
        * and a buffer image has only the one. */
       if (dim == GLSL_SAMPLER_DIM_1D)
          component[1] = component[2];
+      /* And a cube array counts cubes, not layers -- see the shape rewrite in
+       * gex_wgpu_lower_image_shape_instr, which has the same six. */
+      if (dim == GLSL_SAMPLER_DIM_CUBE && is_array)
+         component[2] = nir_udiv_imm(b, component[2], 6);
       nir_def *size = nir_vec(b, component, 3);
       if (intr->def.num_components < 3)
          size = nir_trim_vector(b, size, intr->def.num_components);
@@ -5285,6 +5319,7 @@ static WGPUBuffer
 gex_wgpu_packed_image_write_header(struct gex_wgpu_context *ctx, unsigned slot,
                                    const uint32_t words[]);
 
+static bool gex_wgpu_lower_fb_fetch(nir_shader *nir);
 static WGPUBuffer gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx,
                                              unsigned slot,
                                              const struct pipe_image_view *iv,
