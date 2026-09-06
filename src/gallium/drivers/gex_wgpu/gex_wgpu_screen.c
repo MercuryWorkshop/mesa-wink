@@ -546,8 +546,12 @@ static void gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
  * time. */
 #define GEX_WGPU_MAX_VARYINGS 32
 
-/* The subset of the above a rasterized interface may use: WebGPU's guaranteed
- * vertex-attribute and inter-stage variable counts are both sixteen. */
+/* The subset of the above a rasterized interface may use, and the *floor* for
+ * it: WebGPU's guaranteed vertex-attribute and inter-stage variable counts are
+ * both sixteen. The inter-stage half is no longer assumed to be that, because
+ * it never is -- see screen->max_inter_stage, which carries what the device
+ * actually granted. The vertex-attribute half stays sixteen, being a different
+ * limit that this driver does not raise. */
 #define GEX_WGPU_MAX_RASTER_VARYINGS 16
 
 /* ---- Tessellation ---------------------------------------------------------
@@ -1393,6 +1397,12 @@ struct gex_wgpu_screen {
     * blocks. The vertex figure above is counted separately because WGSL
     * allows only the read-only kind there. */
    uint32_t max_storage_buffers;
+   /* Inter-stage variables the *device* granted, which bounds a rasterized
+    * varying interface. WebGPU guarantees sixteen and the driver assumed
+    * exactly that; adapters offer far more -- 31 natively here, 28 in the
+    * browser -- and the difference is a shader that links against one that
+    * does not. */
+   uint32_t max_inter_stage;
    /* Storage textures the device grants per stage. Only images the shader
     * *writes* cost one of these -- a read-only image is bound as a sampled
     * texture -- so this bounds the writable count rather than the declared
@@ -41163,9 +41173,13 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
        * be rasterized instead. So only the evaluation shader is raised, to
        * match the control shader's outputs below -- the one interface in this
        * driver that is a buffer at both ends. */
-      caps->max_inputs = stages[i] == MESA_SHADER_TESS_EVAL
-                            ? GEX_WGPU_MAX_VARYINGS
-                            : GEX_WGPU_MAX_RASTER_VARYINGS;
+      /* Only the *fragment* stage's inputs are an inter-stage interface. A
+       * vertex shader's inputs are vertex attributes, which WebGPU caps at
+       * sixteen and this driver does not raise; the rest read a buffer. */
+      caps->max_inputs =
+         stages[i] == MESA_SHADER_TESS_EVAL   ? GEX_WGPU_MAX_VARYINGS
+         : stages[i] == MESA_SHADER_FRAGMENT  ? screen->max_inter_stage
+                                              : GEX_WGPU_MAX_RASTER_VARYINGS;
       /* st/mesa reports MaxGeometryOutputComponents as four times this, and
        * GL 3.2 requires 128. Eight slots gave 32 -- a quarter of the floor --
        * and transform_feedback's geometry cases failed at link time with
@@ -41178,10 +41192,18 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
        * for 128 control-shader output components, and this is where that
        * comes from; MAX_TESS_PATCH_COMPONENTS is st/mesa's own 120 and needs
        * the same room. */
+      /* ...and only the *vertex* stage's outputs. The geometry and evaluation
+       * stages hand theirs to the passthrough vertex shader, which reads them
+       * back as vertex *attributes* -- a different limit, sixteen, and one
+       * the adapter does not raise. Letting those follow the inter-stage
+       * count produced a geometry shader whose passthrough layout could not
+       * be built at all: "could not build the geometry passthrough vertex
+       * layout", and transform_feedback lost a case to it. */
       caps->max_outputs =
          stages[i] == MESA_SHADER_FRAGMENT ? 8
          : stages[i] == MESA_SHADER_TESS_CTRL ? GEX_WGPU_MAX_VARYINGS
-                                              : GEX_WGPU_MAX_RASTER_VARYINGS;
+         : stages[i] == MESA_SHADER_VERTEX ? screen->max_inter_stage
+                                           : GEX_WGPU_MAX_RASTER_VARYINGS;
       caps->max_temps = 256;
       caps->max_const_buffer0_size = 16 * 1024;
       /* Never more than the device will bind. st/mesa needs 13 for
@@ -41434,12 +41456,17 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->max_uniform_buffers = 12;      /* WebGPU's guaranteed minimum */
    screen->max_storage_buffers_vertex = 0;
    screen->max_storage_buffers = 0;
+   screen->max_inter_stage = GEX_WGPU_MAX_RASTER_VARYINGS;
    screen->max_storage_textures = GEX_WGPU_MAX_SHADER_IMAGES;
    screen->max_storage_buffer_size = 0;
    const bool got_limits =
       wgpuDeviceGetLimits(device, &limits) == WGPUStatus_Success;
    if (got_limits) {
       screen->max_uniform_buffers = limits.maxUniformBuffersPerShaderStage;
+      if (limits.maxInterStageShaderVariables != WGPU_LIMIT_U32_UNDEFINED &&
+          limits.maxInterStageShaderVariables >= GEX_WGPU_MAX_RASTER_VARYINGS)
+         screen->max_inter_stage =
+            MIN2(limits.maxInterStageShaderVariables, GEX_WGPU_MAX_VARYINGS);
       if (limits.maxTextureDimension2D != WGPU_LIMIT_U32_UNDEFINED &&
           limits.maxTextureDimension2D >= 8192)
          screen->max_texture_2d = limits.maxTextureDimension2D;

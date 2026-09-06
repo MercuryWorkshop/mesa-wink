@@ -266,6 +266,7 @@ create_device(void)
           adapter_limits.field > 0)                                         \
          limits.field = MIN2(adapter_limits.field, (uint32_t)(value))
       GEX_WANT(maxUniformBuffersPerShaderStage, 16);
+      GEX_WANT(maxInterStageShaderVariables, 32);
       /* A uniform block is bound with a dynamic offset here -- one buffer
        * serves many draws from the constant ring -- so a pipeline layout's
        * *dynamic* uniform buffer count is the vertex and fragment stages'
@@ -348,6 +349,9 @@ create_device(void)
                  limits.maxStorageBuffersPerShaderStage,
                  adapter_limits.maxStorageBuffersInVertexStage,
                  adapter_limits.maxStorageBuffersInFragmentStage);
+      fprintf(stderr, "gex-wgpu: adapter inter-stage variables %u (asking "
+              "for %u)\n", adapter_limits.maxInterStageShaderVariables,
+              limits.maxInterStageShaderVariables);
       fprintf(stderr,
               "gex-wgpu: adapter compute limits invocations/workgroup %u "
               "workgroup %ux%ux%u shared %uB (asking for %u)\n",
