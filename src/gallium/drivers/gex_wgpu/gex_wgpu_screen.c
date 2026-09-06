@@ -16556,10 +16556,20 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
         * `quad-tex-3d` and `stex3d` all drew nothing. The view covers the
         * whole volume either way, which is the only thing GL can ask for, so
         * both spellings are accepted. */
+       /* ...and the third spelling, which is u_blitter's: it sets
+        * last_layer to `u_minify(depth0, srclevel) - 1`, the depth of the
+        * *view's own level*. Comparing only against the base level's depth
+        * refused every 3D view above level zero, and the caller was
+        * util_blitter_blit -- which creates the view itself and does not
+        * check, so it handed a NULL src to util_blitter_blit_generic and the
+        * process died inside Mesa. A glGetTexImage of level 1 of a 3D
+        * texture was enough. */
        (texture->target == PIPE_TEXTURE_3D &&
         (templ->u.tex.first_layer != 0 ||
          (templ->u.tex.last_layer != 0 &&
-          templ->u.tex.last_layer != texture->depth0 - 1))) ||
+          templ->u.tex.last_layer != texture->depth0 - 1 &&
+          templ->u.tex.last_layer !=
+             u_minify(texture->depth0, templ->u.tex.first_level) - 1))) ||
        /* A *cube* view must cover six faces; an array or 2D view of a cube
         * texture may cover any range of them, which is how a shader filters a
         * cube map by hand.
@@ -22569,6 +22579,48 @@ gex_wgpu_blit_with_blitter(struct gex_wgpu_context *ctx,
       ctx->blitter, GEX_WGPU_MAX_SAMPLERS, ctx->sampler_views);
    util_blitter_save_so_targets(ctx->blitter, ctx->so_target_count,
                                 ctx->so_targets, MESA_PRIM_TRIANGLES);
+   /* u_blitter creates the source view itself and does not check the result.
+    * This driver *can* refuse one -- a shape or a format WebGPU has no view
+    * for -- and a NULL src then reaches util_blitter_blit_generic, which
+    * dereferences it and kills the process inside Mesa, several frames below
+    * anything this driver wrote. A glGetTexImage of level 1 of a 3D texture
+    * was enough to do it.
+    *
+    * So the very view it is about to build is built here first, purely to
+    * find out. The template is u_blitter's own -- taken from its own helper
+    * rather than reconstructed, so the two cannot drift -- and the cost is
+    * one view creation on a path that is already a textured draw. A blit
+    * declined by name is a wrong picture; a dead process is every case after
+    * it as well. */
+   {
+      struct pipe_sampler_view probe;
+      util_blitter_default_src_texture(ctx->blitter, &probe,
+                                       info->src.resource, info->src.level);
+      probe.format = info->src.format;
+      if (info->swizzle_enable) {
+         probe.swizzle_r = info->swizzle[0];
+         probe.swizzle_g = info->swizzle[1];
+         probe.swizzle_b = info->swizzle[2];
+         probe.swizzle_a = info->swizzle[3];
+      }
+      struct pipe_sampler_view *reachable =
+         ctx->base.create_sampler_view(&ctx->base, info->src.resource, &probe);
+      if (!reachable) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr,
+                    "gex-wgpu: blit declined (no sampler view for the source: "
+                    "%s as %s, target %d, level %u of %u)\n",
+                    util_format_short_name(info->src.resource->format),
+                    util_format_short_name(info->src.format),
+                    (int)info->src.resource->target, info->src.level,
+                    info->src.resource->last_level);
+         }
+         return;
+      }
+      pipe_sampler_view_reference(&reachable, NULL);
+   }
    util_blitter_blit(ctx->blitter, info, NULL);
 }
 
