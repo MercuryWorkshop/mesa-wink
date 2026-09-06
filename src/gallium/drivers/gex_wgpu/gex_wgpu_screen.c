@@ -2138,6 +2138,10 @@ struct gex_wgpu_shader {
     * be dispatched for the side effects even with no transform feedback
     * bound, and the copy that rasterises has had those writes stripped. */
    bool writes_storage;
+   /* Reads the colour attachment: Mesa's advanced-blend lowering asked for
+    * the destination texel, and the draw has to bind a snapshot of it.
+    * See gex_wgpu_lower_fb_fetch. */
+   bool fb_fetch;
    /* The rasterising copy of this vertex shader computes the wrong thing --
     * an atomic it cannot perform reads as zero -- so no draw that would
     * rasterise it may run. Its stores still happen, in the capture dispatch.
@@ -11667,6 +11671,18 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          "gex_wgpu requires dereferenced, consistently typed texture slots");
       return NULL;
    }
+   /* After the texture slots have been collected and checked, and before the
+    * colour outputs are counted. Both halves of that matter: the destination
+    * texture this creates is the driver's own and has no sampler beside it,
+    * so a consistency check that has already run cannot object to it -- which
+    * it did, and the whole shader was refused with "requires dereferenced,
+    * consistently typed texture slots". And the variable it removes is an
+    * *output*, so the colour-output scan just below must not see it. The
+    * logic op's texture is created later still, on a variant, for the first
+    * of those two reasons. */
+   if (expected_stage == MESA_SHADER_FRAGMENT)
+      shader->fb_fetch = gex_wgpu_lower_fb_fetch(nir);
+
    if (expected_stage == MESA_SHADER_FRAGMENT) {
       shader->color_output_type = nir_type_float;
       nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
@@ -12098,6 +12114,144 @@ gex_wgpu_lower_logicop_store(nir_builder *b, nir_intrinsic_instr *intr,
                                            nir_channel(b, &fetch->def, i));
    nir_src_rewrite(&intr->src[1], nir_vec(b, channels, components));
    state->lowered = true;
+   return true;
+}
+
+/* Framebuffer fetch: the destination texel, read by the fragment shader.
+ *
+ * Mesa's GLSL linker lowers KHR_blend_equation_advanced itself -- it writes
+ * every one of the fourteen equations -- and asks the driver for one thing in
+ * return: a readable output. It creates a `nir_var_shader_out` variable with
+ * `data.fb_fetch_output` set and *loads* from it. That is the whole contract,
+ * and this driver can meet it, because the same colour-attachment snapshot
+ * that serves glLogicOp is exactly the destination texel.
+ *
+ * It shares the logic op's binding, which is safe rather than lucky: GL says
+ * enabling GL_COLOR_LOGIC_OP disables blending, so no shader can want both.
+ *
+ * Non-coherent only. A snapshot is taken once per draw, so overlapping
+ * primitives within one draw do not see each other -- which is precisely what
+ * KHR_blend_equation_advanced without _coherent allows, and why it makes the
+ * application call glBlendBarrier. Claiming the coherent form would be a lie
+ * the snapshot cannot keep.
+ */
+static bool
+gex_wgpu_lower_fb_fetch_load(nir_builder *b, nir_intrinsic_instr *intr,
+                             void *data)
+{
+   struct gex_wgpu_logicop_lowering *state = data;
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+   if (!var || var->data.mode != nir_var_shader_out ||
+       !var->data.fb_fetch_output)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   /* Indexed by gl_FragCoord, as the logic op's fetch is, and for the same
+    * reason: the driver's y flip happens before the fragment stage. */
+   nir_def *coord = nir_f2i32(
+      b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
+   nir_deref_instr *texture = nir_build_deref_var(b, state->texture);
+   nir_tex_instr *fetch = nir_tex_instr_create(b->shader, 3);
+   fetch->op = nir_texop_txf;
+   fetch->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   fetch->is_array = false;
+   fetch->dest_type = nir_type_float32;
+   fetch->coord_components = 2;
+   fetch->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref,
+                                       &texture->def);
+   fetch->src[1] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
+   fetch->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
+   nir_def_init(&fetch->instr, &fetch->def, 4, 32);
+   nir_builder_instr_insert(b, &fetch->instr);
+   nir_def *value = &fetch->def;
+   if (intr->def.num_components != 4)
+      value = nir_trim_vector(b, value, intr->def.num_components);
+   nir_def_rewrite_uses(&intr->def, value);
+   nir_instr_remove(&intr->instr);
+   state->lowered = true;
+   return true;
+}
+
+static bool
+gex_wgpu_lower_fb_fetch(nir_shader *nir)
+{
+   bool wanted = false;
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
+      if (var->data.fb_fetch_output)
+         wanted = true;
+   if (!wanted)
+      return false;
+
+   struct gex_wgpu_logicop_lowering state = {0};
+   const struct glsl_type *type =
+      glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_FLOAT);
+   state.texture =
+      nir_variable_create(nir, nir_var_uniform, type, "gex_fb_fetch_dst");
+   if (!state.texture)
+      return false;
+   state.texture->data.descriptor_set = 0;
+   state.texture->data.binding = GEX_WGPU_LOGICOP_BINDING;
+   state.texture->data.explicit_binding = 1;
+   nir_shader_intrinsics_pass(nir, gex_wgpu_lower_fb_fetch_load,
+                              nir_metadata_control_flow, &state);
+   if (getenv("GEX_WGPU_FBFETCH_LOG")) {
+      unsigned loads = 0, derefs = 0;
+      nir_foreach_function_impl(impl, nir)
+         nir_foreach_block(block, impl)
+            nir_foreach_instr(instr, block) {
+               if (instr->type == nir_instr_type_deref) {
+                  nir_deref_instr *d = nir_instr_as_deref(instr);
+                  if (d->deref_type == nir_deref_type_var && d->var &&
+                      d->var->data.fb_fetch_output)
+                     ++derefs;
+               } else if (instr->type == nir_instr_type_intrinsic) {
+                  nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+                  if (in->intrinsic == nir_intrinsic_load_deref ||
+                      in->intrinsic == nir_intrinsic_load_output)
+                     ++loads;
+               }
+            }
+      fprintf(stderr, "gex-fbfetch: lowered=%d derefs_left=%u loads=%u\n",
+              (int)state.lowered, derefs, loads);
+      nir_foreach_function_impl(impl, nir)
+         nir_foreach_block(block, impl)
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_deref)
+                  continue;
+               nir_deref_instr *d = nir_instr_as_deref(instr);
+               if (d->deref_type != nir_deref_type_var || !d->var ||
+                   !d->var->data.fb_fetch_output)
+                  continue;
+               nir_foreach_use(use, &d->def)
+                  fprintf(stderr, "gex-fbfetch:   used by instr type %d%s\n",
+                          (int)nir_src_use_instr(use)->type,
+                          nir_src_use_instr(use)->type ==
+                             nir_instr_type_intrinsic
+                             ? nir_intrinsic_infos[nir_instr_as_intrinsic(
+                                  nir_src_use_instr(use))->intrinsic].name
+                             : "");
+            }
+   }
+   if (!state.lowered) {
+      exec_node_remove(&state.texture->node);
+      return false;
+   }
+   /* The variable stays, and stays an output. That is the whole idiom: by the
+    * time the driver sees the shader, the framebuffer-fetch variable and the
+    * application's own colour output at the same location have been merged
+    * into one, so *reading* it is the destination -- which is what has just
+    * been rewritten -- and *writing* it is the colour this draw produces.
+    *
+    * Removing it, or removing the stores to it, was tried and emptied the
+    * fragment shader: `fn main_1() { return; }`, no output at all, and every
+    * pixel came back holding whatever the destination already had. Clearing
+    * the flag is enough, and stops anything downstream treating it specially. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
+      var->data.fb_fetch_output = 0;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    return true;
 }
 
@@ -13317,10 +13471,16 @@ gex_wgpu_create_blend_state(struct pipe_context *pipe,
     * the colour attachment and applies the operation itself. What it cannot
     * do -- a target that is not 8-bit unorm, or more than one of them -- is
     * declined at the draw, where the framebuffer is known. */
+   /* An advanced blend equation is served too, and by even less of this
+    * driver: Mesa's GLSL linker writes all fourteen equations into the
+    * fragment shader, and st then leaves `rt[0].blend_enable` clear -- so the
+    * pipeline this state builds has blending off, which is exactly right.
+    * What the driver supplies is the destination texel the shader reads; see
+    * gex_wgpu_lower_fb_fetch. Refusing the state here left the shader doing
+    * the blending correctly against no blend state at all. */
    const char *unmodelled =
       state->alpha_to_coverage ? "alpha to coverage"
       : state->alpha_to_one ? "alpha to one"
-      : state->advanced_blend_func ? "advanced blend equation"
       : state->is_yuv ? "YUV target" : NULL;
    if (unmodelled) {
       static bool said;
@@ -37737,22 +37897,30 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          return;
       }
    }
-   const bool needs_texture = ctx->fs->texture_count != 0 || logicop != 0;
+   /* The destination snapshot has two users -- glLogicOp and the framebuffer
+    * fetch Mesa's advanced-blend lowering asks for -- and they share one
+    * binding, which is safe rather than lucky: GL says enabling a logic op
+    * disables blending, so no draw can want both. */
+   const bool wants_dst = logicop != 0 || ctx->fs->fb_fetch;
+   const bool needs_texture = ctx->fs->texture_count != 0 || wants_dst;
    /* Taken here rather than where the bind group is filled: the snapshot
     * copies a texture, which needs an encoder of its own, and by the time the
     * entries are built the render pass has begun -- calling it there took
     * Dawn's BeginRenderPass down with a segmentation fault. The feedback path
     * takes its own snapshot in this same stretch, for the same reason. */
    WGPUTextureView logicop_view = NULL;
-   if (logicop) {
-      logicop_view = gex_wgpu_feedback_snapshot(ctx, ctx->colors[0],
-                                                ctx->color_levels[0]);
+   if (wants_dst) {
+      logicop_view = ctx->colors[0]
+         ? gex_wgpu_feedback_snapshot(ctx, ctx->colors[0],
+                                      ctx->color_levels[0])
+         : NULL;
       if (!logicop_view) {
          static bool said;
          if (!said) {
             said = true;
-            fprintf(stderr, "gex-wgpu: logic op declined (no snapshot of the "
-                            "colour attachment)\n");
+            fprintf(stderr, "gex-wgpu: %s declined (no snapshot of the "
+                            "colour attachment)\n",
+                    logicop ? "logic op" : "framebuffer fetch");
          }
          return;
       }
@@ -38158,7 +38326,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             !omitted &&
             ((ctx->fs->multisampled_slots >> ctx->fs->texture_slots[i]) & 1);
       }
-      if (logicop) {
+      if (wants_dst) {
          /* The colour attachment's copy, read by texelFetch, so
           * unfilterable-float and no sampler beside it. */
          const unsigned entry =
@@ -38445,7 +38613,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
       if (group == 0 && needs_texture) {
          desc.entryCount =
-            ctx->fs->texture_count + ctx->fs->sampler_count + (logicop ? 1 : 0);
+            ctx->fs->texture_count + ctx->fs->sampler_count +
+            (wants_dst ? 1 : 0);
          desc.entries = texture_layout_entries;
       } else if (group == 1 && needs_vertex_constant) {
          desc.entryCount = vertex_group_count;
@@ -38707,7 +38876,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                             ? WGPUSamplerBindingType_NonFiltering
                             : ctx->fs->sampler_types[i]);
       }
-      if (logicop) {
+      if (wants_dst) {
          const unsigned entry =
             ctx->fs->texture_count + ctx->fs->sampler_count;
          entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
@@ -38717,7 +38886,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[0];
       bind_desc.entryCount =
-         ctx->fs->texture_count + ctx->fs->sampler_count + (logicop ? 1 : 0);
+         ctx->fs->texture_count + ctx->fs->sampler_count +
+            (wants_dst ? 1 : 0);
       bind_desc.entries = entries;
       bind_groups[0] = gex_wgpu_cached_bind_group(
          screen, bind_desc.layout, bind_desc.entries,
@@ -40352,6 +40522,19 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    caps->anisotropic_filter = true;
    caps->max_texture_anisotropy = 16.0f;
    caps->polygon_offset_clamp = true;
+   /* One readable colour attachment, which is what
+    * KHR_blend_equation_advanced needs and all it needs: the extension
+    * applies to draw buffer zero only. Mesa's GLSL linker writes every one of
+    * the fourteen equations itself once HasFBFetch is set, and asks the
+    * driver for the destination texel -- which the colour-attachment snapshot
+    * already produces for glLogicOp. See gex_wgpu_lower_fb_fetch.
+    *
+    * Not coherent, and that is not a shortfall being hidden: the snapshot is
+    * taken once per draw, so overlapping primitives inside one draw do not
+    * see each other. That is exactly what the non-coherent form permits, and
+    * why it makes the application call glBlendBarrier. */
+   caps->fbfetch = 1;
+   caps->fbfetch_coherent = false;
    /* Kept for the record: ARB_polygon_offset_clamp used to be *not* claimed,
     * worth keeping: every part of it is already here.
     * pipe_rasterizer_state::offset_clamp is carried through to
