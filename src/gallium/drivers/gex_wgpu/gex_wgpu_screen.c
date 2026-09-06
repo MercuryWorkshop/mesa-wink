@@ -1416,6 +1416,18 @@ struct gex_wgpu_resource {
    WGPUTexture texture;
    WGPUBuffer buffer;
    uint8_t *shadow;
+   /* ARB_buffer_storage: a copy of what was last handed to the device for a
+    * persistently mapped buffer, so the bytes the application changed can be
+    * told from the bytes it did not. Uploading the whole shadow overwrites
+    * whatever the *shader* wrote into the same buffer, which is what an
+    * atomic counter or an SSBO under a persistent mapping is. */
+   uint8_t *persistent_sent;
+   uint32_t persistent_sent_size;
+   /* The PIPE_MAP_* flags the live persistent mapping was made with. A
+      read mapping is the only kind anything has to be read back *into*, and
+      a coherent one is the only kind that has to be up to date without the
+      application asking. */
+   unsigned persistent_usage;
    uint64_t allocation_size;
    /* The WGPU buffer's real size and usage, which is allocation_size and the
     * usage it was created with until a shader forces a bigger one -- see
@@ -5418,12 +5430,16 @@ static void gex_wgpu_flush_image_aliases(struct gex_wgpu_context *ctx,
 #define gex_wgpu_submit_pending(ctx) \
    gex_wgpu_submit_pending_named((ctx), __func__)
 
+/* The body, for callers that already hold the device guard. It is not a
+   recursive mutex, and it is taken as soon as a process has a second GL
+   context -- so a buffer_map or a flush calling the guarded form below would
+   deadlock the moment an application made one, which Qt, Blender and every
+   shared-context toolkit do. */
 static bool
-gex_wgpu_buffer_readback(struct pipe_context *pipe,
-                         struct gex_wgpu_resource *gex,
-                         uint32_t offset, uint32_t size, void *dest)
+gex_wgpu_buffer_readback_locked(struct pipe_context *pipe,
+                                struct gex_wgpu_resource *gex,
+                                uint32_t offset, uint32_t size, void *dest)
 {
-   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    /* Submits its own command buffer, so anything already recorded has to
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
@@ -5471,6 +5487,15 @@ gex_wgpu_buffer_readback(struct pipe_context *pipe,
    return ok;
 }
 
+static bool
+gex_wgpu_buffer_readback(struct pipe_context *pipe,
+                         struct gex_wgpu_resource *gex,
+                         uint32_t offset, uint32_t size, void *dest)
+{
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
+   return gex_wgpu_buffer_readback_locked(pipe, gex, offset, size, dest);
+}
+
 /* A shadow that something is about to read, with the buffer's current contents
  * in it. Recovering them costs one readback per buffer, not per map: the
  * shadow is then kept, and SuperTuxKart's 1.19 million read maps touch only
@@ -5489,6 +5514,18 @@ gex_wgpu_shadow_for_read(struct pipe_context *pipe,
                                  (uint32_t)gex->allocation_size, gex->shadow))
       return NULL;
    return gex->shadow;
+}
+
+/* GEX_WGPU_PERSIST_LOG=1 traces ARB_buffer_storage's two-way traffic: which
+   buffers are persistently mapped, what is uploaded to them and what is read
+   back. Cached, because one of its call sites is not rare. */
+static bool
+gex_wgpu_persist_log(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("GEX_WGPU_PERSIST_LOG") ? 1 : 0;
+   return on != 0;
 }
 
 static void
@@ -16115,6 +16152,7 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
          gex_wgpu_shadow_mapped -= gex->allocation_size;
    }
    FREE(gex->shadow);
+   FREE(gex->persistent_sent);
    FREE(gex);
 }
 
@@ -18914,7 +18952,24 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    if ((usage & PIPE_MAP_READ) && gpu_written &&
        gex_wgpu_batch_conflicts(ctx, resource))
       gex_wgpu_submit_pending(ctx);
-   if ((usage & PIPE_MAP_READ) && gpu_written) {
+   /* ARB_buffer_storage, the same exception the staged write path below
+    * already makes and this one did not: a persistent mapping outlives this
+    * call and has to be the buffer's own shadow. Served from the private
+    * block beneath instead, the application was handed memory the driver had
+    * no further connection to -- nothing uploaded its writes until the unmap
+    * that never comes, and nothing brought the device's writes back to it.
+    * A persistent *read* mapping is the whole GPU-to-CPU half of the
+    * extension: an asynchronous read-back, a compute result, an atomic
+    * counter. So fill the shadow from the device here and fall through to the
+    * shadow path, which tracks the mapping. */
+   if ((usage & PIPE_MAP_READ) && gpu_written && (usage & PIPE_MAP_PERSISTENT)) {
+      if (gex_wgpu_shadow_ensure(gex)) {
+         const uint32_t whole = (uint32_t)(gex->allocation_size & ~3u);
+         if (whole)
+            (void)gex_wgpu_buffer_readback_locked(pipe, gex, 0, whole,
+                                                  gex->shadow);
+      }
+   } else if ((usage & PIPE_MAP_READ) && gpu_written) {
       struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
       const uint32_t offset = (uint32_t)box->x & ~3u;
       const uint32_t end = ALIGN_POT((uint32_t)box->x + (uint32_t)box->width, 4);
@@ -19122,8 +19177,14 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
    /* ARB_buffer_storage: the mapping outlives this call, and nothing will
     * tell the driver when it is written -- so the buffer joins the list every
     * submit uploads. */
-   if (usage & PIPE_MAP_PERSISTENT)
+   if (gex_wgpu_persist_log())
+      fprintf(stderr, "PERSIST map res=%p usage=0x%x bind=0x%x size=%u\n",
+              (void *)resource, usage, resource->bind,
+              (unsigned)gex->allocation_size);
+   if (usage & PIPE_MAP_PERSISTENT) {
+      gex->persistent_usage = usage;
       gex_wgpu_track_persistent_map(ctx, resource, true);
+   }
    *out_transfer = &transfer->base;
    return gex->shadow + box->x;
 }
@@ -21274,7 +21335,6 @@ gex_wgpu_set_shader_buffers(struct pipe_context *pipe, mesa_shader_stage shader,
                             unsigned writable_bitmask)
 {
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
-   (void)writable_bitmask;
    if (shader >= MESA_SHADER_STAGES ||
        start_slot + count > ARRAY_SIZE(ctx->shader_buffers[0])) {
       gex_fail(ctx);
@@ -21289,6 +21349,14 @@ gex_wgpu_set_shader_buffers(struct pipe_context *pipe, mesa_shader_stage shader,
          pipe_resource_reference(&slot->buffer, buffers[i].buffer);
          slot->buffer_offset = buffers[i].buffer_offset;
          slot->buffer_size = buffers[i].buffer_size;
+         /* The frontend is saying the shader may store through this binding.
+            Nothing else records that: PIPE_BIND_SHADER_BUFFER covers the
+            common case, but a buffer bound writable that was created without
+            it -- an atomic counter, which st/mesa lowers to a shader storage
+            block -- was left looking CPU-authored, and a read of it returned
+            the shadow. The bitmask was being discarded. */
+         if (writable_bitmask & (1u << i))
+            gex_resource(buffers[i].buffer)->gpu_written = true;
       }
    }
 }
@@ -21945,14 +22013,25 @@ gex_wgpu_flush_resource(struct pipe_context *pipe,
    (void)resource;
 }
 
+static void gex_wgpu_refresh_persistent_maps(struct gex_wgpu_context *ctx,
+                                             bool coherent_only);
+
 static void
 gex_wgpu_memory_barrier(struct pipe_context *pipe, unsigned flags)
 {
-   gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
-   /* Everything this driver submits goes to one WebGPU queue in order, and
-    * nothing is mapped while the GPU can still be writing it. */
-   (void)pipe;
-   (void)flags;
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   if (gex_wgpu_persist_log())
+      fprintf(stderr, "PERSIST barrier flags=0x%x persistent_count=%u\n",
+              flags, ctx->persistent_count);
+   gex_wgpu_submit_pending(ctx);
+   /* Everything this driver submits goes to one WebGPU queue in order, so
+    * ordering needs nothing further -- but a persistent mapping *is* mapped
+    * while the GPU writes it, which is what this comment used to deny. This
+    * is the point GL says those writes become visible to the client. */
+   if (flags & PIPE_BARRIER_MAPPED_BUFFER) {
+      GEX_DEVICE_GUARD(gex_screen(pipe->screen));
+      gex_wgpu_refresh_persistent_maps(ctx, false);
+   }
 }
 
 static void
@@ -33436,8 +33515,14 @@ gex_wgpu_end_pass(struct gex_wgpu_context *ctx)
  * without a barrier, and this gives it the newer value. Undefined is
  * undefined, and the alternative is a per-draw upload of the whole buffer.
  *
- * The whole buffer, not a dirty range: a coherent mapping is written without
- * telling the driver anything, so there is no range to know. */
+ * A coherent mapping is written without telling the driver anything, so there
+ * is no dirty range to be told -- but there is one to be *found*, by keeping a
+ * copy of what was last sent and comparing. That matters for correctness, not
+ * only for cost: uploading the whole shadow every submit overwrites whatever
+ * the shader wrote into the same buffer, and a buffer that is both
+ * persistently mapped and written by a shader is precisely what an atomic
+ * counter or an SSBO under ARB_buffer_storage is. The increments landed and
+ * the next submit wiped them. */
 static void
 gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
 {
@@ -33449,10 +33534,94 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
       const uint32_t size = (uint32_t)(gex->allocation_size & ~3u);
       if (!size)
          continue;
-      wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow, size);
+      if (gex->persistent_sent && gex->persistent_sent_size != size) {
+         FREE(gex->persistent_sent);
+         gex->persistent_sent = NULL;
+      }
+      if (!gex->persistent_sent) {
+         gex->persistent_sent = MALLOC(size);
+         if (!gex->persistent_sent) {
+            /* No record of what was sent, so send all of it, as before. */
+            wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow,
+                                 size);
+            if (gex->bytes_written < size)
+               gex->bytes_written = size;
+            continue;
+         }
+         gex->persistent_sent_size = size;
+         /* Nothing has been sent, so everything differs. */
+         memset(gex->persistent_sent, ~gex->shadow[0], size);
+      }
+      uint32_t first = 0;
+      while (first < size && gex->shadow[first] == gex->persistent_sent[first])
+         ++first;
+      if (first == size)
+         continue;
+      uint32_t last = size;
+      while (last > first && gex->shadow[last - 1] == gex->persistent_sent[last - 1])
+         --last;
+      /* wgpuQueueWriteBuffer wants both ends on a four-byte boundary. Widening
+       * can only re-send bytes that already agree. */
+      first &= ~3u;
+      last = MIN2(ALIGN_POT(last, 4), size);
+      if (gex_wgpu_persist_log())
+         fprintf(stderr, "PERSIST upload res=%p [%u,%u) of %u\n",
+                 (void *)&gex->base, first, last, size);
+      wgpuQueueWriteBuffer(screen->queue, gex->buffer, first,
+                           gex->shadow + first, last - first);
+      memcpy(gex->persistent_sent + first, gex->shadow + first, last - first);
       /* So a later read map knows the buffer holds something. */
       if (gex->bytes_written < size)
          gex->bytes_written = size;
+   }
+}
+
+/* And the other direction, which did not exist.
+ *
+ * A persistent mapping is two-way: the application writes through it and so
+ * does the GPU. Only the upload above was ever done, so anything reading a
+ * shader's output through a persistent mapping -- a compute result, an atomic
+ * counter -- read the CPU shadow and saw whatever it last wrote there.
+ *
+ * GL says exactly when those writes become visible to the client:
+ * MemoryBarrier with CLIENT_MAPPED_BUFFER_BARRIER_BIT. It is explicit and
+ * rare, so a readback per buffer is the right price; the predicate for "the
+ * GPU may have written this" is the one buffer_map already uses. */
+static void
+gex_wgpu_refresh_persistent_maps(struct gex_wgpu_context *ctx,
+                                 bool coherent_only)
+{
+   if (ctx->failed)
+      return;
+   for (unsigned i = 0; i < ctx->persistent_count; ++i) {
+      struct pipe_resource *resource = ctx->persistent[i];
+      struct gex_wgpu_resource *gex = gex_resource(resource);
+      if (!gex->buffer || !gex->shadow)
+         continue;
+      /* Only a readable mapping has anything to be brought up to date. */
+      if (!(gex->persistent_usage & PIPE_MAP_READ))
+         continue;
+      /* On a flush, only a coherent one: GL promises a coherent mapping is
+         current without being asked, and for any other the application owes
+         a MemoryBarrier, which is the other caller. */
+      if (coherent_only && !(gex->persistent_usage & PIPE_MAP_COHERENT))
+         continue;
+      if (!(gex->gpu_written ||
+            (resource->bind & (PIPE_BIND_STREAM_OUTPUT | PIPE_BIND_SHADER_BUFFER))))
+         continue;
+      const uint32_t size = (uint32_t)(gex->allocation_size & ~3u);
+      if (!size)
+         continue;
+      if (gex_wgpu_persist_log())
+         fprintf(stderr, "PERSIST refresh res=%p size=%u\n",
+                 (void *)resource, size);
+      if (!gex_wgpu_buffer_readback_locked(&ctx->base, gex, 0, size,
+                                           gex->shadow))
+         continue;
+      /* The diff above must not now read the device's own bytes as the
+         application's writes and send them straight back. */
+      if (gex->persistent_sent && gex->persistent_sent_size == size)
+         memcpy(gex->persistent_sent, gex->shadow, size);
    }
 }
 
@@ -40043,8 +40212,15 @@ gex_wgpu_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
                unsigned flags)
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
-   gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
-   (void)pipe;
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   gex_wgpu_submit_pending(ctx);
+   /* glFinish arrives here, and a coherent persistent mapping has to be
+      current afterwards without the application asking for anything: that is
+      what "coherent" means, and it is all KHR-GL44.buffer_storage's dispatch
+      and flush cases wait on. Confined to readable coherent mappings, which
+      a streaming vertex or uniform ring is not, so the common pool costs
+      nothing. */
+   gex_wgpu_refresh_persistent_maps(ctx, true);
    (void)flags;
    if (fence)
       *fence = NULL;
