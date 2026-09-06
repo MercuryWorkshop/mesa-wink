@@ -38758,6 +38758,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    const bool reuse = !counting_now && ctx->pending_pass &&
       memcmp(&ctx->pending_pass_key, &wanted_pass, sizeof(wanted_pass)) == 0;
    WGPUTextureView views[GEX_WGPU_MAX_COLOR_TARGETS] = {0};
+   /* Which targets ended up attached through their scratch texture, which the
+    * pass descriptor below needs because a scratch takes no depth slice. */
+   bool scratch_attached[GEX_WGPU_MAX_COLOR_TARGETS] = {false};
    WGPUTextureView depth_view = NULL;
    bool missing_view = false;
    /* Only a pass that is about to begin needs attachment views. Making them
@@ -38806,12 +38809,23 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                        ctx->color_levels[i]);
          if (scratch) {
             attach = scratch;
+            /* The scratch is a plain 2D texture holding one slice, whatever
+             * the resource behind it is, so the view has to describe *it*
+             * rather than the resource. Left at the resource's shape a 3D
+             * destination asked for a 3D view of a 2D texture --
+             *
+             *   The dimension (TextureViewDimension::e3D) of the texture view
+             *   is not compatible with the dimension (TextureDimension::e2D)
+             *
+             * -- which is an invalid view, an invalid command buffer, and
+             * every copy_image case that reinterprets a format into a 3D
+             * texture. */
+            color_view.dimension = WGPUTextureViewDimension_2D;
             color_view.baseMipLevel = 0;
             color_view.mipLevelCount = 1;
-            if (!three_d) {
-               color_view.baseArrayLayer = 0;
-               color_view.arrayLayerCount = 1;
-            }
+            color_view.baseArrayLayer = 0;
+            color_view.arrayLayerCount = 1;
+            scratch_attached[i] = true;
          } else {
             static bool said;
             if (!said) {
@@ -39432,7 +39446,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       if (!views[i])
          continue;   /* a hole: null view, and no load or store op */
       attachments[i].view = views[i];
-      if (ctx->colors[i] && ctx->colors[i]->target == PIPE_TEXTURE_3D)
+      /* ...and no depth slice either when the pass renders into the scratch:
+       * it is 2D, and a slice index on a 2D attachment is as invalid as the
+       * 3D view was. The slice is applied when the scratch is copied back. */
+      if (ctx->colors[i] && ctx->colors[i]->target == PIPE_TEXTURE_3D &&
+          !scratch_attached[i])
          attachments[i].depthSlice = ctx->color_layers[i];
       attachments[i].loadOp = WGPULoadOp_Load;
       attachments[i].storeOp = WGPUStoreOp_Store;
