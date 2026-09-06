@@ -249,6 +249,29 @@ static const struct {
    { PIPE_FORMAT_R16G16B16_SNORM,      PIPE_FORMAT_R32G32B32_FLOAT },
    { PIPE_FORMAT_R16G16B16_SINT,       PIPE_FORMAT_R32G32B32_SINT },
    { PIPE_FORMAT_R16G16B16_UINT,       PIPE_FORMAT_R32G32B32_UINT },
+   /* The 8-bit counterparts of the two above, which were missing. A
+    * three-component integer attribute cannot be widened to float like the
+    * normalized and scaled formats around it -- glVertexAttribIPointer means
+    * the shader reads integers -- so a driver without an 8-bit three-component
+    * integer vertex format had no route at all: the element reached it,
+    * create_vertex_elements_state refused the whole state, and the draw ran
+    * with no vertex layout and read zeros. The 16-bit pair being here and the
+    * 8-bit pair not is what made GL_UNSIGNED_SHORT work and GL_UNSIGNED_BYTE
+    * silently produce nothing. */
+   { PIPE_FORMAT_R8G8B8_SINT,          PIPE_FORMAT_R32G32B32_SINT },
+   { PIPE_FORMAT_R8G8B8_UINT,          PIPE_FORMAT_R32G32B32_UINT },
+   /* And the one-component integer formats, for the same reason. Before
+    * this the table held exactly four integer entries, all of them
+    * three-component 16-bit, so glVertexAttribIPointer with a count of one
+    * and GL_BYTE had no fallback either. */
+   { PIPE_FORMAT_R8_SINT,              PIPE_FORMAT_R32_SINT },
+   { PIPE_FORMAT_R8_UINT,              PIPE_FORMAT_R32_UINT },
+   { PIPE_FORMAT_R16_SINT,             PIPE_FORMAT_R32_SINT },
+   { PIPE_FORMAT_R16_UINT,             PIPE_FORMAT_R32_UINT },
+   { PIPE_FORMAT_R8G8_SINT,            PIPE_FORMAT_R32G32_SINT },
+   { PIPE_FORMAT_R8G8_UINT,            PIPE_FORMAT_R32G32_UINT },
+   { PIPE_FORMAT_R16G16_SINT,          PIPE_FORMAT_R32G32_SINT },
+   { PIPE_FORMAT_R16G16_UINT,          PIPE_FORMAT_R32G32_UINT },
    { PIPE_FORMAT_R16G16B16A16_SNORM,   PIPE_FORMAT_R32G32B32A32_FLOAT },
    { PIPE_FORMAT_R16_USCALED,          PIPE_FORMAT_R32_FLOAT },
    { PIPE_FORMAT_R16G16_USCALED,       PIPE_FORMAT_R32G32_FLOAT },
