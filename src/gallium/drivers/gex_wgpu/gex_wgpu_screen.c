@@ -2789,6 +2789,10 @@ struct gex_wgpu_sampler_view {
    uint32_t reinterpret_row_bytes;
    uint32_t reinterpret_width;
    uint32_t reinterpret_height;
+   /* How many layers the scratch carries. One for an ordinary 2D view; the
+    * view's whole range for an array, which is what st's canonical-format
+    * blit asks for when glCopyImageSubData crosses format classes. */
+   uint32_t reinterpret_layers;
    /* The source's write_serial the copy was taken at; UINT64_MAX means never. */
    uint64_t reinterpret_serial;
 };
@@ -16755,9 +16759,25 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
            templ->target == PIPE_TEXTURE_2D_ARRAY ||
            templ->target == PIPE_TEXTURE_RECT ||
            templ->target == PIPE_TEXTURE_1D ||
-           templ->target == PIPE_TEXTURE_1D_ARRAY) &&
+           templ->target == PIPE_TEXTURE_1D_ARRAY ||
+           /* ...and 3D, whose scratch is a 3D texture of the same depth. It
+            * was left out when the scratch could only be one 2D layer, and
+            * that is the last of KHR-GL46.copy_image's cross-class copies:
+            * st views a 3D source in a canonical format like any other. */
+           templ->target == PIPE_TEXTURE_3D) &&
           templ->u.tex.first_level == templ->u.tex.last_level &&
-          templ->u.tex.first_layer == templ->u.tex.last_layer) &&
+          /* A layer *range* is served too, not just a single layer. st
+           * implements a cross-class glCopyImageSubData by blitting between
+           * canonical formats -- an r8g8b8a8_unorm view of an r11g11b10_float
+           * array, all twelve layers -- and refusing that left 72 copy_image
+           * cases with a blit declined for want of a source view. The scratch
+           * below is an array of the same depth, so nothing about the range
+           * needs restricting; only a cube, which needs its own six-layer
+           * rule, is kept out by the target list above. */
+          (templ->u.tex.first_layer == templ->u.tex.last_layer ||
+           templ->target == PIPE_TEXTURE_2D_ARRAY ||
+           templ->target == PIPE_TEXTURE_1D_ARRAY ||
+           templ->target == PIPE_TEXTURE_3D)) &&
         /* A stencil-aspect view names a different format from its texture by
          * construction -- X24S8_UINT of a Z24_UNORM_S8_UINT texture -- so the
          * sRGB pairing rule above cannot be the only exception. It is still a
@@ -16955,9 +16975,32 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
        * so here the only question left is which size this one is. */
       const uint32_t texel =
          util_format_get_blocksize(gex_wgpu_stored_format(templ->format));
+      /* A 3D texture's "layers" are its depth slices, and a view of one
+       * covers the whole volume however its layer range is spelled -- the
+       * shape guard above accepts all three spellings. */
+      const bool volume = templ->target == PIPE_TEXTURE_3D;
+      const uint32_t layers =
+         volume ? MAX2(u_minify(texture->depth0, templ->u.tex.first_level), 1u)
+                : templ->u.tex.last_layer - templ->u.tex.first_layer + 1;
+      /* Bounded, because the scratch is a whole copy of the range and the
+       * range is the application's to choose: a cross-class view of a
+       * 2048x2048x256 array would ask for four gigabytes, quietly, on a card
+       * that has less. Above the bound the view is refused by name as it was
+       * before layers were served at all -- a declined blit is a wrong
+       * picture, an exhausted device is the whole process. */
+      const uint64_t scratch_bytes =
+         (uint64_t)ALIGN_POT(width * util_format_get_blocksize(
+                                gex_wgpu_stored_format(templ->format)), 256u) *
+         height * layers;
+      if (scratch_bytes > (64u << 20)) {
+         GEX_SAMPLER_VIEW_REFUSED("reinterpreting scratch too large");
+         FREE(view);
+         return NULL;
+      }
       WGPUTextureDescriptor scratch_desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
-      scratch_desc.dimension = WGPUTextureDimension_2D;
-      scratch_desc.size = (WGPUExtent3D){width, height, 1};
+      scratch_desc.dimension = volume ? WGPUTextureDimension_3D
+                                      : WGPUTextureDimension_2D;
+      scratch_desc.size = (WGPUExtent3D){width, height, layers};
       scratch_desc.format = gex_wgpu_texture_format(templ->format);
       scratch_desc.mipLevelCount = 1;
       scratch_desc.sampleCount = 1;
@@ -16969,7 +17012,7 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
       /* copyTextureToBuffer wants a 256-byte row pitch. */
       view->reinterpret_row_bytes = ALIGN_POT(width * texel, 256u);
       view->reinterpret_bytes =
-         (uint64_t)view->reinterpret_row_bytes * height;
+         (uint64_t)view->reinterpret_row_bytes * height * layers;
       WGPUBufferDescriptor staging_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
       staging_desc.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
       staging_desc.size = view->reinterpret_bytes;
@@ -16978,6 +17021,7 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
                                 &staging_desc);
       view->reinterpret_width = width;
       view->reinterpret_height = height;
+      view->reinterpret_layers = layers;
       view->reinterpret_serial = UINT64_MAX;
       if (!view->reinterpret || !view->reinterpret_staging) {
          if (view->reinterpret) wgpuTextureRelease(view->reinterpret);
@@ -16990,8 +17034,12 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
       view_source = view->reinterpret;
       desc.baseMipLevel = 0;
       desc.mipLevelCount = 1;
+      /* The scratch holds the view's whole layer range starting at zero, so
+       * the view over it covers all of them from zero -- not the one layer it
+       * used to assume, which would have shown a twelve-layer array as one. */
+      /* A 3D view takes the whole volume and names no layers at all. */
       desc.baseArrayLayer = 0;
-      desc.arrayLayerCount = 1;
+      desc.arrayLayerCount = volume ? 1 : layers;
       desc.aspect = WGPUTextureAspect_All;
    }
    /* A view whose format differs from its texture's is the interesting case
@@ -19304,6 +19352,15 @@ gex_wgpu_texture_unmap(struct pipe_context *pipe,
                        struct pipe_transfer *transfer)
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
+   if (getenv("GEX_WGPU_MAPBOX_LOG"))
+      fprintf(stderr, "gex-mapbox: unmap usage=0x%x target=%d level=%u "
+              "box=%d,%d,%d %dx%dx%d stride=%u layer_stride=%llu data=%p\n",
+              transfer->usage, (int)transfer->resource->target,
+              transfer->level, transfer->box.x, transfer->box.y,
+              transfer->box.z, transfer->box.width, transfer->box.height,
+              transfer->box.depth, transfer->stride,
+              (unsigned long long)transfer->layer_stride,
+              (void *)((struct gex_wgpu_transfer *)transfer)->data);
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_transfer *gex = (struct gex_wgpu_transfer *)transfer;
    /* A write map only reaches the texture here: what the caller wrote is
@@ -21934,7 +21991,9 @@ gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
    WGPUTexelCopyTextureInfo from = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
    from.texture = source->texture;
    from.mipLevel = view->base.u.tex.first_level;
-   from.origin = (WGPUOrigin3D){0, 0, view->base.u.tex.first_layer};
+   from.origin = (WGPUOrigin3D){
+      0, 0, view->base.texture->target == PIPE_TEXTURE_3D
+               ? 0u : view->base.u.tex.first_layer};
    from.aspect = WGPUTextureAspect_All;
    WGPUTexelCopyBufferInfo staging = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
    staging.buffer = view->reinterpret_staging;
@@ -21942,7 +22001,8 @@ gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
    staging.layout.bytesPerRow = view->reinterpret_row_bytes;
    staging.layout.rowsPerImage = view->reinterpret_height;
    const WGPUExtent3D extent = {view->reinterpret_width,
-                                view->reinterpret_height, 1};
+                                view->reinterpret_height,
+                                MAX2(view->reinterpret_layers, 1u)};
    wgpuCommandEncoderCopyTextureToBuffer(encoder, &from, &staging, &extent);
    WGPUTexelCopyTextureInfo into = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
    into.texture = view->reinterpret;
