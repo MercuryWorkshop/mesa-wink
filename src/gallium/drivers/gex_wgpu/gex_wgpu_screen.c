@@ -4852,6 +4852,29 @@ gex_wgpu_lower_ssbo_access(nir_builder *b, nir_instr *instr, void *data)
  * twelve. The slots past the limit become storage buffers, which have their
  * own budget; the block is an array of vec4, for which std140 and std430 agree,
  * so only the address space and the binding change. */
+static bool gex_wgpu_has_64_bit(nir_shader *nir);
+
+/* Every buffer this driver can address is a run of 32-bit words -- a storage
+ * block, a uniform block, shared memory -- so an access of any other width is
+ * split into that. The alignment asked for is four for the same reason; the
+ * pass adds the shifting a narrower original needs. */
+static nir_mem_access_size_align
+gex_wgpu_mem_access_size_align(nir_intrinsic_op intrin, uint8_t bytes,
+                               uint8_t bit_size, uint32_t align_mul,
+                               uint32_t align_offset, bool offset_is_const,
+                               enum gl_access_qualifier access,
+                               const void *cb_data)
+{
+   (void)intrin; (void)bit_size; (void)align_mul; (void)align_offset;
+   (void)offset_is_const; (void)access; (void)cb_data;
+   const unsigned components = MIN2(DIV_ROUND_UP(bytes, 4), 4u);
+   return (nir_mem_access_size_align){
+      .num_components = (uint8_t)MAX2(components, 1u),
+      .bit_size = 32,
+      .align = 4,
+   };
+}
+
 static bool
 gex_wgpu_lower_gallium_ubos(nir_shader *nir,
                             enum mesa_shader_stage stage,
@@ -5100,6 +5123,29 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
       var->data.descriptor_set = stage == MESA_SHADER_VERTEX ? 1 : 2;
       var->data.binding = GEX_WGPU_IMAGE_FIRST_BINDING + slot;
       var->data.explicit_binding = 1;
+   }
+
+   /* Any 64-bit load or store is split into 32-bit ones first.
+    *
+    * A 64-bit *memory access* is not an ALU operation, a register, an undef
+    * or a local variable, so none of the 64-bit lowerings this driver runs
+    * later sees it -- nir_lower_int64 rewrites arithmetic. A `load_ssbo` of a
+    * double therefore reached the pass below still 64 bits wide and was
+    * refused by name, `load_ssbo bit_size=64`, which refuses the whole
+    * shader. It has to happen here, before that refusal, and not in
+    * gex_wgpu_compile_nir, which runs long after it.
+    *
+    * Every buffer this driver addresses is a run of 32-bit words in every
+    * address space it serves, so the answer is always the same. The
+    * pack/unpack pairs the split leaves behind fold away in the 64-bit
+    * optimiser loop in gex_wgpu_compile_nir. */
+   if (gex_wgpu_has_64_bit(nir)) {
+      const nir_lower_mem_access_bit_sizes_options bit_sizes = {
+         .modes = nir_var_mem_ssbo | nir_var_mem_ubo | nir_var_mem_shared |
+                  nir_var_mem_global | nir_var_mem_constant,
+         .callback = gex_wgpu_mem_access_size_align,
+      };
+      NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &bit_sizes);
    }
 
    /* Now that the storage blocks carry their bindings, flatten them and turn
