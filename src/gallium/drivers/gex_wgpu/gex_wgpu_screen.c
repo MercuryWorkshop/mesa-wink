@@ -1359,6 +1359,14 @@ struct gex_wgpu_screen {
     * presenting sixty frames a second. Evictions are rare next to draws, so
     * throwing the whole emitted state away on one costs nothing. */
    uint64_t cache_epoch;
+   /* Bumped when a *resource* is destroyed, and consulted only by the bind
+    * group cache. A render pipeline descriptor names shader modules and
+    * pipeline state and never a buffer or a texture, so releasing a
+    * resource cannot make a cached pipeline wrong -- and rebuilding every
+    * pipeline because a buffer went away is what a single global epoch
+    * costs. Measured: browser STK 59.7 -> 58.9 FPS and 99.6% -> 98.4%
+    * fresh with one shared counter, recovered by separating them. */
+   uint64_t resource_epoch;
    uint64_t pass_serial;
    /* Everything above this line that a context may write.
     *
@@ -17151,6 +17159,26 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
    GEX_DEVICE_GUARD(gex_screen(screen));
    (void)screen;
    struct gex_wgpu_resource *gex = gex_resource(resource);
+   /* Releasing any of these hands its address back to Dawn, which reuses it.
+    * The bind group and pipeline caches key on the *serialised bytes* of their
+    * descriptors, and those name buffers and textures by address -- so a
+    * resource created after this one is destroyed can land on the same
+    * address, match a cached key byte for byte, and be given a bind group
+    * built from the resource that is already gone.
+    *
+    * That is the same hazard cache_epoch was introduced for when a deleted
+    * *shader* module's pipeline came back, and it was bumped for shader
+    * modules, sampler views, sampler states and grown buffers -- but not
+    * here, where resources are destroyed. It presented as a fragment shader's
+    * storage write silently going nowhere: gl44-ssbo-probe's
+    * cross_stage_storage read back its seed, in the browser only, and only
+    * when earlier cases in the same run had created and deleted buffers
+    * before it. Any perturbation of the heap moved the addresses and hid it,
+    * including the act of reading one environment variable, which is why no
+    * getenv-gated instrument could see it. */
+   if (gex->texture || gex->rt_scratch || gex->rt_scratch_staging ||
+       gex->buffer)
+      ++gex_screen(screen)->resource_epoch;
    if (gex->texture)
       wgpuTextureRelease(gex->texture);
    if (gex->rt_scratch)
@@ -35132,7 +35160,8 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
 
    struct gex_wgpu_bg_cache_slot *slot =
       &screen->bg_cache[hash % GEX_WGPU_BG_CACHE_SLOTS];
-   if (slot->used && slot->epoch == screen->cache_epoch &&
+   if (slot->used &&
+       slot->epoch == screen->cache_epoch + screen->resource_epoch &&
        slot->hash == hash && slot->layout == layout &&
        slot->count == count && memcmp(slot->entries, entries, bytes) == 0) {
       ++screen->bg_cache_hits;
@@ -35178,7 +35207,7 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
          wgpuBindGroupRelease(slot->group);
    }
    slot->used = true;
-   slot->epoch = screen->cache_epoch;
+   slot->epoch = screen->cache_epoch + screen->resource_epoch;
    slot->hash = hash;
    slot->layout = layout;
    slot->count = count;
