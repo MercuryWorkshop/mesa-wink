@@ -3503,6 +3503,8 @@ st_texture_storage(struct gl_context *ctx,
       enum pipe_texture_target ptarget = gl_target_to_pipe(texObj->Target);
       bool found = false;
 
+      const unsigned requested_samples = num_samples;
+
       if (ctx->Const.MaxSamples > 1 && num_samples == 1) {
          /* don't try num_samples = 1 with drivers that support real msaa */
          num_samples = 2;
@@ -3517,6 +3519,35 @@ st_texture_storage(struct gl_context *ctx,
             found = true;
             break;
          }
+      }
+
+      /* Nothing at or above the bumped count works for this format. Before
+       * failing, try the count that was actually asked for. The bump above
+       * prefers real multisampling to a single sample, which is right
+       * whenever the driver has any for this format and meaningless when it
+       * has none -- and a driver whose support varies by format can be in
+       * exactly that position: WebGPU multisamples no 32-bit-per-component
+       * format at any count, so a one-sample GL_RGBA32F multisample texture,
+       * which is an ordinary texture really, was refused for asking.
+       *
+       * This only ever turns an error into a success: it is reached solely
+       * when the search has already failed, so no format that has real
+       * multisampling takes this path and the bump keeps its meaning for
+       * everyone else.
+       *
+       * `num_samples` must be assigned too, not just texImage->NumSamples.
+       * The loop leaves it one past MAX_SAMPLES and st_texture_create below
+       * reads *it*, so setting only the image's copy asked the driver for a
+       * seventeen-sample texture -- which it refused as GL_OUT_OF_MEMORY,
+       * taking the whole CTS run down with an aborted context. */
+      if (!found && requested_samples < num_samples &&
+          screen->caps.exact_sample_counts &&
+          screen->is_format_supported(screen, fmt, ptarget,
+                                      requested_samples, requested_samples,
+                                      PIPE_BIND_SAMPLER_VIEW)) {
+         num_samples = requested_samples;
+         texImage->NumSamples = requested_samples;
+         found = true;
       }
 
       if (!found) {
