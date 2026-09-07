@@ -1358,6 +1358,12 @@ struct gex_wgpu_screen {
     * That is invisible until it is not: SuperTuxKart went black while still
     * presenting sixty frames a second. Evictions are rare next to draws, so
     * throwing the whole emitted state away on one costs nothing. */
+   /* What the device granted for buffer binding offsets. WebGPU's default is
+    * 256 for both and gex_wgpu_native asks for the adapter's own value, which
+    * is far smaller; these are reported straight to GL, so an application may
+    * pack its bindings as tightly as the hardware really allows. */
+   unsigned uniform_offset_alignment;
+   unsigned storage_offset_alignment;
    uint64_t cache_epoch;
    uint64_t pass_serial;
    /* Everything above this line that a context may write.
@@ -42524,7 +42530,11 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * every topology the driver takes. */
    /* WebGPU requires a storage binding offset to be 256-byte aligned, and
     * st/mesa honours this when it sub-allocates a shader storage block. */
-   caps->shader_buffer_offset_alignment = 256;
+   /* What the device granted, not WebGPU's default; see gex_wgpu_native's
+      GEX_WANT_LOW. An application that packs its storage bindings tighter
+      than 256 bytes is asking for something the hardware allows. */
+   caps->shader_buffer_offset_alignment =
+      screen->storage_offset_alignment;
    /* GL's image format qualifier is not optional here -- WGSL names the
     * format in the storage texture's type, so every image access is
     * formatted by construction. */
@@ -42722,7 +42732,8 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
 
    /* Uniforms reach the shader as uniform buffers; 256 is WebGPU's required
     * minUniformBufferOffsetAlignment. */
-   caps->constant_buffer_offset_alignment = 256;
+   caps->constant_buffer_offset_alignment =
+      screen->uniform_offset_alignment;
    /* WebGPU guarantees maxUniformBufferBindingSize of 64 KiB. st/mesa refuses
     * ARB_uniform_buffer_object below 16 KiB, and OpenGL ES 3.0 requires it. */
    caps->max_constant_buffer_size = 65536;
@@ -43152,6 +43163,8 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->max_inter_stage = GEX_WGPU_MAX_RASTER_VARYINGS;
    screen->max_storage_textures = GEX_WGPU_MAX_SHADER_IMAGES;
    screen->max_storage_buffer_size = 0;
+   screen->uniform_offset_alignment = 256;   /* WebGPU's default, the worst */
+   screen->storage_offset_alignment = 256;
    const bool got_limits =
       wgpuDeviceGetLimits(device, &limits) == WGPUStatus_Success;
    if (got_limits) {
@@ -43164,6 +43177,12 @@ gex_wgpu_screen_create(WGPUDevice device)
           WGPU_LIMIT_U32_UNDEFINED)
          screen->max_dynamic_storage_buffers =
             limits.maxDynamicStorageBuffersPerPipelineLayout;
+      if (limits.minUniformBufferOffsetAlignment)
+         screen->uniform_offset_alignment =
+            limits.minUniformBufferOffsetAlignment;
+      if (limits.minStorageBufferOffsetAlignment)
+         screen->storage_offset_alignment =
+            limits.minStorageBufferOffsetAlignment;
    }
    /* Test overrides, so the baked-offset path can be exercised where the
     * adapter is generous enough that it would otherwise never run. The
@@ -43271,10 +43290,13 @@ gex_wgpu_screen_create(WGPUDevice device)
          ? limits.maxColorAttachmentBytesPerSample : 32u;
    if (getenv("GEX_WGPU_LIMIT_TRACE"))
       fprintf(stderr, "gex-limits: colour bytes/sample granted %u "
-              "(storage textures/stage %u, sampled/stage %u)\n",
+              "(storage textures/stage %u, sampled/stage %u), buffer offset "
+              "alignment uniform %u storage %u\n",
               screen->max_colour_bytes_per_sample,
               got_limits ? limits.maxStorageTexturesPerShaderStage : 0u,
-              got_limits ? limits.maxSampledTexturesPerShaderStage : 0u);
+              got_limits ? limits.maxSampledTexturesPerShaderStage : 0u,
+              got_limits ? limits.minUniformBufferOffsetAlignment : 0u,
+              got_limits ? limits.minStorageBufferOffsetAlignment : 0u);
    /* Both gate the 16-bit normalized formats: they are backed by float32, and
     * a float32 attachment is only filterable and blendable when the device
     * granted these. Without them the formats stay unadvertised rather than

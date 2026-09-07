@@ -340,6 +340,26 @@ create_device(void)
       GEX_WANT(maxTextureDimension2D, 16384);
       GEX_WANT(maxTextureDimension3D, 2048);
       GEX_WANT(maxTextureArrayLayers, 2048);
+      /* The alignment limits run the other way: *lower* is better, and the
+       * default is the worst allowed. WebGPU will not grant below 32 for
+       * these, so ask for the adapter's own value clamped up to that floor --
+       * this adapter offers 4 for both.
+       *
+       * It is worth asking. The 256 default is reported straight through to
+       * GL as SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT and
+       * UNIFORM_BUFFER_OFFSET_ALIGNMENT, so every glBindBufferRange offset an
+       * application picks has to be a multiple of it. One that packs tighter
+       * -- 64 or 128 bytes, which is ordinary -- gets GL_INVALID_VALUE for a
+       * binding the hardware would have accepted, and
+       * KHR-GL45.shader_storage_buffer_object.advanced-switchBuffers is
+       * exactly that: it binds at 128-byte strides without asking. */
+#define GEX_WANT_LOW(field, floor)                                          \
+      if (adapter_limits.field != WGPU_LIMIT_U32_UNDEFINED &&               \
+          adapter_limits.field > 0)                                         \
+         limits.field = MAX2(adapter_limits.field, (uint32_t)(floor))
+      GEX_WANT_LOW(minUniformBufferOffsetAlignment, 32);
+      GEX_WANT_LOW(minStorageBufferOffsetAlignment, 32);
+#undef GEX_WANT_LOW
 #undef GEX_WANT
       if (getenv("GEX_WGPU_LIMIT_TRACE"))
          fprintf(stderr, "gex-limits: adapter colour bytes/sample %u "
@@ -352,6 +372,12 @@ create_device(void)
                  limits.maxStorageBuffersPerShaderStage,
                  adapter_limits.maxStorageBuffersInVertexStage,
                  adapter_limits.maxStorageBuffersInFragmentStage);
+      if (getenv("GEX_WGPU_LIMIT_TRACE"))
+         fprintf(stderr, "gex-limits: adapter buffer offset alignment "
+                 "uniform %u storage %u (lower is better; the default is "
+                 "256 and asking is what gets it)\n",
+                 adapter_limits.minUniformBufferOffsetAlignment,
+                 adapter_limits.minStorageBufferOffsetAlignment);
       fprintf(stderr, "gex-wgpu: adapter inter-stage variables %u (asking "
               "for %u)\n", adapter_limits.maxInterStageShaderVariables,
               limits.maxInterStageShaderVariables);
