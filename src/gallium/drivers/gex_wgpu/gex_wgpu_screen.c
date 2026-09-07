@@ -17177,7 +17177,7 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
     * including the act of reading one environment variable, which is why no
     * getenv-gated instrument could see it. */
    if (gex->texture || gex->rt_scratch || gex->rt_scratch_staging ||
-       gex->buffer)
+       gex->buffer || gex->alias_snapshot)
       ++gex_screen(screen)->resource_epoch;
    if (gex->texture)
       wgpuTextureRelease(gex->texture);
@@ -17187,6 +17187,11 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
       wgpuBufferRelease(gex->rt_scratch_staging);
    if (gex->buffer)
       wgpuBufferRelease(gex->buffer);
+   /* The aliasing snapshot is created lazily and was never released, which
+      leaked one whole allocation per resource that took part in a mixed pair
+      -- and its address is handed back for reuse like any other. */
+   if (gex->alias_snapshot)
+      wgpuBufferRelease(gex->alias_snapshot);
    if (gex->shadow) {
       gex_wgpu_shadow_live -= gex->allocation_size;
       --gex_wgpu_buffers_live;
@@ -34185,6 +34190,36 @@ gex_wgpu_alias_snapshot_now(struct gex_wgpu_context *ctx,
    return copy;
 }
 
+/* Whether the fragment stage writes this *resource* through any of its
+   storage slots. The slot-keyed question above is not the same one: a mixed
+   pair inside the fragment group names one buffer at two different slots, so
+   the writable half is found by resource and not by slot number.
+
+   GL permits it -- and it is ordinary: one buffer bound twice, written through
+   one binding and read through the other. WebGPU refuses any writable binding
+   that shares a synchronization scope with another use of the same buffer, and
+   the per-group aliasing check can only decline the draw. Snapshotting the
+   read-only half is the same repair the compute path and the vertex group
+   already use, and legal for the same reason: GL leaves a read of what is
+   concurrently written undefined without a barrier, and a barrier submits,
+   which closes the scope. */
+static bool
+gex_wgpu_fragment_writes_resource(const struct gex_wgpu_context *ctx,
+                                  const struct pipe_resource *resource)
+{
+   if (!ctx->fs || !resource)
+      return false;
+   for (unsigned i = 0; i < ctx->fs->ssbo_count; ++i) {
+      if (ctx->fs->ssbo_readonly_mask & (UINT64_C(1) << i))
+         continue;
+      const struct pipe_shader_buffer *other =
+         &ctx->shader_buffers[MESA_SHADER_FRAGMENT][ctx->fs->ssbo_slots[i]];
+      if (other->buffer == resource)
+         return true;
+   }
+   return false;
+}
+
 /* Whether the *fragment* stage writes this shader-storage slot, which makes a
  * vertex-stage binding of the same buffer illegal in WebGPU however read-only
  * it is: a buffer may not be writable in one binding and anything else in
@@ -40761,6 +40796,19 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             sb_buffer = gex_resource(sb->buffer)->buffer;
             sb_offset = sb->buffer_offset;
             sb_size = sb->buffer_size;
+            /* A read-only binding of a buffer this stage also writes through
+             * another binding. WebGPU refuses the pair within one pass and
+             * names neither, so the read-only half reads a copy -- the same
+             * repair the compute path and the vertex group use. The offset is
+             * kept rather than zeroed, because the snapshot is a copy of the
+             * whole allocation and so the requested range is at the same
+             * place in it. */
+            if ((ctx->fs->ssbo_readonly_mask & (UINT64_C(1) << i)) &&
+                gex_wgpu_fragment_writes_resource(ctx, sb->buffer)) {
+               WGPUBuffer copy = gex_wgpu_alias_snapshot_now(ctx, sb->buffer);
+               if (copy)
+                  sb_buffer = copy;
+            }
          } else {
             /* Zeros, which is what robust_buffer_access_behavior promises for
                a block nothing is bound to; failing the context instead cost
