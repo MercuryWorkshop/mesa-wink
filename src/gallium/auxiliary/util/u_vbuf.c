@@ -494,6 +494,19 @@ u_vbuf_translate_buffers(struct u_vbuf *mgr, struct translate_key *key,
    uint8_t *out_map;
    unsigned out_offset, mask;
 
+   /* u_upload_alloc always writes *releasebuf, including NULL when it did not
+    * have to allocate a new upload buffer -- so anything already waiting
+    * there is about to be lost, not released. One slot is shared by every
+    * translated buffer type in a draw (this runs once per type) and by every
+    * draw in a multi-draw, and only the last writer's value ever reached the
+    * release at the end of u_vbuf_draw_vbo. Each lost buffer is a whole
+    * upload slab: a SuperTuxKart run leaked about 35 MiB a second this way,
+    * which on a 4 GB card is gone in under two minutes. */
+   if (*releasebuf) {
+      pipe_resource_release(mgr->pipe, *releasebuf);
+      *releasebuf = NULL;
+   }
+
    /* Get a translate object. */
    tr = translate_cache_find(mgr->translate_cache, key);
 
@@ -1219,7 +1232,10 @@ u_vbuf_upload_buffers(struct u_vbuf *mgr,
    unsigned nr_velems = ve->count;
    const struct pipe_vertex_element *velems =
          mgr->using_translate ? mgr->fallback_velems.velems : ve->ve;
-   unsigned rcount = 0;
+   /* Continue the caller's count rather than restarting it: this is called
+    * once per draw and used to assign *release_count, so a multi-draw kept
+    * only the last call's buffers and leaked the rest. */
+   unsigned rcount = *release_count;
 
    /* Faster path when no vertex attribs are interleaved. */
    if ((ve->interleaved_vb_mask & mgr->user_vb_mask) == 0) {
@@ -1241,8 +1257,10 @@ u_vbuf_upload_buffers(struct u_vbuf *mgr,
                        mgr->has_signed_vb_offset ? 0 : offset,
                        size, 4, ptr + offset, &real_vb->buffer_offset,
                        &real_vb->buffer.resource, &releasebufs[rcount]);
-         if (!real_vb->buffer.resource)
+         if (!real_vb->buffer.resource) {
+            *release_count = rcount;
             return PIPE_ERROR_OUT_OF_MEMORY;
+         }
 
          if (releasebufs[rcount])
             rcount++;
@@ -1305,8 +1323,10 @@ u_vbuf_upload_buffers(struct u_vbuf *mgr,
                     mgr->has_signed_vb_offset ? 0 : start,
                     end - start, 4,
                     ptr + start, &real_vb->buffer_offset, &real_vb->buffer.resource, &releasebufs[rcount]);
-      if (!real_vb->buffer.resource)
+      if (!real_vb->buffer.resource) {
+         *release_count = rcount;
          return PIPE_ERROR_OUT_OF_MEMORY;
+      }
 
       if (releasebufs[rcount])
          rcount++;
@@ -1836,6 +1856,17 @@ void u_vbuf_draw_vbo(struct pipe_context *pipe, const struct pipe_draw_info *inf
          pipe->draw_vbo(pipe, &new_info, drawid_offset, indirect, &new_draw, 1);
       if (info->increment_draw_id)
          drawid_offset++;
+
+      /* Release this draw's spent upload buffers now that it is recorded.
+       * Deferring the whole multi-draw to the end kept only the last
+       * iteration's -- and now that release_count accumulates, deferring it
+       * would also run a 32-entry array off its end. A driver that is still
+       * using one of these holds its own reference to it. */
+      pipe_resource_release(pipe, releasebuf);
+      releasebuf = NULL;
+      for (unsigned i = 0; i < release_count; i++)
+         pipe_resource_release(pipe, releasebufs[i]);
+      release_count = 0;
    }
 
    if (mgr->using_translate) {
