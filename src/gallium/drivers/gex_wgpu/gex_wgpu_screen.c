@@ -39365,9 +39365,18 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          GEX_DRAW_DROP();
       }
    }
+   /* Packed images in the *vertex* group, which it did not carry at all: a
+    * vertex shader reading an imageBuffer had its binding in no group, and
+    * Dawn said "No bind group set at group index 1" while the draw rendered
+    * nothing. One shared header plus one data binding each, as the fragment
+    * group below. Only images the rasterising copy still touches get here --
+    * a written one has its store stripped, because WGSL forbids a writable
+    * storage binding in the vertex stage. */
+   const unsigned vs_packed_entries =
+      ctx->vs->packed_image_count ? 1 + ctx->vs->packed_image_count : 0;
    const unsigned vertex_group_count =
       ctx->vs->ubo_count + ctx->vs->ssbo_count + ctx->vs->buftex_count +
-      (ctx->vs->reads_draw_params ? 1u : 0u);
+      vs_packed_entries + (ctx->vs->reads_draw_params ? 1u : 0u);
    const unsigned fragment_group_count =
       ctx->fs->ubo_count + ctx->fs->ssbo_count + ctx->fs->image_count +
       ctx->fs->buftex_count +
@@ -39845,6 +39854,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                             GEX_WGPU_MAX_SO_BUFFERS +
                             GEX_WGPU_MAX_SHADER_BUFFERS +
                             GEX_WGPU_MAX_BUFFER_TEXTURES +
+                            /* packed images: one shared header plus one data
+                               binding each */
+                            1 + GEX_WGPU_MAX_SHADER_IMAGES +
                             /* the draw parameters */ 1];
    WGPUBindGroupLayoutEntry
       fragment_layout_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
@@ -39995,9 +40007,33 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          WGPUBufferBindingType_ReadOnlyStorage;
       vertex_layout_entries[at].buffer.hasDynamicOffset = false;
    }
+   /* Packed images, mirroring the fragment group: a read-only header shared
+    * by every slot, then one data binding per image. Read-only on both counts
+    * here -- WGSL forbids a writable storage binding in the vertex stage, and
+    * what rasterises has had its stores stripped for exactly that reason. */
+   for (unsigned i = 0; i < ctx->vs->packed_image_count; ++i) {
+      const unsigned base = ctx->vs->ubo_count + ctx->vs->ssbo_count +
+                            ctx->vs->buftex_count;
+      const unsigned slot = ctx->vs->packed_image_slots[i];
+      for (unsigned half = 0; half < 2; ++half) {
+         if (half == 0 && i != 0)
+            continue;
+         const unsigned at = half ? base + 1 + i : base;
+         vertex_layout_entries[at] =
+            (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+         vertex_layout_entries[at].binding = half
+            ? GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot
+            : ctx->vs->packed_image_bindings[i];
+         vertex_layout_entries[at].visibility = WGPUShaderStage_Vertex;
+         vertex_layout_entries[at].buffer.type =
+            !half ? WGPUBufferBindingType_Uniform
+                  : WGPUBufferBindingType_ReadOnlyStorage;
+         vertex_layout_entries[at].buffer.hasDynamicOffset = false;
+      }
+   }
    if (ctx->vs->reads_draw_params) {
       const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
-                          ctx->vs->buftex_count;
+                          ctx->vs->buftex_count + vs_packed_entries;
       vertex_layout_entries[at] =
          (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       vertex_layout_entries[at].binding = GEX_WGPU_DRAW_PARAMS_BINDING;
@@ -40485,6 +40521,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SO_BUFFERS +
                  GEX_WGPU_MAX_SHADER_BUFFERS +
                  GEX_WGPU_MAX_BUFFER_TEXTURES +
+                 /* packed images, as in the layout above */
+                 1 + GEX_WGPU_MAX_SHADER_IMAGES +
                  /* the draw parameters */ 1];
       for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
          const unsigned slot = ctx->vs->ubo_slots[i];
@@ -40591,9 +40629,52 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          /* Rounded to four; see the note in the capture path. */
          entries[at].size = ALIGN_POT(view->u.buf.size, 4);
       }
+      /* Packed images, as in the layout above. */
+      for (unsigned i = 0; i < ctx->vs->packed_image_count; ++i) {
+         const unsigned base = ctx->vs->ubo_count + ctx->vs->ssbo_count +
+                               ctx->vs->buftex_count;
+         const unsigned slot = ctx->vs->packed_image_slots[i];
+         const struct pipe_image_view *iv =
+            &ctx->shader_images[MESA_SHADER_VERTEX][slot];
+         WGPUBuffer buffer = NULL, header = NULL;
+         uint64_t size = 0, data_offset = 0;
+         if (!gex_wgpu_image_is_bound(iv)) {
+            /* Nothing bound: a scratch, as the fragment stage does, so the
+               draw happens and the reads answer zero. */
+            buffer = gex_wgpu_packed_image_scratch(ctx, false);
+            header = gex_wgpu_packed_image_scratch(ctx, true);
+            size = GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
+         } else {
+            buffer = gex_wgpu_packed_image_bind(
+               ctx, slot, iv, ctx->vs->packed_image_formats[i],
+               ctx->vs->packed_image_read[i], &size, &header, &data_offset);
+         }
+         if (!buffer || !header) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: draw declined (no buffer for packed "
+                       "vertex image %u)\n", slot);
+            }
+            GEX_DRAW_DROP();
+         }
+         for (unsigned half = 0; half < 2; ++half) {
+            if (half == 0 && i != 0)
+               continue;
+            const unsigned at = half ? base + 1 + i : base;
+            entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+            entries[at].binding = half
+               ? GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot
+               : ctx->vs->packed_image_bindings[i];
+            entries[at].buffer = half ? buffer : header;
+            entries[at].offset = half ? data_offset : 0;
+            entries[at].size =
+               half ? size : GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
+         }
+      }
       if (ctx->vs->reads_draw_params) {
          const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
-                             ctx->vs->buftex_count;
+                             ctx->vs->buftex_count + vs_packed_entries;
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = GEX_WGPU_DRAW_PARAMS_BINDING;
          entries[at].buffer = gex_resource(ctx->constant_ring)->buffer;
