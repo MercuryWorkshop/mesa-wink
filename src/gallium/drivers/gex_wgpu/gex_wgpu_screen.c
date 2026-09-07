@@ -34231,6 +34231,65 @@ gex_wgpu_alias_snapshot_now(struct gex_wgpu_context *ctx,
    return copy;
 }
 
+/* Two *writable* storage-texture bindings over one subresource.
+ *
+ * GL permits it -- one texture bound to two image units, written through both
+ * -- and WebGPU refuses it. What makes that worth catching here rather than
+ * leaving to Dawn is the *shape* of Dawn's complaint: it is reported against
+ * the command buffer, not the draw --
+ *
+ *   Writable storage texture binding aliasing found between [BindGroup] set at
+ *   bind group index 2, binding index 1, and ... binding index 2, with
+ *   subresources ... in [Texture (400x300 px, 3 layer, RGBA32Float)]
+ *   [Invalid CommandBuffer] is invalid.
+ *
+ * -- so it takes every draw recorded beside it. One unservable draw becoming a
+ * lost frame is a much worse outcome than one lost draw, and the buffer
+ * equivalent of this check exists for exactly that reason; this is the
+ * texture half, which was missing.
+ *
+ * There is no repair. The read-only half of a *mixed* pair can be snapshotted
+ * and is; two writable bindings over one range cannot both be served, so this
+ * declines by name. KHR-GL45.shader_image_load_store.advanced-sso-subroutine
+ * is the case: one rgba32f 3-layer texture at two writable units.
+ *
+ * Compared before any view exists, from the image views the application bound
+ * -- same resource, same level, overlapping layers -- because that is the
+ * question, and it needs no WebGPU object to answer.
+ */
+static bool
+gex_wgpu_writable_image_alias(const struct gex_wgpu_context *ctx,
+                              const struct gex_wgpu_shader *shader,
+                              mesa_shader_stage stage,
+                              unsigned *first, unsigned *second)
+{
+   for (unsigned i = 0; i < shader->image_count; ++i) {
+      if (shader->image_access[i] == WGPUStorageTextureAccess_ReadOnly)
+         continue;
+      const struct pipe_image_view *a =
+         &ctx->shader_images[stage][shader->image_slots[i]];
+      if (!a->resource)
+         continue;
+      for (unsigned j = i + 1; j < shader->image_count; ++j) {
+         if (shader->image_access[j] == WGPUStorageTextureAccess_ReadOnly)
+            continue;
+         const struct pipe_image_view *b =
+            &ctx->shader_images[stage][shader->image_slots[j]];
+         if (b->resource != a->resource)
+            continue;
+         if (a->u.tex.level != b->u.tex.level)
+            continue;               /* different levels are disjoint */
+         if (a->u.tex.last_layer < b->u.tex.first_layer ||
+             b->u.tex.last_layer < a->u.tex.first_layer)
+            continue;               /* disjoint layer ranges are allowed */
+         *first = shader->image_slots[i];
+         *second = shader->image_slots[j];
+         return true;
+      }
+   }
+   return false;
+}
+
 /* One read-only image's view, for a stage that may only have read-only ones.
  *
  * The fragment group builds its image views inline and does more: a writable
@@ -41068,6 +41127,24 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[at].buffer = sb_buffer;
          entries[at].offset = sb_offset;
          entries[at].size = sb_size;
+      }
+      /* Two writable images over one subresource would reach Dawn as an
+         invalid *command buffer*, taking every draw recorded beside it; see
+         gex_wgpu_writable_image_alias. */
+      {
+         unsigned alias_a = 0, alias_b = 0;
+         if (gex_wgpu_writable_image_alias(ctx, ctx->fs, MESA_SHADER_FRAGMENT,
+                                           &alias_a, &alias_b)) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: draw declined (fragment image units "
+                       "%u and %u are both writable over one subresource of "
+                       "the same texture, which WebGPU refuses)\n",
+                       alias_a, alias_b);
+            }
+            GEX_DRAW_DROP();
+         }
       }
       /* One view per image, built here rather than cached on the resource:
        * glBindImageTexture names a level and a layer, and the same texture
