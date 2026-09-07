@@ -1359,14 +1359,6 @@ struct gex_wgpu_screen {
     * presenting sixty frames a second. Evictions are rare next to draws, so
     * throwing the whole emitted state away on one costs nothing. */
    uint64_t cache_epoch;
-   /* Bumped when a *resource* is destroyed, and consulted only by the bind
-    * group cache. A render pipeline descriptor names shader modules and
-    * pipeline state and never a buffer or a texture, so releasing a
-    * resource cannot make a cached pipeline wrong -- and rebuilding every
-    * pipeline because a buffer went away is what a single global epoch
-    * costs. Measured: browser STK 59.7 -> 58.9 FPS and 99.6% -> 98.4%
-    * fresh with one shared counter, recovered by separating them. */
-   uint64_t resource_epoch;
    uint64_t pass_serial;
    /* Everything above this line that a context may write.
     *
@@ -17159,26 +17151,16 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
    GEX_DEVICE_GUARD(gex_screen(screen));
    (void)screen;
    struct gex_wgpu_resource *gex = gex_resource(resource);
-   /* Releasing any of these hands its address back to Dawn, which reuses it.
-    * The bind group and pipeline caches key on the *serialised bytes* of their
-    * descriptors, and those name buffers and textures by address -- so a
-    * resource created after this one is destroyed can land on the same
-    * address, match a cached key byte for byte, and be given a bind group
-    * built from the resource that is already gone.
+   /* Nothing is invalidated here any more. Releasing these hands their
+    * handles back for reuse, and a cached bind group key names its objects by
+    * handle -- but the cache now holds its own reference to everything its
+    * keys name, so a handle a live key names cannot be freed at all. See
+    * gex_wgpu_bg_entries_ref.
     *
-    * That is the same hazard cache_epoch was introduced for when a deleted
-    * *shader* module's pipeline came back, and it was bumped for shader
-    * modules, sampler views, sampler states and grown buffers -- but not
-    * here, where resources are destroyed. It presented as a fragment shader's
-    * storage write silently going nowhere: gl44-ssbo-probe's
-    * cross_stage_storage read back its seed, in the browser only, and only
-    * when earlier cases in the same run had created and deleted buffers
-    * before it. Any perturbation of the heap moved the addresses and hid it,
-    * including the act of reading one environment variable, which is why no
-    * getenv-gated instrument could see it. */
-   if (gex->texture || gex->rt_scratch || gex->rt_scratch_staging ||
-       gex->buffer || gex->alias_snapshot)
-      ++gex_screen(screen)->resource_epoch;
+    * It was an epoch bump for a while, which was correct and expensive: the
+    * note in gex_wgpu_cached_bind_group measures a comparable bump destroying
+    * the hit rate outright, and browser STK lost about a point of frame
+    * freshness to this one. */
    if (gex->texture)
       wgpuTextureRelease(gex->texture);
    if (gex->rt_scratch)
@@ -35164,6 +35146,57 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
 /* Bind groups evicted while a draw was still assembling. Released here, one
  * draw later, by which point nothing holds them but Dawn's own reference for
  * whatever work was submitted. */
+/* Hold the objects a cached key names, for as long as it names them.
+ *
+ * gex_wgpu_cached_bind_group's key records its buffers, samplers and views by
+ * *handle*, and Dawn hands a freed handle straight back. The invariant that
+ * makes that safe was already written down here -- a live slot holds its
+ * group, and the group holds everything the key names -- and it is true of
+ * native Dawn, whose C++ objects are refcounted and whose bind group AddRefs
+ * its entries.
+ *
+ * **It is not true of emdawnwebgpu.** There a handle is a malloc'd pointer and
+ * wgpuDeviceCreateBindGroup does no more than `WebGPU.getJsObject(ptr)`: it
+ * reads the JS object out and builds a descriptor, taking no reference on the
+ * handle. So a release frees the pointer back to the wasm heap while the JS
+ * GPUBindGroup keeps the old resource alive -- and the next object of that
+ * size can be malloc'd at the same pointer, match a live key byte for byte,
+ * and be handed a bind group bound to its predecessor.
+ *
+ * That is what silently lost a fragment shader's storage write, and the same
+ * hazard applies to the image views the draw path releases as soon as the
+ * bind group exists. So rather than invalidating the cache whenever something
+ * is destroyed -- which is what an epoch does, and the note below measures
+ * what that costs -- the cache takes its own reference and the invariant
+ * becomes true everywhere. Native Dawn already retains internally, so the
+ * extra pair costs it nothing.
+ */
+static void
+gex_wgpu_bg_entries_ref(const WGPUBindGroupEntry *entries, unsigned count)
+{
+   for (unsigned i = 0; i < count; ++i) {
+      if (entries[i].buffer)
+         wgpuBufferAddRef(entries[i].buffer);
+      if (entries[i].sampler)
+         wgpuSamplerAddRef(entries[i].sampler);
+      if (entries[i].textureView)
+         wgpuTextureViewAddRef(entries[i].textureView);
+   }
+}
+
+static void
+gex_wgpu_bg_entries_unref(const WGPUBindGroupEntry *entries, unsigned count)
+{
+   for (unsigned i = 0; i < count; ++i) {
+      if (entries[i].buffer)
+         wgpuBufferRelease(entries[i].buffer);
+      if (entries[i].sampler)
+         wgpuSamplerRelease(entries[i].sampler);
+      if (entries[i].textureView)
+         wgpuTextureViewRelease(entries[i].textureView);
+   }
+}
+
 static void
 gex_wgpu_release_retired_groups(struct gex_wgpu_screen *screen)
 {
@@ -35195,8 +35228,7 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
 
    struct gex_wgpu_bg_cache_slot *slot =
       &screen->bg_cache[hash % GEX_WGPU_BG_CACHE_SLOTS];
-   if (slot->used &&
-       slot->epoch == screen->cache_epoch + screen->resource_epoch &&
+   if (slot->used && slot->epoch == screen->cache_epoch &&
        slot->hash == hash && slot->layout == layout &&
        slot->count == count && memcmp(slot->entries, entries, bytes) == 0) {
       ++screen->bg_cache_hits;
@@ -35240,13 +35272,17 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
          screen->retired_groups[screen->retired_count++] = slot->group;
       else
          wgpuBindGroupRelease(slot->group);
+      /* The outgoing key stops naming these on the next line. */
+      gex_wgpu_bg_entries_unref(slot->entries, slot->count);
    }
    slot->used = true;
-   slot->epoch = screen->cache_epoch + screen->resource_epoch;
+   slot->epoch = screen->cache_epoch;
    slot->hash = hash;
    slot->layout = layout;
    slot->count = count;
    memcpy(slot->entries, entries, bytes);
+   /* Held until this slot is evicted; see gex_wgpu_bg_entries_ref. */
+   gex_wgpu_bg_entries_ref(slot->entries, slot->count);
    slot->group = group;
    { const WGPUBindGroup gex_ret = group;
      simple_mtx_unlock(&screen->cache_lock);
@@ -41086,9 +41122,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          screen, bind_desc.layout, bind_desc.entries,
          bind_desc.entryCount);
    }
-   /* The image views are this function's own, unlike everything else here:
-    * the bind group that names them retains them, so the local reference is
-    * done with once it exists. */
+   /* The image views are this function's own, unlike everything else here.
+    * Dropping the local reference is safe because the *cache* holds one for
+    * everything its keys name -- see gex_wgpu_bg_entries_ref. It is not safe
+    * for the reason this comment used to give: in emdawnwebgpu creating a
+    * bind group takes no reference on the handle, so releasing the view here
+    * used to free its pointer while a live cache key still named it, and the
+    * next view malloc'd at that pointer could be handed this draw's bind
+    * group. Views are built per draw -- glBindImageTexture names a level and
+    * a layer the next draw may change -- so that reuse is ordinary. */
    for (unsigned i = 0; i < image_view_count; ++i)
       wgpuTextureViewRelease(image_views[i]);
    image_view_count = 0;
