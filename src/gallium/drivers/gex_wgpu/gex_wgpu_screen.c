@@ -15762,11 +15762,21 @@ gex_wgpu_set_constant_buffer(struct pipe_context *pipe,
     * every one of its uniform binds was refused -- which latches the context
     * and turns every later draw into a no-op. Ask the buffer what it can
     * actually do. */
+   /* The *granted* alignment, not 256. This used to be a hardcoded 255 mask,
+    * which was right only while the driver reported 256 to GL as
+    * UNIFORM_BUFFER_OFFSET_ALIGNMENT. Now that it asks the adapter and
+    * reports what it was granted -- 32 natively -- an application may
+    * legitimately bind at a 32-byte offset, and refusing that here would call
+    * gex_fail and latch the context, turning every later draw into a no-op.
+    * A cap that gets looser has to be followed into every check that assumed
+    * the old value. */
+   const unsigned uniform_align =
+      gex_screen(ctx->base.screen)->uniform_offset_alignment;
    if (!buffer->buffer || buffer->user_buffer || buffer->buffer_size == 0 ||
        buffer->buffer->target != PIPE_BUFFER ||
        !(gex_resource(buffer->buffer)->buffer_usage &
          WGPUBufferUsage_Uniform) ||
-       (buffer->buffer_offset & 255u) ||
+       (buffer->buffer_offset & (uniform_align - 1u)) ||
        (uint64_t)buffer->buffer_offset + buffer->buffer_size >
           buffer->buffer->width0) {
       /* Seven conditions shared one latch, and a latched context turns every
@@ -15783,7 +15793,8 @@ gex_wgpu_set_constant_buffer(struct pipe_context *pipe,
                  : !(gex_resource(buffer->buffer)->buffer_usage &
                      WGPUBufferUsage_Uniform)
                     ? "no WebGPU uniform usage"
-                 : (buffer->buffer_offset & 255u) ? "offset not 256-aligned"
+                 : (buffer->buffer_offset & (uniform_align - 1u))
+                    ? "offset not aligned to the granted alignment"
                  : "range past the end of the buffer",
               shader, index, (void *)buffer->buffer,
               (void *)buffer->user_buffer, buffer->buffer_size,
@@ -42547,7 +42558,9 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * The offset alignment is WebGPU's for a storage binding, which is what
     * glTexBufferRange has to respect. */
    caps->texture_buffer_objects = true;
-   caps->texture_buffer_offset_alignment = 256;
+   /* A buffer texture is served through a storage buffer binding, so what it
+      must align to is the storage alignment the device granted. */
+   caps->texture_buffer_offset_alignment = screen->storage_offset_alignment;
    caps->max_texel_buffer_elements =
       screen->max_storage_buffer_size ? screen->max_storage_buffer_size / 16
                                       : 65536;
