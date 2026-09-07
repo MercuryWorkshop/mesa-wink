@@ -25742,6 +25742,35 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
       if (outputs->location[i] == VARYING_SLOT_CLIP_DIST1 && !(skip & (1u << i)))
          clip1_slot = (int)i;
 
+   /* Which *vertex element* feeds each forwarded slot.
+    *
+    * The caller builds the vertex layout by walking the same output list and
+    * skipping the same slots, but the elements it produces are numbered
+    * consecutively -- element 0, 1, 2 -- while keeping each one's original
+    * byte offset. A shader input is bound to an element by its
+    * driver_location, so the input for slot `i` has to name the *compacted*
+    * index, not `i`.
+    *
+    * Naming `i` worked only while nothing was skipped, and silently broke
+    * every slot after the first skip: with outputs [POS, LAYER, VAR0] and the
+    * layer skipped, the layout holds two elements and VAR0's input asked for
+    * driver_location 2, which nothing feeds, so it read zeroes. A geometry
+    * shader that writes gl_Layer or gl_ViewportIndex lost every varying
+    * declared after it -- the primitives drew, in the right place, in the
+    * wrong colour.
+    *
+    * The predicate here is exactly the caller's: `skip` only. clip1 is not
+    * skipped there, so it still consumes an element index even though it
+    * declares no input of its own below; leaving that index unconsumed is
+    * harmless, while renumbering past it would put every later slot back out
+    * of step. */
+   unsigned element_of[GEX_WGPU_MAX_VARYINGS];
+   {
+      unsigned next = 0;
+      for (unsigned i = 0; i < outputs->count && i < GEX_WGPU_MAX_VARYINGS; ++i)
+         element_of[i] = (skip & (1u << i)) ? ~0u : next++;
+   }
+
    for (unsigned i = 0; i < outputs->count; ++i) {
       /* A skipped slot keeps its place in the buffer -- the stride and every
        * other slot's offset depend on it -- and simply is not forwarded. */
@@ -25759,7 +25788,7 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
       nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in,
                                              glsl_vec4_type(), name);
       in->data.location = VERT_ATTRIB_GENERIC0 + i;
-      in->data.driver_location = i;
+      in->data.driver_location = element_of[i];
       /* gl_ClipDistance and gl_CullDistance have to be *arrays*, and a vec4
        * is not one.
        *
@@ -25797,7 +25826,7 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
             nir_variable *in_hi = nir_variable_create(
                b.shader, nir_var_shader_in, glsl_vec4_type(), upper);
             in_hi->data.location = VERT_ATTRIB_GENERIC0 + clip1_slot;
-            in_hi->data.driver_location = (unsigned)clip1_slot;
+            in_hi->data.driver_location = element_of[clip1_slot];
             nir_def *hi = nir_load_var(&b, in_hi);
             for (unsigned c = 0; c < 4; ++c)
                nir_store_deref(&b,
@@ -31561,6 +31590,36 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
               (void *)gs->passthrough_elements, (void *)ctx->gs_vertices,
               (void *)ctx->gs_indices, index_count, (unsigned)raster.mode,
               (void *)ctx->fs);
+   /* GEX_WGPU_GS_LOG=2 additionally dumps what the capture actually wrote,
+    * which is the only way to tell a capture that produced nothing from a
+    * raster pass that dropped it. */
+   if (getenv("GEX_WGPU_GS_LOG") && atoi(getenv("GEX_WGPU_GS_LOG")) > 1 &&
+       ctx->gs_vertices && ctx->gs_indices && index_count) {
+      const unsigned stride = gex_wgpu_varying_stride(&gs->outputs);
+      struct pipe_transfer *it = NULL, *vt = NULL;
+      const uint32_t *idx = (const uint32_t *)pipe_buffer_map_range(
+         &ctx->base, ctx->gs_indices, 0, index_count * 4, PIPE_MAP_READ, &it);
+      const unsigned show = MIN2(index_count, 6u);
+      const float *vp = (const float *)pipe_buffer_map_range(
+         &ctx->base, ctx->gs_vertices, 0,
+         gex_resource(ctx->gs_vertices)->allocation_size, PIPE_MAP_READ, &vt);
+      if (idx && vp) {
+         fprintf(stderr, "gex-wgpu: gs capture stride=%u slots=%u\n", stride,
+                 gs->outputs.count);
+         for (unsigned i = 0; i < show; ++i) {
+            const unsigned v = idx[i];
+            fprintf(stderr, "gex-wgpu:   idx[%u]=%u", i, v);
+            for (unsigned sl = 0; sl < gs->outputs.count && sl < 4; ++sl) {
+               const float *f = vp + (v * stride + sl * 16) / 4;
+               fprintf(stderr, "  s%u=(%.2f %.2f %.2f %.2f)", sl,
+                       f[0], f[1], f[2], f[3]);
+            }
+            fprintf(stderr, "\n");
+         }
+      }
+      if (it) pipe_buffer_unmap(&ctx->base, it);
+      if (vt) pipe_buffer_unmap(&ctx->base, vt);
+   }
    /* ARB_viewport_array's routing: a geometry shader that writes
     * gl_ViewportIndex sends each primitive through a viewport of its own, and
     * WebGPU has one viewport per render pass. So the primitives are *sorted*
