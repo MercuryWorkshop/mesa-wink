@@ -280,6 +280,9 @@ create_device(void)
        * Asked for at twice maxUniformBuffersPerShaderStage, because both
        * stages contribute to one layout. */
       GEX_WANT(maxDynamicUniformBuffersPerPipelineLayout, 32);
+      /* And the spilled blocks, which are dynamic storage buffers out of a
+       * separate and smaller ration. */
+      GEX_WANT(maxDynamicStorageBuffersPerPipelineLayout, 16);
       /* Asked for sixteen and this adapter grants ten, which is its own
        * maximum rather than a tier nobody opted into: requesting
        * WGPUFeatureLevel_Core explicitly on the adapter, instead of leaving

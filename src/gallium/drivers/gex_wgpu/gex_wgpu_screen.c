@@ -1392,6 +1392,19 @@ struct gex_wgpu_screen {
    uint32_t max_texture_3d;
    uint32_t max_texture_layers;
    uint32_t max_uniform_buffers;
+   /* Dynamic-offset buffers one *pipeline layout* may declare, which is a
+    * different and much scarcer budget than the per-stage counts above: this
+    * driver binds every constant buffer with a dynamic offset -- one ring,
+    * one stable buffer, the offset from the draw -- so the vertex blocks, the
+    * fragment blocks and the draw parameters all spend from the same
+    * allowance. WebGPU guarantees eight of each, the native adapters here
+    * grant sixteen or more, and the browser's grants ten; the request in
+    * mesa-gl.js asks for thirty-two and is clamped silently to whatever the
+    * adapter has, so nothing but reading the granted figure back can tell
+    * this driver which it got. Not doing that was worth eleven uniform
+    * blocks: Dawn refused the pipeline layout and the draw vanished. */
+   uint32_t max_dynamic_uniform_buffers;
+   uint32_t max_dynamic_storage_buffers;
    uint32_t max_storage_buffers_vertex;
    /* Storage buffers a single stage may bind, for application shader storage
     * blocks. The vertex figure above is counted separately because WGSL
@@ -38950,6 +38963,46 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       (ctx->fs->packed_image_count ? 1 + ctx->fs->packed_image_count : 0);
    const bool needs_vertex_constant = vertex_group_count != 0;
    const bool needs_fragment_constant = fragment_group_count != 0;
+   /* Whether this draw's constant buffers can keep their dynamic offsets.
+    *
+    * A dynamic offset is what lets a bind group be cached across draws: the
+    * buffer and size repeat while only the offset moves, so the group is
+    * built once. WebGPU rations them per *pipeline layout* rather than per
+    * stage, though, so both stages' blocks and the draw parameters come out
+    * of one allowance -- and a spilled block is a dynamic *storage* buffer,
+    * whose allowance is smaller again.
+    *
+    * Past either allowance the offset has to be baked into the bind group
+    * entry instead. That costs the caching, because a new offset is then a
+    * new group; it is the cold path by construction, since every program
+    * that fits keeps the fast one. Overrunning the allowance was not slower,
+    * it was silent: Dawn refused the layout, every pipeline built from it was
+    * invalid, and the draw disappeared without the GL caller seeing an error.
+    * Eleven uniform blocks in one stage was enough, which is four fewer than
+    * this driver advertises through GL_MAX_VERTEX_UNIFORM_BLOCKS. */
+   unsigned want_dynamic_uniform = ctx->vs->reads_draw_params ? 1u : 0u;
+   unsigned want_dynamic_storage = 0;
+   for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
+      if (ctx->vs->ubo_storage_mask & (UINT32_C(1) << i))
+         ++want_dynamic_storage;
+      else
+         ++want_dynamic_uniform;
+   }
+   for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
+      if (ctx->fs->ubo_storage_mask & (UINT32_C(1) << i))
+         ++want_dynamic_storage;
+      else
+         ++want_dynamic_uniform;
+   }
+   const struct gex_wgpu_screen *dyn_screen = gex_screen(pipe->screen);
+   const bool static_constant_offsets =
+      want_dynamic_uniform > dyn_screen->max_dynamic_uniform_buffers ||
+      want_dynamic_storage > dyn_screen->max_dynamic_storage_buffers;
+   if (static_constant_offsets && getenv("GEX_WGPU_LIMIT_TRACE"))
+      fprintf(stderr, "gex-wgpu: baking constant offsets: want %u dynamic "
+              "uniform (max %u), %u dynamic storage (max %u)\n",
+              want_dynamic_uniform, dyn_screen->max_dynamic_uniform_buffers,
+              want_dynamic_storage, dyn_screen->max_dynamic_storage_buffers);
    /* The logic op this draw applies, plus one, or zero. COPY means "write
     * normally" and NOOP is a zero write mask handled with the colour targets,
     * so neither needs the destination. */
@@ -39460,7 +39513,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * sub-allocated from one ring, so the buffer and size repeat while the
        * offset does not. Baking the offset in would make a distinct bind
        * group per draw and there would be nothing left to cache. */
-      vertex_layout_entries[i].buffer.hasDynamicOffset = true;
+      vertex_layout_entries[i].buffer.hasDynamicOffset =
+         !static_constant_offsets;
       vertex_layout_entries[i].buffer.minBindingSize =
          gex_wgpu_constant_binding_size(
             &ctx->constant_buffers[MESA_SHADER_VERTEX][slot],
@@ -39545,7 +39599,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * sub-allocated from one ring, so the buffer and size repeat while the
        * offset does not. Baking the offset in would make a distinct bind
        * group per draw and there would be nothing left to cache. */
-      fragment_layout_entries[i].buffer.hasDynamicOffset = true;
+      fragment_layout_entries[i].buffer.hasDynamicOffset =
+         !static_constant_offsets;
       fragment_layout_entries[i].buffer.minBindingSize =
          gex_wgpu_constant_binding_size(
             &ctx->constant_buffers[MESA_SHADER_FRAGMENT][slot],
@@ -40005,12 +40060,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[i].binding = ctx->vs->ubo_bindings[i];
          entries[i].buffer = gex_resource(constant->buffer)->buffer;
-         entries[i].offset = 0;
+         entries[i].offset = static_constant_offsets
+            ? constant->buffer_offset : 0;
          entries[i].size =
             gex_wgpu_constant_binding_size(constant, ctx->vs->ubo_required[i]);
-         gex_wgpu_add_dynamic_offset(&dynamic[1],
-                                     ctx->vs->ubo_bindings[i],
-                                     constant->buffer_offset);
+         /* The cache compares whole entries, so a baked offset is already
+            part of the key and a moved one misses rather than being reused. */
+         if (!static_constant_offsets)
+            gex_wgpu_add_dynamic_offset(&dynamic[1],
+                                        ctx->vs->ubo_bindings[i],
+                                        constant->buffer_offset);
       }
       /* The vertex stage's storage blocks, from ctx->shader_buffers rather
        * than from the constant buffers: GL numbers them separately and binds
@@ -40136,12 +40195,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[i].binding = ctx->fs->ubo_bindings[i];
          entries[i].buffer = gex_resource(constant->buffer)->buffer;
-         entries[i].offset = 0;
+         entries[i].offset = static_constant_offsets
+            ? constant->buffer_offset : 0;
          entries[i].size =
             gex_wgpu_constant_binding_size(constant, ctx->fs->ubo_required[i]);
-         gex_wgpu_add_dynamic_offset(&dynamic[2],
-                                     ctx->fs->ubo_bindings[i],
-                                     constant->buffer_offset);
+         /* The cache compares whole entries, so a baked offset is already
+            part of the key and a moved one misses rather than being reused. */
+         if (!static_constant_offsets)
+            gex_wgpu_add_dynamic_offset(&dynamic[2],
+                                        ctx->fs->ubo_bindings[i],
+                                        constant->buffer_offset);
       }
       /* Same for the fragment stage, which may also write them. */
       for (unsigned i = 0; i < ctx->fs->ssbo_count; ++i) {
@@ -42443,6 +42506,8 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->max_texture_3d = 2048;
    screen->max_texture_layers = 256;
    screen->max_uniform_buffers = 12;      /* WebGPU's guaranteed minimum */
+   screen->max_dynamic_uniform_buffers = 8;   /* likewise guaranteed */
+   screen->max_dynamic_storage_buffers = 4;   /* likewise guaranteed */
    screen->max_storage_buffers_vertex = 0;
    screen->max_storage_buffers = 0;
    screen->max_inter_stage = GEX_WGPU_MAX_RASTER_VARYINGS;
@@ -42452,6 +42517,29 @@ gex_wgpu_screen_create(WGPUDevice device)
       wgpuDeviceGetLimits(device, &limits) == WGPUStatus_Success;
    if (got_limits) {
       screen->max_uniform_buffers = limits.maxUniformBuffersPerShaderStage;
+      if (limits.maxDynamicUniformBuffersPerPipelineLayout !=
+          WGPU_LIMIT_U32_UNDEFINED)
+         screen->max_dynamic_uniform_buffers =
+            limits.maxDynamicUniformBuffersPerPipelineLayout;
+      if (limits.maxDynamicStorageBuffersPerPipelineLayout !=
+          WGPU_LIMIT_U32_UNDEFINED)
+         screen->max_dynamic_storage_buffers =
+            limits.maxDynamicStorageBuffersPerPipelineLayout;
+   }
+   /* Test overrides, so the baked-offset path can be exercised where the
+    * adapter is generous enough that it would otherwise never run. The
+    * browser adapter grants ten dynamic uniform buffers and the native ones
+    * sixteen or more, which would have left the fallback shipping untested
+    * everywhere a native gate can reach. */
+   {
+      const char *force = getenv("GEX_WGPU_MAX_DYNAMIC_UNIFORM");
+      if (force)
+         screen->max_dynamic_uniform_buffers = (uint32_t)atoi(force);
+      force = getenv("GEX_WGPU_MAX_DYNAMIC_STORAGE");
+      if (force)
+         screen->max_dynamic_storage_buffers = (uint32_t)atoi(force);
+   }
+   if (got_limits) {
       if (limits.maxInterStageShaderVariables != WGPU_LIMIT_U32_UNDEFINED &&
           limits.maxInterStageShaderVariables >= GEX_WGPU_MAX_RASTER_VARYINGS)
          screen->max_inter_stage =
