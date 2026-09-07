@@ -6584,8 +6584,21 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
    nir_def *coord = tex->src[coord_src].src.ssa;
    b->cursor = nir_after_instr(instr);
    const struct gex_wgpu_border_lowering *lower = &table->slots[slot];
-   if (lower->integer_cube && tex->op != nir_texop_txl) {
-      gex_tex_lower_fail(table, "an integer cube sample without an explicit LOD");
+   /* An implicit LOD needs the derivative-based computation below, and that
+    * works on the *spatial* coordinate -- which for a cube is a three-component
+    * direction, not the face UV it is converted to further down, so the
+    * formula does not apply to it.
+    *
+    * With a single level there is nothing to compute: the clamp to
+    * `integer_levels - 1` takes any LOD to zero, so level zero is the answer
+    * whatever the derivatives say. That makes this exact rather than an
+    * approximation, which is the only reason it is allowed -- a mipmapped
+    * integer cube sampled with an implicit LOD is still refused, by name. */
+   if (lower->integer_cube && tex->op != nir_texop_txl &&
+       lower->integer_levels > 1) {
+      gex_tex_lower_fail(table,
+                         "an implicit-LOD integer cube sample on a mipmapped "
+                         "texture");
       return false;
    }
    if (tex->is_array != lower->integer_array ||
@@ -6614,7 +6627,12 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
    nir_builder_instr_insert(b, &base_txs->instr);
 
    nir_def *selected_lod = zero_lod;
-   if (lower->integer_mip_filter == PIPE_TEX_MIPFILTER_NEAREST) {
+   /* `integer_levels > 1` is not an optimisation: with one level the clamp at
+      the end of this block takes every LOD to zero, so skipping it is the
+      same answer -- and it is what lets an implicit-LOD cube sample through
+      above, where the derivative formula would not apply. */
+   if (lower->integer_mip_filter == PIPE_TEX_MIPFILTER_NEAREST &&
+       lower->integer_levels > 1) {
       nir_def *lod;
       if (tex->op == nir_texop_txl) {
          lod = tex->src[lod_src].src.ssa;
