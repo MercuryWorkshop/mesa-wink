@@ -1371,6 +1371,9 @@ struct gex_wgpu_screen {
     * only costs a miss. */
    struct gex_wgpu_pipeline_cache_slot {
       bool used;
+      /* See cache_epoch: the key names shader modules by address, and an
+       * address outlives the module it belonged to. */
+      uint64_t epoch;
       uint32_t hash;
       unsigned key_length;
       uint8_t key[GEX_WGPU_PIPELINE_KEY_MAX];
@@ -12905,10 +12908,28 @@ gex_wgpu_bind_fs_state(struct pipe_context *pipe, void *state)
 static void
 gex_wgpu_delete_shader_state(struct pipe_context *pipe, void *state)
 {
-   (void)pipe;
    struct gex_wgpu_shader *shader = state;
    if (!shader)
       return;
+   /* The pipeline cache keys on the bytes of the render pipeline descriptor,
+    * and those name this shader's modules *by address* -- which Dawn hands
+    * straight back for the next module allocated. So a program compiled after
+    * this one is deleted can land on the same addresses, match a cached key
+    * byte for byte, and be handed a pipeline built from the deleted shader.
+    * Retire the caches rather than let that happen; the same reasoning
+    * already guards sampler views and sampler states.
+    *
+    * Silent when it happened, and only after enough churn to reuse an
+    * address: one case of KHR-GL44.shading_language_420pack failed in the
+    * browser while its five siblings passed, and passed when run alone or as
+    * its own subfamily. GEX_WGPU_NO_PIPELINE_CACHE=1 made the whole family
+    * match native, which is what named the cache.
+    *
+    * Programs are deleted rarely once an application is running -- shaders
+    * are compiled at load -- so the cost is a cold cache at exactly the
+    * moment the old entries were about to become wrong. */
+   if (pipe && pipe->screen)
+      ++gex_screen(pipe->screen)->cache_epoch;
    if (shader->module)
       wgpuShaderModuleRelease(shader->module);
    if (shader->module_y_flipped)
@@ -35004,7 +35025,14 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
    struct gex_wgpu_pipeline_cache_slot *slot =
       &screen->pipeline_cache[hash % GEX_WGPU_PIPELINE_CACHE_SLOTS];
    *cached = true;
-   if (slot->used && slot->hash == hash && slot->key_length == length &&
+   /* The epoch, as the bind group cache does. Serialising the descriptor
+    * keeps every *field* in the key, which is what the note above is about,
+    * but it cannot keep an object's identity: the modules are named by
+    * address and an address is reused once the module behind it is released.
+    * Without this the cache returned a pipeline built from a deleted
+    * shader. */
+   if (slot->used && slot->epoch == screen->cache_epoch &&
+       slot->hash == hash && slot->key_length == length &&
        memcmp(slot->key, key, length) == 0) {
       ++screen->pipeline_cache_hits;
       { const WGPURenderPipeline gex_ret = slot->pipeline;
@@ -35025,12 +35053,14 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
     * this draw just took, and Dawn keeps its own reference for any work
     * already submitted with it. */
    if (slot->used) {
-      /* No epoch bump. The pipeline cache does not consult the epoch at all,
-       * so bumping it here only invalidated the bind group cache, which does
-       * -- and that cache is shared with every other slot. */
+      /* No epoch *bump* here. Evicting one slot says nothing about any other
+       * object's identity, and the epoch is shared with the bind group cache
+       * -- bumping it would throw that away for nothing. The slot records the
+       * epoch it was built under instead, just below. */
       wgpuRenderPipelineRelease(slot->pipeline);
    }
    slot->used = true;
+   slot->epoch = screen->cache_epoch;
    slot->hash = hash;
    slot->key_length = length;
    memcpy(slot->key, key, length);
