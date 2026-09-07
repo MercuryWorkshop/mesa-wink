@@ -1349,6 +1349,18 @@ struct gex_wgpu_screen {
       WGPUBindGroup group;
    } bg_cache[GEX_WGPU_BG_CACHE_SLOTS];
    uint64_t bg_cache_hits, bg_cache_misses;
+   /* One readback staging buffer, reused. Every texture_map(PIPE_MAP_READ)
+    * created one and released it again, and presentation goes through that
+    * path once a frame -- so an ordinary windowed application allocated and
+    * freed a whole framebuffer's worth of WebGPU buffer every frame, purely to
+    * copy out of. The readback is fully synchronous: the map is waited for and
+    * unmapped before returning, so by the time it is reused nothing can still
+    * be reading it.
+    *
+    * Grow-only. A window that gets bigger reallocates once; one that gets
+    * smaller keeps the larger buffer, which is the cheaper mistake. */
+   WGPUBuffer readback_staging;
+   uint64_t readback_staging_bytes;
    /* Bumped whenever a cached bind group or pipeline is evicted and released.
     *
     * The per-pass "already emitted" state compares raw handles, and a handle
@@ -19770,13 +19782,26 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
    const uint32_t copy_slices = (uint32_t)box->depth;
    const uint64_t slice_bytes = (uint64_t)bytes_per_row * copy_rows;
    const uint64_t readback_size = slice_bytes * copy_slices;
-   WGPUBufferDescriptor buffer_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
-   buffer_desc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
-   buffer_desc.size = readback_size;
-   WGPUBuffer readback = wgpuDeviceCreateBuffer(screen->device, &buffer_desc);
+   /* The screen's staging buffer, grown if this readback needs more than the
+      last one did. See gex_wgpu_screen::readback_staging. */
+   if (screen->readback_staging &&
+       screen->readback_staging_bytes < readback_size) {
+      wgpuBufferRelease(screen->readback_staging);
+      screen->readback_staging = NULL;
+      screen->readback_staging_bytes = 0;
+   }
+   if (!screen->readback_staging) {
+      WGPUBufferDescriptor buffer_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+      buffer_desc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+      buffer_desc.size = readback_size;
+      screen->readback_staging =
+         wgpuDeviceCreateBuffer(screen->device, &buffer_desc);
+      if (screen->readback_staging)
+         screen->readback_staging_bytes = readback_size;
+   }
+   WGPUBuffer readback = screen->readback_staging;
    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(screen->device, NULL);
    if (!readback || !encoder) {
-      if (readback) wgpuBufferRelease(readback);
       if (encoder) wgpuCommandEncoderRelease(encoder);
       return NULL;
    }
@@ -19817,7 +19842,7 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
    WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, NULL);
    wgpuCommandEncoderRelease(encoder);
    if (!command) {
-      wgpuBufferRelease(readback);
+      /* Belongs to the screen; leave it for the next call. */
       gex_fail(ctx);
       return NULL;
    }
@@ -19898,7 +19923,6 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
       }
    }
    wgpuBufferUnmap(readback);
-   wgpuBufferRelease(readback);
 
    if (!transfer || !transfer->data) {
       if (transfer) {
