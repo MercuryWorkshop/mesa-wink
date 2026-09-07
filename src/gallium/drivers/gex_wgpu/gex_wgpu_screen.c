@@ -2131,6 +2131,26 @@ struct gex_wgpu_shader {
     * read off info.system_values_read, for the reason gl_PointCoord and the
     * draw parameters were: a missed read is a rejected module. */
    bool reads_sample_pos;
+   /* This fragment shader reads gl_ClipDistance or gl_CullDistance.
+    *
+    * WGSL has clip distances only as a *vertex output*: there is no
+    * fragment-stage clip-distance input, and no array-typed inter-stage IO
+    * either. Our SPIR-V is correct and contains no bitcast at all -- the
+    * "no matching call to bitcast<f32>(array<f32, 8>)" Tint reports is its
+    * own failed attempt to express the builtin -- so the module is refused
+    * and the program fails to *link*, which kills the application rather
+    * than producing a wrong pixel. Eight KHR-GL44.cull_distance cases are
+    * this, and so is any application that reads the distances it clipped by.
+    *
+    * Carried as ordinary varyings instead: the values are copied into a pair
+    * of vec4s at locations both stages agree on, which is what
+    * gex_wgpu_point_coord_location already does for gl_PointCoord. Like
+    * reads_sample_pos this suppresses the base module, because the locations
+    * are only known once both stages are bound. */
+   bool reads_clip_dist;
+   /* How many distances the fragment shader declares, clip and cull
+    * together, and where the pair of carrier varyings landed. */
+   unsigned clip_dist_count;
    /* Whether the fragment stage reads gl_PointCoord. An expanded wide point
     * feeds it from the corner attribute through a varying, which costs a
     * varying slot, so it is only added where something reads it. */
@@ -2197,6 +2217,12 @@ struct gex_wgpu_shader {
 };
 
 struct gex_wgpu_interp_variant {
+   /* The clip-distance carriers this module writes for the bound fragment
+    * shader: zero when that shader does not read the distances, so an
+    * ordinary pipeline stays one variant. A different count or a different
+    * pair of locations is a different module. */
+   unsigned clip_dist_for;
+   unsigned clip_carrier[2];
    uint8_t interp[GEX_WGPU_MAX_VARYING_LOCATIONS];
    uint8_t aux[GEX_WGPU_MAX_VARYING_LOCATIONS];
    /* The fragment stage's varying widths this module was reshaped to. */
@@ -2257,6 +2283,10 @@ struct gex_wgpu_shader_variant {
     * built for. Zero when the shader does not read it, so a shader that does
     * not is one variant however the framebuffer changes. */
    uint8_t sample_positions_for;
+   /* The clip-distance carriers this variant was built for: the count, and the
+    * two locations, because a different pair is a different module. */
+   unsigned clip_dist_for;
+   unsigned clip_carrier[2];
    /* The logic op this variant applies, plus one, or zero for none. Part of
     * the key because the operation is compiled into the shader. */
    uint8_t logicop;
@@ -6965,6 +6995,230 @@ gex_wgpu_drop_unproduced_inputs(nir_shader *nir, uint64_t produced,
    return true;
 }
 
+/* gl_ClipDistance and gl_CullDistance, read by a fragment shader.
+ *
+ * WGSL has clip distances only as a vertex *output*, and forbids array-typed
+ * inter-stage IO outright, so neither the builtin nor its shape survives to a
+ * fragment input. Tint's complaint names its own workaround rather than
+ * anything in our module -- "no matching call to bitcast<f32>(array<f32, 8>)",
+ * with no OpBitcast anywhere in the SPIR-V we emitted -- and the module is
+ * refused, so the *program fails to link* and the application dies.
+ *
+ * The values are ordinary interpolated floats, so they travel as ordinary
+ * varyings: up to eight of them in two vec4s, at locations both stages agree
+ * on because both derive them the same way. The vertex side still writes the
+ * real clip distances for the rasteriser to clip by; this is a second copy for
+ * the fragment shader to read, which is the only way it can see them.
+ */
+struct gex_wgpu_clip_carrier {
+   nir_variable *carrier[2];
+   nir_variable *source[2];      /* the CLIP_DIST0/1 inputs being replaced */
+   unsigned count;               /* distances the shader declares */
+   unsigned location[2];         /* effective @locations of the carriers */
+   bool progress;
+};
+
+/* One distance, out of the two carriers. */
+static nir_def *
+gex_wgpu_clip_distance_value(nir_builder *b,
+                             struct gex_wgpu_clip_carrier *state,
+                             nir_def *index)
+{
+   nir_def *value[8] = {0};
+   for (unsigned i = 0; i < state->count; ++i)
+      value[i] = nir_channel(b, nir_load_var(b, state->carrier[i / 4]), i % 4);
+
+   /* A constant index picks its component outright, which is what the
+    * generated CTS shaders and every hand-written one do. */
+   if (nir_src_is_const(nir_src_for_ssa(index))) {
+      const unsigned at = nir_src_as_uint(nir_src_for_ssa(index));
+      return at < state->count ? value[at] : nir_imm_float(b, 0.0f);
+   }
+
+   /* A dynamic index has to be selected: WGSL cannot index an inter-stage
+    * input, and this driver already unrolls dynamic sampler indices the same
+    * way. Eight is the ceiling GL sets, so the chain is bounded. */
+   nir_def *result = value[0];
+   for (unsigned i = 1; i < state->count; ++i)
+      result = nir_bcsel(b, nir_ieq_imm(b, index, i), value[i], result);
+   return result;
+}
+
+static bool
+gex_wgpu_lower_clip_distance_read(nir_builder *b, nir_intrinsic_instr *intr,
+                                  void *data)
+{
+   struct gex_wgpu_clip_carrier *state = data;
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   if (!deref)
+      return false;
+
+   /* Either `gl_ClipDistance[i]`, which is a deref_array over the variable,
+    * or the whole variable where a shader declared a single distance. */
+   nir_def *index = NULL;
+   nir_variable *var = NULL;
+   if (deref->deref_type == nir_deref_type_array) {
+      nir_deref_instr *parent = nir_deref_instr_parent(deref);
+      if (!parent || parent->deref_type != nir_deref_type_var)
+         return false;
+      var = parent->var;
+      index = deref->arr.index.ssa;
+   } else if (deref->deref_type == nir_deref_type_var) {
+      var = deref->var;
+   } else {
+      return false;
+   }
+
+   unsigned base = 0;
+   if (var == state->source[0])
+      base = 0;
+   else if (var == state->source[1])
+      base = 4;
+   else
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *at = index ? nir_iadd_imm(b, index, base)
+                       : nir_imm_int(b, base);
+   nir_def *value = gex_wgpu_clip_distance_value(b, state, at);
+   nir_def_rewrite_uses(&intr->def, value);
+   nir_instr_remove(&intr->instr);
+   state->progress = true;
+   return true;
+}
+
+/* The producing stage's half: a second copy of the distances, as varyings the
+ * fragment shader can actually read.
+ *
+ * The real clip-distance outputs stay exactly as they were -- the rasteriser
+ * still clips by them -- so this only ever adds. It runs at the end of the
+ * shader, which is where the final value of each distance is, and where
+ * gex_wgpu_neutralise_cull_distances already writes to the same variables.
+ */
+static nir_def *
+gex_wgpu_clip_distance_source(nir_builder *b, nir_variable *const source[2],
+                              unsigned at)
+{
+   /* Mesa gives a shader with more than four distances a single merged
+    * variable at CLIP_DIST0 holding all of them; when it splits them,
+    * CLIP_DIST1 carries components four and up at its *own* index zero. */
+   nir_variable *from = NULL;
+   unsigned within = at;
+   if (source[0]) {
+      const unsigned length = glsl_type_is_array(source[0]->type)
+         ? glsl_get_length(source[0]->type) : 1u;
+      if (at < length) {
+         from = source[0];
+         within = at;
+      }
+   }
+   if (!from && source[1] && at >= 4) {
+      from = source[1];
+      within = at - 4u;
+   }
+   if (!from)
+      return nir_imm_float(b, 0.0f);
+   if (!glsl_type_is_array(from->type))
+      return nir_load_var(b, from);
+   return nir_load_deref(
+      b, nir_build_deref_array_imm(b, nir_build_deref_var(b, from), within));
+}
+
+static bool
+gex_wgpu_emit_clip_distance_carriers(nir_shader *nir, unsigned count,
+                                     const unsigned location[2])
+{
+   if (!count)
+      return false;
+   nir_variable *source[2] = {0};
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
+      if (var->data.location == VARYING_SLOT_CLIP_DIST0)
+         source[0] = var;
+      else if (var->data.location == VARYING_SLOT_CLIP_DIST1)
+         source[1] = var;
+   }
+   /* A fragment shader may read distances this stage never writes; GL says it
+    * reads undefined values, and zero is the honest stand-in. Still worth a
+    * carrier, because the fragment side has already been rewritten to expect
+    * one and a missing output makes the pipeline invalid. */
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl)
+      return false;
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+
+   const unsigned carriers = DIV_ROUND_UP(MIN2(count, 8u), 4u);
+   for (unsigned i = 0; i < carriers; ++i) {
+      char name[32];
+      snprintf(name, sizeof(name), "gex_clip_dist%u", i);
+      nir_variable *carrier =
+         nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), name);
+      carrier->data.location = VARYING_SLOT_VAR0 + location[i];
+      carrier->data.driver_location = location[i];
+      carrier->data.interpolation = INTERP_MODE_NONE;
+      nir_def *comp[4];
+      for (unsigned c = 0; c < 4; ++c) {
+         const unsigned at = i * 4u + c;
+         comp[c] = at < MIN2(count, 8u)
+            ? gex_wgpu_clip_distance_source(&b, source, at)
+            : nir_imm_float(&b, 0.0f);
+      }
+      nir_store_var(&b, carrier, nir_vec(&b, comp, 4), 0xf);
+   }
+   nir_progress(true, impl, nir_metadata_none);
+   return true;
+}
+
+/* `location[0]` and `location[1]` are the effective @locations the caller
+ * chose; both stages compute them from the same context, so they agree. */
+static bool
+gex_wgpu_lower_clip_distance_input(nir_shader *nir, unsigned count,
+                                   const unsigned location[2])
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT || !count)
+      return false;
+   struct gex_wgpu_clip_carrier state = {0};
+   state.count = MIN2(count, 8u);
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+      if (var->data.location == VARYING_SLOT_CLIP_DIST0)
+         state.source[0] = var;
+      else if (var->data.location == VARYING_SLOT_CLIP_DIST1)
+         state.source[1] = var;
+   }
+   if (!state.source[0] && !state.source[1])
+      return false;
+
+   const unsigned carriers = DIV_ROUND_UP(state.count, 4u);
+   for (unsigned i = 0; i < carriers; ++i) {
+      char name[32];
+      snprintf(name, sizeof(name), "gex_clip_dist%u", i);
+      state.carrier[i] = nir_variable_create(nir, nir_var_shader_in,
+                                             glsl_vec4_type(), name);
+      state.carrier[i]->data.location = VARYING_SLOT_VAR0 + location[i];
+      state.carrier[i]->data.driver_location = location[i];
+      /* Clip distances interpolate like any other float, which is what GL
+       * says the fragment shader sees. */
+      state.carrier[i]->data.interpolation = INTERP_MODE_NONE;
+      state.location[i] = location[i];
+   }
+   /* One carrier serves both halves when the shader declares four or fewer. */
+   if (carriers == 1)
+      state.carrier[1] = state.carrier[0];
+
+   nir_shader_intrinsics_pass(nir, gex_wgpu_lower_clip_distance_read,
+                              nir_metadata_control_flow, &state);
+   if (!state.progress)
+      return false;
+   /* The reads are gone; DCE takes their derefs and the builtin inputs are
+    * then unused. Leaving them declared is the whole defect -- the emitter
+    * would still decorate them BuiltIn ClipDistance and Tint would still
+    * refuse the module. */
+   NIR_PASS(_, nir, nir_opt_dce);
+   nir_remove_dead_variables(nir, nir_var_shader_in, NULL);
+   return true;
+}
+
 /* Make a vertex output as wide as the fragment input it feeds.
  *
  * GLSL lets a fragment shader read `vec3 v` from a vertex shader that writes
@@ -8440,6 +8694,48 @@ gex_wgpu_point_coord_location(const struct gex_wgpu_context *ctx)
       if (!(taken & (1u << location)))
          return location;
    return ~0u;
+}
+
+/* The same search, for more than one location at once.
+ *
+ * gl_PointCoord needs one; the clip-distance carriers need two, because eight
+ * floats do not fit in a single vec4. Both stages call this with the same
+ * context and therefore get the same answer, which is what lets them agree
+ * without either being told about the other.
+ *
+ * Returns false when the shaders between them already use enough locations
+ * that `want` more will not fit under the cautious fifteen. The caller then
+ * has to decline rather than emit a pipeline WebGPU will reject.
+ */
+static bool
+gex_wgpu_free_varying_locations(const struct gex_wgpu_context *ctx,
+                                unsigned want, unsigned *out)
+{
+   uint32_t taken = 0;
+   const nir_shader *stages[2] = {
+      ctx->vs ? ctx->vs->original_nir : NULL,
+      ctx->fs ? ctx->fs->original_nir : NULL,
+   };
+   for (unsigned i = 0; i < 2; ++i) {
+      if (!stages[i])
+         continue;
+      const nir_variable_mode mode =
+         i == 0 ? nir_var_shader_out : nir_var_shader_in;
+      nir_foreach_variable_with_modes(var, stages[i], mode) {
+         if (!gex_wgpu_is_location_varying(var->data.location))
+            continue;
+         const int slot = var->data.location;
+         const unsigned location = slot >= VARYING_SLOT_VAR0
+            ? (unsigned)(slot - VARYING_SLOT_VAR0) : (unsigned)slot;
+         if (location < 32)
+            taken |= 1u << location;
+      }
+   }
+   unsigned found = 0;
+   for (unsigned location = 0; location < 15 && found < want; ++location)
+      if (!(taken & (1u << location)))
+         out[found++] = location;
+   return found == want;
 }
 
 /* gl_PointCoord for an expanded wide point, which is a varying rather than a
@@ -11415,6 +11711,47 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
             }
          }
       }
+
+      /* gl_ClipDistance and gl_CullDistance arrive merged: Mesa gives a
+       * shader with more than four distances between them a single variable
+       * at CLIP_DIST0 holding all of them, and a second at CLIP_DIST1 for
+       * components four and up when it splits them. Count what is declared
+       * rather than trusting info.clip_distance_array_size, which describes
+       * the *writing* stage. */
+      nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+         if (var->data.location != VARYING_SLOT_CLIP_DIST0 &&
+             var->data.location != VARYING_SLOT_CLIP_DIST1)
+            continue;
+         const unsigned base =
+            var->data.location == VARYING_SLOT_CLIP_DIST1 ? 4u : 0u;
+         const unsigned length = glsl_type_is_array(var->type)
+            ? glsl_get_length(var->type) : 1u;
+         shader->reads_clip_dist = true;
+         shader->clip_dist_count = MAX2(shader->clip_dist_count, base + length);
+      }
+      if (shader->reads_clip_dist)
+         shader->clip_dist_count = MIN2(shader->clip_dist_count, 8u);
+      /* The shape, because the mapping from gl_CullDistance[i] to a slot
+       * index depends on whether Mesa merged the two arrays into CLIP_DIST0
+       * or left gl_CullDistance at CULL_DIST0, and guessing which is how the
+       * values come back shifted. */
+      if (getenv("GEX_WGPU_CLIP_LOG")) {
+         nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+            if (var->data.location != VARYING_SLOT_CLIP_DIST0 &&
+                var->data.location != VARYING_SLOT_CLIP_DIST1 &&
+                var->data.location != VARYING_SLOT_CULL_DIST0 &&
+                var->data.location != VARYING_SLOT_CULL_DIST1)
+               continue;
+            fprintf(stderr, "gex-clip: fs input %s loc=%d frac=%u len=%u "
+                    "clip_size=%u cull_size=%u\n",
+                    var->name ? var->name : "?", var->data.location,
+                    var->data.location_frac,
+                    glsl_type_is_array(var->type)
+                       ? glsl_get_length(var->type) : 0u,
+                    nir->info.clip_distance_array_size,
+                    nir->info.cull_distance_array_size);
+         }
+      }
    }
 
    nir_foreach_variable_with_modes(var, nir,
@@ -12210,7 +12547,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * specialize it. */
    const bool deferred_integer_sampling =
       (shader->integer_sampled_slots != 0 || shader->buftex_count != 0 ||
-       shader->unformatted_images != 0 || shader->reads_sample_pos) &&
+       shader->unformatted_images != 0 || shader->reads_sample_pos ||
+       shader->reads_clip_dist) &&
       (expected_stage == MESA_SHADER_FRAGMENT ||
        expected_stage == MESA_SHADER_VERTEX);
    if (deferred_integer_sampling)
@@ -12879,6 +13217,29 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * not is one variant however the framebuffer's sample count changes. */
    const uint8_t want_sample_positions =
       fs->reads_sample_pos ? (uint8_t)MAX2(1u, ctx->fb_samples) : 0u;
+   /* Where the clip-distance carriers land, when this shader reads them. The
+    * vertex side derives the same pair from the same context, which is what
+    * lets the two agree without either being told about the other. Zero
+    * count means the shader does not read them and nothing changes. */
+   unsigned clip_carrier[2] = {0, 0};
+   unsigned want_clip_dist = 0;
+   if (fs->reads_clip_dist && fs->clip_dist_count) {
+      const unsigned carriers = DIV_ROUND_UP(fs->clip_dist_count, 4u);
+      if (gex_wgpu_free_varying_locations(ctx, carriers, clip_carrier))
+         want_clip_dist = fs->clip_dist_count;
+      else {
+         /* Nothing left under WebGPU's inter-stage ceiling. Declining is the
+          * honest answer and has to be said: without a variant this shader
+          * has no module at all, so the draw would vanish silently. */
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: no free varying locations for the "
+                    "clip-distance carriers, so a fragment shader reading "
+                    "gl_ClipDistance cannot be built\n");
+         }
+      }
+   }
    const bool want_point_smooth =
       point_coord_location != ~0u && ctx->rasterizer &&
       ctx->rasterizer->point_smooth;
@@ -12967,7 +13328,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
        line_edge_location == ~0u && !fs->buftex_count &&
-       !want_sample_positions && !want_logicop && !want_ignore_sample_mask &&
+       !want_sample_positions && !want_clip_dist && !want_logicop &&
+       !want_ignore_sample_mask &&
        !want_omit_slots && !want_offset_clamp && !fs->unformatted_images)
       return fs->module;
    uint16_t sampler_mask = 0;
@@ -13075,7 +13437,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
-      want_sample_positions != 0 || want_logicop != 0 ||
+      want_sample_positions != 0 || want_clip_dist != 0 || want_logicop != 0 ||
       want_ignore_sample_mask || want_omit_slots != 0 || want_offset_clamp ||
       fs->unformatted_images != 0;
    if (!needs_variant && !fs->buftex_count)
@@ -13091,6 +13453,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->point_coord_location == point_coord_location &&
                    cached->point_smooth == want_point_smooth &&
                    cached->sample_positions_for == want_sample_positions &&
+                   cached->clip_dist_for == want_clip_dist &&
+                   cached->clip_carrier[0] == clip_carrier[0] &&
+                   cached->clip_carrier[1] == clip_carrier[1] &&
                    cached->logicop == want_logicop &&
                    cached->line_edge_location == line_edge_location &&
                    cached->line_stipple_pattern == line_stipple_pattern &&
@@ -13179,6 +13544,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       nir_shader_intrinsics_pass(variant, gex_wgpu_lower_sample_pos,
                                  nir_metadata_control_flow, &sample_pos);
    }
+   if (want_clip_dist)
+      gex_wgpu_lower_clip_distance_input(variant, want_clip_dist,
+                                         clip_carrier);
    if (want_logicop)
       gex_wgpu_lower_logicop(variant, (unsigned)want_logicop - 1u);
    if (want_line_smooth && !gex_wgpu_lower_line_smooth(variant,
@@ -13283,6 +13651,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->point_coord_location = point_coord_location;
    cached->point_smooth = want_point_smooth;
    cached->sample_positions_for = want_sample_positions;
+   cached->clip_dist_for = want_clip_dist;
+   cached->clip_carrier[0] = clip_carrier[0];
+   cached->clip_carrier[1] = clip_carrier[1];
    cached->logicop = want_logicop;
    cached->line_edge_location = line_edge_location;
    cached->line_stipple_pattern = line_stipple_pattern;
@@ -32130,6 +32501,14 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
 
    const float none[4] = {0.0f, 0.0f, 0.0f, 0.0f};
    const float *want = fold_viewport ? viewport : none;
+   /* The same choice the fragment side makes, from the same context, so the
+      two land on the same locations without either being told. */
+   unsigned want_clip_carrier[2] = {0, 0};
+   unsigned want_clip_dist = 0;
+   if (fs && fs->reads_clip_dist && fs->clip_dist_count &&
+       gex_wgpu_free_varying_locations(
+          ctx, DIV_ROUND_UP(fs->clip_dist_count, 4u), want_clip_carrier))
+      want_clip_dist = fs->clip_dist_count;
    const uint8_t *want_interp = fs ? fs->varying_interp : NULL;
    const uint8_t *want_aux = fs ? fs->varying_aux : NULL;
    const uint8_t *want_components = fs ? fs->varying_components : NULL;
@@ -32139,7 +32518,10 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    for (struct gex_wgpu_interp_variant *v = vs->interp_variants; v;
         v = v->next) {
       bool match = v->mask == fs_mask && v->sampler_mask == sampler_mask &&
-                   memcmp(v->buftex_words, want_buftex,
+                   v->clip_dist_for == want_clip_dist &&
+                    v->clip_carrier[0] == want_clip_carrier[0] &&
+                    v->clip_carrier[1] == want_clip_carrier[1] &&
+                    memcmp(v->buftex_words, want_buftex,
                           sizeof(v->buftex_words)) == 0 &&
                    memcmp(&v->wide, want_wide, sizeof(v->wide)) == 0 &&
                    memcmp(v->viewport, want, sizeof(v->viewport)) == 0 &&
@@ -32227,6 +32609,13 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
             if (fs->varying_interp_mask & (1ull << i))
                want_width[i] = fs->varying_components[i];
          gex_wgpu_fit_varyings(clone, want_width);
+         /* And the clip-distance carriers, if that shader reads them. The
+            real clip-distance outputs are untouched: the rasteriser still
+            clips by them, and this is a second copy the fragment stage can
+            read, which WGSL gives it no other way to do. */
+         if (want_clip_dist)
+            gex_wgpu_emit_clip_distance_carriers(clone, want_clip_dist,
+                                                 want_clip_carrier);
       }
       /* Before the viewport fold, which is what makes the offset's scale a
        * viewport rather than a framebuffer one -- see
@@ -32317,6 +32706,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
              has_buftex
          ? NULL : plain;
    }
+   variant->clip_dist_for = want_clip_dist;
+   variant->clip_carrier[0] = want_clip_carrier[0];
+   variant->clip_carrier[1] = want_clip_carrier[1];
    variant->next = vs->interp_variants;
    vs->interp_variants = variant;
    return flipped ? variant->module_y_flipped : variant->module;
