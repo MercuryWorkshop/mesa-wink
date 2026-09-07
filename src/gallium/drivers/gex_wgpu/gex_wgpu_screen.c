@@ -27681,11 +27681,15 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    gex_wgpu_submit_pending(ctx);
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
 
-   /* An instanced capture still needs the invocation index to reach the
-    * instance, which this variant does not model. */
-   if (info->instance_count != 1)
-      GEX_CAPTURE_LIMIT("an instanced draw; the capture variant does not "
-                        "model the instance index");
+   /* Instanced captures work. The shader side always modelled them --
+    * gex_wgpu_capture_vertex_slot takes the invocation modulo
+    * VERTS_PER_INSTANCE and gex_wgpu_capture_instance divides by it, which is
+    * why the slot table holds one instance's worth however many there are --
+    * and this only ever refused because the dispatch never set the parameter
+    * or grew the invocation count. KHR-GL44.vertex_attrib_binding's whole
+    * BasicInputBase draws with glDrawArraysInstanced, so the refusal cost
+    * most of that family. */
+   const unsigned instances = MAX2(info->instance_count, 1u);
 
    /* Two shapes, and which one this is turns on whether anything is being
     * recorded.
@@ -27832,10 +27836,20 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
     * add, and the count is the number of assembled vertices rather than the
     * number the draw named. */
    params[GEX_WGPU_PARAM_FIRST_VERTEX] = 0u;
+   /* Zero means "not instanced" to both shader-side accessors, so a
+    * single-instance draw keeps the slot as the vertex and the instance as
+    * zero, exactly as before. */
+   params[GEX_WGPU_PARAM_VERTS_PER_INSTANCE] =
+      instances > 1 ? (uint32_t)captured : 0u;
+   params[GEX_WGPU_PARAM_FIRST_INSTANCE] = info->start_instance;
    /* Filled in after the targets are known: how many assembled vertices fit. */
    const nir_xfb_info *xfb =
       ctx->vs->capture_nir ? ctx->vs->capture_nir->xfb_info : NULL;
-   unsigned writable_prims = prims;
+   /* Primitives across every instance: transform feedback records each
+    * instance's primitives one after another, so the room a bound buffer has
+    * is shared between them. */
+   const unsigned total_prims = prims * instances;
+   unsigned writable_prims = total_prims;
 
    /* Room for the shader's own textures and samplers as well: a vertex shader
     * that samples can be captured now, and each unit costs two entries. */
@@ -27874,6 +27888,9 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
                                   : 0u;
          const unsigned room = stride ? left / (stride * verts_per_prim) : 0u;
          writable_prims = MIN2(writable_prims, room);
+         /* GL stops on a whole primitive, and with instancing that is still a
+          * primitive rather than an instance: a buffer with room for one and
+          * a half instances records the primitives that fit. */
       }
       entries[count] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       entries[count].binding = variant->so_bindings[i];
@@ -27929,10 +27946,10 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    /* PRIMITIVES_GENERATED counts what the vertex stage produced;
     * PRIMITIVES_EMITTED counts what transform feedback recorded. */
    gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_EMITTED, writable_prims);
-   /* `prims` is what the draw assembled and `writable_prims` is what the
-    * bound buffers had room for; GL stops on a whole primitive, so the
-    * difference is exactly what overflowed. */
-   if (prims > writable_prims)
+   /* `total_prims` is what the draw assembled across every instance and
+    * `writable_prims` is what the bound buffers had room for; GL stops on a
+    * whole primitive, so the difference is exactly what overflowed. */
+   if (total_prims > writable_prims)
       gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_OVERFLOW, 1);
 
    WGPUBufferDescriptor params_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
