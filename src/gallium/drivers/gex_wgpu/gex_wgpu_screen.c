@@ -859,7 +859,13 @@ gex_wgpu_image_is_packed(enum pipe_format format, bool no_read, bool no_write,
     * buffer, so the shader addresses it in place and allow_read does not
     * apply. */
    if (dim == GLSL_SAMPLER_DIM_BUF)
-      return format != PIPE_FORMAT_NONE;
+      /* A format-less buffer image belongs here too. GLSL permits the
+       * qualifier to be absent only on a write-only image, and the format
+       * then comes from the image *unit* at draw time -- so the format is not
+       * yet known here, and refusing on that made the one shape with nowhere
+       * else to go the one shape declined. The resolution happens per draw;
+       * see the packed_resolved key on the capture variant. */
+      return format != PIPE_FORMAT_NONE || no_read;
    if (format == PIPE_FORMAT_NONE)
       return false;
    /* An atomic comes here whatever the format can otherwise do, because
@@ -1011,6 +1017,14 @@ struct gex_wgpu_stage_images {
     * has no storage texture for the format, or no read_write access for it.
     * See GEX_WGPU_PACKED_IMAGE_FIRST_BINDING. */
    unsigned packed_count;
+   /* Which entries of the packed arrays carry no format qualifier, indexed by
+    * position in those arrays rather than by slot. Their packed_formats entry
+    * is PIPE_FORMAT_NONE and means "not known yet": the format comes from the
+    * image unit, so both the lowering and the binding have to wait for a
+    * draw. A shader with any of these has its packed lowering deferred out of
+    * shader-create and into the capture variant, keyed on what was resolved
+    * -- see gex_wgpu_capture_variant_get. */
+   uint16_t packed_unformatted;
    uint8_t packed_slots[GEX_WGPU_MAX_SHADER_IMAGES];
    uint32_t packed_bindings[GEX_WGPU_MAX_SHADER_IMAGES];
    enum pipe_format packed_formats[GEX_WGPU_MAX_SHADER_IMAGES];
@@ -1074,6 +1088,8 @@ gex_wgpu_collect_stage_images(nir_shader *nir,
           * is emitted once. */
          out->packed_bindings[at] = GEX_WGPU_PACKED_IMAGE_FIRST_BINDING;
          out->packed_formats[at] = image_format;
+         if (image_format == PIPE_FORMAT_NONE)
+            out->packed_unformatted |= (uint16_t)1u << at;
          /* An atomic reads as well as writes; see the graphics path. */
          out->packed_read[at] =
             !no_read || gex_wgpu_image_has_atomic(nir,
@@ -2829,6 +2845,13 @@ struct gex_wgpu_capture_variant {
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
    uint8_t targets[GEX_WGPU_MAX_SAMPLERS];
+   /* The formats this module's packed images were lowered against. Part of
+    * the key, not just bookkeeping: the pack math is chosen by the format, so
+    * a module built for one cannot serve another. Identical to the shader's
+    * own packed_formats unless it declared an image without a qualifier, in
+    * which case the entry is what the image *unit* carried at the draw that
+    * built this variant. */
+   enum pipe_format packed_resolved[GEX_WGPU_MAX_SHADER_IMAGES];
    WGPUShaderModule module;
    unsigned so_mask;
    uint32_t so_bindings[GEX_WGPU_MAX_SO_BUFFERS];
@@ -11907,7 +11930,15 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    /* The clone keeps the stores, so it is the copy that needs the packed
     * lowering. MESA_SHADER_VERTEX puts the buffers in descriptor set 1, which
     * is the group the capture dispatch binds. */
-   if (shader->capture_nir && shader->capture_images.packed_count) {
+   /* A packed image whose format is not yet known cannot be lowered here: the
+    * pack math is chosen by the format, so lowering against PIPE_FORMAT_NONE
+    * would write a wrong answer rather than fail -- and a wrong answer is
+    * worse than the refusal this replaces. Those shaders have the lowering
+    * done per draw instead, in gex_wgpu_capture_variant_get, against the
+    * format the image *unit* carries. Everything with a known format stays on
+    * this path exactly as before. */
+   if (shader->capture_nir && shader->capture_images.packed_count &&
+       !shader->capture_images.packed_unformatted) {
       char why[176] = {0};
       if (!gex_wgpu_apply_packed_images(
              shader->capture_nir, shader->capture_images.packed_count,
@@ -25091,8 +25122,27 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
    const bool wants_variant = gex_wgpu_stage_wants_texture_variant(
       vs->texture_count, vs->texture_slots, vs->integer_sampled_slots,
       ctx->vertex_samplers, ctx->vertex_sampler_views);
+   /* What each packed image's format is for *this* draw. For one the shader
+    * declared a format on, that format. For one declared without -- which
+    * GLSL permits only on a write-only image -- GL says the store converts to
+    * the image unit's format, so it comes from the bound view, and an unbound
+    * unit falls back the way the compute path's resolution does. */
+   enum pipe_format resolved[GEX_WGPU_MAX_SHADER_IMAGES];
+   memset(resolved, 0, sizeof(resolved));
+   for (unsigned i = 0; i < vs->capture_images.packed_count; ++i) {
+      if (!(vs->capture_images.packed_unformatted & ((uint16_t)1u << i))) {
+         resolved[i] = vs->capture_images.packed_formats[i];
+         continue;
+      }
+      const struct pipe_image_view *iv =
+         &ctx->shader_images[MESA_SHADER_VERTEX]
+                            [vs->capture_images.packed_slots[i]];
+      resolved[i] = iv->resource ? iv->format : PIPE_FORMAT_R8G8B8A8_UNORM;
+   }
    for (struct gex_wgpu_capture_variant *v = vs->captures; v; v = v->next) {
       if (memcmp(&v->layout, layout, sizeof(*layout)))
+         continue;
+      if (memcmp(v->packed_resolved, resolved, sizeof(resolved)))
          continue;
       if (!wants_variant)
          return v;
@@ -25250,12 +25300,34 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
    nir_fixup_deref_types(nir);
    NIR_PASS(_, nir, nir_opt_dce);
 
+   /* The packed lowering shader-create deferred, done here against what the
+    * image units actually carry. It has to run before the textures are
+    * collected below, for the same reason it runs before any variant is
+    * cloned on the ordinary path: it removes the image variables, and
+    * anything that counts them afterwards would otherwise count them twice. */
+   if (vs->capture_images.packed_unformatted) {
+      char why[176] = {0};
+      if (!gex_wgpu_apply_packed_images(
+             nir, vs->capture_images.packed_count,
+             vs->capture_images.packed_slots,
+             vs->capture_images.packed_bindings, resolved,
+             vs->capture_images.packed_write, MESA_SHADER_VERTEX, why,
+             sizeof(why))) {
+         fprintf(stderr, "gex-wgpu: no capture variant for a vertex shader "
+                 "with a format-less packed image (%s)\n",
+                 why[0] ? why : "failed");
+         ralloc_free(nir);
+         return NULL;
+      }
+   }
+
    struct gex_wgpu_capture_variant *variant =
       CALLOC_STRUCT(gex_wgpu_capture_variant);
    if (!variant) {
       ralloc_free(nir);
       return NULL;
    }
+   memcpy(variant->packed_resolved, resolved, sizeof(resolved));
    {
       const char *why = NULL;
       if (!gex_wgpu_collect_stage_textures(nir, &variant->textures, &why)) {
@@ -29208,8 +29280,13 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
          header = gex_wgpu_packed_image_scratch(ctx, true);
          packed_size = GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
       } else {
+         /* The variant's resolved format, not the shader's recorded one:
+          * an image declared without a qualifier has PIPE_FORMAT_NONE
+          * recorded, and the module bound here was lowered against what the
+          * image unit carried. The two have to agree on the packing or the
+          * shader writes one layout and the copy-back reads another. */
          packed = gex_wgpu_packed_image_bind(
-            ctx, slot, iv, ctx->vs->capture_images.packed_formats[i],
+            ctx, slot, iv, variant->packed_resolved[i],
             ctx->vs->capture_images.packed_read[i], &packed_size, &header,
             &data_offset);
       }
