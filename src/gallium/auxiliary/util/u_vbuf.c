@@ -331,8 +331,12 @@ void u_vbuf_get_caps(struct pipe_screen *screen, struct u_vbuf_caps *caps,
    /* by default, all of these are supported */
    caps->attrib_4byte_unaligned = 1;
    caps->attrib_element_unaligned = 1;
+   caps->attrib_wider_than_stride = 1;
 
    /* pipe cap removes capabilities */
+   if (screen->caps.vertex_attrib_within_stride)
+      caps->attrib_wider_than_stride = 0;
+
    switch (screen->caps.vertex_input_alignment) {
    case PIPE_VERTEX_INPUT_ALIGNMENT_4BYTE:
       caps->attrib_4byte_unaligned = 0;
@@ -369,7 +373,8 @@ void u_vbuf_get_caps(struct pipe_screen *screen, struct u_vbuf_caps *caps,
    if (caps->max_vertex_buffers < 16)
       caps->fallback_always = true;
 
-   if (!caps->attrib_4byte_unaligned || !caps->attrib_element_unaligned)
+   if (!caps->attrib_4byte_unaligned || !caps->attrib_element_unaligned ||
+       !caps->attrib_wider_than_stride)
       caps->fallback_always = true;
 
    if (!caps->fallback_always && !caps->user_vertex_buffers)
@@ -979,11 +984,21 @@ u_vbuf_create_vertex_elements(struct u_vbuf *mgr, unsigned count,
                                 ve->native_format_size[i] : (ve->native_format_size[i] / desc->nr_channels);
       ve->component_size[i] = component_size;
 
+      /* An attribute that runs past its own stride. GL allows it -- the
+       * vertices overlap and share components, which
+       * KHR-GL44.vertex_attrib_binding uses deliberately with a vec3 at
+       * stride 4 -- and a driver that cannot express it needs the buffer
+       * repacked. The translate path below gives every element an output
+       * offset inside a stride it computes, so the result always fits.
+       * A zero stride is the constant-attribute case and always fits. */
       if (ve->ve[i].src_format != format ||
           (!mgr->caps.attrib_4byte_unaligned &&
            ve->ve[i].src_offset % 4 != 0) ||
           (!mgr->caps.attrib_element_unaligned &&
-           ve->ve[i].src_offset % component_size != 0)) {
+           ve->ve[i].src_offset % component_size != 0) ||
+          (!mgr->caps.attrib_wider_than_stride && ve->ve[i].src_stride &&
+           ve->ve[i].src_offset + ve->native_format_size[i] >
+              ve->ve[i].src_stride)) {
          ve->incompatible_elem_mask |= 1 << i;
          ve->incompatible_vb_mask_any |= vb_index_bit;
       } else {

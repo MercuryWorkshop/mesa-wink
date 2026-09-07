@@ -9573,12 +9573,27 @@ gex_wgpu_capture_vertex(nir_builder *b, struct gex_wgpu_capture *state)
                                gex_wgpu_capture_vertex_slot(b, state)));
 }
 
+/* Why a capture declined. Every one of these used to set state->failed and
+ * say nothing, so the caller could only report "records nothing for this
+ * draw" and name the first attribute's format -- which is the wrong fact when
+ * the cause is a slot limit or an unaligned offset, and no fact at all when
+ * there are no attributes. Two full CTS runs went into finding that out. */
+static void
+gex_wgpu_capture_decline(struct gex_wgpu_capture *state, const char *why,
+                         unsigned detail)
+{
+   state->failed = true;
+   if (getenv("GEX_WGPU_XFB_DEBUG"))
+      fprintf(stderr, "gex-xfb: capture declined: %s (%u)\n", why, detail);
+}
+
 static nir_variable *
 gex_wgpu_capture_so_var(nir_shader *nir, struct gex_wgpu_capture *state,
                         unsigned buffer)
 {
    if (buffer >= GEX_WGPU_MAX_SO_BUFFERS) {
-      state->failed = true;
+      gex_wgpu_capture_decline(state, "transform feedback buffer past the limit",
+                               buffer);
       return NULL;
    }
    if (!state->so[buffer]) {
@@ -9597,7 +9612,7 @@ gex_wgpu_capture_vb_var(nir_shader *nir, struct gex_wgpu_capture *state,
                         unsigned slot)
 {
    if (slot >= GEX_WGPU_MAX_VERTEX_BUFFERS) {
-      state->failed = true;
+      gex_wgpu_capture_decline(state, "vertex buffer slot past the limit", slot);
       return NULL;
    }
    if (!state->vb[slot]) {
@@ -9611,6 +9626,159 @@ gex_wgpu_capture_vb_var(nir_shader *nir, struct gex_wgpu_capture *state,
    return state->vb[slot];
 }
 
+/* How one vertex format's components sit in the words loaded from the vertex
+ * buffer, and what turns them into the value the shader reads.
+ *
+ * The capture path fetches vertex attributes itself, in a compute shader, so
+ * every conversion the vertex-fetch hardware would do has to be written out
+ * here. The set it must cover is not "the formats GL has" but exactly the set
+ * gex_wgpu_vertex_format advertises: u_vbuf translates only what the driver
+ * declines, so a format the *render* path accepts and this one does not is a
+ * format that arrives here untranslated. That gap was silent -- the capture
+ * refused, transform feedback recorded nothing, and the case that asked for it
+ * failed with no error anywhere. Twelve formats were in it. */
+enum gex_wgpu_capture_conv {
+   GEX_CAPTURE_RAW,     /* a 32-bit component: the loaded bits are the value */
+   GEX_CAPTURE_UNORM,   /* c / (2^bits - 1) */
+   GEX_CAPTURE_SNORM,   /* max(c / (2^(bits-1) - 1), -1), c sign-extended */
+   GEX_CAPTURE_USCALED, /* the integer value, as a float */
+   GEX_CAPTURE_SSCALED,
+   GEX_CAPTURE_UINT,    /* a narrow integer, zero-extended */
+   GEX_CAPTURE_SINT,    /* a narrow integer, sign-extended */
+};
+
+struct gex_wgpu_capture_pack {
+   uint8_t words;                    /* words to load */
+   uint8_t comps;                    /* components the format supplies */
+   uint8_t word[4];                  /* which loaded word each comes from */
+   uint8_t shift[4];                 /* its bit offset in that word */
+   uint8_t bits[4];                  /* its width in bits */
+   enum gex_wgpu_capture_conv conv;
+};
+
+/* Four 8-bit components in one word, and the same in BGRA order -- which is a
+ * component swizzle and nothing more, so it is the same entry with r and b
+ * exchanged. */
+#define GEX_CAPTURE_8888(c) \
+   { 1, 4, {0,0,0,0}, {0,8,16,24}, {8,8,8,8}, (c) }
+#define GEX_CAPTURE_8888_BGRA(c) \
+   { 1, 4, {0,0,0,0}, {16,8,0,24}, {8,8,8,8}, (c) }
+/* Four 16-bit components across two words. */
+#define GEX_CAPTURE_16161616(c) \
+   { 2, 4, {0,0,1,1}, {0,16,0,16}, {16,16,16,16}, (c) }
+/* Two 16-bit components in one word. */
+#define GEX_CAPTURE_1616(c) \
+   { 1, 2, {0,0,0,0}, {0,16,0,0}, {16,16,0,0}, (c) }
+/* 10/10/10/2 packed into one word, and its BGRA spelling. GL puts alpha in the
+ * top two bits either way; only r and b trade places. */
+#define GEX_CAPTURE_1010102(c) \
+   { 1, 4, {0,0,0,0}, {0,10,20,30}, {10,10,10,2}, (c) }
+#define GEX_CAPTURE_1010102_BGRA(c) \
+   { 1, 4, {0,0,0,0}, {20,10,0,30}, {10,10,10,2}, (c) }
+/* N plain 32-bit components. */
+#define GEX_CAPTURE_32(n, c) \
+   { (n), (n), {0,1,2,3}, {0,0,0,0}, {32,32,32,32}, (c) }
+
+static bool
+gex_wgpu_capture_pack_for(enum pipe_format format,
+                          struct gex_wgpu_capture_pack *out)
+{
+   static const struct { enum pipe_format format;
+                         struct gex_wgpu_capture_pack pack; } table[] = {
+      { PIPE_FORMAT_R32_FLOAT,          GEX_CAPTURE_32(1, GEX_CAPTURE_RAW) },
+      { PIPE_FORMAT_R32G32_FLOAT,       GEX_CAPTURE_32(2, GEX_CAPTURE_RAW) },
+      { PIPE_FORMAT_R32G32B32_FLOAT,    GEX_CAPTURE_32(3, GEX_CAPTURE_RAW) },
+      { PIPE_FORMAT_R32G32B32A32_FLOAT, GEX_CAPTURE_32(4, GEX_CAPTURE_RAW) },
+      /* The integer formats are word-per-component exactly as the float ones
+       * are, and a NIR value is an untyped bit pattern, so the loaded words
+       * are already what the shader reads -- only the fill for the components
+       * the format does not supply has to be an integer one.
+       *
+       * Leaving them out cost far more than an integer attribute. A transform
+       * feedback capture of a shader reading an `in int` refused, that refusal
+       * *latches* the context, and the CTS reuses one context for a whole
+       * family: KHR-GL45.direct_state_access.buffers_functional does exactly
+       * this, and the 256 cases that followed it all reported InternalError
+       * because the context never came back. Run alone they pass. */
+      { PIPE_FORMAT_R32_SINT,           GEX_CAPTURE_32(1, GEX_CAPTURE_RAW) },
+      { PIPE_FORMAT_R32_UINT,           GEX_CAPTURE_32(1, GEX_CAPTURE_RAW) },
+      { PIPE_FORMAT_R32G32_SINT,        GEX_CAPTURE_32(2, GEX_CAPTURE_RAW) },
+      { PIPE_FORMAT_R32G32_UINT,        GEX_CAPTURE_32(2, GEX_CAPTURE_RAW) },
+      { PIPE_FORMAT_R32G32B32_SINT,     GEX_CAPTURE_32(3, GEX_CAPTURE_RAW) },
+      { PIPE_FORMAT_R32G32B32_UINT,     GEX_CAPTURE_32(3, GEX_CAPTURE_RAW) },
+      { PIPE_FORMAT_R32G32B32A32_SINT,  GEX_CAPTURE_32(4, GEX_CAPTURE_RAW) },
+      { PIPE_FORMAT_R32G32B32A32_UINT,  GEX_CAPTURE_32(4, GEX_CAPTURE_RAW) },
+
+      { PIPE_FORMAT_R8G8B8A8_UNORM,     GEX_CAPTURE_8888(GEX_CAPTURE_UNORM) },
+      { PIPE_FORMAT_R8G8B8A8_SNORM,     GEX_CAPTURE_8888(GEX_CAPTURE_SNORM) },
+      { PIPE_FORMAT_B8G8R8A8_UNORM,     GEX_CAPTURE_8888_BGRA(GEX_CAPTURE_UNORM) },
+
+      { PIPE_FORMAT_R16G16B16A16_UNORM, GEX_CAPTURE_16161616(GEX_CAPTURE_UNORM) },
+      { PIPE_FORMAT_R16G16B16A16_SNORM, GEX_CAPTURE_16161616(GEX_CAPTURE_SNORM) },
+      { PIPE_FORMAT_R16G16_SINT,        GEX_CAPTURE_1616(GEX_CAPTURE_SINT) },
+      { PIPE_FORMAT_R16G16_UINT,        GEX_CAPTURE_1616(GEX_CAPTURE_UINT) },
+
+      { PIPE_FORMAT_R10G10B10A2_UNORM,   GEX_CAPTURE_1010102(GEX_CAPTURE_UNORM) },
+      { PIPE_FORMAT_R10G10B10A2_SNORM,   GEX_CAPTURE_1010102(GEX_CAPTURE_SNORM) },
+      { PIPE_FORMAT_R10G10B10A2_USCALED, GEX_CAPTURE_1010102(GEX_CAPTURE_USCALED) },
+      { PIPE_FORMAT_R10G10B10A2_SSCALED, GEX_CAPTURE_1010102(GEX_CAPTURE_SSCALED) },
+      { PIPE_FORMAT_B10G10R10A2_UNORM,   GEX_CAPTURE_1010102_BGRA(GEX_CAPTURE_UNORM) },
+      { PIPE_FORMAT_B10G10R10A2_SNORM,   GEX_CAPTURE_1010102_BGRA(GEX_CAPTURE_SNORM) },
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(table); ++i)
+      if (table[i].format == format) { *out = table[i].pack; return true; }
+   return false;
+}
+
+/* One component, out of the words already loaded. */
+static nir_def *
+gex_wgpu_capture_component(nir_builder *b,
+                           const struct gex_wgpu_capture_pack *pack,
+                           nir_def *const *raw, unsigned i)
+{
+   nir_def *word = raw[pack->word[i]];
+   const unsigned bits = pack->bits[i];
+
+   if (pack->conv == GEX_CAPTURE_RAW)
+      return word;
+
+   /* Sign-extend by shifting the field to the top of the word and back down
+    * arithmetically; zero-extend by masking. */
+   const bool signed_field = pack->conv == GEX_CAPTURE_SNORM ||
+                             pack->conv == GEX_CAPTURE_SSCALED ||
+                             pack->conv == GEX_CAPTURE_SINT;
+   nir_def *field;
+   if (signed_field) {
+      field = nir_ishr_imm(b, nir_ishl_imm(b, word, 32u - bits - pack->shift[i]),
+                           32u - bits);
+   } else {
+      field = nir_iand_imm(b, nir_ushr_imm(b, word, pack->shift[i]),
+                           bits >= 32 ? 0xffffffffu : ((1u << bits) - 1u));
+   }
+
+   switch (pack->conv) {
+   case GEX_CAPTURE_UINT:
+   case GEX_CAPTURE_SINT:
+      return field;
+   case GEX_CAPTURE_USCALED:
+      return nir_u2f32(b, field);
+   case GEX_CAPTURE_SSCALED:
+      return nir_i2f32(b, field);
+   case GEX_CAPTURE_UNORM:
+      return nir_fmul_imm(b, nir_u2f32(b, field),
+                          1.0 / (double)((1u << bits) - 1u));
+   case GEX_CAPTURE_SNORM: {
+      /* GL clamps at -1: the most negative representable value maps below it.
+       * fmax rather than a clamp because the positive side cannot exceed 1. */
+      const double scale = 1.0 / (double)((1u << (bits - 1u)) - 1u);
+      return nir_fmax(b, nir_fmul_imm(b, nir_i2f32(b, field), scale),
+                      nir_imm_float(b, -1.0f));
+   }
+   default:
+      UNREACHABLE("capture conversion");
+   }
+}
+
 /* Read one vertex attribute out of its vertex buffer, in place of the fetch a
  * compute shader does not get. */
 static nir_def *
@@ -9620,49 +9788,39 @@ gex_wgpu_capture_fetch(nir_builder *b, struct gex_wgpu_capture *state,
    const struct gex_wgpu_capture_layout *layout = state->layout;
    nir_def *zero = nir_imm_zero(b, components, 32);
    if (element >= layout->count) {
-      state->failed = true;
+      /* The shader reads an input the vertex layout has no element for. A
+       * disabled attribute array is served from GL's current-attribute state,
+       * and st/mesa compacts driver locations over the *enabled* elements, so
+       * a shader declaring sixteen inputs with five arrays bound reads past
+       * the end of this table. */
+      gex_wgpu_capture_decline(
+         state, "shader reads a vertex input the layout has no element for",
+         element);
       return zero;
     }
 
-   unsigned words = 0;
-   bool unorm8 = false;
-   bool integer = false;
-   switch ((enum pipe_format)layout->format[element]) {
-   case PIPE_FORMAT_R32_FLOAT: words = 1; break;
-   case PIPE_FORMAT_R32G32_FLOAT: words = 2; break;
-   case PIPE_FORMAT_R32G32B32_FLOAT: words = 3; break;
-   case PIPE_FORMAT_R32G32B32A32_FLOAT: words = 4; break;
-   case PIPE_FORMAT_R8G8B8A8_UNORM: words = 1; unorm8 = true; break;
-   /* The integer formats are word-per-component exactly as the float ones
-    * are, and a NIR value is an untyped bit pattern, so the loaded words are
-    * already what the shader reads -- only the fill for the components the
-    * format does not supply has to be an integer one.
-    *
-    * Leaving them out cost far more than an integer attribute. A transform
-    * feedback capture of a shader reading an `in int` refused, that refusal
-    * *latches* the context, and the CTS reuses one context for a whole
-    * family: KHR-GL45.direct_state_access.buffers_functional does exactly
-    * this, and the 256 cases that followed it all reported InternalError
-    * because the context never came back. Run alone they pass. */
-   case PIPE_FORMAT_R32_SINT:
-   case PIPE_FORMAT_R32_UINT: words = 1; integer = true; break;
-   case PIPE_FORMAT_R32G32_SINT:
-   case PIPE_FORMAT_R32G32_UINT: words = 2; integer = true; break;
-   case PIPE_FORMAT_R32G32B32_SINT:
-   case PIPE_FORMAT_R32G32B32_UINT: words = 3; integer = true; break;
-   case PIPE_FORMAT_R32G32B32A32_SINT:
-   case PIPE_FORMAT_R32G32B32A32_UINT: words = 4; integer = true; break;
-   default:
-      /* Every other format is translated by u_vbuf before it reaches the
-       * driver, so reaching this is a driver bug rather than an app one. */
+   struct gex_wgpu_capture_pack pack;
+   if (!gex_wgpu_capture_pack_for((enum pipe_format)layout->format[element],
+                                  &pack)) {
+      /* Reaching this means the render path advertises a vertex format the
+       * capture path cannot unpack, so u_vbuf passed it through untranslated
+       * and the two sets have drifted apart again. Name it: this refusal is
+       * otherwise a transform feedback that records nothing. */
       if (getenv("GEX_WGPU_XFB_DEBUG"))
          fprintf(stderr, "gex-xfb: capture cannot fetch element %u format %s "
                  "(%u)\n", element,
                  util_format_short_name(layout->format[element]),
                  layout->format[element]);
-      state->failed = true;
+      gex_wgpu_capture_decline(state, "no unpacker for the attribute format",
+                               layout->format[element]);
       return zero;
    }
+   const unsigned words = pack.words;
+   const bool integer = pack.conv == GEX_CAPTURE_RAW
+                        ? util_format_is_pure_integer(
+                             (enum pipe_format)layout->format[element])
+                        : (pack.conv == GEX_CAPTURE_UINT ||
+                           pack.conv == GEX_CAPTURE_SINT);
 
    const unsigned slot = layout->buffer[element];
    nir_variable *buffer = gex_wgpu_capture_vb_var(b->shader, state, slot);
@@ -9673,7 +9831,8 @@ gex_wgpu_capture_fetch(nir_builder *b, struct gex_wgpu_capture *state,
     * only requires alignment to the component type, so a byte-format
     * attribute at an odd offset is legal and refused rather than mis-read. */
    if ((layout->offset[element] & 3) || (layout->stride[element] & 3)) {
-      state->failed = true;
+      gex_wgpu_capture_decline(state, "attribute offset or stride is not a "
+                               "whole number of words", element);
       return zero;
    }
 
@@ -9707,20 +9866,9 @@ gex_wgpu_capture_fetch(nir_builder *b, struct gex_wgpu_capture *state,
          b, nir_build_deref_array(b, data, nir_iadd_imm(b, word, i)));
 
    nir_def *comp[4];
-   unsigned have = words;
-   if (unorm8) {
-      for (unsigned i = 0; i < 4; ++i)
-         comp[i] = nir_fmul_imm(
-            b, nir_u2f32(b, nir_iand_imm(b, nir_ushr_imm(b, raw[0], i * 8),
-                                          0xff)),
-            1.0 / 255.0);
-      have = 4;
-   } else {
-      /* A NIR value is an untyped bit pattern, so the loaded words are
-       * already the floats the shader expects. */
-      for (unsigned i = 0; i < words; ++i)
-         comp[i] = raw[i];
-   }
+   const unsigned have = pack.comps;
+   for (unsigned i = 0; i < have; ++i)
+      comp[i] = gex_wgpu_capture_component(b, &pack, raw, i);
    /* GL fills the components a format does not supply with (0, 0, 0, 1) --
     * and for an integer format that one is an integer one. */
    for (unsigned i = have; i < 4; ++i)
@@ -41246,6 +41394,17 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * odd-stride cases went from refused to correct, and they had been
     * invisible until the GL 4.4 context let that probe run at all. */
    caps->vertex_input_alignment = PIPE_VERTEX_INPUT_ALIGNMENT_4BYTE;
+   /* WebGPU requires every attribute to lie wholly inside its own
+    * arrayStride. GL does not: a vec3 at stride 4 is legal and makes
+    * consecutive vertices share components, which
+    * KHR-GL44.vertex_attrib_binding does on purpose in five of its cases.
+    * create_vertex_elements_state refused such a layout, and a refusal there
+    * is not a refusal -- cso binds the NULL and the next draw has no vertex
+    * layout at all, so nothing rendered and nothing said so. With this set,
+    * u_vbuf repacks the buffer into a stride it computes and the layout never
+    * reaches the driver. Free here: the 4-byte alignment above already puts
+    * u_vbuf permanently in its fallback path. */
+   caps->vertex_attrib_within_stride = true;
    caps->user_vertex_buffers = false;
    /* gl_InstanceID reaches WGSL as @builtin(instance_index), proven by the
     * vertex-gl-instance-id corpus case. SPIR-V's InstanceIndex counts from

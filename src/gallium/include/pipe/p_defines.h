@@ -1185,6 +1185,12 @@ struct pipe_caps {
 
    enum pipe_device_type device_type;
    enum pipe_vertex_input_alignment vertex_input_alignment;
+   /** Set when an attribute must lie wholly inside its vertex stride, i.e.
+    * src_offset + attribute size <= src_stride whenever src_stride is
+    * non-zero. GL permits a stride smaller than the attribute, so that
+    * consecutive vertices overlap and share components; WebGPU rejects that
+    * layout outright, so u_vbuf has to repack the buffer instead. */
+   bool vertex_attrib_within_stride;
    enum pipe_endian endianness;
    enum pipe_point_size_lower_mode point_size_fixed;
 

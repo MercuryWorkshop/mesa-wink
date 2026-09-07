@@ -52,6 +52,10 @@ struct u_vbuf_caps {
    /* TRUE if hardware supports it. */
    unsigned attrib_element_unaligned:1;
 
+   /* Whether an attribute may extend past its own vertex stride. */
+   /* TRUE if hardware supports it. */
+   unsigned attrib_wider_than_stride:1;
+
    /* Whether the driver supports user vertex buffers. */
    unsigned user_vertex_buffers:1;
 

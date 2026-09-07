@@ -66,6 +66,10 @@ u_init_pipe_screen_caps(struct pipe_screen *pscreen, int accel)
    caps->glsl_feature_level_compatibility = 120;
 
    caps->vertex_input_alignment = PIPE_VERTEX_INPUT_ALIGNMENT_NONE;
+   /* Most hardware fetches an attribute that runs past its own stride without
+    * complaint, so the permissive answer is the default and only a driver
+    * that cannot express the layout sets this. */
+   caps->vertex_attrib_within_stride = false;
 
    /* GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT default value. */
    caps->constant_buffer_offset_alignment = 1;
