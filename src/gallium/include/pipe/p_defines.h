@@ -1191,6 +1191,13 @@ struct pipe_caps {
     * consecutive vertices overlap and share components; WebGPU rejects that
     * layout outright, so u_vbuf has to repack the buffer instead. */
    bool vertex_attrib_within_stride;
+   /** Set when is_format_supported is the whole truth about sample counts,
+    * i.e. the driver's multisample support genuinely varies per format and
+    * must not be rounded up to the context's maximum. st_QuerySamplesForFormat
+    * otherwise reports MAX_COLOR_TEXTURE_SAMPLES for every renderable format
+    * whether the driver accepts it or not, which makes glGetInternalformativ
+    * advertise a sample count that glTexStorage2DMultisample then refuses. */
+   bool exact_sample_counts;
    enum pipe_endian endianness;
    enum pipe_point_size_lower_mode point_size_fixed;
 

@@ -1517,13 +1517,24 @@ st_QuerySamplesForFormat(struct gl_context *ctx, GLenum target,
       internalFormat = _mesa_get_linear_internalformat(internalFormat);
    }
 
+   /* A driver whose multisample support varies by format is asked and
+    * believed; for everyone else the count is padded up to the context
+    * maximum as it always has been. Padding a driver that means it produces
+    * an advertisement it cannot honour: glGetInternalformativ offers the
+    * count, the application passes it straight back to
+    * glTexStorage2DMultisample, and that fails with GL_INVALID_OPERATION --
+    * KHR-GL44.texture_view does exactly that with GL_RGBA32F, and WebGPU
+    * excludes every 32-bit-per-component format from multisampling. */
+   const bool pad_to_max =
+      !st->screen->caps.exact_sample_counts;
+
    /* Set sample counts in descending order. */
    for (i = MAX_SAMPLES; i > 1; i--) {
       format = st_choose_format(st, internalFormat, GL_NONE, GL_NONE,
                                 PIPE_TEXTURE_2D, i, i, bind,
                                 false, false);
 
-      if (format != PIPE_FORMAT_NONE || i == min_max_samples) {
+      if (format != PIPE_FORMAT_NONE || (pad_to_max && i == min_max_samples)) {
          samples[num_sample_counts++] = i;
       }
    }

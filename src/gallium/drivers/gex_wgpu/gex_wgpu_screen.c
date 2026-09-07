@@ -42104,6 +42104,10 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * reaches the driver. Free here: the 4-byte alignment above already puts
     * u_vbuf permanently in its fallback path. */
    caps->vertex_attrib_within_stride = true;
+   /* WebGPU offers 4x multisampling for the ordinary formats and none at all
+    * for the 32-bit-per-component ones, so the sample counts this driver
+    * reports really do depend on the format and must not be padded. */
+   caps->exact_sample_counts = true;
    caps->user_vertex_buffers = false;
    /* gl_InstanceID reaches WGSL as @builtin(instance_index), proven by the
     * vertex-gl-instance-id corpus case. SPIR-V's InstanceIndex counts from

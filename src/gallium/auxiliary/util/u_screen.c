@@ -70,6 +70,11 @@ u_init_pipe_screen_caps(struct pipe_screen *pscreen, int accel)
     * complaint, so the permissive answer is the default and only a driver
     * that cannot express the layout sets this. */
    caps->vertex_attrib_within_stride = false;
+   /* Padding the reported sample counts up to the context maximum is what
+    * every driver has always got, and for hardware whose multisampling does
+    * not vary by format it is also correct. Only a driver with real per-format
+    * limits sets this. */
+   caps->exact_sample_counts = false;
 
    /* GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT default value. */
    caps->constant_buffer_offset_alignment = 1;
