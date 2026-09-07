@@ -18821,6 +18821,17 @@ gex_wgpu_write_depth(struct gex_wgpu_context *ctx,
          sdst.mipLevel = level;
          sdst.origin.x = box->x;
          sdst.origin.y = box->y;
+         /* And the array layer, which this did not set. The depth half of
+          * the same upload routes by layer -- target_view_desc.baseArrayLayer
+          * is box->z, a few lines up -- so a layered depth-stencil texture
+          * had its depth written to the right slice and every slice's
+          * stencil written to slice zero, silently. Four slices of
+          * GL_DEPTH32F_STENCIL8 uploaded with distinct stencil values ended
+          * up with three of them holding whatever slice zero got, so a
+          * stencil test against them rejected everything and the layer read
+          * back black: KHR-GL44.geometry_shader.layered_framebuffer
+          * .stencil_support. */
+         sdst.origin.z = box->z;
          sdst.aspect = WGPUTextureAspect_StencilOnly;
          WGPUTexelCopyBufferLayout slayout = WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT;
          slayout.bytesPerRow = w;
