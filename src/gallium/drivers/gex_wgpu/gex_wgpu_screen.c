@@ -41744,16 +41744,28 @@ gex_wgpu_screen_create(WGPUDevice device)
     * *guaranteed* maxComputeInvocationsPerWorkgroup is only 256. Whether GL
     * compute can be advertised at all is therefore a property of the device,
     * not of this driver. */
+   /* The last figure is the *fragment* stage's storage limit, and it was
+    * labelled storage/compute -- so a browser reporting 4294967295 for it
+    * read as a compute limit of four billion. That number is
+    * WGPU_LIMIT_U32_UNDEFINED, which means the implementation does not report
+    * the per-stage limit at all rather than that it is enormous; the
+    * capability path above already falls back for it, and only this line took
+    * it literally. An instrument that misnames a field and prints a sentinel
+    * as a quantity is worse than no instrument. */
+   const uint32_t storage_fragment = limits.maxStorageBuffersInFragmentStage;
    fprintf(stderr,
            "gex-wgpu: compute limits invocations/workgroup %u "
-           "workgroup %ux%ux%u grid %ux%ux%u storage/compute %u\n",
+           "workgroup %ux%ux%u grid %ux%ux%u storage/fragment %s%u\n",
            limits.maxComputeInvocationsPerWorkgroup,
            limits.maxComputeWorkgroupSizeX, limits.maxComputeWorkgroupSizeY,
            limits.maxComputeWorkgroupSizeZ,
            limits.maxComputeWorkgroupsPerDimension,
            limits.maxComputeWorkgroupsPerDimension,
            limits.maxComputeWorkgroupsPerDimension,
-           limits.maxStorageBuffersInFragmentStage);
+           storage_fragment == WGPU_LIMIT_U32_UNDEFINED ? "not reported, using "
+                                                        : "",
+           storage_fragment == WGPU_LIMIT_U32_UNDEFINED
+              ? screen->max_storage_buffers : storage_fragment);
    screen->depth32_stencil8 =
       wgpuDeviceHasFeature(device, WGPUFeatureName_Depth32FloatStencil8);
    /* ARB_depth_clamp: WebGPU calls it unclippedDepth, and it is optional. */
