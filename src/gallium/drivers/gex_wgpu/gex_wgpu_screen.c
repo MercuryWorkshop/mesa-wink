@@ -35085,6 +35085,34 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
     * persistently mapped buffer has to reach the device before the work that
     * reads it. */
    gex_wgpu_flush_persistent_maps(ctx);
+   /* Let the batch go **before** the early return, not after it.
+    *
+    * Every entry in batch_touched holds a `pipe_resource` reference and sets
+    * `in_batch` on it. Returning here without clearing them keeps both: the
+    * reference is never dropped, so the resource outlives the application's
+    * own delete, and `in_batch` stays true, so it is never added again and
+    * never reaches the loop below either. It leaks for the life of the
+    * context.
+    *
+    * That is a real leak and a large one. SuperTuxKart creates and destroys
+    * about 13,400 resources in forty seconds and 1,644 of them were still
+    * live and climbing -- roughly 12% -- which is ~780 KiB of host shadow
+    * plus its WebGPU buffer each, or **35 MiB of VRAM per second**. A race
+    * exhausted a 4 GB card in under two minutes, which is what
+    * gex-wgpu-runs-lock-the-machine is about; that note reads it as a 1.93 GB
+    * working set, and it is not, it is unbounded growth. glxgears is flat and
+    * so is the same STK race on llvmpipe, which is what says the driver holds
+    * them rather than the application allocating them.
+    *
+    * Clearing here is right rather than merely safe: with no encoder there is
+    * nothing recorded, so nothing can still need the batch to keep these
+    * alive. */
+   for (unsigned i = 0; i < ctx->batch_touched_count; ++i) {
+      gex_resource(ctx->batch_touched[i])->in_batch = false;
+      pipe_resource_reference(&ctx->batch_touched[i], NULL);
+   }
+   ctx->batch_touched_count = 0;
+   ctx->batch_touched_overflowed = false;
    if (!ctx->pending_encoder)
       return;
    for (unsigned i = 0; i < GEX_WGPU_SUBMIT_CAUSES; ++i) {
