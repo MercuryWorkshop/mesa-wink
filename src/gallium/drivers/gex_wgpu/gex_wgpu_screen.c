@@ -34213,6 +34213,67 @@ gex_wgpu_alias_snapshot_now(struct gex_wgpu_context *ctx,
    return copy;
 }
 
+/* One read-only image's view, for a stage that may only have read-only ones.
+ *
+ * The fragment group builds its image views inline and does more: a writable
+ * image needs a storage-texture view, and one that is also sampled needs an
+ * alias to break the feedback loop. Neither applies here. WGSL allows only a
+ * read-only image in the vertex stage -- Tint lowers it to a plain
+ * `texture_2d<T>` -- so this is the subset of that loop which read-only
+ * reaches, lifted out rather than copied into it: the fragment path stays as
+ * it is, and the next stage that needs one has a helper to call.
+ */
+static bool
+gex_wgpu_readonly_image_view(struct gex_wgpu_context *ctx,
+                             const struct gex_wgpu_shader *shader,
+                             mesa_shader_stage stage, unsigned i,
+                             WGPUTextureView *out_view, bool *owned)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   const unsigned slot = shader->image_slots[i];
+   const struct pipe_image_view *iv = &ctx->shader_images[stage][slot];
+   const enum pipe_format view_format =
+      gex_wgpu_stage_image_format(ctx, shader, stage, i);
+   *out_view = NULL;
+   *owned = false;
+   if (!iv->resource || !gex_resource(iv->resource)->texture) {
+      /* GL says a unit bound to an incomplete texture reads zero rather than
+         being an error, so the binding still has to exist. */
+      *out_view = gex_wgpu_default_storage_view(
+         screen, shader->image_dimensions[i],
+         gex_wgpu_storage_texture_format(view_format),
+         WGPUStorageTextureAccess_ReadOnly);
+      return *out_view != NULL;
+   }
+   WGPUTexture texture = gex_resource(iv->resource)->texture;
+   /* An image bound at another format in its class needs a texture of that
+      format to view; see the fragment group. */
+   if (gex_wgpu_texture_format(gex_wgpu_stored_format(iv->format)) !=
+       gex_wgpu_texture_format(gex_wgpu_stored_format(iv->resource->format))) {
+      texture = gex_wgpu_image_alias(ctx, iv, true);
+      if (!texture)
+         return false;
+   }
+   WGPUTextureViewDescriptor desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   desc.format = gex_wgpu_texture_format(view_format);
+   desc.dimension = shader->image_dimensions[i];
+   desc.baseMipLevel = iv->u.tex.level;
+   desc.mipLevelCount = 1;
+   if (desc.dimension != WGPUTextureViewDimension_3D) {
+      desc.baseArrayLayer = iv->u.tex.first_layer;
+      desc.arrayLayerCount = iv->u.tex.last_layer - iv->u.tex.first_layer + 1;
+   }
+   /* An alias holds one level and the bound layers, so a view of it starts at
+      the beginning of what was copied. */
+   if (texture != gex_resource(iv->resource)->texture) {
+      desc.baseMipLevel = 0;
+      desc.baseArrayLayer = 0;
+   }
+   *out_view = wgpuTextureCreateView(texture, &desc);
+   *owned = *out_view != NULL;
+   return *out_view != NULL;
+}
+
 /* Whether the fragment stage writes this *resource* through any of its
    storage slots. The slot-keyed question above is not the same one: a mixed
    pair inside the fragment group names one buffer at two different slots, so
@@ -39517,43 +39578,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       ctx->vs->packed_image_count ? 1 + ctx->vs->packed_image_count : 0;
    const unsigned vertex_group_count =
       ctx->vs->ubo_count + ctx->vs->ssbo_count + ctx->vs->buftex_count +
-      vs_packed_entries + (ctx->vs->reads_draw_params ? 1u : 0u);
-   /* A storage-texture image left in the *vertex* stage has no binding.
-    *
-    * vertex_group_count above counts uniform blocks, storage blocks, buffer
-    * textures and packed images -- and not `image_count`, which the fragment
-    * group does count. So a vertex shader still holding a storage-texture
-    * image after gex_wgpu_strip_storage_writes has removed its stores gets no
-    * group 1 entry for it, while the module it compiled to still declares one.
-    * Dawn then refuses the pipeline:
-    *
-    *   The entry-point uses bindings in group 1 but [PipelineLayout] doesn't
-    *   have a BindGroupLayout for this index
-    *     - While validating vertex stage
-    *
-    * and an invalid pipeline poisons the command buffer it is set on, so the
-    * whole draw disappears with no GL error. That is what
-    * KHR-GL45.es_31_compatibility.shader_image_load_store
-    * .advanced-memory-order-vsfs measures, and it read as a memory-ordering
-    * bug because the answer was simply missing. Measured on it:
-    * `vs group=0 (ubo 0 ssbo 0 buftex 0 packed 0 images 1 drawparams 0)`.
-    *
-    * Declining by name is not the fix, it is the honest version of the same
-    * outcome: the draw is lost either way, and this way it says so. The fix is
-    * to bind them -- the read-only-after-strip case is a sampled texture, the
-    * way Tint lowers it -- which means the fragment group's image loop
-    * (stand-ins for incomplete textures, format-class reinterpretation, view
-    * creation) has to become stage-generic rather than being duplicated. */
-   if (ctx->vs->image_count) {
-      static bool said;
-      if (!said) {
-         said = true;
-         fprintf(stderr, "gex-wgpu: draw declined (the vertex stage holds %u "
-                 "storage-texture image(s), which get no bind group entry; "
-                 "vertex images are not bound yet)\n", ctx->vs->image_count);
-      }
-      GEX_DRAW_DROP();
-   }
+      vs_packed_entries + ctx->vs->image_count +
+      (ctx->vs->reads_draw_params ? 1u : 0u);
    const unsigned fragment_group_count =
       ctx->fs->ubo_count + ctx->fs->ssbo_count + ctx->fs->image_count +
       ctx->fs->buftex_count +
@@ -40031,9 +40057,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                             GEX_WGPU_MAX_SO_BUFFERS +
                             GEX_WGPU_MAX_SHADER_BUFFERS +
                             GEX_WGPU_MAX_BUFFER_TEXTURES +
-                            /* packed images: one shared header plus one data
-                               binding each */
-                            1 + GEX_WGPU_MAX_SHADER_IMAGES +
+                            /* storage textures and packed images together,
+                               as in the fragment array below: an image is one
+                               or the other, never both, but a packed one
+                               takes two bindings */
+                            3 * GEX_WGPU_MAX_SHADER_IMAGES +
                             /* the draw parameters */ 1];
    WGPUBindGroupLayoutEntry
       fragment_layout_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
@@ -40208,9 +40236,49 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          vertex_layout_entries[at].buffer.hasDynamicOffset = false;
       }
    }
+   /* Plain storage-texture images, which the vertex stage may hold only
+    * read-only: a written one is *removed* from this copy -- removed rather
+    * than marked read-only, because the declaration is what Tint refuses --
+    * and its store rides the compute dispatch. One the shader also reads is
+    * live, so it survives, and it needs a binding. Without one the module
+    * declares group 1 and the layout has none, which Dawn refuses and an
+    * invalid pipeline poisons the command buffer it is set on: the draw
+    * vanishes with no GL error. Tint lowers a read-only storage image to a
+    * plain texture, so this is a sampled-texture entry, not a storage one. */
+   for (unsigned i = 0; i < ctx->vs->image_count; ++i) {
+      const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
+                          ctx->vs->buftex_count + vs_packed_entries + i;
+      if (ctx->vs->image_access[i] != WGPUStorageTextureAccess_ReadOnly) {
+         /* Should not survive to here; WebGPU forbids it outright. Named
+            rather than left to Dawn, which would only say the pipeline is
+            invalid. */
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: draw declined (vertex image %u is not "
+                    "read-only, which the vertex stage cannot have)\n",
+                    ctx->vs->image_slots[i]);
+         }
+         GEX_DRAW_DROP();
+      }
+      const enum pipe_format resolved =
+         gex_wgpu_stage_image_format(ctx, ctx->vs, MESA_SHADER_VERTEX, i);
+      vertex_layout_entries[at] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      vertex_layout_entries[at].binding = ctx->vs->image_bindings[i];
+      vertex_layout_entries[at].visibility = WGPUShaderStage_Vertex;
+      vertex_layout_entries[at].texture.sampleType =
+         util_format_is_pure_uint(resolved) ? WGPUTextureSampleType_Uint
+         : util_format_is_pure_sint(resolved) ? WGPUTextureSampleType_Sint
+                                     : WGPUTextureSampleType_UnfilterableFloat;
+      vertex_layout_entries[at].texture.viewDimension =
+         ctx->vs->image_dimensions[i];
+      vertex_layout_entries[at].texture.multisampled = false;
+   }
    if (ctx->vs->reads_draw_params) {
       const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
-                          ctx->vs->buftex_count + vs_packed_entries;
+                          ctx->vs->buftex_count + vs_packed_entries +
+                          ctx->vs->image_count;
       vertex_layout_entries[at] =
          (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       vertex_layout_entries[at].binding = GEX_WGPU_DRAW_PARAMS_BINDING;
@@ -40615,7 +40683,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * layer and the same texture may be bound at different ones. Caching them
     * on the resource would let the bind group cache hit; for now it does not,
     * and a fresh view means a fresh key. */
-   WGPUTextureView image_views[GEX_WGPU_MAX_SHADER_IMAGES];
+   /* Both stages put views here now, so it is sized for two. */
+   WGPUTextureView image_views[2 * GEX_WGPU_MAX_SHADER_IMAGES];
    unsigned image_view_count = 0;
    struct gex_wgpu_dynamic_offsets dynamic[4] = {{0}, {0}, {0}, {0}};
    if (pipeline && needs_texture) {
@@ -40698,8 +40767,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SO_BUFFERS +
                  GEX_WGPU_MAX_SHADER_BUFFERS +
                  GEX_WGPU_MAX_BUFFER_TEXTURES +
-                 /* packed images, as in the layout above */
-                 1 + GEX_WGPU_MAX_SHADER_IMAGES +
+                 /* images, plain and packed, as in the layout above */
+                 3 * GEX_WGPU_MAX_SHADER_IMAGES +
                  /* the draw parameters */ 1];
       for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
          const unsigned slot = ctx->vs->ubo_slots[i];
@@ -40849,9 +40918,34 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                half ? size : GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
          }
       }
+      /* The views for those images; see the layout above. */
+      for (unsigned i = 0; i < ctx->vs->image_count; ++i) {
+         const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
+                             ctx->vs->buftex_count + vs_packed_entries + i;
+         WGPUTextureView view = NULL;
+         bool owned = false;
+         if (!gex_wgpu_readonly_image_view(ctx, ctx->vs, MESA_SHADER_VERTEX,
+                                           i, &view, &owned)) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: draw declined (no view for vertex "
+                       "image %u)\n", ctx->vs->image_slots[i]);
+            }
+            GEX_DRAW_DROP();
+         }
+         entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[at].binding = ctx->vs->image_bindings[i];
+         entries[at].textureView = view;
+         /* Released with the fragment stage's, once the bind groups that
+            name them exist; the cache holds its own reference. */
+         if (owned && image_view_count < ARRAY_SIZE(image_views))
+            image_views[image_view_count++] = view;
+      }
       if (ctx->vs->reads_draw_params) {
          const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
-                             ctx->vs->buftex_count + vs_packed_entries;
+                             ctx->vs->buftex_count + vs_packed_entries +
+                             ctx->vs->image_count;
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = GEX_WGPU_DRAW_PARAMS_BINDING;
          entries[at].buffer = gex_resource(ctx->constant_ring)->buffer;
