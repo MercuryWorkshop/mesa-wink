@@ -39518,6 +39518,42 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    const unsigned vertex_group_count =
       ctx->vs->ubo_count + ctx->vs->ssbo_count + ctx->vs->buftex_count +
       vs_packed_entries + (ctx->vs->reads_draw_params ? 1u : 0u);
+   /* A storage-texture image left in the *vertex* stage has no binding.
+    *
+    * vertex_group_count above counts uniform blocks, storage blocks, buffer
+    * textures and packed images -- and not `image_count`, which the fragment
+    * group does count. So a vertex shader still holding a storage-texture
+    * image after gex_wgpu_strip_storage_writes has removed its stores gets no
+    * group 1 entry for it, while the module it compiled to still declares one.
+    * Dawn then refuses the pipeline:
+    *
+    *   The entry-point uses bindings in group 1 but [PipelineLayout] doesn't
+    *   have a BindGroupLayout for this index
+    *     - While validating vertex stage
+    *
+    * and an invalid pipeline poisons the command buffer it is set on, so the
+    * whole draw disappears with no GL error. That is what
+    * KHR-GL45.es_31_compatibility.shader_image_load_store
+    * .advanced-memory-order-vsfs measures, and it read as a memory-ordering
+    * bug because the answer was simply missing. Measured on it:
+    * `vs group=0 (ubo 0 ssbo 0 buftex 0 packed 0 images 1 drawparams 0)`.
+    *
+    * Declining by name is not the fix, it is the honest version of the same
+    * outcome: the draw is lost either way, and this way it says so. The fix is
+    * to bind them -- the read-only-after-strip case is a sampled texture, the
+    * way Tint lowers it -- which means the fragment group's image loop
+    * (stand-ins for incomplete textures, format-class reinterpretation, view
+    * creation) has to become stage-generic rather than being duplicated. */
+   if (ctx->vs->image_count) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: draw declined (the vertex stage holds %u "
+                 "storage-texture image(s), which get no bind group entry; "
+                 "vertex images are not bound yet)\n", ctx->vs->image_count);
+      }
+      GEX_DRAW_DROP();
+   }
    const unsigned fragment_group_count =
       ctx->fs->ubo_count + ctx->fs->ssbo_count + ctx->fs->image_count +
       ctx->fs->buftex_count +
