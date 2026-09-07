@@ -21854,6 +21854,11 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
       FREE(compute);
       return NULL;
    }
+   /* Before the lowering below, which is keyed on a constant block number --
+    * the same reason the graphics path runs it, and it was called from there
+    * only. A dynamically indexed block array is ARB_gpu_shader5 and legal in
+    * every stage, so a compute shader with one failed to link outright. */
+   gex_wgpu_lower_dynamic_ubo_index(nir, GEX_WGPU_MAX_CONSTANT_BUFFERS);
    {
       char why[160] = "";
       if (!gex_wgpu_lower_gallium_ubos(nir, MESA_SHADER_COMPUTE,
@@ -22760,14 +22765,27 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    for (unsigned i = 0; i < compute->buftex_count; ++i) {
       const unsigned slot = compute->buftex_slots[i];
       const struct pipe_sampler_view *view = ctx->compute_sampler_views[slot];
+      /* Unbound reads as zero, exactly as in the graphics stages; declining
+       * the dispatch lost every side effect the shader had, for a case GL
+       * defines. */
+      WGPUBuffer buftex_buffer;
+      uint64_t buftex_offset;
+      bool buftex_placeholder = false;
       if (!view || view->target != PIPE_BUFFER || !view->texture) {
          static bool said;
          if (!said) {
             said = true;
-            fprintf(stderr, "gex-wgpu: dispatch declined (compute texture "
-                    "buffer %u has no buffer bound)\n", slot);
+            fprintf(stderr, "gex-wgpu: compute texture buffer %u has no "
+                    "buffer bound; reading zero\n", slot);
          }
-         goto release_views;
+         buftex_buffer = gex_wgpu_placeholder_storage(ctx, 0);
+         if (!buftex_buffer)
+            goto release_views;
+         buftex_offset = 0;
+         buftex_placeholder = true;
+      } else {
+         buftex_buffer = gex_resource(view->texture)->buffer;
+         buftex_offset = view->u.buf.offset;
       }
       entries[count] =
          (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
@@ -22777,8 +22795,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       entries[count].buffer.hasDynamicOffset = false;
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       bindings[count].binding = compute->buftex_bindings[i];
-      bindings[count].buffer = gex_resource(view->texture)->buffer;
-      bindings[count].offset = view->u.buf.offset;
+      bindings[count].buffer = buftex_buffer;
+      bindings[count].offset = buftex_offset;
       /* Rounded up to four: WebGPU wants a storage binding's size to be a multiple
        * of four, and a buffer texture of a narrow format need not be -- five R8
        * texels is five bytes. The allocation is 16-aligned, so the rounding never
@@ -22787,8 +22805,13 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
        *
        *   Binding size (5) of [Buffer] isn't a multiple of 4 when binding type is
        *   (BufferBindingType::ReadOnlyStorage).
+       *
+       * The placeholder is bound whole: an explicit zero is a rejected
+       * binding, and `view` is NULL on that path anyway.
        */
-      bindings[count].size = ALIGN_POT(view->u.buf.size, 4);
+      bindings[count].size = buftex_placeholder
+         ? ctx->placeholder_storage->width0
+         : ALIGN_POT(view->u.buf.size, 4);
       ++count;
    }
 
@@ -27842,6 +27865,8 @@ gex_wgpu_create_tcs_state(struct pipe_context *pipe,
    }
    /* Read before anything touches info.cs: the two share a union. */
    tcs->vertices_out = nir->info.tess.tcs_vertices_out;
+   /* Before the UBO lowering below; see the compute stage's copy. */
+   gex_wgpu_lower_dynamic_ubo_index(nir, GEX_WGPU_MAX_CONSTANT_BUFFERS);
    const char *refusal = NULL;
    if (!tcs->vertices_out || tcs->vertices_out > 32)
       refusal = "gex_wgpu tessellation control shaders must emit 1..32 vertices";
@@ -28025,6 +28050,8 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
       tes->spacing = PIPE_TESS_SPACING_EQUAL;
       break;
    }
+   /* Before the UBO lowering below; see the compute stage's copy. */
+   gex_wgpu_lower_dynamic_ubo_index(nir, GEX_WGPU_MAX_CONSTANT_BUFFERS);
    const char *refusal = NULL;
    if (tes->domain != TESS_PRIMITIVE_TRIANGLES &&
        tes->domain != TESS_PRIMITIVE_QUADS &&
@@ -28435,6 +28462,8 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       gs->max_vertices - (output_kind->least_vertices - 1);
    gs->max_triangles = gs->max_output_prims;
 
+   /* Before the UBO lowering below; see the compute stage's copy. */
+   gex_wgpu_lower_dynamic_ubo_index(nir, GEX_WGPU_MAX_CONSTANT_BUFFERS);
    if (!gex_wgpu_lower_gallium_ubos(
           nir, MESA_SHADER_GEOMETRY,
           gex_screen(pipe->screen)->max_uniform_buffers, NULL, 0) ||
@@ -41040,22 +41069,38 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const unsigned slot = ctx->vs->buftex_slots[i];
          const struct pipe_sampler_view *view =
             ctx->vertex_sampler_views[slot];
+         /* An unbound or incomplete buffer texture reads as **zero** in GL,
+          * so the zero-filled placeholder is the answer the spec gives rather
+          * than a stand-in for one. This used to call gex_fail(), which
+          * latches the context: one shader sampling a samplerBuffer nobody
+          * had bound killed every later draw in the program, not just its
+          * own. A dispatch declining is bad; a context latching is worse. */
+         WGPUBuffer buftex_buffer;
+         uint64_t buftex_offset, buftex_size;
          if (!view || view->target != PIPE_BUFFER || !view->texture) {
             static bool said;
             if (!said) {
                said = true;
                fprintf(stderr, "gex-wgpu: vertex texture buffer %u has no "
-                       "buffer bound\n", slot);
+                       "buffer bound; reading zero\n", slot);
             }
-            gex_fail(ctx);
-            GEX_DRAW_DROP();
+            buftex_buffer = gex_wgpu_placeholder_storage(ctx, 0);
+            if (!buftex_buffer)
+               GEX_DRAW_DROP();
+            buftex_offset = 0;
+            /* The whole placeholder; an explicit zero is a rejected binding. */
+            buftex_size = ctx->placeholder_storage->width0;
+         } else {
+            buftex_buffer = gex_resource(view->texture)->buffer;
+            buftex_offset = view->u.buf.offset;
+            /* Rounded to four; see the note in the capture path. */
+            buftex_size = ALIGN_POT(view->u.buf.size, 4);
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = ctx->vs->buftex_bindings[i];
-         entries[at].buffer = gex_resource(view->texture)->buffer;
-         entries[at].offset = view->u.buf.offset;
-         /* Rounded to four; see the note in the capture path. */
-         entries[at].size = ALIGN_POT(view->u.buf.size, 4);
+         entries[at].buffer = buftex_buffer;
+         entries[at].offset = buftex_offset;
+         entries[at].size = buftex_size;
       }
       /* Packed images, as in the layout above. */
       for (unsigned i = 0; i < ctx->vs->packed_image_count; ++i) {
@@ -41373,22 +41418,38 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                              ctx->fs->image_count + i;
          const unsigned slot = ctx->fs->buftex_slots[i];
          const struct pipe_sampler_view *view = ctx->sampler_views[slot];
+         /* An unbound or incomplete buffer texture reads as **zero** in GL,
+          * so the zero-filled placeholder is the answer the spec gives rather
+          * than a stand-in for one. This used to call gex_fail(), which
+          * latches the context: one shader sampling a samplerBuffer nobody
+          * had bound killed every later draw in the program, not just its
+          * own. A dispatch declining is bad; a context latching is worse. */
+         WGPUBuffer buftex_buffer;
+         uint64_t buftex_offset, buftex_size;
          if (!view || view->target != PIPE_BUFFER || !view->texture) {
             static bool said;
             if (!said) {
                said = true;
                fprintf(stderr, "gex-wgpu: fragment texture buffer %u has no "
-                       "buffer bound\n", slot);
+                       "buffer bound; reading zero\n", slot);
             }
-            gex_fail(ctx);
-            GEX_DRAW_DROP();
+            buftex_buffer = gex_wgpu_placeholder_storage(ctx, 0);
+            if (!buftex_buffer)
+               GEX_DRAW_DROP();
+            buftex_offset = 0;
+            /* The whole placeholder; an explicit zero is a rejected binding. */
+            buftex_size = ctx->placeholder_storage->width0;
+         } else {
+            buftex_buffer = gex_resource(view->texture)->buffer;
+            buftex_offset = view->u.buf.offset;
+            /* Rounded to four; see the note in the capture path. */
+            buftex_size = ALIGN_POT(view->u.buf.size, 4);
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = ctx->fs->buftex_bindings[i];
-         entries[at].buffer = gex_resource(view->texture)->buffer;
-         entries[at].offset = view->u.buf.offset;
-         /* Rounded to four; see the note in the capture path. */
-         entries[at].size = ALIGN_POT(view->u.buf.size, 4);
+         entries[at].buffer = buftex_buffer;
+         entries[at].offset = buftex_offset;
+         entries[at].size = buftex_size;
       }
       for (unsigned i = 0; i < ctx->fs->packed_image_count; ++i) {
          const unsigned base = ctx->fs->ubo_count + ctx->fs->ssbo_count +
