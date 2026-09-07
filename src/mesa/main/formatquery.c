@@ -1702,7 +1702,16 @@ _mesa_GetInternalformati64v(GLenum target, GLenum internalformat,
 {
    GLint params32[16];
    unsigned i;
-   GLsizei realSize = MIN2(bufSize, 16);
+   /* bufSize belongs to the application, and a negative one is its mistake:
+    * _mesa_GetInternalformativ below raises GL_INVALID_VALUE for it. But
+    * realSize bounds the loop that seeds params32, and that loop's counter is
+    * unsigned -- so a negative bufSize is promoted to about four billion and
+    * the seeding overruns this 16-element stack array long before the call
+    * that would have validated it. Clamp, and let the error be raised where
+    * it belongs. Reachable from any GL client, and in the WebGPU host from a
+    * sandboxed guest's command stream.
+    */
+   GLsizei realSize = CLAMP(bufSize, 0, 16);
    GLsizei callSize;
 
    GET_CURRENT_CONTEXT(ctx);
