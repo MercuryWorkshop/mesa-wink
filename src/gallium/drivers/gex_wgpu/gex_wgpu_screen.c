@@ -9645,6 +9645,8 @@ enum gex_wgpu_capture_conv {
    GEX_CAPTURE_SSCALED,
    GEX_CAPTURE_UINT,    /* a narrow integer, zero-extended */
    GEX_CAPTURE_SINT,    /* a narrow integer, sign-extended */
+   GEX_CAPTURE_FLOAT16, /* a half float, in the low or high half of its word */
+   GEX_CAPTURE_11F11F10F, /* the whole word is three packed floats */
 };
 
 struct gex_wgpu_capture_pack {
@@ -9675,9 +9677,15 @@ struct gex_wgpu_capture_pack {
    { 1, 4, {0,0,0,0}, {0,10,20,30}, {10,10,10,2}, (c) }
 #define GEX_CAPTURE_1010102_BGRA(c) \
    { 1, 4, {0,0,0,0}, {20,10,0,30}, {10,10,10,2}, (c) }
+/* Two 8-bit components in one word. */
+#define GEX_CAPTURE_88(c) \
+   { 1, 2, {0,0,0,0}, {0,8,0,0}, {8,8,0,0}, (c) }
 /* N plain 32-bit components. */
 #define GEX_CAPTURE_32(n, c) \
    { (n), (n), {0,1,2,3}, {0,0,0,0}, {32,32,32,32}, (c) }
+/* Three floats sharing one word, unpacked whole. */
+#define GEX_CAPTURE_PACKED3 \
+   { 1, 3, {0,0,0,0}, {0,0,0,0}, {32,32,32,32}, GEX_CAPTURE_11F11F10F }
 
 static bool
 gex_wgpu_capture_pack_for(enum pipe_format format,
@@ -9724,10 +9732,76 @@ gex_wgpu_capture_pack_for(enum pipe_format format,
       { PIPE_FORMAT_R10G10B10A2_SSCALED, GEX_CAPTURE_1010102(GEX_CAPTURE_SSCALED) },
       { PIPE_FORMAT_B10G10R10A2_UNORM,   GEX_CAPTURE_1010102_BGRA(GEX_CAPTURE_UNORM) },
       { PIPE_FORMAT_B10G10R10A2_SNORM,   GEX_CAPTURE_1010102_BGRA(GEX_CAPTURE_SNORM) },
+      { PIPE_FORMAT_B10G10R10A2_USCALED, GEX_CAPTURE_1010102_BGRA(GEX_CAPTURE_USCALED) },
+      { PIPE_FORMAT_B10G10R10A2_SSCALED, GEX_CAPTURE_1010102_BGRA(GEX_CAPTURE_SSCALED) },
+
+      /* The two-component and narrow-integer forms. KHR-GL45's
+       * direct_state_access family reaches almost all of these: 54 of its 371
+       * cases failed on them, every one through a transform feedback that
+       * recorded nothing. */
+      { PIPE_FORMAT_R8G8_UNORM,          GEX_CAPTURE_88(GEX_CAPTURE_UNORM) },
+      { PIPE_FORMAT_R8G8_SNORM,          GEX_CAPTURE_88(GEX_CAPTURE_SNORM) },
+      { PIPE_FORMAT_R8G8_UINT,           GEX_CAPTURE_88(GEX_CAPTURE_UINT) },
+      { PIPE_FORMAT_R8G8_SINT,           GEX_CAPTURE_88(GEX_CAPTURE_SINT) },
+      { PIPE_FORMAT_R8G8B8A8_UINT,       GEX_CAPTURE_8888(GEX_CAPTURE_UINT) },
+      { PIPE_FORMAT_R8G8B8A8_SINT,       GEX_CAPTURE_8888(GEX_CAPTURE_SINT) },
+      { PIPE_FORMAT_R16G16_UNORM,        GEX_CAPTURE_1616(GEX_CAPTURE_UNORM) },
+      { PIPE_FORMAT_R16G16_SNORM,        GEX_CAPTURE_1616(GEX_CAPTURE_SNORM) },
+      { PIPE_FORMAT_R16G16B16A16_UINT,   GEX_CAPTURE_16161616(GEX_CAPTURE_UINT) },
+      { PIPE_FORMAT_R16G16B16A16_SINT,   GEX_CAPTURE_16161616(GEX_CAPTURE_SINT) },
+
+      /* Half floats, and the one format whose three components share a word
+       * in a layout no bitfield describes. */
+      { PIPE_FORMAT_R16G16_FLOAT,        GEX_CAPTURE_1616(GEX_CAPTURE_FLOAT16) },
+      { PIPE_FORMAT_R16G16B16A16_FLOAT,  GEX_CAPTURE_16161616(GEX_CAPTURE_FLOAT16) },
+      { PIPE_FORMAT_R11G11B10_FLOAT,     GEX_CAPTURE_PACKED3 },
    };
    for (unsigned i = 0; i < ARRAY_SIZE(table); ++i)
       if (table[i].format == format) { *out = table[i].pack; return true; }
    return false;
+}
+
+/* Defined with the rest of the vertex-layout code, four thousand lines below,
+   and needed here to compare the two tables. */
+static WGPUVertexFormat gex_wgpu_vertex_format(enum pipe_format format,
+                                               unsigned *size,
+                                               unsigned *alignment);
+
+/* The two sets have to be equal, so check rather than trust.
+ *
+ * gex_wgpu_vertex_format decides which vertex formats this driver advertises,
+ * and u_vbuf translates only the ones it declines -- so every format the
+ * render path accepts arrives at the capture path untranslated and needs an
+ * unpacker here. When the two drifted apart the symptom was a transform
+ * feedback that silently recorded nothing: twelve formats' worth in
+ * KHR-GL44.vertex_attrib_binding, and fifteen more behind
+ * KHR-GL45.direct_state_access's 54 failures. Nothing connected the two
+ * tables, so nothing could notice.
+ *
+ * This walks every pipe format once at screen setup and names any that the
+ * render path takes and this one cannot read. Silent when they agree, which
+ * is why it can run unconditionally. */
+static void
+gex_wgpu_check_capture_formats(void)
+{
+   unsigned missing = 0;
+   for (unsigned f = 1; f < PIPE_FORMAT_COUNT; ++f) {
+      unsigned size, alignment;
+      if (!gex_wgpu_vertex_format((enum pipe_format)f, &size, &alignment))
+         continue;
+      struct gex_wgpu_capture_pack pack;
+      if (gex_wgpu_capture_pack_for((enum pipe_format)f, &pack))
+         continue;
+      fprintf(stderr,
+              "gex-wgpu: vertex format %s is advertised but the transform "
+              "feedback capture has no unpacker for it -- captures of a "
+              "shader reading it will record nothing\n",
+              util_format_short_name((enum pipe_format)f));
+      ++missing;
+   }
+   if (missing)
+      fprintf(stderr, "gex-wgpu: %u vertex formats have no capture unpacker\n",
+              missing);
 }
 
 /* One component, out of the words already loaded. */
@@ -9741,6 +9815,31 @@ gex_wgpu_capture_component(nir_builder *b,
 
    if (pack->conv == GEX_CAPTURE_RAW)
       return word;
+
+   /* The small floats are converted by hand, not with nir_unpack_half_2x16 or
+    * nir_format_unpack_11f11f10f: every NIR route to a half ends in a 16-bit
+    * type and Tint's SPIR-V reader has none -- "unhandled integer width: 16"
+    * -- so this uses the helper the buffer-texture path already has for the
+    * same reason, which does the conversion in 32-bit arithmetic throughout. */
+   if (pack->conv == GEX_CAPTURE_FLOAT16) {
+      nir_def *half = nir_iand_imm(b, nir_ushr_imm(b, word, pack->shift[i]),
+                                   0xffffu);
+      return gex_wgpu_small_float_to_float(b, half, 10, true);
+   }
+
+   /* R11G11B10_FLOAT is three unsigned floats of two shapes sharing one word:
+    * eleven bits with a six-bit mantissa for r and g, ten with a five-bit
+    * mantissa for b, and no sign anywhere. */
+   if (pack->conv == GEX_CAPTURE_11F11F10F) {
+      static const struct { unsigned shift, width, mantissa; } packed[3] = {
+         { 0, 11, 6 }, { 11, 11, 6 }, { 22, 10, 5 },
+      };
+      nir_def *field =
+         nir_iand_imm(b, nir_ushr_imm(b, word, packed[i].shift),
+                      (1u << packed[i].width) - 1u);
+      return gex_wgpu_small_float_to_float(b, field, packed[i].mantissa,
+                                           false);
+   }
 
    /* Sign-extend by shifting the field to the top of the word and back down
     * arithmetically; zero-extend by masking. */
@@ -41849,6 +41948,10 @@ gex_wgpu_screen_create(WGPUDevice device)
       return NULL;
    }
    screen->device = device;
+   /* Says nothing when the vertex-format tables agree, which is the point:
+      the last two times they drifted, the only symptom was a transform
+      feedback that recorded nothing. */
+   gex_wgpu_check_capture_formats();
    WGPULimits limits = WGPU_LIMITS_INIT;
    /* WebGPU's guaranteed minimums, which is what the device is assumed to
     * have until it says otherwise. */
