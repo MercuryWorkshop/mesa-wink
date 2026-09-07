@@ -1747,6 +1747,14 @@ struct gex_wgpu_context {
    /* Samples per pixel of the bound framebuffer. WebGPU requires the render
     * pipeline's sample count to match its attachments exactly. */
    uint32_t fb_samples;
+   /* Whether the bound framebuffer's attachments are *multisample* at all,
+    * which is GL's SAMPLE_BUFFERS and a different question from how many
+    * samples they have. A texture made with glTexImage2DMultisample and
+    * samples=1 is multisample and has SAMPLE_BUFFERS 1; an ordinary texture
+    * is not and has zero. fb_samples cannot tell them apart -- it is
+    * MAX2(1, nr_samples), so both come out as one -- and the multisample
+    * fragment operations are gated on this rather than on the count. */
+   bool fb_multisample;
    bool viewport_set;
    /* Slots one and above of the viewport and scissor arrays. Slot zero lives
     * in ctx->viewport / ctx->scissor above, because every draw uses it and
@@ -13249,7 +13257,12 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * shader that needs no other variant takes that return, keeps its base
     * module, and goes on discarding its fragments. */
    const bool want_ignore_sample_mask =
-      ctx->fb_samples <= 1 && fs->original_nir &&
+      /* SAMPLE_BUFFERS, not the sample count. `fb_samples <= 1` also caught a
+       * *multisample* framebuffer holding one sample, where GL does perform
+       * the multisample fragment operations and the mask must apply -- every
+       * one of KHR-GL44.sample_variables' 37 failures was that framebuffer,
+       * nine in each of its four formats and none at any other count. */
+      !ctx->fb_multisample && fs->original_nir &&
       (fs->original_nir->info.outputs_written &
        BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK)) != 0;
    /* Slots the bound state cannot satisfy; their samplers are removed from
@@ -24627,6 +24640,9 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
     * GL_OUT_OF_MEMORY -- this driver's latched context, seen from the
     * application -- on a framebuffer that was otherwise complete. */
    uint32_t samples = 0;
+   /* Any multisample attachment makes SAMPLE_BUFFERS one. Read from the raw
+    * nr_samples, before the MAX2 below folds zero and one together. */
+   bool multisample = false;
    for (unsigned i = 0; i < color_count; ++i) {
       /* A hole is a null entry with a real count around it -- see the
        * glDrawBuffers(GL_NONE) case above -- so this cannot dereference
@@ -24634,6 +24650,8 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
        * multisample a framebuffer with a hole in it. */
       if (!colors[i])
          continue;
+      if (colors[i]->nr_samples >= 1)
+         multisample = true;
       const uint32_t attachment = MAX2(1, colors[i]->nr_samples);
       if (!samples)
          samples = attachment;
@@ -24641,6 +24659,8 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
          gex_decline(ctx);
    }
    if (depth) {
+      if (depth->nr_samples >= 1)
+         multisample = true;
       const uint32_t attachment = MAX2(1, depth->nr_samples);
       if (!samples)
          samples = attachment;
@@ -24648,6 +24668,7 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
          gex_decline(ctx);
    }
    ctx->fb_samples = MAX2(1, samples);
+   ctx->fb_multisample = multisample;
 }
 
 /* Build, or find, the compute variant of this vertex shader for this vertex
@@ -42104,9 +42125,11 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * reaches the driver. Free here: the 4-byte alignment above already puts
     * u_vbuf permanently in its fallback path. */
    caps->vertex_attrib_within_stride = true;
-   /* WebGPU offers 4x multisampling for the ordinary formats and none at all
-    * for the 32-bit-per-component ones, so the sample counts this driver
-    * reports really do depend on the format and must not be padded. */
+   /* WebGPU offers 4x for the ordinary formats and none at all for the
+    * 32-bit-per-component ones, so the sample counts this driver reports
+    * really do depend on the format and must not be padded up to the context
+    * maximum. Reporting only what can be allocated turned eighteen
+    * sample_variables cases from failures into honest "not supported". */
    caps->exact_sample_counts = true;
    caps->user_vertex_buffers = false;
    /* gl_InstanceID reaches WGSL as @builtin(instance_index), proven by the

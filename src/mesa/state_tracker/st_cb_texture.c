@@ -3503,19 +3503,10 @@ st_texture_storage(struct gl_context *ctx,
       enum pipe_texture_target ptarget = gl_target_to_pipe(texObj->Target);
       bool found = false;
 
-      if (ctx->Const.MaxSamples > 1 && num_samples == 1 &&
-          !screen->caps.exact_sample_counts) {
+      if (ctx->Const.MaxSamples > 1 && num_samples == 1) {
          /* don't try num_samples = 1 with drivers that support real msaa */
          num_samples = 2;
       }
-      /* A driver with real per-format sample counts is left at the one the
-       * caller asked for. Bumping a single-sample request past 1 assumes that
-       * anything doing multisampling at all does it for every format, and
-       * where that is false the bump turns a request the driver *can* serve
-       * into a search through counts it cannot: a one-sample GL_RGBA32F
-       * multisample texture -- an ordinary texture, really -- became
-       * GL_INVALID_OPERATION because WebGPU multisamples no
-       * 32-bit-per-component format at any count above one. */
 
       for (; num_samples <= MAX_SAMPLES; num_samples++) {
          if (screen->is_format_supported(screen, fmt, ptarget,
