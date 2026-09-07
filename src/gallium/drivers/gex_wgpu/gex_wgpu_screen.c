@@ -28364,6 +28364,38 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       wgpuBufferRelease(params_buffer);
       return false;
    }
+   /* Both groups feed one compute stage, so WebGPU adds their storage buffers
+    * and compares the total against maxStorageBuffersPerShaderStage. Over that
+    * it rejects the layout, which invalidates the pipeline and the command
+    * buffer with it -- so everything already recorded is lost, not just this
+    * capture.
+    *
+    * gex_wgpu_dispatch has checked this for a long time. This path builds its
+    * own layouts and pipeline and never went through it, and the budget here
+    * is easy to exceed: eight vertex buffers, four transform feedback
+    * targets, the index table and the parameter block come to fourteen
+    * against an adapter that grants ten. That is what
+    * KHR-GL45.direct_state_access.vertex_arrays_enable_disable_attributes
+    * hit -- "The number of storage buffers (11) in the Compute stage exceeds
+    * the maximum per-stage limit (10)", then an invalid BindGroupLayout, an
+    * invalid PipelineLayout, and no word about which draw did it. */
+   {
+      unsigned storage = 0;
+      for (unsigned i = 0; i < count; ++i)
+         if (entries[i].buffer.type == WGPUBufferBindingType_Storage ||
+             entries[i].buffer.type == WGPUBufferBindingType_ReadOnlyStorage)
+            ++storage;
+      for (unsigned i = 0; i < ubo_total; ++i)
+         if (ubo_entries[i].buffer.type == WGPUBufferBindingType_Storage ||
+             ubo_entries[i].buffer.type == WGPUBufferBindingType_ReadOnlyStorage)
+            ++storage;
+      const unsigned have = screen->max_storage_buffers;
+      if (have && storage > have) {
+         wgpuBufferRelease(params_buffer);
+         GEX_CAPTURE_LIMIT("more storage buffers than the device takes for "
+                           "one compute stage");
+      }
+   }
    WGPUBindGroupLayoutDescriptor layout_desc =
       WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    layout_desc.entryCount = count;
