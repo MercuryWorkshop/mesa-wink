@@ -12605,6 +12605,47 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    if (expected_stage == MESA_SHADER_FRAGMENT)
       shader->fb_fetch = gex_wgpu_lower_fb_fetch(nir);
 
+   /* layout(early_fragment_tests) in, which cannot be honoured here.
+    *
+    * GL's early fragment tests run the depth and stencil tests *before* the
+    * shader, so a fragment they kill performs none of the shader's side
+    * effects. The tests themselves happen either way and the colour is right
+    * either way; the only observable difference is whether a killed
+    * fragment's image stores, image atomics and storage writes happen. So
+    * this is silent for every shader that has none, and wrong for one that
+    * does.
+    *
+    * There is no way to ask for it. SPIR-V has the EarlyFragmentTests
+    * execution mode and NIR carries the request in
+    * info.fs.early_fragment_tests, but the module reaches Dawn as WGSL and
+    * WGSL has no attribute for it, so the round trip through Tint drops it
+    * whatever the SPIR-V said. WebGPU's own rule is the opposite of what is
+    * wanted: an implementation may test early only when the shader has no
+    * side effects, which is exactly the case where it would not matter.
+    *
+    * Not emulated. A snapshot of the depth attachment compared in the shader
+    * would be exact only where nothing writes depth during the draw, and
+    * approximating the rest is how this driver has produced its worst bugs.
+    * Not refused either: declining the draw would lose the rendering as well,
+    * and over-applying side effects is the lesser wrong. Said once per shader
+    * so it is not silent.
+    *
+    * KHR-GL44.shader_image_load_store.early-fragment-tests and
+    * basic-glsl-earlyFragTests are this, and only this. */
+   if (expected_stage == MESA_SHADER_FRAGMENT &&
+       nir->info.fs.early_fragment_tests &&
+       (nir->info.num_images || nir->info.num_ssbos)) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr,
+                 "gex-wgpu: a fragment shader asks for early_fragment_tests "
+                 "and writes images or storage buffers; WGSL cannot express "
+                 "the request, so side effects of depth-killed fragments "
+                 "still happen\n");
+      }
+   }
+
    if (expected_stage == MESA_SHADER_FRAGMENT) {
       shader->color_output_type = nir_type_float;
       nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
