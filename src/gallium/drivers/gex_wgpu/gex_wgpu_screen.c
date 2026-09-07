@@ -15489,6 +15489,10 @@ gex_wgpu_default_texture_view(struct gex_wgpu_screen *screen,
                               WGPUTextureViewDimension dimension,
                               WGPUTextureSampleType sample_type);
 
+static WGPUSampler
+gex_wgpu_default_sampler(struct gex_wgpu_screen *screen,
+                         WGPUSamplerBindingType type);
+
 static WGPUBuffer
 gex_wgpu_placeholder_storage(struct gex_wgpu_context *ctx, uint64_t least)
 {
@@ -22881,17 +22885,14 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       const unsigned slot = compute->texture_slots[i];
       struct gex_wgpu_sampler_view *view =
          (struct gex_wgpu_sampler_view *)ctx->compute_sampler_views[slot];
-      if (!view) {
-         static bool said;
-         if (!said) {
-            said = true;
-            fprintf(stderr, "gex-wgpu: compute texture %u has no view bound; "
-                    "the dispatch will be dropped\n", slot);
-         }
-         gex_fail(ctx);
-         goto release_views;
-      }
-      gex_wgpu_sampler_view_refresh(pipe, view);
+      /* GL leaves units enabled with nothing bound, and says such a unit
+       * samples as opaque black -- so the 1x1 stand-in the graphics stages
+       * already bind is the answer here too. This used to gex_fail(), which
+       * latches: one compute shader declaring a sampler the application never
+       * bound killed every later draw *and* dispatch in the program. */
+      WGPUTextureView compute_view = NULL;
+      if (view)
+         gex_wgpu_sampler_view_refresh(pipe, view);
       /* A depth view read by a shader that declared a plain sampler, which
        * GL allows and WebGPU serves only as unfilterable-float with a
        * non-filtering sampler -- the same rule the draw path applies, and it
@@ -22905,7 +22906,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          compute->texture_sample_types[i];
       const struct gex_wgpu_sampler *compute_sampler =
          slot < GEX_WGPU_MAX_SAMPLERS ? ctx->compute_samplers[slot] : NULL;
-      if (gex_wgpu_format_sample_type(view->base.format) ==
+      if (view &&
+          gex_wgpu_format_sample_type(view->base.format) ==
              WGPUTextureSampleType_Depth &&
           compute_sample_type == WGPUTextureSampleType_Float &&
           (!compute_sampler ||
@@ -22921,8 +22923,22 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       entries[count].texture.viewDimension = compute->texture_dimensions[i];
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       bindings[count].binding = compute->texture_bindings[i];
-      bindings[count].textureView = gex_wgpu_stage_texture_view(
-         &view->base, compute->texture_dimensions[i]);
+      compute_view = view
+         ? gex_wgpu_stage_texture_view(&view->base,
+                                       compute->texture_dimensions[i])
+         : gex_wgpu_default_texture_view(gex_screen(ctx->base.screen),
+                                         compute->texture_dimensions[i],
+                                         compute_sample_type);
+      if (!compute_view) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: dispatch declined (no view for compute "
+                    "texture %u)\n", slot);
+         }
+         goto release_views;
+      }
+      bindings[count].textureView = compute_view;
       ++count;
    }
    for (unsigned i = 0; i < compute->sampler_count; ++i) {
@@ -22945,15 +22961,21 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          ? ((compute_depth_as_float & (1u << slot)) && sampler->nonfiltering
                ? sampler->nonfiltering : sampler->sampler)
          : NULL;
-      if (!sampler) {
-         static bool said;
-         if (!said) {
-            said = true;
-            fprintf(stderr, "gex-wgpu: compute sampler %u has no state "
-                    "bound\n", slot);
+      if (!bindings[count].sampler) {
+         /* GL's default sampler state, which is what st/mesa would have sent
+          * for a unit the application left alone. Latching here had the same
+          * reach as the texture case above. */
+         bindings[count].sampler = gex_wgpu_default_sampler(
+            gex_screen(ctx->base.screen), entries[count].sampler.type);
+         if (!bindings[count].sampler) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: dispatch declined (no sampler for "
+                       "compute slot %u)\n", slot);
+            }
+            goto release_views;
          }
-         gex_fail(ctx);
-         goto release_views;
       }
       ++count;
    }
