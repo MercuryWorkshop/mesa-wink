@@ -3014,24 +3014,61 @@ static bool
 gex_wgpu_lower_dynamic_ubo_index_instr(nir_builder *b, nir_instr *instr,
                                        void *data)
 {
-   const unsigned blocks = *(const unsigned *)data;
+   const unsigned limit = *(const unsigned *)data;
    if (instr->type != nir_instr_type_intrinsic)
       return false;
    nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
    if (intr->intrinsic != nir_intrinsic_load_ubo ||
        nir_src_is_const(intr->src[0]))
       return false;
-   /* With one block there is nothing to choose between, and with none the
+
+   /* Which slots to unroll over is not 0..N. It is the set the block lookup
+    * in gex_wgpu_lower_ubo_load can answer for, and generating a load for
+    * any other slot fails the link on a block that does not exist.
+    *
+    * `uniform GOKU { ... } goku[14]` at `binding = 2` reaches here as a
+    * single variable at driver_location *1*, so the array owns slots 1..14
+    * and slot zero is not a block at all. Unrolling from zero asked for it
+    * and the link died on `load_ubo slot=0 block=(none)`; capping at the
+    * device's uniform-buffer count then missed elements 12..14, which are
+    * legal and merely spilled to storage bindings, so the shader would have
+    * read the wrong elements had it linked. Both ends were wrong.
+    *
+    * The rule is the lookup's own: a slot below num_ubos that some block
+    * variable sits at or below. Cheap to ask -- there are at most sixteen
+    * slots and a handful of variables -- and it stays right for a shader
+    * with several arrays, or with a default uniform block at slot zero and
+    * an array above it. */
+   const unsigned bound = MIN2(b->shader->info.num_ubos, limit);
+   unsigned slots[GEX_WGPU_MAX_CONSTANT_BUFFERS];
+   unsigned count = 0;
+   for (unsigned i = 0; i < bound && count < ARRAY_SIZE(slots); ++i) {
+      bool owned = false;
+      nir_foreach_variable_with_modes(var, b->shader, nir_var_mem_ubo) {
+         /* An unassigned driver_location means the shader was never linked
+          * and the lookup falls back to the GL binding; match what it does. */
+         const unsigned at = var->data.driver_location == UINT_MAX
+            ? var->data.binding : var->data.driver_location;
+         if (at <= i) {
+            owned = true;
+            break;
+         }
+      }
+      if (owned)
+         slots[count++] = i;
+   }
+   /* With one slot there is nothing to choose between, and with none the
     * bound is not established -- leave the caller's refusal in place rather
     * than guess at a block nothing is bound to. */
-   if (blocks < 2)
+   if (count < 2)
       return false;
 
    b->cursor = nir_before_instr(instr);
    nir_def *index = intr->src[0].ssa;
    nir_def *offset = intr->src[1].ssa;
    nir_def *result = NULL;
-   for (unsigned i = 0; i < blocks; ++i) {
+   for (unsigned k = 0; k < count; ++k) {
+      const unsigned i = slots[k];
       nir_def *one = nir_load_ubo(
          b, intr->def.num_components, intr->def.bit_size,
          nir_imm_int(b, i), offset,
@@ -3049,13 +3086,17 @@ gex_wgpu_lower_dynamic_ubo_index_instr(nir_builder *b, nir_instr *instr,
 static bool
 gex_wgpu_lower_dynamic_ubo_index(nir_shader *nir, unsigned max_ubos)
 {
-   unsigned blocks = MIN2(nir->info.num_ubos, max_ubos);
+   /* `max_ubos` is the driver's constant-buffer ceiling, not the device's
+    * uniform-buffer count: a slot past the latter is spilled to a storage
+    * binding and is still a perfectly good block, so clamping to it dropped
+    * the tail of every array longer than the device's limit. */
+   unsigned limit = MIN2(max_ubos, (unsigned)GEX_WGPU_MAX_CONSTANT_BUFFERS);
    if (getenv("GEX_WGPU_SPLIT_LOG"))
-      fprintf(stderr, "gex-split: %u uniform block(s) to unroll a dynamic "
-              "index over\n", blocks);
+      fprintf(stderr, "gex-split: dynamic ubo index over at most %u slot(s), "
+              "shader declares %u\n", limit, nir->info.num_ubos);
    return nir_shader_instructions_pass(
       nir, gex_wgpu_lower_dynamic_ubo_index_instr,
-      nir_metadata_control_flow, &blocks);
+      nir_metadata_control_flow, &limit);
 }
 
 static bool
@@ -11505,8 +11546,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       return NULL;
    }
    /* Before the lowering below, which is keyed on a constant block number. */
-   gex_wgpu_lower_dynamic_ubo_index(
-      nir, gex_screen(pipe->screen)->max_uniform_buffers);
+   gex_wgpu_lower_dynamic_ubo_index(nir, GEX_WGPU_MAX_CONSTANT_BUFFERS);
    {
       char why[160] = "";
       if (!gex_wgpu_lower_gallium_ubos(nir, expected_stage,
@@ -38980,20 +39020,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * invalid, and the draw disappeared without the GL caller seeing an error.
     * Eleven uniform blocks in one stage was enough, which is four fewer than
     * this driver advertises through GL_MAX_VERTEX_UNIFORM_BLOCKS. */
-   unsigned want_dynamic_uniform = ctx->vs->reads_draw_params ? 1u : 0u;
-   unsigned want_dynamic_storage = 0;
-   for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
-      if (ctx->vs->ubo_storage_mask & (UINT32_C(1) << i))
-         ++want_dynamic_storage;
-      else
-         ++want_dynamic_uniform;
-   }
-   for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
-      if (ctx->fs->ubo_storage_mask & (UINT32_C(1) << i))
-         ++want_dynamic_storage;
-      else
-         ++want_dynamic_uniform;
-   }
+   /* A popcount rather than a loop over the blocks: this runs on every draw
+    * and the answer depends only on the shader pair, so counting the spill
+    * mask's bits is the whole of it. The loops this replaced cost STK two
+    * frames in six hundred, which is small and was measurable. */
+   const unsigned vs_spilled = util_bitcount(ctx->vs->ubo_storage_mask);
+   const unsigned fs_spilled = util_bitcount(ctx->fs->ubo_storage_mask);
+   const unsigned want_dynamic_storage = vs_spilled + fs_spilled;
+   const unsigned want_dynamic_uniform =
+      (ctx->vs->ubo_count - vs_spilled) + (ctx->fs->ubo_count - fs_spilled) +
+      (ctx->vs->reads_draw_params ? 1u : 0u);
    const struct gex_wgpu_screen *dyn_screen = gex_screen(pipe->screen);
    const bool static_constant_offsets =
       want_dynamic_uniform > dyn_screen->max_dynamic_uniform_buffers ||
