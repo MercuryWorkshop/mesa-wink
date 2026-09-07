@@ -28087,16 +28087,19 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
       gs->passthrough_skip |= 1u << gs->viewport_slot;
    if (gs->layer_slot >= 0) {
       gs->passthrough_skip |= 1u << gs->layer_slot;
-      /* Layered rendering is a separate thing this driver does not do: WebGPU
-       * attaches one layer at a time, so everything lands on the framebuffer's
-       * bound layer. Saying so once is better than a link failure (which is
-       * what forwarding the slot produced) and better than silence. */
-      static bool said;
-      if (!said) {
-         said = true;
-         fprintf(stderr, "gex-wgpu: a geometry shader writes gl_Layer; this "
-                         "driver rasterizes the bound layer only\n");
-      }
+      /* The slot is kept out of the passthrough because forwarding it made
+       * the rasterizing half fail to link. The value is not lost: a layered
+       * framebuffer routes it, one render pass per layer, in
+       * gex_wgpu_gs_route_layers -- and with a single-layer framebuffer GL
+       * says every primitive lands on that layer anyway, which is what the
+       * ordinary draw does.
+       *
+       * This used to announce "this driver rasterizes the bound layer only",
+       * which was true when it was written and became false when the routing
+       * landed. It then cost an afternoon: it reads exactly like the
+       * diagnosis for a layered draw that renders nothing, and it is not one.
+       * A latched line that outlives what it describes is worse than
+       * silence. */
    }
    NIR_PASS(_, nir, nir_lower_gs_intrinsics, 0);
    if (getenv("GEX_WGPU_GS_VARYING_LOG")) {
