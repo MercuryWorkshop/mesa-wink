@@ -2148,6 +2148,17 @@ struct gex_wgpu_shader {
     * reads_sample_pos this suppresses the base module, because the locations
     * are only known once both stages are bound. */
    bool reads_clip_dist;
+   /* Vertex stage: where this shader's clip-distance carriers were emitted,
+    * and how many distances they hold. Chosen from *this shader's own*
+    * outputs at creation time, which is what lets them be written before
+    * gex_wgpu_neutralise_cull_distances replaces the cull components with
+    * 1.0 -- a carrier emitted later, in a variant cloned from the
+    * neutralised shader, copies those 1.0s and the fragment stage reads them
+    * instead of the real distances. Zero count means there was no room under
+    * WebGPU's inter-stage ceiling and a fragment shader that reads the
+    * distances cannot be served. */
+   unsigned clip_carrier[2];
+   unsigned clip_carrier_count;
    /* How many distances the fragment shader declares, clip and cull
     * together, and where the pair of carrier varyings landed. */
    unsigned clip_dist_count;
@@ -8696,6 +8707,37 @@ gex_wgpu_point_coord_location(const struct gex_wgpu_context *ctx)
    return ~0u;
 }
 
+/* Free locations among one shader's own outputs.
+ *
+ * The clip-distance carriers are emitted when the vertex shader is created,
+ * long before any fragment shader is bound, so their locations cannot depend
+ * on one. Deriving them from the vertex shader alone lets the fragment side
+ * compute the identical answer later from ctx->vs -- and a location free in
+ * the producing stage is free in the consuming one too, because a fragment
+ * shader's inputs are the vertex shader's outputs (an input nothing produces
+ * is zeroed by gex_wgpu_drop_unproduced_inputs, which does not need a slot).
+ */
+static bool
+gex_wgpu_output_free_locations(const nir_shader *nir, unsigned want,
+                               unsigned *out)
+{
+   uint32_t taken = 0;
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
+      if (!gex_wgpu_is_location_varying(var->data.location))
+         continue;
+      const int slot = var->data.location;
+      const unsigned location = slot >= VARYING_SLOT_VAR0
+         ? (unsigned)(slot - VARYING_SLOT_VAR0) : (unsigned)slot;
+      if (location < 32)
+         taken |= 1u << location;
+   }
+   unsigned found = 0;
+   for (unsigned location = 0; location < 15 && found < want; ++location)
+      if (!(taken & (1u << location)))
+         out[found++] = location;
+   return found == want;
+}
+
 /* The same search, for more than one location at once.
  *
  * gl_PointCoord needs one; the clip-distance carriers need two, because eight
@@ -11655,6 +11697,22 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * and everything that rasterises gets them neutralised. */
    if (expected_stage == MESA_SHADER_VERTEX)
       shader->cull_distances = nir->info.cull_distance_array_size;
+   /* Before the neutralisation below, which is the whole point: it replaces
+    * every cull component with 1.0 so the rasteriser will not clip on them,
+    * and a carrier written after that copies the 1.0 rather than the
+    * distance the shader computed. */
+   if (expected_stage == MESA_SHADER_VERTEX) {
+      const unsigned distances = nir->info.clip_distance_array_size +
+                                 nir->info.cull_distance_array_size;
+      if (distances) {
+         const unsigned carriers = DIV_ROUND_UP(MIN2(distances, 8u), 4u);
+         if (gex_wgpu_output_free_locations(nir, carriers,
+                                           shader->clip_carrier) &&
+             gex_wgpu_emit_clip_distance_carriers(nir, distances,
+                                                  shader->clip_carrier))
+            shader->clip_carrier_count = MIN2(distances, 8u);
+      }
+   }
    if (shader->cull_distances)
       gex_wgpu_neutralise_cull_distances(nir);
 
@@ -13224,19 +13282,24 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    unsigned clip_carrier[2] = {0, 0};
    unsigned want_clip_dist = 0;
    if (fs->reads_clip_dist && fs->clip_dist_count) {
-      const unsigned carriers = DIV_ROUND_UP(fs->clip_dist_count, 4u);
-      if (gex_wgpu_free_varying_locations(ctx, carriers, clip_carrier))
-         want_clip_dist = fs->clip_dist_count;
-      else {
+      /* Wherever the vertex stage put them. It chose at creation time, from
+       * its own outputs, so there is one answer and no agreement to keep. */
+      if (ctx->vs && ctx->vs->clip_carrier_count) {
+         clip_carrier[0] = ctx->vs->clip_carrier[0];
+         clip_carrier[1] = ctx->vs->clip_carrier[1];
+         want_clip_dist = MIN2(fs->clip_dist_count,
+                               ctx->vs->clip_carrier_count);
+      } else {
          /* Nothing left under WebGPU's inter-stage ceiling. Declining is the
           * honest answer and has to be said: without a variant this shader
           * has no module at all, so the draw would vanish silently. */
          static bool said;
          if (!said) {
             said = true;
-            fprintf(stderr, "gex-wgpu: no free varying locations for the "
-                    "clip-distance carriers, so a fragment shader reading "
-                    "gl_ClipDistance cannot be built\n");
+            fprintf(stderr, "gex-wgpu: the vertex stage has no clip-distance "
+                    "carriers (no free varying location, or it writes no "
+                    "distances), so a fragment shader reading gl_ClipDistance "
+                    "cannot be built\n");
          }
       }
    }
@@ -32609,13 +32672,10 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
             if (fs->varying_interp_mask & (1ull << i))
                want_width[i] = fs->varying_components[i];
          gex_wgpu_fit_varyings(clone, want_width);
-         /* And the clip-distance carriers, if that shader reads them. The
-            real clip-distance outputs are untouched: the rasteriser still
-            clips by them, and this is a second copy the fragment stage can
-            read, which WGSL gives it no other way to do. */
-         if (want_clip_dist)
-            gex_wgpu_emit_clip_distance_carriers(clone, want_clip_dist,
-                                                 want_clip_carrier);
+         /* The clip-distance carriers are not emitted here. They are written
+            when the shader is created, before the cull components are
+            neutralised, because this clone is of the *neutralised* shader and
+            a carrier filled from it holds 1.0 for every cull distance. */
       }
       /* Before the viewport fold, which is what makes the offset's scale a
        * viewport rather than a framebuffer one -- see
