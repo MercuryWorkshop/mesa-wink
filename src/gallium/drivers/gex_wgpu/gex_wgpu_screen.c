@@ -994,6 +994,9 @@ struct gex_wgpu_stage_textures {
  * all in the storage texture's type, and the layout has to name exactly the
  * same ones or the device rejects the group. */
 struct gex_wgpu_stage_images {
+   /* Filled by gex_wgpu_collect_stage_images when it refuses, so the caller's
+    * compile error can name the reason rather than the stage. */
+   char why[160];
    unsigned count;
    uint8_t slots[GEX_WGPU_MAX_SHADER_IMAGES];
    uint32_t bindings[GEX_WGPU_MAX_SHADER_IMAGES];
@@ -1029,6 +1032,12 @@ gex_wgpu_collect_stage_images(nir_shader *nir,
                               const char *stage)
 {
    memset(out, 0, sizeof(*out));
+   /* Why it refused, for the caller to hand the application. Every refusal
+    * below already prints its reason, but the *link error* said only
+    * "cannot serve an image in the <stage> stage" -- so an application saw
+    * the least useful half and the specific line went to a terminal nobody
+    * was reading. See gex_wgpu_stage_images::why. */
+   snprintf(out->why, sizeof(out->why), "an image this stage cannot serve");
    /* The same collection the graphics stages do, with the same two refusals:
     * WebGPU allows read_write storage only on the 32-bit single-channel
     * formats, and not every GL image format is a WebGPU storage texture. */
@@ -1140,6 +1149,23 @@ gex_wgpu_collect_stage_images(nir_shader *nir,
                  "storage texture for (dim %u%s); only 1d, 2d, 2d array and "
                  "3d exist\n", stage, var->name ? var->name : "(anon)", (unsigned)dim,
                  glsl_sampler_type_is_array(image_type) ? " array" : "");
+         /* An unformatted imageBuffer lands here, and it is the one shape
+          * that has somewhere to go: gex_wgpu_image_is_packed takes buffer
+          * images whatever their access, but only once the format is known,
+          * and a write-only image declared without a format qualifier gets
+          * its format from the image *unit* at draw time.
+          * gex_wgpu_resolve_unformatted_images does that resolution, and is
+          * called only from the compute dispatch path -- so a vertex or
+          * fragment stage reaches here and is refused instead.
+          * KHR-GL44.shader_image_load_store.advanced-sync-imageAccess and
+          * advanced-sso-atomicCounters are both
+          * `writeonly uniform imageBuffer` in a vertex shader. */
+         snprintf(out->why, sizeof(out->why),
+                  dim == GLSL_SAMPLER_DIM_BUF
+                     ? "image '%s' is an imageBuffer with no format "
+                       "qualifier, whose format is only known at draw time"
+                     : "image '%s' has a shape WGSL has no storage texture "
+                       "for", var->name ? var->name : "(anon)");
          return false;
       }
       ++out->count;
@@ -11819,9 +11845,11 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       NIR_PASS(_, nir, nir_opt_access, &access_options);
       struct gex_wgpu_stage_images classify;
       if (!gex_wgpu_collect_stage_images(nir, &classify, "vertex")) {
-         gex_wgpu_set_compile_error(
-            mutable_state,
-            "gex_wgpu cannot serve an image in the vertex stage");
+         char detail[224];
+         snprintf(detail, sizeof(detail),
+                  "gex_wgpu cannot serve an image in the vertex stage: %s",
+                  classify.why);
+         gex_wgpu_set_compile_error(mutable_state, detail);
          ralloc_free(nir);
          FREE(shader);
          return NULL;
