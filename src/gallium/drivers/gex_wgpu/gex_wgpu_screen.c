@@ -2343,6 +2343,11 @@ struct gex_wgpu_shader_variant {
    /* Texture slots removed from this variant because the bound state could
     * not satisfy their declaration; see gex_wgpu_unusable_texture_slots. */
    uint16_t omitted_slots;
+   /* Slots this variant rewrote from a multisampled declaration to an
+    * ordinary one, because the bound texture has a single sample. Part of the
+    * key: the same shader against a real multisample texture is a different
+    * module. */
+   uint16_t demoted_ms_slots;
    /* The polygon offset this variant computes itself, and the state it baked
     * in as immediates; see gex_wgpu_lower_polygon_offset_clamp. All four are
     * part of the key because all four are constants in the shader. */
@@ -7908,6 +7913,123 @@ gex_wgpu_omit_textures(nir_shader *nir, uint16_t slots)
    return state.progress;
 }
 
+/* Read a one-sample multisample texture as an ordinary one.
+ *
+ * `sampler2DMS` naming a texture with a single sample is perfectly good GL --
+ * glTexStorage2DMultisample takes samples=1, and a format WebGPU cannot
+ * multisample at all is left there (see caps->exact_sample_counts) -- but
+ * WebGPU has no such binding: `multisampled: true` requires sampleCount above
+ * one, and a sampleCount-1 texture is an ordinary texture. So the declaration
+ * is rewritten to match the texture rather than the texture refused.
+ *
+ * Exact, not approximate: with one sample, sample zero is the only sample, so
+ * dropping the sample index loses nothing. That is why this is a rewrite and
+ * not a substitution of the nearest working shape -- see the note about
+ * refusing rather than guessing.
+ *
+ * What it replaced: the slot was declared *unusable* and its sampler removed
+ * from the shader, so every fetch through it read zero and nothing said so.
+ * KHR-GL44.sample_variables' nine remaining failures are that, all of them
+ * rgba32f, which is exactly the format WebGPU will not multisample. */
+struct gex_wgpu_demote_ms {
+   uint16_t slots;
+   bool progress;
+};
+
+static bool
+gex_wgpu_demote_ms_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   struct gex_wgpu_demote_ms *state = data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_MS)
+      return false;
+   if (tex->texture_index >= 16 ||
+       !(state->slots & (uint16_t)(1u << tex->texture_index)))
+      return false;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   /* The sample index has no meaning once the texture has one sample, and
+    * leaving it makes the instruction disagree with its own op. */
+   for (unsigned i = 0; i < tex->num_srcs; ++i) {
+      if (tex->src[i].src_type == nir_tex_src_ms_index) {
+         nir_tex_instr_remove_src(tex, i);
+         break;
+      }
+   }
+   if (tex->op == nir_texop_txf_ms) {
+      tex->op = nir_texop_txf;
+      /* txf takes an explicit level and txf_ms has none, so one has to be
+       * added rather than merely dropping the sample index. Without it the
+       * instruction is short a source the emitter requires and the fetch
+       * came back zero -- which looks exactly like the omitted-sampler
+       * behaviour this pass exists to replace. A one-sample multisample
+       * texture has a single level, so zero is the only answer. */
+      bool has_lod = false;
+      for (unsigned i = 0; i < tex->num_srcs; ++i)
+         if (tex->src[i].src_type == nir_tex_src_lod)
+            has_lod = true;
+      if (!has_lod) {
+         b->cursor = nir_before_instr(instr);
+         nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_int(b, 0));
+      }
+   }
+   state->progress = true;
+   return true;
+}
+
+static bool
+gex_wgpu_demote_ms_textures(nir_shader *nir, uint16_t slots)
+{
+   struct gex_wgpu_demote_ms state = {.slots = slots};
+   nir_shader_instructions_pass(nir, gex_wgpu_demote_ms_instr,
+                                nir_metadata_control_flow, &state);
+   /* And the variables, so the emitter declares an ordinary texture binding
+    * for them instead of a multisampled one. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      /* A *texture* as well as a sampler: by the time a variant is built the
+       * combined samplers have been split, so what is left here is
+       * `texture2DMS`, and checking only for a sampler type matched nothing.
+       * The emitter reads this declaration, not the instruction, to decide
+       * whether to write `texture_multisampled_2d` -- so missing it left the
+       * module saying multisampled while the layout said otherwise, and the
+       * pipeline was refused. */
+      const bool sampler = glsl_type_is_sampler(type);
+      const bool texture = glsl_type_is_texture(type);
+      if ((!sampler && !texture) ||
+          glsl_get_sampler_dim(type) != GLSL_SAMPLER_DIM_MS)
+         continue;
+      /* driver_location is the texture *unit*, which is what the slot mask is
+       * keyed on -- see where texture_slots is filled. `binding` is not: the
+       * graphics stages number a unit's texture and sampler 2*unit and
+       * 2*unit+1, so preferring it matched only unit zero, by luck, and left
+       * every other unit's declaration multisampled while its fetch had
+       * dropped the sample index. Tint says so exactly: "Image Operand Sample
+       * is required for operation on multi-sampled image". */
+      const unsigned at = var->data.driver_location;
+      if (at >= 16 || !(slots & (uint16_t)(1u << at)))
+         continue;
+      const bool is_array = glsl_sampler_type_is_array(type);
+      const struct glsl_type *flat = sampler
+         ? glsl_sampler_type(GLSL_SAMPLER_DIM_2D,
+                             glsl_sampler_type_is_shadow(type), is_array,
+                             glsl_get_sampler_result_type(type))
+         : glsl_texture_type(GLSL_SAMPLER_DIM_2D, is_array,
+                             glsl_get_sampler_result_type(type));
+      var->type = glsl_type_is_array(var->type)
+         ? glsl_array_type(flat, glsl_get_length(var->type), 0)
+         : flat;
+      state.progress = true;
+   }
+   /* The derefs that name those variables still carry the old type, and NIR
+    * validates that they agree -- "instr->type == instr->var->type" -- so
+    * changing the variable alone aborted the process. */
+   if (state.progress)
+      nir_fixup_deref_types(nir);
+   return state.progress;
+}
+
 static bool
 gex_wgpu_lower_texture_variant(nir_shader *nir,
                                unsigned texture_count,
@@ -13209,9 +13331,17 @@ gex_wgpu_unusable_texture_slots(struct gex_wgpu_context *ctx)
       if (!view)
          continue;
       const bool declared_ms = (fs->multisampled_slots & (1u << slot)) != 0;
-      const bool bound_ms =
-         view->texture && MAX2(1, view->texture->nr_samples) > 1;
-      if (declared_ms != bound_ms) {
+      const unsigned samples = view->texture ? view->texture->nr_samples : 0;
+      const bool bound_ms = samples > 1;
+      /* Declared multisampled against a texture that really is multisample
+       * and holds exactly one sample is not unusable: it is legal GL, and the
+       * shader is rewritten to read an ordinary texture instead. See
+       * gex_wgpu_demotable_ms_slots. Everything else that disagrees --
+       * including a sampler2DMS pointed at a texture that is not a
+       * multisample target at all, which carries nr_samples 0 -- stays
+       * refused. */
+      const bool demotable = declared_ms && samples == 1;
+      if (declared_ms != bound_ms && !demotable) {
          mask |= 1u << slot;
          continue;
       }
@@ -13228,10 +13358,46 @@ gex_wgpu_unusable_texture_slots(struct gex_wgpu_context *ctx)
    return mask;
 }
 
+/* Slots the shader declared multisampled where the bound texture has exactly
+ * one sample. Legal GL, unrepresentable as a WebGPU multisampled binding, and
+ * served by gex_wgpu_demote_ms_textures rewriting the declaration. */
+static uint16_t
+gex_wgpu_demotable_ms_slots(struct gex_wgpu_context *ctx)
+{
+   const struct gex_wgpu_shader *fs = ctx->fs;
+   uint16_t mask = 0;
+   if (!fs)
+      return 0;
+   for (unsigned i = 0; i < fs->texture_count; ++i) {
+      const unsigned slot = fs->texture_slots[i];
+      if (slot >= GEX_WGPU_MAX_SAMPLERS)
+         continue;
+      const struct pipe_sampler_view *view = ctx->sampler_views[slot];
+      if (!view || !view->texture)
+         continue;
+      if (!(fs->multisampled_slots & (1u << slot)))
+         continue;
+      /* Exactly one, not "one or fewer". A Gallium resource carries
+       * nr_samples 0 when it is not a multisample target at all, and binding
+       * such a texture to a sampler2DMS is invalid GL -- the old refusal is
+       * right for it and must stay. Only nr_samples == 1 is the legal case
+       * this pass exists for: a real multisample texture that happens to hold
+       * a single sample. Folding the two together with MAX2(1, ...) demoted
+       * ordinary textures too and cost seven sample_variables cases that had
+       * been passing. */
+      if (view->texture->nr_samples == 1)
+         mask |= 1u << slot;
+   }
+   if (mask && getenv("GEX_WGPU_TEX_LOG"))
+      fprintf(stderr, "gex-wgpu: demoting multisampled slots 0x%x to ordinary "
+              "textures (one sample each)\n", mask);
+   return mask;
+}
+
 static WGPUShaderModule
 gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                          bool drawing_triangles,
-                         uint16_t *omitted_out)
+                         uint16_t *omitted_out, uint16_t *demoted_out)
 {
    /* Declining, not latching. This returns NULL and draw_vbo checks it, so
     * the caller already learns of the failure -- latching on top ended the
@@ -13271,6 +13437,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    const uint16_t want_omit_slots = gex_wgpu_unusable_texture_slots(ctx);
    if (omitted_out)
       *omitted_out = want_omit_slots;
+   /* Decided here for the same reason the omit mask is: this function has two
+    * early returns below and a variant reason must sit above both. */
+   const uint16_t want_demote_ms = gex_wgpu_demotable_ms_slots(ctx);
+   if (demoted_out)
+      *demoted_out = want_demote_ms;
    /* What the bound colour target needs the fragment output to be. */
    const nir_alu_type wanted_output =
       ctx->color_count == 0 ? nir_alu_type_get_base_type(fs->color_output_type)
@@ -13459,7 +13630,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
        line_edge_location == ~0u && !fs->buftex_count &&
        !want_sample_positions && !want_clip_dist && !want_logicop &&
        !want_ignore_sample_mask &&
-       !want_omit_slots && !want_offset_clamp && !fs->unformatted_images)
+       !want_omit_slots && !want_demote_ms && !want_offset_clamp &&
+       !fs->unformatted_images)
       return fs->module;
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
@@ -13567,7 +13739,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
       want_sample_positions != 0 || want_clip_dist != 0 || want_logicop != 0 ||
-      want_ignore_sample_mask || want_omit_slots != 0 || want_offset_clamp ||
+      want_ignore_sample_mask || want_omit_slots != 0 ||
+      want_demote_ms != 0 || want_offset_clamp ||
       fs->unformatted_images != 0;
    if (!needs_variant && !fs->buftex_count)
       return fs->module;
@@ -13593,6 +13766,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->poly_stipple == want_stipple &&
                    cached->ignore_sample_mask == want_ignore_sample_mask &&
                    cached->omitted_slots == want_omit_slots &&
+                   cached->demoted_ms_slots == want_demote_ms &&
                    memcmp(cached->image_formats, want_image_formats,
                           sizeof(cached->image_formats)) == 0 &&
                    cached->offset_clamp == want_offset_clamp &&
@@ -13703,6 +13877,10 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       gex_wgpu_ignore_sample_mask(variant);
    if (want_omit_slots)
       gex_wgpu_omit_textures(variant, want_omit_slots);
+   /* Before the texture lowering below, which reads each sampler's dimension
+    * to decide what to build for it. */
+   if (want_demote_ms)
+      gex_wgpu_demote_ms_textures(variant, want_demote_ms);
    /* Before the texture lowering, which reads gl_FragCoord for nothing and
     * would otherwise see the load this adds. */
    if (want_stipple)
@@ -13791,6 +13969,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->poly_stipple = want_stipple;
    cached->ignore_sample_mask = want_ignore_sample_mask;
    cached->omitted_slots = want_omit_slots;
+   cached->demoted_ms_slots = want_demote_ms;
    memcpy(cached->image_formats, want_image_formats,
           sizeof(cached->image_formats));
    cached->offset_clamp = want_offset_clamp;
@@ -38477,12 +38656,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* Slots this variant dropped because the bound state could not satisfy
     * their declaration; their bindings must be left out of the group too. */
    uint16_t omitted_texture_slots = 0;
+   uint16_t demoted_ms_slots = 0;
    const WGPUPrimitiveTopology fs_topology = gex_wgpu_topology(info->mode);
    fragment.module = gex_wgpu_fragment_module(
       ctx, fs_topology == WGPUPrimitiveTopology_PointList,
       fs_topology == WGPUPrimitiveTopology_TriangleList ||
       fs_topology == WGPUPrimitiveTopology_TriangleStrip,
-      &omitted_texture_slots);
+      &omitted_texture_slots, &demoted_ms_slots);
    if (gex_timing) gex_wgpu_time_fsmod += os_time_get_nano() - t_fsmod_start;
    if (!fragment.module)
       GEX_DRAW_DROP();
@@ -39282,7 +39462,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    memset(ctx->feedback_view, 0, sizeof(ctx->feedback_view));
    for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
       const unsigned slot = ctx->fs->texture_slots[i];
-      const bool multisampled = (ctx->fs->multisampled_slots >> slot) & 1;
+      /* Not for a slot this draw's variant demoted: the module reads an
+       * ordinary texture there, so the binding checks below must compare
+       * against that and not against the original declaration. Missing this
+       * left the draw declined for a mismatch the variant had removed. */
+      const bool multisampled =
+         ((ctx->fs->multisampled_slots >> slot) & 1) &&
+         !((demoted_ms_slots >> slot) & 1);
       /* Nothing bound: the bind group supplies a 1x1 stand-in that matches
        * the shader's declaration by construction, so every reconciliation
        * below -- sample type, dimension, multisampledness -- is about a
@@ -39426,7 +39612,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                }
             }
          }
-         GEX_BINDING_BAD(actual_type != ctx->fs->texture_sample_types[i],
+         /* A demoted slot's declaration was recorded for a multisampled
+          * texture, which is unfilterable by definition; the ordinary
+          * texture it now reads has whatever its format says. The module
+          * does not distinguish the two -- WGSL's texture_2d<f32> covers
+          * both and filterability is a property of the *layout* -- so the
+          * layout below states the view's own type and there is nothing here
+          * to disagree with. */
+         GEX_BINDING_BAD(!((demoted_ms_slots >> slot) & 1) &&
+                            actual_type != ctx->fs->texture_sample_types[i],
                          "sample type differs from the shader's");
          GEX_BINDING_BAD(
             multisampled != (ctx->sampler_views[slot]->texture != NULL &&
@@ -39580,16 +39774,26 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           * integer texture has no WebGPU format. */
          const bool omitted =
             (omitted_texture_slots >> ctx->fs->texture_slots[i]) & 1;
+         /* A demoted slot reads an ordinary texture now, so its binding must
+          * say so too -- the module and the layout disagreeing is a rejected
+          * pipeline. */
+         const bool demoted =
+            (demoted_ms_slots >> ctx->fs->texture_slots[i]) & 1;
          texture_layout_entries[i].texture.sampleType =
             omitted ? WGPUTextureSampleType_Float
             : (depth_as_float & (1u << ctx->fs->texture_slots[i]))
                ? WGPUTextureSampleType_UnfilterableFloat
+            /* Demoted: the view's own type, not the multisampled
+               declaration's. */
+            : demoted && ctx->sampler_views[ctx->fs->texture_slots[i]]
+               ? gex_wgpu_format_sample_type(
+                    ctx->sampler_views[ctx->fs->texture_slots[i]]->format)
                : ctx->fs->texture_sample_types[i];
          texture_layout_entries[i].texture.viewDimension =
             omitted ? WGPUTextureViewDimension_2D
                     : ctx->fs->texture_dimensions[i];
          texture_layout_entries[i].texture.multisampled =
-            !omitted &&
+            !omitted && !demoted &&
             ((ctx->fs->multisampled_slots >> ctx->fs->texture_slots[i]) & 1);
       }
       if (wants_dst) {
