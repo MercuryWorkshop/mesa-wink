@@ -1490,6 +1490,27 @@ struct gex_wgpu_screen {
 struct gex_wgpu_resource {
    struct pipe_resource base;
    WGPUTexture texture;
+   /* A multisampled 2D *array*, held as one wide multisampled 2D texture with
+    * the layers side by side. Zero when this is not one.
+    *
+    * WebGPU has no multisampled array texture and Dawn says so in as many
+    * words -- "The depthOrArrayLayers (3) of a multisampled texture is not
+    * 1" -- so there is no array texture to take per-layer views of, which is
+    * the cheaper emulation and is simply unavailable. Tiling is the other
+    * one, and it is the better of the two anyway: one binding rather than one
+    * per layer, a *dynamic* layer index costing an add rather than an
+    * unrolled switch, and none of the sixteen-sampled-texture budget spent on
+    * layers.
+    *
+    * The whole of GL's 2D_MULTISAMPLE_ARRAY support rests on these two
+    * numbers. `ms_tile_width` is the logical width -- what GL asked for and
+    * what glGetTexLevelParameter must keep reporting -- so layer l occupies
+    * x in [l * ms_tile_width, (l+1) * ms_tile_width).
+    *
+    * This is the largest single cluster in the CTS: 62 cases of
+    * texture_swizzle, 30 of direct_state_access and 4 of texture_view. */
+   uint32_t ms_tile_layers;
+   uint32_t ms_tile_width;
    WGPUBuffer buffer;
    uint8_t *shadow;
    /* ARB_buffer_storage: a copy of what was last handed to the device for a
@@ -1636,6 +1657,16 @@ struct gex_wgpu_context {
     * something it converts again -- which is unbounded recursion on a 16 MiB
     * host stack, and a host stack overflow aborts the wasm module and costs
     * every case after it. Bounded, it costs the one draw and says so. */
+   /* Where this pass's layer of a tiled multisampled array begins, in pixels
+    * from the left of the wide texture that holds all of them. Zero for every
+    * ordinary framebuffer, which is every framebuffer that is not a
+    * GL_TEXTURE_2D_MULTISAMPLE_ARRAY.
+    *
+    * The tile *is* the framebuffer as far as the application is concerned, so
+    * the viewport and the scissor are the two things that have to know: GL's
+    * coordinates are relative to the tile and WebGPU's are relative to the
+    * texture. See gex_wgpu_resource::ms_tile_layers. */
+   uint32_t ms_tile_x;
    unsigned draw_depth;
    /* Whether an enclosing draw has already de-interleaved a divisor buffer.
     * Not the same question as "is this the outermost draw": an indirect draw
@@ -2206,6 +2237,14 @@ struct gex_wgpu_shader {
    uint16_t integer_sampled_slots;
    /* Texture slots whose shader declaration is multisampled. */
    uint16_t multisampled_slots;
+   /* And which of those are *arrays*. WGSL has no multisampled array texture
+    * and Dawn will not create one either, so the driver holds a GL
+    * 2D_MULTISAMPLE_ARRAY as one wide multisampled 2D texture with the layers
+    * side by side -- see gex_wgpu_resource::ms_tile_layers. The declaration
+    * cannot be rewritten here, because the tile width comes from the bound
+    * texture, so it is deferred to the variant exactly as integer sampling
+    * is: no base module is built for such a shader. */
+   uint16_t ms_array_slots;
    /* Whether the shader reads gl_DrawID. Only then does a non-zero
     * drawid_offset change what it computes. */
    bool reads_draw_id;
@@ -2428,6 +2467,13 @@ struct gex_wgpu_shader_variant {
     * key: the same shader against a real multisample texture is a different
     * module. */
    uint16_t demoted_ms_slots;
+   /* Slots this variant read as a tiled multisampled array, and the geometry
+    * it baked in as immediates. Both are part of the key: the width decides
+    * every rewritten coordinate and the layer count decides what textureSize
+    * answers, so the same shader against a differently shaped array is a
+    * different module. */
+   uint16_t tiled_ms_slots;
+   uint32_t tiled_ms_geom[GEX_WGPU_MAX_SAMPLERS][3];
    /* The polygon offset this variant computes itself, and the state it baked
     * in as immediates; see gex_wgpu_lower_polygon_offset_clamp. All four are
     * part of the key because all four are constants in the shader. */
@@ -8254,6 +8300,119 @@ gex_wgpu_demote_ms_textures(nir_shader *nir, uint16_t slots)
    return state.progress;
 }
 
+/* A multisampled *array* texture, read as the wide multisampled 2D texture
+ * that actually holds it: layer l lives at x + l * width.
+ *
+ * WGSL has `texture_multisampled_2d` and no array form, and Dawn will not
+ * create the array texture either -- "The depthOrArrayLayers (3) of a
+ * multisampled texture is not 1" -- so both halves of the emulation are
+ * forced. gex_wgpu_resource::ms_tile_layers is the storage half; this is the
+ * shader half, and it is a coordinate rewrite plus a declaration rewrite,
+ * exactly the shape gex_wgpu_demote_ms_textures already has.
+ *
+ * The geometry is baked in as immediates rather than read from the texture,
+ * because it cannot be read: the flattened texture reports its *tiled* width
+ * and a single layer, so textureSize would answer for the wrong thing. That
+ * makes it part of the variant key. */
+struct gex_wgpu_tiled_ms {
+   uint16_t slots;
+   const uint32_t (*geom)[3];   /* width, height, layers -- per slot */
+   bool progress;
+};
+
+static bool
+gex_wgpu_flatten_ms_array_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   struct gex_wgpu_tiled_ms *state = data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_MS || !tex->is_array)
+      return false;
+   if (tex->texture_index >= GEX_WGPU_MAX_SAMPLERS ||
+       !(state->slots & (uint16_t)(1u << tex->texture_index)))
+      return false;
+   const uint32_t width = state->geom[tex->texture_index][0];
+   const uint32_t height = state->geom[tex->texture_index][1];
+   const uint32_t layers = state->geom[tex->texture_index][2];
+
+   /* textureSize has to keep answering in GL's terms -- the layer's own size
+    * and the layer count -- so it is replaced outright. Reading it off the
+    * flattened texture would give (width * layers, height) and no layer
+    * count at all. */
+   if (tex->op == nir_texop_txs) {
+      b->cursor = nir_before_instr(instr);
+      nir_def *size = nir_imm_ivec3(b, (int)width, (int)height, (int)layers);
+      nir_def_replace(&tex->def, size);
+      state->progress = true;
+      return true;
+   }
+   if (tex->op == nir_texop_texture_samples)
+      return false;   /* the sample count is unchanged by the tiling */
+
+   const int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_index < 0 || tex->coord_components != 3)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *coord = tex->src[coord_index].src.ssa;
+   nir_def *flat = nir_vec2(
+      b,
+      nir_iadd(b, nir_channel(b, coord, 0),
+               nir_imul_imm(b, nir_channel(b, coord, 2), width)),
+      nir_channel(b, coord, 1));
+   nir_src_rewrite(&tex->src[coord_index].src, flat);
+   tex->is_array = false;
+   tex->coord_components = 2;
+   state->progress = true;
+   return true;
+}
+
+static bool
+gex_wgpu_flatten_ms_array(nir_shader *nir, uint16_t slots,
+                          const uint32_t (*geom)[3])
+{
+   struct gex_wgpu_tiled_ms state = {.slots = slots, .geom = geom};
+   if (getenv("GEX_WGPU_MSA_LOG"))
+      fprintf(stderr, "gex-msa: flatten slots=0x%x geom0=%ux%ux%u\n",
+              slots, geom[0][0], geom[0][1], geom[0][2]);
+   nir_shader_instructions_pass(nir, gex_wgpu_flatten_ms_array_instr,
+                                nir_metadata_control_flow, &state);
+   /* And the declarations, which is what the emitter reads to decide between
+    * texture_multisampled_2d and its array form -- the same reason
+    * gex_wgpu_demote_ms_textures rewrites them. A module left saying
+    * "array" while its fetches had been flattened would disagree with its
+    * own layout. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      const bool sampler = glsl_type_is_sampler(type);
+      const bool texture = glsl_type_is_texture(type);
+      if ((!sampler && !texture) ||
+          glsl_get_sampler_dim(type) != GLSL_SAMPLER_DIM_MS ||
+          !glsl_sampler_type_is_array(type))
+         continue;
+      const unsigned at = var->data.driver_location;
+      if (at >= GEX_WGPU_MAX_SAMPLERS || !(slots & (uint16_t)(1u << at)))
+         continue;
+      const struct glsl_type *flat = sampler
+         ? glsl_sampler_type(GLSL_SAMPLER_DIM_MS, false, false,
+                             glsl_get_sampler_result_type(type))
+         : glsl_texture_type(GLSL_SAMPLER_DIM_MS, false,
+                             glsl_get_sampler_result_type(type));
+      var->type = glsl_type_is_array(var->type)
+         ? glsl_array_type(flat, glsl_get_length(var->type), 0)
+         : flat;
+      state.progress = true;
+   }
+   /* The derefs naming those variables still carry the old type, and NIR
+    * validates the two against each other -- "instr->type ==
+    * instr->var->type" -- so rewriting the variable alone dumps core inside
+    * nir_opt_copy_prop. gex_wgpu_demote_ms_textures needs the same call for
+    * the same reason. */
+   if (state.progress)
+      nir_fixup_deref_types(nir);
+   return state.progress;
+}
+
 static bool
 gex_wgpu_lower_texture_variant(nir_shader *nir,
                                unsigned texture_count,
@@ -13086,12 +13245,9 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
                ? "gex_wgpu a texture unit above the driver's maximum"
             : duplicate
                ? "gex_wgpu two textures claim one unit or one binding"
-            : view_dimension == WGPUTextureViewDimension_Undefined
-               ? (multisampled && is_array
-                     ? "gex_wgpu a multisampled array texture, which WGSL has "
-                       "no type for"
-                     : "gex_wgpu a texture shape WGSL has no view dimension "
-                       "for")
+            : (view_dimension == WGPUTextureViewDimension_Undefined &&
+               !(multisampled && is_array))
+               ? "gex_wgpu a texture shape WGSL has no view dimension for" 
             : var->data.descriptor_set != expected_texture_set
                ? "gex_wgpu a texture in the wrong descriptor set"
                : NULL;
@@ -13103,7 +13259,15 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          }
          shader->texture_slots[shader->texture_count] = slot;
          shader->texture_bindings[shader->texture_count] = var->data.binding;
-         shader->texture_dimensions[shader->texture_count] = view_dimension;
+         /* A multisampled array is declared, and bound, as the plain
+          * multisampled 2D texture it is really held in;
+          * gex_wgpu_flatten_ms_array rewrites the fetches to match once the
+          * tile width is known. */
+         if (multisampled && is_array)
+            shader->ms_array_slots |= (uint16_t)(1u << slot);
+         shader->texture_dimensions[shader->texture_count] =
+            (multisampled && is_array) ? WGPUTextureViewDimension_2D
+                                       : view_dimension;
          /* A multisampled texture is never filtered -- WGSL reaches it with
           * textureLoad and a sample index, not a sampler -- and WebGPU wants
           * the sample type to say so. */
@@ -13550,6 +13714,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    const bool deferred_integer_sampling =
       (shader->integer_sampled_slots != 0 || shader->buftex_count != 0 ||
        shader->unformatted_images != 0 || shader->reads_sample_pos ||
+       shader->ms_array_slots != 0 ||
        shader->reads_clip_dist) &&
       (expected_stage == MESA_SHADER_FRAGMENT ||
        expected_stage == MESA_SHADER_VERTEX);
@@ -14147,6 +14312,44 @@ gex_wgpu_unusable_texture_slots(struct gex_wgpu_context *ctx)
    return mask;
 }
 
+/* Slots whose bound texture is a multisampled array held as one wide
+ * multisampled 2D texture, with the geometry the shader has to bake in.
+ * See gex_wgpu_flatten_ms_array. */
+static uint16_t
+gex_wgpu_tiled_ms_slots_for(const struct gex_wgpu_shader *fs,
+                            struct pipe_sampler_view *const *views,
+                            uint32_t geom[GEX_WGPU_MAX_SAMPLERS][3])
+{
+   memset(geom, 0, sizeof(uint32_t) * GEX_WGPU_MAX_SAMPLERS * 3);
+   uint16_t mask = 0;
+   if (!fs)
+      return 0;
+   for (unsigned i = 0; i < fs->texture_count; ++i) {
+      const unsigned slot = fs->texture_slots[i];
+      if (slot >= GEX_WGPU_MAX_SAMPLERS)
+         continue;
+      const struct pipe_sampler_view *view = views[slot];
+      if (!view || !view->texture)
+         continue;
+      const struct gex_wgpu_resource *res =
+         gex_resource((struct pipe_resource *)view->texture);
+      if (!res->ms_tile_layers)
+         continue;
+      geom[slot][0] = res->ms_tile_width;
+      geom[slot][1] = view->texture->height0;
+      geom[slot][2] = res->ms_tile_layers;
+      mask |= (uint16_t)(1u << slot);
+   }
+   return mask;
+}
+
+static uint16_t
+gex_wgpu_tiled_ms_slots(struct gex_wgpu_context *ctx,
+                        uint32_t geom[GEX_WGPU_MAX_SAMPLERS][3])
+{
+   return gex_wgpu_tiled_ms_slots_for(ctx->fs, ctx->sampler_views, geom);
+}
+
 /* Slots the shader declared multisampled where the bound texture has exactly
  * one sample. Legal GL, unrepresentable as a WebGPU multisampled binding, and
  * served by gex_wgpu_demote_ms_textures rewriting the declaration. */
@@ -14231,6 +14434,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    const uint16_t want_demote_ms = gex_wgpu_demotable_ms_slots(ctx);
    if (demoted_out)
       *demoted_out = want_demote_ms;
+   uint32_t want_tiled_geom[GEX_WGPU_MAX_SAMPLERS][3];
+   const uint16_t want_tiled_ms =
+      gex_wgpu_tiled_ms_slots(ctx, want_tiled_geom);
    /* What the bound colour target needs the fragment output to be. */
    const nir_alu_type wanted_output =
       ctx->color_count == 0 ? nir_alu_type_get_base_type(fs->color_output_type)
@@ -14419,7 +14625,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
        line_edge_location == ~0u && !fs->buftex_count &&
        !want_sample_positions && !want_clip_dist && !want_logicop &&
        !want_ignore_sample_mask &&
-       !want_omit_slots && !want_demote_ms && !want_offset_clamp &&
+       !want_omit_slots && !want_demote_ms && !want_tiled_ms &&
+       !want_offset_clamp &&
        !fs->unformatted_images)
       return fs->module;
    uint16_t sampler_mask = 0;
@@ -14529,7 +14736,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       want_point_smooth || line_edge_location != ~0u ||
       want_sample_positions != 0 || want_clip_dist != 0 || want_logicop != 0 ||
       want_ignore_sample_mask || want_omit_slots != 0 ||
-      want_demote_ms != 0 || want_offset_clamp ||
+      want_demote_ms != 0 || want_tiled_ms != 0 || want_offset_clamp ||
       fs->unformatted_images != 0;
    if (!needs_variant && !fs->buftex_count)
       return fs->module;
@@ -14556,6 +14763,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->ignore_sample_mask == want_ignore_sample_mask &&
                    cached->omitted_slots == want_omit_slots &&
                    cached->demoted_ms_slots == want_demote_ms &&
+                   cached->tiled_ms_slots == want_tiled_ms &&
+                   memcmp(cached->tiled_ms_geom, want_tiled_geom,
+                          sizeof(cached->tiled_ms_geom)) == 0 &&
                    memcmp(cached->image_formats, want_image_formats,
                           sizeof(cached->image_formats)) == 0 &&
                    cached->offset_clamp == want_offset_clamp &&
@@ -14670,6 +14880,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * to decide what to build for it. */
    if (want_demote_ms)
       gex_wgpu_demote_ms_textures(variant, want_demote_ms);
+   if (want_tiled_ms)
+      gex_wgpu_flatten_ms_array(variant, want_tiled_ms, want_tiled_geom);
    /* Before the texture lowering, which reads gl_FragCoord for nothing and
     * would otherwise see the load this adds. */
    if (want_stipple)
@@ -14766,6 +14978,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->ignore_sample_mask = want_ignore_sample_mask;
    cached->omitted_slots = want_omit_slots;
    cached->demoted_ms_slots = want_demote_ms;
+   cached->tiled_ms_slots = want_tiled_ms;
+   memcpy(cached->tiled_ms_geom, want_tiled_geom,
+          sizeof(cached->tiled_ms_geom));
    memcpy(cached->image_formats, want_image_formats,
           sizeof(cached->image_formats));
    cached->offset_clamp = want_offset_clamp;
@@ -17385,7 +17600,8 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
          PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
       return multisampleable && requested == 4 &&
              MAX2(1, storage_sample_count) == requested &&
-             target == PIPE_TEXTURE_2D &&
+             (target == PIPE_TEXTURE_2D ||
+              target == PIPE_TEXTURE_2D_ARRAY) &&
              bind && !(bind & ~multisample_binds);
    }
 
@@ -17873,6 +18089,38 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
                                   : templ->height0;
    desc.size.depthOrArrayLayers = templ->target == PIPE_TEXTURE_3D
       ? templ->depth0 : templ->array_size;
+   /* A multisampled array becomes one wide multisampled 2D texture: layer l
+    * at x + l * width. Dawn refuses the shape outright otherwise --
+    *
+    *   The depthOrArrayLayers (3) of a multisampled texture is not 1.
+    *
+    * -- and there is nothing to fall back to, since a per-layer view needs an
+    * array texture to view. The logical width is kept on the resource; every
+    * consumer offsets by the layer it is working on. */
+   if (samples > 1 && templ->target == PIPE_TEXTURE_2D_ARRAY &&
+       templ->array_size > 1) {
+      resource->ms_tile_layers = templ->array_size;
+      resource->ms_tile_width = desc.size.width;
+      desc.size.width *= templ->array_size;
+      desc.size.depthOrArrayLayers = 1;
+      /* The tiled width is a real allocation and a real device limit. Refuse
+       * rather than let Dawn reject the create: a refused resource is
+       * GL_OUT_OF_MEMORY, which is a thing GL can say, while an invalid
+       * texture poisons every command buffer that touches it. */
+      if (desc.size.width > gex_screen(screen)->max_texture_2d) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr,
+                    "gex-wgpu: multisampled array refused: %u layers of %u "
+                    "wide tiles is %u, over the device's %u\n",
+                    templ->array_size, resource->ms_tile_width,
+                    desc.size.width, gex_screen(screen)->max_texture_2d);
+         }
+         FREE(resource);
+         return NULL;
+      }
+   }
    desc.format = gex_wgpu_texture_format(templ->format);
    desc.mipLevelCount = templ->last_level + 1;
    desc.sampleCount = samples;
@@ -18725,6 +18973,17 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
       desc.baseArrayLayer = templ->u.tex.first_layer;
       desc.arrayLayerCount =
          templ->u.tex.last_layer - templ->u.tex.first_layer + 1;
+   }
+   /* A tiled multisampled array is one plain 2D multisampled texture holding
+    * every layer side by side, so its view says so: one layer, dimension 2D,
+    * and the shader reaches a given layer by offsetting x instead. The layer
+    * range GL asked for would exceed the one layer the texture has, and the
+    * 2DArray dimension is a different WGSL type from the
+    * texture_multisampled_2d gex_wgpu_flatten_ms_array leaves behind. */
+   if (gex_resource(texture)->ms_tile_layers) {
+      desc.dimension = WGPUTextureViewDimension_2D;
+      desc.baseArrayLayer = 0;
+      desc.arrayLayerCount = 1;
    }
    /* The stencil aspect, which is what ARB_stencil_texturing asks for: the
     * view names `stencil8` whatever the texture's packing is, and the aspect
@@ -21329,6 +21588,50 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
        dst->first_layer != dst->last_layer || dstx != 0 || dsty != 0 ||
        width != level_width || height != level_height) {
       gex_decline(ctx);
+      return;
+   }
+
+   /* A tiled multisampled array cannot be cleared through loadOp at all.
+    * WebGPU's clear covers the whole *view* and a view cannot be a
+    * sub-rectangle, so clearing one layer through the attachment below would
+    * wipe every other layer with it -- the layers live side by side in one
+    * texture.
+    *
+    * A scissored draw can express it, and one already exists: u_blitter's
+    * clear is a textured quad through the ordinary draw path, where the
+    * viewport and scissor offset for the tile is already applied. So the
+    * emulation costs nothing new here beyond noticing that it applies. */
+   if (gex_resource(resource)->ms_tile_layers) {
+      if (getenv("GEX_WGPU_MSA_LOG"))
+         fprintf(stderr, "gex-msa: tiled clear layer %u tile_x=%u\n",
+                 dst->first_layer, ctx->ms_tile_x);
+      if (!ctx->blitter) {
+         gex_decline(ctx);
+         return;
+      }
+      util_blitter_save_blend(ctx->blitter, ctx->blend);
+      util_blitter_save_depth_stencil_alpha(ctx->blitter, ctx->dsa);
+      util_blitter_save_stencil_ref(ctx->blitter, &ctx->stencil_ref);
+      util_blitter_save_rasterizer(ctx->blitter, ctx->rasterizer);
+      util_blitter_save_fragment_shader(ctx->blitter, ctx->fs);
+      util_blitter_save_vertex_shader(ctx->blitter, ctx->vs);
+      util_blitter_save_geometry_shader(ctx->blitter, ctx->gs);
+      util_blitter_save_tessctrl_shader(ctx->blitter, ctx->tcs);
+      util_blitter_save_tesseval_shader(ctx->blitter, ctx->tes);
+      util_blitter_save_vertex_elements(ctx->blitter, ctx->vertex_elements);
+      util_blitter_save_vertex_buffers(ctx->blitter, ctx->vertex_buffer_state,
+                                       ARRAY_SIZE(ctx->vertex_buffer_state));
+      util_blitter_save_framebuffer(ctx->blitter, &ctx->framebuffer);
+      util_blitter_save_viewport(ctx->blitter, &ctx->viewport);
+      util_blitter_save_scissor(ctx->blitter, &ctx->scissor);
+      /* u_blitter asserts on this one rather than tolerating it --
+       * blitter_check_saved_vertex_states: Assertion
+       * `!ctx->has_stream_out || ctx->base.saved_num_so_targets != ~0u'
+       * -- and an assert inside Mesa takes the application with it. */
+      util_blitter_save_so_targets(ctx->blitter, ctx->so_target_count,
+                                   ctx->so_targets, MESA_PRIM_TRIANGLES);
+      util_blitter_clear_render_target(ctx->blitter, dst, color, dstx, dsty,
+                                       width, height);
       return;
    }
 
@@ -25094,6 +25397,25 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
        !gex_wgpu_render_cond_passes(ctx))
       return;
 
+   /* A tiled multisampled array resolves by drawing, not through WebGPU's
+    * resolveTarget: that resolves a whole attachment, and the attachment here
+    * holds every layer at once --
+    *
+    *   The resolve target [TextureView of Texture (8x8)] size (width: 8,
+    *   height: 8) does not match the color attachment
+    *
+    * u_blitter's resolve is a textured draw whose fetches
+    * gex_wgpu_flatten_ms_array rewrites, so it lands on the right tile
+    * without knowing anything about tiling. */
+   if (info->src.resource && info->dst.resource &&
+       gex_resource(info->src.resource)->ms_tile_layers) {
+      if (getenv("GEX_WGPU_MSA_LOG"))
+         fprintf(stderr, "gex-msa: tiled resolve src layer %u -> dst %ux%u\n",
+                 info->src.box.z, info->dst.box.width, info->dst.box.height);
+      gex_wgpu_blit_with_blitter(ctx, info);
+      return;
+   }
+
    /* A multisampled source is a resolve, not a copy. */
    if (info->src.resource && info->dst.resource &&
        MAX2(1, info->src.resource->nr_samples) > 1 &&
@@ -25721,6 +26043,23 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
    const bool has_attachment = color_count || depth;
    ctx->fb_width = has_attachment && state ? state->width : 0;
    ctx->fb_height = has_attachment && state ? state->height : 0;
+   /* A tiled multisampled array's layer offset, taken from whichever
+    * attachment is one. GL attaches a single layer at a time, so at most one
+    * offset is in play per pass; layered rendering re-enters here per layer
+    * with color_layers[] already advanced, which is what makes this work for
+    * gl_Layer without any further arrangement. */
+   ctx->ms_tile_x = 0;
+   for (unsigned i = 0; i < color_count; ++i) {
+      const struct pipe_resource *res = i < color_count ? colors[i] : NULL;
+      if (!res)
+         continue;
+      const struct gex_wgpu_resource *gres =
+         gex_resource((struct pipe_resource *)res);
+      if (gres->ms_tile_layers) {
+         ctx->ms_tile_x = ctx->color_layers[i] * gres->ms_tile_width;
+         break;
+      }
+   }
    /* Every attachment must agree, which GL also requires of a complete
     * framebuffer -- but the count comes from whichever attachment there is,
     * not from colour attachment zero.
@@ -33862,8 +34201,11 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
            vs->varying_aux[i] != fs->varying_aux[i] ||
            vs->varying_components[i] != fs->varying_components[i]))
          differs = true;
+   /* ms_array_slots is a variant reason of its own: the base module was never
+    * built for such a shader -- the tile width comes from the bound texture
+    * -- so `plain` is NULL and returning it drops the draw with no message. */
    if (!differs && !fold_viewport && !unpack_attribs && !lower_textures &&
-       !wide && !has_buftex)
+       !wide && !has_buftex && !vs->ms_array_slots)
       return plain;
 
    const float none[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -34014,6 +34356,18 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       }
       if (unpack_attribs)
          gex_wgpu_lower_vertex_attrib_unpack(clone, want_unpack);
+      /* The vertex stage samples multisampled arrays too, and Tint is exact
+       * about it -- "WGSL multisampled textures must be 2d and non-arrayed"
+       * -- so the same flattening the fragment variant does has to happen
+       * here. KHR-GL45.texture_swizzle's 2DMSArray cases read the texture
+       * from *both* stages. */
+      if (vs->ms_array_slots) {
+         uint32_t vs_tiled_geom[GEX_WGPU_MAX_SAMPLERS][3];
+         const uint16_t vs_tiled = gex_wgpu_tiled_ms_slots_for(
+            vs, ctx->vertex_sampler_views, vs_tiled_geom);
+         if (vs_tiled)
+            gex_wgpu_flatten_ms_array(clone, vs_tiled, vs_tiled_geom);
+      }
       if (lower_textures &&
           !gex_wgpu_lower_texture_variant(clone, vs->texture_count,
                                           vs->texture_slots,
@@ -40069,6 +40423,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       scissor_width = maxx - scissor_x;
       scissor_height = maxy - scissor_y;
    }
+   /* One place, after both are in GL's tile-relative coordinates and before
+    * either reaches WebGPU. A tiled multisampled array puts layer l at
+    * x + l * width of one wide texture, so everything the pass draws moves
+    * with it -- and nothing else in the driver has to know. */
+   viewport_x += (float)ctx->ms_tile_x;
+   scissor_x += ctx->ms_tile_x;
 
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
    WGPUColorTargetState color_targets[GEX_WGPU_MAX_COLOR_TARGETS];
@@ -41136,6 +41496,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          WGPUTextureViewDimension actual_dimension =
             gex_wgpu_target_view_dimension(
                ctx->sampler_views[slot]->target);
+         /* A tiled multisampled array really is a plain multisampled 2D
+          * texture -- the layers are side by side in it -- so its Gallium
+          * target says 2DArray and everything that touches WebGPU says 2D:
+          * the view descriptor, the shader gex_wgpu_flatten_ms_array
+          * rewrote, and therefore this comparison too. Left at the target
+          * this declined every draw by name with
+          * "view dimension differs from the shader's". */
+         if (ctx->sampler_views[slot]->texture &&
+             gex_resource(ctx->sampler_views[slot]->texture)->ms_tile_layers)
+            actual_dimension = WGPUTextureViewDimension_2D;
          if ((actual_dimension == WGPUTextureViewDimension_Cube ||
               actual_dimension == WGPUTextureViewDimension_CubeArray) &&
              ctx->fs->texture_dimensions[i] ==
@@ -41792,7 +42162,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       color_view.baseMipLevel = ctx->color_levels[i];
       color_view.mipLevelCount = 1;
       if (!three_d) {
-         color_view.baseArrayLayer = ctx->color_layers[i];
+         /* A tiled multisampled array has one array layer whatever GL's
+          * layer count says: the layers are side by side in x, so the view is
+          * always layer zero and the offset lives in the viewport instead.
+          * Left at GL's layer this was
+          *
+          *   Texture view array layer range (baseArrayLayer: 1,
+          *   arrayLayerCount: 1) exceeds the texture's array layer count (1)
+          */
+         const struct gex_wgpu_resource *cres = gex_resource(ctx->colors[i]);
+         color_view.baseArrayLayer =
+            cres->ms_tile_layers ? 0u : ctx->color_layers[i];
          color_view.arrayLayerCount = 1;
       }
       /* A surface naming another format renders into a scratch texture of
@@ -42782,7 +43162,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          wanted_scissor[2] = scissor_width;
          wanted_scissor[3] = scissor_height;
       } else {
-         wanted_scissor[0] = 0;
+         /* The tile, not the whole attachment: with the scissor off a draw
+          * wants everything the framebuffer covers, and for a tiled
+          * multisampled array that is one layer's slice of a wider texture.
+          * Left at zero this let every draw write across all the layers. */
+         wanted_scissor[0] = ctx->ms_tile_x;
          wanted_scissor[1] = 0;
          wanted_scissor[2] = ctx->fb_width;
          wanted_scissor[3] = ctx->fb_height;
