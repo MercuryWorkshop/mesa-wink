@@ -6816,10 +6816,12 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
          if (wrap != PIPE_TEX_WRAP_CLAMP_TO_BORDER)
             continue;
          nir_def *component = nir_channel(b, coord, axis);
+         /* `>= 1` for the same reason as in the float path above: at c == 1.0
+          * the nearest texel index is `size`, one past the end. */
          outside = nir_ior(
             b, outside,
             nir_ior(b, nir_flt_imm(b, component, 0.0f),
-                    nir_flt(b, nir_imm_float(b, 1.0f), component)));
+                    nir_fge_imm(b, component, 1.0f)));
       }
       nir_def *border = nir_imm_ivec4(
          b, (int32_t)lower->integer_border[0],
@@ -7030,6 +7032,18 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
       result = nir_flrp(b, border, &tex->def, inside_weight);
    } else if (bordered) {
       nir_def *outside = nir_imm_false(b);
+         /* `>= 1`, not `> 1`. A nearest sample picks texel
+          * floor(c * size), so the coordinate is outside exactly when that
+          * index leaves [0, size-1] -- and at c == 1.0 it is `size`, one past
+          * the end. Testing `1.0 < c` called that inside and read the clamped
+          * edge texel instead of the border.
+          *
+          * It is not a hypothetical boundary: KHR-GL45.texture_border_clamp
+          * drives the third axis with `index / depth`, so layer 6 of a
+          * depth-6 texture is exactly 1.0, and all four Texture3D* cases
+          * failed on that one coordinate. The *Linear variants passed
+          * throughout, which is the tell -- their weight ramp handles the
+          * boundary continuously and needs no comparison. */
       for (unsigned axis = 0; axis < spatial; ++axis) {
          const bool axis_bordered = axis == 0 ? lower->s
                                     : axis == 1 ? lower->t : lower->r;
@@ -7038,7 +7052,7 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
          nir_def *c = nir_channel(b, coord, axis);
          outside = nir_ior(b, outside,
                            nir_ior(b, nir_flt_imm(b, c, 0.0f),
-                                   nir_flt(b, nir_imm_float(b, 1.0f), c)));
+                                   nir_fge_imm(b, c, 1.0f)));
       }
       result = nir_bcsel(b, outside, border, &tex->def);
    }
