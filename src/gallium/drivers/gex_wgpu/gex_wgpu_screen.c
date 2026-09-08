@@ -24136,6 +24136,9 @@ struct gex_wgpu_compute_state {
    uint32_t texture_bindings[GEX_WGPU_MAX_SAMPLERS];
    WGPUTextureViewDimension texture_dimensions[GEX_WGPU_MAX_SAMPLERS];
    WGPUTextureSampleType texture_sample_types[GEX_WGPU_MAX_SAMPLERS];
+   /* Which of those slots the shader declared multisampled, so the bind
+      group layout can say so; see the note at its use. */
+   uint16_t multisampled_slots;
    unsigned sampler_count;
    uint8_t sampler_slots[GEX_WGPU_MAX_SAMPLERS];
    uint32_t sampler_bindings[GEX_WGPU_MAX_SAMPLERS];
@@ -24417,6 +24420,8 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
           * and a rejected bind group means the dispatch runs and writes
           * *nothing* -- so an integer texelFetch in a compute shader read
           * back whatever the buffer already held, with no error anywhere. */
+         if (multisampled)
+            compute->multisampled_slots |= 1u << slot;
          const enum glsl_base_type sampled_base =
             glsl_get_sampler_result_type(type);
          /* Depth is not among these, and cannot be: shadow-ness belongs to
@@ -24425,11 +24430,24 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
           * rather than answering false. It is filled in by the scan below,
           * from the texture instructions, which is the only place a
           * comparison still shows. */
+         /* The *base type* first, then multisampling.
+          *
+          * This tested `multisampled` first, which short-circuited every
+          * integer multisample texture to UnfilterableFloat -- so an
+          * isampler2DMS reached WebGPU as
+          *
+          *   The shader's texture sample type (Sint) isn't compatible with
+          *   the layout's texture sample type (UnfilterableFloat)
+          *
+          * and the dispatch wrote nothing. The two facts are independent and
+          * only one of them belongs in this decision: an integer texture is
+          * unfilterable by its own type, so `UnfilterableFloat` is what
+          * multisampling does to the *float* case and nothing more. */
          compute->texture_sample_types[at] =
-            multisampled ? WGPUTextureSampleType_UnfilterableFloat
-            : sampled_base == GLSL_TYPE_INT ? WGPUTextureSampleType_Sint
+            sampled_base == GLSL_TYPE_INT ? WGPUTextureSampleType_Sint
             : sampled_base == GLSL_TYPE_UINT ? WGPUTextureSampleType_Uint
-                                             : WGPUTextureSampleType_Float;
+            : multisampled ? WGPUTextureSampleType_UnfilterableFloat
+                           : WGPUTextureSampleType_Float;
          ++compute->texture_count;
       } else if (glsl_type_is_bare_sampler(type)) {
          const unsigned slot = var->data.driver_location;
@@ -25312,6 +25330,25 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       entries[count].visibility = WGPUShaderStage_Compute;
       entries[count].texture.sampleType = compute_sample_type;
       entries[count].texture.viewDimension = compute->texture_dimensions[i];
+      /* And whether it is multisampled, which this did not say.
+       *
+       * The collection above computes it -- its comment even says "the layout
+       * has to say so" -- and used it for the view dimension and the sample
+       * type, but never recorded it, so this entry took the
+       * WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT default of false. A compute shader
+       * declaring a sampler2DMS then had a real four-sample texture bound
+       * against a layout claiming one sample, and WebGPU refused the bind
+       * group:
+       *
+       *   Sample count (4) of [Texture (8x4 px, TextureFormat::RGBA8Sint)]
+       *   doesn't match expectation (multisampled: 0)
+       *
+       * A refused bind group means the dispatch runs and writes nothing,
+       * which is the same silent shape the sample-type note above describes.
+       * KHR-GL45.shader_texture_image_samples_tests.texture_functional_test
+       * is this. */
+      entries[count].texture.multisampled =
+         (compute->multisampled_slots >> slot) & 1;
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       bindings[count].binding = compute->texture_bindings[i];
       compute_view = view
