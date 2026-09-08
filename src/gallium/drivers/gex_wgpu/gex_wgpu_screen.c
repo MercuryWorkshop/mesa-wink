@@ -3151,8 +3151,40 @@ struct gex_wgpu_sampler {
     * `vert-tex` samples a texture from its vertex shader with GL_LINEAR, and
     * nearest is the closest thing WebGPU can do for it. */
    WGPUSampler nonfiltering;
+   /* The same state with the *comparison* mode flipped, and nearest filters.
+    *
+    * A comparison sampler and an ordinary one are different binding types in
+    * WebGPU, and the layout names the shader's. GL lets the two disagree: a
+    * sampler2DShadow reading a texture whose GL_TEXTURE_COMPARE_MODE is NONE
+    * is *undefined* in GL, not an error, and so is the reverse. Declining the
+    * draw over it loses every other thing that draw would have written.
+    *
+    * KHR-GL45.incomplete_texture_access is exactly that. It samples an
+    * incomplete texture -- which GL requires to return defined values -- and
+    * its shadow configurations arrive with no comparison mode on the sampler
+    * the driver sees, so every one of them declined and the test read whatever
+    * the framebuffer already held.
+    *
+    * Nearest filters because that costs one sampler instead of two and every
+    * case this twin serves is one GL leaves undefined, so a filter downgrade
+    * cannot be observed as wrong. */
+   WGPUSampler flipped_comparison;
    struct pipe_sampler_state state;
 };
+
+/* The sampler to bind for a slot whose shader declares `want`; see
+ * gex_wgpu_sampler::flipped_comparison. */
+static WGPUSampler
+gex_wgpu_sampler_matching(const struct gex_wgpu_sampler *sampler,
+                          WGPUSamplerBindingType want)
+{
+   const bool state_compares =
+      sampler->state.compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE;
+   const bool want_compare = want == WGPUSamplerBindingType_Comparison;
+   if (state_compares != want_compare && sampler->flipped_comparison)
+      return sampler->flipped_comparison;
+   return sampler->sampler;
+}
 
 struct gex_wgpu_sampler_view {
    struct pipe_sampler_view base;
@@ -20110,6 +20142,13 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
       FREE(sampler);
       return NULL;
    }
+   /* And the comparison flip, off the same nearest descriptor. Not fatal if
+    * it cannot be made: gex_wgpu_sampler_matching falls back to the ordinary
+    * sampler, which is what happened before this existed. */
+   desc.compare = comparison ? WGPUCompareFunction_Undefined
+                             : gex_wgpu_compare(state->compare_func);
+   sampler->flipped_comparison =
+      wgpuDeviceCreateSampler(gex_screen(pipe->screen)->device, &desc);
    sampler->state = *state;
    return sampler;
 }
@@ -20168,6 +20207,8 @@ gex_wgpu_delete_sampler_state(struct pipe_context *pipe, void *state)
    GEX_ENTRY_TIMER();
    (void)pipe;
    struct gex_wgpu_sampler *sampler = state;
+   if (sampler && sampler->flipped_comparison)
+      wgpuSamplerRelease(sampler->flipped_comparison);
    if (sampler && sampler->nonfiltering)
       wgpuSamplerRelease(sampler->nonfiltering);
    if (sampler && sampler->sampler)
@@ -27447,6 +27488,61 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
          FREE(variant);
          ralloc_free(nir);
          return NULL;
+      }
+      /* An image WebGPU has no storage texture for goes through a storage
+       * buffer the shader packs, and this variant never did that -- it
+       * collected the packed tables and left the variables alone. The comment
+       * above says these images "bind as sampled textures", which is true of
+       * every shape but one: an imageBuffer has no sampled form either, WGSL
+       * having no buffer texture, so it reached Tint as `Dim Buffer` and the
+       * whole module came back "invalid dimension: 5". That is
+       * KHR-GL45.shading_language_420pack.binding_images_texture_type_buffer,
+       * and the draw after it declined for want of a vertex capture variant.
+       *
+       * varying_nir is cloned from the shader's own NIR before any packed
+       * lowering runs -- only capture_nir gets it at create time -- so this
+       * applies to every packed image the clone has, not just the
+       * format-less ones the capture variant defers.
+       *
+       * Before the textures are collected below, for the reason the capture
+       * variant gives: the lowering removes the image variables, and anything
+       * counting them afterwards would count them twice. */
+      if (variant->images.packed_count) {
+         if (variant->images.packed_unformatted) {
+            /* Refused by name rather than lowered against PIPE_FORMAT_NONE,
+             * which would choose the pack math from a format nobody has yet
+             * and write a wrong answer -- worse than declining. Serving it
+             * means what the capture variant does: collect the tables at
+             * shader-create so they exist before this cache is searched, then
+             * key the variant on the formats the image *units* carry, the way
+             * packed_resolved does. */
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr,
+                       "gex-wgpu: no varying variant for a vertex shader with "
+                       "a format-less packed image (its format comes from the "
+                       "image unit, which this variant is not keyed on)\n");
+            }
+            FREE(variant);
+            ralloc_free(nir);
+            return NULL;
+         }
+         char why_packed[176] = {0};
+         if (!gex_wgpu_apply_packed_images(
+                nir, variant->images.packed_count,
+                variant->images.packed_slots,
+                variant->images.packed_bindings,
+                variant->images.packed_formats,
+                variant->images.packed_write, MESA_SHADER_VERTEX, why_packed,
+                sizeof(why_packed))) {
+            fprintf(stderr, "gex-wgpu: no varying variant for a vertex shader "
+                    "with a packed image (%s)\n",
+                    why_packed[0] ? why_packed : "failed");
+            FREE(variant);
+            ralloc_free(nir);
+            return NULL;
+         }
       }
       if (!gex_wgpu_collect_stage_textures(nir, &variant->textures, &why)) {
          fprintf(stderr, "gex-wgpu: no capture variant for a vertex shader "
@@ -42698,8 +42794,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const bool actual_comparison =
             ctx->samplers[slot]->state.compare_mode ==
             PIPE_TEX_COMPARE_R_TO_TEXTURE;
-         GEX_BINDING_BAD(expected_comparison != actual_comparison,
-                         "comparison sampler mismatch");
+         /* A disagreement is served by the flipped twin rather than declined:
+          * GL leaves a shadow sampler over a texture with no comparison mode
+          * (and the reverse) undefined, and losing the draw is worse than an
+          * undefined texel. Still bad when there is no twin to bind, which is
+          * the pre-existing behaviour. */
+         GEX_BINDING_BAD(expected_comparison != actual_comparison &&
+                            !ctx->samplers[slot]->flipped_comparison,
+                         "comparison sampler mismatch (and no flipped twin)");
          if (ctx->fs->sampler_types[i] ==
              WGPUSamplerBindingType_NonFiltering) {
             GEX_BINDING_BAD(
@@ -43481,7 +43583,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             ? ((depth_as_float & (1u << slot)) &&
                ctx->samplers[slot]->nonfiltering
                   ? ctx->samplers[slot]->nonfiltering
-                  : ctx->samplers[slot]->sampler)
+                  : gex_wgpu_sampler_matching(ctx->samplers[slot],
+                                              ctx->fs->sampler_types[i]))
             : gex_wgpu_default_sampler(
                  screen, (depth_as_float & (1u << slot))
                             ? WGPUSamplerBindingType_NonFiltering
