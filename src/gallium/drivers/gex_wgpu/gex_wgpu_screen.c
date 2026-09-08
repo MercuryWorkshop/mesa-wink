@@ -2492,6 +2492,11 @@ struct gex_wgpu_shader_variant {
     * the key because the same shader is correct both ways depending on the
     * target bound. */
    bool ignore_sample_mask;
+   /* Whether this variant had its colour writes taken out because the pass
+    * has no colour attachments; see gex_wgpu_drop_color_outputs. Part of the
+    * key for the same reason: the same shader against a framebuffer that does
+    * have one is a different module. */
+   bool drop_color;
    /* Texture slots removed from this variant because the bound state could
     * not satisfy their declaration; see gex_wgpu_unusable_texture_slots. */
    uint16_t omitted_slots;
@@ -12435,6 +12440,88 @@ gex_wgpu_ignore_sample_mask(nir_shader *nir)
                                      nir_metadata_control_flow, NULL);
 }
 
+/* Which fragment outputs are colour, as a mask over FRAG_RESULT_*. */
+#define GEX_WGPU_FRAG_COLOR_OUTPUTS                                       \
+   (BITFIELD64_BIT(FRAG_RESULT_COLOR) |                                   \
+    BITFIELD64_RANGE(FRAG_RESULT_DATA0,                                   \
+                     FRAG_RESULT_DATA7 - FRAG_RESULT_DATA0 + 1))
+
+static bool
+gex_wgpu_color_output_location(const nir_variable *var)
+{
+   if (var->data.mode != nir_var_shader_out)
+      return false;
+   return var->data.location == FRAG_RESULT_COLOR ||
+          (var->data.location >= FRAG_RESULT_DATA0 &&
+           var->data.location <= FRAG_RESULT_DATA7);
+}
+
+static bool
+gex_wgpu_drop_color_outputs_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                                  void *data)
+{
+   (void)b;
+   (void)data;
+   if (intr->intrinsic == nir_intrinsic_store_deref) {
+      nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+      nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+      if (!var || !gex_wgpu_color_output_location(var))
+         return false;
+   } else if (intr->intrinsic == nir_intrinsic_store_output) {
+      const unsigned location = nir_intrinsic_io_semantics(intr).location;
+      if (location != FRAG_RESULT_COLOR &&
+          (location < FRAG_RESULT_DATA0 || location > FRAG_RESULT_DATA7))
+         return false;
+   } else {
+      return false;
+   }
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+/* Take the colour writes out of a fragment shader for a pass that has no
+ * colour attachments.
+ *
+ * GL allows this and says nothing happens: writing gl_FragColor with no
+ * colour buffer bound is legal, and the write is discarded. WebGPU is
+ * stricter -- a fragment stage's targets have to account for every output the
+ * module declares -- so a shader that writes colour cannot be paired with
+ * zero targets as it stands.
+ *
+ * The driver used to answer that by omitting the fragment stage altogether,
+ * on the theory that a zero-target fragment state would not validate. It
+ * does: the driver's own depth-copy pipelines have been built with
+ * `targetCount = 0` all along. What omitting the stage actually did was throw
+ * away everything else a fragment shader does on a depth-only pass --
+ * gl_FragDepth, discard, and any side effects -- and the depth attachment
+ * then received the rasterizer's interpolated z instead.
+ *
+ * That is how a drawn depth blit came to write 0.5 everywhere: u_blitter puts
+ * its quad at NDC zero, its depth-fetch shader's gl_FragDepth never reached
+ * the pipeline, and 0.5 is what NDC zero becomes in a [0, 1] depth range. It
+ * reads as a plausible depth rather than as a missing write, which is why it
+ * survived so long -- see also the alpha-tested shadow caster, which discards
+ * for its cutouts and so was casting solid shadows.
+ *
+ * So: drop the colour stores, let DCE take their derefs, and the outputs are
+ * then unused and removable. Everything that is not colour stays.
+ */
+static bool
+gex_wgpu_drop_color_outputs(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+   if (!nir_shader_intrinsics_pass(nir, gex_wgpu_drop_color_outputs_instr,
+                                   nir_metadata_control_flow, NULL))
+      return false;
+   NIR_PASS(_, nir, nir_opt_dce);
+   nir_remove_dead_variables(nir, nir_var_shader_out, NULL);
+   /* The emitter declares an output for what this claims is written, so it
+    * has to agree with the variables that are left. */
+   nir->info.outputs_written &= ~(uint64_t)GEX_WGPU_FRAG_COLOR_OUTPUTS;
+   return true;
+}
+
 /* Does a storage atomic's *result* reach anything in this shader?
  *
  * The question the replay path turns on, and it has to be asked *before*
@@ -14708,6 +14795,15 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       !ctx->fb_multisample && fs->original_nir &&
       (fs->original_nir->info.outputs_written &
        BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK)) != 0;
+   /* A pass with no colour attachments cannot carry a shader that writes
+    * colour, so the writes come out. Decided here, above both early returns,
+    * for the same reason the line above is: a shader needing no other variant
+    * would take the first return, keep its base module, and be paired with
+    * zero targets -- which is the pipeline WebGPU refuses. */
+   const bool want_drop_color =
+      ctx->color_count == 0 && fs->original_nir &&
+      (fs->original_nir->info.outputs_written &
+       (uint64_t)GEX_WGPU_FRAG_COLOR_OUTPUTS) != 0;
    /* Slots the bound state cannot satisfy; their samplers are removed from
     * this variant and their bindings left out of the group. Decided here for
     * the same reason as the line above: there are two early returns below. */
@@ -14922,7 +15018,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
        line_edge_location == ~0u && !fs->buftex_count &&
        !want_sample_positions && !want_clip_dist && !want_logicop &&
-       !want_ignore_sample_mask &&
+       !want_ignore_sample_mask && !want_drop_color &&
        !want_omit_slots && !want_demote_ms && !want_tiled_ms &&
        !fs->ms_array_slots && !want_frag_tile_x && !want_query_only &&
        !want_offset_clamp &&
@@ -15034,7 +15130,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
       want_sample_positions != 0 || want_clip_dist != 0 || want_logicop != 0 ||
-      want_ignore_sample_mask || want_omit_slots != 0 ||
+      want_ignore_sample_mask || want_drop_color || want_omit_slots != 0 ||
       want_demote_ms != 0 || want_tiled_ms != 0 || fs->ms_array_slots != 0 ||
       want_frag_tile_x != 0 || want_query_only != 0 || want_offset_clamp ||
       fs->unformatted_images != 0;
@@ -15061,6 +15157,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->unproduced == unproduced &&
                    cached->poly_stipple == want_stipple &&
                    cached->ignore_sample_mask == want_ignore_sample_mask &&
+                   cached->drop_color == want_drop_color &&
                    cached->omitted_slots == want_omit_slots &&
                    cached->demoted_ms_slots == want_demote_ms &&
                    cached->tiled_ms_slots == want_tiled_ms &&
@@ -15178,6 +15275,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    }
    if (want_ignore_sample_mask)
       gex_wgpu_ignore_sample_mask(variant);
+   if (want_drop_color)
+      gex_wgpu_drop_color_outputs(variant);
    if (want_omit_slots)
       gex_wgpu_omit_textures(variant, want_omit_slots);
    /* Before the texture lowering below, which reads each sampler's dimension
@@ -15286,6 +15385,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->unproduced = unproduced;
    cached->poly_stipple = want_stipple;
    cached->ignore_sample_mask = want_ignore_sample_mask;
+   cached->drop_color = want_drop_color;
    cached->omitted_slots = want_omit_slots;
    cached->demoted_ms_slots = want_demote_ms;
    cached->tiled_ms_slots = want_tiled_ms;
@@ -17369,6 +17469,27 @@ gex_wgpu_texture_format(enum pipe_format format)
     * there. A missing format is not a missing feature here; it is a missing
     * run. */
    case PIPE_FORMAT_Z16_UNORM: return WGPUTextureFormat_Depth16Unorm;
+   /* 24-bit depth with no stencil, which is what almost every application
+    * actually asks for.
+    *
+    * This was absent, and absent it cost every one of them 8 bits of depth.
+    * st/mesa's candidate list for GL_DEPTH_COMPONENT24 -- and for the unsized
+    * GL_DEPTH_COMPONENT, which is what a default depth buffer and most FBO
+    * attachments are -- is Z24X8, X8Z24, *Z16_UNORM*, Z24_S8, S8_Z24. With
+    * neither 24-bit spelling supported the third entry won, silently: the
+    * framebuffer was complete, depth tested and wrote and read back, and
+    * GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE answered 16 to anyone who asked.
+    * What reaches the screen is z-fighting on coplanar geometry and banding
+    * in anything that reconstructs position from depth, at 1/256 of the
+    * resolution the application requested.
+    *
+    * Depth24Plus is not copyable to or from a buffer, exactly like the depth
+    * aspect of Depth24PlusStencil8 -- so it takes the same draw-based
+    * transfer path, and it already had an upload pipeline slot waiting for
+    * it. Only Z24X8 is claimed, not X8Z24: it comes first in st's list, so it
+    * is the one that gets picked, and the other spells its depth in the high
+    * 24 bits instead. */
+   case PIPE_FORMAT_Z24X8_UNORM: return WGPUTextureFormat_Depth24Plus;
    case PIPE_FORMAT_Z24_UNORM_S8_UINT:
       return WGPUTextureFormat_Depth24PlusStencil8;
    /* Stencil, as data. `stencil8` is a real WebGPU format, so a
@@ -17765,6 +17886,7 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
    }
    if (format == PIPE_FORMAT_Z32_FLOAT ||
        format == PIPE_FORMAT_Z16_UNORM ||
+       format == PIPE_FORMAT_Z24X8_UNORM ||
        format == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
        /* depth32float-stencil8 is an optional WebGPU feature; ARB_depth_buffer_float
         * needs it alongside plain depth32float. */
@@ -20316,6 +20438,10 @@ gex_wgpu_write_depth(struct gex_wgpu_context *ctx,
       const uint8_t *row = src + (size_t)y * src_stride;
       for (unsigned x = 0; x < w; ++x) {
          switch (format) {
+         /* Both spell depth in the low 24 bits of a 32-bit word; Z24X8's
+          * top byte is padding rather than stencil, and `stencil` is NULL for
+          * it because the format has no stencil aspect to write. */
+         case PIPE_FORMAT_Z24X8_UNORM:
          case PIPE_FORMAT_Z24_UNORM_S8_UINT: {
             uint32_t packed;
             memcpy(&packed, row + (size_t)x * 4, 4);
@@ -20773,9 +20899,12 @@ gex_wgpu_read_depth(struct gex_wgpu_context *ctx,
             const float d = row[x];
             const uint8_t st = srow ? srow[box->x + x] : 0;
             switch (format) {
+            case PIPE_FORMAT_Z24X8_UNORM:
             case PIPE_FORMAT_Z24_UNORM_S8_UINT: {
                /* Depth in the low 24 bits, stencil in the high 8: what
-                * util_format calls Z24_UNORM_S8_UINT on a little-endian host. */
+                * util_format calls Z24_UNORM_S8_UINT on a little-endian host.
+                * Z24X8 shares the arithmetic and leaves its top byte zero,
+                * which is what `st` is for a format with no stencil. */
                /* Rounded in double, not in float. d * 16777215.0f is not
                 * exactly representable in f32 across most of the range, so
                 * adding 0.5f and truncating lands one below the correct
@@ -25923,10 +26052,30 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
       if (transferable && gex_wgpu_blit_by_transfer(pipe, info, flip_y))
          return;
       /* Reported here, after the transfer path has had its turn, so that a
-       * blit this driver does serve is not announced as a decline. */
-      static bool said;
-      if (!said) {
-         said = true;
+       * blit this driver does serve is not announced as a decline.
+       *
+       * Once per *shape*, not once per process. A single `static bool` said
+       * the first blit and swallowed every later one, and a
+       * glBlitFramebuffer of COLOR|DEPTH|STENCIL arrives as three separate
+       * blits -- so the colour one was announced and the other two were
+       * invisible. KHR-GL45.framebuffer_blit.scissor_blit was read as a
+       * colour bug for that reason when its colour was already correct and
+       * its depth was not; see [[a-latching-message-undercounts]]. */
+      static uint32_t said[16];
+      static unsigned said_count;
+      const uint32_t shape =
+         (uint32_t)info->src.format * 131u + (uint32_t)info->dst.format * 17u +
+         (uint32_t)info->mask * 7u + (uint32_t)info->src.box.width * 3u +
+         (uint32_t)info->dst.box.width +
+         (uint32_t)info->scissor_enable * 1013u +
+         (uint32_t)info->swizzle_enable * 2027u +
+         (uint32_t)info->alpha_blend * 4051u;
+      bool seen = false;
+      for (unsigned i = 0; i < said_count; ++i)
+         seen |= said[i] == shape;
+      if (!seen) {
+         if (said_count < ARRAY_SIZE(said))
+            said[said_count++] = shape;
          fprintf(stderr,
                  "gex-wgpu: blit sent to u_blitter: %ux%u->%ux%u %s->%s "
                  "scissor=%d swizzle=%d blend=%d cond=%d wr=%u mask=0x%x\n",
@@ -41569,15 +41718,30 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * with "attachment state ... not compatible". This was hardcoded to one. */
    pipeline_desc.multisample.count = MAX2(1, ctx->fb_samples);
    pipeline_desc.multisample.mask = 0xffffffffu;
-   /* No colour targets means no fragment stage. WebGPU's depth-only pipeline
-    * omits it entirely, which is the form guaranteed to validate; a fragment
-    * state with zero targets is the kind of thing that gets rejected, and a
-    * rejected pipeline is a validation error, which poisons the device.
+   /* A depth-only pass keeps its fragment stage, with zero targets.
     *
-    * What this gives up is a fragment shader's side effects on a depth-only
-    * pass -- discard, most of all. That is a narrower loss than refusing the
-    * draw outright, which is what happened before. */
-   pipeline_desc.fragment = ctx->color_count ? &fragment : NULL;
+    * This used to omit the stage whenever there were no colour attachments,
+    * on the theory that a zero-target fragment state would be rejected and
+    * that a rejected pipeline poisons the device. The theory was wrong on the
+    * first point -- the driver's own depth-copy pipelines have been built
+    * with `targetCount = 0` since they were written -- and the cost of it was
+    * everything else a fragment shader does: gl_FragDepth, discard, and any
+    * side effects, all silently dropped, with the rasterizer's interpolated z
+    * reaching the depth attachment in their place.
+    *
+    * Two things that looked like unrelated bugs were this one. A drawn depth
+    * blit wrote 0.5 everywhere, because u_blitter puts its quad at NDC zero
+    * and 0.5 is where that lands in a [0, 1] depth range. And an alpha-tested
+    * shadow caster cast a solid shadow, because the discard that cuts out its
+    * foliage never ran.
+    *
+    * The shader's colour writes come out in a variant -- see
+    * gex_wgpu_drop_color_outputs -- because WebGPU does require the targets
+    * to account for every output the module declares. Still NULL when there
+    * is nothing to attach at all, which is a pass WebGPU rejects on its own
+    * terms and not one this driver should be building a stage for. */
+   pipeline_desc.fragment =
+      (ctx->color_count || ctx->depth) ? &fragment : NULL;
    WGPUDepthStencilState depth_state = WGPU_DEPTH_STENCIL_STATE_INIT;
    if (ctx->depth) {
       const bool enabled = ctx->dsa && ctx->dsa->depth_enabled;
