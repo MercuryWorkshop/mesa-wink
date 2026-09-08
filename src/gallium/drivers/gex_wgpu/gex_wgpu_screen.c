@@ -6133,6 +6133,10 @@ gex_wgpu_lower_viewport_transform(nir_builder *b, nir_intrinsic_instr *intr,
 struct gex_wgpu_border_lowering {
    bool s;
    bool t;
+   /* The third axis, which only a 3D texture has: GL's CLAMP_TO_BORDER on a
+    * 2D *array* applies to s and t, while the layer is selected rather than
+    * wrapped and is always clamped to the array's range. */
+   bool r;
    /* GL_MIRROR_CLAMP_TO_EDGE, per axis. WebGPU has three address modes and
     * this is not one of them -- but the mode *is* "take the absolute value,
     * then clamp to edge", so the sampler is a clamp-to-edge one and the
@@ -6865,7 +6869,9 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
    nir_tex_instr *tex = nir_instr_as_tex(instr);
    if ((tex->op != nir_texop_tex && tex->op != nir_texop_txl &&
         tex->op != nir_texop_txb && tex->op != nir_texop_txd) ||
-       tex->sampler_dim != GLSL_SAMPLER_DIM_2D || tex->is_array ||
+       (tex->sampler_dim != GLSL_SAMPLER_DIM_2D &&
+        tex->sampler_dim != GLSL_SAMPLER_DIM_3D) ||
+       (tex->sampler_dim == GLSL_SAMPLER_DIM_3D && tex->is_array) ||
        /* A shadow lookup is handled below, but only in its new-style form,
         * where the reference is its own source and the result is a scalar.
         * The old-style one carries the reference inside the coordinate and
@@ -6874,8 +6880,20 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
        (tex->is_shadow && !tex->is_new_style_shadow) ||
        tex->dest_type != nir_type_float32)
       return false;
+   /* How many axes are wrapped. A 2D array's layer is not one of them -- it
+    * is selected, not wrapped -- so it is carried through the coordinate and
+    * otherwise ignored here.
+    *
+    * Accepting only non-array 2D was worth seven KHR-GL45.texture_border_clamp
+    * cases, all of the Texture2DArray* and Texture3D* ones, and it declined
+    * them by returning false rather than through gex_tex_lower_fail -- so the
+    * log said nothing at all and the border silently became a clamp to edge.
+    * The arithmetic below was already per-axis and needed no rethinking. */
+   const unsigned spatial =
+      tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? 3u : 2u;
    const int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-   if (coord_index < 0 || tex->coord_components != 2)
+   if (coord_index < 0 ||
+       tex->coord_components != spatial + (tex->is_array ? 1u : 0u))
       return false;
 
    struct gex_wgpu_texture_lowering *table = data;
@@ -6902,18 +6920,28 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
        * nothing about the one that did. */
       static uint32_t seen[16];
       static unsigned seen_count;
+      /* The third axis and the shape belong in the key. Without them a
+       * 3D variant and a 2D one on the same slot look identical and only the
+       * first is ever printed, which is the wrong half of the story when the
+       * question is why the third axis did nothing. */
       const uint32_t key = (uint32_t)lower->s | ((uint32_t)lower->t << 1) |
                            ((uint32_t)lower->linear << 2) |
                            (sampler_slot << 3) |
-                           ((uint32_t)(lower->color[2] != 0.0f) << 8);
+                           ((uint32_t)(lower->color[2] != 0.0f) << 8) |
+                           ((uint32_t)lower->r << 9) |
+                           ((uint32_t)tex->sampler_dim << 10) |
+                           ((uint32_t)tex->is_array << 14);
       bool said = false;
       for (unsigned i = 0; i < seen_count; ++i)
          if (seen[i] == key) { said = true; break; }
       if (!said && seen_count < 16) {
          seen[seen_count++] = key;
-         fprintf(stderr, "gex-wgpu: border lowering slot=%u s=%d t=%d "
+         fprintf(stderr, "gex-wgpu: border lowering slot=%u s=%d t=%d r=%d "
+                 "dim=%d array=%d coords=%u spatial=%u "
                  "linear=%d colour=%g,%g,%g,%g\n", sampler_slot,
-                 (int)lower->s, (int)lower->t, (int)lower->linear,
+                 (int)lower->s, (int)lower->t, (int)lower->r,
+                 (int)tex->sampler_dim, (int)tex->is_array,
+                 tex->coord_components, spatial, (int)lower->linear,
                  lower->color[0], lower->color[1], lower->color[2],
                  lower->color[3]);
       }
@@ -6957,24 +6985,34 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
       border = nir_imm_vec4(b, lower->color[0], lower->color[1],
                             lower->color[2], lower->color[3]);
    }
+   const bool bordered = lower->s || lower->t ||
+                         (spatial > 2 && lower->r);
    nir_def *result = &tex->def;
-   if ((lower->s || lower->t) && lower->linear) {
+   if (bordered && lower->linear) {
       const int texture_index =
          nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
       if (texture_index < 0)
          return false;
       nir_tex_instr *txs = nir_tex_instr_create(b->shader, 1);
       txs->op = nir_texop_txs;
-      txs->sampler_dim = GLSL_SAMPLER_DIM_2D;
+      txs->sampler_dim = tex->sampler_dim;
+      txs->is_array = tex->is_array;
       txs->dest_type = nir_type_int32;
       txs->src[0] = nir_tex_src_for_ssa(
          nir_tex_src_texture_deref, tex->src[texture_index].src.ssa);
-      nir_def_init(&txs->instr, &txs->def, 2, 32);
+      /* An array's txs reports the layer count as a further component, so it
+       * has to be asked for even though only the spatial ones are used --
+       * asking for fewer than the shape has is what ntv turns into a
+       * mismatched OpImageQuerySize. */
+      nir_def_init(&txs->instr, &txs->def,
+                   spatial + (tex->is_array ? 1 : 0), 32);
       nir_builder_instr_insert(b, &txs->instr);
       nir_def *size = nir_i2f32(b, &txs->def);
       nir_def *inside_weight = nir_imm_float(b, 1.0f);
-      for (unsigned axis = 0; axis < 2; ++axis) {
-         if ((axis == 0 && !lower->s) || (axis == 1 && !lower->t))
+      for (unsigned axis = 0; axis < spatial; ++axis) {
+         const bool axis_bordered = axis == 0 ? lower->s
+                                    : axis == 1 ? lower->t : lower->r;
+         if (!axis_bordered)
             continue;
          nir_def *c = nir_channel(b, coord, axis);
          nir_def *dimension = nir_channel(b, size, axis);
@@ -6990,19 +7028,17 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
          inside_weight = nir_fmul(b, inside_weight, axis_weight);
       }
       result = nir_flrp(b, border, &tex->def, inside_weight);
-   } else if (lower->s || lower->t) {
+   } else if (bordered) {
       nir_def *outside = nir_imm_false(b);
-      if (lower->s) {
-         nir_def *s = nir_channel(b, coord, 0);
+      for (unsigned axis = 0; axis < spatial; ++axis) {
+         const bool axis_bordered = axis == 0 ? lower->s
+                                    : axis == 1 ? lower->t : lower->r;
+         if (!axis_bordered)
+            continue;
+         nir_def *c = nir_channel(b, coord, axis);
          outside = nir_ior(b, outside,
-                           nir_ior(b, nir_flt_imm(b, s, 0.0f),
-                                   nir_flt(b, nir_imm_float(b, 1.0f), s)));
-      }
-      if (lower->t) {
-         nir_def *t = nir_channel(b, coord, 1);
-         outside = nir_ior(b, outside,
-                           nir_ior(b, nir_flt_imm(b, t, 0.0f),
-                                   nir_flt(b, nir_imm_float(b, 1.0f), t)));
+                           nir_ior(b, nir_flt_imm(b, c, 0.0f),
+                                   nir_flt(b, nir_imm_float(b, 1.0f), c)));
       }
       result = nir_bcsel(b, outside, border, &tex->def);
    }
@@ -8299,6 +8335,8 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
       table.slots[slot] = (struct gex_wgpu_border_lowering) {
          .s = state->wrap_s == PIPE_TEX_WRAP_CLAMP_TO_BORDER,
          .t = state->wrap_t == PIPE_TEX_WRAP_CLAMP_TO_BORDER,
+         .r = state->wrap_r == PIPE_TEX_WRAP_CLAMP_TO_BORDER &&
+              view->target == PIPE_TEXTURE_3D,
          .mirror_s = state->wrap_s == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE,
          .mirror_t = state->wrap_t == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE,
          .mirror_r = state->wrap_r == PIPE_TEX_WRAP_MIRROR_CLAMP_TO_EDGE,
