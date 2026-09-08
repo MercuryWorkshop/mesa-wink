@@ -25721,6 +25721,29 @@ gex_wgpu_clear(struct pipe_context *pipe, unsigned buffers,
    }
 }
 
+/* Where this pass's layer of a tiled multisampled array begins.
+ *
+ * Recomputed rather than stored per attachment, because the layer is not
+ * only set by set_framebuffer_state: the geometry stage's layered rendering
+ * advances ctx->color_layers[] itself and re-enters the draw path once per
+ * layer, so anything derived from the layer has to be derived again there.
+ * Missing that made every layer of a layered draw write over layer zero's
+ * tile. */
+static void
+gex_wgpu_update_ms_tile_x(struct gex_wgpu_context *ctx)
+{
+   ctx->ms_tile_x = 0;
+   for (unsigned i = 0; i < ctx->color_count; ++i) {
+      if (!ctx->colors[i])
+         continue;
+      const struct gex_wgpu_resource *res = gex_resource(ctx->colors[i]);
+      if (res->ms_tile_layers) {
+         ctx->ms_tile_x = ctx->color_layers[i] * res->ms_tile_width;
+         return;
+      }
+   }
+}
+
 static void
 gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
                                const struct pipe_framebuffer_state *state)
@@ -26043,23 +26066,7 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
    const bool has_attachment = color_count || depth;
    ctx->fb_width = has_attachment && state ? state->width : 0;
    ctx->fb_height = has_attachment && state ? state->height : 0;
-   /* A tiled multisampled array's layer offset, taken from whichever
-    * attachment is one. GL attaches a single layer at a time, so at most one
-    * offset is in play per pass; layered rendering re-enters here per layer
-    * with color_layers[] already advanced, which is what makes this work for
-    * gl_Layer without any further arrangement. */
-   ctx->ms_tile_x = 0;
-   for (unsigned i = 0; i < color_count; ++i) {
-      const struct pipe_resource *res = i < color_count ? colors[i] : NULL;
-      if (!res)
-         continue;
-      const struct gex_wgpu_resource *gres =
-         gex_resource((struct pipe_resource *)res);
-      if (gres->ms_tile_layers) {
-         ctx->ms_tile_x = ctx->color_layers[i] * gres->ms_tile_width;
-         break;
-      }
-   }
+   gex_wgpu_update_ms_tile_x(ctx);
    /* Every attachment must agree, which GL also requires of a complete
     * framebuffer -- but the count comes from whichever attachment there is,
     * not from colour attachment zero.
@@ -31363,6 +31370,7 @@ gex_wgpu_gs_route_layers(struct gex_wgpu_context *ctx,
       for (unsigned i = 0; i < ctx->color_count; ++i)
          ctx->color_layers[i] = saved_colors[i] + l;
       ctx->depth_layer = saved_depth + l;
+      gex_wgpu_update_ms_tile_x(ctx);
       struct pipe_draw_start_count_bias run;
       memset(&run, 0, sizeof(run));
       run.start = starts[l];
@@ -31373,6 +31381,7 @@ gex_wgpu_gs_route_layers(struct gex_wgpu_context *ctx,
    for (unsigned i = 0; i < GEX_WGPU_MAX_COLOR_TARGETS; ++i)
       ctx->color_layers[i] = saved_colors[i];
    ctx->depth_layer = saved_depth;
+   gex_wgpu_update_ms_tile_x(ctx);
    if (getenv("GEX_WGPU_GS_LOG"))
       fprintf(stderr, "gex-wgpu: gs routed %u triangles through %u layer(s) "
               "of %u\n", kept / 3, passes, layer_count);
