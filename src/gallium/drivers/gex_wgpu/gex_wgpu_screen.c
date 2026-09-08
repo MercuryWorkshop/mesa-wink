@@ -1905,6 +1905,20 @@ struct gex_wgpu_context {
     * Set per draw, once the topology is final, because the topology rewrites
     * re-enter the draw path and only the terminal call knows it. */
    unsigned primitive_id_verts;
+   /* Whether this draw is already the de-indexed rewrite, so the rewrite
+    * cannot take itself. */
+   bool primitive_id_rewritten;
+   /* Which vertex buffers the de-indexing gather resolved, held apart from
+    * point_gather_mask on purpose.
+    *
+    * They mean the same thing to the bind path and share the same gathered
+    * buffers, but the point expansion *clears* point_gather_mask at the top
+    * of every draw and again when it decides not to expand -- and the
+    * de-indexed redraw is a nested draw, so it would clear the mask the
+    * outer call had just set. The gathered buffer went unbound and Dawn
+    * refused the draw outright: "Vertex range (first: 0, count: 9) requires a
+    * larger buffer (72) than the bound buffer size (40)". */
+   uint32_t deindex_gather_mask;
    /* Where each segment of a stippled strip starts along its line, in
     * pixels, from the prefix pass. */
    struct pipe_resource *line_starts;
@@ -33706,6 +33720,208 @@ gex_wgpu_bind_capture_records(struct gex_wgpu_context *ctx,
                                 ctx->passthrough_records, true);
 }
 
+/* De-index a draw so that its vertex order is its primitive order, which is
+ * what lets the vertex stage derive gl_PrimitiveID.
+ *
+ * Two shapes need it and they reduce to one job. An **indexed** draw gets the
+ * index *value* in @builtin(vertex_index), not a sequence number, so two
+ * primitives sharing a vertex would disagree about which they belong to. A
+ * **strip** has no per-vertex answer at all: its vertex n belongs to
+ * primitives n-2, n-1 and n. Converting to a list and then resolving the
+ * indices away leaves a draw whose vertex k belongs to primitive
+ * k / verts_per_prim and nothing else, which is exactly what
+ * gex_wgpu_emit_primitive_id assumes.
+ *
+ * Both halves already exist. u_index_translator and u_index_generator produce
+ * the list index array -- called with a hardware mask of the *list*
+ * topologies only, so a strip is converted rather than passed through -- and
+ * gex_wgpu_gather_indexed_vertices resolves an index array into per-vertex
+ * copies of every vertex buffer, which is what the point expansion uses it
+ * for. The bind path already substitutes a gathered buffer at offset zero and
+ * skips the base-instance fold for it, and says so in as many words.
+ *
+ * The cost is a CPU read of the index buffer plus one dispatch per vertex
+ * buffer, per draw. That is heavy, and it is charged only to draws whose
+ * fragment shader reads gl_PrimitiveID -- for which the alternative was
+ * refusing to link the program at all. */
+static bool
+gex_wgpu_deindex_for_primitive_id(struct gex_wgpu_context *ctx,
+                                  const struct pipe_draw_info *info,
+                                  unsigned drawid_offset,
+                                  const struct pipe_draw_start_count_bias *draw)
+{
+   struct pipe_context *pipe = &ctx->base;
+#define GEX_PID_DECLINE(why)                                                  \
+   do {                                                                       \
+      static bool said;                                                       \
+      if (!said) {                                                            \
+         said = true;                                                         \
+         fprintf(stderr, "gex-wgpu: gl_PrimitiveID declined (%s); it will "   \
+                 "read 0 for this draw\n", why);                              \
+      }                                                                       \
+      return false;                                                           \
+   } while (0)
+
+   if (!ctx->vertex_elements || !ctx->vs)
+      GEX_PID_DECLINE("no vertex layout to gather");
+   if (info->primitive_restart && info->index_size)
+      GEX_PID_DECLINE("primitive restart");
+   if (info->instance_count > 1)
+      GEX_PID_DECLINE("instanced");
+   const unsigned count = draw->count;
+   if (!count)
+      return true;
+
+   /* Only the list topologies, which is the whole point: a strip has to be
+    * converted, not passed through, so the mask must not contain it. */
+   const unsigned list_mask = (1u << MESA_PRIM_POINTS) |
+                              (1u << MESA_PRIM_LINES) |
+                              (1u << MESA_PRIM_TRIANGLES);
+   enum mesa_prim out_prim = info->mode;
+   unsigned out_index_size = 0, out_nr = 0;
+   u_translate_func translate = NULL;
+   u_generate_func generate = NULL;
+   const void *src = NULL;
+   struct pipe_transfer *transfer = NULL;
+   unsigned start = draw->start;
+
+   if (info->index_size) {
+      if (info->index_size != 1 && info->index_size != 2 &&
+          info->index_size != 4)
+         GEX_PID_DECLINE("index width");
+      /* PV_LAST to PV_LAST: this conversion is about the topology only. The
+       * provoking-vertex rewrite is a separate pass and re-ordering here
+       * would fight it -- and it does not need to be fought, because a
+       * rotation inside one primitive leaves k / verts_per_prim alone. */
+      if (u_index_translator(list_mask, info->mode, info->index_size, count,
+                             PV_LAST, PV_LAST, PR_DISABLE, &out_prim,
+                             &out_index_size, &out_nr,
+                             &translate) == U_TRANSLATE_ERROR)
+         GEX_PID_DECLINE("no translator for this topology");
+      if (info->has_user_indices) {
+         src = info->index.user;
+         if (!src)
+            GEX_PID_DECLINE("no user index array");
+      } else {
+         src = pipe_buffer_map_range(pipe, info->index.resource,
+                                     start * info->index_size,
+                                     count * info->index_size,
+                                     PIPE_MAP_READ, &transfer);
+         if (!src)
+            GEX_PID_DECLINE("the index buffer could not be mapped");
+         start = 0;
+      }
+   } else if (u_index_generator(list_mask, info->mode, start, count, PV_LAST,
+                                PV_LAST, &out_prim, &out_index_size, &out_nr,
+                                &generate) == U_TRANSLATE_ERROR) {
+      GEX_PID_DECLINE("no generator for this topology");
+   }
+   if (!out_nr) {
+      if (transfer)
+         pipe_buffer_unmap(pipe, transfer);
+      return true;
+   }
+   if (out_index_size != 2 && out_index_size != 4) {
+      if (transfer)
+         pipe_buffer_unmap(pipe, transfer);
+      GEX_PID_DECLINE("output index width");
+   }
+   void *out = MALLOC((size_t)out_nr * out_index_size);
+   if (!out) {
+      if (transfer)
+         pipe_buffer_unmap(pipe, transfer);
+      GEX_PID_DECLINE("out of memory for the list indices");
+   }
+   if (translate)
+      translate(src, start, count, out_nr, info->restart_index, out);
+   else
+      generate(start, out_nr, out);
+   if (transfer)
+      pipe_buffer_unmap(pipe, transfer);
+
+   /* Every buffer an element reads, at that element's stride. The same
+    * bookkeeping the point expansion fills in, and the same gather reads it.
+    */
+   memset(ctx->point_gather_wanted, 0, sizeof(ctx->point_gather_wanted));
+   memset(ctx->point_gather_stride, 0, sizeof(ctx->point_gather_stride));
+   for (unsigned i = 0; i < ctx->vertex_elements->count; ++i) {
+      const struct pipe_vertex_element *ve = &ctx->vertex_elements->elements[i];
+      const unsigned buffer = ve->vertex_buffer_index;
+      if (buffer >= GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS ||
+          buffer >= ctx->vertex_buffer_count || !ctx->vertex_buffers[buffer])
+         continue;
+      /* A per-instance element is not indexed by the vertex at all, so
+       * gathering it would be wrong; the draw is single-instance here, so
+       * leaving it bound reads instance zero, which is what it should. */
+      if (ve->instance_divisor)
+         continue;
+      if (ve->src_stride % 4 || ctx->vertex_buffer_offsets[buffer] % 4) {
+         FREE(out);
+         GEX_PID_DECLINE("an unaligned vertex stride or offset");
+      }
+      ctx->point_gather_wanted[buffer] = true;
+      ctx->point_gather_stride[buffer] = ve->src_stride;
+   }
+
+   /* The gather reads its indices from the info it is handed, so it gets the
+    * list -- as user indices, which is how the topology rewrite hands its own
+    * on too. */
+   struct pipe_draw_info listed = *info;
+   listed.mode = out_prim;
+   listed.index_size = out_index_size;
+   listed.has_user_indices = true;
+   listed.index.user = out;
+   listed.primitive_restart = false;
+   listed.index_bounds_valid = false;
+   listed.min_index = 0;
+   listed.max_index = ~0u;
+   struct pipe_draw_start_count_bias listed_draw = *draw;
+   listed_draw.start = 0;
+   listed_draw.count = out_nr;
+   listed_draw.index_bias = 0;
+
+   ctx->point_gather_mask = 0;
+   const bool gathered =
+      gex_wgpu_gather_indexed_vertices(ctx, &listed, &listed_draw, out_nr);
+   if (!gathered) {
+      ctx->point_gather_mask = 0;
+      FREE(out);
+      GEX_PID_DECLINE("the vertices could not be gathered");
+   }
+
+   /* And the draw itself: no indices at all, so vertex k is primitive
+    * k / verts_per_prim. */
+   struct pipe_draw_info flat = listed;
+   flat.index_size = 0;
+   flat.has_user_indices = false;
+   flat.index.user = NULL;
+   struct pipe_draw_start_count_bias flat_draw = listed_draw;
+   flat_draw.start = 0;
+   flat_draw.count = out_nr;
+   if (getenv("GEX_WGPU_PID_LOG")) {
+      fprintf(stderr, "gex-wgpu: primitive-id de-index mode=%u->%u count=%u"
+              "->%u mask=0x%x isz=%u idx=", (unsigned)info->mode,
+              (unsigned)out_prim, count, out_nr, ctx->point_gather_mask,
+              out_index_size);
+      for (unsigned i = 0; i < MIN2(out_nr, 12u); ++i)
+         fprintf(stderr, "%u ", out_index_size == 2
+                             ? (unsigned)((const uint16_t *)out)[i]
+                             : ((const uint32_t *)out)[i]);
+      fprintf(stderr, "\n");
+   }
+   /* Moved out of point_gather_mask before the nested draw, which clears
+    * that one; see the field's note. */
+   ctx->deindex_gather_mask = ctx->point_gather_mask;
+   ctx->point_gather_mask = 0;
+   ctx->primitive_id_rewritten = true;
+   gex_wgpu_draw_vbo(pipe, &flat, drawid_offset, NULL, &flat_draw, 1);
+   ctx->primitive_id_rewritten = false;
+   ctx->deindex_gather_mask = 0;
+   FREE(out);
+   return true;
+#undef GEX_PID_DECLINE
+}
+
 /* Draw a wide, or smooth, line as quads.
  *
  * Three steps, and the first two are the geometry-shader path's first pass
@@ -41534,6 +41750,27 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        gex_wgpu_line_draw(ctx, info, drawid_offset, &draws[0]))
       GEX_DRAW_DROP();
 
+   /* gl_PrimitiveID, for the draws whose vertex stage cannot derive it as
+    * they stand: an indexed draw or a strip. De-indexing turns both into a
+    * list whose vertex order is its primitive order; see
+    * gex_wgpu_deindex_for_primitive_id.
+    *
+    * After the emulated stages above, because a geometry or tessellation
+    * shader consumes the topology itself and computes the primitive number
+    * exactly -- converting first would be wrong there and the rewrite is not
+    * what such a draw needs. (Carrying the number *out* of those stages is a
+    * separate piece; today they leave the carrier unwritten and the id reads
+    * 0.) Before the topology rewrite below, so that a strip reaches this as a
+    * strip: that rewrite would leave it indexed, which is the other half of
+    * what this exists to undo. */
+   if (!ctx->failed && info && draws && num_draws == 1 && !indirect &&
+       !ctx->primitive_id_rewritten && ctx->fs && ctx->fs->reads_primitive_id &&
+       !ctx->gs && !ctx->tcs && !ctx->tes &&
+       !ctx->gs_rasterizing && !ctx->tess_rasterizing &&
+       (info->index_size || !gex_wgpu_primitive_id_verts(info->mode)) &&
+       gex_wgpu_deindex_for_primitive_id(ctx, info, drawid_offset, &draws[0]))
+      GEX_DRAW_DROP();
+
    /* A topology WebGPU does not have is rewritten into one it does, which
     * comes straight back here as a supported mode -- but only for the
     * topologies u_index_translator actually converts. */
@@ -45584,7 +45821,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const unsigned which = vb_buffer[slot];
          /* A gathered slot is bound to the de-indexed copy instead, at offset
           * zero: the gather already applied the buffer's own offset. */
-         const bool gathered = (ctx->point_gather_mask & (1u << which)) != 0;
+         const bool gathered =
+            ((ctx->point_gather_mask | ctx->deindex_gather_mask) &
+             (1u << which)) != 0;
          struct pipe_resource *buffer = gathered
             ? ctx->point_gathered[which] : ctx->vertex_buffers[which];
          uint32_t offset =
