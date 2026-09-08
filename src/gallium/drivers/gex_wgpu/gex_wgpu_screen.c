@@ -1067,6 +1067,16 @@ struct gex_wgpu_stage_textures {
     * the command buffer with it. The collector already worked this out for
     * the sample type and then threw it away. */
    bool multisampled[GEX_WGPU_MAX_SAMPLERS];
+   /* Buffer textures, which are not textures here at all: a samplerBuffer is
+    * a read-only storage buffer and texelFetch becomes word loads, so it has
+    * a binding range of its own and no dimension or sample type. Recorded
+    * here and lowered in the stage's variant, exactly as the compute stage
+    * and the graphics stages do it -- the collector used to refuse them by
+    * name ("a buffer texture"), which failed the *link* for any program
+    * declaring a samplerBuffer in a geometry or tessellation stage. */
+   unsigned buftex_count;
+   uint8_t buftex_slots[GEX_WGPU_MAX_BUFFER_TEXTURES];
+   uint32_t buftex_bindings[GEX_WGPU_MAX_BUFFER_TEXTURES];
 };
 
 /* The images one stage declares, in the form the bind group layout needs.
@@ -2760,6 +2770,9 @@ struct gex_wgpu_capture_layout {
  * every shader uses: gex_wgpu_gs_module returns it untouched unless the shader
  * samples an integer texture. */
 struct gex_wgpu_gs_variant {
+   /* Texel word counts of the bound buffer textures this module's texelFetch
+    * lowering was built against; bound state, so part of the key. */
+   uint8_t buftex_words[GEX_WGPU_MAX_BUFFER_TEXTURES];
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
    uint8_t targets[GEX_WGPU_MAX_SAMPLERS];
@@ -2876,6 +2889,8 @@ struct gex_wgpu_gs {
  * layouts are fixed at create time -- so unlike the evaluation stage's
  * variant this carries nothing but the texture key. */
 struct gex_wgpu_tcs_variant {
+   /* Bound state, so part of the key; see the geometry variant's copy. */
+   uint8_t buftex_words[GEX_WGPU_MAX_BUFFER_TEXTURES];
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
    uint8_t targets[GEX_WGPU_MAX_SAMPLERS];
@@ -2953,6 +2968,8 @@ struct gex_wgpu_tes_variant {
    uint8_t targets[GEX_WGPU_MAX_SAMPLERS];
    uint8_t first_level[GEX_WGPU_MAX_SAMPLERS];
    uint8_t last_level[GEX_WGPU_MAX_SAMPLERS];
+   /* Bound state, so part of the key; see the geometry variant's copy. */
+   uint8_t buftex_words[GEX_WGPU_MAX_BUFFER_TEXTURES];
    WGPUShaderModule module;
    struct gex_wgpu_tes_variant *next;
 };
@@ -3037,6 +3054,11 @@ struct gex_wgpu_varying_variant {
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
    uint8_t targets[GEX_WGPU_MAX_SAMPLERS];
+   /* Texel word counts of the buffer textures this module's texelFetch
+    * lowering was built against. A samplerBuffer's format lives on the
+    * sampler view, not in the shader, so it is bound state and belongs in the
+    * key -- the same reason the fragment and compute variants carry it. */
+   uint8_t buftex_words[GEX_WGPU_MAX_BUFFER_TEXTURES];
    /* And its images. A vertex shader may have them now, and after the
     * storage-write strip they are read-only here -- Tint lowers such an
     * image to a sampled texture, which is legal in any stage. Left at the
@@ -23161,11 +23183,22 @@ gex_wgpu_collect_stage_textures(nir_shader *nir,
          continue;
       const enum glsl_sampler_dim dim = glsl_get_sampler_dim(type);
       if (dim == GLSL_SAMPLER_DIM_BUF) {
-         /* A buffer texture is a storage buffer here, with a binding range of
-          * its own; serving it from a compute-emulated stage is more than
-          * this pair of helpers does. */
-         *why = "a buffer texture";
-         return false;
+         /* Recorded, not refused. See gex_wgpu_stage_textures::buftex_count. */
+         const unsigned slot = var->data.driver_location;
+         bool seen = false;
+         for (unsigned i = 0; i < out->buftex_count; ++i)
+            seen |= out->buftex_slots[i] == slot;
+         if (seen)
+            continue;
+         if (out->buftex_count >= GEX_WGPU_MAX_BUFFER_TEXTURES ||
+             slot >= GEX_WGPU_MAX_BUFFER_TEXTURES) {
+            *why = "more texture buffers than this driver binds";
+            return false;
+         }
+         const unsigned at = out->buftex_count++;
+         out->buftex_slots[at] = (uint8_t)slot;
+         out->buftex_bindings[at] = GEX_WGPU_BUFTEX_FIRST_BINDING + slot;
+         continue;
       }
       const bool is_array = glsl_sampler_type_is_array(type);
       const bool multisampled = dim == GLSL_SAMPLER_DIM_MS;
@@ -27342,9 +27375,19 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    const bool wants_variant = gex_wgpu_stage_wants_texture_variant(
       vs->texture_count, vs->texture_slots, vs->integer_sampled_slots,
       ctx->vertex_samplers, ctx->vertex_sampler_views);
+   /* The texel width of each bound buffer texture, which the lowering below
+    * is written against -- so it is part of the key. Taken from the shader's
+    * own table, which exists before this cache is searched; the clone's
+    * table, collected further down, holds the same slots. */
+   uint8_t want_buftex[GEX_WGPU_MAX_BUFFER_TEXTURES];
+   gex_wgpu_buftex_words(vs->buftex_count, vs->buftex_slots,
+                         ctx->vertex_sampler_views, want_buftex);
    for (struct gex_wgpu_varying_variant *v = *cache; v; v = v->next) {
       if (memcmp(&v->vertex_layout, vertex, sizeof(*vertex)) ||
           memcmp(&v->varyings, varyings, sizeof(*varyings)))
+         continue;
+      if (vs->buftex_count &&
+          memcmp(v->buftex_words, want_buftex, sizeof(want_buftex)) != 0)
          continue;
       if (!wants_variant)
          return v;
@@ -27534,7 +27577,16 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
                 variant->images.packed_slots,
                 variant->images.packed_bindings,
                 variant->images.packed_formats,
-                variant->images.packed_write, MESA_SHADER_VERTEX, why_packed,
+                /* MESA_SHADER_COMPUTE, because this variant *is* a compute
+                 * dispatch: apply_packed_images picks the descriptor set from
+                 * the stage and gives compute set zero, which is where
+                 * gex_wgpu_bind_stage_packed_images binds them. Naming the
+                 * vertex stage put the declarations in set 1 and Dawn said
+                 * so -- "the entry-point uses bindings in group 1 but
+                 * [PipelineLayout] doesn't have a BindGroupLayout for this
+                 * index" -- which invalidated the command buffer while the
+                 * test still passed, the worst of both. */
+                variant->images.packed_write, MESA_SHADER_COMPUTE, why_packed,
                 sizeof(why_packed))) {
             fprintf(stderr, "gex-wgpu: no varying variant for a vertex shader "
                     "with a packed image (%s)\n",
@@ -27553,6 +27605,27 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
       }
    }
 
+   /* A samplerBuffer is a read-only storage buffer here and texelFetch
+    * becomes word loads, so the fetch has to know the texel's shape -- which
+    * is bound state. Without this the buffer texture the collector now
+    * records reaches Tint as an unlowered `Dim Buffer`; before it recorded
+    * them at all, the *link* failed instead.
+    * gex_wgpu_bind_textures_from binds them from the same table. */
+   if (variant->textures.buftex_count) {
+      char why_buftex[176] = {0};
+      if (!gex_wgpu_apply_buffer_textures(
+             nir, variant->textures.buftex_count,
+             variant->textures.buftex_slots,
+             variant->textures.buftex_bindings, MESA_SHADER_COMPUTE,
+             want_buftex, why_buftex, sizeof(why_buftex))) {
+         fprintf(stderr, "gex-wgpu: no varying variant for a vertex shader "
+                 "with a texture buffer (%s)\n",
+                 why_buftex[0] ? why_buftex : "failed");
+         FREE(variant);
+         ralloc_free(nir);
+         return NULL;
+      }
+   }
    /* An integer texture cannot be sampled in WGSL, so `texture()` on one has
     * to become a fetch that applies the wrap, filter and swizzle itself --
     * all of it bound state, which is why this module is keyed on that state
@@ -27593,6 +27666,7 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
       return NULL;
    }
    free(error);
+   memcpy(variant->buftex_words, want_buftex, sizeof(variant->buftex_words));
    variant->next = *cache;
    *cache = variant;
    return variant;
@@ -28955,7 +29029,7 @@ gex_wgpu_texture_keys_fill(unsigned count, const uint8_t *slots,
 static WGPUShaderModule
 gex_wgpu_gs_module(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs)
 {
-   if (!gs->integer_sampled_slots)
+   if (!gs->integer_sampled_slots && !gs->textures.buftex_count)
       return gs->module;
 
    const int stage = gex_wgpu_compute_stage_index(MESA_SHADER_GEOMETRY);
@@ -28964,8 +29038,13 @@ gex_wgpu_gs_module(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs)
    struct gex_wgpu_sampler *const *samplers = ctx->stage_samplers[stage];
    struct pipe_sampler_view *const *views = ctx->stage_sampler_views[stage];
 
+   uint8_t want_buftex[GEX_WGPU_MAX_BUFFER_TEXTURES];
+   gex_wgpu_buftex_words(gs->textures.buftex_count, gs->textures.buftex_slots,
+                         views, want_buftex);
    for (struct gex_wgpu_gs_variant *cached = gs->variants; cached;
         cached = cached->next) {
+      if (memcmp(cached->buftex_words, want_buftex, sizeof(want_buftex)) != 0)
+         continue;
       if (gex_wgpu_texture_keys_match(
              gs->textures.count, gs->textures.slots, samplers, views,
              cached->sampler_keys, cached->swizzles, cached->targets,
@@ -28976,6 +29055,25 @@ gex_wgpu_gs_module(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs)
    nir_shader *clone = nir_shader_clone(NULL, gs->nir);
    if (!clone)
       return NULL;
+   if (gs->textures.buftex_count) {
+      char why[176] = {0};
+      if (!gex_wgpu_apply_buffer_textures(
+             clone, gs->textures.buftex_count, gs->textures.buftex_slots,
+      /* MESA_SHADER_COMPUTE, not this stage: gex_wgpu_apply_buffer_textures
+       * picks the descriptor set from the stage, and the compute-emulated
+       * stages bind their textures into group *zero*, as the compute stage
+       * does -- gex_wgpu_bind_stage_textures appends to their group0. Naming
+       * the real stage put the block in set 2 and Dawn said so: "the
+       * entry-point uses bindings in group 2 but [PipelineLayout] doesn't
+       * have a BindGroupLayout for this index". */
+             gs->textures.buftex_bindings, MESA_SHADER_COMPUTE, want_buftex,
+             why, sizeof(why))) {
+         fprintf(stderr, "gex-wgpu: no geometry variant for a texture buffer "
+                 "(%s)\n", why[0] ? why : "failed");
+         ralloc_free(clone);
+         return NULL;
+      }
+   }
    if (!gex_wgpu_lower_texture_variant(clone, gs->textures.count,
                                        gs->textures.slots,
                                        gs->integer_sampled_slots,
@@ -28998,6 +29096,7 @@ gex_wgpu_gs_module(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs)
                               samplers, views, cached->sampler_keys,
                               cached->swizzles, cached->targets,
                               cached->first_level, cached->last_level);
+   memcpy(cached->buftex_words, want_buftex, sizeof(cached->buftex_words));
    cached->module = module;
    cached->next = gs->variants;
    gs->variants = cached;
@@ -29601,11 +29700,16 @@ gex_wgpu_tes_variant_get(struct pipe_context *pipe, struct gex_wgpu_tes *tes,
       stage >= 0 ? ctx->stage_sampler_views[stage] : NULL;
    const bool key_textures =
       tes->integer_sampled_slots != 0 && samplers && views;
+   /* Bound state the buffer-texture lowering bakes in, so part of the key. */
+   uint8_t want_buftex[GEX_WGPU_MAX_BUFFER_TEXTURES];
+   gex_wgpu_buftex_words(tes->textures.buftex_count,
+                         tes->textures.buftex_slots, views, want_buftex);
    for (struct gex_wgpu_tes_variant *v = tes->variants; v; v = v->next) {
       if (v->verts_per_patch == verts_per_patch &&
           !memcmp(&v->tcs_outputs, producer, sizeof(*producer)) &&
           !memcmp(&v->tcs_patch_outputs, producer_patch,
                   sizeof(*producer_patch)) &&
+          !memcmp(v->buftex_words, want_buftex, sizeof(want_buftex)) &&
           (!key_textures ||
            gex_wgpu_texture_keys_match(
               tes->textures.count, tes->textures.slots, samplers, views,
@@ -29623,6 +29727,18 @@ gex_wgpu_tes_variant_get(struct pipe_context *pipe, struct gex_wgpu_tes *tes,
     * shader with an integer sampler has no module at all until this runs.
     * That is why the evaluation stage declined every draw rather than
     * producing a wrong one. */
+   if (tes->textures.buftex_count) {
+      char why[176] = {0};
+      if (!gex_wgpu_apply_buffer_textures(
+             nir, tes->textures.buftex_count, tes->textures.buftex_slots,
+             tes->textures.buftex_bindings, MESA_SHADER_COMPUTE,
+             want_buftex, why, sizeof(why))) {
+         fprintf(stderr, "gex-wgpu: no tessellation evaluation variant for a "
+                 "texture buffer (%s)\n", why[0] ? why : "failed");
+         ralloc_free(nir);
+         return NULL;
+      }
+   }
    if (key_textures &&
        !gex_wgpu_lower_texture_variant(nir, tes->textures.count,
                                        tes->textures.slots,
@@ -29644,6 +29760,7 @@ gex_wgpu_tes_variant_get(struct pipe_context *pipe, struct gex_wgpu_tes *tes,
    variant->tcs_outputs = *producer;
    variant->tcs_patch_outputs = *producer_patch;
    variant->verts_per_patch = verts_per_patch;
+   memcpy(variant->buftex_words, want_buftex, sizeof(variant->buftex_words));
    if (key_textures)
       gex_wgpu_texture_keys_fill(tes->textures.count, tes->textures.slots,
                                  samplers, views, variant->sampler_keys,
@@ -29865,7 +29982,7 @@ gex_wgpu_create_tcs_state(struct pipe_context *pipe,
     * all, and an application checking GL_LINK_STATUS stops there. The variant
     * built against the bound sampler state is the only module such a shader
     * has; see gex_wgpu_tcs_variant_module. */
-   if (tcs->integer_sampled_slots) {
+   if (tcs->integer_sampled_slots || tcs->textures.buftex_count) {
       tcs->nir = nir;
       tcs->module = NULL;
       return tcs;
@@ -29893,7 +30010,7 @@ static WGPUShaderModule
 gex_wgpu_tcs_variant_module(struct gex_wgpu_context *ctx,
                             struct gex_wgpu_tcs *tcs)
 {
-   if (!tcs->integer_sampled_slots)
+   if (!tcs->integer_sampled_slots && !tcs->textures.buftex_count)
       return tcs->module;
    const int stage = gex_wgpu_compute_stage_index(MESA_SHADER_TESS_CTRL);
    if (stage < 0 || !tcs->nir)
@@ -29901,8 +30018,13 @@ gex_wgpu_tcs_variant_module(struct gex_wgpu_context *ctx,
    struct gex_wgpu_sampler *const *samplers = ctx->stage_samplers[stage];
    struct pipe_sampler_view *const *views = ctx->stage_sampler_views[stage];
 
+   uint8_t want_buftex[GEX_WGPU_MAX_BUFFER_TEXTURES];
+   gex_wgpu_buftex_words(tcs->textures.buftex_count,
+                         tcs->textures.buftex_slots, views, want_buftex);
    for (struct gex_wgpu_tcs_variant *cached = tcs->variants; cached;
         cached = cached->next) {
+      if (memcmp(cached->buftex_words, want_buftex, sizeof(want_buftex)) != 0)
+         continue;
       if (gex_wgpu_texture_keys_match(
              tcs->textures.count, tcs->textures.slots, samplers, views,
              cached->sampler_keys, cached->swizzles, cached->targets,
@@ -29913,6 +30035,18 @@ gex_wgpu_tcs_variant_module(struct gex_wgpu_context *ctx,
    nir_shader *clone = nir_shader_clone(NULL, tcs->nir);
    if (!clone)
       return NULL;
+   if (tcs->textures.buftex_count) {
+      char why[176] = {0};
+      if (!gex_wgpu_apply_buffer_textures(
+             clone, tcs->textures.buftex_count, tcs->textures.buftex_slots,
+             tcs->textures.buftex_bindings, MESA_SHADER_COMPUTE,
+             want_buftex, why, sizeof(why))) {
+         fprintf(stderr, "gex-wgpu: no tessellation control variant for a "
+                 "texture buffer (%s)\n", why[0] ? why : "failed");
+         ralloc_free(clone);
+         return NULL;
+      }
+   }
    if (!gex_wgpu_lower_texture_variant(clone, tcs->textures.count,
                                        tcs->textures.slots,
                                        tcs->integer_sampled_slots,
@@ -29936,6 +30070,7 @@ gex_wgpu_tcs_variant_module(struct gex_wgpu_context *ctx,
                               samplers, views, cached->sampler_keys,
                               cached->swizzles, cached->targets,
                               cached->first_level, cached->last_level);
+   memcpy(cached->buftex_words, want_buftex, sizeof(cached->buftex_words));
    cached->module = module;
    cached->next = tcs->variants;
    tcs->variants = cached;
@@ -30592,7 +30727,7 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
     * variant built against the bound sampler state is the only module such a
     * shader ever has; see gex_wgpu_gs_module. The compute path skips its base
     * module for the same reason and says so in the same words. */
-   gs->module = gs->integer_sampled_slots
+   gs->module = (gs->integer_sampled_slots || gs->textures.buftex_count)
       ? NULL : gex_wgpu_gs_build_module(pipe, gs, NULL);
 
    struct pipe_shader_state passthrough_state = {0};
@@ -30638,7 +30773,13 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
    gs->passthrough_elements = ctx->base.create_vertex_elements_state(
       &ctx->base, element_count, elements);
 
-   if ((!gs->module && !gs->integer_sampled_slots) || !gs->passthrough ||
+   /* A NULL base module is expected for a shader whose only modules are
+    * variants -- integer sampling or a buffer texture, both of which bake in
+    * bound state. Missing the second of those reported "could not compile the
+    * geometry compute module" for a shader that had deliberately not built
+    * one. */
+   if ((!gs->module && !gs->integer_sampled_slots &&
+        !gs->textures.buftex_count) || !gs->passthrough ||
        !gs->passthrough_elements) {
       /* Named, because all three failures reach the application as an empty
        * link log and there is nothing else to go on. */
@@ -31659,6 +31800,51 @@ gex_wgpu_bind_textures_from(struct pipe_context *pipe,
          return false;
       }
    }
+   /* Buffer textures, as read-only storage buffers -- the shape the stage's
+    * variant lowering expects, and the same one the compute and graphics
+    * paths bind. Appended here so all three emulated stages get it from the
+    * single place they already share.
+    *
+    * An unbound unit reads zero rather than declining the dispatch: GL
+    * defines that, and declining lost every side effect the shader had. */
+   for (unsigned i = 0; i < textures->buftex_count; ++i) {
+      const unsigned slot = textures->buftex_slots[i];
+      const struct pipe_sampler_view *bufview = views[slot];
+      if (group->count >= GEX_WGPU_MAX_GROUP_BINDINGS) {
+         if (getenv("GEX_WGPU_STAGE_TEXTURE_LOG"))
+            fprintf(stderr, "gex-wgpu: stage texture buffer %u has no room in "
+                    "the group\n", slot);
+         return false;
+      }
+      struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+      WGPUBuffer buffer;
+      uint64_t offset, size;
+      if (!bufview || bufview->target != PIPE_BUFFER || !bufview->texture) {
+         buffer = gex_wgpu_placeholder_storage(ctx, 0);
+         if (!buffer)
+            return false;
+         offset = 0;
+         size = ctx->placeholder_storage->width0;
+      } else {
+         buffer = gex_resource(bufview->texture)->buffer;
+         offset = bufview->u.buf.offset;
+         /* Rounded up to four: WebGPU wants a storage binding's size to be a
+          * multiple of four and a narrow buffer texture need not be -- five
+          * R8 texels is five bytes. The allocation is 16-aligned so this
+          * never reaches past the buffer, and the extra bytes are outside
+          * every texel the shader can address. */
+         size = ALIGN_POT(bufview->u.buf.size, 4);
+      }
+      const unsigned at = group->count;
+      group->binding[at] = textures->buftex_bindings[i];
+      group->buffer[at] = buffer;
+      group->offset[at] = offset;
+      group->size[at] = size;
+      /* `var<storage, read>`, which the layout has to agree with. */
+      group->storage_mask |= UINT64_C(1) << at;
+      group->readonly_mask |= UINT64_C(1) << at;
+      ++group->count;
+   }
    return true;
 }
 
@@ -31795,6 +31981,21 @@ gex_wgpu_bind_stage_packed_images(struct gex_wgpu_context *ctx,
           * is an invalid pipeline, not a slow one. */
          if (half) {
             group->storage_mask |= UINT64_C(1) << at;
+            /* And read-only when the shader only reads it, because the
+             * emitter declares such a block `var<storage, read>` and WebGPU
+             * checks the two against each other by name:
+             *
+             *   The buffer type in the shader
+             *   (BufferBindingType::ReadOnlyStorage) is not compatible with
+             *   the type in the layout ... While validating that the
+             *   entry-point's declaration for @group(0) @binding(N) matches
+             *   [BindGroupLayoutInternal]
+             *
+             * Which reached nothing until a *read-only* packed image existed:
+             * the vertex varying variant's images are read-only after the
+             * storage-write strip, so it was the first caller to bind one. */
+            if (!images->packed_write[i])
+               group->readonly_mask |= UINT64_C(1) << at;
          }
          ++group->count;
       }
