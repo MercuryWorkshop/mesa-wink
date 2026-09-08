@@ -2433,7 +2433,8 @@ struct gex_wgpu_interp_variant {
    uint64_t mask;
    /* Scale and translate folded into gl_Position for a viewport WebGPU
     * cannot set. All zero when the viewport fits and nothing is folded. */
-   float viewport[4];
+   /* x scale, y scale, x translate, y translate, z scale, z translate. */
+   float viewport[6];
    WGPUShaderModule module;
    WGPUShaderModule module_y_flipped;
    struct gex_wgpu_interp_variant *next;
@@ -6210,8 +6211,22 @@ gex_wgpu_lower_viewport_transform(nir_builder *b, nir_intrinsic_instr *intr,
    nir_def *y = nir_ffma(b, nir_channel(b, pos, 1),
                          nir_imm_float(b, xform[1]),
                          nir_fmul_imm(b, w, xform[3]));
-   nir_src_rewrite(&intr->src[1],
-                   nir_vec4(b, x, y, nir_channel(b, pos, 2), w));
+   /* And the depth, which carries GL's inverted depth range.
+    *
+    * WebGPU's viewport requires minDepth <= maxDepth, and glDepthRange(n, f)
+    * with n > f is not a corner case -- it is how reverse-Z is spelled, which
+    * modern renderers use as a matter of course. GL's window z is
+    * (f-n)/2 * z_ndc + (n+f)/2, so an inverted range is a negative slope.
+    *
+    * Sorting the range for the viewport and negating clip z is exactly
+    * equivalent: with the viewport at [f, n], WebGPU gives
+    * z_w = f + z01' * (n - f), and the wanted n + z01 * (f - n) is
+    * f + (1 - z01) * (n - f) -- so z01' = 1 - z01, which is z_ndc' = -z_ndc,
+    * which is z' = -z with w untouched. */
+   nir_def *z = nir_ffma(b, nir_channel(b, pos, 2),
+                         nir_imm_float(b, xform[4]),
+                         nir_fmul_imm(b, w, xform[5]));
+   nir_src_rewrite(&intr->src[1], nir_vec4(b, x, y, z, w));
    return true;
 }
 
@@ -15967,8 +15982,16 @@ gex_wgpu_set_viewport_states(struct pipe_context *pipe, unsigned start_slot,
         * non-zero translate, which the all-zero case above does not catch).
         * Failing the context over it cost every later call in it. The draw
         * path declines the draw instead. A *negative* width still cannot come
-        * from GL. */
-       states[0].scale[0] < 0.0f || states[0].scale[2] < 0.0f ||
+        * from GL.
+        *
+        * A negative *depth* scale can, though, and this used to refuse it:
+        * glDepthRange(n, f) with n > f gives scale[2] = (f - n) / 2, and an
+        * inverted range is how reverse-Z is spelled. The draw path sorts the
+        * range for WebGPU's viewport and folds the difference into clip z --
+        * see the depth half of gex_wgpu_lower_viewport_transform -- so there
+        * is nothing left here to refuse. Refusing it took the state, not just
+        * the draw, so every later draw ran with the previous viewport. */
+       states[0].scale[0] < 0.0f ||
        states[0].swizzle_x != PIPE_VIEWPORT_SWIZZLE_POSITIVE_X ||
        states[0].swizzle_y != PIPE_VIEWPORT_SWIZZLE_POSITIVE_Y ||
        states[0].swizzle_z != PIPE_VIEWPORT_SWIZZLE_POSITIVE_Z ||
@@ -34421,7 +34444,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
  */
 static WGPUShaderModule
 gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
-                            const float viewport[4],
+                            const float viewport[6],
                             const struct gex_wgpu_wide_point *wide)
 {
    struct gex_wgpu_shader *vs = ctx->vs;
@@ -34540,7 +34563,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
        !vs->query_only_slots)
       return plain;
 
-   const float none[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+   /* The identity fold, matching gex_wgpu_lower_viewport_transform's use of
+    * it: scale one and translate zero in every axis. */
+   const float none[6] = {1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f};
    const float *want = fold_viewport ? viewport : none;
    /* The same choice the fragment side makes, from the same context, so the
       two land on the same locations without either being told. */
@@ -34679,8 +34704,14 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
          /* compile_nir flips y after this, so the y translate has to be
           * pre-negated for the flipped module: -(y*sy + ty*w) is
           * y*(-sy) - ty*w, and what is wanted is (-y)*sy + ty*w. */
-         const float folded[4] = {viewport[0], viewport[1], viewport[2],
-                                  pass == 1 ? -viewport[3] : viewport[3]};
+         /* Six, matching what gex_wgpu_lower_viewport_transform reads: the
+          * x and y scale and translate, then the depth pair that carries an
+          * inverted depth range. Four left the pass reading past the end and
+          * finding zero, which flattens clip z to the middle of the range --
+          * every inverted range came back 0.5 whatever it was. */
+         const float folded[6] = {viewport[0], viewport[1], viewport[2],
+                                  pass == 1 ? -viewport[3] : viewport[3],
+                                  viewport[4], viewport[5]};
          nir_shader_intrinsics_pass(
             clone, gex_wgpu_lower_viewport_transform,
             nir_metadata_control_flow | nir_metadata_loop_analysis,
@@ -40742,7 +40773,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    bool vertex_flipped = false;
    /* Filled in when the GL viewport cannot be given to WebGPU directly and is
     * folded into the vertex shader instead. */
-   float viewport_fold[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+   /* Identity, so a fold that only wants the depth half leaves x and y
+    * alone: scale one, translate zero, in all three axes. */
+   float viewport_fold[6] = {1.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f};
    bool fold_viewport = false;
    if (ctx->viewport_set) {
       const float sx = ctx->viewport.scale[0];
@@ -40813,15 +40846,25 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          viewport_width = full_width;
          viewport_height = full_height;
       }
+      /* An inverted depth range -- glDepthRange(n, f) with n > f -- which
+       * WebGPU's viewport cannot take: it requires minDepth <= maxDepth.
+       * This used to decline the draw, and that is a poor trade, because an
+       * inverted range is how reverse-Z is spelled and modern renderers use
+       * it as a matter of course.
+       *
+       * The range is sorted for the viewport and clip z negated in the vertex
+       * shader, which is exactly equivalent; see the depth half of
+       * gex_wgpu_lower_viewport_transform for why. */
       if (min_depth > max_depth) {
-         static bool said;
-         if (!said) {
-            said = true;
-            fprintf(stderr,
-                    "gex-wgpu: draw declined (inverted depth range "
-                    "%.3f..%.3f)\n", min_depth, max_depth);
-         }
-         GEX_DRAW_DROP();
+         const float sorted_min = max_depth;
+         const float sorted_max = min_depth;
+         min_depth = sorted_min;
+         max_depth = sorted_max;
+         viewport_fold[4] = -1.0f;
+         fold_viewport = true;
+         if (getenv("GEX_WGPU_DEPTH_LOG"))
+            fprintf(stderr, "gex-depth: inverted range folded, viewport now "
+                    "%.3f..%.3f with clip z negated\n", min_depth, max_depth);
       }
    }
 
