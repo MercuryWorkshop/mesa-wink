@@ -2249,6 +2249,20 @@ struct gex_wgpu_shader {
    uint16_t integer_sampled_slots;
    /* Texture slots whose shader declaration is multisampled. */
    uint16_t multisampled_slots;
+   /* Slots whose *every* use is a query -- textureSize, textureQueryLevels or
+    * textureSamples -- and never a sample.
+    *
+    * Such a slot constrains nothing about the texture's type, which is why
+    * the classification skips queries, and that leaves it with the default
+    * Float. Against a bound depth view WebGPU then refuses the bind group and
+    * the draw is declined by name: every *Shadow_test in texture_query_levels
+    * and every texture_size_*_sh in texture_cube_map_array, twelve cases on
+    * one cause.
+    *
+    * A query-only slot needs no binding at all, though: every answer is a
+    * property of the bound view, so the variant replaces the queries with
+    * immediates and the declaration falls out as dead code. */
+   uint16_t query_only_slots;
    /* And which of those are *arrays*. WGSL has no multisampled array texture
     * and Dawn will not create one either, so the driver holds a GL
     * 2D_MULTISAMPLE_ARRAY as one wide multisampled 2D texture with the layers
@@ -2489,6 +2503,10 @@ struct gex_wgpu_shader_variant {
    /* The tile offset this variant subtracted from gl_FragCoord, baked in as
     * an immediate and so part of the key. */
    uint32_t frag_tile_x;
+   /* Slots whose queries this variant answered with immediates, and the
+    * answers. Both are part of the key for the obvious reason. */
+   uint16_t query_only_slots;
+   uint32_t query_only_geom[GEX_WGPU_MAX_SAMPLERS][5];
    /* The polygon offset this variant computes itself, and the state it baked
     * in as immediates; see gex_wgpu_lower_polygon_offset_clamp. All four are
     * part of the key because all four are constants in the shader. */
@@ -8315,6 +8333,111 @@ gex_wgpu_demote_ms_textures(nir_shader *nir, uint16_t slots)
    return state.progress;
 }
 
+/* A texture slot the shader only ever *asks about*, answered from the bound
+ * view instead of from a binding.
+ *
+ * textureSize, textureQueryLevels and textureSamples say nothing about a
+ * texture's type, so the sample-type classification skips them -- correctly,
+ * since a shader that both samples a float texture and asks its size would
+ * otherwise look float and sint at once. But a slot whose *only* use is a
+ * query then matches no case at all and keeps the default, Float. Bound
+ * against a depth view WebGPU refuses the bind group and the draw is declined
+ * by name. That is twelve cases: every *Shadow_test in texture_query_levels
+ * and every texture_size_*_sh in texture_cube_map_array.
+ *
+ * Declaring the module's texture as depth instead is the shape the driver's
+ * own note beside the depth-filtering decline proposes, and it has to be done
+ * on both sides at once or the mismatch merely moves -- tried, and marking
+ * only the layout produced "the shader's texture sample type isn't compatible
+ * with the layout's" while setting SPIR-V's Depth operand broke eleven other
+ * shaders on "sampled image must have float component type".
+ *
+ * So the binding goes away instead. Every answer is a property of the bound
+ * view, known when the variant is built, so the queries become immediates and
+ * the sampler declaration falls out as dead code -- nothing is left to
+ * disagree about. The same move as the multisampled-array textureSize, which
+ * cannot be read off the flattened texture either. */
+struct gex_wgpu_query_const {
+   uint16_t slots;
+   /* width, height, layers-or-depth, levels, samples -- per slot */
+   const uint32_t (*geom)[5];
+   bool progress;
+};
+
+static bool
+gex_wgpu_lower_query_only_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   struct gex_wgpu_query_const *state = data;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->op != nir_texop_txs && tex->op != nir_texop_query_levels &&
+       tex->op != nir_texop_texture_samples)
+      return false;
+   if (tex->texture_index >= GEX_WGPU_MAX_SAMPLERS ||
+       !(state->slots & (uint16_t)(1u << tex->texture_index)))
+      return false;
+   const uint32_t *g = state->geom[tex->texture_index];
+   b->cursor = nir_before_instr(instr);
+   nir_def *answer;
+   if (tex->op == nir_texop_query_levels) {
+      answer = nir_imm_int(b, (int)g[3]);
+   } else if (tex->op == nir_texop_texture_samples) {
+      answer = nir_imm_int(b, (int)g[4]);
+   } else {
+      /* The size is at the queried level, so it shifts. Expressed rather than
+       * folded because the level need not be a constant, and clamped at one
+       * the way GL's minification is. */
+      const int lod_src = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+      nir_def *lod = lod_src >= 0 ? tex->src[lod_src].src.ssa
+                                  : nir_imm_int(b, 0);
+      unsigned base[3];
+      /* A 1D array's second component is the layer count, not a height, and a
+       * 3D texture's third is its depth rather than a layer count. */
+      if (tex->sampler_dim == GLSL_SAMPLER_DIM_1D) {
+         base[0] = g[0]; base[1] = g[2]; base[2] = 1;
+      } else if (tex->sampler_dim == GLSL_SAMPLER_DIM_3D) {
+         base[0] = g[0]; base[1] = g[1]; base[2] = g[2];
+      } else {
+         base[0] = g[0]; base[1] = g[1]; base[2] = g[2];
+      }
+      nir_def *comps[3];
+      for (unsigned i = 0; i < 3; ++i) {
+         /* Only the spatial axes minify; a layer count does not. */
+         const bool spatial =
+            tex->sampler_dim == GLSL_SAMPLER_DIM_3D ? true
+            : tex->sampler_dim == GLSL_SAMPLER_DIM_1D ? (i == 0) : (i < 2);
+         comps[i] = spatial
+            ? nir_imax(b, nir_ishr(b, nir_imm_int(b, (int)base[i]), lod),
+                       nir_imm_int(b, 1))
+            : nir_imm_int(b, (int)base[i]);
+      }
+      const unsigned n = tex->def.num_components;
+      answer = n == 1 ? comps[0]
+             : n == 2 ? nir_vec2(b, comps[0], comps[1])
+                      : nir_vec3(b, comps[0], comps[1], comps[2]);
+   }
+   nir_def_replace(&tex->def, answer);
+   state->progress = true;
+   return true;
+}
+
+static bool
+gex_wgpu_lower_query_only(nir_shader *nir, uint16_t slots,
+                          const uint32_t (*geom)[5])
+{
+   struct gex_wgpu_query_const state = {.slots = slots, .geom = geom};
+   nir_shader_instructions_pass(nir, gex_wgpu_lower_query_only_instr,
+                                nir_metadata_control_flow, &state);
+   if (!state.progress)
+      return false;
+   /* The sampler and texture variables are now unused. Removing them is what
+    * makes the binding unnecessary -- and the binding is the whole problem,
+    * since its sample type is what could not be agreed on. */
+   nir_remove_dead_variables(nir, nir_var_uniform, NULL);
+   return true;
+}
+
 /* gl_FragCoord, moved back into the tile it belongs to.
  *
  * A tiled multisampled array puts layer l at x + l * width of one wide
@@ -13419,6 +13542,9 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * zero above -- and so did
     * KHR-GL45.geometry_shader.limits.max_combined_texture_units. */
    uint16_t shadow_slots = 0, float_slots = 0, uint_slots = 0, sint_slots = 0;
+   /* Queries and samples tracked apart, so a slot that only ever asks about
+    * the texture can be told from one that reads it. */
+   uint16_t query_slots = 0, sampled_slots = 0;
    /* Which texture op made the metadata invalid, if one did. The masks alone
     * cannot say: the refusals below happen before a slot is recorded, so a
     * rejected shader printed three perfectly consistent masks. Numeric
@@ -13493,8 +13619,11 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
              * only a sampling op constrains. */
             if (tex->op == nir_texop_txs ||
                 tex->op == nir_texop_query_levels ||
-                tex->op == nir_texop_texture_samples)
+                tex->op == nir_texop_texture_samples) {
+               query_slots |= 1u << texture_slot;
                continue;
+            }
+            sampled_slots |= 1u << texture_slot;
             if (tex->is_shadow)
                shadow_slots |= 1u << texture_slot;
             else if (nir_alu_type_get_base_type(tex->dest_type) ==
@@ -13532,6 +13661,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    descriptors_valid &= !(shadow_slots & (float_slots | uint_slots | sint_slots));
    descriptors_valid &= !(float_slots & (uint_slots | sint_slots));
    descriptors_valid &= !(uint_slots & sint_slots);
+   shader->query_only_slots = (uint16_t)(query_slots & ~sampled_slots);
    for (unsigned i = 0; i < shader->texture_count; ++i) {
       const uint16_t slot_bit = 1u << shader->texture_slots[i];
       if (shadow_slots & slot_bit)
@@ -14438,6 +14568,45 @@ gex_wgpu_tiled_ms_slots_for(const struct gex_wgpu_shader *fs,
    return mask;
 }
 
+/* The answers a query-only slot needs, read off the bound view. Only slots
+ * that actually have one: with nothing bound there is no answer to bake in,
+ * and the unusable-slot machinery already covers that case. */
+static uint16_t
+gex_wgpu_query_only_geom(const struct gex_wgpu_shader *sh,
+                         struct pipe_sampler_view *const *views,
+                         uint32_t geom[GEX_WGPU_MAX_SAMPLERS][5])
+{
+   memset(geom, 0, sizeof(uint32_t) * GEX_WGPU_MAX_SAMPLERS * 5);
+   uint16_t mask = 0;
+   if (!sh || !sh->query_only_slots)
+      return 0;
+   for (unsigned i = 0; i < sh->texture_count; ++i) {
+      const unsigned slot = sh->texture_slots[i];
+      if (slot >= GEX_WGPU_MAX_SAMPLERS ||
+          !(sh->query_only_slots & (1u << slot)))
+         continue;
+      const struct pipe_sampler_view *view = views[slot];
+      if (!view || !view->texture || view->target == PIPE_BUFFER)
+         continue;
+      const struct pipe_resource *t = view->texture;
+      const unsigned first = view->u.tex.first_level;
+      const unsigned layers =
+         view->u.tex.last_layer - view->u.tex.first_layer + 1;
+      geom[slot][0] = u_minify(t->width0, first);
+      geom[slot][1] = u_minify(t->height0, first);
+      /* A 3D texture's third figure is its depth and minifies with the
+       * others; an array's is a layer count and does not. A cube array
+       * reports its length in cubes, which is what GL's textureSize gives. */
+      geom[slot][2] = t->target == PIPE_TEXTURE_3D
+         ? u_minify(t->depth0, first)
+         : (view->target == PIPE_TEXTURE_CUBE_ARRAY ? layers / 6u : layers);
+      geom[slot][3] = view->u.tex.last_level - first + 1;
+      geom[slot][4] = MAX2(1u, (unsigned)t->nr_samples);
+      mask |= (uint16_t)(1u << slot);
+   }
+   return mask;
+}
+
 static uint16_t
 gex_wgpu_tiled_ms_slots(struct gex_wgpu_context *ctx,
                         uint32_t geom[GEX_WGPU_MAX_SAMPLERS][3])
@@ -14522,8 +14691,17 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * this variant and their bindings left out of the group. Decided here for
     * the same reason as the line above: there are two early returns below. */
    const uint16_t want_omit_slots = gex_wgpu_unusable_texture_slots(ctx);
+   /* Query-only slots are omitted in exactly the same sense, and have to be
+    * reported through the same mask: the binding validation and the bind
+    * group both read the *base* shader's recorded slots, which a variant
+    * removing a variable does not change. Without this the module had no
+    * texture and the draw was still declined for the one it used to have --
+    * "sample type differs from the shader's", naming a slot nothing sampled. */
+   uint32_t want_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
+   const uint16_t want_query_only =
+      gex_wgpu_query_only_geom(fs, ctx->sampler_views, want_query_geom);
    if (omitted_out)
-      *omitted_out = want_omit_slots;
+      *omitted_out = (uint16_t)(want_omit_slots | want_query_only);
    /* Decided here for the same reason the omit mask is: this function has two
     * early returns below and a variant reason must sit above both. */
    const uint16_t want_demote_ms = gex_wgpu_demotable_ms_slots(ctx);
@@ -14725,7 +14903,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
        !want_sample_positions && !want_clip_dist && !want_logicop &&
        !want_ignore_sample_mask &&
        !want_omit_slots && !want_demote_ms && !want_tiled_ms &&
-       !fs->ms_array_slots && !want_frag_tile_x && !want_offset_clamp &&
+       !fs->ms_array_slots && !want_frag_tile_x && !want_query_only &&
+       !want_offset_clamp &&
        !fs->unformatted_images)
       return fs->module;
    uint16_t sampler_mask = 0;
@@ -14836,7 +15015,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       want_sample_positions != 0 || want_clip_dist != 0 || want_logicop != 0 ||
       want_ignore_sample_mask || want_omit_slots != 0 ||
       want_demote_ms != 0 || want_tiled_ms != 0 || fs->ms_array_slots != 0 ||
-      want_frag_tile_x != 0 || want_offset_clamp ||
+      want_frag_tile_x != 0 || want_query_only != 0 || want_offset_clamp ||
       fs->unformatted_images != 0;
    if (!needs_variant && !fs->buftex_count)
       return fs->module;
@@ -14865,6 +15044,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->demoted_ms_slots == want_demote_ms &&
                    cached->tiled_ms_slots == want_tiled_ms &&
                    cached->frag_tile_x == want_frag_tile_x &&
+                   cached->query_only_slots == want_query_only &&
+                   memcmp(cached->query_only_geom, want_query_geom,
+                          sizeof(cached->query_only_geom)) == 0 &&
                    memcmp(cached->tiled_ms_geom, want_tiled_geom,
                           sizeof(cached->tiled_ms_geom)) == 0 &&
                    memcmp(cached->image_formats, want_image_formats,
@@ -14986,6 +15168,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    if (fs->ms_array_slots)
       gex_wgpu_flatten_ms_array(variant, fs->ms_array_slots, want_tiled_geom);
    gex_wgpu_lower_frag_coord_tile(variant, want_frag_tile_x);
+   if (want_query_only)
+      gex_wgpu_lower_query_only(variant, want_query_only,
+                                want_query_geom);
    /* Before the texture lowering, which reads gl_FragCoord for nothing and
     * would otherwise see the load this adds. */
    if (want_stipple)
@@ -15084,6 +15269,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->demoted_ms_slots = want_demote_ms;
    cached->tiled_ms_slots = want_tiled_ms;
    cached->frag_tile_x = want_frag_tile_x;
+   cached->query_only_slots = want_query_only;
+   memcpy(cached->query_only_geom, want_query_geom,
+          sizeof(cached->query_only_geom));
    memcpy(cached->tiled_ms_geom, want_tiled_geom,
           sizeof(cached->tiled_ms_geom));
    memcpy(cached->image_formats, want_image_formats,
@@ -34334,7 +34522,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
     * built for such a shader -- the tile width comes from the bound texture
     * -- so `plain` is NULL and returning it drops the draw with no message. */
    if (!differs && !fold_viewport && !unpack_attribs && !lower_textures &&
-       !wide && !has_buftex && !vs->ms_array_slots)
+       !wide && !has_buftex && !vs->ms_array_slots &&
+       !vs->query_only_slots)
       return plain;
 
    const float none[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -34506,6 +34695,16 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
          (void)gex_wgpu_tiled_ms_slots_for(vs, ctx->vertex_sampler_views,
                                            vs_tiled_geom);
          gex_wgpu_flatten_ms_array(clone, vs->ms_array_slots, vs_tiled_geom);
+      }
+      /* And the vertex stage's query-only slots, for the same reason: three
+       * of texture_query_levels' six shadow cases read the level count from
+       * the vertex stage. */
+      if (vs->query_only_slots) {
+         uint32_t vs_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
+         const uint16_t vs_query = gex_wgpu_query_only_geom(
+            vs, ctx->vertex_sampler_views, vs_query_geom);
+         if (vs_query)
+            gex_wgpu_lower_query_only(clone, vs_query, vs_query_geom);
       }
       if (lower_textures &&
           !gex_wgpu_lower_texture_variant(clone, vs->texture_count,
