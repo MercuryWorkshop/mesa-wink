@@ -31751,6 +31751,27 @@ give_up:
  * can disagree with this by one vertex. Every real use writes the same value
  * for the whole primitive, and the alternative -- threading the provoking
  * convention through -- buys nothing measurable. */
+/* One triangle's routing destination: which viewport it asked for and which
+ * array layer. Sorted by the pair, so a run of equal keys is one draw. */
+struct gex_wgpu_route_key {
+   uint32_t triangle;
+   uint16_t viewport;
+   uint16_t layer;
+};
+
+static int
+gex_wgpu_route_key_cmp(const void *a, const void *b)
+{
+   const struct gex_wgpu_route_key *x = a, *y = b;
+   if (x->viewport != y->viewport)
+      return x->viewport < y->viewport ? -1 : 1;
+   if (x->layer != y->layer)
+      return x->layer < y->layer ? -1 : 1;
+   /* Stable within a run, so primitives keep their emitted order -- which is
+    * what decides the result where they overlap. */
+   return x->triangle < y->triangle ? -1 : (x->triangle > y->triangle ? 1 : 0);
+}
+
 static bool
 gex_wgpu_gs_route_viewports(struct gex_wgpu_context *ctx,
                             struct gex_wgpu_gs *gs, unsigned index_count,
@@ -31796,6 +31817,27 @@ gex_wgpu_gs_route_viewports(struct gex_wgpu_context *ctx,
       return false;
    }
    const unsigned slot_byte = (unsigned)gs->viewport_slot * 16;
+   /* And gl_Layer, when the shader writes it and the framebuffer has layers
+    * to route into. Routing by the *pair* is what this is for: a shader may
+    * write both, and until it did, the viewport sort ran and gl_Layer was
+    * dropped -- so KHR-GL45.viewport_array's scissor and draw_multiple_layers
+    * put all sixteen quads on one layer. Both write gl_ViewportIndex and
+    * gl_Layer from gl_InvocationID, which is also how a cube map or a shadow
+    * cascade is drawn in one pass.
+    *
+    * With no layer to route the key's layer half is zero throughout and the
+    * sort degenerates to the viewport sort this has always done. */
+   const bool route_layers = gs->layer_slot >= 0 && ctx->fb_layer_count > 1;
+   const unsigned layer_byte = route_layers
+      ? (unsigned)gs->layer_slot * 16 : 0u;
+   struct gex_wgpu_route_key *keys = MALLOC(triangles * sizeof(*keys));
+   if (!keys) {
+      pipe_buffer_unmap(&ctx->base, transfer);
+      FREE(indices);
+      FREE(which);
+      return false;
+   }
+   unsigned key_count = 0;
    unsigned counts[GEX_WGPU_MAX_VIEWPORTS] = {0};
    /* 0xff marks a triangle to drop: three equal indices, which is how the
     * emit path fills a slot no primitive reached, or a first index that would
@@ -31814,17 +31856,26 @@ gex_wgpu_gs_route_viewports(struct gex_wgpu_context *ctx,
        * count rather than making it undefined behaviour. */
       which[t] = (uint8_t)MIN2(index, (uint32_t)GEX_WGPU_MAX_VIEWPORTS - 1);
       ++counts[which[t]];
+      uint32_t layer = 0;
+      if (route_layers) {
+         const uint64_t layer_at = (uint64_t)first * stride + layer_byte;
+         if (layer_at + 4 <= vertex_bytes)
+            memcpy(&layer, vertices + layer_at, sizeof(layer));
+         /* Same clamp GL applies to an out-of-range gl_Layer. */
+         if (layer >= ctx->fb_layer_count)
+            layer = ctx->fb_layer_count - 1u;
+      }
+      keys[key_count].triangle = t;
+      keys[key_count].viewport = which[t];
+      keys[key_count].layer = (uint16_t)layer;
+      ++key_count;
    }
    pipe_buffer_unmap(&ctx->base, transfer);
+   qsort(keys, key_count, sizeof(*keys), gex_wgpu_route_key_cmp);
 
-   unsigned starts[GEX_WGPU_MAX_VIEWPORTS];
-   unsigned at = 0;
-   for (unsigned v = 0; v < GEX_WGPU_MAX_VIEWPORTS; ++v) {
-      starts[v] = at;
-      at += counts[v] * 3;
-   }
-   const unsigned kept = at;
+   const unsigned kept = key_count * 3;
    if (!kept) {
+      FREE(keys);
       FREE(indices);
       FREE(which);
       /* Every triangle was degenerate, which is a legitimate outcome and
@@ -31834,19 +31885,14 @@ gex_wgpu_gs_route_viewports(struct gex_wgpu_context *ctx,
 
    uint32_t *sorted = MALLOC(kept * 4);
    if (!sorted) {
+      FREE(keys);
       FREE(indices);
       FREE(which);
       return false;
    }
-   unsigned fill[GEX_WGPU_MAX_VIEWPORTS];
-   memcpy(fill, starts, sizeof(fill));
-   for (unsigned t = 0; t < triangles; ++t) {
-      if (which[t] == 0xff)
-         continue;
-      unsigned *slot = &fill[which[t]];
-      memcpy(sorted + *slot, indices + t * 3, 3 * sizeof(uint32_t));
-      *slot += 3;
-   }
+   for (unsigned k = 0; k < key_count; ++k)
+      memcpy(sorted + k * 3, indices + keys[k].triangle * 3,
+             3 * sizeof(uint32_t));
    gex_wgpu_buffer_subdata(&ctx->base, ctx->gs_indices, PIPE_MAP_WRITE, 0,
                            kept * 4, sorted);
    FREE(sorted);
@@ -31859,13 +31905,29 @@ gex_wgpu_gs_route_viewports(struct gex_wgpu_context *ctx,
    const bool saved_set = ctx->viewport_set;
    const struct pipe_scissor_state saved_scissor = ctx->scissor;
    const bool saved_scissor_set = ctx->scissor_set;
+   unsigned saved_colors[GEX_WGPU_MAX_COLOR_TARGETS];
+   for (unsigned i = 0; i < GEX_WGPU_MAX_COLOR_TARGETS; ++i)
+      saved_colors[i] = ctx->color_layers[i];
+   const unsigned saved_depth_layer = ctx->depth_layer;
    unsigned passes = 0;
-   for (unsigned v = 0; v < GEX_WGPU_MAX_VIEWPORTS; ++v) {
-      if (!counts[v])
-         continue;
+   /* One draw per run of equal (viewport, layer). The list is sorted by that
+    * pair, so a run is contiguous and needs no second pass over it. */
+   for (unsigned run = 0; run < key_count; ) {
+      const unsigned v = keys[run].viewport;
+      const unsigned layer = keys[run].layer;
+      unsigned end = run;
+      while (end < key_count && keys[end].viewport == v &&
+             keys[end].layer == layer)
+         ++end;
       if (ctx->viewport_slots_set & (1u << v)) {
          ctx->viewport = ctx->viewports[v];
          ctx->viewport_set = true;
+      }
+      if (route_layers) {
+         for (unsigned i = 0; i < ctx->color_count; ++i)
+            ctx->color_layers[i] = saved_colors[i] + layer;
+         ctx->depth_layer = saved_depth_layer + layer;
+         gex_wgpu_update_ms_tile_x(ctx);
       }
       /* The scissor array is indexed the same way, and GL applies the
        * viewport's own scissor box to a routed primitive. */
@@ -31873,20 +31935,35 @@ gex_wgpu_gs_route_viewports(struct gex_wgpu_context *ctx,
          ctx->scissor = ctx->scissors[v];
          ctx->scissor_set = true;
       }
-      struct pipe_draw_start_count_bias run;
-      memset(&run, 0, sizeof(run));
-      run.start = starts[v];
-      run.count = counts[v] * 3;
-      gex_wgpu_draw_vbo(&ctx->base, raster, drawid_offset, NULL, &run, 1);
+      if (getenv("GEX_WGPU_VPROUTE_LOG"))
+         fprintf(stderr, "gex-vp: v=%u tris=%u vp_set=%d sc_set=%d "
+                 "sc=%u,%u..%u,%u\n", v, counts[v],
+                 (ctx->viewport_slots_set >> v) & 1,
+                 (ctx->scissor_slots_set >> v) & 1, ctx->scissor.minx,
+                 ctx->scissor.miny, ctx->scissor.maxx, ctx->scissor.maxy);
+      struct pipe_draw_start_count_bias piece;
+      memset(&piece, 0, sizeof(piece));
+      piece.start = run * 3;
+      piece.count = (end - run) * 3;
+      gex_wgpu_draw_vbo(&ctx->base, raster, drawid_offset, NULL, &piece, 1);
       ++passes;
       ctx->viewport = saved;
       ctx->viewport_set = saved_set;
       ctx->scissor = saved_scissor;
       ctx->scissor_set = saved_scissor_set;
+      if (route_layers) {
+         for (unsigned i = 0; i < GEX_WGPU_MAX_COLOR_TARGETS; ++i)
+            ctx->color_layers[i] = saved_colors[i];
+         ctx->depth_layer = saved_depth_layer;
+         gex_wgpu_update_ms_tile_x(ctx);
+      }
+      run = end;
    }
+   FREE(keys);
    if (getenv("GEX_WGPU_GS_LOG"))
       fprintf(stderr, "gex-wgpu: gs routed %u triangles through %u "
-              "viewport(s)\n", kept / 3, passes);
+              "(viewport, layer) group(s)%s\n", kept / 3, passes,
+              route_layers ? "" : " [viewport only]");
    return true;
 }
 
@@ -33491,8 +33568,12 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
     * state -- the attachment's array layer rather than the viewport. Only
     * when the framebuffer actually has layers to route into; with one layer
     * GL says every primitive lands on it, which the ordinary draw below
-    * already does. Viewport routing wins if a shader writes both, because it
-    * has already redrawn the list and sorted it. */
+    * already does. Viewport routing takes both if a shader writes both: it
+    * sorts by the (viewport, layer) pair and emits one draw per run, so this
+    * layer-only router is for a shader that writes gl_Layer alone. It used to
+    * be that viewport routing simply won and gl_Layer was dropped, which put
+    * every quad of viewport_array's scissor and draw_multiple_layers on one
+    * layer. */
    if (!routed && gs->layer_slot >= 0 && ctx->fb_layer_count > 1 &&
        raster.mode == MESA_PRIM_TRIANGLES && index_count % 3 == 0)
       routed = gex_wgpu_gs_route_layers(ctx, gs, index_count,
