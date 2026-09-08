@@ -32010,9 +32010,16 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
          GEX_GS_DECLINE("the slot table could not be uploaded");
    }
 
+   /* A vertex shader whose atomic *result* the strip rewrote to zero has to
+    * be captured from the clone that kept it, or this stage reads zeros for
+    * varyings the real shader computed from an atomic -- and then the pass
+    * below is also where its stores happen, so the separate side-effect
+    * dispatch must not run as well. Both are keyed on raster_invalid, which
+    * is only ever set for such a shader. */
+   const bool vs_replay = ctx->vs->raster_invalid && ctx->vs->replay_nir;
    struct gex_wgpu_varying_variant *variant =
       gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &gs->inputs,
-                                   false);
+                                   vs_replay);
    if (!variant ||
        !gex_wgpu_ensure_buffer(ctx, &ctx->gs_vs_out, captured * vs_stride,
                                PIPE_BIND_SHADER_BUFFER) ||
@@ -32078,6 +32085,15 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                                      ctx->vs->ubo_count, ctx->vs->ubo_slots,
                                      ctx->vs->ubo_bindings,
                                      ctx->vs->ubo_storage_mask);
+   /* Writable, with a zero read-only mask: ssbo_readonly_mask describes the
+    * stripped shader, where nothing writes the block, while the replay module
+    * declares read_write -- and a layout that disagrees simply fails to build,
+    * which reads as the pass doing nothing. */
+   if (ok && vs_replay)
+      ok = gex_wgpu_bind_stage_ssbos(ctx, &vs_group1, MESA_SHADER_VERTEX,
+                                     "geometry vertex capture",
+                                     ctx->vs->ssbo_count, ctx->vs->ssbo_slots,
+                                     ctx->vs->ssbo_bindings, 0);
    if (ok)
       ok = gex_wgpu_dispatch(ctx, variant->module, &vs_group0, &vs_group1,
                              NULL,
@@ -38902,7 +38918,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * stores and nothing else. Declined here rather than at the link, so the
     * stores below still happen; under GL_RASTERIZER_DISCARD, which is how
     * such a shader is normally driven, this is never reached at all. */
-   if (!discard && ctx->vs && ctx->vs->raster_invalid) {
+   /* A geometry stage takes over: its own vertex capture now runs from the
+    * pre-strip clone, so it computes the real atomic results *and* performs
+    * the stores, and the draw it issues rasterises from that. Falling through
+    * to it is what serves such a shader; dropping here declined it before the
+    * stage that could handle it was ever reached. */
+   const bool gs_serves_replay =
+      ctx->gs && ctx->vs && ctx->vs->raster_invalid && ctx->vs->replay_nir;
+   if (!discard && !gs_serves_replay && ctx->vs && ctx->vs->raster_invalid) {
       static bool said;
       if (!said) {
          said = true;
@@ -38941,8 +38964,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * writes do not happen twice. Running the capture dispatch here instead
     * costs one extra pass over the vertices, and only for the rare shader
     * that has both. */
+   /* Not for a shader the downstream stage's own capture now runs from the
+    * pre-strip clone: that pass performs the stores, so doing them here as
+    * well would double every one of them. */
    if ((ctx->tcs || ctx->tes || ctx->gs) && ctx->vs &&
-       ctx->vs->writes_storage && ctx->vs->capture_nir)
+       ctx->vs->writes_storage && ctx->vs->capture_nir &&
+       !(ctx->gs && ctx->vs->raster_invalid && ctx->vs->replay_nir))
       (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
 
    /* Tessellation replaces this draw with five passes of its own, the last
