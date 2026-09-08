@@ -1637,6 +1637,11 @@ struct gex_wgpu_context {
     * host stack, and a host stack overflow aborts the wasm module and costs
     * every case after it. Bounded, it costs the one draw and says so. */
    unsigned draw_depth;
+   /* Whether an enclosing draw has already de-interleaved a divisor buffer.
+    * Not the same question as "is this the outermost draw": an indirect draw
+    * cannot know its instance count at the outermost level, because the count
+    * is in the buffer. See gex_wgpu_expand_instance_divisors' call site. */
+   bool divisor_expansion_active;
    struct gex_wgpu_shader *vs;
    struct gex_wgpu_shader *fs;
    struct pipe_resource *colors[GEX_WGPU_MAX_COLOR_TARGETS];
@@ -38402,21 +38407,42 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
    }
    if (ctx->draw_depth == 0 && info)
       ctx->draw_base_instance = info->start_instance;
-   /* A divisor above one is de-interleaved for the length of the draw, at
-    * the outermost level only: the restart and multi-draw splits re-enter
-    * here, and expanding an already-expanded buffer would index it by
-    * i / divisor a second time. */
+   /* A divisor above one is de-interleaved for the length of the draw, once:
+    * the restart and multi-draw splits re-enter here, and expanding an
+    * already-expanded buffer would index it by i / divisor a second time.
+    *
+    * The guard is "nothing above us expanded", not "this is the outermost
+    * draw", and the difference is an indirect draw. Its instance count lives
+    * in the argument buffer, so at the outermost level info->instance_count
+    * is still one, the expansion declines, and the resolved draw that
+    * util_draw_indirect reissues arrives one level down -- where the old
+    * depth test refused to expand at all. WebGPU's stepMode has no divisor,
+    * so the un-expanded buffer was bound with one element per instance and
+    * Dawn rejected the draw outright:
+    *
+    *   Instance range (first: 0, count: 4) requires a larger buffer (64)
+    *   than the bound buffer size (32) of the vertex buffer
+    *
+    * An invalid command buffer loses every draw batched with it, so the two
+    * KHR-GL45.draw_indirect instancing cases took the frame with them. */
    struct pipe_resource *saved_divisor[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
    memset(saved_divisor, 0, sizeof(saved_divisor));
-   const unsigned expanded_divisors = ctx->draw_depth == 0
+   const unsigned expanded_divisors = !ctx->divisor_expansion_active
       ? gex_wgpu_expand_instance_divisors(ctx, info, saved_divisor) : 0;
+   /* Only a *successful* expansion closes the door. A level that declined --
+    * because it could not yet know the instance count -- must leave a deeper
+    * one free to try. */
+   if (expanded_divisors)
+      ctx->divisor_expansion_active = true;
    ctx->draw_depth++;
    gex_wgpu_draw_vbo_inner(pipe, info, drawid_offset, indirect, draws,
                            num_draws);
    ctx->draw_depth--;
-   if (expanded_divisors)
+   if (expanded_divisors) {
+      ctx->divisor_expansion_active = false;
       gex_wgpu_restore_instance_divisors(ctx, saved_divisor,
                                          expanded_divisors);
+   }
 }
 
 
