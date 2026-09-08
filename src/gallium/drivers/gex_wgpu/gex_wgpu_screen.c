@@ -38177,6 +38177,27 @@ gex_wgpu_draw_provoking_last(struct pipe_context *pipe,
                              const struct pipe_draw_start_count_bias *draw)
 {
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   /* Not while primitive restart is on: wait for the split.
+    *
+    * The trim below rounds the count down to a whole number of primitives,
+    * and with restart indices in the list that arithmetic is simply wrong --
+    * they are not vertices. KHR-GL45.primitive_restart.restart_mode draws
+    * GL_LINES with `{4, 3, RESTART, 4, 0}`, five indices; u_trim_pipe_prim
+    * rounds five down to four for a two-vertex primitive and the final index
+    * is dropped, so the second line vanishes.
+    *
+    * That is exactly why the case failed on LINES and TRIANGLES while passing
+    * LINE_STRIP, LINE_LOOP, TRIANGLE_STRIP and TRIANGLE_FAN *with the same
+    * indices*: a strip has no stride to round to, so the trim leaves it
+    * alone. A list-only failure is the signature of this arithmetic.
+    *
+    * Returning false hands the draw on to the restart split, which reissues
+    * it as its restart-free ranges with `primitive_restart` cleared -- so
+    * each range comes back through here and is rewritten correctly. The
+    * adjacency path a few lines below the split defers for the same reason
+    * and says so. */
+   if (info->primitive_restart && info->index_size)
+      return false;
    /* Trimmed to whole primitives before anything else looks at it.
     *
     * u_indices' generated translators write one primitive per iteration and
