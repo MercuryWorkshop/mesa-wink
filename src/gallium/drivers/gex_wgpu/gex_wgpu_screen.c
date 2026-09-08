@@ -37482,6 +37482,207 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
 #undef GEX_FLAT_DECLINE
 }
 
+/* Rasterize a vertex shader that cannot be rasterized, from a capture of it.
+ *
+ * A vertex shader that uses the *result* of a storage atomic has no
+ * rasterising form: WGSL forbids storage writes in the vertex stage, so the
+ * atomic cannot be performed there and cannot be dropped either, because the
+ * shader computes with what it returned. The driver answered by rewriting
+ * that result to zero, marking the shader unrasterisable and declining the
+ * draw by name -- the side effects happened and the picture did not.
+ *
+ * The compute clone performs the whole shader for real, so its *outputs* are
+ * exactly what the vertex shader produced. Capturing those and rasterising
+ * them through a passthrough is not an approximation of the draw; it is the
+ * draw. Both halves already exist: the varying capture the geometry and
+ * tessellation stages run, and the passthrough plus element table the
+ * unfilled-polygon replay builds -- and with an all-zero flat mask that table
+ * reads one buffer, slot i for vertex i, which is what is wanted here.
+ *
+ * The capture must come from `replay_nir`, the clone taken *before* the
+ * storage-write strip. varying_nir is post-strip on purpose, so replaying it
+ * would rasterise the zeros the strip left and read as this path not working.
+ * For the same reason this one pass is *both* the side-effect pass and the
+ * capture, which is why the caller does not also run the capture dispatch.
+ */
+static bool
+gex_wgpu_atomic_replay_draw(struct pipe_context *pipe,
+                            const struct pipe_draw_info *info,
+                            unsigned drawid_offset,
+                            const struct pipe_draw_start_count_bias *draw)
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+
+#define GEX_REPLAY_DECLINE(why)                                               \
+   do {                                                                       \
+      static bool said;                                                       \
+      if (!said || getenv("GEX_WGPU_REPLAY_LOG")) {                           \
+         said = true;                                                         \
+         fprintf(stderr, "gex-wgpu: atomic-result replay declined (%s)\n",    \
+                 (why));                                                      \
+      }                                                                       \
+      return false;                                                           \
+   } while (0)
+
+   if (ctx->failed || !ctx->vs || !ctx->fs || !ctx->vertex_elements)
+      GEX_REPLAY_DECLINE("no shader or no vertex elements");
+   if (!ctx->vs->replay_nir)
+      GEX_REPLAY_DECLINE("no pre-strip clone was kept");
+   if (ctx->gs || ctx->tcs || ctx->tes)
+      GEX_REPLAY_DECLINE("another stage is bound");
+   if (ctx->so_target_count)
+      GEX_REPLAY_DECLINE("transform feedback is recording");
+   if (info->instance_count > 1)
+      GEX_REPLAY_DECLINE("instanced");
+   /* Same rule the other captures state: a vertex shader that samples
+    * compiles into a compute module declaring bindings this dispatch does not
+    * provide, and a pipeline WebGPU rejects poisons the device. */
+   if (ctx->vs->texture_count || ctx->vs->sampler_count)
+      GEX_REPLAY_DECLINE("the vertex shader samples a texture");
+
+   unsigned count = draw->count;
+   if (!u_trim_pipe_prim(info->mode, &count) || !count)
+      GEX_REPLAY_DECLINE("no whole primitive");
+
+   struct gex_wgpu_varying_layout varyings;
+   gex_wgpu_line_varyings(ctx, &varyings);
+   /* Flat mask zero: every slot reads buffer zero at its own offset, the
+    * plain per-vertex passthrough. A flat varying still gets GL's provoking
+    * vertex, because the replay draw re-enters draw_vbo and picks up the
+    * index rewrite there -- and that rewrite can no longer double the side
+    * effects, the passthrough having none. */
+   struct gex_wgpu_flat_replay *replay =
+      gex_wgpu_flat_replay_get(ctx, &varyings, 0, false);
+   if (!replay)
+      GEX_REPLAY_DECLINE("no passthrough shader for this varying layout");
+
+   struct gex_wgpu_capture_layout layout;
+   memset(&layout, 0, sizeof(layout));
+   layout.count = ctx->vertex_elements->count;
+   for (unsigned i = 0; i < layout.count; ++i) {
+      const struct pipe_vertex_element *ve = &ctx->vertex_elements->elements[i];
+      if (ve->instance_divisor)
+         GEX_REPLAY_DECLINE("per-instance attributes");
+      layout.buffer[i] = ve->vertex_buffer_index;
+      layout.offset[i] = ve->src_offset;
+      layout.stride[i] = ve->src_stride;
+      layout.format[i] = ve->src_format;
+      layout.divisor[i] = ve->instance_divisor;
+   }
+   struct gex_wgpu_varying_variant *variant =
+      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &varyings, true);
+   if (!variant)
+      GEX_REPLAY_DECLINE("the vertex shader has no pre-strip capture variant");
+
+   const unsigned record = gex_wgpu_varying_stride(&varyings);
+   /* One record of slack, for the reason the other captures keep one: a
+    * buffer sized to the last record exactly leaves the final vertex's fetch
+    * reading up to the end. */
+   if (!gex_wgpu_ensure_buffer(ctx, &ctx->flat_vs_out,
+                               ((uint64_t)count + 1) * record,
+                               PIPE_BIND_VERTEX_BUFFER |
+                               PIPE_BIND_SHADER_BUFFER))
+      GEX_REPLAY_DECLINE("the capture buffer could not be allocated");
+
+   /* Pass one: the real vertex shader as compute. Its stores and atomics
+    * happen here, once, and its outputs land in the capture. The stream
+    * uploader is flushed first because an immediate-mode draw's vertices are
+    * staged through it and this pass reads them on the GPU. */
+   u_upload_unmap(ctx->base.stream_uploader);
+   uint32_t params[GEX_WGPU_PARAM_WORDS] = {0};
+   params[GEX_WGPU_PARAM_FIRST_VERTEX] = draw->start;
+   params[GEX_WGPU_PARAM_COUNT] = count;
+   struct gex_wgpu_bindings vs_group0 = {0}, vs_group1 = {0};
+   bool ok = true;
+   for (unsigned i = 0; i < GEX_WGPU_MAX_VERTEX_BUFFERS; ++i) {
+      if (!(variant->vb_mask & (1u << i)))
+         continue;
+      if (i >= ctx->vertex_buffer_count || !ctx->vertex_buffers[i]) {
+         ok = false;
+         break;
+      }
+      params[GEX_WGPU_PARAM_VB_OFFSET + i] = ctx->vertex_buffer_offsets[i];
+      gex_wgpu_bind_storage_access(&vs_group0, GEX_WGPU_VB_FIRST_BINDING + i,
+                                   ctx->vertex_buffers[i], true);
+   }
+   struct pipe_resource *vs_params = ok
+      ? gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS) : NULL;
+   if (ok && vs_params) {
+      gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_VARYING_OUT_BINDING,
+                            ctx->flat_vs_out);
+      gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
+                            vs_params);
+      /* And the shader's *own* storage blocks -- the whole difference between
+       * this capture and the ones it borrows from, which replay plain vertex
+       * shaders that have none.
+       *
+       * **Writable, with a zero read-only mask.** ctx->vs->ssbo_readonly_mask
+       * describes the *stripped* graphics shader, where nothing writes the
+       * block any more, so it says read-only -- while this module, built from
+       * the clone that kept its atomics, declares read_write. The layout and
+       * the shader then disagree, and the comment on that mask says exactly
+       * what follows: "the bind group simply fails to build and the draw
+       * reads zeros". That is what the first attempt at this hit, and it
+       * looked like the capture pass doing nothing rather than like a
+       * mismatched access flag. */
+      ok = gex_wgpu_bind_varying_textures(ctx, variant, &vs_group0) &&
+           gex_wgpu_bind_constants(ctx, &vs_group1, MESA_SHADER_VERTEX,
+                                   ctx->vs->ubo_count, ctx->vs->ubo_slots,
+                                   ctx->vs->ubo_bindings,
+                                   ctx->vs->ubo_storage_mask) &&
+           gex_wgpu_bind_stage_ssbos(ctx, &vs_group1, MESA_SHADER_VERTEX,
+                                     "atomic-result replay",
+                                     ctx->vs->ssbo_count, ctx->vs->ssbo_slots,
+                                     ctx->vs->ssbo_bindings, 0) &&
+           gex_wgpu_dispatch(ctx, variant->module, &vs_group0, &vs_group1,
+                             NULL,
+                             DIV_ROUND_UP(count, GEX_WGPU_CAPTURE_GROUP));
+   } else {
+      ok = false;
+   }
+   pipe_resource_reference(&vs_params, NULL);
+   if (!ok)
+      GEX_REPLAY_DECLINE("the capture pass did not run");
+
+   /* Pass two: the original topology, from the capture. */
+   struct gex_wgpu_shader *saved_vs = ctx->vs;
+   struct gex_wgpu_vertex_elements *saved_elements = ctx->vertex_elements;
+   struct pipe_resource *saved_buffer = ctx->vertex_buffers[0];
+   const uint32_t saved_offset = ctx->vertex_buffer_offsets[0];
+   const unsigned saved_count = ctx->vertex_buffer_count;
+
+   ctx->vs = replay->shader;
+   ctx->vertex_elements = replay->elements;
+   ctx->vertex_buffers[0] = ctx->flat_vs_out;
+   ctx->vertex_buffer_offsets[0] = 0;
+   ctx->vertex_buffer_count = 1;
+
+   struct pipe_draw_info raster = *info;
+   raster.index_size = 0;
+   raster.has_user_indices = false;
+   raster.index.user = NULL;
+   raster.primitive_restart = false;
+   raster.index_bounds_valid = false;
+   raster.min_index = 0;
+   raster.max_index = ~0u;
+   struct pipe_draw_start_count_bias raster_draw;
+   memset(&raster_draw, 0, sizeof(raster_draw));
+   raster_draw.count = count;
+   if (getenv("GEX_WGPU_REPLAY_LOG"))
+      fprintf(stderr, "gex-wgpu: atomic-result replay verts=%u record=%u "
+              "slots=%u mode=%u\n", count, record, varyings.count,
+              (unsigned)info->mode);
+   gex_wgpu_draw_vbo(pipe, &raster, drawid_offset, NULL, &raster_draw, 1);
+
+   ctx->vs = saved_vs;
+   ctx->vertex_elements = saved_elements;
+   ctx->vertex_buffers[0] = saved_buffer;
+   ctx->vertex_buffer_offsets[0] = saved_offset;
+   ctx->vertex_buffer_count = saved_count;
+   return true;
+#undef GEX_REPLAY_DECLINE
+}
+
 static bool
 gex_wgpu_draw_unfilled(struct pipe_context *pipe,
                        const struct pipe_draw_info *info,
@@ -37961,6 +38162,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * asked for, and both dispatch sites below skip the replay. The
        * rasterisation still gets the rewritten indices, so GL's provoking
        * vertex is unaffected. */
+      /* An unrasterisable shader replays *here*, on the draw the application
+       * issued, and not after the rewrite. Doing it later ran the side
+       * effects twice -- once at this site against four vertices and again in
+       * the replay's own capture against the rewritten six -- which the
+       * probe caught as a counter reading ten. The replay's passthrough draw
+       * re-enters draw_vbo and picks up the index rewrite for itself, so GL's
+       * provoking vertex is still what the flat varying gets. */
+      if (ctx->vs && ctx->vs->raster_invalid && num_draws == 1 && !indirect &&
+          gex_wgpu_atomic_replay_draw(pipe, info, drawid_offset, &draws[0]))
+         GEX_DRAW_DROP();
       if (ctx->vs && ctx->vs->writes_storage && ctx->vs->capture_nir)
          (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
       if (gex_wgpu_draw_provoking_last(pipe, info, drawid_offset, &draws[0]))
@@ -38704,6 +38915,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * rewrite site, against the application's own vertex count. This is
        * the site the flat-strip over-count actually came through -- an
        * unrasterisable shader never reaches the main dispatch below. */
+      /* Rasterize it from a capture rather than losing it. That pass performs
+       * the real shader, atomics included, so it is *both* the side effects
+       * and the picture -- which is why the capture dispatch below is an
+       * alternative to it and not an addition. */
+      if (num_draws == 1 && !indirect &&
+          gex_wgpu_atomic_replay_draw(pipe, info, drawid_offset, &draws[0]))
+         GEX_DRAW_DROP();
+      /* Not during a provoking-vertex replay: the stores already ran at the
+       * rewrite site, against the application's own vertex count. */
       if (ctx->vs->capture_nir && !ctx->provoking_rewritten)
          (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
       GEX_DRAW_DROP();
