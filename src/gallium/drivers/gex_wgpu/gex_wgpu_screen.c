@@ -3427,14 +3427,31 @@ gex_wgpu_lower_buffer_texture(nir_builder *b, nir_instr *instr, void *data)
       return false;
    struct gex_wgpu_buftex_lowering *state = data;
    const unsigned slot = tex->texture_index;
-   if (slot >= GEX_WGPU_MAX_BUFFER_TEXTURES || !state->block[slot] ||
-       !state->words[slot]) {
+   if (slot >= GEX_WGPU_MAX_BUFFER_TEXTURES || !state->block[slot]) {
       state->failed = true;
       if (!state->why[0])
          snprintf(state->why, sizeof(state->why),
-                  "texture buffer slot %u has no buffer bound", slot);
+                  "texture buffer slot %u has no block", slot);
       return false;
    }
+   /* A slot with no bound view has no format and so no texel code, and this
+    * used to refuse the whole variant for it. But GL reads **zero** from an
+    * unbound or incomplete texture without raising an error, and the binding
+    * side already serves that with the zero-filled placeholder -- so refusing
+    * here made the placeholder unreachable and left the honest answer one
+    * layer out of reach. Half a fix is worth naming: the binding was changed
+    * first and this was found by the probe written for it.
+    *
+    * R32 is the stand-in code, and one code serves every shader because the
+    * data is zeros. The code contributes only the component count and the bit
+    * width; whether the result is converted as float or as an integer comes
+    * from the fetch's own `dest_type` below. So a `samplerBuffer` reads 0.0
+    * and a `usamplerBuffer` reads 0u out of the same binding, and one
+    * component means the g, b and a channels are filled as GL fills them for
+    * a one-channel format. */
+   const unsigned bound_code = state->words[slot]
+      ? state->words[slot]
+      : (unsigned)gex_wgpu_buffer_texture_code(PIPE_FORMAT_R32_UINT);
    /* texelFetch only. textureSize on a buffer would need the binding's
     * length, which means arrayLength() on the runtime array -- a different
     * opcode and a different claim, so it is refused by name rather than
@@ -3456,8 +3473,8 @@ gex_wgpu_lower_buffer_texture(nir_builder *b, nir_instr *instr, void *data)
       return false;
    }
 
-   const unsigned code = state->words[slot];
-   if (code > ARRAY_SIZE(gex_wgpu_buftex_texels)) {
+   const unsigned code = bound_code;
+   if (!code || code > ARRAY_SIZE(gex_wgpu_buftex_texels)) {
       state->failed = true;
       if (!state->why[0])
          snprintf(state->why, sizeof(state->why),
@@ -7336,6 +7353,58 @@ gex_wgpu_emit_clip_distance_carriers(nir_shader *nir, unsigned count,
    return true;
 }
 
+/* Give a lone index-1 fragment output the index-0 partner WGSL insists on.
+ *
+ * WGSL allows `@blend_src` only on a *pair*, so an output at index 1 with no
+ * index-0 output at the same location cannot be expressed and Tint rejects the
+ * module -- a failed link, which is the whole program rather than one draw.
+ * GL allows the shape and says index 0's value is undefined when nothing
+ * writes it, so a synthesized output writing zeros satisfies both: any value
+ * is conformant for GL, and the pair is what WGSL wants.
+ *
+ * Only the missing halves are added, and only for a fragment shader. A shader
+ * that already declares both -- EEVEE's eevee_light_culling_debug, the case
+ * the decoration rule beside this was written for -- is untouched. */
+static void
+gex_wgpu_add_missing_index_zero_output(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return;
+   uint32_t have_zero = 0, have_one = 0;
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
+      if (var->data.location < FRAG_RESULT_DATA0)
+         continue;
+      const unsigned at = var->data.location - FRAG_RESULT_DATA0;
+      if (at >= 32)
+         continue;
+      if (var->data.index == 0)
+         have_zero |= 1u << at;
+      else if (var->data.index == 1)
+         have_one |= 1u << at;
+   }
+   const uint32_t missing = have_one & ~have_zero;
+   if (!missing)
+      return;
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl)
+      return;
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   uint32_t left = missing;
+   while (left) {
+      const unsigned at = u_bit_scan(&left);
+      char name[40];
+      snprintf(name, sizeof(name), "gex_blend_src0_%u", at);
+      nir_variable *out =
+         nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), name);
+      out->data.location = FRAG_RESULT_DATA0 + at;
+      out->data.index = 0;
+      out->data.driver_location = at;
+      out->data.interpolation = INTERP_MODE_NONE;
+      nir_store_var(&b, out, nir_imm_vec4(&b, 0.0f, 0.0f, 0.0f, 0.0f), 0xf);
+   }
+   nir_progress(true, impl, nir_metadata_none);
+}
+
 /* `location[0]` and `location[1]` are the effective @locations the caller
  * chose; both stages compute them from the same context, so they agree. */
 static bool
@@ -9727,6 +9796,22 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
     * info.fs.color_is_dual_source, because this runs after passes that
     * rewrite the outputs and the flag is only as fresh as the last
     * nir_shader_gather_info. */
+   /* A lone index-*1* output is the other half of the same rule, and it needs
+    * more than a decoration: WGSL wants `@blend_src(0)` to exist, so if the
+    * shader never declared an index-0 output there is nothing to decorate and
+    * Tint says
+    *
+    *   '@blend_src(0)' is missing when '@blend_src' is used
+    *
+    * which failed the *link*. GL permits this outright --
+    * `glBindFragDataLocationIndexed(program, 0, 1, "color")` with no index-0
+    * output at all, which is KHR-GL45.program_interface_query's
+    * output-location-index -- and leaves index 0's value **undefined** when
+    * nothing writes it. So synthesizing one that writes zeros is exact by
+    * specification rather than a guess: any value satisfies GL, and the pair
+    * satisfies WGSL. */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT)
+      gex_wgpu_add_missing_index_zero_output(nir);
    bool dual_source_output = false;
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
