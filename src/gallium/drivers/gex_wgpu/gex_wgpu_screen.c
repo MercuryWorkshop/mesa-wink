@@ -30295,9 +30295,11 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    WGPUBindGroupLayoutEntry entries[GEX_WGPU_MAX_SO_BUFFERS +
                                    GEX_WGPU_MAX_VERTEX_BUFFERS + 2 +
                                    2 * GEX_WGPU_MAX_SAMPLERS];
+   /* Zeroed for the reason the draw path's entries are; the cache hashes the
+    * padding along with the fields. */
    WGPUBindGroupEntry bindings[GEX_WGPU_MAX_SO_BUFFERS +
                                GEX_WGPU_MAX_VERTEX_BUFFERS + 2 +
-                               2 * GEX_WGPU_MAX_SAMPLERS];
+                               2 * GEX_WGPU_MAX_SAMPLERS] = {0};
    unsigned count = 0;
 
    for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
@@ -30508,7 +30510,7 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    WGPUBindGroupLayoutEntry ubo_entries[GEX_WGPU_MAX_CONSTANT_BUFFERS +
                                         GEX_WGPU_MAX_SHADER_BUFFERS];
    WGPUBindGroupEntry ubo_bindings[GEX_WGPU_MAX_CONSTANT_BUFFERS +
-                                   GEX_WGPU_MAX_SHADER_BUFFERS];
+                                   GEX_WGPU_MAX_SHADER_BUFFERS] = {0};
    const unsigned ubo_count = ctx->vs->ubo_count;
    for (unsigned i = 0; i < ubo_count; ++i) {
       const unsigned slot = ctx->vs->ubo_slots[i];
@@ -31271,7 +31273,13 @@ static WGPUBindGroup
 gex_wgpu_group(WGPUDevice device, WGPUBindGroupLayout layout,
                const struct gex_wgpu_bindings *group)
 {
-   WGPUBindGroupEntry entries[GEX_WGPU_MAX_GROUP_BINDINGS];
+   /* Zeroed whole, not merely filled element by element. WGPU_BIND_GROUP_ENTRY_INIT
+    * sets every *field* and says nothing about the padding between them, and
+    * gex_wgpu_cached_bind_group hashes and memcmps these structures as raw
+    * bytes -- so two logically identical entry arrays could hash differently
+    * or compare unequal on padding alone. valgrind counted 214 uses of
+    * uninitialised values across one CTS case, all of them here. */
+   WGPUBindGroupEntry entries[GEX_WGPU_MAX_GROUP_BINDINGS] = {0};
    for (unsigned i = 0; i < group->count; ++i) {
       entries[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       entries[i].binding = group->binding[i];
@@ -36884,6 +36892,39 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
  * becomes true everywhere. Native Dawn already retains internally, so the
  * extra pair costs it nothing.
  */
+/* Stored field by field into a zeroed slot, so what the cache holds is fully
+ * defined -- the ref-counting walk below then reads values rather than
+ * whatever a compound literal's padding happened to contain. */
+static void
+gex_wgpu_bg_entries_store(WGPUBindGroupEntry *into,
+                          const WGPUBindGroupEntry *from, unsigned count)
+{
+   memset(into, 0, count * sizeof(*into));
+   for (unsigned i = 0; i < count; ++i) {
+      into[i].binding = from[i].binding;
+      into[i].buffer = from[i].buffer;
+      into[i].offset = from[i].offset;
+      into[i].size = from[i].size;
+      into[i].sampler = from[i].sampler;
+      into[i].textureView = from[i].textureView;
+   }
+}
+
+/* Field by field, for the reason the hash is: the padding between them is
+ * unspecified and a memcmp would compare it. */
+static bool
+gex_wgpu_bg_entries_equal(const WGPUBindGroupEntry *a,
+                          const WGPUBindGroupEntry *b, unsigned count)
+{
+   for (unsigned i = 0; i < count; ++i) {
+      if (a[i].binding != b[i].binding || a[i].buffer != b[i].buffer ||
+          a[i].offset != b[i].offset || a[i].size != b[i].size ||
+          a[i].sampler != b[i].sampler || a[i].textureView != b[i].textureView)
+         return false;
+   }
+   return true;
+}
+
 static void
 gex_wgpu_bg_entries_ref(const WGPUBindGroupEntry *entries, unsigned count)
 {
@@ -36935,15 +36976,38 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
       { const WGPUBindGroup gex_ret = NULL;
         simple_mtx_unlock(&screen->cache_lock);
         return gex_ret; }
-   const size_t bytes = count * sizeof(*entries);
-   uint32_t hash = gex_wgpu_cache_hash(entries, bytes);
-   hash = gex_wgpu_cache_hash(&layout, sizeof(layout)) ^ hash ^ (count * 97u);
+   /* Hashed and compared field by field, not as raw bytes.
+    *
+    * WGPUBindGroupEntry has padding between its members, and assigning a
+    * compound literal -- which is how every one of these is built -- copies
+    * that literal's padding, whose contents the language does not define. So
+    * two logically identical entry arrays could hash differently or compare
+    * unequal on padding alone, and valgrind counted 214 uses of uninitialised
+    * values in one CTS case, every one of them this.
+    *
+    * A false miss only costs a bind group, which is why this was invisible.
+    * The reason to fix it is that 214 errors bury whatever else valgrind
+    * would have to say about a run. */
+   uint32_t hash = gex_wgpu_cache_hash(&layout, sizeof(layout)) ^
+                   (count * 97u);
+   for (unsigned i = 0; i < count; ++i) {
+      /* An array, not a struct: a struct of a uint32_t and pointers has
+       * padding of its own, which would put this straight back where it
+       * started. */
+      const uint64_t key[6] = {
+         entries[i].binding, (uint64_t)(uintptr_t)entries[i].buffer,
+         entries[i].offset, entries[i].size,
+         (uint64_t)(uintptr_t)entries[i].sampler,
+         (uint64_t)(uintptr_t)entries[i].textureView};
+      hash ^= gex_wgpu_cache_hash(key, sizeof(key)) * (i + 1u);
+   }
 
    struct gex_wgpu_bg_cache_slot *slot =
       &screen->bg_cache[hash % GEX_WGPU_BG_CACHE_SLOTS];
    if (slot->used && slot->epoch == screen->cache_epoch &&
        slot->hash == hash && slot->layout == layout &&
-       slot->count == count && memcmp(slot->entries, entries, bytes) == 0) {
+       slot->count == count &&
+       gex_wgpu_bg_entries_equal(slot->entries, entries, count)) {
       ++screen->bg_cache_hits;
       { const WGPUBindGroup gex_ret = slot->group;
         simple_mtx_unlock(&screen->cache_lock);
@@ -36993,7 +37057,7 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    slot->hash = hash;
    slot->layout = layout;
    slot->count = count;
-   memcpy(slot->entries, entries, bytes);
+   gex_wgpu_bg_entries_store(slot->entries, entries, count);
    /* Held until this slot is evicted; see gex_wgpu_bg_entries_ref. */
    gex_wgpu_bg_entries_ref(slot->entries, slot->count);
    slot->group = group;
@@ -42602,7 +42666,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    unsigned image_view_count = 0;
    struct gex_wgpu_dynamic_offsets dynamic[4] = {{0}, {0}, {0}, {0}};
    if (pipeline && needs_texture) {
-      WGPUBindGroupEntry entries[GEX_WGPU_MAX_SAMPLERS * 2 + 1];
+      /* Zeroed whole: the cache hashes the padding with the fields. */
+      WGPUBindGroupEntry entries[GEX_WGPU_MAX_SAMPLERS * 2 + 1] = {0};
       for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
          const unsigned slot = ctx->fs->texture_slots[i];
          entries[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
