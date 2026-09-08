@@ -2290,6 +2290,18 @@ struct gex_wgpu_shader {
     * need one, the other, or both. */
    nir_shader *varying_nir;
    struct gex_wgpu_varying_variant *varyings;
+   /* The same clone taken *before* gex_wgpu_strip_storage_writes, kept only
+    * for a shader whose atomic result the strip would rewrite to zero.
+    *
+    * varying_nir is deliberately post-strip -- for a geometry or tessellation
+    * draw the capture dispatch does the stores and the varying pass must not
+    * do them twice -- so it cannot serve the replay: replaying it would
+    * rasterise the zeros the strip put there and read as the replay not
+    * working. This one keeps the atomics, and the pass built from it is
+    * *both* the side-effect pass and the capture, which is why the ordinary
+    * capture dispatch must not also run for such a draw. */
+   nir_shader *replay_nir;
+   struct gex_wgpu_varying_variant *replay_varyings;
    struct gex_wgpu_shader_variant *variants;
    /* The interpolation this stage declares per varying location: what a
     * fragment shader asks of its inputs, and what a vertex or geometry shader
@@ -11552,6 +11564,57 @@ gex_wgpu_ignore_sample_mask(nir_shader *nir)
                                      nir_metadata_control_flow, NULL);
 }
 
+/* Does a storage atomic's *result* reach anything in this shader?
+ *
+ * The question the replay path turns on, and it has to be asked *before*
+ * gex_wgpu_strip_storage_writes runs, because that is what rewrites the
+ * result to zero. Same predicate the strip uses to decide raster_invalid, so
+ * the two agree by construction rather than by coincidence.
+ */
+static bool
+gex_wgpu_uses_storage_atomic_result(nir_shader *nir, uint32_t direct_images)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            bool atomic = false;
+            switch (intr->intrinsic) {
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+               atomic = true;
+               break;
+            case nir_intrinsic_image_deref_atomic:
+            case nir_intrinsic_image_deref_atomic_swap: {
+               nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+               nir_variable *var =
+                  deref ? nir_deref_instr_get_variable(deref) : NULL;
+               atomic = var && var->data.driver_location < 32 &&
+                        (direct_images &
+                         (UINT32_C(1) << var->data.driver_location));
+               break;
+            }
+            case nir_intrinsic_deref_atomic:
+            case nir_intrinsic_deref_atomic_swap: {
+               nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+               nir_variable *var =
+                  deref ? nir_deref_instr_get_variable(deref) : NULL;
+               atomic = var && var->data.mode == nir_var_mem_ssbo;
+               break;
+            }
+            default:
+               break;
+            }
+            if (atomic && !nir_def_is_unused(&intr->def))
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 /* Does this shader write a storage block?
  *
  * WGSL forbids `var<storage, read_write>` in the vertex stage outright, so a
@@ -12044,6 +12107,14 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       }
    }
    shader->writes_storage = vs_writes_storage;
+   /* A clone that keeps the atomics, for the replay path -- taken here
+    * because the strip below is what would rewrite their results away, and
+    * the varying clone further down is deliberately post-strip. Only for a
+    * shader that actually uses an atomic's result, so nothing else pays for
+    * it: the predicate is the strip's own. */
+   if (vs_writes_storage &&
+       gex_wgpu_uses_storage_atomic_result(nir, vs_direct_images))
+      shader->replay_nir = nir_shader_clone(NULL, nir);
    /* After the clone, so the capture keeps them. Declining here rather than
     * letting Tint refuse the module means the reason names itself. */
    if (vs_writes_storage &&
@@ -13130,6 +13201,16 @@ gex_wgpu_delete_shader_state(struct pipe_context *pipe, void *state)
       FREE(varying);
       varying = next;
    }
+   struct gex_wgpu_varying_variant *replay = shader->replay_varyings;
+   while (replay) {
+      struct gex_wgpu_varying_variant *next = replay->next;
+      if (replay->module)
+         wgpuShaderModuleRelease(replay->module);
+      FREE(replay);
+      replay = next;
+   }
+   if (shader->replay_nir)
+      ralloc_free(shader->replay_nir);
    if (shader->varying_nir)
       ralloc_free(shader->varying_nir);
    struct gex_wgpu_capture_variant *capture = shader->captures;
@@ -25653,8 +25734,15 @@ static struct gex_wgpu_varying_variant *
 gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
                              struct gex_wgpu_shader *vs,
                              const struct gex_wgpu_capture_layout *vertex,
-                             const struct gex_wgpu_varying_layout *varyings)
+                             const struct gex_wgpu_varying_layout *varyings,
+                             bool replay)
 {
+   /* `replay` picks the clone that still has its atomics -- see replay_nir --
+    * and a cache list of its own, so a shader can hold both kinds at once
+    * without one answering for the other. */
+   nir_shader *const source = replay ? vs->replay_nir : vs->varying_nir;
+   struct gex_wgpu_varying_variant **const cache =
+      replay ? &vs->replay_varyings : &vs->varyings;
    /* A vertex shader that samples a texture cannot be run as compute here:
     * the split pass puts a vertex stage's texture and sampler in descriptor
     * set 3 -- the graphics stages each have a set of their own -- and a
@@ -25678,7 +25766,7 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    const bool wants_variant = gex_wgpu_stage_wants_texture_variant(
       vs->texture_count, vs->texture_slots, vs->integer_sampled_slots,
       ctx->vertex_samplers, ctx->vertex_sampler_views);
-   for (struct gex_wgpu_varying_variant *v = vs->varyings; v; v = v->next) {
+   for (struct gex_wgpu_varying_variant *v = *cache; v; v = v->next) {
       if (memcmp(&v->vertex_layout, vertex, sizeof(*vertex)) ||
           memcmp(&v->varyings, varyings, sizeof(*varyings)))
          continue;
@@ -25707,13 +25795,13 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
       if (match)
          return v;
    }
-   if (!vs->varying_nir) {
+   if (!source) {
       if (getenv("GEX_WGPU_UNFILLED_LOG"))
          fprintf(stderr, "gex-wgpu: capture variant: no varying_nir kept\n");
       return NULL;
    }
 
-   nir_shader *nir = nir_shader_clone(NULL, vs->varying_nir);
+   nir_shader *nir = nir_shader_clone(NULL, source);
    if (!nir) {
       if (getenv("GEX_WGPU_UNFILLED_LOG"))
          fprintf(stderr, "gex-wgpu: capture variant: clone failed\n");
@@ -25874,8 +25962,8 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
       return NULL;
    }
    free(error);
-   variant->next = vs->varyings;
-   vs->varyings = variant;
+   variant->next = *cache;
+   *cache = variant;
    return variant;
 }
 
@@ -31020,7 +31108,7 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
    if (ctx->vs->texture_count || ctx->vs->sampler_count)
       GEX_LINE_DECLINE("the vertex shader samples a texture");
    struct gex_wgpu_varying_variant *variant =
-      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &varyings);
+      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &varyings, false);
    const unsigned record = gex_wgpu_varying_stride(&varyings);
    if (!variant)
       GEX_LINE_DECLINE("the vertex shader has no compute variant");
@@ -31923,7 +32011,8 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    }
 
    struct gex_wgpu_varying_variant *variant =
-      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &gs->inputs);
+      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &gs->inputs,
+                                   false);
    if (!variant ||
        !gex_wgpu_ensure_buffer(ctx, &ctx->gs_vs_out, captured * vs_stride,
                                PIPE_BIND_SHADER_BUFFER) ||
@@ -32683,7 +32772,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    }
    struct gex_wgpu_varying_variant *vs_variant =
       gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout,
-                                   tcs ? &tcs->inputs : &tes->inputs);
+                                   tcs ? &tcs->inputs : &tes->inputs, false);
    if (!vs_variant)
       GEX_TESS_DECLINE("could not build the vertex capture variant");
 
@@ -36350,7 +36439,7 @@ gex_wgpu_capture_positions(struct gex_wgpu_context *ctx, unsigned first,
       }
    }
    struct gex_wgpu_varying_variant *variant =
-      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &varyings);
+      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &varyings, false);
    if (!variant)
       GEX_CAPTURE_DECLINE("no compute variant for this layout");
    if (!gex_wgpu_ensure_buffer(ctx, &ctx->facing_vs_out, count * record,
@@ -37221,7 +37310,7 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
       layout.divisor[i] = ve->instance_divisor;
    }
    struct gex_wgpu_varying_variant *variant =
-      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &varyings);
+      gex_wgpu_varying_variant_get(ctx, ctx->vs, &layout, &varyings, false);
    if (!variant)
       GEX_FLAT_DECLINE("the vertex shader has no compute variant");
 
