@@ -18177,8 +18177,18 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
     * -- and there is nothing to fall back to, since a per-layer view needs an
     * array texture to view. The logical width is kept on the resource; every
     * consumer offsets by the layer it is working on. */
-   if (samples > 1 && templ->target == PIPE_TEXTURE_2D_ARRAY &&
-       templ->array_size > 1) {
+   /* Any multisampled 2D array, one layer included. A single layer needs no
+    * tiling -- width * 1 is width, and depthOrArrayLayers was already 1 -- so
+    * the allocation is byte for byte what it was. What changes is the
+    * bookkeeping, and every consumer needs it: the view is forced to
+    * dimension 2D to match the declaration the shader flattening leaves
+    * behind, and the geometry is what textureSize answers with.
+    *
+    * Excluding it was worth most of KHR-GL45.texture_swizzle's 2DMSArray
+    * group, which uses a depth of exactly 1: the shader was flattened on its
+    * *declaration* while the resource said "not tiled", so the geometry came
+    * back all zeros and textureSize answered (0, 0, 0). */
+   if (samples > 1 && templ->target == PIPE_TEXTURE_2D_ARRAY) {
       resource->ms_tile_layers = templ->array_size;
       resource->ms_tile_width = desc.size.width;
       desc.size.width *= templ->array_size;
