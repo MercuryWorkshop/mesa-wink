@@ -590,6 +590,10 @@ gex_wgpu_say_once(uint32_t *shapes, unsigned *count, uint32_t shape)
                          &GEX_SAY_CAT(gex_said_count_, __LINE__),           \
                          (uint32_t)(shape)))
 
+/* What GL_MIN_MAP_BUFFER_ALIGNMENT promises and what the shadow block a map
+ * returns is therefore allocated to; see gex_wgpu_shadow_ensure. */
+#define GEX_WGPU_MAP_ALIGNMENT 64
+
 #define GEX_WGPU_MAX_VARYINGS 32
 
 /* The subset of the above a rasterized interface may use, and the *floor* for
@@ -5774,7 +5778,17 @@ gex_wgpu_shadow_ensure(struct gex_wgpu_resource *gex)
 {
    if (gex->shadow)
       return gex->shadow;
-   gex->shadow = CALLOC(1, gex->allocation_size);
+   /* Aligned, because this block *is* what glMapBuffer returns and GL promises
+    * the pointer is a multiple of GL_MIN_MAP_BUFFER_ALIGNMENT. The cap says
+    * 64 and CALLOC gives 16 on glibc x86-64, so the promise was simply false
+    * -- KHR-GL45.map_buffer_alignment.functional checks the pointer while its
+    * `query` sibling checks only the number, which is why one passed and the
+    * other did not.
+    *
+    * Both sides read GEX_WGPU_MAP_ALIGNMENT so they cannot drift apart; an
+    * alignment cap and the allocation behind it are one fact in two places,
+    * which is the shape that goes wrong. */
+   gex->shadow = align_calloc(gex->allocation_size, GEX_WGPU_MAP_ALIGNMENT);
    if (gex->shadow) {
       gex_wgpu_shadow_live += gex->allocation_size;
       gex_wgpu_shadow_unread += gex->allocation_size;
@@ -18525,7 +18539,7 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
       resource->buffer =
          wgpuDeviceCreateBuffer(gex_screen(screen)->device, &desc);
       if (!resource->buffer) {
-         FREE(resource->shadow);
+         align_free(resource->shadow);
          FREE(resource);
          return NULL;
       }
@@ -18865,7 +18879,7 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
       if (gex->ever_mapped)
          gex_wgpu_shadow_mapped -= gex->allocation_size;
    }
-   FREE(gex->shadow);
+   align_free(gex->shadow);
    FREE(gex->persistent_sent);
    FREE(gex);
 }
@@ -46150,7 +46164,7 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    /* WebGPU guarantees maxUniformBufferBindingSize of 64 KiB. st/mesa refuses
     * ARB_uniform_buffer_object below 16 KiB, and OpenGL ES 3.0 requires it. */
    caps->max_constant_buffer_size = 65536;
-   caps->min_map_buffer_alignment = 64;
+   caps->min_map_buffer_alignment = GEX_WGPU_MAP_ALIGNMENT;
 
    caps->max_varyings = 16;
    /* ARB_viewport_array, and with it ARB_fragment_layer_viewport -- st turns
