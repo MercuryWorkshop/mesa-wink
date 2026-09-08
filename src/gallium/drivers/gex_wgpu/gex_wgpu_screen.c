@@ -5678,6 +5678,13 @@ static int gex_wgpu_map_bind_live[GEX_WGPU_MAP_USAGE_BUCKETS];
 /* Cumulative, not live: which map shapes the hot path is actually made of.
  * A redesign that makes the common map cheap has to know which one that is. */
 static unsigned gex_wgpu_map_usage_total[GEX_WGPU_MAP_USAGE_BUCKETS];
+/* Unmaps that had to submit the pending batch, by the usage they were mapped
+ * with. buffer_unmap is 78% of every submit a SuperTuxKart run makes -- 42481
+ * of 54382, about 14 a frame -- and which map flags are behind them decides
+ * whether anything can be done about it: an UNSYNCHRONIZED map already skips
+ * the check, and a DISCARD_WHOLE_RESOURCE one could be served by renaming the
+ * buffer instead of waiting for the batch. Counted rather than guessed. */
+static unsigned gex_wgpu_unmap_conflict_usage[GEX_WGPU_MAP_USAGE_BUCKETS];
 static unsigned gex_wgpu_map_aligned, gex_wgpu_map_unaligned;
 /* Why a permanent shadow got allocated, so the lazy path can be told what is
  * still forcing one. */
@@ -6127,6 +6134,19 @@ gex_wgpu_report_draw_targets(void)
                   "0x%x:%d ", u, gex_wgpu_map_usage_live[u]);
       }
       fprintf(stderr, "gex-wgpu: open maps by usage -- %s\n",
+              line[0] ? line : "none");
+   }
+   {
+      /* The submits buffer_unmap forces, by map usage. See the note on
+       * gex_wgpu_unmap_conflict_usage. */
+      char line[512] = "";
+      for (unsigned u = 0; u < GEX_WGPU_MAP_USAGE_BUCKETS; ++u) {
+         if (gex_wgpu_unmap_conflict_usage[u] == 0)
+            continue;
+         snprintf(line + strlen(line), sizeof(line) - strlen(line),
+                  "0x%x:%u ", u, gex_wgpu_unmap_conflict_usage[u]);
+      }
+      fprintf(stderr, "gex-wgpu: unmap-forced submits by usage -- %s\n",
               line[0] ? line : "none");
       line[0] = '\0';
       for (unsigned bnd = 0; bnd < GEX_WGPU_MAP_USAGE_BUCKETS; ++bnd) {
@@ -21910,10 +21930,31 @@ gex_wgpu_buffer_unmap(struct pipe_context *pipe,
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
-   if (transfer &&
+   /* Only a map that can *write* needs the batch submitted here.
+    *
+    * What this submit orders is the upload unmap performs against draws
+    * already recorded into the pending batch. A read-only map performs none:
+    * `transfer->staged_write` is set only for a map without PIPE_MAP_READ,
+    * and nothing else in this function touches the buffer. Read ordering is
+    * handled at *map* time, where it belongs -- see the PIPE_MAP_READ submit
+    * in gex_wgpu_buffer_map, which is gated on the resource actually having
+    * been written by the GPU.
+    *
+    * Measured before changed. Every one of the 42481 batch-breaking unmaps in
+    * a SuperTuxKart run carried usage 0x1 -- PIPE_MAP_READ alone. That was
+    * 78% of the 54382 submits the whole run made, about fourteen a frame, and
+    * not one of them ordered anything. The histogram that says so is printed
+    * beside the submit causes; see gex_wgpu_unmap_conflict_usage. */
+   const bool may_write =
+      transfer && (transfer->usage & (PIPE_MAP_WRITE | PIPE_MAP_DISCARD_RANGE |
+                                      PIPE_MAP_DISCARD_WHOLE_RESOURCE)) != 0;
+   if (transfer && may_write &&
        gex_wgpu_batch_conflicts_usage((struct gex_wgpu_context *)pipe,
-                                      transfer->resource, transfer->usage))
+                                      transfer->resource, transfer->usage)) {
+      ++gex_wgpu_unmap_conflict_usage[transfer->usage %
+                                      GEX_WGPU_MAP_USAGE_BUCKETS];
       gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
+   }
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct gex_wgpu_transfer *gex_transfer =
       (struct gex_wgpu_transfer *)transfer;
@@ -35927,6 +35968,25 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                fprintf(stderr, " %s=%llu", gex_wgpu_submit_cause[i],
                        (unsigned long long)gex_wgpu_submit_cause_count[i]);
          fprintf(stderr, "\n");
+         /* Beside the causes, because buffer_unmap is most of them and this
+          * is what says whether they are addressable. Printed here rather
+          * than only in the teardown report: an application measured by
+          * killing it -- which is how every gate here measures one -- never
+          * reaches teardown, so that report was empty for the runs that
+          * matter. */
+         {
+            char usage_line[512] = "";
+            for (unsigned u = 0; u < GEX_WGPU_MAP_USAGE_BUCKETS; ++u) {
+               if (gex_wgpu_unmap_conflict_usage[u] == 0)
+                  continue;
+               snprintf(usage_line + strlen(usage_line),
+                        sizeof(usage_line) - strlen(usage_line), "0x%x:%u ",
+                        u, gex_wgpu_unmap_conflict_usage[u]);
+            }
+            fprintf(stderr,
+                    "gex-wgpu: unmap-forced submits by map usage -- %s\n",
+                    usage_line[0] ? usage_line : "none");
+         }
       }
 
 /* Give a packed shader image somewhere to put its texels, and remember that
