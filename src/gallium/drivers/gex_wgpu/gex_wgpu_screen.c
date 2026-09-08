@@ -37418,6 +37418,27 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
       struct gex_wgpu_resource *gex = gex_resource(ctx->persistent[i]);
       if (!gex->buffer || !gex->shadow)
          continue;
+      /* Only a mapping the application can *write* has anything to publish.
+       *
+       * A read-only persistent mapping is the GPU-to-CPU half of
+       * ARB_buffer_storage -- an asynchronous read-back, a compute result, an
+       * atomic counter -- and the application never writes through it, so
+       * there is nothing here to send. Sending anyway uploads the shadow over
+       * whatever the device just wrote, and then the read-back below returns
+       * what was uploaded.
+       *
+       * KHR-GL45.sync.flush_commands is exactly that: it maps a buffer
+       * READ|PERSISTENT|COHERENT, copies into it with
+       * glCopyNamedBufferSubData, waits on a fence and reads. The trace ran
+       * `PERSIST upload [0,16)` and then `PERSIST refresh`, in that order, so
+       * the test read the zeroed shadow back and reported [0, 0] against a
+       * reference of [3, 1415927]. Nothing in the driver said a word.
+       *
+       * The upload was reached because the copy had set gpu_written, which
+       * sends this down the diff path, where a freshly allocated
+       * persistent_sent is deliberately seeded to "everything differs". */
+      if (!(gex->persistent_usage & PIPE_MAP_WRITE))
+         continue;
       const uint32_t size = (uint32_t)(gex->allocation_size & ~3u);
       if (!size)
          continue;
