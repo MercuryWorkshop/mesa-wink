@@ -2474,6 +2474,9 @@ struct gex_wgpu_shader_variant {
     * different module. */
    uint16_t tiled_ms_slots;
    uint32_t tiled_ms_geom[GEX_WGPU_MAX_SAMPLERS][3];
+   /* The tile offset this variant subtracted from gl_FragCoord, baked in as
+    * an immediate and so part of the key. */
+   uint32_t frag_tile_x;
    /* The polygon offset this variant computes itself, and the state it baked
     * in as immediates; see gex_wgpu_lower_polygon_offset_clamp. All four are
     * part of the key because all four are constants in the shader. */
@@ -8298,6 +8301,73 @@ gex_wgpu_demote_ms_textures(nir_shader *nir, uint16_t slots)
    if (state.progress)
       nir_fixup_deref_types(nir);
    return state.progress;
+}
+
+/* gl_FragCoord, moved back into the tile it belongs to.
+ *
+ * A tiled multisampled array puts layer l at x + l * width of one wide
+ * texture, and the viewport moves with it -- so the fragment shader really
+ * does run at the wider texture's coordinates, and gl_FragCoord reports them.
+ * Every shader that uses gl_FragCoord for anything but its own attachment is
+ * then wrong by exactly the tile offset.
+ *
+ * KHR-GL45.direct_state_access's storage_multisample_3d cases are precisely
+ * that: they index a *non-tiled* input texture with
+ * `texelFetch(texture_input, ivec3(gl_FragCoord.xy, texture_layer), 0)`, so
+ * layer 2 read texels 4..5 of an input that is two wide. It is not a
+ * conformance detail either -- any application rendering into a layer of a
+ * multisampled array and reading gl_FragCoord would see the same shift. */
+static bool
+gex_wgpu_lower_frag_coord_tile_instr(nir_builder *b,
+                                     nir_intrinsic_instr *intr, void *data)
+{
+   const uint32_t tile_x = *(const uint32_t *)data;
+   nir_def *coord = NULL;
+   if (intr->intrinsic == nir_intrinsic_load_frag_coord) {
+      coord = &intr->def;
+   } else if (intr->intrinsic == nir_intrinsic_load_deref) {
+      /* The other shape gl_FragCoord arrives in: a variable, before
+       * nir_lower_system_values has been anywhere near it. The same pairing
+       * the gl_SamplePosition scan documents. */
+      nir_variable *var = nir_intrinsic_get_var(intr, 0);
+      if (!var || var->data.mode != nir_var_shader_in ||
+          var->data.location != VARYING_SLOT_POS)
+         return false;
+      coord = &intr->def;
+   } else {
+      return false;
+   }
+   if (coord->num_components < 1)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *shifted = nir_fadd_imm(b, nir_channel(b, coord, 0),
+                                   -(float)tile_x);
+   nir_def *replacement;
+   switch (coord->num_components) {
+   case 1: replacement = shifted; break;
+   case 2: replacement = nir_vec2(b, shifted, nir_channel(b, coord, 1));
+      break;
+   case 3: replacement = nir_vec3(b, shifted, nir_channel(b, coord, 1),
+                                  nir_channel(b, coord, 2)); break;
+   default:
+      replacement = nir_vec4(b, shifted, nir_channel(b, coord, 1),
+                             nir_channel(b, coord, 2),
+                             nir_channel(b, coord, 3));
+      break;
+   }
+   /* `after`, so the vec that reads the original is not itself rewritten to
+    * read its own result. */
+   nir_def_rewrite_uses_after(coord, replacement);
+   return true;
+}
+
+static bool
+gex_wgpu_lower_frag_coord_tile(nir_shader *nir, uint32_t tile_x)
+{
+   if (!tile_x)
+      return false;
+   return nir_shader_intrinsics_pass(nir, gex_wgpu_lower_frag_coord_tile_instr,
+                                     nir_metadata_control_flow, &tile_x);
 }
 
 /* A multisampled *array* texture, read as the wide multisampled 2D texture
@@ -14437,6 +14507,10 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    uint32_t want_tiled_geom[GEX_WGPU_MAX_SAMPLERS][3];
    const uint16_t want_tiled_ms =
       gex_wgpu_tiled_ms_slots(ctx, want_tiled_geom);
+   /* Only when something is actually rendering into a tile. A pass whose
+    * attachments are ordinary leaves gl_FragCoord alone, which is every pass
+    * that is not writing a multisampled array. */
+   const uint32_t want_frag_tile_x = ctx->ms_tile_x;
    /* What the bound colour target needs the fragment output to be. */
    const nir_alu_type wanted_output =
       ctx->color_count == 0 ? nir_alu_type_get_base_type(fs->color_output_type)
@@ -14626,7 +14700,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
        !want_sample_positions && !want_clip_dist && !want_logicop &&
        !want_ignore_sample_mask &&
        !want_omit_slots && !want_demote_ms && !want_tiled_ms &&
-       !want_offset_clamp &&
+       !fs->ms_array_slots && !want_frag_tile_x && !want_offset_clamp &&
        !fs->unformatted_images)
       return fs->module;
    uint16_t sampler_mask = 0;
@@ -14736,7 +14810,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       want_point_smooth || line_edge_location != ~0u ||
       want_sample_positions != 0 || want_clip_dist != 0 || want_logicop != 0 ||
       want_ignore_sample_mask || want_omit_slots != 0 ||
-      want_demote_ms != 0 || want_tiled_ms != 0 || want_offset_clamp ||
+      want_demote_ms != 0 || want_tiled_ms != 0 || fs->ms_array_slots != 0 ||
+      want_frag_tile_x != 0 || want_offset_clamp ||
       fs->unformatted_images != 0;
    if (!needs_variant && !fs->buftex_count)
       return fs->module;
@@ -14764,6 +14839,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->omitted_slots == want_omit_slots &&
                    cached->demoted_ms_slots == want_demote_ms &&
                    cached->tiled_ms_slots == want_tiled_ms &&
+                   cached->frag_tile_x == want_frag_tile_x &&
                    memcmp(cached->tiled_ms_geom, want_tiled_geom,
                           sizeof(cached->tiled_ms_geom)) == 0 &&
                    memcmp(cached->image_formats, want_image_formats,
@@ -14880,8 +14956,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * to decide what to build for it. */
    if (want_demote_ms)
       gex_wgpu_demote_ms_textures(variant, want_demote_ms);
-   if (want_tiled_ms)
-      gex_wgpu_flatten_ms_array(variant, want_tiled_ms, want_tiled_geom);
+   /* The declared mask, for the reason the vertex path above spells out: an
+    * arrayed multisampled declaration is what Tint refuses, bound or not. */
+   if (fs->ms_array_slots)
+      gex_wgpu_flatten_ms_array(variant, fs->ms_array_slots, want_tiled_geom);
+   gex_wgpu_lower_frag_coord_tile(variant, want_frag_tile_x);
    /* Before the texture lowering, which reads gl_FragCoord for nothing and
     * would otherwise see the load this adds. */
    if (want_stipple)
@@ -14979,6 +15058,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->omitted_slots = want_omit_slots;
    cached->demoted_ms_slots = want_demote_ms;
    cached->tiled_ms_slots = want_tiled_ms;
+   cached->frag_tile_x = want_frag_tile_x;
    memcpy(cached->tiled_ms_geom, want_tiled_geom,
           sizeof(cached->tiled_ms_geom));
    memcpy(cached->image_formats, want_image_formats,
@@ -25739,6 +25819,11 @@ gex_wgpu_update_ms_tile_x(struct gex_wgpu_context *ctx)
       const struct gex_wgpu_resource *res = gex_resource(ctx->colors[i]);
       if (res->ms_tile_layers) {
          ctx->ms_tile_x = ctx->color_layers[i] * res->ms_tile_width;
+         if (getenv("GEX_WGPU_MSA_LOG"))
+            fprintf(stderr, "gex-msa: tile_x=%u from attachment %u layer %u "
+                    "(count=%u width=%u layers=%u)\n", ctx->ms_tile_x, i,
+                    ctx->color_layers[i], ctx->color_count,
+                    res->ms_tile_width, res->ms_tile_layers);
          return;
       }
    }
@@ -34370,12 +34455,22 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
        * -- so the same flattening the fragment variant does has to happen
        * here. KHR-GL45.texture_swizzle's 2DMSArray cases read the texture
        * from *both* stages. */
+      /* Every *declared* multisampled array, not only the bound ones. The
+       * declaration is what Tint refuses -- "WGSL multisampled textures must
+       * be 2d and non-arrayed" names the variable, not a fetch -- so a slot
+       * the shader declares and nothing has been bound to still has to be
+       * flattened or the module will not compile at all. texture_swizzle
+       * declares its sampler in both stages and binds a vertex view for
+       * neither, which is exactly that case.
+       *
+       * The geometry comes from the binding where there is one and is zero
+       * where there is not; a slot with nothing bound samples nothing that
+       * anything reads. */
       if (vs->ms_array_slots) {
          uint32_t vs_tiled_geom[GEX_WGPU_MAX_SAMPLERS][3];
-         const uint16_t vs_tiled = gex_wgpu_tiled_ms_slots_for(
-            vs, ctx->vertex_sampler_views, vs_tiled_geom);
-         if (vs_tiled)
-            gex_wgpu_flatten_ms_array(clone, vs_tiled, vs_tiled_geom);
+         (void)gex_wgpu_tiled_ms_slots_for(vs, ctx->vertex_sampler_views,
+                                           vs_tiled_geom);
+         gex_wgpu_flatten_ms_array(clone, vs->ms_array_slots, vs_tiled_geom);
       }
       if (lower_textures &&
           !gex_wgpu_lower_texture_variant(clone, vs->texture_count,
