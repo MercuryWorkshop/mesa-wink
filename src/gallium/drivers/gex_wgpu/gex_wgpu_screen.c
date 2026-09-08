@@ -2402,6 +2402,9 @@ struct gex_wgpu_shader {
     * reads_sample_pos this suppresses the base module, because the locations
     * are only known once both stages are bound. */
    bool reads_clip_dist;
+   /* Any interpolateAtOffset whose offset is not the current sample, which
+    * WGSL cannot express and gex_wgpu_lower_interp_at_offset serves. */
+   bool reads_interp_offset;
    /* Vertex stage: where this shader's clip-distance carriers were emitted,
     * and how many distances they hold. Chosen from *this shader's own*
     * outputs at creation time, which is what lets them be written before
@@ -2500,6 +2503,10 @@ struct gex_wgpu_interp_variant {
     * pair of locations is a different module. */
    unsigned clip_dist_for;
    unsigned clip_carrier[2];
+   /* Where this variant writes 1/w for the fragment stage's
+    * interpolateAtOffset, or ~0u when it writes none; see
+    * gex_wgpu_inv_w_location. */
+   unsigned inv_w_location;
    uint8_t interp[GEX_WGPU_MAX_VARYING_LOCATIONS];
    uint8_t aux[GEX_WGPU_MAX_VARYING_LOCATIONS];
    /* The fragment stage's varying widths this module was reshaped to. */
@@ -2565,6 +2572,11 @@ struct gex_wgpu_shader_variant {
     * two locations, because a different pair is a different module. */
    unsigned clip_dist_for;
    unsigned clip_carrier[2];
+   /* The location this variant reads 1/w from for interpolateAtOffset, or
+    * ~0u when it has none to serve. Part of the key for the same reason the
+    * carriers are: both stages agree on it from the context, and a different
+    * location is a different module. */
+   unsigned inv_w_location;
    /* The logic op this variant applies, plus one, or zero for none. Part of
     * the key because the operation is compiled into the shader. */
    uint8_t logicop;
@@ -7781,6 +7793,191 @@ gex_wgpu_add_missing_index_zero_output(nir_shader *nir)
    }
    nir_progress(true, impl, nir_metadata_none);
 }
+
+
+/* Both defined further down, beside the lowerings they belong to. */
+static bool gex_wgpu_interp_is_current_sample(nir_intrinsic_instr *intr);
+static bool gex_wgpu_free_varying_locations(const struct gex_wgpu_context *ctx,
+                                            unsigned want, unsigned *out);
+
+/* Where 1/w lands for interpolateAtOffset, computed identically by both
+ * stages from the same context so neither has to be told what the other
+ * chose -- the arrangement the clip-distance carriers use, one step further
+ * along because the carriers are chosen when the *vertex shader* is created
+ * and this is chosen per draw.
+ *
+ * Past those carriers by construction: asking for `carriers + 1` locations
+ * and taking the last cannot be one of them, whether or not the carriers are
+ * themselves counted by the free-location scan. Two helpers each asking for
+ * "one free location" would each be told about the first one and collide,
+ * which is the trap this shape avoids.
+ *
+ * ~0u when there is nothing to serve, or when nothing is left under WebGPU's
+ * inter-stage ceiling -- the caller has to decline for that, because such a
+ * shader has no base module and the draw would otherwise vanish. */
+static unsigned
+gex_wgpu_inv_w_location(const struct gex_wgpu_context *ctx)
+{
+   if (!ctx->fs || !ctx->fs->reads_interp_offset)
+      return ~0u;
+   const unsigned carriers = ctx->vs ? ctx->vs->clip_carrier_count : 0u;
+   unsigned slots[3] = {0, 0, 0};
+   if (carriers + 1u > ARRAY_SIZE(slots) ||
+       !gex_wgpu_free_varying_locations(ctx, carriers + 1u, slots))
+      return ~0u;
+   return slots[carriers];
+}
+
+/* interpolateAtOffset, which WGSL does not have.
+ *
+ * GL asks for a varying's value at an offset from the pixel centre, exactly.
+ * The identity that gives it needs one extra varying and no approximation.
+ *
+ * A perspective-interpolated varying is v(p) = A(p)/B(p), where
+ * A = sum(v_i/w_i * b_i) and B = sum(b_i/w_i) with screen-space barycentrics
+ * -- so **A and B are both linear in screen space** while v is not. The
+ * fragment shader already has v at the centre; give it B as well, as a
+ * `noperspective` varying carrying 1/w, and then
+ *
+ *     A = v * B                       (exactly v/w at this pixel)
+ *     A(p+o) = A + o.x*dFdx(A) + o.y*dFdy(A)
+ *     B(p+o) = B + o.x*dFdx(B) + o.y*dFdy(B)
+ *     v(p+o) = A(p+o) / B(p+o)
+ *
+ * and the derivatives are *exact*, because a quad difference of a linear
+ * function is its derivative. Checked before any of this was written: against
+ * llvmpipe's own interpolateAtOffset on a quad whose w runs 1 to 4, the error
+ * is zero at every offset tried.
+ *
+ * One varying for the whole shader, not one per attribute -- 1/w does not
+ * depend on which varying is being asked about. The vertex side is
+ * gex_wgpu_emit_inv_w; both stages choose the location from
+ * gex_wgpu_helper_varyings so neither has to be told what the other picked.
+ *
+ * A flat varying takes no interpolation at all, and a noperspective one is
+ * already linear, so those two are handled directly rather than through the
+ * identity -- using it on them would be wrong, not merely slower.
+ */
+struct gex_wgpu_interp_offset_lowering {
+   nir_variable *inv_w;
+   bool progress;
+};
+
+static bool
+gex_wgpu_lower_interp_at_offset_instr(nir_builder *b,
+                                      nir_intrinsic_instr *intr, void *data)
+{
+   struct gex_wgpu_interp_offset_lowering *state = data;
+   if (intr->intrinsic != nir_intrinsic_interp_deref_at_offset)
+      return false;
+   /* The current-sample spelling is served by gex_wgpu_lower_sample_interp,
+    * which turns it into an @interpolate(sample) read; leave it alone. */
+   if (gex_wgpu_interp_is_current_sample(intr))
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+   if (!var)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *centre = nir_load_deref(b, deref);
+   nir_def *offset = intr->src[1].ssa;
+   nir_def *ox = nir_channel(b, offset, 0);
+   nir_def *oy = nir_channel(b, offset, 1);
+   const unsigned comps = centre->num_components;
+
+   nir_def *result;
+   if (var->data.interpolation == INTERP_MODE_FLAT) {
+      /* One vertex's value, whatever the offset. */
+      result = centre;
+   } else if (var->data.interpolation == INTERP_MODE_NOPERSPECTIVE) {
+      /* Already linear in screen space: one step, no division. */
+      result = nir_fadd(
+         b, centre,
+         nir_fadd(b, nir_fmul(b, nir_replicate(b, ox, comps),
+                              nir_ddx(b, centre)),
+                  nir_fmul(b, nir_replicate(b, oy, comps),
+                           nir_ddy(b, centre))));
+   } else {
+      nir_def *bb = nir_load_var(b, state->inv_w);
+      nir_def *aa = nir_fmul(b, centre, nir_replicate(b, bb, comps));
+      nir_def *a_off = nir_fadd(
+         b, aa,
+         nir_fadd(b, nir_fmul(b, nir_replicate(b, ox, comps), nir_ddx(b, aa)),
+                  nir_fmul(b, nir_replicate(b, oy, comps), nir_ddy(b, aa))));
+      nir_def *b_off =
+         nir_fadd(b, bb,
+                  nir_fadd(b, nir_fmul(b, ox, nir_ddx(b, bb)),
+                           nir_fmul(b, oy, nir_ddy(b, bb))));
+      result = nir_fdiv(b, a_off, nir_replicate(b, b_off, comps));
+   }
+   nir_def_replace(&intr->def, result);
+   state->progress = true;
+   return true;
+}
+
+static bool
+gex_wgpu_lower_interp_at_offset(nir_shader *nir, unsigned location)
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+   struct gex_wgpu_interp_offset_lowering state = {0};
+   state.inv_w = nir_variable_create(nir, nir_var_shader_in,
+                                     glsl_float_type(), "gex_inv_w");
+   state.inv_w->data.location = VARYING_SLOT_VAR0 + location;
+   state.inv_w->data.driver_location = location;
+   /* 1/w is the quantity that interpolates linearly in screen space, so it
+    * must not be perspective-corrected on the way in. */
+   state.inv_w->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
+   nir_shader_intrinsics_pass(nir, gex_wgpu_lower_interp_at_offset_instr,
+                              nir_metadata_control_flow, &state);
+   if (!state.progress) {
+      exec_node_remove(&state.inv_w->node);
+      return false;
+   }
+   nir->info.inputs_read |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + location);
+   return true;
+}
+
+/* The vertex half: 1/w at the location the fragment stage will read it from.
+ *
+ * Stored beside every gl_Position store, from that store's own w, so it
+ * cannot disagree with the position actually emitted -- including after the
+ * viewport fold, which is why this runs where it does. */
+static bool
+gex_wgpu_emit_inv_w_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                          void *data)
+{
+   nir_variable *inv_w = data;
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_shader_out ||
+       var->data.location != VARYING_SLOT_POS)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *w = nir_channel(b, intr->src[1].ssa, 3);
+   nir_store_var(b, inv_w, nir_frcp(b, w), 0x1);
+   return true;
+}
+
+static bool
+gex_wgpu_emit_inv_w(nir_shader *nir, unsigned location)
+{
+   nir_variable *inv_w = nir_variable_create(nir, nir_var_shader_out,
+                                             glsl_float_type(), "gex_inv_w");
+   inv_w->data.location = VARYING_SLOT_VAR0 + location;
+   inv_w->data.driver_location = location;
+   inv_w->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
+   if (!nir_shader_intrinsics_pass(nir, gex_wgpu_emit_inv_w_instr,
+                                   nir_metadata_control_flow, inv_w)) {
+      exec_node_remove(&inv_w->node);
+      return false;
+   }
+   nir->info.outputs_written |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + location);
+   return true;
+}
+
 
 /* `location[0]` and `location[1]` are the effective @locations the caller
  * chose; both stages compute them from the same context, so they agree. */
@@ -13418,6 +13615,22 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       }
       if (shader->reads_clip_dist)
          shader->clip_dist_count = MIN2(shader->clip_dist_count, 8u);
+      /* And any interpolateAtOffset the sample lowering will not take: WGSL
+       * has no such builtin, so this shader has no base module and is served
+       * by gex_wgpu_lower_interp_at_offset in the variant. */
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_interp_deref_at_offset)
+                  continue;
+               if (!gex_wgpu_interp_is_current_sample(intr))
+                  shader->reads_interp_offset = true;
+            }
+         }
+      }
       /* The shape, because the mapping from gl_CullDistance[i] to a slot
        * index depends on whether Mesa merged the two arrays into CLIP_DIST0
        * or left gl_CullDistance at CULL_DIST0, and guessing which is how the
@@ -14289,7 +14502,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       (shader->integer_sampled_slots != 0 || shader->buftex_count != 0 ||
        shader->unformatted_images != 0 || shader->reads_sample_pos ||
        shader->ms_array_slots != 0 ||
-       shader->reads_clip_dist) &&
+       shader->reads_clip_dist || shader->reads_interp_offset) &&
       (expected_stage == MESA_SHADER_FRAGMENT ||
        expected_stage == MESA_SHADER_VERTEX);
    if (deferred_integer_sampling)
@@ -15146,6 +15359,18 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * vertex side derives the same pair from the same context, which is what
     * lets the two agree without either being told about the other. Zero
     * count means the shader does not read them and nothing changes. */
+   const unsigned want_inv_w = gex_wgpu_inv_w_location(ctx);
+   if (fs->reads_interp_offset && want_inv_w == ~0u) {
+      /* Said, because this shader has no base module: without a variant the
+       * draw disappears with no message at all. */
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: fragment shader declined (no free varying "
+                 "location for interpolateAtOffset's 1/w carrier)\n");
+      }
+      return NULL;
+   }
    unsigned clip_carrier[2] = {0, 0};
    unsigned want_clip_dist = 0;
    if (fs->reads_clip_dist && fs->clip_dist_count) {
@@ -15260,6 +15485,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
        line_edge_location == ~0u && !fs->buftex_count &&
        !want_sample_positions && !want_clip_dist && !want_logicop &&
        !want_ignore_sample_mask && !want_drop_color &&
+       !fs->reads_interp_offset &&
        !want_omit_slots && !want_demote_ms && !want_tiled_ms &&
        !fs->ms_array_slots && !want_frag_tile_x && !want_query_only &&
        !want_offset_clamp &&
@@ -15371,7 +15597,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
       want_sample_positions != 0 || want_clip_dist != 0 || want_logicop != 0 ||
-      want_ignore_sample_mask || want_drop_color || want_omit_slots != 0 ||
+      want_ignore_sample_mask || want_drop_color ||
+      fs->reads_interp_offset || want_omit_slots != 0 ||
       want_demote_ms != 0 || want_tiled_ms != 0 || fs->ms_array_slots != 0 ||
       want_frag_tile_x != 0 || want_query_only != 0 || want_offset_clamp ||
       fs->unformatted_images != 0;
@@ -15389,6 +15616,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->point_smooth == want_point_smooth &&
                    cached->sample_positions_for == want_sample_positions &&
                    cached->clip_dist_for == want_clip_dist &&
+                   cached->inv_w_location == want_inv_w &&
                    cached->clip_carrier[0] == clip_carrier[0] &&
                    cached->clip_carrier[1] == clip_carrier[1] &&
                    cached->logicop == want_logicop &&
@@ -15488,6 +15716,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       nir_shader_intrinsics_pass(variant, gex_wgpu_lower_sample_pos,
                                  nir_metadata_control_flow, &sample_pos);
    }
+   if (want_inv_w != ~0u)
+      gex_wgpu_lower_interp_at_offset(variant, want_inv_w);
    if (want_clip_dist)
       gex_wgpu_lower_clip_distance_input(variant, want_clip_dist,
                                          clip_carrier);
@@ -15617,6 +15847,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->point_smooth = want_point_smooth;
    cached->sample_positions_for = want_sample_positions;
    cached->clip_dist_for = want_clip_dist;
+   cached->inv_w_location = want_inv_w;
    cached->clip_carrier[0] = clip_carrier[0];
    cached->clip_carrier[1] = clip_carrier[1];
    cached->logicop = want_logicop;
@@ -35506,6 +35737,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
        gex_wgpu_free_varying_locations(
           ctx, DIV_ROUND_UP(fs->clip_dist_count, 4u), want_clip_carrier))
       want_clip_dist = fs->clip_dist_count;
+   /* The same answer the fragment side computes, from the same context. */
+   const unsigned want_inv_w = gex_wgpu_inv_w_location(ctx);
    const uint8_t *want_interp = fs ? fs->varying_interp : NULL;
    const uint8_t *want_aux = fs ? fs->varying_aux : NULL;
    const uint8_t *want_components = fs ? fs->varying_components : NULL;
@@ -35516,6 +35749,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
         v = v->next) {
       bool match = v->mask == fs_mask && v->sampler_mask == sampler_mask &&
                    v->clip_dist_for == want_clip_dist &&
+                   v->inv_w_location == want_inv_w &&
                     v->clip_carrier[0] == want_clip_carrier[0] &&
                     v->clip_carrier[1] == want_clip_carrier[1] &&
                     memcmp(v->buftex_words, want_buftex,
@@ -35611,6 +35845,13 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
             neutralised, because this clone is of the *neutralised* shader and
             a carrier filled from it holds 1.0 for every cull distance. */
       }
+      /* 1/w for the fragment stage's interpolateAtOffset, *after* the varying
+       * fit: that trims the outputs to the widths the fragment shader reads,
+       * and this one is not in that table -- emitting it first would have it
+       * trimmed straight back out. Before the viewport fold below, so the w
+       * it divides is the w the pipeline actually rasterises with. */
+      if (want_inv_w != ~0u)
+         gex_wgpu_emit_inv_w(clone, want_inv_w);
       /* Before the viewport fold, which is what makes the offset's scale a
        * viewport rather than a framebuffer one -- see
        * gex_wgpu_lower_wide_point. */
@@ -35739,6 +35980,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
          ? NULL : plain;
    }
    variant->clip_dist_for = want_clip_dist;
+   variant->inv_w_location = want_inv_w;
    variant->clip_carrier[0] = want_clip_carrier[0];
    variant->clip_carrier[1] = want_clip_carrier[1];
    variant->next = vs->interp_variants;
