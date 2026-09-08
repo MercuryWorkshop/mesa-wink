@@ -34790,6 +34790,23 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                                                          : MESA_PRIM_TRIANGLES;
    raster.index_size = 4;
    raster.index.resource = ctx->gs_indices;
+   /* One instance, whatever the application asked for. Instancing is
+    * unrolled into the capture -- the index list this draw is handed already
+    * covers every instance -- so inheriting instance_count from the
+    * application's draw rasterized the whole list once per instance, an
+    * `instances`-fold overdraw.
+    *
+    * Nothing detected it for as long as it existed. The geometry topology
+    * probe's `instanced` case passes either way, because the extra copies
+    * land exactly on top of the originals and opaque geometry in the same
+    * place is indistinguishable from one copy. Additive blending is not: two
+    * instances of a triangle writing 0.25 read 1.0 instead of 0.5. See
+    * gl44-gs-instanced-blend-probe, which asserts exactly that.
+    *
+    * It also un-refuses wide points for an instanced draw, whose expansion
+    * declines on `instance_count > 1` -- correctly, since it needs the
+    * instance dimension for its own per-point data. */
+   raster.instance_count = 1;
    raster.has_user_indices = false;
    raster.primitive_restart = false;
    raster.index_bounds_valid = false;
@@ -35774,6 +35791,23 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    raster.mode = out_prim;
    raster.index_size = 4;
    raster.index.resource = ctx->tess_indices;
+   /* One instance, whatever the application asked for. Instancing is
+    * unrolled into the capture -- the index list this draw is handed already
+    * covers every instance -- so inheriting instance_count from the
+    * application's draw rasterized the whole list once per instance, an
+    * `instances`-fold overdraw.
+    *
+    * Nothing detected it for as long as it existed. The geometry topology
+    * probe's `instanced` case passes either way, because the extra copies
+    * land exactly on top of the originals and opaque geometry in the same
+    * place is indistinguishable from one copy. Additive blending is not: two
+    * instances of a triangle writing 0.25 read 1.0 instead of 0.5. See
+    * gl44-gs-instanced-blend-probe, which asserts exactly that.
+    *
+    * It also un-refuses wide points for an instanced draw, whose expansion
+    * declines on `instance_count > 1` -- correctly, since it needs the
+    * instance dimension for its own per-point data. */
+   raster.instance_count = 1;
    raster.has_user_indices = false;
    raster.primitive_restart = false;
    raster.index_bounds_valid = false;
