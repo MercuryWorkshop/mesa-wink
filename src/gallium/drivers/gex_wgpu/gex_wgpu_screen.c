@@ -35697,6 +35697,12 @@ gex_wgpu_draw_only(void)
 uint64_t gex_wgpu_present_nanos;
 static uint64_t gex_wgpu_batched_submits;
 static uint64_t gex_wgpu_batched_draws;
+/* Draws this driver has actually recorded, ever. Monotonic on purpose:
+ * ctx->pending_draws is reset at every submit, so it cannot answer "did
+ * anything get drawn between here and there". See GEX_DRAW_DROP. */
+static uint64_t gex_wgpu_draws_recorded;
+/* How the ways of not drawing divide. See gex_wgpu_note_draw_drop. */
+static uint64_t gex_wgpu_draws_handed_off, gex_wgpu_draws_dropped;
 
 static int64_t gex_wgpu_time_origin;
 static uint64_t gex_wgpu_timed_draws;
@@ -35963,6 +35969,12 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                  (unsigned long long)sc->bg_cache_misses,
                  pl ? 100.0 * sc->pipeline_cache_hits / pl : 0.0,
                  (unsigned long long)sc->pipeline_cache_misses);
+         fprintf(stderr,
+                 "gex-wgpu: %llu draws recorded, %llu handed to another path, "
+                 "%llu dropped\n",
+                 (unsigned long long)gex_wgpu_draws_recorded,
+                 (unsigned long long)gex_wgpu_draws_handed_off,
+                 (unsigned long long)gex_wgpu_draws_dropped);
          fprintf(stderr, "gex-wgpu: %llu submits for %llu batched draws;"
                          " broken by:",
                  (unsigned long long)gex_wgpu_batched_submits,
@@ -39913,25 +39925,51 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
 
 /* Every way draw_vbo_inner can decide not to draw.
  *
- * There are more than forty, and each was a bare `return`: the draw does not
- * happen and nothing anywhere says so. That is the hardest shape to diagnose
- * here -- the application sees no error, the suite sees a buffer nobody
- * wrote, and a frame is missing something with no thread to pull.
+ * There are sixty-two, and each was a bare `return`: the draw does not happen
+ * and nothing anywhere says so. That is the hardest shape to diagnose here --
+ * the application sees no error, the suite sees a buffer nobody wrote, and a
+ * frame is missing something with no thread to pull.
  * GEX_WGPU_DRAW_DROP=1 names the line that gave up.
  *
  * A line number rather than a reason string on purpose: a reason has to be
- * written forty times and will be wrong somewhere, and the line is exact and
- * stays correct for free.
+ * written sixty-two times and will be wrong somewhere, and the line is exact
+ * and stays correct for free.
+ *
+ * But most of these are not drops at all. Well over half hand the draw to
+ * another path that performs it -- primitive conversion, the provoking-vertex
+ * replay, the indirect expansion, the geometry and tessellation dispatches --
+ * and a few are correctly nothing to do, like a zero-count sub-draw or an
+ * empty scissor. Counting those as drops is not a cosmetic problem: Blender's
+ * EEVEE viewport reported 5382 of them and **sixteen** were real, so the
+ * instrument built to find silently vanished draws answered with 99.7% noise.
+ *
+ * The split is made mechanically rather than by classifying sixty-two sites
+ * by hand, which would be wrong somewhere for the same reason a reason string
+ * would: if anything was recorded between entering this call and giving up,
+ * a nested path drew it. That is exactly what a handoff means, it needs no
+ * per-site judgement, and it cannot drift as the sites change.
  */
 static void
-gex_wgpu_note_draw_drop(int line)
+gex_wgpu_note_draw_drop(int line, bool handed_off)
 {
+   if (handed_off)
+      ++gex_wgpu_draws_handed_off;
+   else
+      ++gex_wgpu_draws_dropped;
    static int on = -1;
    if (on < 0) on = getenv("GEX_WGPU_DRAW_DROP") ? 1 : 0;
    if (on)
-      fprintf(stderr, "gex-wgpu: draw dropped at gex_wgpu_screen.c:%d\n", line);
+      fprintf(stderr, "gex-wgpu: draw %s at gex_wgpu_screen.c:%d\n",
+              handed_off ? "handed off" : "dropped", line);
 }
-#define GEX_DRAW_DROP() do { gex_wgpu_note_draw_drop(__LINE__); return; } while (0)
+/* `gex_draws_at_entry` is a local of draw_vbo_inner, which is the only
+ * function this macro is used in. */
+#define GEX_DRAW_DROP()                                                       \
+   do {                                                                       \
+      gex_wgpu_note_draw_drop(__LINE__,                                       \
+                              gex_wgpu_draws_recorded != gex_draws_at_entry); \
+      return;                                                                 \
+   } while (0)
 
 static void
 gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
@@ -39943,6 +39981,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   /* What GEX_DRAW_DROP compares against to tell a handoff from a real drop. */
+   const uint64_t gex_draws_at_entry = gex_wgpu_draws_recorded;
    /* The whole call, so that the pipeline and submit figures below can be
     * read as fractions of the driver's own cost rather than of wall clock,
     * which also contains the application and the frame readback. */
@@ -44667,6 +44707,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       const char *want = getenv("GEX_WGPU_MAX_BATCH");
       batch_limit = want ? MAX2(1, atoi(want)) : GEX_WGPU_MAX_BATCHED_DRAWS;
    }
+   ++gex_wgpu_draws_recorded;
    if ((int)++ctx->pending_draws >= batch_limit ||
        ctx->batch_touched_overflowed)
       gex_wgpu_submit_pending(ctx);
