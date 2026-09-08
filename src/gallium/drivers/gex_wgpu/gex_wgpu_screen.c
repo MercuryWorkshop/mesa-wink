@@ -15534,6 +15534,52 @@ gex_wgpu_demotable_ms_slots(struct gex_wgpu_context *ctx)
    return mask;
 }
 
+/* Returning a base module that does not exist.
+ *
+ * A shader in `deferred_integer_sampling` has **no base module** -- its
+ * `module` is NULL by construction, because the state it needs to compile
+ * against is not known until a draw. Both of the early returns below hand
+ * back `fs->module`, and the vertex variant's hands back `plain`, so a
+ * variant reason missing from one of those lists returns NULL and the draw
+ * disappears at `if (!fragment.module)` with nothing said.
+ *
+ * That has now cost three features -- gl_SamplePosition, interpolateAtOffset
+ * and gl_PrimitiveID -- and the third took most of a session, because the
+ * failure lands only on the draws the new feature is *for* while every other
+ * draw of the same shader works. It looks like a half-implemented feature
+ * rather than a mis-wired one.
+ *
+ * So the class reports itself now. This does not fix any particular omission;
+ * it converts the next one from a silent dropped draw into a line naming the
+ * flags that suppressed the module, which is the difference between an
+ * afternoon and a grep.
+ *
+ * Say-only, deliberately: an earlier version returned `shader->module` when
+ * it was non-NULL, which is wrong at the vertex sites. There `plain` is
+ * `flipped ? module_y_flipped : module`, so handing back `module` would give
+ * a flipped draw the unflipped shader. A diagnostic must not be able to
+ * change which module is used. */
+static void
+gex_wgpu_say_no_base_module(const struct gex_wgpu_shader *shader,
+                            const char *stage, int line)
+{
+   static bool said;
+   if (!said) {
+      said = true;
+      fprintf(stderr,
+              "gex-wgpu: %s stage has no base module and no variant reason "
+              "(line %d): int_sampled=0x%x buftex=%u unformatted=0x%x "
+              "sample_pos=%d ms_array=0x%x clip_dist=%d interp_offset=%d "
+              "primitive_id=%d -- one of these is missing from a variant "
+              "list; see gex_wgpu_base_module_or_say\n",
+              stage, line, shader->integer_sampled_slots,
+              shader->buftex_count, shader->unformatted_images,
+              (int)shader->reads_sample_pos, shader->ms_array_slots,
+              (int)shader->reads_clip_dist, (int)shader->reads_interp_offset,
+              (int)shader->reads_primitive_id);
+   }
+}
+
 static WGPUShaderModule
 gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                          bool drawing_triangles,
@@ -15849,7 +15895,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
        !fs->ms_array_slots && !want_frag_tile_x && !want_query_only &&
        !want_offset_clamp &&
        !fs->unformatted_images)
-      return fs->module;
+      {
+         if (!fs->module)
+            gex_wgpu_say_no_base_module(fs, "fragment", __LINE__);
+         return fs->module;
+      }
    uint16_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
     * the texture specialization. Folding the two together made every retyped
@@ -15951,7 +16001,21 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * gl_FragCoord.y back as a colour from two shaders that differ only in
     * whether they also sample a texture, and requires the same answer from
     * both. */
+   /* `fs->integer_sampled_slots` in its own right, not only through
+    * needs_sampler_variant.
+    *
+    * That flag is set inside a `uses_sampler && view && sampler` guard, so an
+    * integer sampler at a unit with *nothing bound* contributed no reason --
+    * and the base module does not exist for such a shader, so the early
+    * return below would hand back NULL. Whether that is reachable is another
+    * matter: gl44-unbound-integer-sampler-probe was written to reach it, with
+    * a float colour target so that nothing else forces a variant, and it
+    * passes 4/4 on both drivers. So this is defence in depth rather than a
+    * fix for anything observed -- but it is free and it is the honest
+    * predicate, because a shader whose module was deferred always needs a
+    * variant regardless of what is bound. */
    const bool needs_variant =
+      fs->integer_sampled_slots != 0 ||
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
@@ -15963,7 +16027,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       want_frag_tile_x != 0 || want_query_only != 0 || want_offset_clamp ||
       fs->unformatted_images != 0;
    if (!needs_variant && !fs->buftex_count)
-      return fs->module;
+      {
+         if (!fs->module)
+            gex_wgpu_say_no_base_module(fs, "fragment", __LINE__);
+         return fs->module;
+      }
 
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
         cached; cached = cached->next) {
@@ -36371,9 +36439,13 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       sampler_mask = 0;
    if ((!fs && !fold_viewport && !unpack_attribs && !lower_textures &&
         !wide && !has_buftex) || !vs->original_nir)
+   {
+      if (!plain)
+         gex_wgpu_say_no_base_module(vs, "vertex", __LINE__);
       return fold_viewport || unpack_attribs || lower_textures || wide ||
              has_buftex
          ? NULL : plain;
+   }
 
    const uint64_t fs_mask = fs ? fs->varying_interp_mask : 0;
    const uint64_t shared = vs->varying_interp_mask & fs_mask;
@@ -36404,7 +36476,11 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    if (!differs && !fold_viewport && !unpack_attribs && !lower_textures &&
        !wide && !has_buftex && !vs->ms_array_slots &&
        !vs->query_only_slots && !ctx->primitive_id_verts)
+   {
+      if (!plain)
+         gex_wgpu_say_no_base_module(vs, "vertex", __LINE__);
       return plain;
+   }
 
    /* The identity fold, matching gex_wgpu_lower_viewport_transform's use of
     * it: scale one and translate zero in every axis. */
@@ -36480,8 +36556,12 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    struct gex_wgpu_interp_variant *variant =
       CALLOC_STRUCT(gex_wgpu_interp_variant);
    if (!variant)
+   {
+      if (!plain)
+         gex_wgpu_say_no_base_module(vs, "vertex", __LINE__);
       return fold_viewport || unpack_attribs || wide || has_buftex
                 ? NULL : plain;
+   }
    variant->mask = fs_mask;
    variant->wide = *want_wide;
    memcpy(variant->buftex_words, want_buftex, sizeof(variant->buftex_words));
@@ -36669,6 +36749,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
                          "(interpolation, viewport, attribute unpack or "
                          "integer sampling)\n");
       }
+      if (!plain)
+         gex_wgpu_say_no_base_module(vs, "vertex", __LINE__);
       return fold_viewport || unpack_attribs || lower_textures || wide ||
              has_buftex
          ? NULL : plain;
