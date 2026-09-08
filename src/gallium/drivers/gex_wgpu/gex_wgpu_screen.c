@@ -16786,11 +16786,34 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
        * colour: WGSL has texture_depth_2d_array and texture_depth_cube, so a
        * cascaded shadow map and a cube shadow map are both expressible.
        * Multisampling stays 2D-only, which is also all WebGPU offers. */
+      /* 1D and 1D array are here because refusing them **aborts the
+       * application**, not because WebGPU has a 1D depth texture.
+       *
+       * `glTexImage1D(GL_TEXTURE_1D, 0, GL_DEPTH_COMPONENT16, ...)` is legal
+       * GL. When every depth format is declined for the target,
+       * st_ChooseTextureFormat returns MESA_FORMAT_NONE and Mesa asserts on
+       * it rather than raising a GL error:
+       *
+       *   teximage.c:3017: _mesa_choose_texture_format:
+       *   Assertion `f != MESA_FORMAT_NONE' failed.
+       *
+       * -- so the process dies inside glTexImage1D. Found by
+       * KHR-GL45.texture_swizzle, where it took out the whole 697-case family
+       * run rather than one case, and reproduced in isolation with a core
+       * dump. A refusal that a frontend cannot express is not a refusal, it
+       * is a crash; see `a-create-refusal-fails-the-link` for the same lesson
+       * one layer up.
+       *
+       * Serving it costs nothing: this driver already creates every non-3D
+       * texture as `WGPUTextureDimension_2D`, so a 1D depth texture is a 2D
+       * one a single row tall, which is exactly how the sampled path already
+       * treats 1D colour textures. Multisampling stays 2D-only, as before. */
       const bool depth_target_ok =
          target == PIPE_TEXTURE_2D ||
          (depth_samples == 1 &&
           (target == PIPE_TEXTURE_RECT || target == PIPE_TEXTURE_2D_ARRAY ||
-           target == PIPE_TEXTURE_CUBE || target == PIPE_TEXTURE_CUBE_ARRAY));
+           target == PIPE_TEXTURE_CUBE || target == PIPE_TEXTURE_CUBE_ARRAY ||
+           target == PIPE_TEXTURE_1D || target == PIPE_TEXTURE_1D_ARRAY));
       return depth_target_ok &&
              (depth_samples == 1 || depth_samples == 4) &&
              MAX2(1, storage_sample_count) == depth_samples &&
