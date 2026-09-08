@@ -1900,6 +1900,11 @@ struct gex_wgpu_context {
     * is what makes the quad shader's output and the fragment variant's input
     * one @location. */
    unsigned line_edge_location;
+   /* Vertices per primitive for a gl_PrimitiveID the *vertex* stage derives,
+    * or 0 when nothing needs one or an emulated stage supplies it instead.
+    * Set per draw, once the topology is final, because the topology rewrites
+    * re-enter the draw path and only the terminal call knows it. */
+   unsigned primitive_id_verts;
    /* Where each segment of a stippled strip starts along its line, in
     * pixels, from the prefix pass. */
    struct pipe_resource *line_starts;
@@ -2487,6 +2492,20 @@ struct gex_wgpu_shader {
    /* Any interpolateAtOffset whose offset is not the current sample, which
     * WGSL cannot express and gex_wgpu_lower_interp_at_offset serves. */
    bool reads_interp_offset;
+   /* This fragment shader reads gl_PrimitiveID.
+    *
+    * WGSL has no primitive id at all, so ntv's BuiltIn PrimitiveId reaches
+    * Tint as "unknown SPIR-V builtin: 7" and the module is refused -- at
+    * *link* time, so a program using it does not run. That is the severe
+    * shape: not a wrong pixel, an application that will not start.
+    *
+    * Carried as an ordinary flat varying instead, on a location both stages
+    * agree on, exactly as reads_clip_dist and gl_PointCoord are. Which stage
+    * *writes* it depends on the draw -- an emulated geometry or tessellation
+    * stage computes the primitive number exactly and can hand it over, and a
+    * plain draw derives it from the vertex index -- so the base module is
+    * suppressed and the variant is built once the location is known. */
+   bool reads_primitive_id;
    /* Vertex stage: where this shader's clip-distance carriers were emitted,
     * and how many distances they hold. Chosen from *this shader's own*
     * outputs at creation time, which is what lets them be written before
@@ -2589,6 +2608,12 @@ struct gex_wgpu_interp_variant {
     * interpolateAtOffset, or ~0u when it writes none; see
     * gex_wgpu_inv_w_location. */
    unsigned inv_w_location;
+   /* The location this variant carries gl_PrimitiveID on, or ~0u. Part of
+    * the key for the same reasons: both stages derive it from the context,
+    * and a different location is a different module. The vertex side also
+    * bakes in the divisor, which is the topology's vertices per primitive. */
+   unsigned primitive_id_location;
+   unsigned primitive_id_verts;
    uint8_t interp[GEX_WGPU_MAX_VARYING_LOCATIONS];
    uint8_t aux[GEX_WGPU_MAX_VARYING_LOCATIONS];
    /* The fragment stage's varying widths this module was reshaped to. */
@@ -2659,6 +2684,8 @@ struct gex_wgpu_shader_variant {
     * carriers are: both stages agree on it from the context, and a different
     * location is a different module. */
    unsigned inv_w_location;
+   unsigned primitive_id_location;
+   unsigned primitive_id_verts;
    /* The logic op this variant applies, plus one, or zero for none. Part of
     * the key because the operation is compiled into the shader. */
    uint8_t logicop;
@@ -7944,6 +7971,141 @@ gex_wgpu_inv_w_location(const struct gex_wgpu_context *ctx)
        !gex_wgpu_free_varying_locations(ctx, carriers + 1u, slots))
       return ~0u;
    return slots[carriers];
+}
+
+/* Where the primitive id rides, and how many vertices make a primitive.
+ *
+ * WGSL has no primitive id, and the slot GL names for it is no help either:
+ * VARYING_SLOT_PRIMITIVE_ID becomes @location(26) under ntv's rule, past
+ * every adapter's inter-stage ceiling. So it is relocated onto an ordinary
+ * flat varying that both stages compute the same way, which is what
+ * gl_PointCoord and the clip-distance carriers already do.
+ *
+ * The index convention is the same one gex_wgpu_inv_w_location follows: the
+ * clip carriers take the first `carriers` slots, interpolateAtOffset's 1/w
+ * takes the next, and this takes the one after. Asking for all of them at
+ * once is what keeps two features that are both in use off the same slot.
+ *
+ * `verts` is where the value comes from. For a *list* topology every vertex
+ * of a primitive shares `vertex_index / verts`, so the vertex shader can
+ * derive it with a divide and no help. A strip cannot: its vertex n belongs
+ * to primitives n-2, n-1 and n, so no function of one vertex names one
+ * primitive. Nor can an *indexed* draw, where WebGPU hands the vertex stage
+ * the index *value* rather than a sequence number -- two primitives sharing a
+ * vertex would disagree about which they belong to. Both of those go through
+ * the emulated geometry stage instead, which computes the number exactly for
+ * every topology; this returns 0 for them and the caller decides. */
+static unsigned
+gex_wgpu_primitive_id_location(const struct gex_wgpu_context *ctx)
+{
+   if (!ctx->fs || !ctx->fs->reads_primitive_id)
+      return ~0u;
+   const unsigned carriers = ctx->vs ? ctx->vs->clip_carrier_count : 0u;
+   const bool inv_w = ctx->fs->reads_interp_offset;
+   unsigned slots[4] = {0, 0, 0, 0};
+   const unsigned want = carriers + (inv_w ? 1u : 0u) + 1u;
+   if (want > ARRAY_SIZE(slots) ||
+       !gex_wgpu_free_varying_locations(ctx, want, slots))
+      return ~0u;
+   return slots[want - 1u];
+}
+
+/* Vertices per primitive for a topology whose primitive number a single
+ * vertex can name, or 0. */
+static unsigned
+gex_wgpu_primitive_id_verts(enum mesa_prim mode)
+{
+   switch (mode) {
+   case MESA_PRIM_POINTS:    return 1;
+   case MESA_PRIM_LINES:     return 2;
+   case MESA_PRIM_TRIANGLES: return 3;
+   default:                  return 0;
+   }
+}
+
+/* The fragment half: gl_PrimitiveID becomes a flat integer input at the
+ * agreed location.
+ *
+ * Both shapes it arrives in. GLSL gives it as an input *variable* at
+ * VARYING_SLOT_PRIMITIVE_ID -- which is what ntv decorates BuiltIn
+ * PrimitiveId and so what Tint refuses -- while a shader that has been
+ * through nir_lower_system_values has the intrinsic instead. Handling only
+ * one of them would leave the other to be refused, which is the trap
+ * gl_SamplePosition set: see reads_sample_pos. */
+static bool
+gex_wgpu_relocate_primitive_id_instr(nir_builder *b,
+                                     nir_intrinsic_instr *intr, void *data)
+{
+   nir_variable *input = data;
+   if (intr->intrinsic != nir_intrinsic_load_primitive_id)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_load_var(b, input));
+   return true;
+}
+
+static bool
+gex_wgpu_relocate_primitive_id(nir_shader *nir, unsigned location)
+{
+   nir_variable *input = NULL;
+   /* The declared variable, relocated in place -- its reads are already
+    * derefs of it, so nothing else has to change. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+      if (var->data.location != VARYING_SLOT_PRIMITIVE_ID)
+         continue;
+      var->data.location = VARYING_SLOT_VAR0 + location;
+      var->data.driver_location = location;
+      var->data.interpolation = INTERP_MODE_FLAT;
+      input = var;
+   }
+   if (!input) {
+      input = nir_variable_create(nir, nir_var_shader_in, glsl_int_type(),
+                                  "gex_primitive_id");
+      input->data.location = VARYING_SLOT_VAR0 + location;
+      input->data.driver_location = location;
+      input->data.interpolation = INTERP_MODE_FLAT;
+   }
+   const bool any =
+      nir_shader_intrinsics_pass(nir, gex_wgpu_relocate_primitive_id_instr,
+                                 nir_metadata_control_flow, input) ||
+      input->data.location == VARYING_SLOT_VAR0 + location;
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   return any;
+}
+
+/* The vertex half: write `gl_VertexID / verts` to the same location, flat.
+ *
+ * Only sound for a list topology on a de-indexed draw, which is the caller's
+ * business -- see gex_wgpu_primitive_id_verts. The provoking-vertex rewrite
+ * does not disturb it: that rewrite permutes vertices *within* a primitive so
+ * a flat varying takes GL's last-vertex value, and a rotation inside a group
+ * of `verts` leaves the quotient alone. */
+static bool
+gex_wgpu_emit_primitive_id(nir_shader *nir, unsigned location, unsigned verts)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl || !verts)
+      return false;
+   nir_variable *out = nir_variable_create(nir, nir_var_shader_out,
+                                           glsl_int_type(),
+                                           "gex_primitive_id");
+   out->data.location = VARYING_SLOT_VAR0 + location;
+   out->data.driver_location = location;
+   out->data.interpolation = INTERP_MODE_FLAT;
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   /* The full form, not the zero-based one: the screen's nir_options do not
+    * ask for vertex_id_zero_based, so this is the intrinsic the rest of the
+    * driver produces and lowers -- notably the wide-point expansion, which
+    * rewrites it to the instance index. That rewrite is *correct* here too: an
+    * expanded point draw is six vertices by N instances, and the point's own
+    * number is the instance. */
+   nir_def *id = nir_load_vertex_id(&b);
+   if (verts > 1)
+      id = nir_udiv_imm(&b, id, verts);
+   nir_store_var(&b, out, id, 0x1);
+   nir_progress(true, impl, nir_metadata_none);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   return true;
 }
 
 /* interpolateAtOffset, which WGSL does not have.
@@ -13435,16 +13597,14 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * which is the correct trade for a feature this rare, and it reuses
     * machinery that is already tested rather than adding a derivation with
     * subtleties of its own. Worth doing when something real asks. */
-   if (expected_stage == MESA_SHADER_FRAGMENT &&
-       (nir->info.inputs_read & BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_ID))) {
-      gex_wgpu_set_compile_error(
-         mutable_state,
-         "gex_wgpu cannot read gl_PrimitiveID in a fragment shader (WGSL has "
-         "no primitive id; serving it means routing the draw through the "
-         "geometry stage, which already computes one)");
-      ralloc_free(nir);
-      return NULL;
-   }
+   /* Noted, not refused. What used to be here was a refusal by name, and it
+    * was honest about the platform but wrong about GL: the shader is legal,
+    * so failing the link is a claim GL does not make, and it killed the
+    * process. gex_wgpu_relocate_primitive_id carries it on a varying
+    * instead. */
+   const bool fs_reads_primitive_id =
+      expected_stage == MESA_SHADER_FRAGMENT &&
+      (nir->info.inputs_read & BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_ID));
    /* Before the lowering below, which is keyed on a constant block number. */
    gex_wgpu_lower_dynamic_ubo_index(nir, GEX_WGPU_MAX_CONSTANT_BUFFERS);
    {
@@ -13753,6 +13913,9 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       }
       if (shader->reads_clip_dist)
          shader->clip_dist_count = MIN2(shader->clip_dist_count, 8u);
+      /* Noted above from inputs_read; recorded here with its siblings,
+       * because it suppresses the base module for the same reason they do. */
+      shader->reads_primitive_id = fs_reads_primitive_id;
       /* And any interpolateAtOffset the sample lowering will not take: WGSL
        * has no such builtin, so this shader has no base module and is served
        * by gex_wgpu_lower_interp_at_offset in the variant. */
@@ -14646,7 +14809,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       (shader->integer_sampled_slots != 0 || shader->buftex_count != 0 ||
        shader->unformatted_images != 0 || shader->reads_sample_pos ||
        shader->ms_array_slots != 0 ||
-       shader->reads_clip_dist || shader->reads_interp_offset) &&
+       shader->reads_clip_dist || shader->reads_interp_offset ||
+       shader->reads_primitive_id) &&
       (expected_stage == MESA_SHADER_FRAGMENT ||
        expected_stage == MESA_SHADER_VERTEX);
    if (deferred_integer_sampling)
@@ -15503,7 +15667,28 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * vertex side derives the same pair from the same context, which is what
     * lets the two agree without either being told about the other. Zero
     * count means the shader does not read them and nothing changes. */
+   /* Where gl_PrimitiveID rides, and who writes it.
+    *
+    * A draw with an emulated geometry or tessellation stage has that stage
+    * compute the primitive number exactly, for every topology; a plain draw
+    * derives it in the vertex shader, which only a list topology on a
+    * de-indexed draw allows. `want_pid_verts` is zero in the first case and
+    * the vertices per primitive in the second, and it is part of the vertex
+    * variant's key rather than the fragment one's -- the fragment stage reads
+    * a flat integer from a location and does not care where it came from. */
+   const unsigned want_pid = gex_wgpu_primitive_id_location(ctx);
    const unsigned want_inv_w = gex_wgpu_inv_w_location(ctx);
+   if (fs->reads_primitive_id && want_pid == ~0u) {
+      /* Said, because this shader has no base module either: without a
+       * variant the draw disappears with no message at all. */
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: fragment shader declined (no free varying "
+                 "location to carry gl_PrimitiveID)\n");
+      }
+      return NULL;
+   }
    if (fs->reads_interp_offset && want_inv_w == ~0u) {
       /* Said, because this shader has no base module: without a variant the
        * draw disappears with no message at all. */
@@ -15558,15 +15743,31 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * another and would zero it. */
    if (line_edge_location != ~0u)
       produced |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + line_edge_location);
+   /* The primitive-id carrier has a producer exactly when the draw's topology
+    * lets the vertex stage derive it. */
+   if (want_pid != ~0u && ctx->primitive_id_verts)
+      produced |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + want_pid);
    uint64_t unproduced = 0;
    if (ctx->vs && fs->original_nir) {
       nir_foreach_shader_in_variable(var, fs->original_nir) {
          if (!gex_wgpu_is_location_varying(var->data.location) ||
              var->data.location >= GEX_WGPU_MAX_VARYING_LOCATIONS)
             continue;
+         /* Not gl_PrimitiveID: no vertex shader writes that slot, so it would
+          * always read as unproduced -- and the variant does not have an
+          * input there any more, it has the relocated carrier below. */
+         if (var->data.location == VARYING_SLOT_PRIMITIVE_ID)
+            continue;
          if (!(produced & BITFIELD64_BIT(var->data.location)))
             unproduced |= BITFIELD64_BIT(var->data.location);
       }
+      /* The carrier, when this draw's topology cannot supply it. Zeroing it
+       * is the honest answer and is what makes gl_PrimitiveID read 0 for an
+       * indexed or strip draw rather than reading whatever the location held.
+       * The refusal this replaced avoided the wrong value by refusing to run
+       * the program at all. */
+      if (want_pid != ~0u && !ctx->primitive_id_verts)
+         unproduced |= BITFIELD64_BIT(VARYING_SLOT_VAR0 + want_pid);
    }
 
    /* glPolygonStipple, applied as a discard against the pattern -- and only
@@ -15629,7 +15830,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
        line_edge_location == ~0u && !fs->buftex_count &&
        !want_sample_positions && !want_clip_dist && !want_logicop &&
        !want_ignore_sample_mask && !want_drop_color &&
-       !fs->reads_interp_offset &&
+       !fs->reads_interp_offset && !fs->reads_primitive_id &&
        !want_omit_slots && !want_demote_ms && !want_tiled_ms &&
        !fs->ms_array_slots && !want_frag_tile_x && !want_query_only &&
        !want_offset_clamp &&
@@ -15742,7 +15943,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       want_point_smooth || line_edge_location != ~0u ||
       want_sample_positions != 0 || want_clip_dist != 0 || want_logicop != 0 ||
       want_ignore_sample_mask || want_drop_color ||
-      fs->reads_interp_offset || want_omit_slots != 0 ||
+      fs->reads_interp_offset || fs->reads_primitive_id ||
+      want_omit_slots != 0 ||
       want_demote_ms != 0 || want_tiled_ms != 0 || fs->ms_array_slots != 0 ||
       want_frag_tile_x != 0 || want_query_only != 0 || want_offset_clamp ||
       fs->unformatted_images != 0;
@@ -15761,6 +15963,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->sample_positions_for == want_sample_positions &&
                    cached->clip_dist_for == want_clip_dist &&
                    cached->inv_w_location == want_inv_w &&
+                   cached->primitive_id_location == want_pid &&
                    cached->clip_carrier[0] == clip_carrier[0] &&
                    cached->clip_carrier[1] == clip_carrier[1] &&
                    cached->logicop == want_logicop &&
@@ -15849,6 +16052,18 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    if (point_coord_location != ~0u)
       gex_wgpu_lower_point_coord_varying(variant, point_coord_location,
                                          sprite_locations);
+   /* Before the unproduced-input drop, deliberately.
+    *
+    * The drop zeroes an input no bound vertex shader writes, and that is
+    * exactly the behaviour wanted when nothing can derive the primitive id
+    * for this draw: the shader reads 0. Relocating first is what lets the
+    * fallback come out of machinery that already exists rather than a second
+    * mechanism -- and relocating *after* would have been worse than merely
+    * late, because the drop would have replaced the reads with a constant
+    * while the input was still at VARYING_SLOT_PRIMITIVE_ID, so the id would
+    * read 0 even on the draws that can supply it. */
+   if (want_pid != ~0u)
+      gex_wgpu_relocate_primitive_id(variant, want_pid);
    if (unproduced)
       gex_wgpu_drop_unproduced_inputs(variant, produced, sprite_locations);
    if (want_point_smooth)
@@ -15992,6 +16207,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->sample_positions_for = want_sample_positions;
    cached->clip_dist_for = want_clip_dist;
    cached->inv_w_location = want_inv_w;
+   cached->primitive_id_location = want_pid;
    cached->clip_carrier[0] = clip_carrier[0];
    cached->clip_carrier[1] = clip_carrier[1];
    cached->logicop = want_logicop;
@@ -35971,7 +36187,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
     * -- so `plain` is NULL and returning it drops the draw with no message. */
    if (!differs && !fold_viewport && !unpack_attribs && !lower_textures &&
        !wide && !has_buftex && !vs->ms_array_slots &&
-       !vs->query_only_slots)
+       !vs->query_only_slots && !ctx->primitive_id_verts)
       return plain;
 
    /* The identity fold, matching gex_wgpu_lower_viewport_transform's use of
@@ -35988,6 +36204,12 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       want_clip_dist = fs->clip_dist_count;
    /* The same answer the fragment side computes, from the same context. */
    const unsigned want_inv_w = gex_wgpu_inv_w_location(ctx);
+   /* And the same for gl_PrimitiveID, with the divisor the draw path decided
+    * from the final topology. Both are needed: the location has to match the
+    * fragment side and the divisor is baked into the shader. */
+   const unsigned want_pid_verts = ctx->primitive_id_verts;
+   const unsigned want_pid =
+      want_pid_verts ? gex_wgpu_primitive_id_location(ctx) : ~0u;
    const uint8_t *want_interp = fs ? fs->varying_interp : NULL;
    const uint8_t *want_aux = fs ? fs->varying_aux : NULL;
    const uint8_t *want_components = fs ? fs->varying_components : NULL;
@@ -35999,6 +36221,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       bool match = v->mask == fs_mask && v->sampler_mask == sampler_mask &&
                    v->clip_dist_for == want_clip_dist &&
                    v->inv_w_location == want_inv_w &&
+                   v->primitive_id_location == want_pid &&
+                   v->primitive_id_verts == want_pid_verts &&
                     v->clip_carrier[0] == want_clip_carrier[0] &&
                     v->clip_carrier[1] == want_clip_carrier[1] &&
                     memcmp(v->buftex_words, want_buftex,
@@ -36101,6 +36325,11 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
        * it divides is the w the pipeline actually rasterises with. */
       if (want_inv_w != ~0u)
          gex_wgpu_emit_inv_w(clone, want_inv_w);
+      /* And the primitive id, after the varying fit for the same reason 1/w
+       * is: the fit trims outputs to the widths the fragment shader reads and
+       * this one is not in that table. */
+      if (want_pid != ~0u)
+         gex_wgpu_emit_primitive_id(clone, want_pid, want_pid_verts);
       /* Before the viewport fold, which is what makes the offset's scale a
        * viewport rather than a framebuffer one -- see
        * gex_wgpu_lower_wide_point. */
@@ -36230,6 +36459,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    }
    variant->clip_dist_for = want_clip_dist;
    variant->inv_w_location = want_inv_w;
+   variant->primitive_id_location = want_pid;
+   variant->primitive_id_verts = want_pid_verts;
    variant->clip_carrier[0] = want_clip_carrier[0];
    variant->clip_carrier[1] = want_clip_carrier[1];
    variant->next = vs->interp_variants;
@@ -42524,6 +42755,20 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * their declaration; their bindings must be left out of the group too. */
    uint16_t omitted_texture_slots = 0;
    uint16_t demoted_ms_slots = 0;
+   /* Who derives gl_PrimitiveID for this draw, decided here because this is
+    * where the topology is final: the strip and unsupported-topology rewrites
+    * re-enter this function, so an earlier answer would describe the
+    * application's draw rather than the one about to be recorded.
+    *
+    * A list topology on a de-indexed draw is the only shape a vertex shader
+    * can derive it from -- see gex_wgpu_primitive_id_verts. Zero means the
+    * fragment stage's carrier has no producer, which
+    * gex_wgpu_drop_unproduced_inputs then zeroes: gl_PrimitiveID reads 0,
+    * which is wrong but is a wrong pixel rather than a dead process, and is
+    * what the refusal this replaced gave up the whole program to avoid. */
+   ctx->primitive_id_verts =
+      (ctx->fs && ctx->fs->reads_primitive_id && !info->index_size)
+         ? gex_wgpu_primitive_id_verts(info->mode) : 0u;
    const WGPUPrimitiveTopology fs_topology = gex_wgpu_topology(info->mode);
    fragment.module = gex_wgpu_fragment_module(
       ctx, fs_topology == WGPUPrimitiveTopology_PointList,
