@@ -10225,6 +10225,12 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    const struct ntv_info info = {
       .is_native_vulkan = true,
       .omit_fragment_output_index_zero = !dual_source_output,
+      /* All eight KHR-GL45.shaders.struct.local.{basic,nested}_{not_,}equal
+       * cases failed on this and nothing else. Comparing two structs whose
+       * members hold the same values leaves CSE with one SSA value on both
+       * sides of the member comparison, ntv recognises `x != x` as a NaN test
+       * and emits OpIsNan -- which WGSL has no builtin for. */
+      .avoid_spv_isnan = true,
       .avoid_spv_khr_fma = true,
       /* WGSL's sample_mask builtin is a scalar, so the single-element array
        * Vulkan wants stored into gl_SampleMask cannot be assigned to it. */

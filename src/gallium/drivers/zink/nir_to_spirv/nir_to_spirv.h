@@ -59,6 +59,15 @@ struct ntv_info {
    /* WebGPU's SPIR-V ingest rejects SPV_KHR_fma.  Use the equivalent core
     * GLSL.std.450 Fma extended instruction for nir_op_ffma instead. */
    bool avoid_spv_khr_fma;
+   /* Never emit OpIsNan.  WGSL has no isNan builtin -- it was removed from
+    * the language -- and Tint's reader turns the instruction into a call to
+    * one anyway, so the module is rejected with "unresolved call target
+    * 'isNan'".  The comparisons below that emit it are an optimisation, not a
+    * semantic requirement: an *ordered* float comparison is already false
+    * when either operand is NaN, so OpFOrdEqual(x, x) is exactly !isnan(x)
+    * and OpFUnordNotEqual(x, x) is exactly isnan(x).  Taking the general path
+    * costs one instruction and says the same thing. */
+   bool avoid_spv_isnan;
    /* Store gl_SampleMask as a scalar rather than constructing the
     * single-element array Vulkan mandates.
     *

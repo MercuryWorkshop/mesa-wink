@@ -2350,7 +2350,7 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
 
    case nir_op_fneu:
       assert(nir_op_infos[alu->op].num_inputs == 2);
-      if (raw_src[0] == raw_src[1])
+      if (raw_src[0] == raw_src[1] && !ctx->sinfo->avoid_spv_isnan)
          result =  emit_unop(ctx, SpvOpIsNan, dest_type, src[0]);
       else
          result = emit_binop(ctx, SpvOpFUnordNotEqual, dest_type, src[0], src[1]);
@@ -2358,7 +2358,7 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
 
    case nir_op_feq:
       assert(nir_op_infos[alu->op].num_inputs == 2);
-      if (raw_src[0] == raw_src[1])
+      if (raw_src[0] == raw_src[1] && !ctx->sinfo->avoid_spv_isnan)
          result =  emit_unop(ctx, SpvOpLogicalNot, dest_type,
                              emit_unop(ctx, SpvOpIsNan, dest_type, src[0]));
       else
