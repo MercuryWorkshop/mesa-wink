@@ -45670,8 +45670,27 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
       /* Only the *fragment* stage's inputs are an inter-stage interface. A
        * vertex shader's inputs are vertex attributes, which WebGPU caps at
        * sixteen and this driver does not raise; the rest read a buffer. */
+      /* The *control* shader's inputs are a buffer at both ends too, and had
+       * been left on the rasterized count with the stages that really are
+       * rasterized. They come from the vertex shader's capture buffer, which
+       * the vertex stage writes as a compute pass -- there is no attribute
+       * slot anywhere in that path. At 29 locations st reported
+       * GL_MAX_TESS_CONTROL_INPUT_COMPONENTS as 116 and GL 4.0 requires 128,
+       * which is KHR-GL45.limits.max_tess_control_input_components.
+       *
+       * The vertex stage's *output* limit stays where it is, and the two do
+       * not have to agree: a vertex shader may be rasterized instead, so its
+       * outputs are bounded by the inter-stage count whether or not a control
+       * shader is bound. GL keeps the producer's and consumer's limits
+       * separate for exactly that reason.
+       *
+       * The geometry stage's inputs read the same buffer and could be raised
+       * on the same grounds; they are not, because GL asks for 64 there and
+       * this already reports 116. Nothing is gained by moving a limit that is
+       * already met. */
       caps->max_inputs =
          stages[i] == MESA_SHADER_TESS_EVAL   ? GEX_WGPU_MAX_VARYINGS
+         : stages[i] == MESA_SHADER_TESS_CTRL ? GEX_WGPU_MAX_VARYINGS
          : stages[i] == MESA_SHADER_FRAGMENT  ? screen->max_inter_stage
                                               : screen->max_raster_varyings;
       /* st/mesa reports MaxGeometryOutputComponents as four times this, and
