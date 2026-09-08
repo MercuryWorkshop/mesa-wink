@@ -25773,13 +25773,25 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
                     util_format_short_name(info->src.format));
          }
       }
-      /* Declined, not latched. gex_wgpu_resolve already names what it could
-       * not do -- a format pair, a level -- and the destination simply keeps
-       * what it held. Latching turned that into GL_OUT_OF_MEMORY from the
-       * next glReadPixels, which dEQP treats as fatal: it is what ended the
+      /* WebGPU's resolve is narrow: one level, matching formats, and no
+       * integer format at all, because averaging samples is what a resolve is
+       * and there is no defined average of two integers. What it cannot do,
+       * u_blitter can -- a textured draw that fetches the samples itself --
+       * and it already implements GL's rule for the integer case, which is to
+       * copy sample zero rather than average. So a refusal falls through to a
+       * draw instead of leaving the destination holding whatever it had.
+       *
+       * That silent keeping is what KHR-GL45.framebuffer_blit's
+       * multisampled_to_singlesampled_blit_color_config_test saw: a resolve
+       * from r8_unorm to b8g8r8a8_unorm, refused for the format pair.
+       *
+       * Still declined rather than latched if the draw cannot be built
+       * either. Latching turned that into GL_OUT_OF_MEMORY from the next
+       * glReadPixels, which dEQP treats as fatal: it is what ended the
        * mustpass run at framebuffer_blit, 864 cases in. */
-      (void)gex_wgpu_resolve(pipe, info->dst.resource, info->dst.level,
-                             info->src.resource, info->src.level);
+      if (!gex_wgpu_resolve(pipe, info->dst.resource, info->dst.level,
+                            info->src.resource, info->src.level))
+         gex_wgpu_blit_with_blitter(ctx, info);
       return;
    }
 
