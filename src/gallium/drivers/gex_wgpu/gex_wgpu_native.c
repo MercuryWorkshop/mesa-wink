@@ -293,9 +293,14 @@ create_device(void)
        * direct_state_access.vertex_arrays_enable_disable_attributes is that.
        * The usual suspicion -- see the note about asking for limits -- does
        * not apply here. */
-      GEX_WANT(maxStorageBuffersPerShaderStage, 16);
-      GEX_WANT(maxStorageBuffersInVertexStage, 16);
-      GEX_WANT(maxStorageBuffersInFragmentStage, 16);
+      /* 24 is GEX_WGPU_MAX_SHADER_BUFFERS, this driver's own array bound.
+       * This adapter still grants ten -- measured, and its own maximum as the
+       * note above says -- but the browser's granted exactly the sixteen it
+       * was asked for while a shader wanted seventeen, so the ask was the
+       * constraint there and not the adapter. */
+      GEX_WANT(maxStorageBuffersPerShaderStage, 24);
+      GEX_WANT(maxStorageBuffersInVertexStage, 24);
+      GEX_WANT(maxStorageBuffersInFragmentStage, 24);
       /* Storage *textures*, which WebGPU defaults to four per stage where
        * GL 4.2 asks for eight image uniforms. Dawn says so itself when a
        * shader wants more --
@@ -319,7 +324,11 @@ create_device(void)
       /* Eight RGBA8 draw buffers is exactly WebGPU's default 32 bytes per
        * sample, so GL 3.2's eight draw buffers of any wider format fails on
        * it. */
-      GEX_WANT(maxColorAttachmentBytesPerSample, 64);
+      /* GL's worst case, not WebGPU's next tier up: eight draw buffers of
+       * RGBA32F is 128 bytes per sample. GEX_WANT clamps to what the adapter
+       * offers, so asking for the requirement costs nothing where it is not
+       * available -- this adapter grants 32 either way. */
+      GEX_WANT(maxColorAttachmentBytesPerSample, 128);
       /* Compute, because a *granted* limit of 256 is what st/mesa reads and
        * ARB_compute_shader wants 1024 -- GL 4.3 requires
        * MAX_COMPUTE_WORK_GROUP_INVOCATIONS to be at least that. WebGPU's
