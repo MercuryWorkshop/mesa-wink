@@ -13006,6 +13006,42 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          ralloc_free(nir);
       return NULL;
    }
+   /* gl_PrimitiveID in a fragment shader, refused by name.
+    *
+    * WGSL has no primitive id at all, so ntv's `BuiltIn PrimitiveId` reaches
+    * Tint as "unknown SPIR-V builtin: 7" -- an opaque message plus a hex dump
+    * naming nothing, which is what the six fragment cases of
+    * KHR-GL45.shader_image_size read as. The outcome is the same either way
+    * (the shader does not compile); this only makes the log say which GL
+    * feature is missing.
+    *
+    * The right fix is *not* to derive it in the vertex shader from
+    * @builtin(vertex_index). That works only for a non-indexed draw -- WebGPU
+    * gives an indexed draw the index *value* there, not a sequence number --
+    * and it collides with the provoking-vertex machinery, which rewrites the
+    * index list precisely so flat varyings take GL's last-vertex value, so
+    * the sequence number a derivation depends on is not stable under it.
+    *
+    * The right fix is to route such a draw through the geometry stage. That
+    * emulation already computes the primitive number exactly, for every
+    * topology and for indexed draws (see gex_wgpu_gs_builtin), so serving
+    * this means generating a passthrough geometry shader that writes
+    * gl_PrimitiveIDIn into VARYING_SLOT_PRIMITIVE_ID and carrying that slot
+    * through the passthrough vertex shader -- it is excluded from the varying
+    * collection today. It costs the whole compute-emulated path for the draw,
+    * which is the correct trade for a feature this rare, and it reuses
+    * machinery that is already tested rather than adding a derivation with
+    * subtleties of its own. Worth doing when something real asks. */
+   if (expected_stage == MESA_SHADER_FRAGMENT &&
+       (nir->info.inputs_read & BITFIELD64_BIT(VARYING_SLOT_PRIMITIVE_ID))) {
+      gex_wgpu_set_compile_error(
+         mutable_state,
+         "gex_wgpu cannot read gl_PrimitiveID in a fragment shader (WGSL has "
+         "no primitive id; serving it means routing the draw through the "
+         "geometry stage, which already computes one)");
+      ralloc_free(nir);
+      return NULL;
+   }
    /* Before the lowering below, which is keyed on a constant block number. */
    gex_wgpu_lower_dynamic_ubo_index(nir, GEX_WGPU_MAX_CONSTANT_BUFFERS);
    {
