@@ -1669,6 +1669,12 @@ struct gex_wgpu_context {
     * something it converts again -- which is unbounded recursion on a 16 MiB
     * host stack, and a host stack overflow aborts the wasm module and costs
     * every case after it. Bounded, it costs the one draw and says so. */
+   /* The nesting depth at which an indirect resolution is reissuing the
+    * application's own draws, or ~0u when none is. See the draw-parameter
+    * capture: a reissued indirect command is not a split of an outer draw,
+    * it is a draw the application asked for that happens to arrive one level
+    * down, and its base vertex, base instance and draw id are its own. */
+   unsigned indirect_resolve_at;
    /* Where this pass's layer of a tiled multisampled array begins, in pixels
     * from the left of the wide texture that holds all of them. Zero for every
     * ordinary framebuffer, which is every framebuffer that is not a
@@ -39207,13 +39213,28 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
     *
     * draw_depth is already the "as the application issued it" test used by
     * the bisection above, so it serves here too. */
-   if (ctx->draw_depth == 0 && info && draws) {
+   /* The outermost draw, or one being reissued by an indirect resolution.
+    *
+    * The depth test alone was wrong for the second case, and
+    * KHR-GL45.shader_draw_parameters_tests' four MultiDraw*Indirect* cases
+    * are exactly that: glMultiDrawArraysIndirect with a baseInstance of 1 in
+    * its third command drew at the same place as its second, because
+    * gl_BaseInstance stayed 0 for every command. util_draw_indirect reissues
+    * each command as an ordinary draw one level down, where the guard refused
+    * to look at it -- `nesting-depth-is-not-the-invariant` for the second
+    * time, in a different feature.
+    *
+    * Only that one level: a restart or multi-draw split *inside* a reissued
+    * command is still a split, and must keep the values the command set. */
+   const bool own_draw_params =
+      ctx->draw_depth == 0 || ctx->draw_depth == ctx->indirect_resolve_at;
+   if (own_draw_params && info && draws) {
       ctx->draw_base_vertex = info->index_size ? (uint32_t)draws[0].index_bias
                                                : 0u;
       ctx->draw_first_vertex = info->index_size
          ? (uint32_t)draws[0].index_bias : draws[0].start;
    }
-   if (ctx->draw_depth == 0 && info)
+   if (own_draw_params && info)
       ctx->draw_base_instance = info->start_instance;
    /* A divisor above one is de-interleaved for the length of the draw, once:
     * the restart and multi-draw splits re-enter here, and expanding an
@@ -39846,7 +39867,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       GEX_DRAW_DROP();
    }
    if (indirect && info && !ctx->failed) {
+      /* The reissued commands land one level down and carry their own draw
+       * parameters; see own_draw_params. Saved and restored so a nested
+       * resolution -- which util_draw_indirect does not do today -- could not
+       * lose the outer one. */
+      const unsigned saved_resolve_at = ctx->indirect_resolve_at;
+      ctx->indirect_resolve_at = ctx->draw_depth;
       util_draw_indirect(pipe, info, drawid_offset, indirect);
+      ctx->indirect_resolve_at = saved_resolve_at;
       GEX_DRAW_DROP();
    }
 
@@ -44026,6 +44054,10 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    }
    (void)flags;
    struct gex_wgpu_context *ctx = CALLOC_STRUCT(gex_wgpu_context);
+   /* Explicit rather than relying on calloc's zero, which happens to work
+    * only because draw_depth is also zero there. */
+   if (ctx)
+      ctx->indirect_resolve_at = ~0u;
    if (!ctx)
       return NULL;
    ctx->base.screen = screen;
