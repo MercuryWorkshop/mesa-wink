@@ -1096,7 +1096,9 @@ emit_output(struct ntv_context *ctx, struct nir_variable *var)
        * while, produced a module byte-identical to the one it was meant to
        * differ from. A consumer that needs the two stages to agree about
        * interpolation sampling, as WebGPU does, cannot be satisfied through
-       * SPIR-V and has to give the qualifier up on the fragment side. */
+       * SPIR-V at all; gex_wgpu writes the agreement into the WGSL text after
+       * Tint instead, which is why the qualifier no longer has to be given up
+       * on the fragment side. */
    } else {
       if (var->data.location >= FRAG_RESULT_DATA0) {
          spirv_builder_emit_location(&ctx->builder, var_id,

@@ -9530,6 +9530,399 @@ gex_wgpu_split_64bit_undef(nir_shader *nir)
    return any;
 }
 
+/* interpolateAtSample(v, gl_SampleID) and
+ * interpolateAtOffset(v, gl_SamplePosition - 0.5), both served as a plain
+ * per-sample read of v.
+ *
+ * Neither reaches WGSL as a function: Tint refuses the GLSL.std.450
+ * instructions ntv emits for them ("unhandled GLSL.std.450 instruction 77"
+ * and 78), and WGSL has no interpolation builtins to lower them onto. What it
+ * does have is `@interpolate(perspective, sample)`, which makes an ordinary
+ * read of the varying *be* the value at the current sample -- so the two
+ * forms above are exactly expressible, with no approximation, whenever their
+ * second argument names the sample being shaded.
+ *
+ * That both forms mean the same thing is worth spelling out, because the
+ * offset one does not look like it. gl_SamplePosition is the sample's
+ * position within the pixel with the lower-left corner at zero, so
+ * `gl_SamplePosition - 0.5` is its offset from the centre -- which is what
+ * interpolateAtOffset measures from. Interpolating at that offset is
+ * interpolating at that sample. The CTS writes both, and llvmpipe returns
+ * byte-identical values for them and for a `sample`-qualified varying, which
+ * is what gl44-sample-interp-probe pins.
+ *
+ * Any other second argument is left alone and refused downstream by name. An
+ * arbitrary sample index or offset is a genuinely different operation and
+ * substituting the current sample for it would be the kind of nearest-shape
+ * guess that reads as a wrong picture rather than a missing feature.
+ *
+ * The qualifier belongs to the *variable*, not the read, so it can only be
+ * set when every read of that variable is one of these two forms. A shader
+ * that also reads the varying plainly would have that read silently promoted
+ * to per-sample, and WGSL cannot give one location two interpolations, so
+ * such a variable is left for the refusal. */
+static bool
+gex_wgpu_def_is_system_value(nir_def *def, gl_system_value want,
+                             nir_intrinsic_op want_intrin)
+{
+   nir_instr *parent = nir_def_instr(def);
+   if (parent->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(parent);
+   if (intr->intrinsic == want_intrin)
+      return true;
+   /* The other shape it arrives in: GLSL gives a system value as a *variable*
+    * in nir_var_system_value, and only nir_lower_system_values turns it into
+    * the intrinsic. Matching one shape and not the other is how the
+    * gl_SamplePosition scan above once came back false for a shader that
+    * plainly read it. */
+   if (intr->intrinsic == nir_intrinsic_load_deref) {
+      nir_variable *var = nir_intrinsic_get_var(intr, 0);
+      return var && var->data.mode == nir_var_system_value &&
+             var->data.location == (int)want;
+   }
+   return false;
+}
+
+/* One component of the offset: gl_SamplePosition[comp] - 0.5. */
+static bool
+gex_wgpu_is_sample_pos_minus_half(nir_def *def, unsigned chan, unsigned comp)
+{
+   nir_instr *parent = nir_def_instr(def);
+   if (parent->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(parent);
+   if (alu->op != nir_op_fadd)
+      return false;
+   for (unsigned i = 0; i < 2; ++i) {
+      const nir_alu_src *p = &alu->src[i];
+      if (!gex_wgpu_def_is_system_value(p->src.ssa, SYSTEM_VALUE_SAMPLE_POS,
+                                        nir_intrinsic_load_sample_pos))
+         continue;
+      /* The component has to be its *own*: an offset built from
+       * gl_SamplePosition.yx is a different offset, and a swizzle is exactly
+       * the sort of thing that would go unnoticed if this only checked that
+       * gl_SamplePosition appeared somewhere. */
+      if (p->swizzle[chan] != comp)
+         continue;
+      const nir_alu_src *k = &alu->src[1 - i];
+      if (nir_src_is_const(k->src) &&
+          nir_src_comp_as_float(k->src, k->swizzle[chan]) == -0.5f)
+         return true;
+   }
+   return false;
+}
+
+/* `gl_SamplePosition - 0.5`, in every component. NIR has no float subtract,
+ * so this is an fadd against -0.5 -- and usually not one fadd but two, since
+ * the GLSL front end scalarises the vector subtract into
+ * `vec2(pos.x - 0.5, pos.y - 0.5)`. Matching only the vector form found
+ * nothing: the diagnostic reported the offset's parent as `vec2`.
+ *
+ * This matcher does not reach the shape st actually delivers, and the reason
+ * is worth writing down rather than rediscovering. st lowers
+ * gl_SamplePosition before the driver sees it: nir_lower_wpos_ytransform's
+ * lower_load_sample_pos replaces it with
+ * `vec2(pos.x, ffma(pos.y, scale, max(neg_scale, 0)))`, where scale and
+ * neg_scale are channels of the gl_FbWposYTransform uniform -- the y flip
+ * between GL's lower-left origin and WebGPU's upper-left. Then
+ * nir_opt_algebraic reassociates the `- 0.5` into that arithmetic: the y
+ * component of the offset arrives with `fmul` outermost, not `fadd`. Matching
+ * it would mean matching the optimiser's output rather than one pass's, which
+ * is not a shape worth depending on.
+ *
+ * So interpolateAtOffset stays declined by name, and the route that would
+ * serve it in *general* is this: carry `v/w` and `1/w` as two
+ * `@interpolate(linear)` varyings, both of which are linear in screen space,
+ * and evaluate either at an arbitrary offset as
+ * `centre + o.x * dpdx + o.y * dpdy`, exactly. The quotient is then the
+ * perspective-correct value at that offset -- exact rather than a first-order
+ * guess, and it serves an arbitrary interpolateAtSample index too. It costs a
+ * second varying slot per varying so read, and it edits the vertex stage,
+ * which is why it is not being done alongside the narrow case above. */
+static bool
+gex_wgpu_def_is_current_sample_offset(nir_def *def)
+{
+   nir_instr *parent = nir_def_instr(def);
+   if (parent->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(parent);
+
+   if (alu->op == nir_op_vec2 || alu->op == nir_op_vec3 ||
+       alu->op == nir_op_vec4) {
+      const unsigned n = nir_op_infos[alu->op].num_inputs;
+      if (n != def->num_components)
+         return false;
+      for (unsigned c = 0; c < n; ++c)
+         if (!gex_wgpu_is_sample_pos_minus_half(alu->src[c].src.ssa,
+                                                alu->src[c].swizzle[0], c))
+            return false;
+      return true;
+   }
+
+   if (alu->op != nir_op_fadd)
+      return false;
+   for (unsigned i = 0; i < 2; ++i) {
+      const nir_alu_src *p = &alu->src[i];
+      if (!gex_wgpu_def_is_system_value(p->src.ssa, SYSTEM_VALUE_SAMPLE_POS,
+                                        nir_intrinsic_load_sample_pos))
+         continue;
+      const nir_alu_src *k = &alu->src[1 - i];
+      if (!nir_src_is_const(k->src))
+         continue;
+      bool exact = true;
+      for (unsigned c = 0; c < def->num_components; ++c)
+         if (p->swizzle[c] != c ||
+             nir_src_comp_as_float(k->src, k->swizzle[c]) != -0.5f)
+            exact = false;
+      if (exact)
+         return true;
+   }
+   return false;
+}
+
+static bool
+gex_wgpu_interp_is_current_sample(nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic == nir_intrinsic_interp_deref_at_sample)
+      return gex_wgpu_def_is_system_value(intr->src[1].ssa,
+                                          SYSTEM_VALUE_SAMPLE_ID,
+                                          nir_intrinsic_load_sample_id);
+   if (intr->intrinsic == nir_intrinsic_interp_deref_at_offset) {
+      if (gex_wgpu_def_is_current_sample_offset(intr->src[1].ssa))
+         return true;
+      if (getenv("GEX_WGPU_INTERP_LOG")) {
+         nir_instr *parent = nir_def_instr(intr->src[1].ssa);
+         fprintf(stderr, "gex-wgpu: interp offset is not the current sample: "
+                 "%s\n", parent->type == nir_instr_type_alu
+                    ? nir_op_infos[nir_instr_as_alu(parent)->op].name
+                    : "not an ALU result");
+      }
+      return false;
+   }
+   return false;
+}
+
+#define GEX_WGPU_SAMPLE_INTERP_VARS 64
+
+static bool
+gex_wgpu_lower_sample_interp(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+
+   nir_variable *vars[GEX_WGPU_SAMPLE_INTERP_VARS];
+   unsigned convertible[GEX_WGPU_SAMPLE_INTERP_VARS] = {0};
+   unsigned blocking[GEX_WGPU_SAMPLE_INTERP_VARS] = {0};
+   unsigned var_count = 0;
+
+   /* Classify every read of every input first. Rewriting as we went would
+    * commit to the qualifier before knowing whether a later plain read of the
+    * same variable rules it out. */
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            bool reads_input;
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_deref:
+            case nir_intrinsic_interp_deref_at_centroid:
+            case nir_intrinsic_interp_deref_at_sample:
+            case nir_intrinsic_interp_deref_at_offset:
+               reads_input = true;
+               break;
+            default:
+               reads_input = false;
+               break;
+            }
+            if (!reads_input)
+               continue;
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            if (!deref)
+               continue;
+            nir_variable *var = nir_deref_instr_get_variable(deref);
+            if (!var || var->data.mode != nir_var_shader_in)
+               continue;
+            unsigned at = var_count;
+            for (unsigned i = 0; i < var_count; ++i)
+               if (vars[i] == var) { at = i; break; }
+            if (at == var_count) {
+               if (var_count == GEX_WGPU_SAMPLE_INTERP_VARS)
+                  continue;
+               vars[var_count] = var;
+               ++var_count;
+            }
+            if (gex_wgpu_interp_is_current_sample(intr))
+               ++convertible[at];
+            else
+               ++blocking[at];
+         }
+      }
+   }
+
+   uint64_t promote = 0;
+   for (unsigned i = 0; i < var_count && i < 64; ++i)
+      if (convertible[i] && !blocking[i])
+         promote |= 1ull << i;
+   if (!promote)
+      return false;
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block_safe(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_interp_deref_at_sample &&
+                intr->intrinsic != nir_intrinsic_interp_deref_at_offset)
+               continue;
+            if (!gex_wgpu_interp_is_current_sample(intr))
+               continue;
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            nir_variable *var =
+               deref ? nir_deref_instr_get_variable(deref) : NULL;
+            if (!var)
+               continue;
+            unsigned at = UINT_MAX;
+            for (unsigned i = 0; i < var_count && i < 64; ++i)
+               if (vars[i] == var) { at = i; break; }
+            if (at == UINT_MAX || !(promote & (1ull << at)))
+               continue;
+            nir_builder b = nir_builder_at(nir_before_instr(instr));
+            nir_def *val = nir_load_deref(&b, deref);
+            nir_def_replace(&intr->def, val);
+            progress = true;
+         }
+      }
+   }
+   if (!progress)
+      return false;
+
+   for (unsigned i = 0; i < var_count && i < 64; ++i) {
+      if (!(promote & (1ull << i)))
+         continue;
+      /* The function overrides whatever qualifier the declaration carried:
+       * interpolateAtSample on a `centroid in` varying is still the sample's
+       * value, and the two bits are mutually exclusive in SPIR-V anyway. */
+      vars[i]->data.centroid = 0;
+      vars[i]->data.sample = 1;
+   }
+   nir_foreach_function_impl(impl, nir)
+      nir_progress(true, impl, nir_metadata_control_flow);
+   return true;
+}
+
+/* Interpolation sampling, added to a pre-fragment stage's output struct.
+ *
+ * WebGPU requires the two stages to declare the same interpolation
+ * *sampling*, and rejects the pipeline otherwise. GL puts `centroid` and
+ * `sample` on the fragment input alone, so the vertex side never carries one
+ * and every such varying mismatched. SPIR-V cannot express the agreement:
+ * SpvDecorationCentroid and SpvDecorationSample are defined for fragment
+ * inputs, an output of a pre-fragment stage carrying them is not valid, and
+ * Tint drops them -- which is why ntv deliberately does not emit them there.
+ *
+ * So the agreement is written into the WGSL text, which is the last point at
+ * which the two sides are both visible and still editable.
+ *
+ * Two things make the edit narrow enough to trust. The location Tint prints
+ * is `var->data.driver_location`, the same number on both sides -- that is
+ * what makes @location match at all today. And the edit has to stay inside
+ * the *output struct*: a vertex shader's own attributes are @location too, on
+ * the entry point's parameters, and `@location(0) pos_param` collides
+ * textually with the `@location(0)` of the first varying. The output struct is
+ * the one containing @builtin(position), which is what this searches for.
+ *
+ * `sampling` is indexed by location and holds the varying_aux bits: 1 for
+ * centroid, 2 for sample, 0 to leave alone. Returns a fresh malloc'd string,
+ * or the original pointer when there is nothing to do. */
+static char *
+gex_wgpu_wgsl_add_output_sampling(char *wgsl, const uint8_t *sampling,
+                                  unsigned count)
+{
+   unsigned wanted = 0;
+   for (unsigned i = 0; i < count; ++i)
+      if (sampling[i])
+         ++wanted;
+   if (!wanted)
+      return wgsl;
+
+   /* The output struct: find the `struct ... {` whose body carries
+    * @builtin(position). */
+   const char *pos = strstr(wgsl, "@builtin(position)");
+   if (!pos)
+      return wgsl;
+   const char *open = NULL;
+   for (const char *p = pos; p > wgsl; --p) {
+      if (*p == '{') { open = p; break; }
+   }
+   if (!open)
+      return wgsl;
+   const char *close = strchr(open, '}');
+   if (!close)
+      return wgsl;
+
+   const size_t len = strlen(wgsl);
+   /* Each insertion adds at most `@interpolate(perspective, centroid) `. */
+   char *out = malloc(len + (size_t)wanted * 48 + 1);
+   if (!out)
+      return wgsl;
+   size_t w = 0;
+   const char *p = wgsl;
+   while (*p) {
+      if (p >= open && p < close && !strncmp(p, "@location(", 10)) {
+         const char *digits = p + 10;
+         char *end = NULL;
+         const unsigned long loc = strtoul(digits, &end, 10);
+         if (end && *end == ')' && loc < count && sampling[loc]) {
+            const char *how = (sampling[loc] & 1u) ? "centroid" : "sample";
+            /* Whatever ntv said about the *mode* is already here for a
+             * non-default one -- `@interpolate(linear)` for noperspective.
+             * Keep that word and add the sampling to it; a mode this rewrote
+             * would disagree with the fragment side just as loudly as a
+             * missing sampling does. */
+            const char *after = end + 1;
+            while (*after == ' ' || *after == '\n' || *after == '\t')
+               ++after;
+            char mode[16] = "perspective";
+            const char *resume = end + 1;
+            if (!strncmp(after, "@interpolate(", 13)) {
+               const char *arg = after + 13;
+               size_t n = 0;
+               while (n < sizeof(mode) - 1 && arg[n] && arg[n] != ',' &&
+                      arg[n] != ')')
+                  ++n;
+               /* `@interpolate(flat)` has no sampling to speak of and WGSL
+                * does not accept one, so a flat varying is left as it is. */
+               if (n && strncmp(arg, "flat", 4)) {
+                  memcpy(mode, arg, n);
+                  mode[n] = '\0';
+                  const char *shut = strchr(arg, ')');
+                  if (shut)
+                     resume = shut + 1;
+               } else {
+                  resume = NULL;
+               }
+            }
+            if (resume) {
+               w += (size_t)snprintf(out + w, 48 + 24,
+                                     "@location(%lu) @interpolate(%s, %s)",
+                                     loc, mode, how);
+               p = resume;
+               continue;
+            }
+         }
+      }
+      out[w++] = *p++;
+   }
+   out[w] = '\0';
+   free(wgsl);
+   return out;
+}
+
 static WGPUShaderModule
 gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
                      enum mesa_shader_stage stage, bool flip_y,
@@ -10042,6 +10435,21 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
     * -- it is a diagnostic line -- but it is a read of freed memory on a path
     * anyone debugging a shader turns on. */
    const unsigned dumped_stage = (unsigned)nir->info.stage;
+   /* What this stage's outputs say about interpolation sampling, read off the
+    * NIR while it still exists and applied to the WGSL below. Only a
+    * pre-fragment stage has any: the fragment side's own centroid/sample
+    * reaches SPIR-V and needs no help. */
+   uint8_t out_sampling[GEX_WGPU_MAX_VARYING_LOCATIONS] = {0};
+   if (nir->info.stage < MESA_SHADER_FRAGMENT) {
+      nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
+         if (!var->data.centroid && !var->data.sample)
+            continue;
+         if (var->data.driver_location >= GEX_WGPU_MAX_VARYING_LOCATIONS)
+            continue;
+         out_sampling[var->data.driver_location] =
+            (uint8_t)(var->data.centroid ? 1u : 2u);
+      }
+   }
    ralloc_free(nir);
    if (!spirv) {
       *error_out = strdup("Mesa NIR to SPIR-V failed");
@@ -10055,6 +10463,8 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    spirv_shader_delete(spirv);
    if (!wgsl)
       return NULL;
+   wgsl = gex_wgpu_wgsl_add_output_sampling(wgsl, out_sampling,
+                                            GEX_WGPU_MAX_VARYING_LOCATIONS);
    const double t_wgsl = os_time_get_nano() / 1000000.0;
 
    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
@@ -11939,48 +12349,41 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    if (expected_stage == MESA_SHADER_VERTEX)
       shader->inputs_read = nir->info.inputs_read;
 
-   /* Centroid and sample are dropped from every fragment input, and the
-    * varying is interpolated at the pixel centre instead.
+   /* Centroid and sample are kept on the fragment input and honoured.
     *
-    * Not a choice so much as the only thing SPIR-V can express. WebGPU
-    * requires the two stages to declare the same interpolation *sampling*,
-    * and rejects the pipeline otherwise -- which invalidates the command
-    * buffer and loses every draw batched with it, so a `centroid in` varying
-    * used to cost far more than the difference it names. Making the vertex
-    * side agree is the obvious fix and it cannot be done: SpvDecorationCentroid
-    * and SpvDecorationSample are defined for fragment *inputs*, a vertex
-    * output carrying them is not valid SPIR-V, and Tint drops them -- so the
-    * decoration this driver used to emit on the vertex output never reached
-    * the WGSL and the two sides stayed different. The dump shows it: the
-    * fragment entry point gets `@interpolate(perspective, sample)` and the
-    * vertex output struct gets nothing.
+    * They used to be dropped here, because WebGPU requires the two stages to
+    * declare the same interpolation *sampling* and SPIR-V cannot say it on
+    * the vertex side: SpvDecorationCentroid and SpvDecorationSample are
+    * defined for fragment inputs, a pre-fragment output carrying them is not
+    * valid, and Tint drops them -- so the fragment entry point got
+    * `@interpolate(perspective, sample)`, the vertex output struct got
+    * nothing, and the mismatched pipeline lost every draw batched with it.
+    * Giving the qualifier up on the fragment side made the pipeline valid and
+    * the answer wrong: a `sample in` varying read the pixel centre, which is
+    * the same value at every sample, and nothing said so.
     *
-    * So the fragment side gives the qualifier up. Centroid and centre differ
-    * only where a pixel is partially covered, which GL already leaves to the
-    * implementation; `sample` is a real difference and is reported by name.
-    * The remaining route to honouring it is patching the WGSL text after
-    * Tint, which is worth doing only if something needs it.
+    * The agreement is now written into the WGSL text instead, after Tint, by
+    * gex_wgpu_wgsl_add_output_sampling -- the last point at which both sides
+    * are visible and still editable. Centroid and sample are real
+    * differences and are now measured rather than described:
+    * gl44-sample-interp-probe reads the four samples of one pixel separately
+    * and requires four different values, which is exactly what the centre
+    * fallback cannot produce. */
+
+   /* Before the interpolation is recorded just below, which is the whole
+    * point of the ordering: this pass promotes a varying to `sample`, and the
+    * record is what the vertex side is later made to agree with. Run after
+    * it, the record said "centre", the vertex output was left undecorated,
+    * the fragment input carried Sample anyway, and the mismatched pipeline
+    * dropped the draw -- so the probe read back the clear colour rather than
+    * a wrong colour, which is the failure mode that looks like nothing
+    * happening.
     *
-    * interpolateAtSample is refused rather than lowered for the same reason:
-    * it could be turned into a plain read of a `sample` varying, but there is
-    * no such thing here, so the read would silently be the centre value. */
-   if (expected_stage == MESA_SHADER_FRAGMENT) {
-      nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
-         if (!var->data.centroid && !var->data.sample)
-            continue;
-         if (var->data.sample) {
-            static bool said;
-            if (!said) {
-               said = true;
-               fprintf(stderr, "gex-wgpu: `sample` interpolation is not "
-                       "expressible through SPIR-V; interpolating at the "
-                       "pixel centre instead\n");
-            }
-         }
-         var->data.centroid = 0;
-         var->data.sample = 0;
-      }
-   }
+    * It also has to precede the gl_SamplePosition scan further down: turning
+    * `interpolateAtOffset(v, gl_SamplePosition - 0.5)` into a per-sample read
+    * takes that use of gl_SamplePosition with it, so a shader whose only use
+    * was the offset no longer needs the sample-position variant at all. */
+   gex_wgpu_lower_sample_interp(nir);
 
    /* What this stage says about each varying's interpolation, recorded by the
     * @location ntv will emit. The fragment stage's is the one GL means; the
@@ -14259,10 +14662,17 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    WGPUShaderModule module = gex_wgpu_compile_nir(
       &ctx->base, variant, MESA_SHADER_FRAGMENT, false, &error);
    if (!module) {
-      fprintf(stderr, "gex-wgpu: fragment variant compile failed: %s\n",
-              error ? error : "unknown");
+      /* A shader Tint will not accept is one shader, not a broken device.
+       * Failing the context here cost every case after it: this probe's
+       * interpolateAtCentroid works on its own and was reported as a failure
+       * because interpolateAtSample had been compiled first and latched. The
+       * decline path immediately above is the right shape -- the caller
+       * already reads NULL as "do not draw this". */
+      GEX_FS_DECLINE(error ? error : "fragment variant compile failed");
       FREE(error);
-      gex_fail(ctx);
+      /* No ralloc_free(variant): gex_wgpu_compile_nir owns the NIR it is
+       * handed and frees it on both paths. Freeing it again here tripped
+       * ralloc's canary and dumped core. */
       return NULL;
    }
    FREE(error);
