@@ -223,6 +223,53 @@ extern void gex_wgpu_jspi_signal(void);
  * storage binding offset 256-aligned and glBindImageTexture's is not. */
 #define GEX_WGPU_PACKED_IMAGE_BASE_BYTES 6
 #define GEX_WGPU_PACKED_IMAGE_HEADER_WORDS 7
+
+/* The record buffer an emulated geometry or tessellation stage wrote, read by
+ * the passthrough vertex shader that rasterizes it.
+ *
+ * It used to arrive as a *vertex buffer* -- one vec4 attribute per varying,
+ * at a fixed stride, which is exactly a vertex layout -- and the reason given
+ * was that WGSL allows only read-only storage in the vertex stage while the
+ * SPIR-V emitter declared every storage buffer read_write. That second half
+ * stopped being true: gex_wgpu_word_block takes a `read_only` flag now,
+ * emits NonWritable, and the buffer textures and the draw-parameter block
+ * above are both read-only storage in this very stage.
+ *
+ * Reading it as storage instead is not a rewrite for its own sake. Three
+ * things follow from it:
+ *
+ *   - The stage's output count stops being bounded by *vertex attributes*.
+ *     GL asks for 128 output components from the geometry and evaluation
+ *     stages; one attribute per varying against the adapter's thirty
+ *     reported 116, and KHR-GL45.limits' two output-component cases failed
+ *     on it. Storage has no such ceiling, so the bound becomes the rasterized
+ *     interface the varyings go on to occupy, which is the honest one.
+ *
+ *   - Wide points stop degrading. The point expansion rebinds every vertex
+ *     buffer with `stepMode: instance` and needs one free attribute for its
+ *     corner buffer, so a passthrough that had claimed them all printed
+ *     "points drawn one pixel wide (no free vertex attribute)". A passthrough
+ *     with no attributes at all leaves every one free -- and the expansion's
+ *     own lowering already rewrites load_vertex_id to the instance index, so
+ *     the record lookup follows it without knowing it happened.
+ *
+ *   - The vertex layout and its slot-compaction mapping go away. A skipped
+ *     slot used to renumber every element after it, and getting that
+ *     mapping wrong silently dropped every varying declared after a
+ *     gl_Layer write; addressing records by slot number cannot express the
+ *     bug.
+ *
+ * The record index is gl_VertexID, which WebGPU gives an indexed draw as the
+ * index *value* -- and the rasterizing draw is indexed, by the index list the
+ * capture built. That is the same number the fixed-function fetch used to
+ * multiply by the stride, so nothing about the buffer's layout changes.
+ *
+ * The flat-unfilled replay still reads attributes, and has to: its trick is
+ * two vertex buffers over one capture at two offsets, so that flat varyings
+ * come from the provoking vertex's record while the position comes from the
+ * edge's own. There is no single record index to look up there. */
+#define GEX_WGPU_PASSTHROUGH_BINDING \
+   (GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + GEX_WGPU_MAX_SHADER_IMAGES)
 /* Rounded to four so a slot is a whole uvec4: the block is a *uniform* buffer
  * and WGSL gives a uniform array a 16-byte stride, so it is declared as an
  * array of uvec4 and a word is addressed as [w / 4][w % 4]. Both of those are
@@ -417,6 +464,22 @@ gex_wgpu_buffer_texture_code(enum pipe_format format)
  * meant the capture read its vertex numbers out of the buffer it was writing
  * varyings into: every captured position came back (0,0,0,0). */
 #define GEX_WGPU_VARYING_OUT_BINDING (GEX_WGPU_CAPTURE_PARAMS_BINDING + 2)
+/* And where an emulated stage's record buffer moves to when the shader being
+ * captured is the passthrough that reads it.
+ *
+ * The passthrough declares that block in the *vertex* group, set 1, because
+ * that is where a rasterizing draw's vertex bindings live. A capture variant
+ * of the same shader is a compute pipeline whose only group is zero, and a
+ * clone that kept set 1 was refused outright --
+ *
+ *   The entry-point uses bindings in group 1 but [PipelineLayout] doesn't
+ *   have a BindGroupLayout for this index
+ *
+ * -- which is what geometry-after-tessellation hit: the geometry stage
+ * captures its input vertices by re-running the shader that produced them,
+ * and after tessellation that shader is the evaluation stage's passthrough.
+ * Plus three rather than plus one or two, for the reason above this. */
+#define GEX_WGPU_CAPTURE_RECORDS_BINDING (GEX_WGPU_CAPTURE_PARAMS_BINDING + 3)
 
 /* Bindings of the de-indexing gather pass, which has its own group 0. See
  * gex_wgpu_gather_indexed_vertices. */
@@ -1846,6 +1909,13 @@ struct gex_wgpu_context {
     * slots this draw redirected; the other two arrays are the gather's own
     * inputs. */
    struct pipe_resource *point_gathered[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
+   /* The same de-indexing for an emulated stage's record buffer, which is
+    * not a vertex buffer and so is not in the array above. A points-out
+    * geometry shader needs it: its rasterizing draw is indexed by the list
+    * the capture built, and the point expansion addresses the *instance*
+    * dimension, which WebGPU's index buffer cannot reach. */
+   struct pipe_resource *point_gathered_records;
+   bool point_records_gathered;
    uint32_t point_gather_mask;
    bool point_gather_wanted[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
    unsigned point_gather_stride[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
@@ -2142,6 +2212,15 @@ struct gex_wgpu_context {
    struct primconvert_context *primconvert;
    struct pipe_resource *gs_vs_out;
    struct pipe_resource *gs_vertices;
+   /* The record buffer the passthrough vertex shader reads, for the length of
+    * an emulated stage's rasterizing draw. It is gs_vertices or
+    * tess_vertices; the draw path binds it at GEX_WGPU_PASSTHROUGH_BINDING
+    * and clears it again, so a draw with an ordinary vertex shader has none
+    * and the binding is absent from the group. */
+   struct pipe_resource *passthrough_records;
+   /* Bytes per record, which the point gather needs and the passthrough
+      shader has baked in already. */
+   unsigned records_stride;
    struct pipe_resource *gs_indices;
    /* Primitives closed per geometry invocation, and the exclusive prefix sum
     * of those -- the two buffers transform feedback out of a geometry shader
@@ -2377,6 +2456,9 @@ struct gex_wgpu_shader {
    /* ARB_shader_draw_parameters. Vertex stage only; the block is declared
     * only when the shader reads one of the three values. */
    bool reads_draw_params;
+   /* Whether this is a generated passthrough that reads an emulated stage's
+      record buffer; see GEX_WGPU_PASSTHROUGH_BINDING. */
+   bool reads_passthrough_records;
    /* How many of the merged clip/cull array's components are cull distances.
     * Zero for a shader that writes none, which is almost all of them. */
    uint8_t cull_distances;
@@ -2890,7 +2972,6 @@ struct gex_wgpu_gs {
     * buffer as a vertex buffer and passes it straight through, and the vertex
     * element state describing that buffer. */
    struct gex_wgpu_shader *passthrough;
-   void *passthrough_elements;
 };
 
 /* The tessellation-control shader, lowered to compute.
@@ -3041,7 +3122,6 @@ struct gex_wgpu_tes {
    /* The rasterization half, exactly as the geometry stage's: a vertex shader
     * that reads the evaluation output buffer as a vertex buffer. */
    struct gex_wgpu_shader *passthrough;
-   void *passthrough_elements;
    /* What this shader captures. Kept for the same reason the geometry stage
     * keeps it: the module build clears nir->xfb_info once the evaluation
     * shader has become a compute shader, and the capture pass is built
@@ -4948,11 +5028,45 @@ struct gex_wgpu_ssbo_lowering {
 /* The block's single member, as an array of words. Flattening loses the
  * declared field structure, which is safe because every access arrives as a
  * byte offset and is resolved here rather than by name. */
+/* A storage block the *driver* declared, rather than one of the
+ * application's.
+ *
+ * Everything from GEX_WGPU_IMAGE_FIRST_BINDING up is the driver's own
+ * numbering -- shader images, buffer textures, the draw-parameter block, an
+ * emulated stage's records -- and an application block cannot reach it: GL
+ * bounds a `binding =` qualifier by GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS,
+ * which this driver reports as GEX_WGPU_MAX_SHADER_BUFFERS, and the linker
+ * rejects a higher one.
+ *
+ * Two passes below have to know the difference, and both got it wrong for the
+ * passthrough's record block at once. The slot assignment renumbered it to
+ * GEX_WGPU_SSBO_FIRST_BINDING + driver_location -- which is 32, where an
+ * application buffer then bound over it -- and the flatten reshaped its type,
+ * which *re-interns* it and leaves every deref already built against the
+ * original failing NIR validation inside ntv:
+ *
+ *   deref_var &gex_passthrough_records (ssbo gex_passthrough_records#1)
+ *   error: instr->type == instr->var->type
+ *
+ * The draw-parameter block escapes both by being declared after they have
+ * run. A block whose loads *are* the shader body cannot be. */
+static bool
+gex_wgpu_driver_owned_block(const nir_variable *var)
+{
+   return var->data.explicit_binding &&
+          var->data.binding >= GEX_WGPU_IMAGE_FIRST_BINDING;
+}
+
 static void
 gex_wgpu_flatten_ssbo_blocks(nir_shader *nir)
 {
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
-      if (var->data.binding < GEX_WGPU_SSBO_FIRST_BINDING)
+      /* The application's blocks only: below the range are the spilled
+       * uniform blocks, and at or above it the driver's own. Reshaping one
+       * of the driver's re-interns its type; see
+       * gex_wgpu_driver_owned_block. */
+      if (var->data.binding < GEX_WGPU_SSBO_FIRST_BINDING ||
+          gex_wgpu_driver_owned_block(var))
          continue;
       struct glsl_struct_field field = {0};
       field.type = glsl_array_type(glsl_uint_type(), 0, 4);
@@ -5529,6 +5643,10 @@ gex_wgpu_lower_gallium_ubos(nir_shader *nir,
    const struct glsl_type *ssbo_blocks[GEX_WGPU_MAX_SHADER_BUFFERS] = {0};
    unsigned ssbo_seen = 0;
    nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
+      /* Not the driver's own blocks, which carry their binding already and
+       * whose slot means nothing here; see gex_wgpu_driver_owned_block. */
+      if (gex_wgpu_driver_owned_block(var))
+         continue;
       /* st/mesa binds storage buffers at consecutive slots in block-index
        * order -- set_shader_buffers(stage, 0, num_ssbos, ...) -- so the slot
        * is the block index, which Mesa leaves in driver_location.
@@ -11558,6 +11676,26 @@ gex_wgpu_capture_vertex(nir_builder *b, struct gex_wgpu_capture *state)
                                gex_wgpu_capture_vertex_slot(b, state)));
 }
 
+/* Move a passthrough's record block into the compute variant's own group.
+ *
+ * Called on the clone rather than the original: the rasterizing shader must
+ * keep set 1, where the draw path binds it. Returns whether the block was
+ * there, which is what tells the caller to reserve the binding. See
+ * GEX_WGPU_CAPTURE_RECORDS_BINDING. */
+static bool
+gex_wgpu_capture_records_rewrite(nir_shader *nir)
+{
+   bool any = false;
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
+      if (var->data.binding != GEX_WGPU_PASSTHROUGH_BINDING)
+         continue;
+      var->data.binding = GEX_WGPU_CAPTURE_RECORDS_BINDING;
+      var->data.descriptor_set = 0;
+      any = true;
+   }
+   return any;
+}
+
 /* Why a capture declined. Every one of these used to set state->failed and
  * say nothing, so the caller could only report "records nothing for this
  * draw" and name the first attribute's format -- which is the wrong fact when
@@ -13677,6 +13815,12 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
        * previous entry" -- and a storage block with no buffer bound. */
       if (var->data.binding == GEX_WGPU_DRAW_PARAMS_BINDING)
          continue;
+      /* Nor is the passthrough's record buffer: the draw path binds it from
+       * the emulated stage's capture, not from ctx->shader_buffers. */
+      if (var->data.binding == GEX_WGPU_PASSTHROUGH_BINDING) {
+         shader->reads_passthrough_records = true;
+         continue;
+      }
       if (var->data.binding >= GEX_WGPU_SSBO_FIRST_BINDING) {
          const unsigned ssbo_slot = var->data.driver_location;
          bool seen = false;
@@ -27262,6 +27406,7 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
 
    struct gex_wgpu_capture state = {0};
    state.layout = layout;
+   (void)gex_wgpu_capture_records_rewrite(nir);
    state.params = gex_wgpu_word_block(nir, "gex_capture_params",
                                       GEX_WGPU_CAPTURE_PARAMS_BINDING, 0, false);
    if (layout->index_table)
@@ -27347,7 +27492,7 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
    nir->info.workgroup_size[1] = 1;
    nir->info.workgroup_size[2] = 1;
    nir->info.workgroup_size_variable = false;
-   nir->info.num_ssbos = GEX_WGPU_CAPTURE_INDEX_BINDING + 1;
+   nir->info.num_ssbos = GEX_WGPU_CAPTURE_RECORDS_BINDING + 1;
    nir->xfb_info = NULL;
    /* Group zero, with the compute-stage numbering; see the same loop in
     * gex_wgpu_varying_variant_get for why it is not optional. */
@@ -27675,6 +27820,7 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    struct gex_wgpu_capture state = {0};
    state.layout = vertex;
    state.varyings = varyings;
+   (void)gex_wgpu_capture_records_rewrite(nir);
    state.params = gex_wgpu_word_block(nir, "gex_capture_params",
                                       GEX_WGPU_CAPTURE_PARAMS_BINDING, 0, false);
    /* An indexed draw captures through a slot table -- one already-resolved
@@ -28281,18 +28427,17 @@ gex_wgpu_collect_varyings(nir_shader *nir, nir_variable_mode mode,
 }
 
 /* The rasterization half: a vertex shader that reads the geometry shader's
- * output buffer as an ordinary vertex buffer and passes it straight through.
+ * output buffer and passes it straight through.
  *
- * Reading it as a vertex buffer rather than a storage buffer is deliberate.
- * WGSL only allows read-only storage in the vertex stage, and the SPIR-V
- * emitter declares every storage buffer read_write, so a vertex shader that
- * loaded the buffer directly would be rejected. Fixed-function vertex fetch
- * has no such restriction, and the buffer is already vec4 slots at a fixed
- * stride, which is exactly a vertex layout. */
+ * Two forms, and `storage` picks between them. Read-only storage indexed by
+ * gl_VertexID is what the emulated stages use, for the three reasons at
+ * GEX_WGPU_PASSTHROUGH_BINDING. One vec4 vertex attribute per varying is
+ * what the flat-unfilled replay uses, because its two buffers over one
+ * capture have no single record index; see gex_wgpu_flat_replay_get. */
 static nir_shader *
 gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
                             const struct gex_wgpu_varying_layout *outputs,
-                            uint32_t skip)
+                            uint32_t skip, bool storage)
 {
    /* Built with this driver's own compiler options rather than none. A shader
     * created with NULL options has `nir->options` null, and NIR dereferences
@@ -28354,6 +28499,38 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
          element_of[i] = (skip & (1u << i)) ? ~0u : next++;
    }
 
+   /* The storage form's two shared values: the block every slot reads from,
+    * and the byte at which this vertex's record starts.
+    *
+    * gl_VertexID rather than a sequence number, because the rasterizing draw
+    * is indexed and WebGPU hands an indexed draw the index *value* there --
+    * which is the record number the capture wrote, the same number the
+    * fixed-function fetch used to scale by the stride. The wide-point
+    * expansion rewrites this intrinsic to the instance index and the lookup
+    * follows it unchanged, which is how points keep their records after
+    * every vertex buffer has been rebound per-instance. */
+   nir_variable *records = NULL;
+   nir_def *record_byte = NULL;
+   if (storage) {
+      records = gex_wgpu_word_block(b.shader, "gex_passthrough_records",
+                                    GEX_WGPU_PASSTHROUGH_BINDING, 0, true);
+      /* Set one, which is the vertex stage's group. gex_wgpu_word_block
+       * leaves it at zero and the storage-block pass that would have
+       * assigned it now skips the driver's own blocks, so this is the only
+       * thing that says which group the binding is in. Left at zero Dawn
+       * refused every pipeline built from it --
+       *
+       *   The entry-point uses bindings in group 0 but [PipelineLayout] does
+       *   not have a BindGroupLayout for this index
+       *
+       * -- which invalidated the command buffer and took 54 of
+       * geometry_shader's 136 cases with it. The draw-parameter block sets
+       * the same field for the same reason. */
+      records->data.descriptor_set = 1;
+      record_byte = nir_imul_imm(&b, nir_load_vertex_id(&b),
+                                 gex_wgpu_varying_stride(outputs));
+   }
+
    for (unsigned i = 0; i < outputs->count; ++i) {
       /* A skipped slot keeps its place in the buffer -- the stride and every
        * other slot's offset depend on it -- and simply is not forwarded. */
@@ -28368,10 +28545,13 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
          continue;
       char name[24];
       snprintf(name, sizeof(name), "gex_gs_varying%u", i);
-      nir_variable *in = nir_variable_create(b.shader, nir_var_shader_in,
-                                             glsl_vec4_type(), name);
-      in->data.location = VERT_ATTRIB_GENERIC0 + i;
-      in->data.driver_location = element_of[i];
+      nir_variable *in = NULL;
+      if (!storage) {
+         in = nir_variable_create(b.shader, nir_var_shader_in,
+                                  glsl_vec4_type(), name);
+         in->data.location = VERT_ATTRIB_GENERIC0 + i;
+         in->data.driver_location = element_of[i];
+      }
       /* gl_ClipDistance and gl_CullDistance have to be *arrays*, and a vec4
        * is not one.
        *
@@ -28393,7 +28573,15 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
                  : glsl_vec4_type(), name);
       out->data.location = outputs->location[i];
       out->data.driver_location = i;
-      nir_def *value = nir_load_var(&b, in);
+      /* A slot keeps its place in the record whether or not it is
+       * forwarded, so the offset is the slot number and not a compacted
+       * one -- which is the whole reason the storage form needs no
+       * element_of[] mapping. */
+      nir_def *value =
+         storage ? gex_wgpu_load_varying(&b, records,
+                                         nir_iadd_imm(&b, record_byte, i * 16),
+                                         4)
+                 : nir_load_var(&b, in);
       if (is_clip) {
          out->data.compact = 1;
          for (unsigned c = 0; c < 4; ++c)
@@ -28406,11 +28594,18 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
          if (clip1_slot >= 0) {
             char upper[24];
             snprintf(upper, sizeof(upper), "gex_gs_varying%d", clip1_slot);
-            nir_variable *in_hi = nir_variable_create(
-               b.shader, nir_var_shader_in, glsl_vec4_type(), upper);
-            in_hi->data.location = VERT_ATTRIB_GENERIC0 + clip1_slot;
-            in_hi->data.driver_location = element_of[clip1_slot];
-            nir_def *hi = nir_load_var(&b, in_hi);
+            nir_def *hi;
+            if (storage) {
+               hi = gex_wgpu_load_varying(
+                  &b, records,
+                  nir_iadd_imm(&b, record_byte, clip1_slot * 16), 4);
+            } else {
+               nir_variable *in_hi = nir_variable_create(
+                  b.shader, nir_var_shader_in, glsl_vec4_type(), upper);
+               in_hi->data.location = VERT_ATTRIB_GENERIC0 + clip1_slot;
+               in_hi->data.driver_location = element_of[clip1_slot];
+               hi = nir_load_var(&b, in_hi);
+            }
             for (unsigned c = 0; c < 4; ++c)
                nir_store_deref(&b,
                                nir_build_deref_array_imm(
@@ -28943,7 +29138,7 @@ gex_wgpu_flat_replay_get(struct gex_wgpu_context *ctx,
    state.type = PIPE_SHADER_IR_NIR;
    state.ir.nir = lerp
       ? gex_wgpu_clip_replay_nir(&ctx->base, layout, flat_mask)
-      : gex_wgpu_gs_passthrough_nir(&ctx->base, layout, 0);
+      : gex_wgpu_gs_passthrough_nir(&ctx->base, layout, 0, false);
    state.report_compile_error = true;
    replay->shader = state.ir.nir
       ? gex_wgpu_create_shader_state(&ctx->base, &state, MESA_SHADER_VERTEX)
@@ -30552,10 +30747,9 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
     * depends on the control shader bound with it. The rasterization half does
     * not: it reads this shader's own outputs, which are known now. */
    tes->nir = nir;
-   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct pipe_shader_state passthrough_state = {0};
    passthrough_state.type = PIPE_SHADER_IR_NIR;
-   passthrough_state.ir.nir = gex_wgpu_gs_passthrough_nir(pipe, &tes->outputs, 0);
+   passthrough_state.ir.nir = gex_wgpu_gs_passthrough_nir(pipe, &tes->outputs, 0, true);
    /* The same inheritance the geometry passthrough needs; see the note there.
     * When tessellation is bound its evaluation stage is the last one before
     * the rasterizer, so its distances are the ones GL culls on. */
@@ -30568,24 +30762,11 @@ gex_wgpu_create_tes_state(struct pipe_context *pipe,
                                                    MESA_SHADER_VERTEX);
    free(passthrough_state.error_message);
 
-   struct pipe_vertex_element elements[GEX_WGPU_MAX_VARYINGS];
-   memset(elements, 0, sizeof(elements));
-   for (unsigned i = 0; i < tes->outputs.count; ++i) {
-      elements[i].src_offset = i * 16;
-      elements[i].src_stride = gex_wgpu_varying_stride(&tes->outputs);
-      elements[i].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
-      elements[i].vertex_buffer_index = 0;
-   }
-   tes->passthrough_elements = ctx->base.create_vertex_elements_state(
-      &ctx->base, tes->outputs.count, elements);
-   if (!tes->passthrough || !tes->passthrough_elements) {
+   if (!tes->passthrough) {
       gex_wgpu_set_compile_error(
          mutable_state,
-         !tes->passthrough
-            ? "gex_wgpu could not build the tessellation passthrough vertex "
-              "shader"
-            : "gex_wgpu could not build the tessellation passthrough vertex "
-              "layout");
+         "gex_wgpu could not build the tessellation passthrough vertex "
+         "shader");
       gex_wgpu_delete_tes_state(pipe, tes);
       return NULL;
    }
@@ -30673,8 +30854,6 @@ gex_wgpu_delete_tes_state(struct pipe_context *pipe, void *state)
    }
    if (tes->passthrough)
       gex_wgpu_delete_shader_state(pipe, tes->passthrough);
-   if (tes->passthrough_elements)
-      pipe->delete_vertex_elements_state(pipe, tes->passthrough_elements);
    if (tes->nir)
       ralloc_free(tes->nir);
    if (tes->xfb_module)
@@ -30687,7 +30866,6 @@ static void *
 gex_wgpu_create_gs_state(struct pipe_context *pipe,
                          const struct pipe_shader_state *state)
 {
-   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct pipe_shader_state *mutable_state = (struct pipe_shader_state *)state;
    nir_shader *nir = state->type == PIPE_SHADER_IR_NIR ? state->ir.nir : NULL;
    if (!nir || nir->info.stage != MESA_SHADER_GEOMETRY) {
@@ -30977,7 +31155,8 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
 
    struct pipe_shader_state passthrough_state = {0};
    passthrough_state.type = PIPE_SHADER_IR_NIR;
-   passthrough_state.ir.nir = gex_wgpu_gs_passthrough_nir(pipe, &gs->outputs, gs->passthrough_skip);
+   passthrough_state.ir.nir = gex_wgpu_gs_passthrough_nir(pipe, &gs->outputs,
+                                                 gs->passthrough_skip, true);
    /* The passthrough inherits the emulated stage's clip/cull split, or the
     * cull filter never runs at all.
     *
@@ -30999,42 +31178,21 @@ gex_wgpu_create_gs_state(struct pipe_context *pipe,
                                                   MESA_SHADER_VERTEX);
    free(passthrough_state.error_message);
 
-   struct pipe_vertex_element elements[GEX_WGPU_MAX_VARYINGS];
-   memset(elements, 0, sizeof(elements));
-   unsigned element_count = 0;
-   for (unsigned i = 0; i < gs->outputs.count; ++i) {
-      /* Skipped slots are absent from the layout too, and the ones that
-       * remain keep their *original* offset: the buffer's stride and every
-       * other slot's place in it are set by the full output list. */
-      if (gs->passthrough_skip & (1u << i))
-         continue;
-      elements[element_count].src_offset = i * 16;
-      elements[element_count].src_stride =
-         gex_wgpu_varying_stride(&gs->outputs);
-      elements[element_count].src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
-      elements[element_count].vertex_buffer_index = 0;
-      ++element_count;
-   }
-   gs->passthrough_elements = ctx->base.create_vertex_elements_state(
-      &ctx->base, element_count, elements);
-
    /* A NULL base module is expected for a shader whose only modules are
     * variants -- integer sampling or a buffer texture, both of which bake in
     * bound state. Missing the second of those reported "could not compile the
     * geometry compute module" for a shader that had deliberately not built
     * one. */
    if ((!gs->module && !gs->integer_sampled_slots &&
-        !gs->textures.buftex_count) || !gs->passthrough ||
-       !gs->passthrough_elements) {
-      /* Named, because all three failures reach the application as an empty
-       * link log and there is nothing else to go on. */
+        !gs->textures.buftex_count) || !gs->passthrough) {
+      /* Named, because both failures reach the application as an empty link
+       * log and there is nothing else to go on. */
       gex_wgpu_set_compile_error(
          mutable_state,
          !gs->module
             ? "gex_wgpu could not compile the geometry compute module"
-            : !gs->passthrough
-            ? "gex_wgpu could not build the geometry passthrough vertex shader"
-            : "gex_wgpu could not build the geometry passthrough vertex layout");
+            : "gex_wgpu could not build the geometry passthrough vertex "
+              "shader");
       if (gs->module)
          wgpuShaderModuleRelease(gs->module);
       if (gs->passthrough)
@@ -31074,8 +31232,6 @@ gex_wgpu_delete_gs_state(struct pipe_context *pipe, void *state)
    free(gs->xfb);
    if (gs->passthrough)
       gex_wgpu_delete_shader_state(pipe, gs->passthrough);
-   if (gs->passthrough_elements)
-      pipe->delete_vertex_elements_state(pipe, gs->passthrough_elements);
    if (gs->nir)
       ralloc_free(gs->nir);
    FREE(gs);
@@ -33270,8 +33426,68 @@ gex_wgpu_gather_indexed_vertices(struct gex_wgpu_context *ctx,
       if (ok)
          ctx->point_gather_mask |= 1u << buffer;
    }
+   /* And an emulated stage's records, which are not one of the vertex
+    * buffers above but need exactly the same de-indexing: one whole record
+    * per point, in draw order, so the expansion can address them on the
+    * instance index. The passthrough's own load is unchanged -- its
+    * gl_VertexID is rewritten to the instance index by the expansion's
+    * lowering, and this buffer is what that index then means. */
+   if (ok && ctx->vs && ctx->vs->reads_passthrough_records &&
+       ctx->passthrough_records && ctx->records_stride) {
+      const unsigned stride = ctx->records_stride;
+      const unsigned dwords = stride / 4;
+      const unsigned total = count * dwords;
+      if ((uint64_t)count * stride > (64u << 20) ||
+          !gex_wgpu_ensure_buffer(ctx, &ctx->point_gathered_records,
+                                  count * stride,
+                                  PIPE_BIND_SHADER_BUFFER)) {
+         ok = false;
+      } else {
+         uint32_t params[GEX_WGPU_GATHER_PARAM_WORDS] = {0};
+         params[GEX_WGPU_GATHER_PARAM_STRIDE] = dwords;
+         params[GEX_WGPU_GATHER_PARAM_SRC_BASE] = 0;
+         params[GEX_WGPU_GATHER_PARAM_DWORDS] = total;
+         struct pipe_resource *param_buffer =
+            gex_wgpu_params_buffer(ctx, params, GEX_WGPU_GATHER_PARAM_WORDS);
+         struct gex_wgpu_bindings group0 = {0}, group1 = {0};
+         gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GATHER_PARAMS_BINDING,
+                                      param_buffer, true);
+         gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GATHER_INDEX_BINDING,
+                                      table, true);
+         gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GATHER_SRC_BINDING,
+                                      ctx->passthrough_records, true);
+         gex_wgpu_bind_storage(&group0, GEX_WGPU_GATHER_DST_BINDING,
+                               ctx->point_gathered_records);
+         ok = param_buffer &&
+              gex_wgpu_dispatch(ctx, module, &group0, &group1, NULL,
+                                DIV_ROUND_UP(total, GEX_WGPU_GATHER_GROUP));
+         pipe_resource_reference(&param_buffer, NULL);
+         if (ok)
+            ctx->point_records_gathered = true;
+         if (getenv("GEX_WGPU_POINT_LOG"))
+            fprintf(stderr, "gex-wgpu: gather records stride=%u count=%u "
+                    "ok=%d\n", stride, count, (int)ok);
+      }
+   }
    pipe_resource_reference(&table, NULL);
    return ok;
+}
+
+/* The records a captured passthrough reads, bound where its clone now
+ * declares them. A no-op for every other shader, which is every shader that
+ * is not rasterizing an emulated stage: the flag comes from the module's own
+ * declaration, so binding without one -- "Binding doesn't exist in
+ * BindGroupLayout" -- cannot happen either way. */
+static void
+gex_wgpu_bind_capture_records(struct gex_wgpu_context *ctx,
+                              struct gex_wgpu_bindings *group)
+{
+   if (!ctx->vs || !ctx->vs->reads_passthrough_records ||
+       !ctx->passthrough_records)
+      return;
+   /* Read-only, matching the NonWritable the passthrough declares. */
+   gex_wgpu_bind_storage_access(group, GEX_WGPU_CAPTURE_RECORDS_BINDING,
+                                ctx->passthrough_records, true);
 }
 
 /* Draw a wide, or smooth, line as quads.
@@ -33479,6 +33695,7 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
                          ctx->line_vs_out);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
                          vs_params);
+   gex_wgpu_bind_capture_records(ctx, &vs_group0);
    /* Bound writable to match the declaration -- gex_wgpu_word_block was asked
     * for a writable block, and the layout entry has to agree or the binding
     * does not match the shader at all. The transform-feedback capture binds
@@ -34399,6 +34616,7 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                          ctx->gs_vs_out);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
                          vs_params);
+   gex_wgpu_bind_capture_records(ctx, &vs_group0);
    if (slot_table)
       gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_INDEX_BINDING,
                             slot_table);
@@ -34537,26 +34755,27 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    }
 
    /* A shader that declares no output emits no vertex, so there is nothing
-    * to rasterize and no passthrough to build one from -- its element state
-    * would have no attributes and its vertex shader no position. The stores
-    * it exists for have already happened, in pass two. */
+    * to rasterize and no passthrough to build one from -- it would forward
+    * no varyings and have no position to forward. The stores it exists for
+    * have already happened, in pass two. */
    if (!gs->outputs.count)
       return true;
 
    /* Pass five: rasterize what the geometry shader wrote. The passthrough
-    * vertex shader and its element state stand in for the application's for
-    * the length of this draw. */
+    * vertex shader stands in for the application's for the length of this
+    * draw, reading the records the capture wrote. */
    struct gex_wgpu_shader *saved_vs = ctx->vs;
    struct gex_wgpu_vertex_elements *saved_elements = ctx->vertex_elements;
-   struct pipe_resource *saved_buffer = ctx->vertex_buffers[0];
-   const uint32_t saved_offset = ctx->vertex_buffer_offsets[0];
-   const unsigned saved_count = ctx->vertex_buffer_count;
 
    ctx->vs = gs->passthrough;
-   ctx->vertex_elements = gs->passthrough_elements;
-   ctx->vertex_buffers[0] = ctx->gs_vertices;
-   ctx->vertex_buffer_offsets[0] = 0;
-   ctx->vertex_buffer_count = 1;
+   /* Attributeless: the passthrough reads its records from a storage buffer
+    * now, which the draw path picks up from ctx->passthrough_records. A
+    * shader declaring no vertex inputs is a case the draw path already
+    * handles -- see the note beside `if (!ctx->vertex_elements)` -- so
+    * leaving stale buffers bound is fine and unbinding them is not needed. */
+   ctx->vertex_elements = NULL;
+   pipe_resource_reference(&ctx->passthrough_records, ctx->gs_vertices);
+   ctx->records_stride = gex_wgpu_varying_stride(&gs->outputs);
    ctx->gs = NULL;
    const bool saved_rasterizing = ctx->gs_rasterizing;
    ctx->gs_rasterizing = true;
@@ -34581,9 +34800,9 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
     * what localised a crash inside it to this draw rather than to the compute
     * passes above. */
    if (getenv("GEX_WGPU_GS_LOG"))
-      fprintf(stderr, "gex-wgpu: gs pass3 vs=%p elements=%p verts=%p "
+      fprintf(stderr, "gex-wgpu: gs pass3 vs=%p records=%p "
               "indices=%p count=%u mode=%u fs=%p\n", (void *)gs->passthrough,
-              (void *)gs->passthrough_elements, (void *)ctx->gs_vertices,
+              (void *)ctx->gs_vertices,
               (void *)ctx->gs_indices, index_count, (unsigned)raster.mode,
               (void *)ctx->fs);
    /* GEX_WGPU_GS_LOG=2 additionally dumps what the capture actually wrote,
@@ -34655,9 +34874,8 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
    ctx->gs_rasterizing = saved_rasterizing;
    ctx->vs = saved_vs;
    ctx->vertex_elements = saved_elements;
-   ctx->vertex_buffers[0] = saved_buffer;
-   ctx->vertex_buffer_offsets[0] = saved_offset;
-   ctx->vertex_buffer_count = saved_count;
+   pipe_resource_reference(&ctx->passthrough_records, NULL);
+   ctx->records_stride = 0;
    return !ctx->failed;
 }
 
@@ -35209,6 +35427,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                          ctx->tess_vs_out);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
                          vs_params);
+   gex_wgpu_bind_capture_records(ctx, &vs_group0);
    /* Separately, and before the chain below, because a texture the capture
     * pass cannot bind is a *decline* and not a driver failure. Until the
     * capture learned to sample, such a shader was refused when its variant
@@ -35542,15 +35761,12 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    /* Pass five: rasterize it, through the passthrough vertex shader. */
    struct gex_wgpu_shader *saved_vs = ctx->vs;
    struct gex_wgpu_vertex_elements *saved_elements = ctx->vertex_elements;
-   struct pipe_resource *saved_buffer = ctx->vertex_buffers[0];
-   const uint32_t saved_offset = ctx->vertex_buffer_offsets[0];
-   const unsigned saved_count = ctx->vertex_buffer_count;
 
    ctx->vs = tes->passthrough;
-   ctx->vertex_elements = tes->passthrough_elements;
-   ctx->vertex_buffers[0] = ctx->tess_vertices;
-   ctx->vertex_buffer_offsets[0] = 0;
-   ctx->vertex_buffer_count = 1;
+   /* Attributeless, as the geometry stage's is; see the note there. */
+   ctx->vertex_elements = NULL;
+   pipe_resource_reference(&ctx->passthrough_records, ctx->tess_vertices);
+   ctx->records_stride = gex_wgpu_varying_stride(&tes->outputs);
    ctx->tcs = NULL;
    ctx->tes = NULL;
 
@@ -35580,9 +35796,8 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    ctx->tes = tes;
    ctx->vs = saved_vs;
    ctx->vertex_elements = saved_elements;
-   ctx->vertex_buffers[0] = saved_buffer;
-   ctx->vertex_buffer_offsets[0] = saved_offset;
-   ctx->vertex_buffer_count = saved_count;
+   pipe_resource_reference(&ctx->passthrough_records, NULL);
+   ctx->records_stride = 0;
    return !ctx->failed;
 #undef GEX_TESS_DECLINE
 }
@@ -39021,6 +39236,7 @@ gex_wgpu_capture_positions(struct gex_wgpu_context *ctx, unsigned first,
                          ctx->facing_vs_out);
    gex_wgpu_bind_storage(&group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
                          param_buffer);
+   gex_wgpu_bind_capture_records(ctx, &group0);
    bool ok = param_buffer &&
              gex_wgpu_bind_varying_textures(ctx, variant, &group0) &&
              gex_wgpu_bind_constants(ctx, &group1, MESA_SHADER_VERTEX,
@@ -39936,6 +40152,7 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
                             ctx->flat_vs_out);
       gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
                             vs_params);
+      gex_wgpu_bind_capture_records(ctx, &vs_group0);
       /* Writable to match the declaration, as the other two captures bind
        * theirs: the block was asked for writable and the layout entry has to
        * agree or the binding does not match the shader at all. */
@@ -40163,6 +40380,7 @@ gex_wgpu_atomic_replay_draw(struct pipe_context *pipe,
                             ctx->flat_vs_out);
       gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
                             vs_params);
+      gex_wgpu_bind_capture_records(ctx, &vs_group0);
       /* And the shader's *own* storage blocks -- the whole difference between
        * this capture and the ones it borrows from, which replay plain vertex
        * shaders that have none.
@@ -41637,6 +41855,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    ctx->point_expand.active = false;
    ctx->point_expand.corners = NULL;
    ctx->point_gather_mask = 0;
+   ctx->point_records_gathered = false;
    if (info && draws && info->mode == MESA_PRIM_POINTS && ctx->vs &&
        ctx->rasterizer && draws[0].count > 0 && !ctx->failed) {
       const bool writes_size =
@@ -41663,15 +41882,23 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * and only a draw whose strides are whole dwords -- the gather copies
        * by dword, and a packed byte stride would need a byte-addressed
        * variant for nothing: no vertex layout st/mesa builds has one. */
+      /* A passthrough rasterizing an emulated stage reads its vertices from
+       * a storage buffer rather than a vertex buffer, so it has no elements
+       * at all -- and requiring elements here refused every points-out
+       * geometry shader as "indexed" and drew its points one pixel wide.
+       * The records are de-indexed the same way the vertex buffers are. */
+      const bool records =
+         ctx->vs->reads_passthrough_records && ctx->passthrough_records;
       bool gather = false;
       if (want && info->index_size &&
           (info->index_size == 2 || info->index_size == 4) &&
-          !info->primitive_restart && ctx->vertex_elements) {
+          !info->primitive_restart && (ctx->vertex_elements || records)) {
          gather = true;
          memset(ctx->point_gather_wanted, 0,
                 sizeof(ctx->point_gather_wanted));
          memset(ctx->point_gather_stride, 0, sizeof(ctx->point_gather_stride));
-         for (unsigned i = 0; i < ctx->vertex_elements->count; ++i) {
+         for (unsigned i = 0; ctx->vertex_elements &&
+                              i < ctx->vertex_elements->count; ++i) {
             const struct pipe_vertex_element *ve =
                &ctx->vertex_elements->elements[i];
             const unsigned buffer = ve->vertex_buffer_index;
@@ -41829,8 +42056,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * redirect anything: the gathered buffers hold the vertices in draw
        * order, which is only right for a draw that has stopped being
        * indexed. */
-      if (!ctx->point_expand.active)
+      if (!ctx->point_expand.active) {
          ctx->point_gather_mask = 0;
+         ctx->point_records_gathered = false;
+      }
       /* Once per distinct reason, so a program that draws indexed points
        * every frame says so once. Keyed on the pointer because every reason
        * above is a string literal, which makes the identity stable and the
@@ -42894,10 +43123,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * storage binding in the vertex stage. */
    const unsigned vs_packed_entries =
       ctx->vs->packed_image_count ? 1 + ctx->vs->packed_image_count : 0;
+   /* One more for an emulated stage's record buffer, when the bound vertex
+    * shader is the generated passthrough that reads it. */
+   const bool vs_records =
+      ctx->vs->reads_passthrough_records && ctx->passthrough_records;
    const unsigned vertex_group_count =
       ctx->vs->ubo_count + ctx->vs->ssbo_count + ctx->vs->buftex_count +
       vs_packed_entries + ctx->vs->image_count +
-      (ctx->vs->reads_draw_params ? 1u : 0u);
+      (ctx->vs->reads_draw_params ? 1u : 0u) + (vs_records ? 1u : 0u);
    const unsigned fragment_group_count =
       ctx->fs->ubo_count + ctx->fs->ssbo_count + ctx->fs->image_count +
       ctx->fs->buftex_count +
@@ -43625,6 +43858,23 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       vertex_layout_entries[at].buffer.minBindingSize =
          GEX_WGPU_DRAW_PARAM_WORDS * 4;
    }
+   if (vs_records) {
+      const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
+                          ctx->vs->buftex_count + vs_packed_entries +
+                          ctx->vs->image_count +
+                          (ctx->vs->reads_draw_params ? 1u : 0u);
+      vertex_layout_entries[at] =
+         (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      vertex_layout_entries[at].binding = GEX_WGPU_PASSTHROUGH_BINDING;
+      vertex_layout_entries[at].visibility = WGPUShaderStage_Vertex;
+      /* Read-only, for the reason every storage binding in this stage is:
+       * WGSL forbids a writable one here. The whole buffer, at offset zero
+       * and with no dynamic offset -- the capture always starts a record set
+       * at the beginning of its own buffer, and a new buffer is a new bind
+       * group anyway, so there is nothing for a dynamic offset to save. */
+      vertex_layout_entries[at].buffer.type =
+         WGPUBufferBindingType_ReadOnlyStorage;
+   }
    for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
       const unsigned slot = ctx->fs->ubo_slots[i];
       const bool storage = ctx->fs->ubo_storage_mask & (UINT64_C(1) << i);
@@ -44318,6 +44568,24 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           * the bind group be cached across draws. */
          gex_wgpu_add_dynamic_offset(&dynamic[1], GEX_WGPU_DRAW_PARAMS_BINDING,
                                      draw_params_offset);
+      }
+      if (vs_records) {
+         const unsigned at = ctx->vs->ubo_count + ctx->vs->ssbo_count +
+                             ctx->vs->buftex_count + vs_packed_entries +
+                             ctx->vs->image_count +
+                             (ctx->vs->reads_draw_params ? 1u : 0u);
+         /* The de-indexed copy when the point expansion made one: the draw
+            is no longer indexed, so a record's number is its place in draw
+            order. See gex_wgpu_gather_indexed_vertices. */
+         struct gex_wgpu_resource *rec =
+            gex_resource(ctx->point_records_gathered
+                            ? ctx->point_gathered_records
+                            : ctx->passthrough_records);
+         entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[at].binding = GEX_WGPU_PASSTHROUGH_BINDING;
+         entries[at].buffer = rec->buffer;
+         entries[at].offset = 0;
+         entries[at].size = rec->allocation_size;
       }
       if (gex_wgpu_trace_buffer_aliasing("vertex", vertex_layout_entries,
                                         entries, vertex_group_count))
@@ -45267,6 +45535,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    gex_wgpu_batch_touch(ctx, index_resource);
    for (unsigned slot = 0; slot < vb_slot_count; ++slot)
       gex_wgpu_batch_touch(ctx, ctx->vertex_buffers[vb_buffer[slot]]);
+   /* An emulated stage's records, which this draw reads. They used to be
+    * tracked by the loop above, as vertex buffer zero; a storage binding is
+    * no less a read, and a resource the batch does not hold can be
+    * overwritten under draws that have not been submitted. */
+   if (vs_records)
+      gex_wgpu_batch_touch(ctx, ctx->point_records_gathered
+                                   ? ctx->point_gathered_records
+                                   : ctx->passthrough_records);
    for (unsigned i = 0; i < ctx->vs->ubo_count; ++i)
       gex_wgpu_batch_touch(
          ctx,
@@ -45412,6 +45688,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    /* The scratch the geometry path runs through. */
    pipe_resource_reference(&ctx->gs_vs_out, NULL);
    pipe_resource_reference(&ctx->gs_vertices, NULL);
+   pipe_resource_reference(&ctx->passthrough_records, NULL);
    pipe_resource_reference(&ctx->gs_indices, NULL);
    pipe_resource_reference(&ctx->tess_vs_out, NULL);
    pipe_resource_reference(&ctx->tess_tcs_out, NULL);
@@ -45423,6 +45700,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    pipe_resource_reference(&ctx->fb_scratch, NULL);
    for (unsigned i = 0; i < GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS; ++i)
       pipe_resource_reference(&ctx->point_gathered[i], NULL);
+   pipe_resource_reference(&ctx->point_gathered_records, NULL);
    pipe_resource_reference(&ctx->line_vs_out, NULL);
    pipe_resource_reference(&ctx->line_starts, NULL);
    for (struct gex_wgpu_flat_replay *r = ctx->flat_replays; r;) {
@@ -46578,18 +46856,31 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
        * for 128 control-shader output components, and this is where that
        * comes from; MAX_TESS_PATCH_COMPONENTS is st/mesa's own 120 and needs
        * the same room. */
-      /* ...and only the *vertex* stage's outputs. The geometry and evaluation
-       * stages hand theirs to the passthrough vertex shader, which reads them
-       * back as vertex *attributes* -- a different limit, sixteen, and one
-       * the adapter does not raise. Letting those follow the inter-stage
-       * count produced a geometry shader whose passthrough layout could not
-       * be built at all: "could not build the geometry passthrough vertex
-       * layout", and transform_feedback lost a case to it. */
+      /* The geometry and evaluation stages follow the inter-stage count too,
+       * now that their passthrough reads records from a storage buffer
+       * instead of as vertex attributes; see
+       * GEX_WGPU_PASSTHROUGH_BINDING.
+       *
+       * It used to be max_raster_varyings -- one per vertex attribute, and an
+       * attribute is what each varying arrived as. Letting them follow the
+       * inter-stage count then produced a geometry shader whose passthrough
+       * layout could not be built at all ("could not build the geometry
+       * passthrough vertex layout"), and transform_feedback lost a case to
+       * it. There is no layout to fail now.
+       *
+       * What bounds them instead is what the varyings go on to occupy: the
+       * rasterized interface between the passthrough and the fragment stage.
+       * That is 29 -> 31 slots here, so st reports 116 -> 124 output
+       * components. GL 3.2 asks for 128, so
+       * KHR-GL45.limits.max_geometry_output_components and its evaluation
+       * twin still fail -- but on `maxInterStageShaderVariables`, which this
+       * adapter grants 31 of and was asked for all 31, rather than on a
+       * vertex-attribute ceiling that had nothing to do with them. A wall
+       * named correctly is worth more than one moved. */
       caps->max_outputs =
          stages[i] == MESA_SHADER_FRAGMENT ? 8
          : stages[i] == MESA_SHADER_TESS_CTRL ? GEX_WGPU_MAX_VARYINGS
-         : stages[i] == MESA_SHADER_VERTEX ? screen->max_inter_stage
-                                           : screen->max_raster_varyings;
+                                             : screen->max_inter_stage;
       caps->max_temps = 256;
       caps->max_const_buffer0_size = 16 * 1024;
       /* Never more than the device will bind. st/mesa needs 13 for
