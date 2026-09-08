@@ -2039,6 +2039,10 @@ struct gex_wgpu_context {
     * what pinned every application to about 20000 draws a second whatever
     * its resolution -- the cost was the pass, not the pixels. */
    WGPURenderPassEncoder pending_pass;
+   /* Set while a draw is being run a second time because the pass it meant to
+    * reuse was closed underneath it; see the `!pass` branch of
+    * gex_wgpu_draw_vbo_inner. Bounds the retry to one. */
+   bool pass_retry;
    struct gex_wgpu_pass_key {
       struct pipe_resource *colors[GEX_WGPU_MAX_COLOR_TARGETS];
       enum pipe_format formats[GEX_WGPU_MAX_COLOR_TARGETS];
@@ -44150,6 +44154,45 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       gex_wgpu_cmd_note("BEGIN-PASS");
       ctx->pending_pass =
          wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+      /* The descriptor, when the pass could not be begun.
+       *
+       * Dawn raises a validation error and returns an *invalid* object rather
+       * than NULL for a descriptor it rejects, so a NULL here is something
+       * else -- and with no Dawn message in the log there is nothing to go on
+       * but the descriptor itself. Printed once per shape. */
+      if (!ctx->pending_pass) {
+         GEX_SAY_ONCE_PER((uint32_t)pass_desc.colorAttachmentCount * 131u +
+                          (uint32_t)(pass_desc.depthStencilAttachment ? 1u : 0u) *
+                             17u +
+                          (uint32_t)(ctx->depth ? ctx->depth->format : 0)) {
+            fprintf(stderr,
+                    "gex-wgpu: beginRenderPass returned NULL: %zu colour "
+                    "attachment%s, occlusion=%s, depth=%s",
+                    (size_t)pass_desc.colorAttachmentCount,
+                    pass_desc.colorAttachmentCount == 1 ? "" : "s",
+                    pass_desc.occlusionQuerySet ? "yes" : "no",
+                    pass_desc.depthStencilAttachment ? "yes" : "no");
+            for (unsigned i = 0; i < pass_desc.colorAttachmentCount; ++i)
+               fprintf(stderr, " [%u view=%s load=%u store=%u]", i,
+                       pass_desc.colorAttachments[i].view ? "ok" : "NULL",
+                       (unsigned)pass_desc.colorAttachments[i].loadOp,
+                       (unsigned)pass_desc.colorAttachments[i].storeOp);
+            if (pass_desc.depthStencilAttachment)
+               fprintf(stderr,
+                       " depth[view=%s fmt=%s dload=%u dstore=%u dro=%d "
+                       "sload=%u sstore=%u sro=%d]",
+                       pass_desc.depthStencilAttachment->view ? "ok" : "NULL",
+                       ctx->depth
+                          ? util_format_short_name(ctx->depth->format) : "none",
+                       (unsigned)pass_desc.depthStencilAttachment->depthLoadOp,
+                       (unsigned)pass_desc.depthStencilAttachment->depthStoreOp,
+                       (int)pass_desc.depthStencilAttachment->depthReadOnly,
+                       (unsigned)pass_desc.depthStencilAttachment->stencilLoadOp,
+                       (unsigned)pass_desc.depthStencilAttachment->stencilStoreOp,
+                       (int)pass_desc.depthStencilAttachment->stencilReadOnly);
+            fprintf(stderr, "\n");
+         }
+      }
       ++screen->pass_serial;
       memset(&ctx->emitted, 0, sizeof(ctx->emitted));
       if (!counting && ctx->pending_pass)
@@ -44474,7 +44517,65 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       wgpuRenderPipelineRelease(pipeline);
    /* bind_groups[] and, when cached, the pipeline belong to the screen. */
    if (!pass) {
-      gex_fail(ctx);
+      /* Declined, not latched -- the 23rd site to be moved across the line
+       * gex_wgpu_declined draws, and for the same reason as the other 22.
+       *
+       * A pass this driver could not begin is a framebuffer it cannot
+       * express; the device is untouched and the draw simply does not happen.
+       * Latching instead made *every later draw in the process* refuse, which
+       * is how one unsupported framebuffer became a whole application's
+       * worth of failures: Blender's EEVEE viewport exceeds the native
+       * adapter's 32-byte colour budget, the attachments past it are dropped,
+       * this pass then could not begin, and the log after that point read
+       * "draw refused (context already failed)" and said nothing about
+       * anything else EEVEE needed. Whatever is behind this is only visible
+       * once it stops. */
+      /* The pass this draw meant to reuse was closed while it was being set
+       * up, so run the draw again rather than dropping it.
+       *
+       * `reuse` is decided early because it gates building the attachment
+       * views, which cost two to three microseconds a draw to make and
+       * release unused. Between that decision and the begin, the driver may
+       * record an image alias or a storage-buffer snapshot -- and both have
+       * to close the pass, because a copy cannot be recorded inside one. The
+       * draw then arrives here with nothing to reuse and no views built, and
+       * dropped itself silently.
+       *
+       * Blender's EEVEE viewport is exactly this shape: it aliases an image
+       * every frame, so its *scene* pass was dropped every frame while the
+       * UI, which aliases nothing, drew normally. That is why the viewport
+       * came up black with a correct grid and gizmos over it.
+       *
+       * The second pass through finds pending_pass NULL, so `reuse` is false,
+       * the views are built and the pass is begun; the alias work it repeats
+       * is idempotent, the snapshot already being there. Once only, so a pass
+       * WebGPU genuinely will not begin still declines -- and `reuse` in the
+       * message is what tells the two apart. */
+      if (reuse && !ctx->pass_retry) {
+         ctx->pass_retry = true;
+         gex_wgpu_draw_vbo_inner(pipe, info, drawid_offset, indirect, draws,
+                                 num_draws);
+         ctx->pass_retry = false;
+         return;
+      }
+      GEX_SAY_ONCE_PER((uint32_t)ctx->color_count * 131u +
+                       (uint32_t)ctx->fb_samples * 17u +
+                       (uint32_t)(ctx->color_count ? ctx->color_formats[0] : 0) *
+                          7u +
+                       (uint32_t)(ctx->depth ? ctx->depth->format : 0)) {
+         fprintf(stderr,
+                 "gex-wgpu: draw declined (no render pass, reuse=%d: %u "
+                 "colour target%s, first %s, depth %s, %u sample%s)\n",
+                 (int)reuse,
+                 ctx->color_count, ctx->color_count == 1 ? "" : "s",
+                 ctx->color_count
+                    ? util_format_short_name(ctx->color_formats[0]) : "none",
+                 ctx->depth ? util_format_short_name(ctx->depth->format)
+                            : "none",
+                 MAX2(1u, ctx->fb_samples),
+                 MAX2(1u, ctx->fb_samples) == 1 ? "" : "s");
+      }
+      gex_decline(ctx);
       GEX_DRAW_DROP();
    }
    const int64_t t_submit_start = gex_timing ? os_time_get_nano() : 0;
