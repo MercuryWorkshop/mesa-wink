@@ -37858,9 +37858,25 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        !ctx->rasterizer->flatshade_first && !unfilled_draw_pending &&
        !downstream_primitives &&
        u_reduced_prim(info->mode) != MESA_PRIM_POINTS &&
-       gex_wgpu_shader_has_flat_varying(ctx->fs) &&
-       gex_wgpu_draw_provoking_last(pipe, info, drawid_offset, &draws[0]))
-      GEX_DRAW_DROP();
+       gex_wgpu_shader_has_flat_varying(ctx->fs)) {
+      /* The rewrite re-issues this draw as an indexed *list*, and a list has
+       * more vertices than the strip or fan it came from -- six against four
+       * for a two-triangle strip. Invisible for an ordinary shader, and
+       * observable for one with side effects: GL runs a vertex shader once
+       * per vertex for glDrawArrays, so an atomic counter came out 50% high
+       * and an SSBO store indexed by gl_VertexID wrote the shared vertices
+       * twice. Measured on a four-vertex strip: six increments, and the
+       * recorded results were 1,5,4,3 rather than 1,2,3,4.
+       *
+       * So the side effects run *here*, against the count the application
+       * asked for, and both dispatch sites below skip the replay. The
+       * rasterisation still gets the rewritten indices, so GL's provoking
+       * vertex is unaffected. */
+      if (ctx->vs && ctx->vs->writes_storage && ctx->vs->capture_nir)
+         (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
+      if (gex_wgpu_draw_provoking_last(pipe, info, drawid_offset, &draws[0]))
+         GEX_DRAW_DROP();
+   }
 
    /* glPolygonMode with the faces set differently -- GL_LINE in front and
     * GL_POINT behind, say -- drawn as one pass per facing.
@@ -38595,7 +38611,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                  "rasterising copy cannot perform; its stores still run, but "
                  "it may only be drawn with GL_RASTERIZER_DISCARD)\n");
       }
-      if (ctx->vs->capture_nir)
+      /* Not during a provoking-vertex replay: the stores already ran at the
+       * rewrite site, against the application's own vertex count. This is
+       * the site the flat-strip over-count actually came through -- an
+       * unrasterisable shader never reaches the main dispatch below. */
+      if (ctx->vs->capture_nir && !ctx->provoking_rewritten)
          (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
       GEX_DRAW_DROP();
    }
@@ -38653,7 +38673,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* ...and a vertex shader that writes a storage block of its own needs the
     * same dispatch even with no feedback bound: that pass is where its stores
     * actually happen, the rasterising copy having had them stripped. */
-   if ((ctx->so_target_count || ctx->vs->writes_storage) &&
+   /* Transform feedback is exempt from the replay skip: it records
+    * *primitives*, so the assembled list is exactly what it should see. Only
+    * the plain side-effect dispatch has to avoid running twice. */
+   if ((ctx->so_target_count ||
+        (ctx->vs->writes_storage && !ctx->provoking_rewritten)) &&
        ctx->vs->capture_nir)
       (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
    if (discard)
