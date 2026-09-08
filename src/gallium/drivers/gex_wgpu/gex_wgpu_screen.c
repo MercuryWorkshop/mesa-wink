@@ -365,7 +365,11 @@ gex_wgpu_buffer_texture_code(enum pipe_format format)
  * limit applies to those rather than to everything bound. */
 #define GEX_WGPU_MAX_VERTEX_BUFFERS 8
 #define GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS PIPE_MAX_ATTRIBS
-#define GEX_WGPU_MAX_VERTEX_ELEMENTS 16
+/* Raised from sixteen with the vertex-attribute limit: the passthrough
+ * rasterisation of an emulated stage builds one element per varying, so its
+ * capacity has to reach whatever the device granted. Array capacity only --
+ * what GL reports as MAX_VERTEX_ATTRIBS is a separate claim. */
+#define GEX_WGPU_MAX_VERTEX_ELEMENTS 32
 /* Constant buffer slots past what WebGPU allows as uniform buffers are backed
  * by storage buffers instead, bound above the uniform ones in the same group. */
 #define GEX_WGPU_STORAGE_UBO_FIRST_BINDING GEX_WGPU_MAX_CONSTANT_BUFFERS
@@ -1479,6 +1483,14 @@ struct gex_wgpu_screen {
     * browser -- and the difference is a shader that links against one that
     * does not. */
    uint32_t max_inter_stage;
+   /* Vertex attributes the device granted, which bounds the *passthrough*
+    * rasterisation of an emulated geometry or tessellation stage: every
+    * varying the stage produces arrives at the passthrough vertex shader as
+    * an attribute. WebGPU guarantees sixteen and nobody had asked for more;
+    * this adapter offers thirty. Never below sixteen, so the floor the rest
+    * of the driver assumes still holds, and never above
+    * GEX_WGPU_MAX_VARYINGS, which is the array bound. */
+   uint32_t max_raster_varyings;
    /* Storage textures the device grants per stage. Only images the shader
     * *writes* cost one of these -- a read-only image is bound as a sampled
     * texture -- so this bounds the writable count rather than the declared
@@ -9285,9 +9297,22 @@ gex_wgpu_lower_line_stipple(nir_shader *nir, unsigned location,
  * not already declare. WebGPU takes sixteen vertex attributes, so a shader
  * using all of them cannot have another and the draw goes unexpanded. */
 static unsigned
-gex_wgpu_point_corner_location(const struct gex_wgpu_shader *vs)
+gex_wgpu_point_corner_location(const struct gex_wgpu_shader *vs,
+                               unsigned attribute_count)
 {
-   for (unsigned location = 0; location < 16; ++location)
+   /* Over what the device granted, not over sixteen. The bound used to be a
+    * literal 16 -- WebGPU's guarantee -- and stayed one after the driver
+    * started asking for the adapter's real maximum, which is thirty here. A
+    * passthrough vertex shader carrying seventeen or more varyings then had
+    * every location the search could see taken, and the points came out one
+    * pixel wide with the reason printed and no way to act on it.
+    *
+    * That is `a-looser-cap-needs-following`: raising a limit is only half of
+    * it, and the half that is easy to miss is the hardcoded number somewhere
+    * else that used to agree with it. */
+   const unsigned bound = MIN2(attribute_count,
+                               (unsigned)GEX_WGPU_MAX_VERTEX_ELEMENTS);
+   for (unsigned location = 0; location < bound; ++location)
       if (!(vs->vertex_locations & BITFIELD64_BIT(location)))
          return location;
    return ~0u;
@@ -40035,7 +40060,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             instanced_elements +=
                ctx->vertex_elements->elements[i].instance_divisor != 0;
       const unsigned corner_location =
-         gex_wgpu_point_corner_location(ctx->vs);
+         gex_wgpu_point_corner_location(
+            ctx->vs, gex_screen(pipe->screen)->max_raster_varyings + 1u);
       /* An indexed draw is de-indexed rather than refused; see
        * gex_wgpu_gather_indexed_vertices. Only the two widths WebGPU has,
        * and only a draw whose strides are whole dwords -- the gather copies
@@ -44787,7 +44813,7 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
       caps->max_inputs =
          stages[i] == MESA_SHADER_TESS_EVAL   ? GEX_WGPU_MAX_VARYINGS
          : stages[i] == MESA_SHADER_FRAGMENT  ? screen->max_inter_stage
-                                              : GEX_WGPU_MAX_RASTER_VARYINGS;
+                                              : screen->max_raster_varyings;
       /* st/mesa reports MaxGeometryOutputComponents as four times this, and
        * GL 3.2 requires 128. Eight slots gave 32 -- a quarter of the floor --
        * and transform_feedback's geometry cases failed at link time with
@@ -44811,7 +44837,7 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
          stages[i] == MESA_SHADER_FRAGMENT ? 8
          : stages[i] == MESA_SHADER_TESS_CTRL ? GEX_WGPU_MAX_VARYINGS
          : stages[i] == MESA_SHADER_VERTEX ? screen->max_inter_stage
-                                           : GEX_WGPU_MAX_RASTER_VARYINGS;
+                                           : screen->max_raster_varyings;
       caps->max_temps = 256;
       caps->max_const_buffer0_size = 16 * 1024;
       /* Never more than the device will bind. st/mesa needs 13 for
@@ -45071,6 +45097,7 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->max_storage_buffers_vertex = 0;
    screen->max_storage_buffers = 0;
    screen->max_inter_stage = GEX_WGPU_MAX_RASTER_VARYINGS;
+   screen->max_raster_varyings = GEX_WGPU_MAX_RASTER_VARYINGS;
    screen->max_storage_textures = GEX_WGPU_MAX_SHADER_IMAGES;
    screen->max_storage_buffer_size = 0;
    screen->uniform_offset_alignment = 256;   /* WebGPU's default, the worst */
@@ -45108,6 +45135,26 @@ gex_wgpu_screen_create(WGPUDevice device)
          screen->max_dynamic_storage_buffers = (uint32_t)atoi(force);
    }
    if (got_limits) {
+      /* The attribute count the passthrough is really bounded by. Clamped
+       * both ways: below by the floor the rest of the driver assumes, above
+       * by GEX_WGPU_MAX_VARYINGS, which is how big the arrays are. */
+      if (limits.maxVertexAttributes != WGPU_LIMIT_U32_UNDEFINED &&
+          limits.maxVertexAttributes > GEX_WGPU_MAX_RASTER_VARYINGS) {
+         /* One attribute short of what the device grants, held back for the
+          * wide-point expansion: a point wider than a pixel is drawn as six
+          * vertices per point with the corner offsets in a vertex attribute
+          * of their own, so a stage that fills every attribute with varyings
+          * leaves the expansion nothing and the points come out one pixel
+          * wide -- "points drawn one pixel wide (no free vertex attribute)",
+          * which is geometry_shader.limits.max_output_components exactly.
+          *
+          * The advertised limit is what the test then *uses*, so claiming one
+          * less is claiming what actually works rather than a number that
+          * degrades silently at the top of its range. */
+         screen->max_raster_varyings =
+            MIN2(limits.maxVertexAttributes - 1u,
+                 (uint32_t)GEX_WGPU_MAX_VARYINGS);
+      }
       if (limits.maxInterStageShaderVariables != WGPU_LIMIT_U32_UNDEFINED &&
           limits.maxInterStageShaderVariables >= GEX_WGPU_MAX_RASTER_VARYINGS)
          screen->max_inter_stage =

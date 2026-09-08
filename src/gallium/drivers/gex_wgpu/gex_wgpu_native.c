@@ -298,6 +298,15 @@ create_device(void)
        * note above says -- but the browser's granted exactly the sixteen it
        * was asked for while a shader wanted seventeen, so the ask was the
        * constraint there and not the adapter. */
+      /* Vertex attributes. WebGPU's guarantee is sixteen and this driver had
+       * never asked for more, which is a ceiling on the *passthrough*
+       * rasterisation of a geometry or tessellation draw: every varying the
+       * emulated stage produces arrives as a vertex attribute, so sixteen
+       * varyings leaves nothing free -- "points drawn one pixel wide (no free
+       * vertex attribute)" is that, and so are
+       * geometry_shader.limits.max_output_components and
+       * tessellation_shader's max_in_out_attributes. */
+      GEX_WANT(maxVertexAttributes, 32);
       GEX_WANT(maxStorageBuffersPerShaderStage, 24);
       GEX_WANT(maxStorageBuffersInVertexStage, 24);
       GEX_WANT(maxStorageBuffersInFragmentStage, 24);
@@ -370,6 +379,10 @@ create_device(void)
       GEX_WANT_LOW(minStorageBufferOffsetAlignment, 32);
 #undef GEX_WANT_LOW
 #undef GEX_WANT
+      if (getenv("GEX_WGPU_LIMIT_TRACE"))
+         fprintf(stderr, "gex-limits: adapter vertex attributes %u "
+                 "(asked %u)\n", adapter_limits.maxVertexAttributes,
+                 limits.maxVertexAttributes);
       if (getenv("GEX_WGPU_LIMIT_TRACE"))
          fprintf(stderr, "gex-limits: adapter colour bytes/sample %u "
                  "(asked %u), storage textures/stage %u, storage "
