@@ -548,6 +548,48 @@ static void gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
  * sixteen -- and those caps stay at sixteen by hand. Deriving them from this
  * would advertise a limit that fails at pipeline creation instead of at link
  * time. */
+/* Say a diagnostic once per *shape* rather than once per process.
+ *
+ * `static bool said` is the idiom throughout this file and it is right for a
+ * message that says one thing. It is wrong for one that carries a format, a
+ * slot or a size: the first occurrence is announced and every later one about
+ * something else is swallowed.
+ *
+ * That is not a small loss. A glBlitFramebuffer of COLOR|DEPTH|STENCIL
+ * arrives here as separate blits, and only the colour one being printed had
+ * KHR-GL45.framebuffer_blit.scissor_blit read as a colour defect while its
+ * colour was already correct and its depth was not. Anything a single GL call
+ * fans out into -- a blit, a copy, a resolve, per aspect or per attachment --
+ * wants this instead.
+ *
+ * Sixteen shapes a site, far more than any of these produces, and a
+ * seventeenth simply prints: going quiet is the failure mode being fixed, so
+ * forgetting is the better way to run out. */
+#define GEX_WGPU_SAY_SHAPES 16
+
+static bool
+gex_wgpu_say_once(uint32_t *shapes, unsigned *count, uint32_t shape)
+{
+   for (unsigned i = 0; i < *count; ++i)
+      if (shapes[i] == shape)
+         return false;
+   if (*count < GEX_WGPU_SAY_SHAPES)
+      shapes[(*count)++] = shape;
+   return true;
+}
+
+#define GEX_SAY_CAT2(a, b) a##b
+#define GEX_SAY_CAT(a, b) GEX_SAY_CAT2(a, b)
+/* Used as `GEX_SAY_ONCE_PER(shape) { fprintf(...); }`. The statics are named
+ * by line so two of these can share a block. */
+#define GEX_SAY_ONCE_PER(shape)                                             \
+   static uint32_t GEX_SAY_CAT(gex_said_shapes_, __LINE__)                  \
+      [GEX_WGPU_SAY_SHAPES];                                                \
+   static unsigned GEX_SAY_CAT(gex_said_count_, __LINE__);                  \
+   if (gex_wgpu_say_once(GEX_SAY_CAT(gex_said_shapes_, __LINE__),           \
+                         &GEX_SAY_CAT(gex_said_count_, __LINE__),           \
+                         (uint32_t)(shape)))
+
 #define GEX_WGPU_MAX_VARYINGS 32
 
 /* The subset of the above a rasterized interface may use, and the *floor* for
@@ -25123,9 +25165,8 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
       const unsigned h = (unsigned)abs(box->height);
       if (box->x != 0 || box->y != 0 || dstx != 0 || dsty != 0 ||
           w != src_w || h != src_h || w != dst_w || h != dst_h) {
-         static bool said;
-         if (!said) {
-            said = true;
+         GEX_SAY_ONCE_PER((uint32_t)src->format * 131u + w * 17u + h * 7u +
+                          (uint32_t)box->x * 3u + (uint32_t)box->y) {
             fprintf(stderr, "gex-wgpu: copy declined (a %s copy must take the "
                     "whole subresource; asked for %ux%u at %d,%d of a %ux%u "
                     "level into %u,%u of a %ux%u one)\n",
@@ -25537,9 +25578,7 @@ gex_wgpu_resolve(struct pipe_context *pipe, struct pipe_resource *dst,
     * with it. 48 of KHR-GL45.direct_state_access's error lines were this. */
    if (util_format_is_pure_integer(src->format) ||
        util_format_is_pure_integer(dst->format)) {
-      static bool said;
-      if (!said) {
-         said = true;
+      GEX_SAY_ONCE_PER(src->format) {
          fprintf(stderr, "gex-wgpu: resolve refused: %s is an integer format, "
                  "which WebGPU cannot resolve\n",
                  util_format_short_name(src->format));
@@ -25547,9 +25586,9 @@ gex_wgpu_resolve(struct pipe_context *pipe, struct pipe_resource *dst,
       return false;
    }
    if (dst->format != src->format || dst_level != 0 || src_level != 0) {
-      static bool said;
-      if (!said) {
-         said = true;
+      GEX_SAY_ONCE_PER((uint32_t)dst->format * 131u +
+                       (uint32_t)src->format * 17u + dst_level * 7u +
+                       src_level) {
          fprintf(stderr,
                  "gex-wgpu: resolve refused: dst %s level %u, src %s level %u\n",
                  util_format_short_name(dst->format), dst_level,
@@ -25680,9 +25719,10 @@ gex_wgpu_blit_with_blitter(struct gex_wgpu_context *ctx,
       struct pipe_sampler_view *reachable =
          ctx->base.create_sampler_view(&ctx->base, info->src.resource, &probe);
       if (!reachable) {
-         static bool said;
-         if (!said) {
-            said = true;
+         GEX_SAY_ONCE_PER((uint32_t)info->src.resource->format * 131u +
+                          (uint32_t)info->src.format * 17u +
+                          (uint32_t)info->src.resource->target * 7u +
+                          info->src.level) {
             fprintf(stderr,
                     "gex-wgpu: blit declined (no sampler view for the source: "
                     "%s as %s, target %d, level %u of %u)\n",
@@ -26142,21 +26182,14 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
        * invisible. KHR-GL45.framebuffer_blit.scissor_blit was read as a
        * colour bug for that reason when its colour was already correct and
        * its depth was not; see [[a-latching-message-undercounts]]. */
-      static uint32_t said[16];
-      static unsigned said_count;
-      const uint32_t shape =
-         (uint32_t)info->src.format * 131u + (uint32_t)info->dst.format * 17u +
-         (uint32_t)info->mask * 7u + (uint32_t)info->src.box.width * 3u +
-         (uint32_t)info->dst.box.width +
-         (uint32_t)info->scissor_enable * 1013u +
-         (uint32_t)info->swizzle_enable * 2027u +
-         (uint32_t)info->alpha_blend * 4051u;
-      bool seen = false;
-      for (unsigned i = 0; i < said_count; ++i)
-         seen |= said[i] == shape;
-      if (!seen) {
-         if (said_count < ARRAY_SIZE(said))
-            said[said_count++] = shape;
+      GEX_SAY_ONCE_PER((uint32_t)info->src.format * 131u +
+                       (uint32_t)info->dst.format * 17u +
+                       (uint32_t)info->mask * 7u +
+                       (uint32_t)info->src.box.width * 3u +
+                       (uint32_t)info->dst.box.width +
+                       (uint32_t)info->scissor_enable * 1013u +
+                       (uint32_t)info->swizzle_enable * 2027u +
+                       (uint32_t)info->alpha_blend * 4051u) {
          fprintf(stderr,
                  "gex-wgpu: blit sent to u_blitter: %ux%u->%ux%u %s->%s "
                  "scissor=%d swizzle=%d blend=%d cond=%d wr=%u mask=0x%x\n",
