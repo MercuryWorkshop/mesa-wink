@@ -871,6 +871,40 @@ gex_wgpu_image_is_packed(enum pipe_format format, bool no_read, bool no_write,
        * see the packed_resolved key on the capture variant. */
       return format != PIPE_FORMAT_NONE || no_read;
    if (format == PIPE_FORMAT_NONE)
+      /* An unformatted image that is not a buffer is **not** packed, and the
+       * reason is not the one the buffer branch above gives.
+       *
+       * GLSL permits the format qualifier to be absent only on a write-only
+       * image, and the format then comes from the image *unit* at draw time.
+       * So the obvious move is the buffer branch's -- pack it, and resolve
+       * the format per draw through packed_unformatted. That was tried, and
+       * measured, and it is wrong: KHR-GL45.shader_image_load_store went 39
+       * to 36.
+       *
+       * Not for want of bindings, which was the first guess and also wrong.
+       * `advanced-sso-simple` declares the same four images **twice** -- once
+       * `rgba32f` and once with no qualifier -- and rgba32f *is* a WebGPU
+       * storage format. Packing only the unformatted declaration gives one
+       * image two representations at once: writes land in a storage buffer
+       * while reads come from the storage texture, and nothing carries them
+       * across. The results are wrong rather than declined, which is why the
+       * storage-buffer budget looked like the cause.
+       *
+       * Serving this properly means deciding packed-or-not **per draw**, from
+       * the format the unit actually resolves to, so an image whose format
+       * turns out to be storable keeps the storage texture and stays
+       * consistent with every other declaration of it. That is a module
+       * variant -- which path an image takes decides its bindings -- and
+       * there is no precedent for it yet: a buffer image is always packed, so
+       * only its format has ever needed per-draw resolution.
+       *
+       * What it costs meanwhile is one case, KHR-GL45.stencil_texturing,
+       * which writes stencil through a write-only uimage2D backed by r8ui --
+       * a format WebGPU cannot store -- and is declined by name:
+       *
+       *   dispatch declined (image unit 0 is r8_uint, which WebGPU cannot
+       *   take as a storage texture, and the shader declared no format to
+       *   store through) */
       return false;
    /* An atomic comes here whatever the format can otherwise do, because
     * nothing else can serve it at all -- but only where a texel *is* a
@@ -17502,6 +17536,7 @@ gex_wgpu_texture_format(enum pipe_format format)
    case PIPE_FORMAT_S8_UINT:
    case PIPE_FORMAT_X24S8_UINT:
    case PIPE_FORMAT_S8X24_UINT:
+   case PIPE_FORMAT_X32_S8X24_UINT:
       return WGPUTextureFormat_Stencil8;
    default: return WGPUTextureFormat_Undefined;
    }
@@ -17521,7 +17556,15 @@ gex_wgpu_is_stencil_only_format(enum pipe_format format)
 {
    return format == PIPE_FORMAT_S8_UINT ||
           format == PIPE_FORMAT_X24S8_UINT ||
-          format == PIPE_FORMAT_S8X24_UINT;
+          format == PIPE_FORMAT_S8X24_UINT ||
+          /* The stencil aspect of Z32_FLOAT_S8X24_UINT, and the fourth of the
+           * four spellings util_format_stencil_only can return. Missing it
+           * meant a sampler view of that aspect was refused outright --
+           * "sampler view refused (shape or format) format=x32_s8x24_uint" --
+           * so ARB_stencil_texturing worked on depth24-stencil8 and not on
+           * the float-depth format. Three of four is the shape to watch for;
+           * see [[the-helper-exists-and-nobody-calls-it]]. */
+          format == PIPE_FORMAT_X32_S8X24_UINT;
 }
 
 static bool
@@ -17870,7 +17913,8 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
     * where the texture cannot. Claiming only X24S8_UINT is enough, because
     * st_extensions asks for either one. */
    if (gex_wgpu_is_stencil_only_format(format)) {
-      if (format == PIPE_FORMAT_S8X24_UINT &&
+      if ((format == PIPE_FORMAT_S8X24_UINT ||
+           format == PIPE_FORMAT_X32_S8X24_UINT) &&
           !gex_screen(screen)->depth32_stencil8)
          return false;
       const unsigned allowed = format == PIPE_FORMAT_S8_UINT
