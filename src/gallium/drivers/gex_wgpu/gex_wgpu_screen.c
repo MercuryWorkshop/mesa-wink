@@ -1919,6 +1919,20 @@ struct gex_wgpu_context {
     * refused the draw outright: "Vertex range (first: 0, count: 9) requires a
     * larger buffer (72) than the bound buffer size (40)". */
    uint32_t deindex_gather_mask;
+   /* The same hand-off for the record buffer, and for the same reason: the
+    * nested draw clears point_records_gathered at the top of its point block
+    * before it reaches the binding, so the outer call's gather would be
+    * forgotten and the passthrough would read the *indexed* records in
+    * de-indexed order. */
+   bool deindex_records_gathered;
+   /* The rasterizing draw of an emulated stage whose record already carries
+    * VARYING_SLOT_PRIMITIVE_ID -- a geometry shader that writes
+    * gl_PrimitiveID declares it as an output, so it is a slot like any other
+    * and the passthrough forwards it. Set by the stage that built the
+    * record, and read by the de-index gate: a draw that already has the id
+    * must not be de-indexed to derive one, because the derived number would
+    * overwrite the value the shader actually wrote. */
+   bool passthrough_has_primitive_id;
    /* Where each segment of a stippled strip starts along its line, in
     * pixels, from the prefix pass. */
    struct pipe_resource *line_starts;
@@ -34066,7 +34080,18 @@ gex_wgpu_deindex_for_primitive_id(struct gex_wgpu_context *ctx,
       return false;                                                           \
    } while (0)
 
-   if (!ctx->vertex_elements || !ctx->vs)
+   /* A draw with no vertex elements is not necessarily nothing to gather:
+    * the rasterizing pass of an emulated stage is attributeless and reads its
+    * vertices out of a record buffer instead, which the gather de-indexes the
+    * same way. That is the tessellation case -- the tessellator's output is
+    * indexed and its vertices are *shared* between triangles, so no
+    * per-vertex slot can name one primitive, and de-indexing is what makes
+    * the record number the primitive number again. */
+   const bool records_only =
+      !ctx->vertex_elements && ctx->vs &&
+      ctx->vs->reads_passthrough_records && ctx->passthrough_records &&
+      ctx->records_stride;
+   if ((!ctx->vertex_elements && !records_only) || !ctx->vs)
       GEX_PID_DECLINE("no vertex layout to gather");
    if (info->primitive_restart && info->index_size)
       GEX_PID_DECLINE("primitive restart");
@@ -34148,7 +34173,8 @@ gex_wgpu_deindex_for_primitive_id(struct gex_wgpu_context *ctx,
     */
    memset(ctx->point_gather_wanted, 0, sizeof(ctx->point_gather_wanted));
    memset(ctx->point_gather_stride, 0, sizeof(ctx->point_gather_stride));
-   for (unsigned i = 0; i < ctx->vertex_elements->count; ++i) {
+   for (unsigned i = 0; ctx->vertex_elements && i < ctx->vertex_elements->count;
+        ++i) {
       const struct pipe_vertex_element *ve = &ctx->vertex_elements->elements[i];
       const unsigned buffer = ve->vertex_buffer_index;
       if (buffer >= GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS ||
@@ -34185,10 +34211,12 @@ gex_wgpu_deindex_for_primitive_id(struct gex_wgpu_context *ctx,
    listed_draw.index_bias = 0;
 
    ctx->point_gather_mask = 0;
+   ctx->point_records_gathered = false;
    const bool gathered =
       gex_wgpu_gather_indexed_vertices(ctx, &listed, &listed_draw, out_nr);
-   if (!gathered) {
+   if (!gathered || (records_only && !ctx->point_records_gathered)) {
       ctx->point_gather_mask = 0;
+      ctx->point_records_gathered = false;
       FREE(out);
       GEX_PID_DECLINE("the vertices could not be gathered");
    }
@@ -34217,10 +34245,13 @@ gex_wgpu_deindex_for_primitive_id(struct gex_wgpu_context *ctx,
     * that one; see the field's note. */
    ctx->deindex_gather_mask = ctx->point_gather_mask;
    ctx->point_gather_mask = 0;
+   ctx->deindex_records_gathered = ctx->point_records_gathered;
+   ctx->point_records_gathered = false;
    ctx->primitive_id_rewritten = true;
    gex_wgpu_draw_vbo(pipe, &flat, drawid_offset, NULL, &flat_draw, 1);
    ctx->primitive_id_rewritten = false;
    ctx->deindex_gather_mask = 0;
+   ctx->deindex_records_gathered = false;
    FREE(out);
    return true;
 #undef GEX_PID_DECLINE
@@ -36532,6 +36563,12 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
    ctx->vertex_elements = NULL;
    pipe_resource_reference(&ctx->passthrough_records, ctx->tess_vertices);
    ctx->records_stride = gex_wgpu_varying_stride(&tes->outputs);
+   /* An evaluation shader can write gl_PrimitiveID, in which case it is an
+    * output like any other and the record carries it. When it does not, the
+    * de-index gate below derives the id from the record order instead. */
+   const bool saved_has_pid = ctx->passthrough_has_primitive_id;
+   ctx->passthrough_has_primitive_id =
+      gex_wgpu_varying_slot(&tes->outputs, VARYING_SLOT_PRIMITIVE_ID) >= 0;
    ctx->tcs = NULL;
    ctx->tes = NULL;
 
@@ -36573,6 +36610,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
               (unsigned)raster.mode);
    gex_wgpu_draw_vbo(&ctx->base, &raster, drawid_offset, NULL, &raster_draw, 1);
    ctx->tess_rasterizing = saved_rasterizing;
+   ctx->passthrough_has_primitive_id = saved_has_pid;
 
    ctx->tcs = tcs;
    ctx->tes = tes;
@@ -42113,10 +42151,22 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * 0.) Before the topology rewrite below, so that a strip reaches this as a
     * strip: that rewrite would leave it indexed, which is the other half of
     * what this exists to undo. */
+   /* The tessellation rasterizing pass is *allowed* through, and it is the
+    * one emulated case that needs this. Its record already exists and its
+    * stage is finished -- ctx->tcs and ctx->tes are NULL by then -- so what
+    * arrives here is a plain indexed triangle list over records, and
+    * de-indexing it makes the record number the primitive number.
+    *
+    * A geometry shader is a different matter and stays excluded: one that
+    * writes gl_PrimitiveID declares it as an output, so the record carries
+    * the value the shader chose, which need not resemble any primitive count.
+    * Deriving a number here would overwrite it. passthrough_has_primitive_id
+    * is what the producing stage sets to say so. */
    if (!ctx->failed && info && draws && num_draws == 1 && !indirect &&
        !ctx->primitive_id_rewritten && ctx->fs && ctx->fs->reads_primitive_id &&
        !ctx->gs && !ctx->tcs && !ctx->tes &&
-       !ctx->gs_rasterizing && !ctx->tess_rasterizing &&
+       !ctx->gs_rasterizing &&
+       !ctx->passthrough_has_primitive_id &&
        (info->index_size || !gex_wgpu_primitive_id_verts(info->mode)) &&
        gex_wgpu_deindex_for_primitive_id(ctx, info, drawid_offset, &draws[0]))
       GEX_DRAW_DROP();
@@ -45464,7 +45514,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             is no longer indexed, so a record's number is its place in draw
             order. See gex_wgpu_gather_indexed_vertices. */
          struct gex_wgpu_resource *rec =
-            gex_resource(ctx->point_records_gathered
+            gex_resource((ctx->point_records_gathered ||
+                          ctx->deindex_records_gathered)
                             ? ctx->point_gathered_records
                             : ctx->passthrough_records);
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
@@ -46428,7 +46479,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * no less a read, and a resource the batch does not hold can be
     * overwritten under draws that have not been submitted. */
    if (vs_records)
-      gex_wgpu_batch_touch(ctx, ctx->point_records_gathered
+      gex_wgpu_batch_touch(ctx, (ctx->point_records_gathered ||
+                                 ctx->deindex_records_gathered)
                                    ? ctx->point_gathered_records
                                    : ctx->passthrough_records);
    for (unsigned i = 0; i < ctx->vs->ubo_count; ++i)
