@@ -11612,6 +11612,18 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
             (uint8_t)(var->data.centroid ? 1u : 2u);
       }
    }
+   /* The label's name is taken before the free, and that is the whole of
+    * it: reading nir->info.name after ralloc_free is a use-after-free, and
+    * it segfaulted on the third module of every run -- late enough to look
+    * like a driver defect in whatever was being tested rather than in the
+    * diagnostic added to find it. The buffer is a local because
+    * WGPUStringView does not own its bytes and
+    * wgpuDeviceCreateShaderModule copies during the call, so it has to
+    * outlive that call and nothing more. */
+   char module_label[80];
+   snprintf(module_label, sizeof(module_label), "%s:%s",
+            _mesa_shader_stage_to_abbrev(stage),
+            (nir->info.name && nir->info.name[0]) ? nir->info.name : "app");
    ralloc_free(nir);
    if (!spirv) {
       *error_out = strdup("Mesa NIR to SPIR-V failed");
@@ -11633,6 +11645,26 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
    source.code = (WGPUStringView){wgsl, WGPU_STRLEN};
    WGPUShaderModuleDescriptor desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
    desc.nextInChain = &source.chain;
+   /* Labelled, because every WebGPU validation message about a module or a
+    * pipeline built from one otherwise reads "(unlabeled)".
+    *
+    * This driver runs a dozen generated shaders per draw -- passthroughs,
+    * captures, gathers, quad shaders, scans -- and a message like
+    *
+    *   Binding doesn't exist in [BindGroupLayoutInternal (unlabeled)].
+    *    - While validating that the entry-point's declaration for
+    *      @group(1) @binding(32) matches ...
+    *   [Invalid ComputePipeline (unlabeled)] is invalid.
+    *
+    * names the group and the binding but not *which pass* failed, and
+    * bisecting that by reading cost most of an afternoon. Every generated
+    * shader already carries a name from nir_builder_init_simple_shader, and
+    * an application's carries its stage; this is the one place they all pass
+    * through.
+    *
+    * The buffer is a local because WGPUStringView does not own its bytes and
+    * wgpuDeviceCreateShaderModule copies during the call. */
+   desc.label = (WGPUStringView){module_label, WGPU_STRLEN};
    WGPUShaderModule module = wgpuDeviceCreateShaderModule(
       gex_screen(pipe->screen)->device, &desc);
    const double t_module = os_time_get_nano() / 1000000.0;
