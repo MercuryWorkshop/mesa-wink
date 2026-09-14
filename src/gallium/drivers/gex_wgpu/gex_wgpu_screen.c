@@ -1888,8 +1888,18 @@ enum gex_wgpu_query_slot {
    GEX_WGPU_QUERY_EMITTED,
    /* ARB_transform_feedback_overflow_query, which asks a different question
     * from either counter: not how much was recorded but whether anything was
-    * *not* -- so it is its own target and may run beside them. */
+    * *not* -- so it is its own target and may run beside them.
+    *
+    * **Two** targets, not one. GL_TRANSFORM_FEEDBACK_OVERFLOW asks about any
+    * stream and GL_TRANSFORM_FEEDBACK_STREAM_OVERFLOW about one, they are
+    * distinct query targets, and a program may have both active at once --
+    * which is precisely what
+    * KHR-GL45.transform_feedback_overflow_query_ARB.basic-* does, to check
+    * the two against each other. Sharing one slot made the second
+    * glBeginQuery refuse, and a refusal here is GL_OUT_OF_MEMORY, which dEQP
+    * escalates to a ResourceError that can end a whole run. */
    GEX_WGPU_QUERY_OVERFLOW,
+   GEX_WGPU_QUERY_OVERFLOW_ANY,
    GEX_WGPU_QUERY_SLOTS,
 };
 
@@ -1915,8 +1925,9 @@ gex_wgpu_query_slot(unsigned type)
    case PIPE_QUERY_SO_STATISTICS:
       return GEX_WGPU_QUERY_EMITTED;
    case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
-   case PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE:
       return GEX_WGPU_QUERY_OVERFLOW;
+   case PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE:
+      return GEX_WGPU_QUERY_OVERFLOW_ANY;
    default:
       return -1;
    }
@@ -23979,6 +23990,31 @@ gex_wgpu_set_clip_state(struct pipe_context *pipe,
  * else is refused rather than silently answering zero, which would read as
  * "nothing drawn".
  */
+/* Say which query was refused, and return the NULL that refuses it.
+ *
+ * Both refusals here used to be a bare `return NULL`, and st turns that into
+ * **GL_OUT_OF_MEMORY from glBeginQuery** -- which dEQP treats as a
+ * ResourceError, and a ResourceError does not fail one case, it can end the
+ * whole run. That has happened once already in this file's history
+ * (KHR-GL44.transform_feedback.geometry, 31 cases into a 16843-case mustpass)
+ * and the only thing on stderr either time was nothing at all. One line per
+ * (type, index), so a program looping over queries says it once. */
+static struct pipe_query *
+gex_wgpu_refuse_query(unsigned query_type, unsigned index, const char *why)
+{
+   static uint32_t said[8];
+   const unsigned key = query_type < 256 ? query_type : 255;
+   const unsigned word = key >> 5, bit = 1u << (key & 31);
+   if (word < ARRAY_SIZE(said) && !(said[word] & bit)) {
+      said[word] |= bit;
+      fprintf(stderr,
+              "gex-wgpu: query refused: pipe type %u index %u (%s). st turns "
+              "this into GL_OUT_OF_MEMORY from glBeginQuery.\n",
+              query_type, index, why);
+   }
+   return NULL;
+}
+
 static struct pipe_query *
 gex_wgpu_create_query(struct pipe_context *pipe, unsigned query_type,
                       unsigned index)
@@ -24041,7 +24077,7 @@ gex_wgpu_create_query(struct pipe_context *pipe, unsigned query_type,
    if ((index != 0 && !counted && !overflow) ||
        (!occlusion && !counted && !timer && !overflow) ||
        index >= GEX_WGPU_MAX_VERTEX_STREAMS)
-      return NULL;
+      return gex_wgpu_refuse_query(query_type, index, "query type not served");
 
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
    if (counted || timer) {
@@ -24078,7 +24114,9 @@ gex_wgpu_create_query(struct pipe_context *pipe, unsigned query_type,
 
       if (!ctx->occlusion_set || !ctx->occlusion_resolve ||
           !ctx->occlusion_readback)
-         return NULL;
+         return gex_wgpu_refuse_query(query_type, index,
+                                      "the occlusion query set could not be "
+                                      "created");
    }
 
    struct gex_wgpu_query *query = CALLOC_STRUCT(gex_wgpu_query);
@@ -24122,6 +24160,19 @@ gex_wgpu_query_add(struct gex_wgpu_context *ctx, enum gex_wgpu_query_slot slot,
    struct gex_wgpu_query *query = ctx->active_queries[slot][stream];
    if (query)
       query->result += count;
+}
+
+/* An overflow happened on `stream`: tell both targets that care.
+ *
+ * The per-stream target hears about its own stream; the any-stream target
+ * hears about every stream, because "did any stream overflow" is true as soon
+ * as one did. Three call sites produce this and each used to name a single
+ * slot, which is how they would drift. */
+static void
+gex_wgpu_query_overflow(struct gex_wgpu_context *ctx, unsigned stream)
+{
+   gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_OVERFLOW, stream, 1);
+   gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_OVERFLOW_ANY, 0, 1);
 }
 
 /* Is any stream's query of this group running? The draw paths ask this to
@@ -24232,10 +24283,29 @@ gex_wgpu_begin_query(struct pipe_context *pipe, struct pipe_query *q)
    const int slot = gex_wgpu_query_slot(query->type);
    /* Occupied per (slot, stream): two queries of the same type on *different*
     * streams both run, which is what glBeginQueryIndexed is for. Only the
-    * same stream twice is the error GL defines. */
+    * same stream twice is the error GL defines.
+    *
+    * Refusing here is not free and was silent: st turns a false from
+    * begin_query into **GL_OUT_OF_MEMORY from glBeginQuery**, which dEQP
+    * reports as a ResourceError -- and a ResourceError can end a whole run
+    * rather than fail one case. Say which query and why. */
    if (slot < 0 || query->index >= GEX_WGPU_MAX_VERTEX_STREAMS ||
-       ctx->active_queries[slot][query->index])
+       ctx->active_queries[slot][query->index]) {
+      static uint32_t said;
+      const unsigned key = (unsigned)(query->type & 31);
+      if (!(said & (1u << key))) {
+         said |= 1u << key;
+         fprintf(stderr,
+                 "gex-wgpu: glBeginQuery refused: pipe type %u index %u (%s). "
+                 "st turns this into GL_OUT_OF_MEMORY.\n",
+                 query->type, query->index,
+                 slot < 0 ? "no slot for this query type"
+                 : query->index >= GEX_WGPU_MAX_VERTEX_STREAMS
+                    ? "stream index out of range"
+                    : "a query of this type is already active on this stream");
+      }
       return false;
+   }
    query->active = true;
    query->have_result = false;
    query->counted = false;
@@ -32842,7 +32912,7 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
     * `writable_prims` is what the bound buffers had room for; GL stops on a
     * whole primitive, so the difference is exactly what overflowed. */
    if (total_prims > writable_prims)
-      gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_OVERFLOW, 0, 1);
+      gex_wgpu_query_overflow(ctx, 0);
 
    WGPUBufferDescriptor params_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
    params_desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
@@ -36015,7 +36085,7 @@ gex_wgpu_gs_capture_stream(struct gex_wgpu_context *ctx,
    /* Overflow is a predicate, so it accumulates as "did it ever happen"
     * rather than by how much. */
    if (generated > recorded)
-      gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_OVERFLOW, stream, 1);
+      gex_wgpu_query_overflow(ctx, stream);
    return true;
 }
 
@@ -36944,7 +37014,7 @@ gex_wgpu_tes_capture(struct gex_wgpu_context *ctx, struct gex_wgpu_tes *tes,
    gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_GENERATED, 0, prims);
    gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_EMITTED, 0, recorded);
    if (recorded < prims)
-      gex_wgpu_query_add(ctx, GEX_WGPU_QUERY_OVERFLOW, 0, 1);
+      gex_wgpu_query_overflow(ctx, 0);
    return true;
 }
 
