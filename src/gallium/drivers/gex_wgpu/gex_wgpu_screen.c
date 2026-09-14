@@ -2484,6 +2484,15 @@ struct gex_wgpu_shader {
     * VERT_ATTRIB_* mask whose generic attributes start at bit 16, while the
     * module's locations are driver locations counted from zero. */
    uint64_t vertex_locations;
+   /* Double-precision vertex inputs, as a component count per vertex element
+    * (1 for a `double`, 4 for a `dvec4`) and zero for everything else. WGSL
+    * has no 64-bit float, so such a shader is refused outright unless
+    * gex_wgpu_lower_vertex_attrib_double rewrites it -- and because that
+    * lowering lives in the per-draw variant, a shader with any of these has
+    * its base module deferred, exactly as integer sampling and buffer
+    * textures do. */
+   uint8_t double_inputs[GEX_WGPU_MAX_VERTEX_ELEMENTS];
+   bool has_double_inputs;
    uint64_t vertex_locations_sint;
    uint64_t vertex_locations_uint;
    /* Which @location each Gallium vertex element feeds, or 0xff for an
@@ -12389,6 +12398,35 @@ gex_wgpu_capture_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return false;
 
    b->cursor = nir_before_instr(&intr->instr);
+   /* A 64-bit input is declined rather than fetched, and declining is the
+    * whole point: gex_wgpu_capture_fetch returns 32-bit words, so replacing a
+    * `dvec4` load with them leaves every consumer doing
+    * `unpack_64_2x32_split_x` on a 32-bit source -- which nir_validate
+    * catches and **aborts the process** on. An application that asks for
+    * transform feedback of a double-precision attribute would die rather than
+    * get a wrong answer or a refusal.
+    *
+    * This became reachable the moment gex_wgpu_lower_vertex_attrib_double let
+    * such a shader link at all; before that the program never got this far.
+    * It is the shape lifting-a-refusal-moves-the-failure describes, and the
+    * correct response is to name the new one rather than to leave the old
+    * refusal in place.
+    *
+    * Fetching them properly means eight words for a dvec4 and a pack per
+    * component, which also needs the capture layout to carry the element's
+    * *component count* -- the element's own format is r32g32b32a32_uint
+    * whatever the declaration was, with dual_slot saying "and sixteen more
+    * bytes". Worth doing when something asks; nothing does yet except two CTS
+    * cases. */
+   if (intr->def.bit_size == 64) {
+      gex_wgpu_capture_decline(
+         state, "a 64-bit vertex input cannot be captured yet",
+         deref->var->data.driver_location);
+      nir_def *zero = nir_imm_zero(b, intr->def.num_components, 64);
+      nir_def_rewrite_uses(&intr->def, zero);
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
    nir_def *value = gex_wgpu_capture_fetch(
       b, state, deref->var->data.driver_location, intr->def.num_components);
    nir_def_rewrite_uses(&intr->def, value);
@@ -14849,6 +14887,18 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
             if (element < GEX_WGPU_MAX_VERTEX_ELEMENTS)
                shader->vertex_element_location[element] = (uint8_t)location;
          }
+         /* Only the first slot carries the count: the second is the upper
+          * half of the same attribute and has no declaration of its own. A
+          * dmat or an array of doubles is deliberately not marked -- the
+          * lowering handles a bare vector only, and leaving the rest refused
+          * by name is better than a wrong number. */
+         if (base == GLSL_TYPE_DOUBLE &&
+             glsl_type_is_vector_or_scalar(var->type) &&
+             var->data.driver_location < GEX_WGPU_MAX_VERTEX_ELEMENTS) {
+            shader->double_inputs[var->data.driver_location] =
+               (uint8_t)glsl_get_vector_elements(var->type);
+            shader->has_double_inputs = true;
+         }
       }
    }
    /* Kept for the fragment stage's sampler and output variants, and for the
@@ -14948,6 +14998,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
        shader->unformatted_images != 0 || shader->reads_sample_pos ||
        shader->ms_array_slots != 0 ||
        shader->reads_clip_dist || shader->reads_interp_offset ||
+       shader->has_double_inputs ||
        shader->reads_primitive_id) &&
       (expected_stage == MESA_SHADER_FRAGMENT ||
        expected_stage == MESA_SHADER_VERTEX);
@@ -17416,6 +17467,149 @@ gex_wgpu_ufloat11_to_f32(nir_builder *b, nir_def *bits, unsigned mantissa_bits)
  * makes ntv emit a module whose declared @location type disagrees with the
  * pipeline's vertex format, which WebGPU rejects and which poisons the device
  * for every later command. */
+/* A double-precision vertex input, fetched as uints and reassembled.
+ *
+ * WGSL has no 64-bit float, so `dvec4 in` reaches Tint as an f64 input and the
+ * whole module is refused -- "unhandled float width: 64" -- which arrives at
+ * the application as a *link* error, so the program does not run at all.
+ *
+ * Nothing is computed in 64 bits by the time the driver sees such a shader:
+ * nir_lower_int64 has already run, and the rejected SPIR-V shows every use of
+ * the input as an immediate bitcast to a uint pair --
+ *
+ *     %222 = OpLoad %v4double %attribute_0
+ *     %223 = OpCompositeExtract %double %222 0
+ *     %225 = OpBitcast %ulong %223
+ *     %227 = OpBitcast %v2uint %225
+ *
+ * -- so the variable and its load are the whole problem, and rebuilding each
+ * double with pack_64_2x32_split folds straight back against those bitcasts.
+ * That is the same contract nir_lower_int64 itself relies on.
+ *
+ * The locations cost nothing extra. GL already reserves *two* attribute slots
+ * for a dvec3 or dvec4 -- glsl_count_attribute_slots(type, true) says so, and
+ * the rejected module decorates its dvec4 inputs Location 0, 2, 4, 6 -- and
+ * two uvec4s is exactly what six or eight uint components need. A double or a
+ * dvec2 is four components or fewer and takes one slot, which is again what
+ * GL reserves.
+ *
+ * Only a bare vector is handled. A dmat or an array of doubles is left alone
+ * and still refused, which is no worse than before and says so by name rather
+ * than producing a wrong number; see the caller's mask.
+ */
+static bool
+gex_wgpu_lower_vertex_attrib_double(nir_shader *nir, const uint8_t *doubles)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl)
+      return false;
+
+   /* The replacement halves, by element. Two at most: eight uint components
+    * is a dvec4, the widest GL has. */
+   nir_variable *half[GEX_WGPU_MAX_VERTEX_ELEMENTS][2] = {{NULL}};
+   bool any = false;
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+      const unsigned element = var->data.driver_location;
+      if (element >= GEX_WGPU_MAX_VERTEX_ELEMENTS || !doubles[element])
+         continue;
+      if (!glsl_type_is_vector_or_scalar(var->type) ||
+          glsl_get_base_type(var->type) != GLSL_TYPE_DOUBLE)
+         continue;
+      const unsigned components = glsl_get_vector_elements(var->type);
+      const unsigned words = components * 2u;
+      const unsigned halves = DIV_ROUND_UP(words, 4u);
+      /* Exact widths, not uvec4 twice. The vertex element is split into two
+       * WebGPU attributes whose formats follow these counts, and a `dvec3` is
+       * six words: four and *two*. Declaring the upper half as a uvec4 there
+       * would ask for sixteen bytes where the stride has eight, which is a
+       * validation error rather than a wasted fetch. */
+      const unsigned width[2] = {MIN2(words, 4u), words > 4u ? words - 4u : 0u};
+      /* The first half reuses the variable, so nothing that names it by
+       * pointer has to be found and repaired; the second is new. */
+      var->type = glsl_vector_type(GLSL_TYPE_UINT, width[0]);
+      half[element][0] = var;
+      for (unsigned h = 1; h < halves; ++h) {
+         char name[40];
+         snprintf(name, sizeof(name), "gex_attrib%u_hi", element);
+         nir_variable *hi = nir_variable_create(nir, nir_var_shader_in,
+                                                glsl_vector_type(GLSL_TYPE_UINT,
+                                                                 width[h]),
+                                                name);
+         /* The slot GL already reserved for the upper half of this
+          * attribute. Both numbers move together: driver_location is what the
+          * vertex element is indexed by and what the emitted @location
+          * becomes. */
+         hi->data.location = var->data.location + h;
+         hi->data.driver_location = element + h;
+         hi->data.interpolation = INTERP_MODE_NONE;
+         half[element][h] = hi;
+      }
+      any = true;
+   }
+   if (!any)
+      return false;
+
+   nir_builder b = nir_builder_create(impl);
+   bool progress = false;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type == nir_instr_type_deref) {
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (deref->deref_type == nir_deref_type_var &&
+                deref->var->data.mode == nir_var_shader_in) {
+               const unsigned element = deref->var->data.driver_location;
+               if (element < GEX_WGPU_MAX_VERTEX_ELEMENTS &&
+                   doubles[element] && half[element][0] == deref->var)
+                  deref->type = deref->var->type;
+            }
+            continue;
+         }
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+         if (load->intrinsic != nir_intrinsic_load_deref)
+            continue;
+         nir_deref_instr *deref = nir_src_as_deref(load->src[0]);
+         if (!deref || deref->deref_type != nir_deref_type_var ||
+             deref->var->data.mode != nir_var_shader_in)
+            continue;
+         const unsigned element = deref->var->data.driver_location;
+         if (element >= GEX_WGPU_MAX_VERTEX_ELEMENTS || !doubles[element] ||
+             half[element][0] != deref->var)
+            continue;
+         if (load->def.bit_size != 64)
+            continue;
+
+         const unsigned components = load->def.num_components;
+         b.cursor = nir_after_instr(instr);
+         /* Read both halves whole and index the words: component i of the
+          * double vector is words 2i and 2i+1, which for i >= 2 fall in the
+          * second uvec4. */
+         nir_def *words[2] = {NULL, NULL};
+         nir_def *rebuilt[4];
+         for (unsigned i = 0; i < components && i < 4; ++i) {
+            const unsigned lo = i * 2u, hi = lo + 1u;
+            const unsigned lo_half = lo / 4u, hi_half = hi / 4u;
+            for (unsigned h = lo_half; h <= hi_half; ++h) {
+               if (!words[h] && half[element][h])
+                  words[h] = nir_load_var(&b, half[element][h]);
+            }
+            if (!words[lo_half] || !words[hi_half])
+               break;
+            rebuilt[i] = nir_pack_64_2x32_split(
+               &b, nir_channel(&b, words[lo_half], lo % 4u),
+               nir_channel(&b, words[hi_half], hi % 4u));
+         }
+         nir_def *value = nir_vec(&b, rebuilt, components);
+         nir_def_replace(&load->def, value);
+         progress = true;
+      }
+   }
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   nir_progress(progress, impl, nir_metadata_none);
+   return progress;
+}
+
 static bool
 gex_wgpu_lower_vertex_attrib_unpack(nir_shader *nir, const uint8_t *kinds)
 {
@@ -17573,8 +17767,17 @@ gex_wgpu_create_vertex_elements_state(struct pipe_context *pipe,
        * state, which left nothing bound and turned an ordinary draw into a
        * latched context. */
       const bool packed = elements[i].src_stride == 0;
+      /* A dual-slot element is a *64-bit* attribute, and it is accepted now.
+       * st presents one as r32g32b32a32_uint with dual_slot set, meaning "and
+       * another sixteen bytes at +16" -- so the draw path emits two WebGPU
+       * attributes for it, at locations L and L+1, which is exactly the pair
+       * GL already reserves and exactly what
+       * gex_wgpu_lower_vertex_attrib_double declares. Refusing it here
+       * returned NULL from create_vertex_elements_state, which is not a
+       * refused draw: st leaves the previous state bound and the next draw
+       * fetches through it. */
       if (elements[i].vertex_buffer_index >=
-             GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS || elements[i].dual_slot ||
+             GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS ||
           /* A divisor above one is served by de-interleaving the buffer at
            * draw time -- see gex_wgpu_expand_instance_divisors. WebGPU's
            * stepMode advances once per instance and has no divisor, so the
@@ -17584,10 +17787,15 @@ gex_wgpu_create_vertex_elements_state(struct pipe_context *pipe,
           elements[i].src_offset % alignment ||
           (!packed &&
            (uint64_t)elements[i].src_offset + size > elements[i].src_stride)) {
+         /* The format by name, because "size=16" says what the driver made
+          * of it and not what the application asked for -- and for a
+          * dual-slot element those are different questions. */
          fprintf(stderr,
-                 "gex-wgpu: vertex element %u refused: vb=%u dual=%d "
+                 "gex-wgpu: vertex element %u refused: vb=%u fmt=%s dual=%d "
                  "divisor=%u stride=%u offset=%u size=%u align=%u\n",
-                 i, elements[i].vertex_buffer_index, (int)elements[i].dual_slot,
+                 i, elements[i].vertex_buffer_index,
+                 util_format_short_name(elements[i].src_format),
+                 (int)elements[i].dual_slot,
                  elements[i].instance_divisor, elements[i].src_stride,
                  elements[i].src_offset, size, alignment);
          return NULL;
@@ -37065,6 +37273,11 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       }
       if (unpack_attribs)
          gex_wgpu_lower_vertex_attrib_unpack(clone, want_unpack);
+      /* Before nothing in particular, but necessarily in the *variant*: the
+       * base module is deferred for such a shader, so this is the only copy
+       * that is ever compiled. */
+      if (vs->has_double_inputs)
+         gex_wgpu_lower_vertex_attrib_double(clone, vs->double_inputs);
       /* The vertex stage samples multisampled arrays too, and Tint is exact
        * about it -- "WGSL multisampled textures must be 2d and non-arrayed"
        * -- so the same flattening the fragment variant does has to happen
@@ -43619,6 +43832,36 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          vertex_attributes[slot][attribute].offset = element->src_offset;
          vertex_attributes[slot][attribute].shaderLocation = location;
          supplied_locations |= BITFIELD64_BIT(location);
+         /* The upper half of a 64-bit attribute. st gives one element with
+          * dual_slot set rather than two elements, and GL has already
+          * reserved location+1 for it -- glsl_count_attribute_slots(type,
+          * true) counts two for a dvec3 or dvec4, which is where
+          * vertex_locations got both bits.
+          *
+          * The width comes from the *shader*, not from the element: the
+          * element says r32g32b32a32_uint whatever the declaration was, and a
+          * dvec3 is six words, so its upper half is two. Asking for four
+          * there would read sixteen bytes out of an eight-byte tail and
+          * WebGPU rejects the layout for it. */
+         if (element->dual_slot && location + 1 < 64) {
+            const unsigned comps =
+               i < GEX_WGPU_MAX_VERTEX_ELEMENTS ? ctx->vs->double_inputs[i] : 0;
+            const unsigned hi_words = comps * 2u > 4u ? comps * 2u - 4u : 0u;
+            if (hi_words && attribute_counts[slot] <
+                            GEX_WGPU_MAX_VERTEX_ELEMENTS) {
+               const unsigned at = attribute_counts[slot]++;
+               vertex_attributes[slot][at] =
+                  (WGPUVertexAttribute)WGPU_VERTEX_ATTRIBUTE_INIT;
+               vertex_attributes[slot][at].format =
+                  hi_words >= 4 ? WGPUVertexFormat_Uint32x4
+                  : hi_words == 3 ? WGPUVertexFormat_Uint32x3
+                  : hi_words == 2 ? WGPUVertexFormat_Uint32x2
+                                  : WGPUVertexFormat_Uint32;
+               vertex_attributes[slot][at].offset = element->src_offset + 16u;
+               vertex_attributes[slot][at].shaderLocation = location + 1u;
+               supplied_locations |= BITFIELD64_BIT(location + 1u);
+            }
+         }
       }
       for (unsigned slot = 0; slot < vb_slot_count; ++slot) {
          const unsigned buffer = vb_buffer[slot];
