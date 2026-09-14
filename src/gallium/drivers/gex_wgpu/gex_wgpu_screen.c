@@ -1997,6 +1997,9 @@ struct gex_wgpu_context {
     * refused the draw outright: "Vertex range (first: 0, count: 9) requires a
     * larger buffer (72) than the bound buffer size (40)". */
    uint32_t deindex_gather_mask;
+   /* cso_context has the application's queries paused for an internal draw;
+    * see gex_wgpu_set_active_query_state. */
+   bool queries_paused;
    /* The same hand-off for the record buffer, and for the same reason: the
     * nested draw clears point_records_gathered at the top of its point block
     * before it reaches the binding, so the outer call's gather would be
@@ -6026,6 +6029,11 @@ gex_screen(struct pipe_screen *screen)
 {
    return (struct gex_wgpu_screen *)screen;
 }
+
+/* Whether an active conditional render lets this command through. Defined
+ * with the queries, far below; the clear, blit, dispatch and draw paths all
+ * need it and three of them come first. */
+static bool gex_wgpu_render_cond_passes(struct gex_wgpu_context *ctx);
 
 /* Marking the context failed.
  *
@@ -23479,10 +23487,16 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
    const unsigned level_width = resource ? u_minify(resource->width0, level) : 0;
    const unsigned level_height = resource ? u_minify(resource->height0, level) : 0;
    /* render_condition_enabled asks the clear to respect an active
-    * conditional render; this driver implements no set_render_condition, so
-    * none can be active, and st/mesa sets the flag regardless. Latching on it
-    * ended runs. */
-   (void)render_condition_enabled;
+    * conditional render, and it is honoured now.
+    *
+    * The comment here used to say "this driver implements no
+    * set_render_condition, so none can be active" -- which was true when it
+    * was written and stopped being true when gex_wgpu_render_condition was
+    * added. A stale premise is worse than no comment: it explains away the
+    * very thing that needs doing, and it sat directly above the
+    * `(void)` that ignored the flag. */
+   if (render_condition_enabled && !gex_wgpu_render_cond_passes(ctx))
+      return;
    if (ctx->failed || !resource ||
        level > resource->last_level ||
        dst->first_layer != dst->last_layer || dstx != 0 || dsty != 0 ||
@@ -23678,7 +23692,11 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
     * in step with one: this refusal latches, so a depth format added to the
     * table and forgotten here turns a new capability into a dead run. That is
     * how depth16 cost two attempts. */
-   (void)render_condition_enabled;
+   /* Honoured, as the colour clear beside it is: GL lists glClear among the
+    * commands an active conditional render discards, and depth is no
+    * different from colour there. */
+   if (render_condition_enabled && !gex_wgpu_render_cond_passes(ctx))
+      return;
    const bool clearable_depth = dst &&
       util_format_is_depth_or_stencil(dst->format) &&
       gex_wgpu_texture_format(dst->format) != WGPUTextureFormat_Undefined;
@@ -24003,6 +24021,10 @@ static void
 gex_wgpu_query_add(struct gex_wgpu_context *ctx, enum gex_wgpu_query_slot slot,
                    uint64_t count)
 {
+   /* Not while the frontend has the application's queries paused -- see
+    * gex_wgpu_set_active_query_state. */
+   if (ctx->queries_paused)
+      return;
    struct gex_wgpu_query *query = ctx->active_queries[slot];
    if (query && !query->index)
       query->result += count;
@@ -24225,12 +24247,28 @@ gex_wgpu_get_query_result_resource(struct pipe_context *pipe,
                                 : (const void *)&narrow_value);
 }
 
+/* Whether the *application's* queries should count what happens next.
+ *
+ * cso_context turns this off around u_blitter's internal draws and on again
+ * afterwards, so that a blit -- which is a quad this driver rasterizes like
+ * any other -- does not add its primitives to a GL_PRIMITIVES_GENERATED or
+ * transform-feedback query the application has running.
+ *
+ * The comment here used to read "No queries are implemented, so there is
+ * nothing to pause or resume". That was true when it was written and has been
+ * false since occlusion queries landed; meanwhile every glBlitFramebuffer,
+ * every u_blitter clear and every mipmap generation inside an active query
+ * inflated its count, silently. Stale premises are how these survive: the
+ * comment reads as a decision rather than an omission, so nobody looks again.
+ *
+ * Only the *counting* queries need this. The samples-passed query is a real
+ * WebGPU occlusion query attached to a render pass descriptor, and an
+ * internal blit opens its own pass without one, so it cannot contribute. */
 static void
 gex_wgpu_set_active_query_state(struct pipe_context *pipe, bool enable)
 {
-   /* No queries are implemented, so there is nothing to pause or resume. */
-   (void)pipe;
-   (void)enable;
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   ctx->queries_paused = !enable;
 }
 
 /* GL_KHR_robustness' reset query, which is core in GL 4.5.
@@ -25467,6 +25505,18 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
    struct gex_wgpu_compute_state *compute = ctx->compute;
    if (ctx->failed)
+      return;
+   /* An active conditional render covers dispatches, not only draws -- GL
+    * 4.6 lists glDispatchCompute among the commands glBeginConditionalRender
+    * discards. The predicate was consulted in gex_wgpu_draw_vbo and
+    * gex_wgpu_blit and nowhere else, so a dispatch inside a failed
+    * conditional ran anyway and wrote its buffers.
+    *
+    * That is the accepted-and-ignored shape again: caps->conditional_render
+    * is advertised, set_render_condition is implemented, and one of the
+    * commands it governs never asked. KHR-GL45.compute_shader's
+    * conditional-dispatching is the case. */
+   if (!gex_wgpu_render_cond_passes(ctx))
       return;
    if (!compute) {
       /* No compute state means the shader was refused when it was created,
@@ -27608,6 +27658,14 @@ gex_wgpu_clear(struct pipe_context *pipe, unsigned buffers,
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   /* glClear is one of the commands an active conditional render discards,
+    * and `pipe_context::clear` carries no flag to ask about it the way
+    * clear_render_target and clear_depth_stencil do -- st does not check, so
+    * the driver must. Patching only those two left glClear itself
+    * unconditional, which the probe showed by still failing `clear-fails`
+    * while `dispatch-fails` had started passing. */
+   if (!gex_wgpu_render_cond_passes(ctx))
+      return;
    /* A partial channel or stencil mask needs a masked clear, which the
     * per-target clears below cannot express; refuse it rather than write
     * channels GL asked to be left alone. */
@@ -32423,10 +32481,28 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
        * dispatch would run and write nowhere. */
       if (!target || !target->buffer)
          GEX_CAPTURE_LIMIT("a stream output target has no buffer bound");
-      /* Bound whole and offset in the parameters, because a storage binding
-       * offset must be 256-byte aligned and GL promises only four. */
+      /* Bound from this target's *own* base, rounded down to the 256 a
+       * storage binding offset must be a multiple of, with the remainder kept
+       * in the parameters -- GL promises only four-byte alignment, which is
+       * why the remainder exists at all.
+       *
+       * It used to bind the whole buffer at offset zero and put the entire
+       * base in the parameters. That is correct for one target and wrong for
+       * two on the same buffer: both bindings then cover the same range, both
+       * writable, which WebGPU refuses --
+       *
+       *   draw declined (capture binding 17 and capture binding 16 are both
+       *   writable over one range of the same buffer)
+       *
+       * -- and the draw was declined even though GL's two ranges are disjoint.
+       * KHR-GL45.texture_view's view_classes is that shape: it reads its
+       * results back through feedback into one buffer.
+       *
+       * Two targets that genuinely overlap still collide, and still should. */
       struct gex_wgpu_so_target *so = (struct gex_wgpu_so_target *)target;
-      params[GEX_WGPU_PARAM_SO_OFFSET + i] = target->buffer_offset + so->written;
+      const uint64_t so_base = (uint64_t)target->buffer_offset + so->written;
+      const uint64_t so_bind_at = so_base & ~(uint64_t)255;
+      params[GEX_WGPU_PARAM_SO_OFFSET + i] = (uint32_t)(so_base - so_bind_at);
       /* The dispatch below writes it, so a later map has to read it back. */
       gex_resource(target->buffer)->gpu_written = true;
       /* GL stops capturing when a bound buffer would overflow, and it stops
@@ -32453,8 +32529,19 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       bindings[count] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       bindings[count].binding = variant->so_bindings[i];
       bindings[count].buffer = gex_resource(target->buffer)->buffer;
-      bindings[count].offset = 0;
-      bindings[count].size = gex_resource(target->buffer)->allocation_size;
+      bindings[count].offset = so_bind_at;
+      /* To the end of *this target's* range, not the end of the buffer, so
+       * two targets on one buffer do not overlap. Clamped to the allocation
+       * because buffer_offset + buffer_size is GL's view and the allocation
+       * is WebGPU's. */
+      {
+         const uint64_t allocated =
+            gex_resource(target->buffer)->allocation_size;
+         uint64_t end = (uint64_t)target->buffer_offset + target->buffer_size;
+         if (end > allocated)
+            end = allocated;
+         bindings[count].size = end > so_bind_at ? end - so_bind_at : 0;
+      }
       ++count;
    }
 
@@ -38855,10 +38942,24 @@ gex_wgpu_trace_buffer_aliasing(const char *where,
                static bool said;
                if (!said) {
                   said = true;
-                  fprintf(stderr, "gex-wgpu: draw declined (%s binding %u and "
-                          "%s binding %u are both writable over one range of "
-                          "the same buffer)\n", where, bindings[i].binding,
-                          seen->where, seen->binding);
+                  /* With the ranges. "Both writable over one range" does
+                   * not say whether the two really overlap or whether the
+                   * driver bound more than each needed -- and it was the
+                   * latter once already: the stream-output targets bound the
+                   * whole buffer at offset zero and put their base in the
+                   * shader's parameters, so any two on one buffer collided
+                   * whatever GL had asked for. Without the numbers there is
+                   * nothing in the message to check that against. */
+                  fprintf(stderr, "gex-wgpu: draw declined (%s binding %u "
+                          "[%llu..%llu) and %s binding %u [%llu..%llu) are "
+                          "both writable over one range of the same buffer)\n",
+                          where, bindings[i].binding,
+                          (unsigned long long)bindings[i].offset,
+                          (unsigned long long)(bindings[i].offset +
+                                               bindings[i].size),
+                          seen->where, seen->binding,
+                          (unsigned long long)seen->offset,
+                          (unsigned long long)(seen->offset + seen->size));
                }
             }
             continue;
