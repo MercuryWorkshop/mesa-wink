@@ -2360,6 +2360,11 @@ struct gex_wgpu_wide_point {
 
 struct gex_wgpu_shader {
    enum mesa_shader_stage stage;
+   /* The NIR's own name -- "GLSL3" for an application shader -- kept so the
+    * pipeline and layout labels can say *which* program a draw was running.
+    * Copied rather than pointed at, because the NIR is freed long before any
+    * draw uses this. */
+   char name[24];
    unsigned ubo_count;
    /* Bit per entry of ubo_slots: set where that constant buffer is backed by
     * a storage buffer rather than a uniform one. */
@@ -3210,6 +3215,29 @@ struct gex_wgpu_varying_variant {
    struct gex_wgpu_stage_images images;
    WGPUTextureView image_views[GEX_WGPU_MAX_SHADER_IMAGES];
    unsigned image_view_count;
+   /* The application storage blocks *this module* declares, read off the NIR
+    * it was compiled from rather than taken from the shader state.
+    *
+    * The shader's own table is not the answer here, for two reasons that pull
+    * in opposite directions and so cannot both be handled by a flag. This
+    * module is built from a post-strip clone for the ordinary capture and
+    * from the pre-strip clone for a replay, and the strip changes whether a
+    * block is written -- so the read-only mask differs between the two
+    * modules built from one shader, and a layout that disagrees with the
+    * module's `var<storage, read>` or `read_write` is simply rejected. And
+    * whichever clone it came from, the block is still *declared*, so a
+    * dispatch that binds nothing leaves the module's binding unmatched:
+    *
+    *   Binding doesn't exist in [BindGroupLayoutInternal "tess vs capture g1"]
+    *    - ... the entry-point's declaration for @group(1) @binding(32)
+    *
+    * which invalidates the pipeline, and with it the command buffer and every
+    * draw already recorded in it. Reading it off the module removes the
+    * question. */
+   unsigned ssbo_count;
+   uint8_t ssbo_slots[GEX_WGPU_MAX_SHADER_BUFFERS];
+   uint32_t ssbo_bindings[GEX_WGPU_MAX_SHADER_BUFFERS];
+   uint32_t ssbo_readonly_mask;
    struct gex_wgpu_varying_variant *next;
 };
 
@@ -13676,6 +13704,9 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       return NULL;
    }
    shader->stage = expected_stage;
+   snprintf(shader->name, sizeof(shader->name), "%s:%s",
+            _mesa_shader_stage_to_abbrev(expected_stage),
+            (nir->info.name && nir->info.name[0]) ? nir->info.name : "app");
    if (expected_stage == MESA_SHADER_VERTEX)
       shader->inputs_read = nir->info.inputs_read;
 
@@ -21101,6 +21132,7 @@ gex_wgpu_depth_upload_pipeline(struct gex_wgpu_screen *screen,
          WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
       layout_desc.entryCount = 2;
       layout_desc.entries = entry;
+      layout_desc.label = (WGPUStringView){"depth upload g0", WGPU_STRLEN};
       screen->depth_upload_layout =
          wgpuDeviceCreateBindGroupLayout(screen->device, &layout_desc);
    }
@@ -21109,6 +21141,8 @@ gex_wgpu_depth_upload_pipeline(struct gex_wgpu_screen *screen,
       WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
    pipeline_layout_desc.bindGroupLayoutCount = 1;
    pipeline_layout_desc.bindGroupLayouts = &screen->depth_upload_layout;
+   pipeline_layout_desc.label =
+      (WGPUStringView){"depth upload layout", WGPU_STRLEN};
    WGPUPipelineLayout pipeline_layout =
       wgpuDeviceCreatePipelineLayout(screen->device, &pipeline_layout_desc);
 
@@ -21130,6 +21164,7 @@ gex_wgpu_depth_upload_pipeline(struct gex_wgpu_screen *screen,
    fragment.entryPoint = (WGPUStringView){"fs", WGPU_STRLEN};
    fragment.targetCount = 0;
    desc.fragment = &fragment;
+   desc.label = (WGPUStringView){"depth upload", WGPU_STRLEN};
    screen->depth_upload[slot] =
       wgpuDeviceCreateRenderPipeline(screen->device, &desc);
 
@@ -21195,6 +21230,7 @@ gex_wgpu_msaa_depth_pipeline(struct gex_wgpu_screen *screen,
          WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
       layout_desc.entryCount = 1;
       layout_desc.entries = &entry;
+      layout_desc.label = (WGPUStringView){"msaa depth g0", WGPU_STRLEN};
       screen->msaa_depth_layout =
          wgpuDeviceCreateBindGroupLayout(screen->device, &layout_desc);
    }
@@ -21203,6 +21239,8 @@ gex_wgpu_msaa_depth_pipeline(struct gex_wgpu_screen *screen,
       WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
    pipeline_layout_desc.bindGroupLayoutCount = 1;
    pipeline_layout_desc.bindGroupLayouts = &screen->msaa_depth_layout;
+   pipeline_layout_desc.label =
+      (WGPUStringView){"msaa depth layout", WGPU_STRLEN};
    WGPUPipelineLayout resolve_layout =
       wgpuDeviceCreatePipelineLayout(screen->device, &pipeline_layout_desc);
 
@@ -21225,6 +21263,7 @@ gex_wgpu_msaa_depth_pipeline(struct gex_wgpu_screen *screen,
    fragment.entryPoint = (WGPUStringView){"fs", WGPU_STRLEN};
    fragment.targetCount = 0;
    desc.fragment = &fragment;
+   desc.label = (WGPUStringView){"msaa depth resolve", WGPU_STRLEN};
    screen->msaa_depth[slot] =
       wgpuDeviceCreateRenderPipeline(screen->device, &desc);
    if (!screen->msaa_depth[slot])
@@ -21634,6 +21673,7 @@ gex_wgpu_depth_resolve_pipeline(struct gex_wgpu_screen *screen)
       WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    layout_desc.entryCount = 1;
    layout_desc.entries = &entry;
+   layout_desc.label = (WGPUStringView){"depth resolve g0", WGPU_STRLEN};
    screen->msaa_depth_layout =
       wgpuDeviceCreateBindGroupLayout(screen->device, &layout_desc);
 
@@ -21641,6 +21681,8 @@ gex_wgpu_depth_resolve_pipeline(struct gex_wgpu_screen *screen)
       WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
    pipeline_layout_desc.bindGroupLayoutCount = 1;
    pipeline_layout_desc.bindGroupLayouts = &screen->msaa_depth_layout;
+   pipeline_layout_desc.label =
+      (WGPUStringView){"depth resolve layout", WGPU_STRLEN};
    WGPUPipelineLayout pipeline_layout =
       wgpuDeviceCreatePipelineLayout(screen->device, &pipeline_layout_desc);
 
@@ -21661,6 +21703,7 @@ gex_wgpu_depth_resolve_pipeline(struct gex_wgpu_screen *screen)
    desc.multisample.count = 1;
    desc.multisample.mask = 0xffffffffu;
    desc.fragment = &fragment;
+   desc.label = (WGPUStringView){"depth resolve", WGPU_STRLEN};
    screen->depth_resolve = wgpuDeviceCreateRenderPipeline(screen->device, &desc);
 
    if (pipeline_layout)
@@ -25555,17 +25598,21 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
       WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    layout_desc.entryCount = count;
    layout_desc.entries = entries;
+   layout_desc.label = (WGPUStringView){"launch_grid g0", WGPU_STRLEN};
    WGPUBindGroupLayout layout =
       wgpuDeviceCreateBindGroupLayout(screen->device, &layout_desc);
    WGPUPipelineLayoutDescriptor pipeline_layout_desc =
       WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
    pipeline_layout_desc.bindGroupLayoutCount = count ? 1 : 0;
    pipeline_layout_desc.bindGroupLayouts = count ? &layout : NULL;
+   pipeline_layout_desc.label =
+      (WGPUStringView){"launch_grid layout", WGPU_STRLEN};
    WGPUPipelineLayout pipeline_layout =
       wgpuDeviceCreatePipelineLayout(screen->device, &pipeline_layout_desc);
 
    WGPUComputePipelineDescriptor pipeline_desc =
       WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+   pipeline_desc.label = (WGPUStringView){"launch_grid", WGPU_STRLEN};
    pipeline_desc.layout = pipeline_layout;
    WGPUShaderModule compute_module = gex_wgpu_compute_module(ctx, compute);
    if (!compute_module) {
@@ -25590,6 +25637,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    group_desc.layout = layout;
    group_desc.entryCount = count;
    group_desc.entries = bindings;
+   group_desc.label = (WGPUStringView){"launch_grid g0", WGPU_STRLEN};
    WGPUBindGroup group =
       count ? wgpuDeviceCreateBindGroup(screen->device, &group_desc) : NULL;
 
@@ -28094,6 +28142,43 @@ gex_wgpu_capture_slot_of(nir_builder *b, struct gex_wgpu_capture *state)
    return gex_wgpu_capture_slot(b);
 }
 
+/* The application storage blocks a module declares, and whether each is
+ * read-only, taken from the NIR it is about to be compiled from.
+ *
+ * Deliberately blind to the descriptor set: these clones are rewritten into a
+ * compute stage's groups before they get here, and the binding *range* is what
+ * identifies an application block -- see GEX_WGPU_SSBO_FIRST_BINDING, whose
+ * comment says so. The slot is driver_location, which is what
+ * ctx->shader_buffers is indexed by. */
+static void
+gex_wgpu_collect_module_ssbos(nir_shader *nir, unsigned *count,
+                              uint8_t *slots, uint32_t *bindings,
+                              uint32_t *readonly_mask)
+{
+   *count = 0;
+   *readonly_mask = 0;
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
+      if (var->data.binding < GEX_WGPU_SSBO_FIRST_BINDING ||
+          var->data.binding >= GEX_WGPU_IMAGE_FIRST_BINDING)
+         continue;
+      const unsigned slot = var->data.driver_location;
+      bool seen = false;
+      for (unsigned i = 0; i < *count; ++i)
+         if (slots[i] == slot) { seen = true; break; }
+      if (seen || *count >= GEX_WGPU_MAX_SHADER_BUFFERS ||
+          slot >= GEX_WGPU_MAX_SHADER_BUFFERS)
+         continue;
+      slots[*count] = (uint8_t)slot;
+      bindings[*count] = var->data.binding;
+      /* nir_opt_access marks a block the shader only reads, and the SPIR-V
+       * emitter turns that into a read-only declaration -- so this is the
+       * same bit the layout has to agree with. */
+      if (var->data.access & ACCESS_NON_WRITEABLE)
+         *readonly_mask |= UINT32_C(1) << *count;
+      ++*count;
+   }
+}
+
 /* Build, or find, the compute variant of this vertex shader that writes the
  * given varyings for a geometry shader to read. */
 static struct gex_wgpu_varying_variant *
@@ -28413,6 +28498,10 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
       }
    }
 
+   /* Before the compile, because gex_wgpu_compile_nir frees the NIR. */
+   gex_wgpu_collect_module_ssbos(nir, &variant->ssbo_count,
+                                 variant->ssbo_slots, variant->ssbo_bindings,
+                                 &variant->ssbo_readonly_mask);
    char *error = NULL;
    variant->module = gex_wgpu_compile_nir(&ctx->base, nir,
                                           MESA_SHADER_COMPUTE, false, &error);
@@ -32308,12 +32397,16 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    layout_desc.entryCount = count;
    layout_desc.entries = entries;
+   layout_desc.label =
+      (WGPUStringView){"side-effect capture g0", WGPU_STRLEN};
    WGPUBindGroupLayout group_layout =
       wgpuDeviceCreateBindGroupLayout(screen->device, &layout_desc);
    WGPUBindGroupLayoutDescriptor ubo_layout_desc =
       WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    ubo_layout_desc.entryCount = ubo_total;
    ubo_layout_desc.entries = ubo_entries;
+   ubo_layout_desc.label =
+      (WGPUStringView){"side-effect capture g1", WGPU_STRLEN};
    WGPUBindGroupLayout ubo_layout =
       wgpuDeviceCreateBindGroupLayout(screen->device, &ubo_layout_desc);
    WGPUBindGroupLayout group_layouts[2] = {group_layout, ubo_layout};
@@ -32321,11 +32414,15 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
    pipeline_layout_desc.bindGroupLayoutCount = 2;
    pipeline_layout_desc.bindGroupLayouts = group_layouts;
+   pipeline_layout_desc.label =
+      (WGPUStringView){"side-effect capture layout", WGPU_STRLEN};
    WGPUPipelineLayout pipeline_layout =
       wgpuDeviceCreatePipelineLayout(screen->device, &pipeline_layout_desc);
 
    WGPUComputePipelineDescriptor pipeline_desc =
       WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+   pipeline_desc.label =
+      (WGPUStringView){"side-effect capture", WGPU_STRLEN};
    pipeline_desc.layout = pipeline_layout;
    pipeline_desc.compute.module = variant->module;
    pipeline_desc.compute.entryPoint = (WGPUStringView){"main", WGPU_STRLEN};
@@ -32336,11 +32433,14 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    group_desc.layout = group_layout;
    group_desc.entryCount = count;
    group_desc.entries = bindings;
+   group_desc.label = (WGPUStringView){"side-effect capture g0", WGPU_STRLEN};
    WGPUBindGroup group = wgpuDeviceCreateBindGroup(screen->device, &group_desc);
    WGPUBindGroupDescriptor ubo_group_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
    ubo_group_desc.layout = ubo_layout;
    ubo_group_desc.entryCount = ubo_total;
    ubo_group_desc.entries = ubo_bindings;
+   ubo_group_desc.label =
+      (WGPUStringView){"side-effect capture g1", WGPU_STRLEN};
    WGPUBindGroup ubo_group =
       wgpuDeviceCreateBindGroup(screen->device, &ubo_group_desc);
 
@@ -32818,6 +32918,47 @@ gex_wgpu_bind_stage_ssbos(struct gex_wgpu_context *ctx,
    return true;
 }
 
+/* The application storage blocks a varying variant's module declares, bound
+ * into the dispatch's group one.
+ *
+ * This exists as a helper for the same reason gex_wgpu_bind_varying_textures
+ * does: six paths dispatch a varying variant, and until this was written only
+ * two of them bound storage blocks at all. The other four -- the line, the
+ * tessellation and the flat-unfilled vertex captures, and the standalone
+ * position capture -- left the module's binding unmatched, which is not a
+ * wrong answer but an invalid pipeline, and an invalid pipeline loses the
+ * command buffer and every draw already recorded in it.
+ *
+ * KHR-GL45.shader_atomic_counter_ops_tests is where that surfaced, and only
+ * after the bind group layouts were given names: the message had been read as
+ * the atomic replay's for weeks, and the label said "tess vs capture g1". */
+static bool
+gex_wgpu_bind_varying_ssbos(struct gex_wgpu_context *ctx,
+                            const struct gex_wgpu_varying_variant *variant,
+                            const char *pass_name,
+                            struct gex_wgpu_bindings *group)
+{
+   if (getenv("GEX_WGPU_SSBO_TRACE"))
+      fprintf(stderr, "gex-capssbo: %s count=%u readonly=0x%x\n", pass_name,
+              variant->ssbo_count, variant->ssbo_readonly_mask);
+   {
+      /* Names ONE site, so an A/B leaves the other five binding as they did.
+       * The first version of this switch skipped all six, which also disabled
+       * the two binds that predate this change -- so "off" was a third
+       * behaviour rather than HEAD's, and it passed, which read as the fix
+       * being non-causal. */
+      const char *skip = getenv("GEX_WGPU_NO_CAPTURE_SSBO");
+      if (skip && strstr(pass_name, skip))
+         return true;
+   }
+   if (!variant->ssbo_count)
+      return true;
+   return gex_wgpu_bind_stage_ssbos(ctx, group, MESA_SHADER_VERTEX, pass_name,
+                                    variant->ssbo_count, variant->ssbo_slots,
+                                    variant->ssbo_bindings,
+                                    variant->ssbo_readonly_mask);
+}
+
 /* The textures a vertex shader run as a compute pass samples. Every path that
  * dispatches a varying variant needs this, and forgetting it is not a wrong
  * picture but an invalid pipeline, which loses the whole command buffer. */
@@ -32848,7 +32989,8 @@ gex_wgpu_bind_varying_textures(struct gex_wgpu_context *ctx,
 }
 
 static WGPUBindGroupLayout
-gex_wgpu_group_layout(WGPUDevice device, const struct gex_wgpu_bindings *group)
+gex_wgpu_group_layout(WGPUDevice device, const char *label,
+                      const struct gex_wgpu_bindings *group)
 {
    WGPUBindGroupLayoutEntry entries[GEX_WGPU_MAX_GROUP_BINDINGS];
    for (unsigned i = 0; i < group->count; ++i) {
@@ -32887,12 +33029,17 @@ gex_wgpu_group_layout(WGPUDevice device, const struct gex_wgpu_bindings *group)
    WGPUBindGroupLayoutDescriptor desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    desc.entryCount = group->count;
    desc.entries = entries;
+   /* Named by the pass that asked for it. "Binding doesn't exist in
+    * [BindGroupLayoutInternal (unlabeled)]" names the group and the binding
+    * but not which of the fifteen internal dispatches built it, and bisecting
+    * that by reading cost most of an afternoon on the atomic-counter lead. */
+   desc.label = (WGPUStringView){label, WGPU_STRLEN};
    return wgpuDeviceCreateBindGroupLayout(device, &desc);
 }
 
 static WGPUBindGroup
 gex_wgpu_group(WGPUDevice device, WGPUBindGroupLayout layout,
-               const struct gex_wgpu_bindings *group)
+               const char *label, const struct gex_wgpu_bindings *group)
 {
    /* Zeroed whole, not merely filled element by element. WGPU_BIND_GROUP_ENTRY_INIT
     * sets every *field* and says nothing about the padding between them, and
@@ -32954,6 +33101,7 @@ gex_wgpu_group(WGPUDevice device, WGPUBindGroupLayout layout,
    desc.layout = layout;
    desc.entryCount = group->count;
    desc.entries = entries;
+   desc.label = (WGPUStringView){label, WGPU_STRLEN};
    return wgpuDeviceCreateBindGroup(device, &desc);
 }
 
@@ -32979,7 +33127,8 @@ gex_wgpu_group_storage_buffers(const struct gex_wgpu_bindings *group)
 }
 
 static bool
-gex_wgpu_dispatch(struct gex_wgpu_context *ctx, WGPUShaderModule module,
+gex_wgpu_dispatch(struct gex_wgpu_context *ctx, const char *what,
+                  WGPUShaderModule module,
                   const struct gex_wgpu_bindings *g0,
                   const struct gex_wgpu_bindings *g1,
                   struct pipe_resource *zero, unsigned workgroups)
@@ -33016,13 +33165,26 @@ gex_wgpu_dispatch(struct gex_wgpu_context *ctx, WGPUShaderModule module,
     * reach the queue first or it would run after this. */
    gex_wgpu_submit_pending(ctx);
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
-   WGPUBindGroupLayout layout0 = gex_wgpu_group_layout(screen->device, g0);
-   WGPUBindGroupLayout layout1 = gex_wgpu_group_layout(screen->device, g1);
+   /* Every object this dispatch creates is named after the pass, because a
+    * validation message otherwise reads "(unlabeled)" and there are fifteen
+    * callers. The buffers are locals: WGPUStringView does not own its bytes
+    * and each create call copies during the call, so they need to outlive
+    * that call and nothing more. */
+   char label_g0[72], label_g1[72], label_pl[72], label_pipe[72];
+   snprintf(label_g0, sizeof(label_g0), "%s g0", what);
+   snprintf(label_g1, sizeof(label_g1), "%s g1", what);
+   snprintf(label_pl, sizeof(label_pl), "%s layout", what);
+   snprintf(label_pipe, sizeof(label_pipe), "%s", what);
+   WGPUBindGroupLayout layout0 =
+      gex_wgpu_group_layout(screen->device, label_g0, g0);
+   WGPUBindGroupLayout layout1 =
+      gex_wgpu_group_layout(screen->device, label_g1, g1);
    WGPUBindGroupLayout layouts[2] = {layout0, layout1};
    WGPUPipelineLayoutDescriptor pipeline_layout_desc =
       WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
    pipeline_layout_desc.bindGroupLayoutCount = 2;
    pipeline_layout_desc.bindGroupLayouts = layouts;
+   pipeline_layout_desc.label = (WGPUStringView){label_pl, WGPU_STRLEN};
    WGPUPipelineLayout pipeline_layout =
       wgpuDeviceCreatePipelineLayout(screen->device, &pipeline_layout_desc);
 
@@ -33031,11 +33193,14 @@ gex_wgpu_dispatch(struct gex_wgpu_context *ctx, WGPUShaderModule module,
    pipeline_desc.layout = pipeline_layout;
    pipeline_desc.compute.module = module;
    pipeline_desc.compute.entryPoint = (WGPUStringView){"main", WGPU_STRLEN};
+   pipeline_desc.label = (WGPUStringView){label_pipe, WGPU_STRLEN};
    WGPUComputePipeline pipeline =
       wgpuDeviceCreateComputePipeline(screen->device, &pipeline_desc);
 
-   WGPUBindGroup group0 = gex_wgpu_group(screen->device, layout0, g0);
-   WGPUBindGroup group1 = gex_wgpu_group(screen->device, layout1, g1);
+   WGPUBindGroup group0 =
+      gex_wgpu_group(screen->device, layout0, label_g0, g0);
+   WGPUBindGroup group1 =
+      gex_wgpu_group(screen->device, layout1, label_g1, g1);
    WGPUCommandEncoder encoder =
       wgpuDeviceCreateCommandEncoder(screen->device, NULL);
 
@@ -33777,7 +33942,8 @@ gex_wgpu_gather_indexed_vertices(struct gex_wgpu_context *ctx,
       gex_wgpu_bind_storage(&group0, GEX_WGPU_GATHER_DST_BINDING,
                             ctx->point_gathered[buffer]);
       ok = param_buffer &&
-           gex_wgpu_dispatch(ctx, module, &group0, &group1, NULL,
+           gex_wgpu_dispatch(ctx, "point gather (vertices)", module,
+                             &group0, &group1, NULL,
                              DIV_ROUND_UP(total, GEX_WGPU_GATHER_GROUP));
       if (getenv("GEX_WGPU_POINT_LOG")) {
          static unsigned told;
@@ -33826,7 +33992,8 @@ gex_wgpu_gather_indexed_vertices(struct gex_wgpu_context *ctx,
          gex_wgpu_bind_storage(&group0, GEX_WGPU_GATHER_DST_BINDING,
                                ctx->point_gathered_records);
          ok = param_buffer &&
-              gex_wgpu_dispatch(ctx, module, &group0, &group1, NULL,
+              gex_wgpu_dispatch(ctx, "point gather (records)", module,
+                                &group0, &group1, NULL,
                                 DIV_ROUND_UP(total, GEX_WGPU_GATHER_GROUP));
          pipe_resource_reference(&param_buffer, NULL);
          if (ok)
@@ -34279,8 +34446,11 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
                                      ctx->vs->ubo_bindings,
                                      ctx->vs->ubo_storage_mask);
    if (ok)
-      ok = gex_wgpu_dispatch(ctx, variant->module, &vs_group0, &vs_group1,
-                             NULL,
+      ok = gex_wgpu_bind_varying_ssbos(ctx, variant, "line vertex capture",
+                                       &vs_group1);
+   if (ok)
+      ok = gex_wgpu_dispatch(ctx, "line vs capture", variant->module,
+                             &vs_group0, &vs_group1, NULL,
                              DIV_ROUND_UP(draw->count,
                                           GEX_WGPU_CAPTURE_GROUP));
    pipe_resource_reference(&vs_params, NULL);
@@ -34351,7 +34521,8 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
          gex_wgpu_bind_storage(&prefix_group0, GEX_WGPU_PREFIX_OUT_BINDING,
                                ctx->line_starts);
          have_starts = prefix_buffer &&
-                       gex_wgpu_dispatch(ctx, prefix, &prefix_group0,
+                       gex_wgpu_dispatch(ctx, "line prefix scan", prefix,
+                                         &prefix_group0,
                                          &prefix_group1, NULL, 1);
          pipe_resource_reference(&prefix_buffer, NULL);
       }
@@ -34838,8 +35009,9 @@ gex_wgpu_gs_scan(struct gex_wgpu_context *ctx, unsigned prims)
                                 ctx->gs_counts, true);
    gex_wgpu_bind_storage(&scan_group0, GEX_WGPU_GSSCAN_OFFSETS_BINDING,
                          ctx->gs_offsets);
-   const bool ok = scan_buffer && gex_wgpu_dispatch(ctx, scan, &scan_group0,
-                                                    &scan_group1, NULL, 1);
+   const bool ok = scan_buffer &&
+      gex_wgpu_dispatch(ctx, "gs scan", scan, &scan_group0,
+                        &scan_group1, NULL, 1);
    pipe_resource_reference(&scan_buffer, NULL);
    if (!ok)
       gex_dispatch_gave_up(ctx);
@@ -34919,7 +35091,8 @@ gex_wgpu_gs_capture(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs,
    gex_wgpu_bind_storage_access(&group0, GEX_WGPU_GSXFB_INDICES_BINDING,
                                 ctx->gs_indices, true);
    const bool ok = param_buffer &&
-        gex_wgpu_dispatch(ctx, compact, &group0, &group1, NULL,
+        gex_wgpu_dispatch(ctx, "gs compact", compact, &group0, &group1,
+                          NULL,
                           DIV_ROUND_UP(prims * gs->max_output_prims,
                                        GEX_WGPU_GSXFB_GROUP));
    pipe_resource_reference(&param_buffer, NULL);
@@ -35207,18 +35380,18 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                                      ctx->vs->ubo_count, ctx->vs->ubo_slots,
                                      ctx->vs->ubo_bindings,
                                      ctx->vs->ubo_storage_mask);
-   /* Writable, with a zero read-only mask: ssbo_readonly_mask describes the
-    * stripped shader, where nothing writes the block, while the replay module
-    * declares read_write -- and a layout that disagrees simply fails to build,
-    * which reads as the pass doing nothing. */
-   if (ok && vs_replay)
-      ok = gex_wgpu_bind_stage_ssbos(ctx, &vs_group1, MESA_SHADER_VERTEX,
-                                     "geometry vertex capture",
-                                     ctx->vs->ssbo_count, ctx->vs->ssbo_slots,
-                                     ctx->vs->ssbo_bindings, 0);
+   /* From the variant's own table, not the shader's. This used to be the
+    * shader's with a hardcoded zero read-only mask and a `vs_replay` guard,
+    * which was right for the replay clone by construction and wrong for the
+    * ordinary one in both halves: the post-strip module declares the block
+    * too, and may declare it read-only. The variant reads its mask off the
+    * module it compiled, so neither the guard nor the constant is needed. */
    if (ok)
-      ok = gex_wgpu_dispatch(ctx, variant->module, &vs_group0, &vs_group1,
-                             NULL,
+      ok = gex_wgpu_bind_varying_ssbos(ctx, variant, "geometry vertex capture",
+                                       &vs_group1);
+   if (ok)
+      ok = gex_wgpu_dispatch(ctx, "gs vs capture", variant->module,
+                             &vs_group0, &vs_group1, NULL,
                              DIV_ROUND_UP(captured,
                                           GEX_WGPU_CAPTURE_GROUP));
    pipe_resource_reference(&vs_params, NULL);
@@ -35285,8 +35458,8 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
       GEX_GS_DECLINE("no geometry module for the bound sampler state");
    }
    if (ok)
-      ok = gex_wgpu_dispatch(ctx, gs_module, &gs_group0, &gs_group1,
-                             ctx->gs_indices,
+      ok = gex_wgpu_dispatch(ctx, "gs stage", gs_module,
+                             &gs_group0, &gs_group1, ctx->gs_indices,
                              DIV_ROUND_UP(runs, GEX_WGPU_GS_GROUP));
    for (unsigned i = 0; i < gs_image_view_count; ++i)
       wgpuTextureViewRelease(gs_image_views[i]);
@@ -35781,7 +35954,8 @@ gex_wgpu_tes_capture(struct gex_wgpu_context *ctx, struct gex_wgpu_tes *tes,
    gex_wgpu_bind_storage_access(&group0, GEX_WGPU_TESXFB_INDICES_BINDING,
                                 ctx->tess_indices, true);
    const bool ok = param_buffer &&
-        gex_wgpu_dispatch(ctx, compact, &group0, &group1, NULL,
+        gex_wgpu_dispatch(ctx, "tes compact", compact, &group0, &group1,
+                          NULL,
                           DIV_ROUND_UP(prims, GEX_WGPU_TESXFB_GROUP));
    pipe_resource_reference(&param_buffer, NULL);
    if (!ok) {
@@ -36033,8 +36207,12 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                                      ctx->vs->ubo_bindings,
                                      ctx->vs->ubo_storage_mask);
    if (ok)
-      ok = gex_wgpu_dispatch(ctx, vs_variant->module, &vs_group0, &vs_group1,
-                             NULL,
+      ok = gex_wgpu_bind_varying_ssbos(ctx, vs_variant,
+                                       "tessellation vertex capture",
+                                       &vs_group1);
+   if (ok)
+      ok = gex_wgpu_dispatch(ctx, "tess vs capture", vs_variant->module,
+                             &vs_group0, &vs_group1, NULL,
                              DIV_ROUND_UP(patches * verts_in,
                                           GEX_WGPU_CAPTURE_GROUP));
    pipe_resource_reference(&vs_params, NULL);
@@ -36123,7 +36301,8 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
          }
          ok = false;
       } else {
-         ok = gex_wgpu_dispatch(ctx, tcs_module, &tcs_group0, &tcs_group1,
+         ok = gex_wgpu_dispatch(ctx, "tcs stage", tcs_module,
+                                &tcs_group0, &tcs_group1,
                                 ctx->tess_levels, patches);
       }
    }
@@ -36296,8 +36475,8 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
                                   tes->ssbo_slots, tes->ssbo_bindings,
                                   tes->ssbo_readonly_mask);
    if (ok)
-      ok = gex_wgpu_dispatch(ctx, variant->module, &tes_group0, &tes_group1,
-                             NULL,
+      ok = gex_wgpu_dispatch(ctx, "tes stage", variant->module,
+                             &tes_group0, &tes_group1, NULL,
                              DIV_ROUND_UP(vertex_count, GEX_WGPU_TESS_GROUP));
    for (unsigned i = 0; i < tes_image_view_count; ++i)
       wgpuTextureViewRelease(tes_image_views[i]);
@@ -37209,6 +37388,7 @@ gex_wgpu_layout_storage_buffers(const WGPUBindGroupLayoutEntry *entries,
 
 static WGPUBindGroupLayout
 gex_wgpu_cached_bind_group_layout(struct gex_wgpu_screen *screen,
+                                  const char *label,
                                   const WGPUBindGroupLayoutEntry *entries,
                                   unsigned count)
 {
@@ -37231,6 +37411,13 @@ gex_wgpu_cached_bind_group_layout(struct gex_wgpu_screen *screen,
    WGPUBindGroupLayoutDescriptor desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
    desc.entryCount = count;
    desc.entries = entries;
+   /* The label is *not* part of the key, and deliberately: the key is the
+    * entry array, so two programs whose group 1 has the same shape share one
+    * layout and it keeps the name of whichever built it first. That is a
+    * diagnostic being approximate, not a correctness problem -- and it is
+    * still the difference between "(unlabeled)" and knowing the shape came
+    * from a draw's group 1 rather than from one of the internal passes. */
+   desc.label = (WGPUStringView){label, WGPU_STRLEN};
    WGPUBindGroupLayout layout =
       wgpuDeviceCreateBindGroupLayout(screen->device, &desc);
    if (!layout)
@@ -37263,6 +37450,7 @@ gex_wgpu_cached_bind_group_layout(struct gex_wgpu_screen *screen,
 
 static WGPUPipelineLayout
 gex_wgpu_cached_pipeline_layout(struct gex_wgpu_screen *screen,
+                                const char *label,
                                 WGPUBindGroupLayout *layouts, unsigned count)
 {
    simple_mtx_lock(&screen->cache_lock);
@@ -37283,6 +37471,8 @@ gex_wgpu_cached_pipeline_layout(struct gex_wgpu_screen *screen,
    WGPUPipelineLayoutDescriptor desc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
    desc.bindGroupLayoutCount = count;
    desc.bindGroupLayouts = layouts;
+   /* Shared between programs with the same layouts, as above. */
+   desc.label = (WGPUStringView){label, WGPU_STRLEN};
    WGPUPipelineLayout layout =
       wgpuDeviceCreatePipelineLayout(screen->device, &desc);
    if (!layout)
@@ -39077,7 +39267,7 @@ gex_wgpu_release_retired_groups(struct gex_wgpu_screen *screen)
  * recycled address would silently match the wrong entry. */
 static WGPUBindGroup
 gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
-                           WGPUBindGroupLayout layout,
+                           const char *label, WGPUBindGroupLayout layout,
                            const WGPUBindGroupEntry *entries, unsigned count)
 {
    simple_mtx_lock(&screen->cache_lock);
@@ -39128,6 +39318,10 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    desc.layout = layout;
    desc.entryCount = count;
    desc.entries = entries;
+   /* Not part of the key, for the same reason the layout's is not: the key is
+    * the layout plus the entries, and a group reused by another draw keeps
+    * the name of the one that built it. */
+   desc.label = (WGPUStringView){label, WGPU_STRLEN};
    WGPUBindGroup group = wgpuDeviceCreateBindGroup(screen->device, &desc);
    if (!group)
       { const WGPUBindGroup gex_ret = NULL;
@@ -39876,7 +40070,11 @@ gex_wgpu_capture_positions(struct gex_wgpu_context *ctx, unsigned first,
                                      ctx->vs->ubo_bindings,
                                      ctx->vs->ubo_storage_mask);
    if (ok)
-      ok = gex_wgpu_dispatch(ctx, variant->module, &group0, &group1, NULL,
+      ok = gex_wgpu_bind_varying_ssbos(ctx, variant, "position capture",
+                                       &group1);
+   if (ok)
+      ok = gex_wgpu_dispatch(ctx, "position capture", variant->module,
+                             &group0, &group1, NULL,
                              DIV_ROUND_UP(count, GEX_WGPU_CAPTURE_GROUP));
    pipe_resource_reference(&param_buffer, NULL);
    if (ok)
@@ -40795,8 +40993,11 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
                                    ctx->vs->ubo_count, ctx->vs->ubo_slots,
                                    ctx->vs->ubo_bindings,
                                    ctx->vs->ubo_storage_mask) &&
-           gex_wgpu_dispatch(ctx, variant->module, &vs_group0, &vs_group1,
-                             NULL,
+           gex_wgpu_bind_varying_ssbos(ctx, variant,
+                                       "flat-unfilled vertex capture",
+                                       &vs_group1) &&
+           gex_wgpu_dispatch(ctx, "flat-unfilled vs capture",
+                             variant->module, &vs_group0, &vs_group1, NULL,
                              DIV_ROUND_UP(sections * count,
                                           GEX_WGPU_CAPTURE_GROUP));
    } else {
@@ -41031,12 +41232,10 @@ gex_wgpu_atomic_replay_draw(struct pipe_context *pipe,
                                    ctx->vs->ubo_count, ctx->vs->ubo_slots,
                                    ctx->vs->ubo_bindings,
                                    ctx->vs->ubo_storage_mask) &&
-           gex_wgpu_bind_stage_ssbos(ctx, &vs_group1, MESA_SHADER_VERTEX,
-                                     "atomic-result replay",
-                                     ctx->vs->ssbo_count, ctx->vs->ssbo_slots,
-                                     ctx->vs->ssbo_bindings, 0) &&
-           gex_wgpu_dispatch(ctx, variant->module, &vs_group0, &vs_group1,
-                             NULL,
+           gex_wgpu_bind_varying_ssbos(ctx, variant, "atomic-result replay",
+                                       &vs_group1) &&
+           gex_wgpu_dispatch(ctx, "atomic-result replay", variant->module,
+                             &vs_group0, &vs_group1, NULL,
                              DIV_ROUND_UP(count, GEX_WGPU_CAPTURE_GROUP));
    } else {
       ok = false;
@@ -44711,6 +44910,20 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       : needs_fragment_constant ? 3
       : needs_vertex_constant ? 2 : needs_texture ? 1 : 0;
    const int64_t t_bind_start = gex_timing ? os_time_get_nano() : 0;
+   /* Names the draw for every WebGPU message about the objects below. The
+    * two shader names are what tell one program's draw from another's, which
+    * is the question a validation message otherwise leaves open. Locals,
+    * because WGPUStringView does not own its bytes and every create call
+    * below copies during the call. */
+   char draw_label[72];
+   snprintf(draw_label, sizeof(draw_label), "draw %s/%s",
+            ctx->vs ? ctx->vs->name : "?", ctx->fs ? ctx->fs->name : "?");
+   char group_label[4][80];
+   for (unsigned g = 0; g < 4; ++g)
+      snprintf(group_label[g], sizeof(group_label[g]), "%s g%u",
+               draw_label, g);
+   char layout_label[80];
+   snprintf(layout_label, sizeof(layout_label), "%s layout", draw_label);
    for (unsigned group = 0; group < group_count; ++group) {
       WGPUBindGroupLayoutDescriptor desc =
          WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
@@ -44746,8 +44959,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
       /* Owned by the screen's cache, so nothing here releases it. */
       group_layouts[group] =
-         gex_wgpu_cached_bind_group_layout(screen, desc.entries,
-                                           desc.entryCount);
+         gex_wgpu_cached_bind_group_layout(screen, group_label[group],
+                                           desc.entries, desc.entryCount);
       if (!group_layouts[group]) {
          gex_fail(ctx);
          GEX_DRAW_DROP();
@@ -44755,7 +44968,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    if (group_count) {
       explicit_pipeline_layout =
-         gex_wgpu_cached_pipeline_layout(screen, group_layouts, group_count);
+         gex_wgpu_cached_pipeline_layout(screen, layout_label, group_layouts,
+                                         group_count);
       if (!explicit_pipeline_layout) {
          gex_fail(ctx);
          GEX_DRAW_DROP();
@@ -44769,6 +44983,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    if (gex_timing) gex_wgpu_time_bind += os_time_get_nano() - t_bind_start;
    const int64_t t_pipeline_start = gex_timing ? os_time_get_nano() : 0;
    bool pipeline_cached = false;
+   /* Safe against the pipeline cache without any further thought:
+    * gex_wgpu_pipeline_key already clears head.label before hashing, so the
+    * label is not part of the key and a per-draw stack buffer cannot turn
+    * every lookup into a miss. */
+   pipeline_desc.label = (WGPUStringView){draw_label, WGPU_STRLEN};
    WGPURenderPipeline pipeline =
       gex_wgpu_cached_pipeline(screen, &pipeline_desc, &pipeline_cached);
    if (gex_timing)
@@ -45020,7 +45239,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             (wants_dst ? 1 : 0);
       bind_desc.entries = entries;
       bind_groups[0] = gex_wgpu_cached_bind_group(
-         screen, bind_desc.layout, bind_desc.entries,
+         screen, group_label[0], bind_desc.layout, bind_desc.entries,
          bind_desc.entryCount);
    }
    if (pipeline && needs_vertex_constant) {
@@ -45262,7 +45481,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       bind_desc.entryCount = vertex_group_count;
       bind_desc.entries = entries;
       bind_groups[1] = gex_wgpu_cached_bind_group(
-         screen, bind_desc.layout, bind_desc.entries,
+         screen, group_label[1], bind_desc.layout, bind_desc.entries,
          bind_desc.entryCount);
    }
    if (pipeline && needs_fragment_constant) {
@@ -45577,7 +45796,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       bind_desc.entryCount = fragment_group_count;
       bind_desc.entries = entries;
       bind_groups[2] = gex_wgpu_cached_bind_group(
-         screen, bind_desc.layout, bind_desc.entries,
+         screen, group_label[2], bind_desc.layout, bind_desc.entries,
          bind_desc.entryCount);
    }
    if (pipeline && needs_vertex_texture) {
@@ -45621,7 +45840,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       bind_desc.entryCount = ctx->vs->texture_count + ctx->vs->sampler_count;
       bind_desc.entries = entries;
       bind_groups[3] = gex_wgpu_cached_bind_group(
-         screen, bind_desc.layout, bind_desc.entries,
+         screen, group_label[3], bind_desc.layout, bind_desc.entries,
          bind_desc.entryCount);
    }
    /* The image views are this function's own, unlike everything else here.
