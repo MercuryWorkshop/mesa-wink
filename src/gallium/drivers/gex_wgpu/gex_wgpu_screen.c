@@ -2597,6 +2597,17 @@ struct gex_wgpu_shader {
    bool has_double_inputs;
    uint64_t vertex_locations_sint;
    uint64_t vertex_locations_uint;
+   /* The *upper halves* of 64-bit inputs, which the module declares but this
+    * table does not: gex_wgpu_lower_vertex_attrib_double creates the second
+    * uvec4 on a variant clone, long after vertex_locations is built here.
+    *
+    * Kept separate rather than folded into vertex_locations because that mask
+    * is not only a diagnostic -- it gates a per-location test and an
+    * attribute-count limit, and widening it would change both. This one is
+    * read by the "did the vertex state feed every declared location" check
+    * and nothing else. Without it that check reported `missing 0x0` for the
+    * very shader Dawn was rejecting for a missing location. */
+   uint64_t vertex_locations_hi;
    /* Which @location each Gallium vertex element feeds, or 0xff for an
     * element this shader has no input for. 0xff throughout means the scan
     * found no input variables, and the caller falls back to the element
@@ -15081,9 +15092,16 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          if (base == GLSL_TYPE_DOUBLE &&
              glsl_type_is_vector_or_scalar(var->type) &&
              var->data.driver_location < GEX_WGPU_MAX_VERTEX_ELEMENTS) {
+            const unsigned components = glsl_get_vector_elements(var->type);
             shader->double_inputs[var->data.driver_location] =
-               (uint8_t)glsl_get_vector_elements(var->type);
+               (uint8_t)components;
             shader->has_double_inputs = true;
+            /* Three or four doubles do not fit one uvec4, so the lowering
+             * declares a second at base_location + 1. Recorded here so the
+             * missing-location check below can see it. */
+            if (components >= 3 && base_location + 1 < 64)
+               shader->vertex_locations_hi |=
+                  BITFIELD64_BIT(base_location + 1);
          }
       }
    }
@@ -44520,7 +44538,32 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
              * the layout then reads sixteen bytes out of an eight-byte tail,
              * which WebGPU rejects by name. */
             if (location == 0xff) {
-               if (i == 0 || !ctx->vertex_elements->elements[i - 1].dual_slot)
+               /* Is this the upper half of the element before it?
+                *
+                * `dual_slot` is *one* of the two shapes st produces for a
+                * 64-bit attribute, not the only one, and keying on it alone
+                * was wrong: KHR-GL45.vertex_attrib_64bit.vao arrives with the
+                * halves as two separate elements and `dual_slot` clear on
+                * both -- element 4 at offset 64 and element 5 at offset 80,
+                * sixteen bytes each, which is one dvec4. The test then failed
+                * with "Vertex attribute slot 9 used in ShaderModule is not
+                * present in the VertexState", because elements 5, 7 and 9
+                * were skipped here while the module declared the locations
+                * they should have fed.
+                *
+                * The other shape is the shader's own component count: an
+                * input of three or four doubles is declared by
+                * gex_wgpu_lower_vertex_attrib_double as two uvec4s, so
+                * whatever element follows it with no location of its own is
+                * its second half. */
+               const struct pipe_vertex_element *below_element =
+                  i > 0 ? &ctx->vertex_elements->elements[i - 1] : NULL;
+               const bool upper_half =
+                  below_element &&
+                  (below_element->dual_slot ||
+                   (i - 1 < GEX_WGPU_MAX_VERTEX_ELEMENTS &&
+                    ctx->vs->double_inputs[i - 1] >= 3));
+               if (!upper_half)
                   continue;
                const unsigned below = ctx->vs->vertex_element_location[i - 1];
                if (below == 0xff || below + 1 >= 64)
@@ -44591,7 +44634,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * pipeline was then built with no vertex state while the module still
     * declared its inputs. */
    {
-      const uint64_t missing = ctx->vs->vertex_locations & ~supplied_locations;
+      /* Everything the *module* declares, which is vertex_locations plus the
+       * 64-bit upper halves the variant lowering adds -- see
+       * vertex_locations_hi. Checking only the former reported nothing
+       * missing for KHR-GL45.vertex_attrib_64bit.vao while Dawn refused its
+       * pipeline for "slot 9 not present in the VertexState". */
+      const uint64_t declared =
+         ctx->vs->vertex_locations | ctx->vs->vertex_locations_hi;
+      const uint64_t missing = declared & ~supplied_locations;
       /* Which shader inputs a real vertex buffer feeds, and which fall through
        * to the default-attribute buffer's fixed (0, 0, 0, 1).
        *
@@ -44650,7 +44700,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                     "flip=%d fold=%d scissor=%d %d,%d %dx%d fb=%ux%u "
                     "depthtest=%d func=%d write=%d cfmt=%d srgb=%d\n",
                     (void *)ctx->vs,
-                    (unsigned long long)ctx->vs->vertex_locations,
+                    /* `declared`, not vertex_locations: the two differ by the
+                     * 64-bit upper halves, and printing the narrower one beside
+                     * a `missing` computed from the wider made the line look
+                     * self-contradictory. */
+                    (unsigned long long)declared,
                     (unsigned long long)supplied_locations,
                     (unsigned long long)missing,
                     ctx->vertex_elements ? (int)ctx->vertex_elements->count : -1,
