@@ -450,7 +450,30 @@ gex_wgpu_buffer_texture_code(enum pipe_format format)
  * which is what every caller that never sets them gets. */
 #define GEX_WGPU_PARAM_VERTS_PER_INSTANCE (GEX_WGPU_PARAM_INDEX_BIAS + 1)
 #define GEX_WGPU_PARAM_FIRST_INSTANCE (GEX_WGPU_PARAM_VERTS_PER_INSTANCE + 1)
-#define GEX_WGPU_PARAM_WORDS (GEX_WGPU_PARAM_FIRST_INSTANCE + 1)
+/* ARB_shader_draw_parameters, for a vertex shader replayed as compute.
+ *
+ * The rasterizing copy reads these from a block of its own at
+ * GEX_WGPU_DRAW_PARAMS_BINDING, declared *after* the capture and varying
+ * clones are taken -- deliberately, because a compute variant binds its own
+ * groups and would otherwise carry a storage block nothing fills. The
+ * consequence was that a clone kept the raw intrinsics and every one of them
+ * read **zero**: gl_BaseVertex through a tessellation stage was silently 0
+ * while the same shader drawn plainly was right.
+ *
+ * They ride in the capture's own params block instead, which every one of the
+ * seven capture dispatches already binds -- so there is no new binding to
+ * forget. Separate words from FIRST_VERTEX above, which is the capture's own
+ * first slot and means something else.
+ *
+ * FIRST_VERTEX here is the internal value gl_VertexID is derived from;
+ * BASE_VERTEX is glDrawElements' basevertex and is zero for a command that
+ * has none. They differ, and conflating them is what the rasterizing path's
+ * own comment warns about. */
+#define GEX_WGPU_PARAM_DP_BASE_VERTEX (GEX_WGPU_PARAM_FIRST_INSTANCE + 1)
+#define GEX_WGPU_PARAM_DP_BASE_INSTANCE (GEX_WGPU_PARAM_DP_BASE_VERTEX + 1)
+#define GEX_WGPU_PARAM_DP_DRAW_ID (GEX_WGPU_PARAM_DP_BASE_INSTANCE + 1)
+#define GEX_WGPU_PARAM_DP_FIRST_VERTEX (GEX_WGPU_PARAM_DP_DRAW_ID + 1)
+#define GEX_WGPU_PARAM_WORDS (GEX_WGPU_PARAM_DP_FIRST_VERTEX + 1)
 #define GEX_WGPU_CAPTURE_GROUP 64
 /* Where a vertex shader run as compute writes its varyings when a geometry
  * shader is going to consume them.
@@ -2044,6 +2067,11 @@ struct gex_wgpu_context {
    uint32_t draw_base_vertex;
    uint32_t draw_first_vertex;
    uint32_t draw_base_instance;
+   /* gl_DrawID, kept here rather than passed down because the capture
+    * dispatches are reached from several call paths and not all of them carry
+    * the draw index. Set under the same own_draw_params guard as the three
+    * above, so a restart or multi-draw split keeps the command's value. */
+   uint32_t draw_id;
    uint32_t fb_width;
    uint32_t fb_height;
    /* ARB_framebuffer_no_attachments: a framebuffer with nothing attached,
@@ -12382,19 +12410,27 @@ gex_wgpu_capture_builtin(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    case nir_intrinsic_load_vertex_id_zero_base:
       value = gex_wgpu_capture_vertex_slot(b, state);
       break;
-   case nir_intrinsic_load_first_vertex:
-   case nir_intrinsic_load_base_vertex:
-      value = gex_wgpu_param(b, state, GEX_WGPU_PARAM_FIRST_VERTEX);
-      break;
    case nir_intrinsic_load_instance_id:
       value = gex_wgpu_capture_instance(b, state);
       break;
-   case nir_intrinsic_load_base_instance:
-      value = gex_wgpu_param(b, state, GEX_WGPU_PARAM_FIRST_INSTANCE);
-      break;
-   case nir_intrinsic_load_draw_id:
-      value = nir_imm_int(b, 0);
-      break;
+   /* The four ARB_shader_draw_parameters values used to be answered here, and
+    * two of the four answers were wrong by construction:
+    *
+    *   load_base_vertex -> GEX_WGPU_PARAM_FIRST_VERTEX, which is the
+    *     *capture's* first slot and not GL's basevertex. They are different
+    *     numbers -- the rasterizing path's own comment says so -- and for an
+    *     indexed draw with a basevertex the capture's is zero, so
+    *     gl_BaseVertex read 0.
+    *   load_draw_id -> the immediate zero. gl_DrawID was never anything else
+    *     in a captured shader.
+    *
+    * Both are silent: the draw runs and the number is wrong. They are lowered
+    * by gex_wgpu_lower_draw_params now, from words the caller fills out of the
+    * context, and that pass runs *before* this one in both clone builders so
+    * none of the four reaches here. Left unhandled deliberately rather than
+    * answered again: an intrinsic that arrives here now falls through to
+    * SPIR-V and Tint refuses the module, which is a loud failure and the
+    * right one for a value nobody filled. */
    default:
       return false;
    }
@@ -13098,6 +13134,13 @@ gex_wgpu_constant_binding_size(const struct pipe_constant_buffer *constant,
  */
 struct gex_wgpu_draw_params_lowering {
    nir_variable *block;
+   /* Which word each value lives at. The rasterizing copy has a block of its
+    * own with the four at 0..3; a capture reads them out of its params block,
+    * where they sit above the capture's own words. One pass, two layouts. */
+   unsigned word_first_vertex;
+   unsigned word_base_vertex;
+   unsigned word_base_instance;
+   unsigned word_draw_id;
    bool used;
 };
 
@@ -13109,16 +13152,16 @@ gex_wgpu_lower_draw_params(nir_builder *b, nir_intrinsic_instr *intr,
    unsigned word;
    switch (intr->intrinsic) {
    case nir_intrinsic_load_first_vertex:
-      word = GEX_WGPU_DRAW_PARAM_FIRST_VERTEX;
+      word = state->word_first_vertex;
       break;
    case nir_intrinsic_load_base_vertex:
-      word = GEX_WGPU_DRAW_PARAM_BASE_VERTEX;
+      word = state->word_base_vertex;
       break;
    case nir_intrinsic_load_base_instance:
-      word = GEX_WGPU_DRAW_PARAM_BASE_INSTANCE;
+      word = state->word_base_instance;
       break;
    case nir_intrinsic_load_draw_id:
-      word = GEX_WGPU_DRAW_PARAM_DRAW_ID;
+      word = state->word_draw_id;
       break;
    default:
       return false;
@@ -13949,6 +13992,10 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    if (expected_stage == MESA_SHADER_VERTEX &&
        gex_wgpu_reads_draw_params(nir)) {
       struct gex_wgpu_draw_params_lowering draw_params = {0};
+      draw_params.word_first_vertex = GEX_WGPU_DRAW_PARAM_FIRST_VERTEX;
+      draw_params.word_base_vertex = GEX_WGPU_DRAW_PARAM_BASE_VERTEX;
+      draw_params.word_base_instance = GEX_WGPU_DRAW_PARAM_BASE_INSTANCE;
+      draw_params.word_draw_id = GEX_WGPU_DRAW_PARAM_DRAW_ID;
       draw_params.block =
          gex_wgpu_word_block(nir, "gex_draw_params",
                              GEX_WGPU_DRAW_PARAMS_BINDING, 0, true);
@@ -27862,6 +27909,19 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
                                  nir_metadata_control_flow, &state);
    nir_shader_intrinsics_pass(nir, gex_wgpu_capture_drop_output,
                               nir_metadata_control_flow, &state);
+   /* The same draw-parameter lowering the varying variant takes, and for the
+    * same reason: this clone predates the rasterizing copy's own block, so
+    * without it every one of the three reads zero. */
+   {
+      struct gex_wgpu_draw_params_lowering draw_params = {0};
+      draw_params.block = state.params;
+      draw_params.word_first_vertex = GEX_WGPU_PARAM_DP_FIRST_VERTEX;
+      draw_params.word_base_vertex = GEX_WGPU_PARAM_DP_BASE_VERTEX;
+      draw_params.word_base_instance = GEX_WGPU_PARAM_DP_BASE_INSTANCE;
+      draw_params.word_draw_id = GEX_WGPU_PARAM_DP_DRAW_ID;
+      nir_shader_intrinsics_pass(nir, gex_wgpu_lower_draw_params,
+                                 nir_metadata_control_flow, &draw_params);
+   }
    if (getenv("GEX_WGPU_XFB_DEBUG")) {
       const nir_xfb_info *dbg = nir->xfb_info;
       fprintf(stderr, "gex-xfb: so_mask=0x%x failed=%d outputs=%u written=0x%x\n",
@@ -28302,6 +28362,28 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    state.varying_out = gex_wgpu_word_block(nir, "gex_varying_out",
                                            GEX_WGPU_VARYING_OUT_BINDING, 0, false);
 
+   /* ARB_shader_draw_parameters, against the capture's own params block.
+    *
+    * The rasterizing copy's block is declared *after* this clone is taken --
+    * see the comment where it is created -- so the clone still holds the raw
+    * intrinsics, and nothing lowered them: gl_BaseVertex, gl_BaseInstance and
+    * gl_DrawID all read **zero** in a captured vertex shader. Not a refusal
+    * and not a validation error, just a wrong number, so a draw through a
+    * geometry or tessellation stage was silently wrong while the same shader
+    * drawn plainly was right.
+    *
+    * The params block is bound by every capture dispatch already, which is
+    * why the values ride there rather than in a binding of their own. */
+   {
+      struct gex_wgpu_draw_params_lowering draw_params = {0};
+      draw_params.block = state.params;
+      draw_params.word_first_vertex = GEX_WGPU_PARAM_DP_FIRST_VERTEX;
+      draw_params.word_base_vertex = GEX_WGPU_PARAM_DP_BASE_VERTEX;
+      draw_params.word_base_instance = GEX_WGPU_PARAM_DP_BASE_INSTANCE;
+      draw_params.word_draw_id = GEX_WGPU_PARAM_DP_DRAW_ID;
+      nir_shader_intrinsics_pass(nir, gex_wgpu_lower_draw_params,
+                                 nir_metadata_control_flow, &draw_params);
+   }
    nir_shader_intrinsics_pass(nir, gex_wgpu_capture_input,
                               nir_metadata_control_flow, &state);
    nir_shader_intrinsics_pass(nir, gex_wgpu_capture_builtin,
@@ -31939,6 +32021,13 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
     * add, and the count is the number of assembled vertices rather than the
     * number the draw named. */
    params[GEX_WGPU_PARAM_FIRST_VERTEX] = 0u;
+   /* This one builds its WGPUBuffer directly rather than through
+    * gex_wgpu_params_buffer, so it fills the draw parameters itself; see
+    * gex_wgpu_capture_params_buffer for why they belong in this block. */
+   params[GEX_WGPU_PARAM_DP_BASE_VERTEX] = ctx->draw_base_vertex;
+   params[GEX_WGPU_PARAM_DP_BASE_INSTANCE] = ctx->draw_base_instance;
+   params[GEX_WGPU_PARAM_DP_DRAW_ID] = ctx->draw_id;
+   params[GEX_WGPU_PARAM_DP_FIRST_VERTEX] = ctx->draw_first_vertex;
    /* Zero means "not instanced" to both shader-side accessors, so a
     * single-instance draw keeps the slot as the vertex and the instance as
     * zero, exactly as before. */
@@ -33288,6 +33377,31 @@ gex_wgpu_params_buffer(struct gex_wgpu_context *ctx, const uint32_t *words,
    return resource;
 }
 
+/* The capture params buffer, with ARB_shader_draw_parameters filled in.
+ *
+ * Every capture dispatch builds a `uint32_t params[GEX_WGPU_PARAM_WORDS]` and
+ * makes a buffer of it, and each one is the only place that knows its own
+ * words -- but the four draw parameters are the same for all of them, being
+ * properties of the application's draw rather than of the pass. Filling them
+ * here rather than at the seven sites is what stops the eighth from
+ * forgetting: a forgotten one is not a validation error but a *zero*, which
+ * is the failure mode this driver keeps producing.
+ *
+ * The values are the context's, set once per application draw under the
+ * own_draw_params guard, and still current here: a capture runs inside the
+ * draw that set them, and the nested rasterizing draw is deeper so it does
+ * not overwrite them. */
+static struct pipe_resource *
+gex_wgpu_capture_params_buffer(struct gex_wgpu_context *ctx, uint32_t *params)
+{
+   params[GEX_WGPU_PARAM_DP_BASE_VERTEX] = ctx->draw_base_vertex;
+   params[GEX_WGPU_PARAM_DP_BASE_INSTANCE] = ctx->draw_base_instance;
+   params[GEX_WGPU_PARAM_DP_DRAW_ID] = ctx->draw_id;
+   params[GEX_WGPU_PARAM_DP_FIRST_VERTEX] = ctx->draw_first_vertex;
+   return gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS);
+}
+
+
 static bool
 gex_wgpu_ensure_buffer(struct gex_wgpu_context *ctx,
                        struct pipe_resource **slot, unsigned size,
@@ -34457,7 +34571,7 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
                                    ctx->vertex_buffers[i], true);
    }
    struct pipe_resource *vs_params =
-      gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS);
+      gex_wgpu_capture_params_buffer(ctx, params);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_VARYING_OUT_BINDING,
                          ctx->line_vs_out);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
@@ -35384,7 +35498,7 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
                                    ctx->vertex_buffers[i], true);
    }
    struct pipe_resource *vs_params =
-      gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS);
+      gex_wgpu_capture_params_buffer(ctx, params);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_VARYING_OUT_BINDING,
                          ctx->gs_vs_out);
    gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
@@ -36210,7 +36324,7 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
          GEX_TESS_DECLINE("the slot table buffer could not be made");
    }
    struct pipe_resource *vs_params =
-      gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS);
+      gex_wgpu_capture_params_buffer(ctx, params);
    if (slot_table)
       gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_CAPTURE_INDEX_BINDING,
                             slot_table);
@@ -40095,7 +40209,7 @@ gex_wgpu_capture_positions(struct gex_wgpu_context *ctx, unsigned first,
                                    ctx->vertex_buffers[i], true);
    }
    struct pipe_resource *param_buffer =
-      gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS);
+      gex_wgpu_capture_params_buffer(ctx, params);
    gex_wgpu_bind_storage(&group0, GEX_WGPU_VARYING_OUT_BINDING,
                          ctx->facing_vs_out);
    gex_wgpu_bind_storage(&group0, GEX_WGPU_CAPTURE_PARAMS_BINDING,
@@ -41014,7 +41128,7 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
                                    ctx->vertex_buffers[i], true);
    }
    struct pipe_resource *vs_params = ok
-      ? gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS) : NULL;
+      ? gex_wgpu_capture_params_buffer(ctx, params) : NULL;
    if (ok && vs_params) {
       gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_VARYING_OUT_BINDING,
                             ctx->flat_vs_out);
@@ -41245,7 +41359,7 @@ gex_wgpu_atomic_replay_draw(struct pipe_context *pipe,
                                    ctx->vertex_buffers[i], true);
    }
    struct pipe_resource *vs_params = ok
-      ? gex_wgpu_params_buffer(ctx, params, GEX_WGPU_PARAM_WORDS) : NULL;
+      ? gex_wgpu_capture_params_buffer(ctx, params) : NULL;
    if (ok && vs_params) {
       gex_wgpu_bind_storage(&vs_group0, GEX_WGPU_VARYING_OUT_BINDING,
                             ctx->flat_vs_out);
@@ -41598,8 +41712,10 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
       ctx->draw_first_vertex = info->index_size
          ? (uint32_t)draws[0].index_bias : draws[0].start;
    }
-   if (own_draw_params && info)
+   if (own_draw_params && info) {
       ctx->draw_base_instance = info->start_instance;
+      ctx->draw_id = (uint32_t)drawid_offset;
+   }
    /* A divisor above one is de-interleaved for the length of the draw, once:
     * the restart and multi-draw splits re-enter here, and expanding an
     * already-expanded buffer would index it by i / divisor a second time.
@@ -42239,6 +42355,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             ctx->draw_base_vertex = (uint32_t)draws[i].index_bias;
             ctx->draw_first_vertex = (uint32_t)draws[i].index_bias;
          }
+         /* And its own gl_DrawID, for a *captured* vertex shader. The
+          * rasterizing copy reads the drawid_offset argument passed below and
+          * so was already right; a capture reads ctx->draw_id, which the
+          * nested call will not update -- own_draw_params is false one level
+          * down, deliberately, so that a restart split keeps its command's
+          * values. Set here for the same reason the basevertex above is. */
+         ctx->draw_id = info->increment_draw_id ? (uint32_t)(drawid_offset + i)
+                                                : (uint32_t)drawid_offset;
          /* gl_DrawID counts across the sub-draws of a glMultiDraw* command,
           * and Gallium says so with info->increment_draw_id -- the same loop
           * also serves the primitive-restart splitter, whose ranges all came
