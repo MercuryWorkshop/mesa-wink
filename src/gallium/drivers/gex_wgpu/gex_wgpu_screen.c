@@ -19863,6 +19863,25 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
     * group, which uses a depth of exactly 1: the shader was flattened on its
     * *declaration* while the resource said "not tiled", so the geometry came
     * back all zeros and textureSize answered (0, 0, 0). */
+   /* `samples > 1`, and extending it to `nr_samples >= 1` -- "GL asked for a
+    * multisample array whatever count it got" -- was tried on 2026-09-14 and
+    * is **worse**, so it is recorded here rather than left to be rediscovered.
+    *
+    * The 14 textures_storage_multisample_3d_* failures in
+    * KHR-GL45.direct_state_access are one-sample multisample arrays: the
+    * device will not multisample those formats, so the resource comes back at
+    * one sample, the tiling does not fire, and the draw is declined by name
+    * with "view dimension differs from the shader's". Tiling them makes that
+    * decline stop -- and the draw then fails *validation* instead:
+    *
+    *   The shader's binding dimension (TextureViewDimension::e2D) doesn't
+    *   match the layout's binding dimension (TextureViewDimension::e2DArray)
+    *    - ... @group(0) @binding(0) ... [BindGroupLayoutInternal "draw ..."]
+    *
+    * which invalidates the pipeline and the command buffer with it. A decline
+    * loses one draw; an invalid command buffer loses every draw batched with
+    * it. So a third place still disagrees about the dimension, and finding it
+    * is the work -- not this condition. */
    if (samples > 1 && templ->target == PIPE_TEXTURE_2D_ARRAY) {
       resource->ms_tile_layers = templ->array_size;
       resource->ms_tile_width = desc.size.width;
@@ -44956,10 +44975,25 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
                const struct pipe_sampler_view *v =
                   ctx->sampler_views[ctx->fs->texture_slots[i]];
+               /* The *bound* view's dimension and tiling beside the
+                * shader's, because "view dimension differs" names only one
+                * side of a comparison and the interesting question is which
+                * of the two is wrong. A multisampled array is tiled into a
+                * plain 2D texture, so a shader flattened to 2D over a
+                * resource that was not tiled declines every draw -- and
+                * without ms_tile here there is nothing in the message to say
+                * so. */
+               const struct gex_wgpu_resource *vr =
+                  (v && v->texture) ? gex_resource(v->texture) : NULL;
                fprintf(stderr, "gex-wgpu:   declared slot %u type %d dim %d "
+                       "bound_dim %d ms_tile %u samples %u target %d "
                        "bound %s\n", ctx->fs->texture_slots[i],
                        (int)ctx->fs->texture_sample_types[i],
                        (int)ctx->fs->texture_dimensions[i],
+                       v ? (int)gex_wgpu_target_view_dimension(v->target) : -1,
+                       vr ? vr->ms_tile_layers : 0u,
+                       (v && v->texture) ? MAX2(1u, (unsigned)v->texture->nr_samples) : 0u,
+                       v ? (int)v->target : -1,
                        v ? util_format_short_name(v->format) : "(none)");
             }
       }
