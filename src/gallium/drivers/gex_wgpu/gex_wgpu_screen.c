@@ -2723,6 +2723,14 @@ struct gex_wgpu_shader {
 };
 
 struct gex_wgpu_interp_variant {
+   /* Which clip space this module was built for.
+    *
+    * GL's default is z in [-1, 1] and WebGPU's is [0, 1], so the default is
+    * converted by nir_lower_clip_halfz; `glClipControl(..., GL_ZERO_TO_ONE)`
+    * says the shader already writes [0, 1] and the conversion must not run.
+    * The two cannot share a module, and the base module is built for the
+    * default -- so a ZERO_TO_ONE draw has no `plain` answer either. */
+   bool clip_halfz;
    /* The clip-distance carriers this module writes for the bound fragment
     * shader: zero when that shader does not read the distances, so an
     * ordinary pipeline stays one variant. A different count or a different
@@ -2881,6 +2889,11 @@ struct gex_wgpu_shader_variant {
 struct gex_wgpu_rasterizer {
    bool scissor;
    bool front_ccw;
+   /* ARB_clip_control's depth mode: true for GL_ZERO_TO_ONE, where the
+    * shader already writes clip z in [0, 1] and nir_lower_clip_halfz must not
+    * run. Kept because the *module* depends on it -- see
+    * gex_wgpu_interp_variant_get, which keys a vertex variant on it. */
+   bool clip_halfz;
    /* GL's own glPolygonOffset arguments, before the scaling depth_bias
     * carries. gex_wgpu_lower_polygon_offset_clamp needs them unscaled. */
    float offset_units;
@@ -2991,6 +3004,15 @@ struct gex_wgpu_capture_layout {
     * key because, like the formats above, it changes the address the shader
     * computes rather than anything the draw passes in. */
    uint32_t divisor[PIPE_MAX_ATTRIBS];
+   /* Components of a *double-precision* input at this element, or 0.
+    *
+    * It cannot come from the format: st presents a `dvec4` as one element of
+    * r32g32b32a32_uint with dual_slot set, meaning "and another sixteen bytes
+    * at +16", so the format says four 32-bit channels whatever the shader
+    * declared. The shader's own count is the only thing that knows a dvec3
+    * from a dvec4, and the capture needs it to know how many words to read
+    * and how many doubles to build. */
+   uint8_t doubles[PIPE_MAX_ATTRIBS];
 };
 
 /* A geometry shader, which runs as a compute pass.
@@ -11216,7 +11238,7 @@ gex_wgpu_wgsl_add_output_sampling(char *wgsl, const uint8_t *sampling,
 static WGPUShaderModule
 gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
                      enum mesa_shader_stage stage, bool flip_y,
-                     char **error_out)
+                     bool clip_halfz, char **error_out)
 {
    *error_out = NULL;
    const nir_lower_tex_options texture_options = {
@@ -11355,7 +11377,20 @@ gex_wgpu_compile_nir(struct pipe_context *pipe, nir_shader *nir,
          nir->info.outputs_written |= VARYING_BIT_POS;
          nir_progress(true, impl, nir_metadata_control_flow);
       }
-      NIR_PASS(_, nir, nir_lower_clip_halfz);
+      /* GL's default clip space runs z from -1 to 1 and WebGPU's runs 0 to 1,
+       * so the default needs converting -- but `glClipControl(...,
+       * GL_ZERO_TO_ONE)` says the shader already writes z in [0, 1] and the
+       * conversion must **not** happen. Running it unconditionally
+       * transformed such a shader twice: z = 0.5 landed at 0.75, z = 0.25 at
+       * 0.625, which is (z + 1) / 2 applied again.
+       *
+       * That is silent -- no error and no refusal, every fragment simply at
+       * the wrong depth -- and GL_ZERO_TO_ONE is half of **reverse-Z**, which
+       * is how a modern renderer gets usable depth precision at distance. The
+       * driver advertised caps->clip_halfz and *accepted* the rasterizer
+       * state while nothing read it. */
+      if (!clip_halfz)
+         NIR_PASS(_, nir, nir_lower_clip_halfz);
       if (flip_y)
          nir_shader_intrinsics_pass(
             nir, gex_wgpu_lower_position_y,
@@ -12424,6 +12459,30 @@ gex_wgpu_capture_fetch(nir_builder *b, struct gex_wgpu_capture *state,
    nir_def *word = nir_ushr_imm(b, byte, 2);
    nir_deref_instr *data = gex_wgpu_block_words(b, buffer);
 
+   /* A double-precision input: two words per component, packed back into a
+    * 64-bit value. The words are contiguous whatever `dual_slot` says about
+    * the *element* -- dual_slot describes how the rasterising path has to
+    * split one attribute across two WebGPU vertex attributes, and this path
+    * does not use vertex attributes at all. It reads the vertex buffer
+    * itself, where a dvec4 is simply eight words in a row. */
+   if (layout->doubles[element]) {
+      const unsigned want = MIN2(layout->doubles[element], 4u);
+      nir_def *made[4];
+      for (unsigned i = 0; i < want; ++i) {
+         nir_def *lo = nir_load_deref(
+            b, nir_build_deref_array(b, data, nir_iadd_imm(b, word, i * 2)));
+         nir_def *hi = nir_load_deref(
+            b, nir_build_deref_array(b, data,
+                                     nir_iadd_imm(b, word, i * 2 + 1)));
+         made[i] = nir_pack_64_2x32_split(b, lo, hi);
+      }
+      /* GL's (0, 0, 0, 1) fill, in the load's own width, for a shader that
+       * reads more components than the attribute supplies. */
+      for (unsigned i = want; i < components && i < 4; ++i)
+         made[i] = nir_imm_double(b, i == 3 ? 1.0 : 0.0);
+      return nir_vec(b, made, components);
+   }
+
    nir_def *raw[4];
    for (unsigned i = 0; i < words; ++i)
       raw[i] = nir_load_deref(
@@ -12467,20 +12526,26 @@ gex_wgpu_capture_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
     * correct response is to name the new one rather than to leave the old
     * refusal in place.
     *
-    * Fetching them properly means eight words for a dvec4 and a pack per
-    * component, which also needs the capture layout to carry the element's
-    * *component count* -- the element's own format is r32g32b32a32_uint
-    * whatever the declaration was, with dual_slot saying "and sixteen more
-    * bytes". Worth doing when something asks; nothing does yet except two CTS
-    * cases. */
+    * It is fetched properly now -- two words per component, packed back with
+    * pack_64_2x32_split -- but only where the layout carries the element's
+    * *component count*. That cannot come from the format: st presents a dvec4
+    * as one element of r32g32b32a32_uint with dual_slot set, so the format
+    * says four 32-bit channels whatever the shader declared, and only the
+    * shader's own count separates a dvec3 from a dvec4. A layout without it
+    * still declines by name rather than handing 32-bit words to a 64-bit
+    * load. */
    if (intr->def.bit_size == 64) {
-      gex_wgpu_capture_decline(
-         state, "a 64-bit vertex input cannot be captured yet",
-         deref->var->data.driver_location);
-      nir_def *zero = nir_imm_zero(b, intr->def.num_components, 64);
-      nir_def_rewrite_uses(&intr->def, zero);
-      nir_instr_remove(&intr->instr);
-      return true;
+      const unsigned element = deref->var->data.driver_location;
+      if (!state->layout || element >= PIPE_MAX_ATTRIBS ||
+          !state->layout->doubles[element]) {
+         gex_wgpu_capture_decline(
+            state, "a 64-bit vertex input whose component count is unknown",
+            element);
+         nir_def *zero = nir_imm_zero(b, intr->def.num_components, 64);
+         nir_def_rewrite_uses(&intr->def, zero);
+         nir_instr_remove(&intr->instr);
+         return true;
+      }
    }
    nir_def *value = gex_wgpu_capture_fetch(
       b, state, deref->var->data.driver_location, intr->def.num_components);
@@ -15061,11 +15126,11 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
       ralloc_free(nir);
    else
       shader->module = gex_wgpu_compile_nir(pipe, nir, expected_stage, false,
-                                            &error);
+                                            false, &error);
    if (shader->module && expected_stage == MESA_SHADER_VERTEX) {
       if (flipped)
          shader->module_y_flipped = gex_wgpu_compile_nir(
-            pipe, flipped, expected_stage, true, &error);
+            pipe, flipped, expected_stage, true, false, &error);
       else
          error = strdup("out of memory cloning vertex shader");
       flipped = NULL;
@@ -15799,12 +15864,13 @@ gex_wgpu_say_no_base_module(const struct gex_wgpu_shader *shader,
       fprintf(stderr,
               "gex-wgpu: %s stage has no base module and no variant reason "
               "(line %d): int_sampled=0x%x buftex=%u unformatted=0x%x "
-              "sample_pos=%d ms_array=0x%x clip_dist=%d interp_offset=%d "
+              "sample_pos=%d ms_array=0x%x doubles=%d clip_dist=%d interp_offset=%d "
               "primitive_id=%d -- one of these is missing from a variant "
               "list; see gex_wgpu_base_module_or_say\n",
               stage, line, shader->integer_sampled_slots,
               shader->buftex_count, shader->unformatted_images,
               (int)shader->reads_sample_pos, shader->ms_array_slots,
+              (int)shader->has_double_inputs,
               (int)shader->reads_clip_dist, (int)shader->reads_interp_offset,
               (int)shader->reads_primitive_id);
    }
@@ -16486,7 +16552,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    }
    char *error = NULL;
    WGPUShaderModule module = gex_wgpu_compile_nir(
-      &ctx->base, variant, MESA_SHADER_FRAGMENT, false, &error);
+      &ctx->base, variant, MESA_SHADER_FRAGMENT, false, false, &error);
    if (!module) {
       /* A shader Tint will not accept is one shader, not a broken device.
        * Failing the context here cost every case after it: this probe's
@@ -16794,6 +16860,7 @@ gex_wgpu_create_rasterizer_state(struct pipe_context *pipe,
       rasterizer->cull_face = state->cull_face;
       rasterizer->discard = state->rasterizer_discard;
       rasterizer->unclipped_depth = !state->depth_clip_near;
+   rasterizer->clip_halfz = state->clip_halfz;
    }
    return rasterizer;
 }
@@ -25004,7 +25071,7 @@ gex_wgpu_create_compute_state(struct pipe_context *pipe,
 
    char *error = NULL;
    compute->module =
-      gex_wgpu_compile_nir(pipe, nir, MESA_SHADER_COMPUTE, false, &error);
+      gex_wgpu_compile_nir(pipe, nir, MESA_SHADER_COMPUTE, false, false, &error);
    if (!compute->module) {
       fprintf(stderr, "gex-wgpu: compute shader rejected: %s\n",
               error ? error : "unknown");
@@ -25253,7 +25320,7 @@ gex_wgpu_compute_module(struct gex_wgpu_context *ctx,
    }
    char *error = NULL;
    WGPUShaderModule module = gex_wgpu_compile_nir(
-      &ctx->base, clone, MESA_SHADER_COMPUTE, false, &error);
+      &ctx->base, clone, MESA_SHADER_COMPUTE, false, false, &error);
    if (!module) {
       static bool said;
       if (!said) {
@@ -28385,7 +28452,7 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
 
    char *error = NULL;
    variant->module = gex_wgpu_compile_nir(&ctx->base, nir,
-                                          MESA_SHADER_COMPUTE, false, &error);
+                                          MESA_SHADER_COMPUTE, false, false, &error);
    if (!variant->module) {
       fprintf(stderr, "gex-wgpu: capture shader rejected: %s\n",
               error ? error : "unknown");
@@ -28889,7 +28956,7 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
                                  &variant->ssbo_readonly_mask);
    char *error = NULL;
    variant->module = gex_wgpu_compile_nir(&ctx->base, nir,
-                                          MESA_SHADER_COMPUTE, false, &error);
+                                          MESA_SHADER_COMPUTE, false, false, &error);
    if (!variant->module) {
       fprintf(stderr, "gex-wgpu: varying shader rejected: %s\n",
               error ? error : "unknown");
@@ -29569,7 +29636,7 @@ gex_wgpu_line_prefix_module(struct gex_wgpu_context *ctx)
    char *error = NULL;
    screen->line_prefix_module =
       gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false,
-                           &error);
+                           false, &error);
    if (!screen->line_prefix_module)
       fprintf(stderr, "gex-wgpu: line prefix shader failed to compile: %s\n",
               error ? error : "unknown");
@@ -30222,7 +30289,7 @@ gex_wgpu_gs_build_module(struct pipe_context *pipe, struct gex_wgpu_gs *gs,
 
    char *error = NULL;
    WGPUShaderModule module =
-      gex_wgpu_compile_nir(pipe, nir, MESA_SHADER_COMPUTE, false, &error);
+      gex_wgpu_compile_nir(pipe, nir, MESA_SHADER_COMPUTE, false, false, &error);
    if (!module)
       fprintf(stderr, "gex-wgpu: geometry shader rejected: %s\n",
               error ? error : "unknown");
@@ -30860,7 +30927,7 @@ gex_wgpu_tess_finish_module(struct pipe_context *pipe, nir_shader *nir,
 
    char *error = NULL;
    WGPUShaderModule module =
-      gex_wgpu_compile_nir(pipe, nir, MESA_SHADER_COMPUTE, false, &error);
+      gex_wgpu_compile_nir(pipe, nir, MESA_SHADER_COMPUTE, false, false, &error);
    if (!module)
       fprintf(stderr, "gex-wgpu: %s rejected: %s\n", what,
               error ? error : "unknown");
@@ -32252,6 +32319,10 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
          layout.offset[i] = ve->src_offset;
          layout.stride[i] = ve->src_stride;
          layout.format[i] = ve->src_format;
+         /* The shader's component count for a double-precision input, which
+          * the format cannot supply; see gex_wgpu_capture_layout::doubles. */
+         layout.doubles[i] = (ctx->vs && i < GEX_WGPU_MAX_VERTEX_ELEMENTS)
+            ? ctx->vs->double_inputs[i] : 0;
          layout.divisor[i] = ve->instance_divisor;
       }
    }
@@ -34233,7 +34304,7 @@ gex_wgpu_gather_module(struct gex_wgpu_context *ctx)
    char *error = NULL;
    screen->gather_module =
       gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false,
-                           &error);
+                           false, &error);
    if (!screen->gather_module)
       fprintf(stderr, "gex-wgpu: gather shader failed to compile: %s\n",
               error ? error : "unknown");
@@ -34759,6 +34830,10 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
          layout.offset[i] = ve->src_offset;
          layout.stride[i] = ve->src_stride;
          layout.format[i] = ve->src_format;
+         /* The shader's component count for a double-precision input, which
+          * the format cannot supply; see gex_wgpu_capture_layout::doubles. */
+         layout.doubles[i] = (ctx->vs && i < GEX_WGPU_MAX_VERTEX_ELEMENTS)
+            ? ctx->vs->double_inputs[i] : 0;
          layout.divisor[i] = ve->instance_divisor;
       }
    }
@@ -35243,7 +35318,7 @@ gex_wgpu_gs_scan_module(struct gex_wgpu_context *ctx)
 
    char *error = NULL;
    screen->gs_scan_module =
-      gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false, &error);
+      gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false, false, &error);
    if (!screen->gs_scan_module)
       fprintf(stderr, "gex-wgpu: geometry scan shader failed to compile: %s\n",
               error ? error : "unknown");
@@ -35397,7 +35472,7 @@ gex_wgpu_gs_xfb_module(struct gex_wgpu_context *ctx, struct gex_wgpu_gs *gs)
 
    char *error = NULL;
    gs->xfb_module =
-      gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false, &error);
+      gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false, false, &error);
    if (!gs->xfb_module)
       fprintf(stderr, "gex-wgpu: geometry capture shader failed to compile: "
                       "%s\n", error ? error : "unknown");
@@ -35658,6 +35733,10 @@ gex_wgpu_gs_draw(struct gex_wgpu_context *ctx,
          layout.offset[i] = ve->src_offset;
          layout.stride[i] = ve->src_stride;
          layout.format[i] = ve->src_format;
+         /* The shader's component count for a double-precision input, which
+          * the format cannot supply; see gex_wgpu_capture_layout::doubles. */
+         layout.doubles[i] = (ctx->vs && i < GEX_WGPU_MAX_VERTEX_ELEMENTS)
+            ? ctx->vs->double_inputs[i] : 0;
          layout.divisor[i] = ve->instance_divisor;
       }
    }
@@ -36326,7 +36405,7 @@ gex_wgpu_tes_xfb_module(struct gex_wgpu_context *ctx, struct gex_wgpu_tes *tes,
 
    char *error = NULL;
    tes->xfb_module =
-      gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false, &error);
+      gex_wgpu_compile_nir(&ctx->base, nir, MESA_SHADER_COMPUTE, false, false, &error);
    if (!tes->xfb_module)
       fprintf(stderr, "gex-wgpu: tessellation capture shader failed to "
                       "compile: %s\n", error ? error : "unknown");
@@ -36534,6 +36613,10 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
          layout.offset[i] = ve->src_offset;
          layout.stride[i] = ve->src_stride;
          layout.format[i] = ve->src_format;
+         /* The shader's component count for a double-precision input, which
+          * the format cannot supply; see gex_wgpu_capture_layout::doubles. */
+         layout.doubles[i] = (ctx->vs && i < GEX_WGPU_MAX_VERTEX_ELEMENTS)
+            ? ctx->vs->double_inputs[i] : 0;
          layout.divisor[i] = ve->instance_divisor;
       }
    }
@@ -37050,6 +37133,13 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    struct gex_wgpu_shader *vs = ctx->vs;
    struct gex_wgpu_shader *fs = ctx->fs;
    WGPUShaderModule plain = flipped ? vs->module_y_flipped : vs->module;
+   /* ARB_clip_control's depth mode, which Gallium carries on the rasterizer
+    * state. The base module was built with the default conversion applied, so
+    * it is not a legal answer for a ZERO_TO_ONE draw -- exactly as it is not
+    * for an unpacked vertex format or a wide point. */
+   const bool want_halfz = ctx->rasterizer && ctx->rasterizer->clip_halfz;
+   if (want_halfz)
+      plain = NULL;
    const bool fold_viewport = viewport != NULL;
    /* A vertex format WebGPU cannot fetch is delivered as a raw dword and
     * unpacked in the shader, so the module depends on the bound vertex
@@ -37162,8 +37252,14 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    /* ms_array_slots is a variant reason of its own: the base module was never
     * built for such a shader -- the tile width comes from the bound texture
     * -- so `plain` is NULL and returning it drops the draw with no message. */
+   /* `want_halfz` belongs in this list for the same reason ms_array_slots
+    * does: the base module was built with nir_lower_clip_halfz applied, so it
+    * is not a legal answer for a GL_ZERO_TO_ONE draw -- and `plain` was set
+    * to NULL above, which without this returns NULL and drops the draw with
+    * nothing on screen but the depth clear. */
    if (!differs && !fold_viewport && !unpack_attribs && !lower_textures &&
-       !wide && !has_buftex && !vs->ms_array_slots &&
+       !wide && !has_buftex && !vs->ms_array_slots && !want_halfz &&
+       !vs->has_double_inputs &&
        !vs->query_only_slots && !ctx->primitive_id_verts)
    {
       if (!plain)
@@ -37200,6 +37296,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    for (struct gex_wgpu_interp_variant *v = vs->interp_variants; v;
         v = v->next) {
       bool match = v->mask == fs_mask && v->sampler_mask == sampler_mask &&
+                   v->clip_halfz == want_halfz &&
                    v->clip_dist_for == want_clip_dist &&
                    v->inv_w_location == want_inv_w &&
                    v->primitive_id_location == want_pid &&
@@ -37252,6 +37349,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
                 ? NULL : plain;
    }
    variant->mask = fs_mask;
+   variant->clip_halfz = want_halfz;
    variant->wide = *want_wide;
    memcpy(variant->buftex_words, want_buftex, sizeof(variant->buftex_words));
    memcpy(variant->viewport, want, sizeof(variant->viewport));
@@ -37410,7 +37508,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       }
       char *error = NULL;
       WGPUShaderModule module = gex_wgpu_compile_nir(
-         &ctx->base, clone, MESA_SHADER_VERTEX, pass == 1, &error);
+         &ctx->base, clone, MESA_SHADER_VERTEX, pass == 1, want_halfz,
+         &error);
       /* Said out loud rather than freed unread. Discarding it left the
        * failure below with nothing but a list of the four things it could
        * have been, and the shader that failed never reaches the dump in
@@ -40473,6 +40572,10 @@ gex_wgpu_capture_positions(struct gex_wgpu_context *ctx, unsigned first,
          layout.offset[i] = ve->src_offset;
          layout.stride[i] = ve->src_stride;
          layout.format[i] = ve->src_format;
+         /* The shader's component count for a double-precision input, which
+          * the format cannot supply; see gex_wgpu_capture_layout::doubles. */
+         layout.doubles[i] = (ctx->vs && i < GEX_WGPU_MAX_VERTEX_ELEMENTS)
+            ? ctx->vs->double_inputs[i] : 0;
          layout.divisor[i] = ve->instance_divisor;
       }
    }
@@ -41350,6 +41453,8 @@ gex_wgpu_flat_unfilled_draw(struct pipe_context *pipe,
       layout.offset[i] = ve->src_offset;
       layout.stride[i] = ve->src_stride;
       layout.format[i] = ve->src_format;
+      layout.doubles[i] = (ctx->vs && i < GEX_WGPU_MAX_VERTEX_ELEMENTS)
+         ? ctx->vs->double_inputs[i] : 0;
       layout.divisor[i] = ve->instance_divisor;
    }
    struct gex_wgpu_varying_variant *variant =
@@ -41614,6 +41719,8 @@ gex_wgpu_atomic_replay_draw(struct pipe_context *pipe,
       layout.offset[i] = ve->src_offset;
       layout.stride[i] = ve->src_stride;
       layout.format[i] = ve->src_format;
+      layout.doubles[i] = (ctx->vs && i < GEX_WGPU_MAX_VERTEX_ELEMENTS)
+         ? ctx->vs->double_inputs[i] : 0;
       layout.divisor[i] = ve->instance_divisor;
    }
    struct gex_wgpu_varying_variant *variant =
@@ -43883,10 +43990,36 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             &ctx->vertex_elements->elements[i];
          unsigned location = i;
          if (!by_element) {
-            if (i >= GEX_WGPU_MAX_VERTEX_ELEMENTS ||
-                ctx->vs->vertex_element_location[i] == 0xff)
+            if (i >= GEX_WGPU_MAX_VERTEX_ELEMENTS)
                continue;
             location = ctx->vs->vertex_element_location[i];
+            /* The upper half of a 64-bit attribute.
+             *
+             * st gives a dvec3 or dvec4 **two** elements -- the second at
+             * offset + 16 -- but only one shader variable, so
+             * glsl_count_attribute_slots reports one slot and this element
+             * gets no location of its own. The module declares both halves,
+             * because gex_wgpu_lower_vertex_attrib_double creates the second
+             * uvec4 at driver_location + 1, and without a location here
+             * nothing supplies it: "Vertex attribute slot N used in
+             * ShaderModule is not present in the VertexState".
+             *
+             * Its location is the previous element's plus one, which is the
+             * slot GL already reserved. Taking the *element's own* format is
+             * the point of doing it this way rather than synthesising an
+             * attribute: a dvec3's upper half is r32g32_uint, two words, and
+             * the shader's component count cannot say so -- Mesa pads the
+             * input to four components, so asking the shader gives four and
+             * the layout then reads sixteen bytes out of an eight-byte tail,
+             * which WebGPU rejects by name. */
+            if (location == 0xff) {
+               if (i == 0 || !ctx->vertex_elements->elements[i - 1].dual_slot)
+                  continue;
+               const unsigned below = ctx->vs->vertex_element_location[i - 1];
+               if (below == 0xff || below + 1 >= 64)
+                  continue;
+               location = below + 1;
+            }
          }
          const unsigned buffer = element->vertex_buffer_index;
          /* Disabled array: no buffer behind this element, so it supplies no
@@ -43913,36 +44046,6 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          vertex_attributes[slot][attribute].offset = element->src_offset;
          vertex_attributes[slot][attribute].shaderLocation = location;
          supplied_locations |= BITFIELD64_BIT(location);
-         /* The upper half of a 64-bit attribute. st gives one element with
-          * dual_slot set rather than two elements, and GL has already
-          * reserved location+1 for it -- glsl_count_attribute_slots(type,
-          * true) counts two for a dvec3 or dvec4, which is where
-          * vertex_locations got both bits.
-          *
-          * The width comes from the *shader*, not from the element: the
-          * element says r32g32b32a32_uint whatever the declaration was, and a
-          * dvec3 is six words, so its upper half is two. Asking for four
-          * there would read sixteen bytes out of an eight-byte tail and
-          * WebGPU rejects the layout for it. */
-         if (element->dual_slot && location + 1 < 64) {
-            const unsigned comps =
-               i < GEX_WGPU_MAX_VERTEX_ELEMENTS ? ctx->vs->double_inputs[i] : 0;
-            const unsigned hi_words = comps * 2u > 4u ? comps * 2u - 4u : 0u;
-            if (hi_words && attribute_counts[slot] <
-                            GEX_WGPU_MAX_VERTEX_ELEMENTS) {
-               const unsigned at = attribute_counts[slot]++;
-               vertex_attributes[slot][at] =
-                  (WGPUVertexAttribute)WGPU_VERTEX_ATTRIBUTE_INIT;
-               vertex_attributes[slot][at].format =
-                  hi_words >= 4 ? WGPUVertexFormat_Uint32x4
-                  : hi_words == 3 ? WGPUVertexFormat_Uint32x3
-                  : hi_words == 2 ? WGPUVertexFormat_Uint32x2
-                                  : WGPUVertexFormat_Uint32;
-               vertex_attributes[slot][at].offset = element->src_offset + 16u;
-               vertex_attributes[slot][at].shaderLocation = location + 1u;
-               supplied_locations |= BITFIELD64_BIT(location + 1u);
-            }
-         }
       }
       for (unsigned slot = 0; slot < vb_slot_count; ++slot) {
          const unsigned buffer = vb_buffer[slot];
@@ -44206,9 +44309,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                }
                fprintf(stderr,
                        "gex-wgpu:   el%u -> @location(%d) buf%u off=%u "
-                       "stride=%u fmt=%d div=%u v0: %s\n",
+                       "stride=%u fmt=%d div=%u dual=%d dbl=%u v0: %s\n",
                        e, loc, b, el->src_offset, el->src_stride,
-                       (int)el->src_format, el->instance_divisor, val);
+                       (int)el->src_format, el->instance_divisor,
+                       (int)el->dual_slot,
+                       (e < GEX_WGPU_MAX_VERTEX_ELEMENTS && ctx->vs)
+                          ? ctx->vs->double_inputs[e] : 0u, val);
             }
             /* Every constant buffer this vertex stage actually reads, not just
              * the first one seen at bind time. The buffers checked earlier
