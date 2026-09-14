@@ -41795,6 +41795,15 @@ gex_wgpu_note_draw_drop(int line, bool handed_off)
    if (on)
       fprintf(stderr, "gex-wgpu: draw %s at gex_wgpu_screen.c:%d\n",
               handed_off ? "handed off" : "dropped", line);
+   /* Not reported unless asked for, and that was measured rather than
+    * assumed. An always-on "a draw was dropped" line looked right -- a
+    * dropped draw is the failure mode this driver keeps producing -- and
+    * fires on **15 of 201 probes that pass**: a draw with rasterizer discard,
+    * a transform-feedback-only draw and a tessellated draw all legitimately
+    * record nothing, and `handed_off` cannot tell those from a loss because
+    * it only knows whether anything was recorded. A diagnostic that fires on
+    * 7.5% of correct runs trains its reader to ignore it, which costs more
+    * than it saves. GEX_WGPU_DRAW_DROP=1 remains the way to see them. */
 }
 /* `gex_draws_at_entry` is a local of draw_vbo_inner, which is the only
  * function this macro is used in. */
