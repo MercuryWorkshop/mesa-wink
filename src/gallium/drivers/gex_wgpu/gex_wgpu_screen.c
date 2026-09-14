@@ -601,8 +601,63 @@ gex_wgpu_color_sample_cost(enum pipe_format format, unsigned *cost,
                            unsigned *alignment)
 {
    const unsigned bytes = util_format_get_blocksize(format);
-   *cost = bytes <= 1 ? 1 : bytes <= 2 ? 2 : bytes <= 8 ? 8 : 16;
-   *alignment = bytes <= 1 ? 1 : bytes <= 2 ? 2 : 4;
+   /* WebGPU's table, not the format's own size, and **not** a function of the
+    * size either -- which is what this used to assume.
+    *
+    * Two four-byte formats are charged differently: `rgba8unorm` costs eight
+    * and `r32uint` costs four. Charging every four-byte format eight made
+    * eight single-channel 32-bit draw buffers look like sixty-four against a
+    * budget of thirty-two, so four of them were *dropped* -- and dropping an
+    * attachment is silent in the picture, it simply never gets written.
+    * KHR-GL45.texture_barrier is exactly that shape: eight R32UI attachments,
+    * each also sampled, and the whole family failed with four of its eight
+    * textures untouched.
+    *
+    * The spec's rule is by channel count as much as by width, so it is
+    * spelled out rather than derived:
+    *
+    *   r8*                      1, align 1
+    *   r16*, rg8*               2, align 2
+    *   r32uint/sint/float       4, align 4
+    *   rg16*                    4, align 2
+    *   rgba8*, bgra8*           8, align 1
+    *   rgb10a2*, rg11b10ufloat  8, align 4
+    *   rg32*                    8, align 4
+    *   rgba16*                  8, align 2
+    *   rgba32*                 16, align 4
+    */
+   const unsigned channels = util_format_get_nr_components(format);
+   if (bytes <= 1) {
+      *cost = 1; *alignment = 1;
+   } else if (bytes <= 2) {
+      *cost = 2; *alignment = 2;
+   } else if (bytes <= 4) {
+      /* A four-byte format is one 32-bit channel, two 16-bit ones, or a
+       * packed four-channel colour. Only the first two are charged their
+       * size. */
+      if (channels == 1) {
+         *cost = 4; *alignment = 4;
+      } else if (channels == 2) {
+         *cost = 4; *alignment = 2;
+      } else {
+         /* rgba8 and bgra8 align to 1; the packed rgb10a2 and rg11b10 forms
+          * align to 4. Both cost 8. The first channel's *width* separates
+          * them -- eight bits means the plain byte-per-channel forms -- which
+          * the component count cannot, since both have four channels in four
+          * bytes. */
+         const struct util_format_description *desc =
+            util_format_description(format);
+         *cost = 8;
+         *alignment = (desc && desc->channel[0].size == 8) ? 1 : 4;
+      }
+   } else if (bytes <= 8) {
+      *cost = 8;
+      /* rg32* is two 32-bit channels and aligns to 4; rgba16* is four 16-bit
+       * ones and aligns to 2. */
+      *alignment = channels <= 2 ? 4 : 2;
+   } else {
+      *cost = 16; *alignment = 4;
+   }
 }
 
 /* Defined with the sampler views; a compute dispatch binds them too. */
@@ -27743,13 +27798,20 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
                spent = aligned + bytes;
                continue;
             }
+            /* With the arithmetic, because "exceeds the budget" does not say
+             * whether the budget is too small or this driver's accounting is
+             * too generous -- and it was the accounting: every four-byte
+             * format was charged eight, so eight R32UI targets looked like
+             * sixty-four instead of thirty-two. Without the numbers there was
+             * nothing in the message to disbelieve. */
             static bool said;
             if (!said) {
                said = true;
                fprintf(stderr,
-                       "gex-wgpu: colour target %u dropped: the attachments "
-                       "exceed %u bytes per sample\n", i,
-                       gex_screen(pipe->screen)->max_colour_bytes_per_sample);
+                       "gex-wgpu: colour target %u dropped: %s costs %u "
+                       "(align %u), %u already spent of %u bytes per sample\n",
+                       i, util_format_short_name(color_formats[i]), bytes,
+                       alignment, spent, budget);
             }
             colors[i] = NULL;
             color_formats[i] = PIPE_FORMAT_NONE;
