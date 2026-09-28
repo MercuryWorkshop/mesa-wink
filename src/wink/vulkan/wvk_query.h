@@ -42,7 +42,19 @@ struct wvk_pass_query {
    struct wvk_query_pool *pool;
    uint32_t query;
    uint32_t slot;
+   /* A part of a query a pass was ended in, or a clear came in: added to
+    * what the parts before counted, but for the first. */
+   bool accumulate;
+   /* The active query: how many parts it has so far, and whether it is
+    * between them. */
+   uint32_t parts;
+   bool suspended;
 };
+
+/* The active occlusion query ended where the pass is going to, or a clear
+ * is not to be counted; and begun again, in a slot of its own, after. */
+void wvk_replay_suspend_query(struct wvk_replay *replay);
+void wvk_replay_resume_query(struct wvk_replay *replay);
 
 /* Whether a command buffer has occlusion queries, and so its passes need
  * the submit's query set. */

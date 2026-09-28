@@ -68,6 +68,10 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   WebGPU pass renders one layer. A vertex shader's `gl_Layer` chooses by
   moving vertices of other layers out of the clip volume, and the view
   index is the pass's. Input attachments are fetched at the layer drawn.
+- **Timestamps** are the beginnings of empty compute passes, WebGPU having
+  them only where a pass begins or ends; a render pass is ended for one and
+  begun again. An occlusion query a pass is ended in goes on in the next,
+  its parts added, and clears are not counted.
 - **Blits and `vkCmdClearAttachments`** come from the runtime's vk_meta.
   Its passes of several layers are begun again at each.
 - **Present** copies the swapchain image into the surface's current
@@ -155,7 +159,8 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   memory barrier there is dropped.
 - An attribute larger than its binding's dynamic stride, which WebGPU
   cannot describe.
-- Precise occlusion queries, and timestamps.
+- Precise occlusion queries: WebGPU's count is exact on some backends
+  only. Alpha to coverage with a sample mask the shader writes.
 - Subgroups are one invocation each: Tint reads no subgroup operations from
   SPIR-V. Every operation but the quad ones is there, trivially.
 - Compressed images whose size is not a whole number of blocks: WebGPU's

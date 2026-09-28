@@ -67,6 +67,7 @@ struct wvk_device {
    /* The shaders of copies WebGPU does not do: query results, bytes
     * between buffer layouts, and depth out of a texture. */
    WGPUComputePipeline copy_query_pipeline;
+   WGPUComputePipeline add_query_pipeline;
    WGPUComputePipeline repack_pipeline;
    /* 16-bit packed texels into and out of RGBA8 textures: 2D arrays and
     * 3D, each way (wvk_cmd_copy.c). */

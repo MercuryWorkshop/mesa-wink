@@ -100,6 +100,8 @@ void
 wvk_replay_end_passes(struct wvk_replay *replay)
 {
    if (replay->pass) {
+      /* An occlusion query goes on in the next pass, if there is one. */
+      wvk_replay_suspend_query(replay);
       wgpuRenderPassEncoderEnd(replay->pass);
       wgpuRenderPassEncoderRelease(replay->pass);
       replay->pass = NULL;
@@ -312,6 +314,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_init(&replay.snapshots, NULL);
    util_dynarray_init(&replay.pass_queries, NULL);
    replay.serial = serial;
+   replay.dev = dev;
 
    WGPUCommandEncoderDescriptor edesc = WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
    replay.encoder = wgpuDeviceCreateCommandEncoder(dev->wgpu, &edesc);

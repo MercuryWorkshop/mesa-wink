@@ -101,6 +101,7 @@ struct wvk_replay {
    struct util_dynarray push_sets;
    /* Memory for vk_meta's vertices, freed after. */
    struct util_dynarray meta_memory;   /* VkDeviceMemory */
+   struct wvk_device *dev;
    /* Images with atomics whose buffer of texels is the image now, until
     * the next barrier (wvk_replay_sync_atomic_images). */
    struct util_dynarray atomic_images; /* struct wvk_image * */
@@ -120,6 +121,11 @@ struct wvk_replay {
    uint32_t pass_query_first;
    struct util_dynarray pass_queries;   /* struct wvk_pass_query */
    struct wvk_pass_query active_query;
+   /* Timestamps: a query set of the submit's, and where each is resolved
+    * to, 256 bytes apart as resolves want. */
+   WGPUQuerySet timestamp_set;
+   WGPUBuffer timestamp_resolve;
+   uint32_t timestamp_next;
 };
 
 struct wvk_push_buffer {

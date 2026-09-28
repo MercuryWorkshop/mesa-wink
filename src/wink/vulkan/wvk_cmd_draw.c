@@ -447,6 +447,8 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
    }
    if (dev->copy_query_pipeline)
       wgpuComputePipelineRelease(dev->copy_query_pipeline);
+   if (dev->add_query_pipeline)
+      wgpuComputePipelineRelease(dev->add_query_pipeline);
    if (dev->repack_pipeline)
       wgpuComputePipelineRelease(dev->repack_pipeline);
    for (uint32_t i = 0; i < ARRAY_SIZE(dev->packed16_pipelines); ++i) {

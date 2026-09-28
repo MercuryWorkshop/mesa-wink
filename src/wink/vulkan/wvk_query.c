@@ -10,8 +10,10 @@
  * memory -- host-visible, so they come back like any other memory a
  * submit wrote. A query is available once the submit it ended in is done.
  *
- * Timestamps are zero: WebGPU writes them only at pass boundaries, and
- * timestampValidBits says there are none.
+ * Timestamps: WebGPU writes them only where a pass begins or ends, so
+ * each is an empty compute pass's beginning -- a render pass ended for it,
+ * and begun again after -- resolved and copied to the pool's memory then,
+ * in nanoseconds.
  */
 #include "wvk_query.h"
 
@@ -31,6 +33,7 @@
 #include <stdlib.h>
 
 #define WVK_QUERY_SET_SIZE 4096
+#define WVK_TIMESTAMP_SET_SIZE 1024
 /* resolveQuerySet writes to 256-byte aligned offsets: 32 queries. */
 #define WVK_QUERY_ALIGN 32
 
@@ -181,7 +184,7 @@ wvk_replay_query_set(struct wvk_device *dev, struct wvk_replay *replay)
       replay->query_set = wgpuDeviceCreateQuerySet(dev->wgpu, &desc);
       WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
       bd.label = wvk_sv("wvk query resolve");
-      bd.usage = WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc;
+      bd.usage = WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc | WGPUBufferUsage_Storage;
       bd.size = WVK_QUERY_SET_SIZE * 8;
       replay->query_resolve = wgpuDeviceCreateBuffer(dev->wgpu, &bd);
    }
@@ -189,6 +192,89 @@ wvk_replay_query_set(struct wvk_device *dev, struct wvk_replay *replay)
    replay->query_next = align(replay->query_next, WVK_QUERY_ALIGN);
    replay->pass_query_first = replay->query_next;
    return replay->query_set;
+}
+
+/* A part of a query added to the parts before: 64-bit, which WGSL adds a
+ * word at a time. */
+static const char add_query_wgsl[] =
+   "struct P { src: u32, dst: u32 }\n"
+   "@group(0) @binding(0) var<storage, read> src: array<u32>;\n"
+   "@group(0) @binding(1) var<storage, read_write> dst: array<u32>;\n"
+   "@group(0) @binding(2) var<uniform> p: P;\n"
+   "@compute @workgroup_size(1)\n"
+   "fn main() {\n"
+   "  let lo = dst[p.dst] + src[p.src];\n"
+   "  let carry = select(0u, 1u, lo < src[p.src]);\n"
+   "  dst[p.dst + 1u] = dst[p.dst + 1u] + src[p.src + 1u] + carry;\n"
+   "  dst[p.dst] = lo;\n"
+   "}\n";
+
+static void
+add_query_part(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_pass_query *pq)
+{
+   simple_mtx_lock(&dev->cache_lock);
+   if (!dev->add_query_pipeline) {
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(add_query_wgsl);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk add query");
+      desc.compute.module = module;
+      desc.compute.entryPoint = wvk_sv("main");
+      dev->add_query_pipeline = wgpuDeviceCreateComputePipeline(dev->wgpu, &desc);
+      wgpuShaderModuleRelease(module);
+   }
+   simple_mtx_unlock(&dev->cache_lock);
+   const uint32_t params[4] = { pq->slot * 2, pq->query * 2 };
+   WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
+   if (!dev->add_query_pipeline || !params_buffer)
+      return;
+   const WGPUBindGroupEntry entries[] = {
+      { .binding = 0, .buffer = replay->query_resolve, .offset = 0, .size = WVK_QUERY_SET_SIZE * 8 },
+      { .binding = 1, .buffer = pq->pool->buffer, .offset = 0, .size = pq->pool->mem->buffer_size },
+      { .binding = 2, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
+   };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = wgpuComputePipelineGetBindGroupLayout(dev->add_query_pipeline, 0);
+   bg.entryCount = ARRAY_SIZE(entries);
+   bg.entries = entries;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bg.layout);
+   WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
+   wgpuComputePassEncoderSetPipeline(pass, dev->add_query_pipeline);
+   wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
+   wgpuComputePassEncoderEnd(pass);
+   wgpuComputePassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+}
+
+void
+wvk_replay_suspend_query(struct wvk_replay *replay)
+{
+   struct wvk_pass_query *q = &replay->active_query;
+   if (!replay->pass || !q->pool || q->slot == UINT32_MAX || q->suspended)
+      return;
+   wgpuRenderPassEncoderEndOcclusionQuery(replay->pass);
+   struct wvk_pass_query part = *q;
+   part.accumulate = q->parts++ > 0;
+   util_dynarray_append(&replay->pass_queries, part);
+   q->suspended = true;
+}
+
+void
+wvk_replay_resume_query(struct wvk_replay *replay)
+{
+   struct wvk_pass_query *q = &replay->active_query;
+   if (!q->pool || !q->suspended || !replay->pass || !replay->query_set ||
+       replay->query_next >= WVK_QUERY_SET_SIZE)
+      return;
+   q->slot = replay->query_next++;
+   q->suspended = false;
+   wgpuRenderPassEncoderBeginOcclusionQuery(replay->pass, q->slot);
 }
 
 void
@@ -200,8 +286,11 @@ wvk_replay_resolve_queries(struct wvk_replay *replay)
    wgpuCommandEncoderResolveQuerySet(replay->encoder, replay->query_set, first, count,
                                      replay->query_resolve, (uint64_t)first * 8);
    util_dynarray_foreach(&replay->pass_queries, struct wvk_pass_query, pq) {
-      wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, replay->query_resolve, (uint64_t)pq->slot * 8,
-                                           pq->pool->buffer, (uint64_t)pq->query * 8, 8);
+      if (pq->accumulate)
+         add_query_part(replay->dev, replay, pq);
+      else
+         wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, replay->query_resolve, (uint64_t)pq->slot * 8,
+                                              pq->pool->buffer, (uint64_t)pq->query * 8, 8);
       wvk_replay_write(replay, pq->pool->mem, (uint64_t)pq->query * 8, 8);
    }
    util_dynarray_clear(&replay->pass_queries);
@@ -215,6 +304,10 @@ wvk_replay_finish_queries(struct wvk_replay *replay)
       wgpuQuerySetRelease(replay->query_set);
    if (replay->query_resolve)
       wgpuBufferRelease(replay->query_resolve);
+   if (replay->timestamp_set)
+      wgpuQuerySetRelease(replay->timestamp_set);
+   if (replay->timestamp_resolve)
+      wgpuBufferRelease(replay->timestamp_resolve);
    util_dynarray_fini(&replay->pass_queries);
 }
 
@@ -252,9 +345,14 @@ wvk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, 
       pool->serial[query] = replay->serial;
    if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
       return;
-   if (replay->active_query.pool == pool && replay->active_query.slot != UINT32_MAX && replay->pass) {
+   if (replay->active_query.pool == pool && replay->active_query.slot != UINT32_MAX && replay->pass &&
+       !replay->active_query.suspended) {
       wgpuRenderPassEncoderEndOcclusionQuery(replay->pass);
-      util_dynarray_append(&replay->pass_queries, replay->active_query);
+      struct wvk_pass_query part = replay->active_query;
+      part.accumulate = part.parts > 0;
+      util_dynarray_append(&replay->pass_queries, part);
+   } else if (replay->active_query.pool == pool && replay->active_query.parts) {
+      /* Counted, in the parts it had. */
    } else {
       /* Not counted: say something was drawn, which is never wrong to
        * act on. */
@@ -279,10 +377,48 @@ wvk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stag
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(wvk_query_pool, pool, queryPool);
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
    if (query >= pool->vk.query_count)
       return;
+   pool->serial[query] = replay->serial;
    ((uint64_t *)pool->mem->host)[query] = 0;
-   pool->serial[query] = cmd->replay->serial;
+   if (!wvk_physical_device_has_feature(wvk_device_physical(dev), WGPUFeatureName_TimestampQuery))
+      return;
+   if (!replay->timestamp_set) {
+      WGPUQuerySetDescriptor desc = WGPU_QUERY_SET_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk timestamps");
+      desc.type = WGPUQueryType_Timestamp;
+      desc.count = WVK_TIMESTAMP_SET_SIZE;
+      replay->timestamp_set = wgpuDeviceCreateQuerySet(dev->wgpu, &desc);
+      WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
+      bd.label = wvk_sv("wvk timestamp resolve");
+      bd.usage = WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc;
+      bd.size = WVK_TIMESTAMP_SET_SIZE * 256;
+      replay->timestamp_resolve = wgpuDeviceCreateBuffer(dev->wgpu, &bd);
+   }
+   if (replay->timestamp_next >= WVK_TIMESTAMP_SET_SIZE) {
+      mesa_logw_once("wvk: more than %u timestamps in a submit", WVK_TIMESTAMP_SET_SIZE);
+      return;
+   }
+   const uint32_t slot = replay->timestamp_next++;
+   const bool in_pass = replay->pass != NULL;
+   wvk_replay_end_passes(replay);
+   WGPUPassTimestampWrites writes = WGPU_PASS_TIMESTAMP_WRITES_INIT;
+   writes.querySet = replay->timestamp_set;
+   writes.beginningOfPassWriteIndex = slot;
+   WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+   pd.timestampWrites = &writes;
+   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
+   wgpuComputePassEncoderEnd(pass);
+   wgpuComputePassEncoderRelease(pass);
+   wgpuCommandEncoderResolveQuerySet(replay->encoder, replay->timestamp_set, slot, 1, replay->timestamp_resolve,
+                                     (uint64_t)slot * 256);
+   wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, replay->timestamp_resolve, (uint64_t)slot * 256,
+                                        pool->buffer, (uint64_t)query * 8, 8);
+   wvk_replay_write(replay, pool->mem, (uint64_t)query * 8, 8);
+   if (in_pass)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
 }
 
 /* Results to a buffer on the GPU, in whatever layout the flags ask: a

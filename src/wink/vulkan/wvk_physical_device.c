@@ -442,8 +442,8 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .sampledImageStencilSampleCounts = WVK_SAMPLE_COUNTS,
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxSampleMaskWords = 1,
-      /* Timestamps exist only at pass boundaries in WebGPU. */
-      .timestampComputeAndGraphics = false,
+      /* An empty compute pass's beginning, anywhere (wvk_query.c). */
+      .timestampComputeAndGraphics = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TimestampQuery),
       .timestampPeriod = 1.0f,
       .maxClipDistances = clip ? 8 : 0,
       .maxCullDistances = 0,
@@ -679,6 +679,7 @@ wvk_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
                                             uint32_t *pQueueFamilyPropertyCount,
                                             VkQueueFamilyProperties2 *pQueueFamilyProperties)
 {
+   VK_FROM_HANDLE(wvk_physical_device, pdev, physicalDevice);
    VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyProperties2, out, pQueueFamilyProperties,
                           pQueueFamilyPropertyCount);
 
@@ -687,7 +688,7 @@ wvk_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
       p->queueFamilyProperties = (VkQueueFamilyProperties){
          .queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
          .queueCount = 1,
-         .timestampValidBits = 0,
+         .timestampValidBits = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TimestampQuery) ? 64 : 0,
          .minImageTransferGranularity = { 1, 1, 1 },
       };
       vk_foreach_struct(stype, ext, p->pNext) {

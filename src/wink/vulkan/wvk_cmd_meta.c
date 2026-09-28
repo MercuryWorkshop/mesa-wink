@@ -169,10 +169,13 @@ wvk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
    }
 
    struct wvk_meta_save save;
+   /* Clears are not drawing, to an occlusion query. */
+   wvk_replay_suspend_query(cmd->replay);
    meta_begin(cmd, &save);
    vk_meta_clear_attachments(&cmd->vk, &dev->meta, &render, attachmentCount, pAttachments,
                              rectCount, pRects);
    meta_end(cmd, &save);
+   wvk_replay_resume_query(cmd->replay);
 }
 
 VKAPI_ATTR void VKAPI_CALL
