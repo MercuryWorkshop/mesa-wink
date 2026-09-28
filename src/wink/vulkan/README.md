@@ -41,7 +41,11 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   swizzles are applied to what is read through them, and samplers' border
   colours, mirroring once, LOD bias and unnormalized coordinates are the
   shader's. Integer textures, which WebGPU does not sample, are fetched
-  from, with the sampler's address modes and LOD applied.
+  from, with the sampler's address modes and LOD applied; an integer cube
+  is the 2D array of its faces, the face chosen as Vulkan chooses it.
+  Comparisons WGSL cannot make -- with gradients, a bias, or at a LOD
+  other than 0 -- fetch and compare each texel of the filter by hand, and
+  textureQueryLod is worked out from the sampler's record.
 - **Image atomics**, which WGSL does not have, are on a storage buffer of
   the image's texels. A 32-bit integer storage image has one besides its
   texture, and a shader that does atomics on it uses it for everything.
@@ -156,7 +160,6 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   SPIR-V. Every operation but the quad ones is there, trivially.
 - Compressed images whose size is not a whole number of blocks: WebGPU's
   texture is the whole blocks, and sampling it covers the padding.
-- Integer cube textures, which need a 2D-array view to fetch from.
 - Blend states whose colour factors use both CONSTANT_COLOR and
   CONSTANT_ALPHA: WebGPU has one constant.
 - Multisampled array images are a texture for each layer, since WebGPU

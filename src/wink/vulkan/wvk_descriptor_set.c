@@ -22,6 +22,7 @@
 #include "vk_buffer_view.h"
 #include "vk_descriptor_update_template.h"
 #include "vk_util.h"
+#include "vk_format.h"
 
 void
 wvk_descriptor_set_invalidate(struct wvk_descriptor_set *set)
@@ -216,8 +217,12 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
        * input attachment an array, fetched at the pass's layer. */
       WGPUTextureView wgpu = view ? view->view : NULL;
       const WGPUTextureViewDescriptor *desc = view ? &view->view_desc : NULL;
+      /* And an integer cube, which shaders fetch the faces of. */
+      const bool integer_cube = view && (view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
+                                         view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) &&
+                                vk_format_is_int(view->vk.view_format);
       if (view && view->array_view &&
-          (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)) {
+          (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT || integer_cube)) {
          wgpu = view->array_view;
          desc = &view->array_desc;
       }

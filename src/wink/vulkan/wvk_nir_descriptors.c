@@ -606,8 +606,10 @@ texture_query(nir_builder *b, nir_tex_instr *tex, nir_texop op, nir_def *lod)
    const int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
    nir_tex_instr *q = nir_tex_instr_create(b->shader, lod ? 2 : 1);
    q->op = op;
-   q->sampler_dim = tex->sampler_dim;
-   q->is_array = tex->is_array;
+   /* As the texture is: an integer cube's is a 2D array of its faces. */
+   const struct glsl_type *type = glsl_without_array(nir_src_as_deref(tex->src[texture].src)->type);
+   q->sampler_dim = glsl_get_sampler_dim(type);
+   q->is_array = glsl_sampler_type_is_array(type);
    q->dest_type = nir_type_int32;
    q->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, tex->src[texture].src.ssa);
    if (lod)
@@ -688,15 +690,16 @@ border_texel(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t 
  * of the coordinates in texels of the base level; with the sampler's bias
  * and LOD range. Before the bias went into the instruction. */
 static nir_def *
-sample_lambda(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot,
-              nir_def *coord, unsigned spatial)
+sample_lambda_raw(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot,
+                  nir_def *coord, unsigned spatial)
 {
    nir_def *lambda;
    const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
    if (tex->op == nir_texop_txl && lod_idx >= 0) {
       lambda = tex->src[lod_idx].src.ssa;
    } else if (tex->op == nir_texop_txd || (b->shader->info.stage == MESA_SHADER_FRAGMENT &&
-                                           (tex->op == nir_texop_tex || tex->op == nir_texop_txb))) {
+                                           (tex->op == nir_texop_tex || tex->op == nir_texop_txb ||
+                                            tex->op == nir_texop_lod))) {
       nir_def *base = &texture_query(b, tex, nir_texop_txs, nir_imm_int(b, 0))->def;
       nir_def *dx, *dy;
       if (tex->op == nir_texop_txd) {
@@ -706,8 +709,20 @@ sample_lambda(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t
          dx = nir_ddx(b, nir_trim_vector(b, coord, spatial));
          dy = nir_ddy(b, nir_trim_vector(b, coord, spatial));
       }
-      nir_def *scale = nir_i2f32(b, nir_trim_vector(b, base, spatial));
-      nir_def *rho = nir_fmax(b, nir_fast_length(b, nir_fmul(b, dx, scale)), nir_fast_length(b, nir_fmul(b, dy, scale)));
+      nir_def *rho;
+      if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
+         /* A face's coordinates are the direction over its major axis,
+          * from -1 to 1 across the face's size. */
+         nir_def *dir = nir_trim_vector(b, coord, 3);
+         nir_def *major = nir_fmax(b, nir_fmax(b, nir_fabs(b, nir_channel(b, dir, 0)), nir_fabs(b, nir_channel(b, dir, 1))),
+                                   nir_fabs(b, nir_channel(b, dir, 2)));
+         nir_def *scale = nir_fdiv(b, nir_fmul_imm(b, nir_i2f32(b, nir_channel(b, base, 0)), 0.5),
+                                   nir_fmax(b, major, nir_imm_float(b, 1e-20f)));
+         rho = nir_fmul(b, nir_fmax(b, nir_fast_length(b, dx), nir_fast_length(b, dy)), scale);
+      } else {
+         nir_def *scale = nir_i2f32(b, nir_trim_vector(b, base, spatial));
+         rho = nir_fmax(b, nir_fast_length(b, nir_fmul(b, dx, scale)), nir_fast_length(b, nir_fmul(b, dy, scale)));
+      }
       lambda = nir_flog2(b, nir_fmax(b, rho, nir_imm_float(b, 1e-20f)));
       const int bias_idx = nir_tex_instr_src_index(tex, nir_tex_src_bias);
       if (tex->op == nir_texop_txb && bias_idx >= 0)
@@ -715,7 +730,14 @@ sample_lambda(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t
    } else {
       lambda = nir_imm_float(b, 0.0f);
    }
-   lambda = nir_fadd(b, lambda, sampler_word(b, meta, group, slot, WVK_META_SAMPLER_BIAS));
+   return nir_fadd(b, lambda, sampler_word(b, meta, group, slot, WVK_META_SAMPLER_BIAS));
+}
+
+static nir_def *
+sample_lambda(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot,
+              nir_def *coord, unsigned spatial)
+{
+   nir_def *lambda = sample_lambda_raw(b, meta, tex, group, slot, coord, spatial);
    return nir_fclamp(b, lambda, sampler_word(b, meta, group, slot, WVK_META_SAMPLER_MIN_LOD),
                      sampler_word(b, meta, group, slot, WVK_META_SAMPLER_MAX_LOD));
 }
@@ -726,6 +748,28 @@ sample_lambda(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t
  * border axis weighs the border in by how much of the filter's footprint
  * is outside, at the level's size: exact for nearest and for bilinear on
  * one level. */
+/* textureQueryLod, which WGSL has not: the LOD with the sampler's bias,
+ * and the level that would be sampled -- within the sampler's range and
+ * the view's levels, and the nearest level unless mipmaps are linear. */
+static bool
+lower_query_lod(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
+{
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (b->shader->info.stage != MESA_SHADER_FRAGMENT || coord_idx < 0)
+      return false;
+   b->cursor = nir_before_instr(&tex->instr);
+   const unsigned spatial = glsl_get_sampler_dim_coordinate_components(tex->sampler_dim);
+   nir_def *lambda = sample_lambda_raw(b, meta, tex, group, slot, tex->src[coord_idx].src.ssa, spatial);
+   nir_def *flags = sampler_word(b, meta, group, slot, WVK_META_SAMPLER_FLAGS);
+   nir_def *d = nir_fclamp(b, lambda, sampler_word(b, meta, group, slot, WVK_META_SAMPLER_MIN_LOD),
+                           sampler_word(b, meta, group, slot, WVK_META_SAMPLER_MAX_LOD));
+   d = nir_bcsel(b, flag(b, flags, WVK_SAMPLER_MIP_LINEAR), d, nir_ffloor(b, nir_fadd_imm(b, d, 0.5)));
+   nir_def *levels = nir_i2f32(b, &texture_query(b, tex, nir_texop_query_levels, NULL)->def);
+   nir_def *level = nir_fclamp(b, d, nir_imm_float(b, 0.0f), nir_fadd_imm(b, levels, -1.0f));
+   nir_def_replace(&tex->def, nir_trim_vector(b, nir_vec2(b, level, lambda), tex->def.num_components));
+   return true;
+}
+
 static bool
 lower_float_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
 {
@@ -771,11 +815,19 @@ lower_float_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uin
    nir_def *comps[4];
    for (unsigned i = 0; i < tex->coord_components; ++i)
       comps[i] = nir_channel(b, coord, i);
+   /* An offset is the sampler's to wrap too: in the coordinates, and out
+    * again after, where the sample adds it. */
+   const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
    nir_def *weight = one;
    for (unsigned i = 0; i < spatial; ++i) {
       nir_def *extent = nir_i2f32(b, nir_channel(b, size, i));
       nir_def *mode = address_mode(b, flags, i);
       nir_def *c = nir_bcsel(b, flag(b, flags, WVK_SAMPLER_UNNORMALIZED), nir_fdiv(b, comps[i], extent), comps[i]);
+      nir_def *offset = offset_idx >= 0 && i < tex->src[offset_idx].src.ssa->num_components
+                           ? nir_fdiv(b, nir_i2f32(b, nir_channel(b, tex->src[offset_idx].src.ssa, i)), extent)
+                           : NULL;
+      if (offset)
+         c = nir_fadd(b, c, offset);
       c = nir_bcsel(b, nir_ieq_imm(b, mode, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE), nir_fabs(b, c), c);
       nir_def *border = nir_ieq_imm(b, mode, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
       nir_def *linear = nir_bcsel(b, minified, flag(b, flags, WVK_SAMPLER_MIN_LINEAR),
@@ -787,6 +839,8 @@ lower_float_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uin
       nir_def *half = nir_fdiv(b, nir_imm_float(b, 0.5f), extent);
       nir_def *inset = nir_fmin(b, nir_fmax(b, c, half), nir_fsub(b, one, half));
       comps[i] = nir_bcsel(b, nir_iand(b, border, linear), inset, c);
+      if (offset)
+         comps[i] = nir_fsub(b, comps[i], offset);
    }
    nir_def *adjusted = nir_vec(b, comps, tex->coord_components);
    nir_pop_if(b, NULL);
@@ -849,6 +903,80 @@ wrap_texel(nir_builder *b, nir_def *t, nir_def *extent, nir_def *mode, nir_def *
    return nir_bcsel(b, nir_ieq_imm(b, mode, VK_SAMPLER_ADDRESS_MODE_REPEAT), repeat,
           nir_bcsel(b, nir_ieq_imm(b, mode, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT), mirrored,
           nir_bcsel(b, nir_ieq_imm(b, mode, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE), once, clamped)));
+}
+
+/* The face of a cube a direction selects, and where in it, as Vulkan's
+ * cube map face selection has it. */
+static void
+cube_face(nir_builder *b, nir_def *dir, nir_def **face, nir_def **s, nir_def **t)
+{
+   nir_def *x = nir_channel(b, dir, 0), *y = nir_channel(b, dir, 1), *z = nir_channel(b, dir, 2);
+   nir_def *ax = nir_fabs(b, x), *ay = nir_fabs(b, y), *az = nir_fabs(b, z);
+   nir_def *zero = nir_imm_float(b, 0.0f);
+   nir_def *is_z = nir_iand(b, nir_fge(b, az, ax), nir_fge(b, az, ay));
+   nir_def *is_y = nir_iand(b, nir_inot(b, is_z), nir_fge(b, ay, ax));
+   nir_def *ma = nir_bcsel(b, is_z, az, nir_bcsel(b, is_y, ay, ax));
+   nir_def *sc = nir_bcsel(b, is_z, nir_bcsel(b, nir_fge(b, z, zero), x, nir_fneg(b, x)),
+                           nir_bcsel(b, is_y, x, nir_bcsel(b, nir_fge(b, x, zero), nir_fneg(b, z), z)));
+   nir_def *tc = nir_bcsel(b, is_y, nir_bcsel(b, nir_fge(b, y, zero), z, nir_fneg(b, z)), nir_fneg(b, y));
+   *face = nir_bcsel(b, is_z, nir_bcsel(b, nir_fge(b, z, zero), nir_imm_int(b, 4), nir_imm_int(b, 5)),
+                     nir_bcsel(b, is_y, nir_bcsel(b, nir_fge(b, y, zero), nir_imm_int(b, 2), nir_imm_int(b, 3)),
+                               nir_bcsel(b, nir_fge(b, x, zero), nir_imm_int(b, 0), nir_imm_int(b, 1))));
+   nir_def *inv = nir_frcp(b, nir_fmax(b, ma, nir_imm_float(b, 1e-20f)));
+   *s = nir_fmul_imm(b, nir_fadd_imm(b, nir_fmul(b, sc, inv), 1.0), 0.5);
+   *t = nir_fmul_imm(b, nir_fadd_imm(b, nir_fmul(b, tc, inv), 1.0), 0.5);
+}
+
+/* Sampling an integer cube, which WebGPU does not: a fetch from the 2D
+ * array of its faces, at the texel nearest where the direction meets the
+ * face, of the level the LOD selects. */
+static bool
+lower_integer_cube_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
+{
+   const int texture_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (texture_idx < 0 || coord_idx < 0 ||
+       !glsl_sampler_type_is_array(glsl_without_array(nir_src_as_deref(tex->src[texture_idx].src)->type)))
+      return false;
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   nir_def *lambda = sample_lambda(b, meta, tex, group, slot, coord, 3);
+   nir_def *levels = &texture_query(b, tex, nir_texop_query_levels, NULL)->def;
+   nir_def *level = nir_f2i32(b, nir_fround_even(b, nir_fmax(b, lambda, nir_imm_float(b, 0.0f))));
+   level = nir_imin(b, level, nir_iadd_imm(b, levels, -1));
+   nir_def *size = &texture_query(b, tex, nir_texop_txs, level)->def;
+   nir_def *face, *s, *t;
+   cube_face(b, coord, &face, &s, &t);
+   nir_def *w = nir_channel(b, size, 0), *h = nir_channel(b, size, 1);
+   nir_def *x = nir_imin(b, nir_imax(b, nir_f2i32(b, nir_ffloor(b, nir_fmul(b, s, nir_i2f32(b, w)))), nir_imm_int(b, 0)),
+                         nir_iadd_imm(b, w, -1));
+   nir_def *y = nir_imin(b, nir_imax(b, nir_f2i32(b, nir_ffloor(b, nir_fmul(b, t, nir_i2f32(b, h)))), nir_imm_int(b, 0)),
+                         nir_iadd_imm(b, h, -1));
+   nir_def *layer = face;
+   if (tex->is_array) {
+      nir_def *cubes = nir_udiv_imm(b, nir_channel(b, size, 2), 6);
+      nir_def *index = nir_imin(b, nir_imax(b, nir_f2i32(b, nir_fround_even(b, nir_channel(b, coord, 3))), nir_imm_int(b, 0)),
+                                nir_iadd_imm(b, cubes, -1));
+      layer = nir_iadd(b, face, nir_imul_imm(b, index, 6));
+   }
+   nir_tex_instr *txf = nir_tex_instr_create(b->shader, 3);
+   txf->op = nir_texop_txf;
+   txf->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   txf->is_array = true;
+   txf->dest_type = tex->dest_type;
+   txf->coord_components = 3;
+   txf->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, tex->src[texture_idx].src.ssa);
+   txf->src[1] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_vec3(b, x, y, layer));
+   txf->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, level);
+   nir_def_init(&txf->instr, &txf->def, 4, tex->def.bit_size);
+   nir_builder_instr_insert(b, &txf->instr);
+   if (tex->op == nir_texop_tg4) {
+      nir_def *c = nir_channel(b, &txf->def, tex->component);
+      nir_def_replace(&tex->def, nir_vec4(b, c, c, c, c));
+      return true;
+   }
+   nir_def_replace(&tex->def, nir_trim_vector(b, &txf->def, tex->def.num_components));
+   return true;
 }
 
 /* Sampling an integer texture, which WebGPU does not: a fetch, of the
@@ -949,6 +1077,102 @@ lower_integer_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, u
    return true;
 }
 
+/* One level's filtered comparison: the texels the filter takes, each
+ * wrapped as the sampler's address modes say or the border's depth, each
+ * compared with `ref`, weighed. */
+static nir_def *
+compare_level(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot,
+              nir_def *flags, nir_def *level, nir_def *linear, nir_def *ref, nir_def *border_depth)
+{
+   const int texture_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   const unsigned n = tex->coord_components;
+   const unsigned spatial = n - (tex->is_array ? 1 : 0);
+   nir_def *op = nir_ubitfield_extract_imm(b, flags, WVK_SAMPLER_COMPARE_SHIFT, 3);
+   nir_def *size = &texture_query(b, tex, nir_texop_txs, level)->def;
+
+   nir_def *first[3], *frac[3];
+   for (unsigned i = 0; i < spatial; ++i) {
+      nir_def *u = nir_fmul(b, nir_channel(b, coord, i), nir_i2f32(b, nir_channel(b, size, i)));
+      nir_def *lin = nir_fadd_imm(b, u, -0.5);
+      nir_def *base = nir_bcsel(b, linear, nir_ffloor(b, lin), nir_ffloor(b, u));
+      frac[i] = nir_bcsel(b, linear, nir_fsub(b, lin, nir_ffloor(b, lin)), nir_imm_float(b, 0.0f));
+      first[i] = nir_f2i32(b, base);
+      if (offset_idx >= 0)
+         first[i] = nir_iadd(b, first[i], nir_channel(b, tex->src[offset_idx].src.ssa, i));
+   }
+   nir_def *layer = NULL;
+   if (tex->is_array)
+      layer = nir_imin(b, nir_imax(b, nir_f2i32(b, nir_fround_even(b, nir_channel(b, coord, spatial))),
+                                   nir_imm_int(b, 0)),
+                       nir_iadd_imm(b, nir_channel(b, size, spatial), -1));
+
+   nir_def *sum = nir_imm_float(b, 0.0f);
+   for (unsigned tap = 0; tap < (1u << spatial); ++tap) {
+      nir_def *comps[4];
+      nir_def *outside = nir_imm_false(b);
+      nir_def *weight = nir_imm_float(b, 1.0f);
+      for (unsigned i = 0; i < spatial; ++i) {
+         const bool next = tap & (1u << i);
+         nir_def *t = next ? nir_iadd_imm(b, first[i], 1) : first[i];
+         comps[i] = wrap_texel(b, t, nir_channel(b, size, i), address_mode(b, flags, i), &outside);
+         weight = nir_fmul(b, weight, next ? frac[i] : nir_fsub(b, nir_imm_float(b, 1.0f), frac[i]));
+      }
+      if (layer)
+         comps[spatial] = layer;
+      nir_tex_instr *txf = nir_tex_instr_create(b->shader, 3);
+      txf->op = nir_texop_txf;
+      txf->sampler_dim = tex->sampler_dim;
+      txf->is_array = tex->is_array;
+      txf->dest_type = nir_type_float32;
+      txf->coord_components = n;
+      txf->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, tex->src[texture_idx].src.ssa);
+      txf->src[1] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_vec(b, comps, n));
+      txf->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, level);
+      nir_def_init(&txf->instr, &txf->def, 4, 32);
+      nir_builder_instr_insert(b, &txf->instr);
+      nir_def *depth = nir_bcsel(b, outside, border_depth, nir_channel(b, &txf->def, 0));
+      sum = nir_fadd(b, sum, nir_fmul(b, weight, depth_compare(b, op, ref, depth)));
+   }
+   return sum;
+}
+
+/* A comparison with gradients, or at a LOD other than 0, which WGSL has
+ * none of: by hand, at the levels the LOD selects, linear between them
+ * where mipmaps are. */
+static bool
+lower_shadow_explicit(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
+{
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int ref_idx = nir_tex_instr_src_index(tex, nir_tex_src_comparator);
+   if (coord_idx < 0 || ref_idx < 0 || tex->coord_components - (tex->is_array ? 1 : 0) > 2)
+      return false;
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *flags = sampler_word(b, meta, group, slot, WVK_META_SAMPLER_FLAGS);
+   const unsigned spatial = tex->coord_components - (tex->is_array ? 1 : 0);
+   nir_def *lambda = sample_lambda(b, meta, tex, group, slot, tex->src[coord_idx].src.ssa, spatial);
+   nir_def *levels = &texture_query(b, tex, nir_texop_query_levels, NULL)->def;
+   nir_def *minified = nir_flt(b, nir_imm_float(b, 0.0f), lambda);
+   nir_def *linear = nir_bcsel(b, minified, flag(b, flags, WVK_SAMPLER_MIN_LINEAR), flag(b, flags, WVK_SAMPLER_MAG_LINEAR));
+   nir_def *mip_linear = nir_iand(b, minified, flag(b, flags, WVK_SAMPLER_MIP_LINEAR));
+   nir_def *lam = nir_fmax(b, lambda, nir_imm_float(b, 0.0f));
+   nir_def *top = nir_iadd_imm(b, levels, -1);
+   nir_def *l0 = nir_f2i32(b, nir_bcsel(b, mip_linear, nir_ffloor(b, lam), nir_ffloor(b, nir_fadd_imm(b, lam, 0.5))));
+   l0 = nir_imin(b, l0, top);
+   nir_def *l1 = nir_imin(b, nir_iadd_imm(b, l0, 1), top);
+   nir_def *t = nir_bcsel(b, mip_linear, nir_ffract(b, lam), nir_imm_float(b, 0.0f));
+   nir_def *border[4];
+   border_texel(b, meta, tex, group, slot, true, border);
+   nir_def *ref = nir_channel(b, tex->src[ref_idx].src.ssa, 0);
+   nir_def *r0 = compare_level(b, meta, tex, group, slot, flags, l0, linear, ref, border[0]);
+   nir_def *r1 = compare_level(b, meta, tex, group, slot, flags, l1, linear, ref, border[0]);
+   nir_def *result = nir_flrp(b, r0, r1, t);
+   nir_def_replace(&tex->def, nir_pad_vector_imm_int(b, result, 0, tex->def.num_components));
+   return true;
+}
+
 static bool
 lower_sampler_instr(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -962,6 +1186,7 @@ lower_sampler_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_texop_txl:
    case nir_texop_txd:
    case nir_texop_tg4:
+   case nir_texop_lod:
       break;
    default:
       return false;
@@ -970,8 +1195,36 @@ lower_sampler_instr(nir_builder *b, nir_instr *instr, void *data)
    uint32_t group, slot;
    if (sampler < 0 || !deref_binding(tex->src[sampler].src, &group, &slot))
       return false;
+   if (tex->op == nir_texop_lod)
+      return lower_query_lod(b, meta, tex, group, slot);
+   /* WGSL compares at level 0 or with implicit derivatives, and without a
+    * bias: the rest by hand. */
+   if (tex->is_shadow) {
+      const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+      const bool level_zero = tex->op == nir_texop_txl && lod_idx >= 0 && nir_src_is_const(tex->src[lod_idx].src) &&
+                              nir_src_as_float(tex->src[lod_idx].src) == 0.0;
+      const bool explicit = tex->op == nir_texop_txd || tex->op == nir_texop_txb ||
+                            (tex->op == nir_texop_txl && !level_zero);
+      if (explicit && tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE && lower_shadow_explicit(b, meta, tex, group, slot))
+         return true;
+      if (explicit && tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE) {
+         /* A cube's faces are not fetched by hand: at level 0, which is
+          * all a shadow cube map mostly has. */
+         mesa_logw_once("wvk: a shadow cube sampled with a bias, LOD or gradients is sampled at level 0");
+         b->cursor = nir_before_instr(&tex->instr);
+         const nir_tex_src_type gone[] = { nir_tex_src_bias, nir_tex_src_ddx, nir_tex_src_ddy, nir_tex_src_lod };
+         for (unsigned i = 0; i < ARRAY_SIZE(gone); ++i) {
+            const int idx = nir_tex_instr_src_index(tex, gone[i]);
+            if (idx >= 0)
+               nir_tex_instr_remove_src(tex, idx);
+         }
+         tex->op = nir_texop_txl;
+         nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_float(b, 0.0f));
+      }
+   }
    if (nir_alu_type_get_base_type(tex->dest_type) != nir_type_float && !tex->is_shadow)
-      return lower_integer_sample(b, meta, tex, group, slot);
+      return tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ? lower_integer_cube_sample(b, meta, tex, group, slot)
+                                                       : lower_integer_sample(b, meta, tex, group, slot);
    return lower_float_sample(b, meta, tex, group, slot);
 }
 

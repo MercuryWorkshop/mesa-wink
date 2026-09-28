@@ -350,6 +350,19 @@ new_var(nir_shader *nir, nir_variable_mode mode, const struct glsl_type *type,
    return var;
 }
 
+/* An integer cube texture as the 2D array of its faces, which is what is
+ * bound for one (wvk_descriptor_set.c): WebGPU samples no integer
+ * textures, and a cube's faces are fetched from by hand
+ * (wvk_nir_descriptors.c). */
+static const struct glsl_type *
+integer_cube_as_array(const struct glsl_type *type)
+{
+   if (!glsl_type_is_texture(type) || glsl_get_sampler_dim(type) != GLSL_SAMPLER_DIM_CUBE ||
+       glsl_get_sampler_result_type(type) == GLSL_TYPE_FLOAT)
+      return type;
+   return glsl_texture_type(GLSL_SAMPLER_DIM_2D, true, glsl_get_sampler_result_type(type));
+}
+
 static void
 split_resource_vars(nir_shader *nir, struct lower_state *state)
 {
@@ -381,9 +394,9 @@ split_resource_vars(nir_shader *nir, struct lower_state *state)
          s->sampler = rzalloc_array(s, nir_variable *, s->count);
       for (uint32_t e = 0; e < s->count; ++e) {
          if (combined) {
-            const struct glsl_type *texture =
+            const struct glsl_type *texture = integer_cube_as_array(
                glsl_texture_type(glsl_get_sampler_dim(bare), glsl_sampler_type_is_array(bare),
-                                 glsl_get_sampler_result_type(bare));
+                                 glsl_get_sampler_result_type(bare)));
             s->texture[e] = new_var(nir, nir_var_uniform, texture, var, bl->slot + e, "_tex", e);
             s->sampler[e] = new_var(nir, nir_var_uniform,
                                     glsl_sampler_type_is_shadow(bare) ? glsl_bare_shadow_sampler_type()
@@ -405,7 +418,7 @@ split_resource_vars(nir_shader *nir, struct lower_state *state)
                glsl_image_type(GLSL_SAMPLER_DIM_2D, true, glsl_get_sampler_result_type(bare));
             s->texture[e] = new_var(nir, var->data.mode, array, var, bl->slot + e, "_", e);
          } else {
-            s->texture[e] = new_var(nir, var->data.mode, bare, var, bl->slot + e, "_", e);
+            s->texture[e] = new_var(nir, var->data.mode, integer_cube_as_array(bare), var, bl->slot + e, "_", e);
          }
       }
       _mesa_hash_table_insert(state->split, var, s);
@@ -562,6 +575,41 @@ cube_image_as_array(nir_builder *b, nir_intrinsic_instr *intr)
                            : nir_trim_vector(b, &intr->def, 2);
    nir_def_rewrite_uses(placeholder, nir_trim_vector(b, size, n));
    nir_instr_remove(nir_def_instr(placeholder));
+}
+
+/* Queries of an integer cube, which is the 2D array of its faces
+ * (integer_cube_as_array): sampling it is the samplers' lowering's. */
+static bool
+integer_cube_query_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   const int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE || texture < 0 ||
+       (tex->op != nir_texop_txs && tex->op != nir_texop_query_levels))
+      return false;
+   const struct glsl_type *type = glsl_without_array(nir_src_as_deref(tex->src[texture].src)->type);
+   if (glsl_get_sampler_dim(type) != GLSL_SAMPLER_DIM_2D)
+      return false;
+   const bool arrayed = tex->is_array;
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->is_array = true;
+   if (tex->op != nir_texop_txs)
+      return true;
+   /* The faces' size, and cubes of six layers each. */
+   const unsigned n = tex->def.num_components;
+   tex->def.num_components = 3;
+   b->cursor = nir_after_instr(instr);
+   nir_def *placeholder = nir_undef(b, n, tex->def.bit_size);
+   nir_def_rewrite_uses(&tex->def, placeholder);
+   b->cursor = nir_after_instr(instr);
+   nir_def *size = arrayed ? nir_vec3(b, nir_channel(b, &tex->def, 0), nir_channel(b, &tex->def, 1),
+                                      nir_udiv_imm(b, nir_channel(b, &tex->def, 2), 6))
+                           : nir_trim_vector(b, &tex->def, 2);
+   nir_def_rewrite_uses(placeholder, nir_trim_vector(b, size, n));
+   nir_instr_remove(nir_def_instr(placeholder));
+   return true;
 }
 
 static bool
@@ -2087,10 +2135,15 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    split_buffer_vars(nir, &state);
    /* Writes by a dynamic index are ladders of ifs. */
    NIR_PASS(_, nir, nir_shader_instructions_pass, rewrite_resource_instr, nir_metadata_none, &state);
+   NIR_PASS(_, nir, nir_shader_instructions_pass, integer_cube_query_instr, nir_metadata_control_flow, NULL);
    /* Swizzles first: a gather's is a gather of another component, which
     * then samples as its own; and the border replaces a texel before the
     * swizzle takes it apart. */
    NIR_PASS(_, nir, wvk_nir_lower_view_swizzles, shader->meta_base);
+   /* Projection divided out first: the samplers' lowering takes the
+    * coordinates as they are. */
+   const nir_lower_tex_options txp = { .lower_txp = ~0u };
+   NIR_PASS(_, nir, nir_lower_tex, &txp);
    NIR_PASS(_, nir, wvk_nir_lower_samplers, shader->meta_base);
    NIR_PASS(_, nir, lower_1d_images);
    NIR_PASS(_, nir, lower_ms_arrays);
