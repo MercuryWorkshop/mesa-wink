@@ -7,6 +7,7 @@
 
 #include "wvk_private.h"
 #include "wvk_queue.h"
+#include "wvk_descriptor_set_layout.h"
 
 #include "vk_command_pool.h"
 #include "vk_device.h"
@@ -59,8 +60,7 @@ struct wvk_device {
    /* Bind groups of only the driver's bindings, by layout. */
    struct {
       struct wvk_bgl *bgl;
-      uint64_t extra;
-      uint64_t draw;
+      struct wvk_driver_key driver;
       WGPUBindGroup group;
    } driver_groups[8];
    uint32_t driver_group_next;

@@ -7,6 +7,8 @@
 
 #include "wvk_private.h"
 
+#include "wvk_descriptor_set_layout.h"
+
 #include "vk_shader.h"
 
 struct wvk_device;
@@ -39,7 +41,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 3
+#define WVK_SHADER_BINARY_VERSION 4
 
 enum wvk_shader_variant {
    /* Vulkan's y points down, WebGPU's up: gl_Position.y negated. */
@@ -75,6 +77,10 @@ struct wvk_shader {
    /* Vertex: BaseVertex, BaseInstance or DrawIndex read, which the draw
     * has to say. */
    bool uses_draw_parameters;
+   /* Vertex: the Vulkan vertex bindings whose attributes the shader reads
+    * itself, at WVK_DRIVER_SLOT_VERTEX + i. */
+   uint8_t pulled_bindings[WVK_MAX_PULLED_BINDINGS];
+   uint8_t pulled_count;
    /* Compute. */
    uint16_t workgroup_size[3];
 };

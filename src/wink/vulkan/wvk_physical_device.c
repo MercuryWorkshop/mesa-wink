@@ -112,10 +112,10 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_uniform_buffer_standard_layout = true,
       .EXT_host_query_reset = true,
       .EXT_separate_stencil_usage = true,
-      /* WebGPU steps instances one at a time. TODO: divisors by pulling
-       * vertices in the shader. */
-      .EXT_vertex_attribute_divisor = false,
-      .KHR_vertex_attribute_divisor = false,
+      /* WebGPU steps instances one at a time: other divisors are read by
+       * the shader (wvk_shader.c, pull_divided_attributes). */
+      .EXT_vertex_attribute_divisor = true,
+      .KHR_vertex_attribute_divisor = true,
    };
    (void)pdev;
 }
@@ -172,8 +172,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .maintenance4 = false,
 
       /* VK_KHR_vertex_attribute_divisor */
-      .vertexAttributeInstanceRateDivisor = false,
-      .vertexAttributeInstanceRateZeroDivisor = false,
+      .vertexAttributeInstanceRateDivisor = true,
+      .vertexAttributeInstanceRateZeroDivisor = true,
 
       /* VK_KHR_portability_subset: what WebGPU leaves out */
       .constantAlphaColorBlendFactors = true,
@@ -370,7 +370,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxPushDescriptors = 32,
 
       /* VK_KHR_vertex_attribute_divisor */
-      .maxVertexAttribDivisor = 1,
+      .maxVertexAttribDivisor = UINT32_MAX,
       .supportsNonZeroFirstInstance = true,
 
       /* VK_KHR_portability_subset */

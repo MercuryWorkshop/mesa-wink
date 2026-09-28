@@ -61,6 +61,10 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* The draw's parameters (BaseVertex, BaseInstance): the push buffer again
  * for a direct draw, the indirect buffer for an indirect one. */
 #define WVK_DRIVER_SLOT_DRAW (WVK_DRIVER_SLOT_BASE + 1)
+/* Vertex buffers whose attributes the vertex shader reads itself: those
+ * of bindings with a divisor other than 1, which WebGPU cannot step. */
+#define WVK_DRIVER_SLOT_VERTEX (WVK_DRIVER_SLOT_BASE + 2)
+#define WVK_MAX_PULLED_BINDINGS 4
 #define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
 
 /* The push binding: the application's push constants, then the driver's
@@ -69,12 +73,24 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
  *   - the words of the draw binding BaseVertex and BaseInstance are, and
  *     DrawIndex, 4 uints;
  *   - a direct draw's BaseVertex and BaseInstance, which those words name
- *     then, 4 uints. */
+ *     then, 4 uints;
+ *   - where each pulled vertex buffer's bound range starts in its binding,
+ *     in bytes, 4 uints. */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
 #define WVK_DRIVER_DRAW_VALUES (WVK_DRIVER_DATA_OFFSET + 32)
-#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 48)
+#define WVK_DRIVER_PULL_OFFSET (WVK_DRIVER_DATA_OFFSET + 48)
+#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 64)
+
+/* What a group-3 bind group's driver bindings are bound to: the push
+ * buffer's generation, and memory serials (0: none) for the draw binding
+ * (none: the push buffer) and the pulled vertex buffers. */
+struct wvk_driver_key {
+   uint64_t push_generation;
+   uint64_t draw;
+   uint64_t vertex[WVK_MAX_PULLED_BINDINGS];
+};
 
 static inline bool
 wvk_descriptor_type_is_dynamic(VkDescriptorType type)

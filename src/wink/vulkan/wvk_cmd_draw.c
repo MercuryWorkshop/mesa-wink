@@ -623,11 +623,15 @@ struct wvk_bound_buffer {
    uint64_t size;
 };
 
-struct wvk_draw_binding {
+/* A driver binding on an application's buffer: the draw binding on an
+ * indirect buffer, or a pulled vertex buffer. */
+struct wvk_driver_buffer {
    WGPUBuffer buffer;
-   /* The memory's serial, or 0 for the push buffer. */
+   /* The memory's serial, or 0 for none. */
    uint64_t serial;
+   /* The dynamic offset, and the bind group's size. */
    uint32_t offset;
+   uint64_t size;
 };
 
 /* An indirect draw's binding: from its command rounded down to 256 bytes,
@@ -650,7 +654,9 @@ struct wvk_bound_state {
    uint32_t push_offset;
    /* What the draw binding is: the push buffer, or (buffer set) an
     * indirect buffer from a 256-byte boundary. See set_draw_parameters. */
-   struct wvk_draw_binding draw;
+   struct wvk_driver_buffer draw;
+   /* The vertex shader's pulled vertex buffers. See set_pulled_buffers. */
+   struct wvk_driver_buffer pulled[WVK_MAX_PULLED_BINDINGS];
    /* The last draw's pipeline layout. */
    struct wvk_layout *graphics_layout;
 
@@ -930,9 +936,21 @@ note_buffer(struct wvk_replay *replay, const struct wvk_descriptor *d, bool writ
       wvk_replay_write(replay, d->mem, d->offset, d->size);
 }
 
+/* The application's buffer behind a driver binding, or NULL for the push
+ * binding. */
+static const struct wvk_driver_buffer *
+driver_binding_buffer(const struct wvk_bound_state *st, uint32_t binding)
+{
+   if (binding == WVK_DRIVER_SLOT_DRAW)
+      return &st->draw;
+   if (binding >= WVK_DRIVER_SLOT_VERTEX && binding < WVK_DRIVER_SLOT_VERTEX + WVK_MAX_PULLED_BINDINGS)
+      return &st->pulled[binding - WVK_DRIVER_SLOT_VERTEX];
+   return NULL;
+}
+
 static WGPUBindGroup
 make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct wvk_descriptor_set *set,
-                uint32_t group, const struct wvk_draw_binding *draw)
+                uint32_t group, const struct wvk_bound_state *st)
 {
    const struct wvk_physical_device *pdev = wvk_device_physical(dev);
    WGPUBindGroupEntry *entries = calloc(MAX2(bgl->count, 1), sizeof(*entries));
@@ -944,10 +962,14 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       *e = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       e->binding = b->binding;
       if (group == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
+         const struct wvk_driver_buffer *d = driver_binding_buffer(st, b->binding);
          e->offset = 0;
-         if (b->binding == WVK_DRIVER_SLOT_DRAW && draw->buffer) {
-            e->buffer = draw->buffer;
-            e->size = WVK_DRAW_WINDOW;
+         if (d && d->buffer) {
+            e->buffer = d->buffer;
+            e->size = d->size;
+         } else if (b->binding >= WVK_DRIVER_SLOT_VERTEX) {
+            e->buffer = dev->null_buffer;
+            e->size = 256;
          } else {
             e->buffer = dev->push_buffer;
             e->size = WVK_PUSH_DATA_SIZE;
@@ -1005,34 +1027,44 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
    return bg;
 }
 
-static bool
-bgl_has_binding(const struct wvk_bgl *bgl, uint32_t binding)
+/* What this layout's driver bindings are bound to now. */
+static struct wvk_driver_key
+driver_key(const struct wvk_device *dev, const struct wvk_bgl *bgl, uint32_t group,
+           const struct wvk_bound_state *st)
 {
+   struct wvk_driver_key key = { 0 };
+   if (group != WVK_DRIVER_GROUP)
+      return key;
+   key.push_generation = dev->push_generation;
    for (uint32_t i = 0; i < bgl->count; ++i) {
-      if (bgl->entries[i].b.binding == binding)
-         return true;
+      const uint32_t binding = bgl->entries[i].b.binding;
+      const struct wvk_driver_buffer *d = driver_binding_buffer(st, binding);
+      if (!d)
+         continue;
+      if (binding == WVK_DRIVER_SLOT_DRAW)
+         key.draw = d->serial;
+      else
+         key.vertex[binding - WVK_DRIVER_SLOT_VERTEX] = d->serial;
    }
-   return false;
+   return key;
 }
 
 /* A set's bind group for this layout: kept in the set until it changes. */
 static WGPUBindGroup
 get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descriptor_set *set, uint32_t group,
-               const struct wvk_draw_binding *draw)
+               const struct wvk_bound_state *st)
 {
-   const bool driver = group == WVK_DRIVER_GROUP;
-   const uint64_t extra = driver ? dev->push_generation : 0;
-   const uint64_t draw_serial = driver && bgl_has_binding(bgl, WVK_DRIVER_SLOT_DRAW) ? draw->serial : 0;
+   const struct wvk_driver_key key = driver_key(dev, bgl, group, st);
    if (!set) {
       /* Only the driver's bindings, or nothing: kept on the device. */
       if (bgl == dev->empty_bgl)
          return dev->empty_bind_group;
       for (uint32_t i = 0; i < ARRAY_SIZE(dev->driver_groups); ++i) {
-         if (dev->driver_groups[i].bgl == bgl && dev->driver_groups[i].extra == extra &&
-             dev->driver_groups[i].draw == draw_serial && dev->driver_groups[i].group)
+         if (dev->driver_groups[i].bgl == bgl && dev->driver_groups[i].group &&
+             !memcmp(&dev->driver_groups[i].driver, &key, sizeof(key)))
             return dev->driver_groups[i].group;
       }
-      WGPUBindGroup bg = make_bind_group(dev, bgl, NULL, group, draw);
+      WGPUBindGroup bg = make_bind_group(dev, bgl, NULL, group, st);
       if (!bg)
          return NULL;
       const uint32_t i = dev->driver_group_next;
@@ -1040,18 +1072,17 @@ get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descripto
       if (dev->driver_groups[i].group)
          wgpuBindGroupRelease(dev->driver_groups[i].group);
       dev->driver_groups[i].bgl = bgl;
-      dev->driver_groups[i].extra = extra;
-      dev->driver_groups[i].draw = draw_serial;
+      dev->driver_groups[i].driver = key;
       dev->driver_groups[i].group = bg;
       return bg;
    }
    for (uint32_t i = 0; i < WVK_SET_BIND_GROUPS; ++i) {
       struct wvk_set_bind_group *c = &set->bind_groups[i];
-      if (c->group && c->layout == bgl->layout && c->generation == set->generation && c->extra == extra &&
-          c->draw == draw_serial)
+      if (c->group && c->layout == bgl->layout && c->generation == set->generation &&
+          !memcmp(&c->driver, &key, sizeof(key)))
          return c->group;
    }
-   WGPUBindGroup bg = make_bind_group(dev, bgl, set, group, draw);
+   WGPUBindGroup bg = make_bind_group(dev, bgl, set, group, st);
    if (!bg)
       return NULL;
    struct wvk_set_bind_group *c = &set->bind_groups[set->bind_group_next];
@@ -1059,7 +1090,7 @@ get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descripto
    if (c->group)
       wgpuBindGroupRelease(c->group);
    *c = (struct wvk_set_bind_group){
-      .layout = bgl->layout, .generation = set->generation, .extra = extra, .draw = draw_serial, .group = bg,
+      .layout = bgl->layout, .generation = set->generation, .driver = key, .group = bg,
    };
    return bg;
 }
@@ -1107,7 +1138,7 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
    for (uint32_t g = driver_only ? WVK_DRIVER_GROUP : 0; g < layout->group_count; ++g) {
       struct wvk_bgl *bgl = layout->groups[g];
       struct wvk_bound_set *bound = &st->sets[bind_point][g];
-      WGPUBindGroup bg = get_bind_group(dev, bgl, bgl->count ? bound->set : NULL, g, &st->draw);
+      WGPUBindGroup bg = get_bind_group(dev, bgl, bgl->count ? bound->set : NULL, g, st);
       if (!bg)
          return false;
 
@@ -1119,8 +1150,10 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
          const struct wvk_shader_binding *b = &bgl->entries[i].b;
          if (g == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
             if (b->dynamic && offset_count < WVK_MAX_DYNAMIC) {
-               offsets[offset_count++] = b->binding == WVK_DRIVER_SLOT_DRAW && st->draw.buffer
-                                            ? st->draw.offset : push_at;
+               /* The draw binding is the push buffer unless it is not. */
+               const struct wvk_driver_buffer *d = driver_binding_buffer(st, b->binding);
+               offsets[offset_count++] = d && (d->buffer || b->binding != WVK_DRIVER_SLOT_DRAW) ? d->offset
+                                                                                                : push_at;
             }
             continue;
          }
@@ -1356,6 +1389,38 @@ set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
    }
 }
 
+/* The vertex buffers whose attributes the vertex shader reads itself, as
+ * storage: each memory's buffer from a 256-byte boundary, as dynamic
+ * offsets are, as far as a binding can reach. The driver's data says
+ * where in that the bound range starts. */
+static void
+set_pulled_buffers(struct wvk_device *dev, struct wvk_replay *replay)
+{
+   const struct wvk_physical_device *pdev = wvk_device_physical(dev);
+   struct wvk_bound_state *st = replay->state;
+   uint32_t starts[WVK_MAX_PULLED_BINDINGS] = { 0 };
+   for (uint32_t i = 0; i < st->vs->pulled_count; ++i) {
+      const struct wvk_bound_buffer *vb = &st->vb[st->vs->pulled_bindings[i]];
+      struct wvk_driver_buffer *d = &st->pulled[i];
+      if (!vb->buffer || !vb->mem) {
+         *d = (struct wvk_driver_buffer){ 0 };
+         continue;
+      }
+      const uint64_t whole = vb->mem->buffer_size;
+      const uint64_t size = MIN2(whole, pdev->limits.maxStorageBufferBindingSize) & ~3ull;
+      const uint64_t offset = MIN2(vb->offset, whole - size) & ~255ull;
+      if (vb->offset + vb->size > offset + size)
+         mesa_logw_once("wvk: a vertex buffer with a divisor reaches past what a binding can");
+      *d = (struct wvk_driver_buffer){ vb->mem->buffer, vb->mem->serial, (uint32_t)offset, size };
+      starts[i] = (uint32_t)(vb->offset - offset);
+      wvk_replay_read(replay, vb->mem, vb->offset, vb->size);
+   }
+   if (memcmp(st->push + WVK_DRIVER_PULL_OFFSET, starts, sizeof(starts))) {
+      memcpy(st->push + WVK_DRIVER_PULL_OFFSET, starts, sizeof(starts));
+      st->push_offset = UINT32_MAX;
+   }
+}
+
 /* Everything a draw needs set on the pass. False skips the draw. */
 static bool
 flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
@@ -1398,6 +1463,8 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
     * constants. */
    set_viewport_scissor(cmd, pass);
    st->graphics_layout = p->layout;
+   if (st->vs->pulled_count)
+      set_pulled_buffers(dev, replay);
    if (!bind_groups(dev, replay, p->layout, WVK_BIND_GRAPHICS, pass, NULL, false))
       return false;
 
@@ -1446,13 +1513,14 @@ set_draw_parameters(struct wvk_bound_state *st, const struct wvk_bound_buffer *i
        * firstVertex and firstInstance of a VkDrawIndirectCommand. */
       words[0] = first + (indexed ? 3 : 2);
       words[1] = first + (indexed ? 4 : 3);
-      st->draw = (struct wvk_draw_binding){ indirect->buffer, indirect->mem->serial, (uint32_t)start };
+      st->draw = (struct wvk_driver_buffer){ indirect->buffer, indirect->mem->serial, (uint32_t)start,
+                                             WVK_DRAW_WINDOW };
    } else {
       words[0] = WVK_DRIVER_DRAW_VALUES / 4;
       words[1] = WVK_DRIVER_DRAW_VALUES / 4 + 1;
       words[4] = (uint32_t)base_vertex;
       words[5] = base_instance;
-      st->draw = (struct wvk_draw_binding){ 0 };
+      st->draw = (struct wvk_driver_buffer){ 0 };
    }
    words[2] = draw_id;
    if (memcmp(st->push + WVK_DRIVER_DRAW_OFFSET, words, sizeof(words))) {

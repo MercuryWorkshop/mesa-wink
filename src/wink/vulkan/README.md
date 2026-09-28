@@ -29,6 +29,10 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   samplers split, push constants as a storage buffer → zink's `nir_to_spirv`
   → Tint → WGSL. Set N is `@group(N)`, and each element of a Vulkan binding
   is a binding of its own. The driver's bindings sit at the top of group 3.
+- **Vertex attribute divisors** other than 1 are read by the vertex shader
+  itself, from the vertex buffer bound as storage, since WebGPU steps an
+  instance attribute every instance. It is the one piece of pipeline state
+  compiled into shaders.
 - **Blits and `vkCmdClearAttachments`** come from the runtime's vk_meta.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images

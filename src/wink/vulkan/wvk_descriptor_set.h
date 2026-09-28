@@ -39,10 +39,8 @@ struct wvk_descriptor {
 struct wvk_set_bind_group {
    WGPUBindGroupLayout layout;
    uint64_t generation;
-   /* What else went into it: the driver's bindings, for group 3 -- the
-    * push buffer's generation, and the draw binding's memory. */
-   uint64_t extra;
-   uint64_t draw;
+   /* What else went into it: the driver's bindings, for group 3. */
+   struct wvk_driver_key driver;
    WGPUBindGroup group;
 };
 

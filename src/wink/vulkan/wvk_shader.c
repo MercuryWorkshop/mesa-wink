@@ -17,8 +17,9 @@
  * of a pipeline are made of: a Vulkan set layout does not say whether a
  * texture is 2D or a cube, float or integer, and WebGPU insists.
  *
- * Nothing of a pipeline's state is compiled in: WebGPU pipelines are made
- * at the draw, from the modules here and whatever the state is then.
+ * Of a pipeline's state, only vertex attributes WebGPU cannot step are
+ * compiled in (pull_divided_attributes). WebGPU pipelines are made at the
+ * draw, from the modules here and whatever the state is then.
  */
 #include "wvk_shader.h"
 
@@ -122,14 +123,38 @@ wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    optimize(nir);
 }
 
+/* The vertex attributes the shader reads itself: those of instance-rate
+ * bindings with a divisor other than 1, since WebGPU steps an instance
+ * attribute every instance. */
+static bool
+is_pulled(const struct vk_vertex_input_state *vi, int location)
+{
+   if (!vi || location < 0 || location >= MESA_VK_MAX_VERTEX_ATTRIBUTES ||
+       !(vi->attributes_valid & BITFIELD_BIT(location)))
+      return false;
+   const struct vk_vertex_binding_state *vb = &vi->bindings[vi->attributes[location].binding];
+   return vb->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE && vb->divisor != 1;
+}
+
 static void
 wvk_hash_state(struct vk_physical_device *device, const struct vk_graphics_pipeline_state *state,
                const struct vk_features *enabled_features, VkShaderStageFlags stages,
                blake3_hash blake3_out)
 {
-   /* No state is compiled in. */
+   /* Only the attributes a vertex shader reads itself are compiled in. */
    struct mesa_blake3 ctx;
    _mesa_blake3_init(&ctx);
+   const struct vk_vertex_input_state *vi = state ? state->vi : NULL;
+   if ((stages & VK_SHADER_STAGE_VERTEX_BIT) && vi) {
+      u_foreach_bit(location, vi->attributes_valid) {
+         if (!is_pulled(vi, location))
+            continue;
+         const struct vk_vertex_attribute_state *a = &vi->attributes[location];
+         const struct vk_vertex_binding_state *vb = &vi->bindings[a->binding];
+         const uint32_t words[] = { location, a->binding, a->format, a->offset, vb->stride, vb->divisor };
+         _mesa_blake3_update(&ctx, words, sizeof(words));
+      }
+   }
    _mesa_blake3_final(&ctx, blake3_out);
 }
 
@@ -774,6 +799,142 @@ lower_draw_parameters_instr(nir_builder *b, nir_intrinsic_instr *intr, void *dat
    return true;
 }
 
+/* One channel of a vertex attribute, as its format has it, from the
+ * attribute's first byte in the pulled binding. Vulkan aligns attributes
+ * to their components, or to the whole of a packed format, so no channel
+ * straddles two words. */
+static nir_def *
+fetch_channel(nir_builder *b, nir_def *address, const struct util_format_description *desc, unsigned c,
+              uint32_t slot)
+{
+   const struct util_format_channel_description *ch = &desc->channel[c];
+   nir_def *bit = nir_iadd_imm(b, nir_ishl_imm(b, address, 3), ch->shift);
+   nir_def *word = nir_load_ssbo(b, 1, 32, driver_buffer(b, WVK_DRIVER_SLOT_VERTEX + slot),
+                                 nir_ishl_imm(b, nir_ushr_imm(b, bit, 5), 2), .align_mul = 4,
+                                 .access = ACCESS_NON_WRITEABLE);
+   nir_def *shift = nir_iand_imm(b, bit, 31);
+   const bool is_signed = ch->type == UTIL_FORMAT_TYPE_SIGNED;
+   nir_def *bits = ch->size == 32 ? word
+                   : is_signed    ? nir_ibitfield_extract(b, word, shift, nir_imm_int(b, ch->size))
+                                  : nir_ubitfield_extract(b, word, shift, nir_imm_int(b, ch->size));
+   switch (ch->type) {
+   case UTIL_FORMAT_TYPE_FLOAT:
+      return ch->size == 16 ? nir_channel(b, nir_unpack_half_2x16(b, bits), 0) : bits;
+   case UTIL_FORMAT_TYPE_UNSIGNED:
+      if (ch->normalized)
+         return nir_fdiv_imm(b, nir_u2f32(b, bits), (double)u_uintN_max(ch->size));
+      return ch->pure_integer ? bits : nir_u2f32(b, bits);
+   case UTIL_FORMAT_TYPE_SIGNED:
+      if (ch->normalized)
+         return nir_fmax(b, nir_fdiv_imm(b, nir_i2f32(b, bits), (double)u_intN_max(ch->size)),
+                         nir_imm_float(b, -1.0f));
+      return ch->pure_integer ? bits : nir_i2f32(b, bits);
+   default:
+      return nir_imm_int(b, 0);
+   }
+}
+
+/* An attribute's value: Vulkan's element firstInstance + (InstanceIndex -
+ * firstInstance) / divisor, or firstInstance for a divisor of 0, from
+ * where the draw's range of the buffer starts in the binding. */
+static nir_def *
+fetch_attribute(nir_builder *b, const struct vk_vertex_input_state *vi, int location, uint32_t slot)
+{
+   const struct vk_vertex_attribute_state *a = &vi->attributes[location];
+   const struct vk_vertex_binding_state *vb = &vi->bindings[a->binding];
+   nir_def *first = nir_load_base_instance(b);
+   nir_def *element = first;
+   if (vb->divisor)
+      element = nir_iadd(b, first, nir_udiv_imm(b, nir_isub(b, nir_load_instance_id(b), first), vb->divisor));
+   nir_def *starts = nir_load_ssbo(b, 4, 32, driver_buffer(b, WVK_DRIVER_SLOT_PUSH),
+                                   nir_imm_int(b, WVK_DRIVER_PULL_OFFSET), .align_mul = 16,
+                                   .access = ACCESS_NON_WRITEABLE);
+   nir_def *address = nir_iadd(b, nir_channel(b, starts, slot),
+                               nir_iadd_imm(b, nir_imul_imm(b, element, vb->stride), a->offset));
+
+   const struct util_format_description *desc = vk_format_description(a->format);
+   nir_def *channels[4];
+   for (unsigned c = 0; c < desc->nr_channels; ++c)
+      channels[c] = fetch_channel(b, address, desc, c, slot);
+   const bool integer = util_format_is_pure_integer(desc->format);
+   nir_def *out[4];
+   for (unsigned i = 0; i < 4; ++i) {
+      switch (desc->swizzle[i]) {
+      case PIPE_SWIZZLE_X:
+      case PIPE_SWIZZLE_Y:
+      case PIPE_SWIZZLE_Z:
+      case PIPE_SWIZZLE_W:
+         out[i] = channels[desc->swizzle[i] - PIPE_SWIZZLE_X];
+         break;
+      case PIPE_SWIZZLE_1:
+         out[i] = integer ? nir_imm_int(b, 1) : nir_imm_float(b, 1.0f);
+         break;
+      default:
+         out[i] = nir_imm_int(b, 0);
+         break;
+      }
+   }
+   return nir_vec(b, out, 4);
+}
+
+static bool
+pull_divided_attributes(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
+                        struct wvk_shader *shader)
+{
+   const struct vk_vertex_input_state *vi = state ? state->vi : NULL;
+   if (nir->info.stage != MESA_SHADER_VERTEX || !vi)
+      return false;
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_deref)
+               continue;
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            if (!nir_deref_mode_is(deref, nir_var_shader_in))
+               continue;
+            /* A location of a matrix or an array is an element of it. */
+            nir_variable *var = nir_deref_instr_get_variable(deref);
+            int location = var->data.location - VERT_ATTRIB_GENERIC0;
+            if (deref->deref_type == nir_deref_type_array && nir_src_is_const(deref->arr.index))
+               location += nir_src_as_uint(deref->arr.index);
+            else if (deref->deref_type != nir_deref_type_var)
+               continue;
+            if (!is_pulled(vi, location))
+               continue;
+            if (glsl_get_bit_size(deref->type) != 32) {
+               mesa_logw_once("wvk: a 64-bit attribute with a divisor");
+               continue;
+            }
+            const uint32_t binding = vi->attributes[location].binding;
+            uint32_t slot = 0;
+            while (slot < shader->pulled_count && shader->pulled_bindings[slot] != binding)
+               ++slot;
+            if (slot == WVK_MAX_PULLED_BINDINGS) {
+               mesa_logw_once("wvk: more than %u vertex bindings with divisors", WVK_MAX_PULLED_BINDINGS);
+               continue;
+            }
+            if (slot == shader->pulled_count)
+               shader->pulled_bindings[shader->pulled_count++] = binding;
+            b.cursor = nir_before_instr(instr);
+            nir_def *value = fetch_attribute(&b, vi, location, slot);
+            nir_def_replace(&intr->def, nir_trim_vector(&b, value, intr->def.num_components));
+            progress = true;
+         }
+      }
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   if (progress) {
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_in, NULL);
+   }
+   return progress;
+}
+
 /* The viewport transform from the driver's data: a vertex shader's
  * position is scaled and moved to where Vulkan's viewport would have put
  * it, WebGPU's being kept inside the attachments. See set_viewport_scissor. */
@@ -815,7 +976,9 @@ lower_viewport_transform(nir_shader *nir)
 }
 
 static bool
-lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *info, void *mem_ctx)
+lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *info,
+                       const struct vk_graphics_pipeline_state *state, struct wvk_shader *shader,
+                       void *mem_ctx)
 {
    struct word_buffers wb = {
       .vars = _mesa_pointer_hash_table_create(mem_ctx),
@@ -832,6 +995,8 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo | nir_var_mem_ssbo,
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, lower_viewport_transform);
+   /* Before the draw parameters: pulling reads BaseInstance. */
+   NIR_PASS(_, nir, pull_divided_attributes, state, shader);
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_draw_parameters_instr, nir_metadata_control_flow,
                NULL);
@@ -1298,7 +1463,8 @@ wvk_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
 
 static VkResult
 compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
-            const VkAllocationCallbacks *pAllocator, struct vk_shader **shader_out)
+            const struct vk_graphics_pipeline_state *pipeline_state, const VkAllocationCallbacks *pAllocator,
+            struct vk_shader **shader_out)
 {
    nir_shader *nir = info->nir;
    const mesa_shader_stage stage = nir->info.stage;
@@ -1330,7 +1496,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    NIR_PASS(_, nir, lower_ms_arrays);
    NIR_PASS(_, nir, pad_fragment_outputs);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, demote_to_terminate_instr, nir_metadata_all, NULL);
-   lower_buffers_to_words(nir, info, mem_ctx);
+   lower_buffers_to_words(nir, info, pipeline_state, shader, mem_ctx);
    optimize(nir);
    /* The combined and arrayed originals, now without a use. */
    hash_table_foreach(state.split, he)
@@ -1420,7 +1586,7 @@ wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_co
 {
    struct wvk_device *dev = container_of(vk_dev, struct wvk_device, vk);
    for (uint32_t i = 0; i < shader_count; ++i) {
-      VkResult result = compile_one(dev, &infos[i], pAllocator, &shaders_out[i]);
+      VkResult result = compile_one(dev, &infos[i], state, pAllocator, &shaders_out[i]);
       if (result != VK_SUCCESS) {
          /* compile consumes every NIR, whatever happens. */
          for (uint32_t j = i + 1; j < shader_count; ++j)
@@ -1467,6 +1633,8 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->writes_depth);
    blob_write_uint8(blob, shader->uses_push_constants);
    blob_write_uint8(blob, shader->uses_draw_parameters);
+   blob_write_uint8(blob, shader->pulled_count);
+   blob_write_bytes(blob, shader->pulled_bindings, sizeof(shader->pulled_bindings));
    blob_write_bytes(blob, shader->workgroup_size, sizeof(shader->workgroup_size));
    return !blob->out_of_memory;
 }
@@ -1489,6 +1657,9 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const bool writes_depth = blob_read_uint8(blob);
    const bool uses_push_constants = blob_read_uint8(blob);
    const bool uses_draw_parameters = blob_read_uint8(blob);
+   const uint8_t pulled_count = blob_read_uint8(blob);
+   uint8_t pulled_bindings[WVK_MAX_PULLED_BINDINGS];
+   blob_copy_bytes(blob, pulled_bindings, sizeof(pulled_bindings));
    uint16_t workgroup_size[3];
    blob_copy_bytes(blob, workgroup_size, sizeof(workgroup_size));
    if (blob->overrun || !wgsl[0]) {
@@ -1517,6 +1688,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->writes_depth = writes_depth;
    shader->uses_push_constants = uses_push_constants;
    shader->uses_draw_parameters = uses_draw_parameters;
+   shader->pulled_count = MIN2(pulled_count, WVK_MAX_PULLED_BINDINGS);
+   memcpy(shader->pulled_bindings, pulled_bindings, sizeof(pulled_bindings));
    memcpy(shader->workgroup_size, workgroup_size, sizeof(workgroup_size));
    VkResult result = shader->bindings ? VK_SUCCESS : vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    for (uint32_t i = 0; result == VK_SUCCESS && i < WVK_SHADER_VARIANTS; ++i) {
