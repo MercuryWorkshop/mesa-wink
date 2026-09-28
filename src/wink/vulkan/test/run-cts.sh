@@ -4,7 +4,8 @@
 #
 #   run-cts.sh OUT GROUP... [-- deqp-runner options]
 #
-# GROUP is a mustpass file without .txt: api, pipeline, texture, ...
+# GROUP is a mustpass list without .txt (api, texture, ...) or a directory
+# of them (pipeline, image).
 # WVK_CTS_ROOT is build-cts.sh's (default ~/.cache/mesa-wink/vk-cts), and
 # WVK_MESA_BUILD the Mesa build with the driver (default build/wvk-native).
 # OUT gets deqp-runner's results.csv and failures.csv. WVK_CTS_TIMEOUT is
@@ -21,7 +22,15 @@ OUT=$(cd "$OUT" && pwd)
 MUSTPASS="$ROOT/VK-GL-CTS/external/vulkancts/mustpass/main/vk-default"
 : > "$OUT/caselist.txt"
 while [ $# -gt 0 ] && [ "$1" != "--" ]; do
-  cat "$MUSTPASS/$1.txt" >> "$OUT/caselist.txt"
+  # A group is a list, or a directory of them (pipeline, image, ...).
+  if [ -f "$MUSTPASS/$1.txt" ]; then
+    cat "$MUSTPASS/$1.txt" >> "$OUT/caselist.txt"
+  elif [ -d "$MUSTPASS/$1" ]; then
+    find "$MUSTPASS/$1" -name '*.txt' -exec cat {} + >> "$OUT/caselist.txt"
+  else
+    echo "no group $1; there are: $(cd "$MUSTPASS" && ls | sed 's/\.txt$//' | tr '\n' ' ')" >&2
+    exit 1
+  fi
   shift
 done
 [ "${1:-}" = "--" ] && shift

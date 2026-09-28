@@ -5,6 +5,7 @@
 #include "wvk_sync.h"
 
 #include "wvk_device.h"
+#include "wvk_platform.h"
 #include "wvk_queue.h"
 
 #include "util/os_time.h"
@@ -93,7 +94,7 @@ wvk_sync_wait_many(struct vk_device *vk_device, uint32_t wait_count,
       if (result == VK_ERROR_DEVICE_LOST)
          return result;
       if (result == VK_NOT_READY)
-         os_time_sleep(100);
+         wvk_platform_sleep(100 * 1000);
    }
 }
 

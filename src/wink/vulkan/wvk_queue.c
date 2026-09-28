@@ -36,6 +36,7 @@ on_work_done(WGPUQueueWorkDoneStatus status, void *userdata1, void *userdata2)
    if (status != WGPUQueueWorkDoneStatus_Success)
       vk_device_set_lost(&wvk_queue_device(queue)->vk, "queue work failed");
    p->done = true;
+   wvk_platform_signal();
 }
 
 static void
@@ -48,6 +49,7 @@ on_mapped(WGPUMapAsyncStatus status, WGPUStringView message, void *userdata1, vo
       rb->failed = true;
       mesa_loge("wvk: reading host-visible memory back failed: %.*s", wvk_sv_len(message), message.data);
    }
+   wvk_platform_signal();
 }
 
 /* The oldest submit is done if its work is, and every readback mapped:
@@ -118,8 +120,8 @@ wvk_queue_wait_progress(struct wvk_queue *queue, uint64_t abs_timeout_ns)
    const uint64_t now = os_time_get_nano();
    const uint64_t timeout = abs_timeout_ns == OS_TIMEOUT_INFINITE ? UINT64_MAX
                             : abs_timeout_ns > now ? abs_timeout_ns - now : 0;
-   const WGPUWaitStatus status = wgpuInstanceWaitAny(queue_instance(queue)->wgpu, count, waits,
-                                                     MIN2(timeout, WVK_WAIT_SLICE_NS));
+   const WGPUWaitStatus status = wvk_platform_wait_any(queue_instance(queue)->wgpu, waits, count,
+                                                       MIN2(timeout, WVK_WAIT_SLICE_NS));
 
    bool progressed = false;
    while (retire_oldest(queue))
@@ -183,7 +185,7 @@ wvk_queue_commit(struct wvk_queue *queue, uint64_t serial,
    ++queue->pending_count;
 
    WGPUQueueWorkDoneCallbackInfo cb = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
-   cb.mode = WGPUCallbackMode_WaitAnyOnly;
+   cb.mode = wvk_platform_callback_mode();
    cb.callback = on_work_done;
    cb.userdata1 = queue;
    cb.userdata2 = p;
@@ -191,7 +193,7 @@ wvk_queue_commit(struct wvk_queue *queue, uint64_t serial,
 
    for (uint32_t i = 0; i < readback_count; ++i) {
       WGPUBufferMapCallbackInfo map = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
-      map.mode = WGPUCallbackMode_WaitAnyOnly;
+      map.mode = wvk_platform_callback_mode();
       map.callback = on_mapped;
       map.userdata1 = &readbacks[i];
       readbacks[i].future = wgpuBufferMapAsync(readbacks[i].staging, WGPUMapMode_Read, 0,

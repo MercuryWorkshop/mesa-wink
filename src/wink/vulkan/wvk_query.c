@@ -21,6 +21,7 @@
 #include "wvk_device_memory.h"
 #include "wvk_entrypoints.h"
 #include "wvk_physical_device.h"
+#include "wvk_platform.h"
 #include "wvk_queue.h"
 
 #include "vk_cmd_queue.h"
@@ -130,7 +131,7 @@ wvk_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t firstQ
             if (r == VK_ERROR_DEVICE_LOST)
                return r;
             if (r == VK_NOT_READY)
-               os_time_sleep(100);
+               wvk_platform_sleep(100 * 1000);
          }
       }
       const bool available = query_available(queue, pool, q);

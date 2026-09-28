@@ -77,8 +77,9 @@ wvk_files = files(
   'wvk_sync.c',
   'wvk_wsi.c',
 )
+wvk_files += files('wvk_platform.c')
 if wvk_is_wasm
-  error('the browser half of the wink Vulkan driver is not written yet')
+  wvk_files += files('wvk_platform_emscripten.c')
 else
   wvk_files += files('wvk_platform_native.c')
 endif

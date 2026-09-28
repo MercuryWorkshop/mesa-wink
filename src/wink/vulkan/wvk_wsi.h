@@ -64,6 +64,8 @@ struct wvk_swapchain {
    struct wvk_surface *surface;
    /* A newer swapchain took the surface over: acquiring is out of date. */
    bool retired;
+   /* Presents wait for the display, which in a browser is ours to do. */
+   bool fifo;
 
    VkExtent2D extent;
    VkFormat format;

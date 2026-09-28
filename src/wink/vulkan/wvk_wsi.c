@@ -538,6 +538,8 @@ wvk_CreateSwapchainKHR(VkDevice _device, const VkSwapchainCreateInfoKHR *pCreate
    sc->extent = pCreateInfo->imageExtent;
    sc->format = pCreateInfo->imageFormat;
    sc->surface_format = surface_format;
+   sc->fifo = pCreateInfo->presentMode == VK_PRESENT_MODE_FIFO_KHR ||
+              pCreateInfo->presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
 
    VkImageFormatListCreateInfo format_list = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
@@ -706,7 +708,7 @@ flush_submits(struct wvk_device *dev, struct wvk_queue *queue)
          return VK_SUCCESS;
       if (vk_device_is_lost(&dev->vk))
          return VK_ERROR_DEVICE_LOST;
-      os_time_sleep(100);
+      wvk_platform_sleep(100 * 1000);
    }
 }
 
@@ -723,10 +725,17 @@ worse(VkResult a, VkResult b)
 
 /* WINK_VK_CAPTURE=N:FILE.bmp writes what the Nth present shows to a file,
  * for looking at what reached the screen where nothing can capture it. */
+struct capture_map {
+   bool done, mapped;
+};
+
 static void
 on_capture_mapped(WGPUMapAsyncStatus status, WGPUStringView message, void *userdata1, void *userdata2)
 {
-   *(bool *)userdata1 = status == WGPUMapAsyncStatus_Success;
+   struct capture_map *m = userdata1;
+   m->mapped = status == WGPUMapAsyncStatus_Success;
+   m->done = true;
+   wvk_platform_signal();
 }
 
 static void
@@ -760,13 +769,16 @@ maybe_capture(struct wvk_device *dev, struct wvk_swapchain *sc, struct wvk_image
    wgpuCommandBufferRelease(commands);
    wgpuCommandEncoderRelease(encoder);
 
-   bool mapped = false;
+   struct capture_map m = { 0 };
    WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
-   cb.mode = WGPUCallbackMode_WaitAnyOnly;
+   cb.mode = wvk_platform_callback_mode();
    cb.callback = on_capture_mapped;
-   cb.userdata1 = &mapped;
+   cb.userdata1 = &m;
    struct wvk_instance *instance = (struct wvk_instance *)dev->vk.physical->instance;
-   wvk_platform_wait(instance->wgpu, wgpuBufferMapAsync(buffer, WGPUMapMode_Read, 0, desc.size, cb), UINT64_MAX);
+   WGPUFutureWaitInfo wait = { .future = wgpuBufferMapAsync(buffer, WGPUMapMode_Read, 0, desc.size, cb) };
+   while (!m.done && wvk_platform_wait_any(instance->wgpu, &wait, 1, UINT64_MAX) != WGPUWaitStatus_Error)
+      ;
+   const bool mapped = m.mapped;
    const uint8_t *data = mapped ? wgpuBufferGetConstMappedRange(buffer, 0, desc.size) : NULL;
    FILE *f = data ? fopen(path, "wb") : NULL;
    if (f) {
@@ -894,5 +906,12 @@ wvk_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
    }
    STACK_ARRAY_FINISH(results);
    STACK_ARRAY_FINISH(textures);
+
+   bool fifo = false;
+   for (uint32_t i = 0; i < count; ++i) {
+      VK_FROM_HANDLE(wvk_swapchain, sc, pPresentInfo->pSwapchains[i]);
+      fifo |= sc->fifo;
+   }
+   wvk_platform_present_yield(fifo);
    return result;
 }
