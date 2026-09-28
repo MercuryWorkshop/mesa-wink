@@ -86,8 +86,9 @@ static WGPUTextureView
 attachment_view(struct wvk_replay *replay, struct wvk_image_view *view, WGPUTextureAspect aspect)
 {
    struct wvk_image *image = wvk_image_view_image(view);
-   WGPUTextureView v = wvk_image_attachment_view(image, view->format, aspect,
-                                                 view->vk.base_mip_level, view->vk.base_array_layer);
+   /* A pass of several layers is one for each: this one's. */
+   WGPUTextureView v = wvk_image_attachment_view(image, view->format, aspect, view->vk.base_mip_level,
+                                                 view->vk.base_array_layer + replay->pass_layer);
    util_dynarray_append(&replay->views, v);
    return v;
 }
@@ -111,10 +112,15 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    struct wvk_replay *replay = cmd->replay;
    const VkRenderingInfo *info = pRenderingInfo;
-   const bool resuming = info->flags & VK_RENDERING_RESUMING_BIT;
+   replay->pass_idle = replay->pass_layered && replay->pass_multiview && info->viewMask &&
+                       !(info->viewMask & BITFIELD_BIT(replay->pass_layer));
+   /* An idle subpass keeps the layer as it was. */
+   const bool resuming = (info->flags & VK_RENDERING_RESUMING_BIT) || replay->pass_idle;
    const bool suspending = info->flags & VK_RENDERING_SUSPENDING_BIT;
 
    wvk_replay_end_passes(replay);
+   wvk_replay_set_pass_layer(replay);
+   replay->pass_info = info;
 
    const struct wvk_physical_device *pdev = wvk_device_physical(wvk_cmd_buffer_device(cmd));
    WGPURenderPassColorAttachment colors[8];
@@ -130,6 +136,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    replay->rendering.resolve.info.pNext = NULL;
    replay->rendering.resolve.info.colorAttachmentCount = color_count;
    replay->rendering.area = info->renderArea;
+   replay->rendering.view_mask = info->viewMask;
    replay->rendering.depth_format = WGPUTextureFormat_Undefined;
    replay->rendering.samples = 1;
    replay->rendering.extent = (VkExtent2D){ 0, 0 };
@@ -146,7 +153,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       replay->rendering.color_format[i] = view->format;
       colors[i].view = attachment_view(replay, view, WGPUTextureAspect_All);
       if (wvk_image_view_image(view)->dimension == WGPUTextureDimension_3D)
-         colors[i].depthSlice = view->vk.base_array_layer;
+         colors[i].depthSlice = view->vk.base_array_layer + replay->pass_layer;
       colors[i].loadOp = load_op(att->loadOp, resuming);
       if (!resuming && !area_covers(&info->renderArea, view)) {
          colors[i].loadOp = WGPULoadOp_Load;
@@ -274,6 +281,24 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    }
 }
 
+void
+wvk_replay_restart_pass(struct wvk_cmd_buffer *cmd, uint32_t layer)
+{
+   struct wvk_replay *replay = cmd->replay;
+   const VkRenderingInfo *begun = replay->pass_info;
+   if (!begun)
+      return;
+   VkRenderingInfo info = *begun;
+   info.flags |= VK_RENDERING_RESUMING_BIT;
+   /* Resolves are the pass's end's, which has not come. */
+   const bool pending = replay->rendering.resolve.pending;
+   replay->pass_layer = layer;
+   wvk_CmdBeginRendering(wvk_cmd_buffer_to_handle(cmd), &info);
+   replay->rendering.resolve.pending |= pending;
+   /* The pass is still the one begun, not this copy of it. */
+   replay->pass_info = begun;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdEndRendering(VkCommandBuffer commandBuffer)
 {
@@ -282,6 +307,10 @@ wvk_CmdEndRendering(VkCommandBuffer commandBuffer)
    wvk_replay_end_passes(replay);
    replay->rendering.color_count = 0;
    replay->rendering.depth_stencil = NULL;
+   replay->pass_info = NULL;
+   /* A pass vk_meta drew layer by layer ends at the first again. */
+   if (!replay->pass_layered)
+      replay->pass_layer = 0;
 
    if (!replay->rendering.resolve.pending || replay->rendering.resolve.suspending)
       return;

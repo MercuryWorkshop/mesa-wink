@@ -51,6 +51,7 @@ struct wvk_replay {
       uint32_t samples;
       VkExtent2D extent;
       VkRect2D area;
+      uint32_t view_mask;
       /* Counts passes, so that what is bound knows when it is gone. */
       uint32_t serial;
       /* Resolves WebGPU does not do -- integer formats, modes other than
@@ -67,6 +68,19 @@ struct wvk_replay {
 
    /* What is bound, as of the command buffer being replayed. */
    struct wvk_bound_state *state;
+
+   /* A render pass of several layers or views is replayed once for each
+    * (wvk_cmd_buffer.c): which one this is, and whether they are views. */
+   bool pass_layered;
+   bool pass_multiview;
+   uint32_t pass_layer;
+   /* A subpass whose views are not this one's: it neither clears nor
+    * draws. */
+   bool pass_idle;
+   /* What the pass began with, for beginning it again at another layer:
+    * vk_meta draws layer after layer in a pass of its own (see
+    * wvk_meta_draw_volume). Valid while the pass is. */
+   const VkRenderingInfo *pass_info;
 
    /* Push constants for the submit's draws, 256 bytes apart: written to
     * the device's push buffer just before it. */
@@ -102,6 +116,10 @@ struct wvk_bound_state;
 /* A fresh state for the next command buffer of a submit: nothing is bound
  * across command buffers. */
 void wvk_replay_reset_state(struct wvk_replay *replay);
+/* The layer and view the pass renders, in the driver's data. */
+void wvk_replay_set_pass_layer(struct wvk_replay *replay);
+/* The current pass again, at `layer`, with what it has drawn kept. */
+void wvk_replay_restart_pass(struct wvk_cmd_buffer *cmd, uint32_t layer);
 void wvk_replay_finish_state(struct wvk_device *dev, struct wvk_replay *replay);
 
 /* What is bound, kept around a vk_meta operation. */

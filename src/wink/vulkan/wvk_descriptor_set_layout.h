@@ -129,13 +129,16 @@ enum wvk_texel_type {
  *     then, 4 uints;
  *   - where each pulled vertex buffer's bound range starts in its binding,
  *     in bytes, 4 uints;
- *   - the viewport transform's depth part, 2 floats and 2 of padding. */
+ *   - the viewport transform's depth part, 2 floats; and the layer and
+ *     view a pass renders, 2 uints (a pass per layer or view, see
+ *     wvk_cmd_buffer.c). */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
 #define WVK_DRIVER_DRAW_VALUES (WVK_DRIVER_DATA_OFFSET + 32)
 #define WVK_DRIVER_PULL_OFFSET (WVK_DRIVER_DATA_OFFSET + 48)
 #define WVK_DRIVER_DEPTH_OFFSET (WVK_DRIVER_DATA_OFFSET + 64)
+#define WVK_DRIVER_LAYER_OFFSET (WVK_DRIVER_DEPTH_OFFSET + 8)
 #define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 80)
 #define WVK_META_OFFSET WVK_PUSH_DATA_SIZE
 /* How much of the push buffer the push binding shows: its data, and as

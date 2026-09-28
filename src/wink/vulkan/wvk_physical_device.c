@@ -97,6 +97,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
+      .KHR_multiview = true,
       .KHR_portability_subset = true,
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
@@ -158,11 +159,15 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
 
-      /* Vulkan 1.1 */
+      /* Vulkan 1.1. A pass of several views is one for each. */
       .shaderDrawParameters = true,
+      .multiview = true,
 
       /* Vulkan 1.2 */
       .samplerMirrorClampToEdge = true,
+      /* A vertex shader's gl_Layer: vertices of other layers leave the
+       * clip volume in each layer's pass. */
+      .shaderOutputLayer = true,
       /* Descriptor indexing: bind groups are made when the submit is
        * replayed, so updates after binding are what it sees; a binding
        * never written shows a placeholder. */
@@ -411,8 +416,8 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT,
       .subgroupQuadOperationsInAllStages = false,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES,
-      .maxMultiviewViewCount = 0,
-      .maxMultiviewInstanceIndex = 0,
+      .maxMultiviewViewCount = 8,
+      .maxMultiviewInstanceIndex = UINT32_MAX / 8,
       .protectedNoFault = false,
       .maxPerSetDescriptors = 1024,
       .maxMemoryAllocationSize = l->maxBufferSize,

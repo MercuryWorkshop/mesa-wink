@@ -49,15 +49,41 @@ wvk_cmd_bind_map_buffer(struct vk_command_buffer *vk_cmd, struct vk_meta_device 
    return VK_SUCCESS;
 }
 
+/* vk_meta draws a volume, or layers, in one pass of several layers, the
+ * vertex shader choosing each rectangle's. That pass, begun during a
+ * replay rather than from the command queue, is not replayed per layer:
+ * so each layer is drawn in the pass begun again at that layer. */
+static void
+wvk_meta_draw_volume(struct vk_command_buffer *vk_cmd, struct vk_meta_device *meta,
+                     const struct vk_meta_rect *rect, uint32_t layer_count)
+{
+   struct wvk_cmd_buffer *cmd = container_of(vk_cmd, struct wvk_cmd_buffer, vk);
+   struct wvk_replay *replay = cmd->replay;
+   /* A pass replayed per layer has the vertex shader's culling choose. */
+   if (replay->pass_layered || (layer_count <= 1 && rect->layer == replay->pass_layer)) {
+      vk_meta_draw_volume(vk_cmd, meta, rect, layer_count);
+      return;
+   }
+   for (uint32_t i = 0; i < layer_count; ++i) {
+      struct vk_meta_rect one = *rect;
+      one.layer = rect->layer + i;
+      if (one.layer != replay->pass_layer)
+         wvk_replay_restart_pass(cmd, one.layer);
+      vk_meta_draw_volume(vk_cmd, meta, &one, 1);
+   }
+}
+
 VkResult
 wvk_device_init_meta(struct wvk_device *dev)
 {
    VkResult result = vk_meta_device_init(&dev->vk, &dev->meta);
    if (result != VK_SUCCESS)
       return result;
-   /* A WebGPU pass is one layer, and there are no geometry shaders to pick
-    * one with: layers are drawn one by one. */
-   dev->meta.use_layered_rendering = false;
+   /* A pass of several layers is replayed once for each (wvk_cmd_buffer.c),
+    * or vk_meta's own drawn layer by layer, and vertex shaders choose
+    * theirs. */
+   dev->meta.use_layered_rendering = true;
+   dev->meta.cmd_draw_volume = wvk_meta_draw_volume;
    dev->meta.use_gs_for_layer = false;
    dev->meta.use_stencil_export = false;
    /* vk_meta's own vertex shader for its rectangles, which it draws as two
@@ -127,6 +153,7 @@ wvk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
    struct vk_meta_rendering_info render = {
       .samples = replay->rendering.samples,
       .color_attachment_count = replay->rendering.color_count,
+      .view_mask = replay->rendering.view_mask,
    };
    for (uint32_t i = 0; i < replay->rendering.color_count; ++i) {
       const struct wvk_image_view *view = replay->rendering.color[i];

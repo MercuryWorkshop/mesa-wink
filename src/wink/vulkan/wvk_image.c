@@ -368,7 +368,10 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
       desc.arrayLayerCount = image->dimension == WGPUTextureDimension_3D ? 1 : view->vk.layer_count;
       desc.aspect = view->aspect;
       view->view = wgpuTextureCreateView(image->texture, &desc);
-      if (desc.dimension == WGPUTextureViewDimension_Cube || desc.dimension == WGPUTextureViewDimension_CubeArray) {
+      /* Cubes as storage images, and input attachments, are 2D arrays. */
+      if (desc.dimension == WGPUTextureViewDimension_Cube || desc.dimension == WGPUTextureViewDimension_CubeArray ||
+          (desc.dimension == WGPUTextureViewDimension_2D && image->vk.samples == 1 &&
+           (view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))) {
          desc.dimension = WGPUTextureViewDimension_2DArray;
          view->array_view = wgpuTextureCreateView(image->texture, &desc);
       }

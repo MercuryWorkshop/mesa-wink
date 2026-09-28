@@ -42,7 +42,8 @@ struct wvk_image_view {
    struct vk_image_view vk;
    /* For binding: the whole subresource range, in the view's dimension;
     * and for a cube's, as a 2D array of its faces, which is how a storage
-    * image of it binds, and how one is fetched from. */
+    * image of it binds, and how one is fetched from; and for an input
+    * attachment's, as a 2D array, fetched at the layer drawn. */
    WGPUTextureView view;
    WGPUTextureView array_view;
    WGPUTextureFormat format;

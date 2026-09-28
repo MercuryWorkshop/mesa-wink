@@ -250,10 +250,11 @@ split_resource_vars(nir_shader *nir, struct lower_state *state)
                                     var, bl->slot + bl->count + e, "_smp", e);
          } else if (glsl_type_is_image(bare) && (glsl_get_sampler_dim(bare) == GLSL_SAMPLER_DIM_SUBPASS ||
                                                  glsl_get_sampler_dim(bare) == GLSL_SAMPLER_DIM_SUBPASS_MS)) {
-            /* An input attachment: fetched, as a texture. */
+            /* An input attachment: fetched, as a texture, at the layer
+             * or view drawn. A multisampled one is one layer. */
             const bool ms = glsl_get_sampler_dim(bare) == GLSL_SAMPLER_DIM_SUBPASS_MS;
             const struct glsl_type *texture =
-               glsl_texture_type(ms ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D, false,
+               glsl_texture_type(ms ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D, !ms,
                                  glsl_get_sampler_result_type(bare));
             s->texture[e] = new_var(nir, nir_var_uniform, texture, var, bl->slot + e, "_ia", e);
          } else if (glsl_type_is_image(bare) && glsl_get_sampler_dim(bare) == GLSL_SAMPLER_DIM_CUBE) {
@@ -494,6 +495,9 @@ rewrite_resource_instr(nir_builder *b, nir_instr *instr, void *data)
        * element: lower_to_words chooses among them. */
       const uint32_t set = nir_intrinsic_desc_set(intr);
       const uint32_t binding = nir_intrinsic_binding(intr);
+      /* The driver's own are where they go. */
+      if (set == WVK_DRIVER_GROUP && binding >= WVK_DRIVER_SLOT_BASE)
+         return false;
       const struct wvk_descriptor_set_binding_layout *bl = binding_layout(state->info, set, binding);
       if (!bl) {
          mesa_loge("wvk: a shader uses set %u binding %u, which its pipeline layout does not have",
@@ -570,20 +574,50 @@ lower_push_constants(nir_shader *nir)
    return progress;
 }
 
-/* gl_Layer and gl_ViewportIndex from a vertex shader: WebGPU renders one
- * layer and one viewport, and so does everything here, one pass at a time
- * -- vk_meta's shaders write the layer anyway. */
+static nir_def *driver_buffer(nir_builder *b, uint32_t binding);
+
+/* The layer or view the pass renders: the driver's data (a pass a layer). */
+static nir_def *
+driver_layer(nir_builder *b, unsigned which)
+{
+   nir_def *words = nir_load_ssbo(b, 2, 32, driver_buffer(b, WVK_DRIVER_SLOT_PUSH),
+                                  nir_imm_int(b, WVK_DRIVER_LAYER_OFFSET), .align_mul = 8,
+                                  .access = ACCESS_NON_WRITEABLE);
+   return nir_channel(b, words, which);
+}
+
+/* gl_Layer and gl_ViewportIndex from a vertex shader. WebGPU renders one
+ * layer and one viewport: a pass of several layers is one per layer, and
+ * a vertex of another layer than the pass's goes out of the clip volume
+ * -- x = 2w is outside whatever the viewport transform does -- so its
+ * primitive is not drawn there. */
 static bool
-drop_layer_outputs(nir_shader *nir)
+lower_layer_outputs(nir_shader *nir, struct wvk_shader *shader)
 {
    if (nir->info.stage != MESA_SHADER_VERTEX)
       return false;
    bool progress = false;
+   nir_variable *layer = NULL, *position = NULL;
    nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location == VARYING_SLOT_POS)
+         position = var;
       if (var->data.location == VARYING_SLOT_LAYER || var->data.location == VARYING_SLOT_VIEWPORT) {
+         if (var->data.location == VARYING_SLOT_LAYER)
+            layer = var;
          var->data.mode = nir_var_shader_temp;
          progress = true;
       }
+   }
+   if (layer && position && glsl_type_is_scalar(layer->type)) {
+      nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+      nir_builder b = nir_builder_at(nir_before_impl(impl));
+      nir_store_var(&b, layer, nir_imm_int(&b, 0), 0x1);
+      b.cursor = nir_after_impl(impl);
+      nir_push_if(&b, nir_ine(&b, nir_load_var(&b, layer), driver_layer(&b, 0)));
+      nir_store_var(&b, position, nir_imm_vec4(&b, 2.0f, 2.0f, 0.0f, 1.0f), 0xf);
+      nir_pop_if(&b, NULL);
+      nir_progress(true, impl, nir_metadata_none);
+      shader->writes_layer = true;
    }
    if (progress) {
       nir_fixup_deref_modes(nir);
@@ -595,15 +629,15 @@ drop_layer_outputs(nir_shader *nir)
    return progress;
 }
 
-/* gl_Layer in a fragment shader, and the view index: always the first,
- * as a pass is one layer. TODO: a pass per layer for layered blits. */
+/* gl_Layer in a fragment shader, and the view index: the pass's, from the
+ * driver's data. */
 static bool
 lower_layer_id_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    if (intr->intrinsic != nir_intrinsic_load_layer_id && intr->intrinsic != nir_intrinsic_load_view_index)
       return false;
    b->cursor = nir_before_instr(&intr->instr);
-   nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components, intr->def.bit_size));
+   nir_def_replace(&intr->def, driver_layer(b, intr->intrinsic == nir_intrinsic_load_view_index));
    return true;
 }
 
@@ -1679,7 +1713,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       mesa_logw_once("wvk: a pipeline layout of more descriptors than their records have room for");
 
    NIR_PASS(_, nir, lower_push_constants);
-   NIR_PASS(_, nir, drop_layer_outputs);
+   NIR_PASS(_, nir, lower_layer_outputs, shader);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_layer_id_instr, nir_metadata_control_flow, NULL);
    split_resource_vars(nir, &state);
    split_buffer_vars(nir, &state);
@@ -1863,6 +1897,7 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->writes_depth);
    blob_write_uint8(blob, shader->uses_push_constants);
    blob_write_uint8(blob, shader->uses_draw_parameters);
+   blob_write_uint8(blob, shader->writes_layer);
    blob_write_bytes(blob, shader->meta_base, sizeof(shader->meta_base));
    blob_write_uint32(blob, shader->meta_words);
    blob_write_uint8(blob, shader->pulled_count);
@@ -1889,6 +1924,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const bool writes_depth = blob_read_uint8(blob);
    const bool uses_push_constants = blob_read_uint8(blob);
    const bool uses_draw_parameters = blob_read_uint8(blob);
+   const bool writes_layer = blob_read_uint8(blob);
    uint32_t meta_base[4];
    blob_copy_bytes(blob, meta_base, sizeof(meta_base));
    const uint32_t meta_words = blob_read_uint32(blob);
@@ -1923,6 +1959,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->writes_depth = writes_depth;
    shader->uses_push_constants = uses_push_constants;
    shader->uses_draw_parameters = uses_draw_parameters;
+   shader->writes_layer = writes_layer;
    memcpy(shader->meta_base, meta_base, sizeof(meta_base));
    shader->meta_words = meta_words;
    shader->pulled_count = MIN2(pulled_count, WVK_MAX_PULLED_BINDINGS);

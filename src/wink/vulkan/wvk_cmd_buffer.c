@@ -15,6 +15,9 @@
  */
 #include "wvk_cmd_buffer.h"
 
+#include "vk_framebuffer.h"
+#include "vk_render_pass.h"
+
 #include "wvk_device.h"
 #include "wvk_device_memory.h"
 #include "wvk_entrypoints.h"
@@ -193,6 +196,102 @@ coalesce(struct util_dynarray *ranges)
 /* ---------------------------------------------------------------------- */
 /* Submit */
 
+/* Run [first, end) of a command queue: the executor runs whole queues, so
+ * the range is one for the while. */
+static void
+execute_range(struct list_head *first, struct list_head *end, VkCommandBuffer commandBuffer,
+              const struct vk_device_dispatch_table *disp)
+{
+   if (first == end)
+      return;
+   struct vk_cmd_queue range;
+   memset(&range, 0, sizeof(range));
+   struct list_head *before = first->prev, *last = end->prev;
+   before->next = end;
+   end->prev = before;
+   range.cmds.next = first;
+   first->prev = &range.cmds;
+   range.cmds.prev = last;
+   last->next = &range.cmds;
+   vk_cmd_queue_execute(&range, commandBuffer, disp);
+   before->next = first;
+   first->prev = before;
+   last->next = end;
+   end->prev = last;
+}
+
+/* The layers a render pass renders, a bit each, if more than one: its
+ * views, or its layers. A pass that suspends or resumes, into another
+ * command buffer, is one pass. A render pass object's are those of all
+ * its subpasses, or its framebuffer's; `end` is what ends it. */
+static uint32_t
+pass_layers(const struct vk_cmd_queue_entry *cmd, bool *multiview, enum vk_cmd_type *end)
+{
+   *multiview = false;
+   if (cmd->type == VK_CMD_BEGIN_RENDER_PASS2 || cmd->type == VK_CMD_BEGIN_RENDER_PASS) {
+      const VkRenderPassBeginInfo *begin = cmd->type == VK_CMD_BEGIN_RENDER_PASS2
+                                              ? cmd->u.begin_render_pass2.render_pass_begin
+                                              : cmd->u.begin_render_pass.render_pass_begin;
+      VK_FROM_HANDLE(vk_render_pass, pass, begin ? begin->renderPass : VK_NULL_HANDLE);
+      VK_FROM_HANDLE(vk_framebuffer, framebuffer, begin ? begin->framebuffer : VK_NULL_HANDLE);
+      *end = cmd->type == VK_CMD_BEGIN_RENDER_PASS2 ? VK_CMD_END_RENDER_PASS2 : VK_CMD_END_RENDER_PASS;
+      if (!pass || !framebuffer)
+         return 0;
+      if (pass->is_multiview) {
+         *multiview = true;
+         return pass->view_mask;
+      }
+      return framebuffer->layers > 1 ? BITFIELD_MASK(MIN2(framebuffer->layers, 32)) : 0;
+   }
+   if (cmd->type != VK_CMD_BEGIN_RENDERING)
+      return 0;
+   *end = VK_CMD_END_RENDERING;
+   const VkRenderingInfo *info = cmd->u.begin_rendering.rendering_info;
+   if (!info || (info->flags & (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)))
+      return 0;
+   if (info->viewMask) {
+      *multiview = true;
+      return info->viewMask;
+   }
+   return info->layerCount > 1 ? BITFIELD_MASK(MIN2(info->layerCount, 32)) : 0;
+}
+
+/* A command queue, with each render pass of several layers or views run
+ * once for each: WebGPU renders one layer a pass. */
+static void
+replay_queue(struct wvk_replay *replay, struct vk_cmd_queue *queue, VkCommandBuffer commandBuffer,
+             const struct vk_device_dispatch_table *disp)
+{
+   struct list_head *head = &queue->cmds;
+   struct list_head *run = head->next;
+   for (struct list_head *it = head->next; it != head;) {
+      const struct vk_cmd_queue_entry *cmd = list_entry(it, struct vk_cmd_queue_entry, cmd_link);
+      bool multiview;
+      enum vk_cmd_type end_type = VK_CMD_END_RENDERING;
+      const uint32_t layers = pass_layers(cmd, &multiview, &end_type);
+      struct list_head *end = it->next;
+      while (layers && end != head && list_entry(end, struct vk_cmd_queue_entry, cmd_link)->type != end_type)
+         end = end->next;
+      if (!layers || end == head) {
+         it = it->next;
+         continue;
+      }
+      execute_range(run, it, commandBuffer, disp);
+      struct list_head *after = end->next;
+      u_foreach_bit(layer, layers) {
+         replay->pass_layered = true;
+         replay->pass_multiview = multiview;
+         replay->pass_layer = layer;
+         execute_range(it, after, commandBuffer, disp);
+      }
+      replay->pass_layered = false;
+      replay->pass_multiview = false;
+      replay->pass_layer = 0;
+      run = it = after;
+   }
+   execute_range(run, head, commandBuffer, disp);
+}
+
 VkResult
 wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
                        struct vk_command_buffer *const *cmds, uint32_t count, uint64_t serial)
@@ -225,7 +324,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
       vk_command_buffer_begin(&rcmd->vk, &begin);
       wvk_replay_reset_state(&replay);
       replay.uses_queries = wvk_cmd_queue_has_occlusion_queries(&cmds[i]->cmd_queue);
-      vk_cmd_queue_execute(&cmds[i]->cmd_queue, wvk_cmd_buffer_to_handle(rcmd), &dev->vk.dispatch_table);
+      replay_queue(&replay, &cmds[i]->cmd_queue, wvk_cmd_buffer_to_handle(rcmd), &dev->vk.dispatch_table);
    }
    wvk_replay_end_passes(&replay);
    rcmd->replay = NULL;

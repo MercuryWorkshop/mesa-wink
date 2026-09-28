@@ -45,7 +45,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **Arrays of descriptors** are bindings of their own. A dynamic or
   non-uniform index chooses among them in the shader: reads from each,
   selected; writes only where the index is.
+- **Passes of several layers or views** are replayed once for each: a
+  WebGPU pass renders one layer. A vertex shader's `gl_Layer` chooses by
+  moving vertices of other layers out of the clip volume, and the view
+  index is the pass's. Input attachments are fetched at the layer drawn.
 - **Blits and `vkCmdClearAttachments`** come from the runtime's vk_meta.
+  Its passes of several layers are begun again at each.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
   have to stay.
@@ -121,7 +126,6 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - WebGPU has 10 storage buffers a stage in browsers, and texel buffers are
   storage buffers, beyond what Vulkan counts as such. Image atomics, which
   WGSL does not have.
-- Layered rendering: a pass is one layer. This affects multiview too.
 - Precise occlusion queries, and timestamps.
 - Subgroups.
 - Compressed images whose size is not a whole number of blocks: WebGPU's
@@ -129,8 +133,8 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Integer cube textures, which need a 2D-array view to fetch from.
 - Blend states whose colour factors use both CONSTANT_COLOR and
   CONSTANT_ALPHA: WebGPU has one constant.
-- Blits of several layers, and 3D blits: a pass is one layer.
-- Multisampled array images.
+- Multisampled array images: WebGPU has no multisampled arrays. This
+  affects multiview with multisampling too.
 
 Some of these are what WebGPU has no way to express. The rest are work still
 to do.

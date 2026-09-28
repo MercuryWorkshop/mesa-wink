@@ -183,9 +183,11 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
    clear_descriptor(d, bl->immutable_samplers != NULL);
    if (type != VK_DESCRIPTOR_TYPE_SAMPLER) {
       const struct wvk_image_view *view = wvk_image_view_from_handle(info->imageView);
-      /* A storage image of a cube is the 2D array of its faces. */
+      /* A storage image of a cube is the 2D array of its faces, and an
+       * input attachment an array, fetched at the pass's layer. */
       WGPUTextureView wgpu = view ? view->view : NULL;
-      if (view && view->array_view && type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+      if (view && view->array_view &&
+          (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT))
          wgpu = view->array_view;
       if (wgpu) {
          d->view = wgpu;

@@ -721,6 +721,17 @@ wvk_replay_reset_state(struct wvk_replay *replay)
    }
 }
 
+void
+wvk_replay_set_pass_layer(struct wvk_replay *replay)
+{
+   struct wvk_bound_state *st = replay->state;
+   const uint32_t words[2] = { replay->pass_layer, replay->pass_multiview ? replay->pass_layer : 0 };
+   if (st && memcmp(st->push + WVK_DRIVER_LAYER_OFFSET, words, sizeof(words))) {
+      memcpy(st->push + WVK_DRIVER_LAYER_OFFSET, words, sizeof(words));
+      st->push_offset = UINT32_MAX;
+   }
+}
+
 void *
 wvk_replay_save_state(struct wvk_replay *replay)
 {
@@ -1642,6 +1653,12 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
       mesa_logw_once("wvk: a draw without a vertex shader");
       return false;
    }
+   /* A pass of several layers, but for its views, is one per layer: what
+    * does not choose its layer is drawn in the first. */
+   if (replay->pass_layered && !replay->pass_multiview && replay->pass_layer && !st->vs->writes_layer)
+      return false;
+   if (replay->pass_idle)
+      return false;
    if (dyn->rs.rasterizer_discard_enable || dyn->rs.cull_mode == VK_CULL_MODE_FRONT_AND_BACK)
       return false;
    if (dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
