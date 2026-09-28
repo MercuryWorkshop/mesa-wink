@@ -15,6 +15,23 @@
 
 #include "vk_format.h"
 
+#include <float.h>
+#include <math.h>
+
+/* WebGPU refuses a clear value that is NaN or infinite, and one refused
+ * pass is a lost command buffer: NaN clears to 0, and infinity to the
+ * largest float, which a 16-bit format takes as its infinity. Components a
+ * format does not have are often left as garbage, too. */
+static double
+finite(float f)
+{
+   if (isnan(f))
+      return 0.0;
+   if (isinf(f))
+      return f > 0 ? FLT_MAX : -FLT_MAX;
+   return f;
+}
+
 WGPUColor
 wvk_clear_color(VkFormat format, const VkClearColorValue *value)
 {
@@ -24,7 +41,8 @@ wvk_clear_color(VkFormat format, const VkClearColorValue *value)
       return (WGPUColor){ value->uint32[0], value->uint32[1], value->uint32[2], value->uint32[3] };
    if (vk_format_is_sint(format))
       return (WGPUColor){ value->int32[0], value->int32[1], value->int32[2], value->int32[3] };
-   return (WGPUColor){ value->float32[0], value->float32[1], value->float32[2], value->float32[3] };
+   return (WGPUColor){ finite(value->float32[0]), finite(value->float32[1]), finite(value->float32[2]),
+                       finite(value->float32[3]) };
 }
 
 static WGPULoadOp
@@ -136,7 +154,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
          if (depth) {
             ds.depthLoadOp = load_op(depth->loadOp, resuming);
             ds.depthStoreOp = store_op(depth->storeOp, suspending);
-            ds.depthClearValue = depth->clearValue.depthStencil.depth;
+            ds.depthClearValue = CLAMP(finite(depth->clearValue.depthStencil.depth), 0.0, 1.0);
          } else {
             /* Not rendered to in this pass: kept as it is. */
             ds.depthReadOnly = true;

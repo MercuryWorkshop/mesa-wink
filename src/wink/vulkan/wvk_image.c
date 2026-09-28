@@ -105,8 +105,13 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    desc.label = wvk_sv("VkImage");
    desc.usage = wusage;
    desc.dimension = image->dimension;
-   desc.size.width = image->vk.extent.width;
-   desc.size.height = image->vk.image_type == VK_IMAGE_TYPE_1D ? 1 : image->vk.extent.height;
+   /* WebGPU wants a block-compressed texture a whole number of blocks;
+    * Vulkan takes any size. The texture is the next size up, and edge
+    * copies go to its blocks. TODO: sampling sees the padded size. */
+   const enum pipe_format pformat = vk_format_to_pipe_format(pCreateInfo->format);
+   desc.size.width = align(image->vk.extent.width, util_format_get_blockwidth(pformat));
+   desc.size.height = image->vk.image_type == VK_IMAGE_TYPE_1D
+                         ? 1 : align(image->vk.extent.height, util_format_get_blockheight(pformat));
    desc.size.depthOrArrayLayers = image->vk.image_type == VK_IMAGE_TYPE_3D
                                      ? image->vk.extent.depth : image->vk.array_layers;
    desc.format = format->texture;
@@ -279,6 +284,9 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
        * own format, which WebGPU works out itself. */
       desc.format = view->aspect == WGPUTextureAspect_All ? view->format : WGPUTextureFormat_Undefined;
       desc.dimension = view_dimension(view->vk.view_type);
+      /* A multisampled view is 2D in WebGPU, whatever array it says. */
+      if (image->vk.samples > 1)
+         desc.dimension = WGPUTextureViewDimension_2D;
       desc.baseMipLevel = view->vk.base_mip_level;
       desc.mipLevelCount = view->vk.level_count;
       desc.baseArrayLayer = image->dimension == WGPUTextureDimension_3D ? 0 : view->vk.base_array_layer;

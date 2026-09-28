@@ -187,7 +187,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .tessellationIsolines = false,
       .tessellationPointMode = false,
       .triangleFans = false,
-      .vertexAttributeAccessBeyondStride = false,
+      .vertexAttributeAccessBeyondStride = true,
    };
 }
 

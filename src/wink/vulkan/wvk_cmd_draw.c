@@ -25,6 +25,7 @@
 #include "wvk_shader.h"
 
 #include "vk_descriptor_update_template.h"
+#include "vk_format.h"
 #include "vk_graphics_state.h"
 #include "vk_pipeline_layout.h"
 
@@ -271,8 +272,11 @@ struct wvk_render_key {
    uint8_t attr_bindings[16];
    uint16_t vb_strides[8];
    uint8_t vb_steps[8];
-   /* The Vulkan binding of each WebGPU slot. */
+   /* The Vulkan binding of each WebGPU slot, and where in it the slot
+    * starts: an attribute past its stride, which WebGPU refuses, is a slot
+    * of its own that starts where the attribute is. */
    uint8_t vb_bindings[8];
+   uint16_t vb_offsets[8];
    uint8_t attr_count, vb_count;
    uint8_t variant;
    uint8_t topology, strip_index_format, front_face, cull_mode, unclipped_depth;
@@ -937,8 +941,13 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
                                                              : pdev->limits.maxStorageBufferBindingSize;
          e->buffer = d->buffer;
          e->offset = d->offset;
-         /* Storage bindings are whole words. */
-         e->size = MIN2(d->size, max) & ~3ull;
+         /* Storage bindings are whole words. A uniform buffer binds as much
+          * of the buffer as there is: WebGPU wants all of the shader's
+          * block bound, where Vulkan wants only what is read. */
+         uint64_t size = d->size;
+         if (b->kind == WVK_BINDING_UNIFORM && !b->dynamic && d->mem)
+            size = MAX2(size, d->mem->buffer_size - d->offset);
+         e->size = MIN2(size, max) & ~3ull;
          break;
       }
       case WVK_BINDING_SAMPLER:
@@ -1120,19 +1129,23 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
       if (!f || !f->vertex || a->binding >= MESA_VK_MAX_VERTEX_BINDINGS)
          continue;
       /* Bindings take slots in the order attributes name them. */
+      const uint32_t stride = dyn->vi_binding_strides[a->binding];
+      const uint32_t bytes = vk_format_get_blocksize(a->format);
+      const uint16_t start = stride && a->offset + bytes > stride ? a->offset : 0;
       uint32_t slot = 0;
-      while (slot < k->vb_count && k->vb_bindings[slot] != a->binding)
+      while (slot < k->vb_count && (k->vb_bindings[slot] != a->binding || k->vb_offsets[slot] != start))
          ++slot;
       if (slot == k->vb_count) {
          if (slot == ARRAY_SIZE(k->vb_bindings)) {
             mesa_logw_once("wvk: a pipeline reads more vertex buffers than WebGPU has");
             continue;
          }
-         k->vb_bindings[k->vb_count++] = a->binding;
+         k->vb_bindings[k->vb_count] = a->binding;
+         k->vb_offsets[k->vb_count++] = start;
       }
       const uint32_t i = k->attr_count++;
       k->attr_formats[i] = f->vertex;
-      k->attr_offsets[i] = a->offset;
+      k->attr_offsets[i] = a->offset - start;
       k->attr_locations[i] = loc;
       k->attr_bindings[i] = slot;
    }
@@ -1183,11 +1196,15 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
    }
 
    k->depth_format = replay->rendering.depth_format;
+   const bool has_stencil = k->depth_format == WGPUTextureFormat_Depth24PlusStencil8 ||
+                            k->depth_format == WGPUTextureFormat_Depth32FloatStencil8 ||
+                            k->depth_format == WGPUTextureFormat_Stencil8;
    if (k->depth_format) {
       const bool depth_test = dyn->ds.depth.test_enable;
       k->depth_compare = depth_test ? dyn->ds.depth.compare_op : VK_COMPARE_OP_ALWAYS;
       k->depth_write = depth_test && dyn->ds.depth.write_enable;
-      if (dyn->ds.stencil.test_enable) {
+      /* WebGPU wants the stencil state left alone without a stencil. */
+      if (dyn->ds.stencil.test_enable && has_stencil) {
          const struct vk_stencil_test_face_state *f = &dyn->ds.stencil.front, *b = &dyn->ds.stencil.back;
          k->front.fail = f->op.fail;
          k->front.pass = f->op.pass;
@@ -1318,11 +1335,12 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
 
    for (uint32_t slot = 0; slot < p->key.vb_count; ++slot) {
       const struct wvk_bound_buffer *vb = &st->vb[p->key.vb_bindings[slot]];
-      if (!vb->buffer) {
+      const uint64_t start = p->key.vb_offsets[slot];
+      if (!vb->buffer || start >= vb->size) {
          wgpuRenderPassEncoderSetVertexBuffer(pass, slot, dev->null_buffer, 0, WGPU_WHOLE_SIZE);
          continue;
       }
-      wgpuRenderPassEncoderSetVertexBuffer(pass, slot, vb->buffer, vb->offset, vb->size);
+      wgpuRenderPassEncoderSetVertexBuffer(pass, slot, vb->buffer, vb->offset + start, vb->size - start);
       wvk_replay_read(replay, vb->mem, vb->offset, vb->size);
    }
    if (indexed) {

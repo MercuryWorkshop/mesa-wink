@@ -158,6 +158,11 @@ image_region(const struct wvk_image *image, const VkImageSubresourceLayers *sub,
       image->vk.image_type == VK_IMAGE_TYPE_1D ? 1 : extent.height,
       is_3d ? extent.depth : layers,
    };
+   /* A region of a compressed image may end at the edge of the image, mid
+    * block; WebGPU copies the whole block, which its texture has. */
+   const enum pipe_format pformat = vk_format_to_pipe_format(image->vk.format);
+   size->width = align(size->width, util_format_get_blockwidth(pformat));
+   size->height = align(size->height, util_format_get_blockheight(pformat));
 }
 
 /* One buffer-texture copy, split into rows if WebGPU wants a pitch the

@@ -337,7 +337,14 @@ rewrite_resource_instr(nir_builder *b, nir_instr *instr, void *data)
 static void
 split_buffer_vars(nir_shader *nir, struct lower_state *state)
 {
-   nir_foreach_variable_with_modes_safe(var, nir, nir_var_mem_ubo | nir_var_mem_ssbo) {
+   /* The originals first: the clones join the same list. */
+   struct util_dynarray originals;
+   util_dynarray_init(&originals, state->split);
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo | nir_var_mem_ssbo)
+      util_dynarray_append(&originals, var);
+
+   util_dynarray_foreach(&originals, nir_variable *, v) {
+      nir_variable *var = *v;
       /* The driver's own, such as the push constants, are where they go. */
       if (var->data.descriptor_set == WVK_DRIVER_GROUP && var->data.binding >= WVK_DRIVER_SLOT_BASE)
          continue;
@@ -348,7 +355,9 @@ split_buffer_vars(nir_shader *nir, struct lower_state *state)
          exec_node_remove(&var->node);
          continue;
       }
-      const uint32_t count = glsl_type_is_array(var->type) ? glsl_get_aoa_size(var->type) : 1;
+      /* vtn declares an array of blocks as one block: how many there are
+       * is the layout's to say. */
+      const uint32_t count = bl->count;
       const struct glsl_type *bare = glsl_without_array(var->type);
       for (uint32_t e = 0; e < count; ++e) {
          nir_variable *v = e == 0 ? var : nir_variable_clone(var, nir);
@@ -413,6 +422,344 @@ lower_layer_id_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return false;
    b->cursor = nir_before_instr(&intr->instr);
    nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components, intr->def.bit_size));
+   return true;
+}
+
+/* Sampling an integer texture: WGSL has only fetches of those. Vulkan
+ * samples integer formats nearest, so the fetch is of the texel the
+ * coordinate falls in, clamped to the edge -- which is what vk_meta's and
+ * nearly every application's samplers for these do. */
+static bool
+lower_integer_sample_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (nir_alu_type_get_base_type(tex->dest_type) == nir_type_float || tex->is_shadow)
+      return false;
+   if (tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl &&
+       tex->op != nir_texop_txd)
+      return false;
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
+      return false;
+
+   b->cursor = nir_before_instr(instr);
+   const int texture_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   if (texture_idx < 0 || coord_idx < 0)
+      return false;
+   nir_def *texture = tex->src[texture_idx].src.ssa;
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   nir_def *lod = tex->op == nir_texop_txl && lod_idx >= 0
+                     ? nir_f2i32(b, nir_fround_even(b, tex->src[lod_idx].src.ssa))
+                     : nir_imm_int(b, 0);
+
+   nir_tex_instr *txs = nir_tex_instr_create(b->shader, 2);
+   txs->op = nir_texop_txs;
+   txs->sampler_dim = tex->sampler_dim;
+   txs->is_array = tex->is_array;
+   txs->dest_type = nir_type_int32;
+   txs->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture);
+   txs->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, lod);
+   nir_def_init(&txs->instr, &txs->def, nir_tex_instr_dest_size(txs), 32);
+   nir_builder_instr_insert(b, &txs->instr);
+   nir_def *size = &txs->def;
+
+   const unsigned n = tex->coord_components;
+   const unsigned spatial = n - (tex->is_array ? 1 : 0);
+   nir_def *comps[4];
+   for (unsigned i = 0; i < n; ++i) {
+      nir_def *c = nir_channel(b, coord, i);
+      nir_def *extent = nir_channel(b, size, i);
+      nir_def *texel = i < spatial ? nir_f2i32(b, nir_ffloor(b, nir_fmul(b, c, nir_i2f32(b, extent))))
+                                   : nir_f2i32(b, nir_fround_even(b, c));
+      if (offset_idx >= 0 && i < spatial)
+         texel = nir_iadd(b, texel, nir_channel(b, tex->src[offset_idx].src.ssa, i));
+      comps[i] = nir_imax(b, nir_imin(b, texel, nir_iadd_imm(b, extent, -1)), nir_imm_int(b, 0));
+   }
+
+   nir_tex_instr *txf = nir_tex_instr_create(b->shader, 3);
+   txf->op = nir_texop_txf;
+   txf->sampler_dim = tex->sampler_dim;
+   txf->is_array = tex->is_array;
+   txf->dest_type = tex->dest_type;
+   txf->coord_components = n;
+   txf->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture);
+   txf->src[1] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_vec(b, comps, n));
+   txf->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, lod);
+   nir_def_init(&txf->instr, &txf->def, tex->def.num_components, tex->def.bit_size);
+   nir_builder_instr_insert(b, &txf->instr);
+   nir_def_replace(&tex->def, &txf->def);
+   return true;
+}
+
+/*
+ * Buffers as arrays of words. WGSL has layout rules of its own, which
+ * std430 and row-major matrices break, and Tint then refuses the module.
+ * So every access is lowered to an offset (nir_lower_explicit_io), and
+ * each buffer becomes an array of 32-bit words -- of vec4s for a uniform
+ * buffer, whose arrays WGSL wants 16 bytes apart -- which has no layout to
+ * get wrong. This is what the GL driver does with its buffers too.
+ */
+
+/* Push constants through a descriptor, as every other buffer is, so that
+ * the lowering below sees them the same way. */
+static bool
+push_constants_to_descriptor(nir_shader *nir)
+{
+   nir_variable *push = NULL;
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo) {
+      if (var->data.descriptor_set == WVK_DRIVER_GROUP && var->data.binding == WVK_DRIVER_SLOT_PUSH)
+         push = var;
+   }
+   if (!push)
+      return false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (deref->deref_type != nir_deref_type_var || deref->var != push)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_def *index = nir_vulkan_resource_index(&b, 2, 32, nir_imm_int(&b, 0),
+                                                       .desc_set = WVK_DRIVER_GROUP,
+                                                       .binding = WVK_DRIVER_SLOT_PUSH,
+                                                       .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            nir_def *desc = nir_load_vulkan_descriptor(&b, 2, 32, index,
+                                                       .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            nir_deref_instr *cast = nir_build_deref_cast(&b, desc, nir_var_mem_ssbo, push->type, 0);
+            nir_def_replace(&deref->def, &cast->def);
+         }
+      }
+      /* What hangs off the cast is an address of its size now. */
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (deref->deref_type != nir_deref_type_var && deref->deref_type != nir_deref_type_cast &&
+                nir_deref_mode_is(deref, nir_var_mem_ssbo))
+               deref->def.num_components = nir_src_num_components(deref->parent);
+         }
+      }
+      nir_progress(true, impl, nir_metadata_none);
+   }
+   return true;
+}
+
+static nir_mem_access_size_align
+word_access(nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_size, uint32_t align_mul,
+            uint32_t align_offset, bool offset_is_const, enum gl_access_qualifier access,
+            const void *cb_data)
+{
+   /* Whole words, a vector of them at most. */
+   return (nir_mem_access_size_align){
+      .num_components = MIN2(DIV_ROUND_UP(bytes, 4), 4),
+      .bit_size = 32,
+      .align = 4,
+      .shift = nir_mem_access_shift_method_scalar,
+   };
+}
+
+struct word_buffers {
+   /* (set << 16 | binding) + 1 -> nir_variable * of words. */
+   struct hash_table *vars;
+   const struct vk_shader_compile_info *info;
+   /* Uniform buffers: how big each block is, from the variables vtn made. */
+   struct hash_table *ubo_sizes;
+};
+
+/* The binding an index operand of load_ssbo and friends came from:
+ * vulkan_resource_index, through load_vulkan_descriptor. */
+static bool
+index_binding(nir_src src, uint32_t *set, uint32_t *binding)
+{
+   nir_scalar s = nir_scalar_resolved(src.ssa, 0);
+   for (unsigned depth = 0; depth < 8; ++depth) {
+      if (!nir_scalar_is_intrinsic(s))
+         return false;
+      nir_intrinsic_instr *intr = nir_def_as_intrinsic(s.def);
+      if (intr->intrinsic == nir_intrinsic_vulkan_resource_index) {
+         *set = nir_intrinsic_desc_set(intr);
+         *binding = nir_intrinsic_binding(intr);
+         return true;
+      }
+      if (intr->intrinsic != nir_intrinsic_load_vulkan_descriptor &&
+          intr->intrinsic != nir_intrinsic_vulkan_resource_reindex)
+         return false;
+      s = nir_scalar_resolved(intr->src[0].ssa, 0);
+   }
+   return false;
+}
+
+static nir_variable *
+word_var(nir_shader *nir, struct word_buffers *wb, bool ubo, uint32_t set, uint32_t binding)
+{
+   void *k = (void *)(uintptr_t)(((uintptr_t)set << 16 | binding) + 1);
+   struct hash_entry *he = _mesa_hash_table_search(wb->vars, k);
+   if (he)
+      return he->data;
+   struct glsl_struct_field field = { .name = "words", .offset = 0 };
+   if (ubo) {
+      struct hash_entry *size = _mesa_hash_table_search(wb->ubo_sizes, k);
+      const uint32_t bytes = size ? (uint32_t)(uintptr_t)size->data : 16;
+      field.type = glsl_array_type(glsl_uvec4_type(), MAX2(DIV_ROUND_UP(bytes, 16), 1), 16);
+   } else {
+      field.type = glsl_array_type(glsl_uint_type(), 0, 4);
+   }
+   const struct glsl_type *type =
+      glsl_interface_type(&field, 1, ubo ? GLSL_INTERFACE_PACKING_STD140 : GLSL_INTERFACE_PACKING_STD430,
+                          false, ubo ? "wvk_ubo" : "wvk_ssbo");
+   char name[32];
+   snprintf(name, sizeof(name), "%s_%u_%u", ubo ? "ubo" : "ssbo", set, binding);
+   nir_variable *var = nir_variable_create(nir, ubo ? nir_var_mem_ubo : nir_var_mem_ssbo, type, name);
+   var->data.descriptor_set = set;
+   var->data.binding = binding;
+   var->interface_type = type;
+   _mesa_hash_table_insert(wb->vars, k, var);
+   return var;
+}
+
+/* The word at a byte offset: a deref of it, and for a uniform buffer the
+ * component of the vec4 it is in. */
+static nir_def *
+load_word(nir_builder *b, nir_variable *var, bool ubo, nir_def *word)
+{
+   nir_deref_instr *words = nir_build_deref_struct(b, nir_build_deref_var(b, var), 0);
+   if (!ubo)
+      return nir_load_deref(b, nir_build_deref_array(b, words, word));
+   nir_def *vec = nir_load_deref(b, nir_build_deref_array(b, words, nir_ushr_imm(b, word, 2)));
+   return nir_vector_extract(b, vec, nir_iand_imm(b, word, 3));
+}
+
+static bool
+lower_to_words_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct word_buffers *wb = data;
+   bool ubo = false;
+   int index_src;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ubo:
+      ubo = true;
+      FALLTHROUGH;
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
+   case nir_intrinsic_get_ssbo_size:
+      index_src = 0;
+      break;
+   case nir_intrinsic_store_ssbo:
+      index_src = 1;
+      break;
+   default:
+      return false;
+   }
+   uint32_t set, binding;
+   if (!index_binding(intr->src[index_src], &set, &binding)) {
+      mesa_loge("wvk: a buffer access whose binding cannot be told");
+      return false;
+   }
+   nir_variable *var = word_var(b->shader, wb, ubo, set, binding);
+   b->cursor = nir_before_instr(&intr->instr);
+
+   if (intr->intrinsic == nir_intrinsic_get_ssbo_size) {
+      nir_deref_instr *words = nir_build_deref_struct(b, nir_build_deref_var(b, var), 0);
+      nir_def *length = nir_deref_buffer_array_length(b, 32, &words->def, .access = ACCESS_NON_WRITEABLE);
+      nir_def_replace(&intr->def, nir_imul_imm(b, length, 4));
+      return true;
+   }
+
+   const int offset_src = intr->intrinsic == nir_intrinsic_store_ssbo ? 2 : 1;
+   nir_def *first = nir_ushr_imm(b, intr->src[offset_src].ssa, 2);
+
+   if (intr->intrinsic == nir_intrinsic_load_ubo || intr->intrinsic == nir_intrinsic_load_ssbo) {
+      if (intr->def.bit_size != 32) {
+         mesa_loge("wvk: a %u-bit buffer load", intr->def.bit_size);
+         return false;
+      }
+      nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned c = 0; c < intr->def.num_components; ++c)
+         comps[c] = load_word(b, var, ubo, nir_iadd_imm(b, first, c));
+      nir_def_replace(&intr->def, nir_vec(b, comps, intr->def.num_components));
+      return true;
+   }
+
+   nir_deref_instr *words = nir_build_deref_struct(b, nir_build_deref_var(b, var), 0);
+   if (intr->intrinsic == nir_intrinsic_store_ssbo) {
+      nir_def *value = intr->src[0].ssa;
+      if (value->bit_size != 32) {
+         mesa_loge("wvk: a %u-bit buffer store", value->bit_size);
+         return false;
+      }
+      u_foreach_bit(c, nir_intrinsic_write_mask(intr)) {
+         nir_store_deref(b, nir_build_deref_array(b, words, nir_iadd_imm(b, first, c)),
+                         nir_channel(b, value, c), 0x1);
+      }
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+
+   /* Atomics, on one word. */
+   nir_deref_instr *word = nir_build_deref_array(b, words, first);
+   nir_def *result;
+   if (intr->intrinsic == nir_intrinsic_ssbo_atomic_swap)
+      result = nir_deref_atomic_swap(b, 32, &word->def, intr->src[2].ssa, intr->src[3].ssa,
+                                     .atomic_op = nir_intrinsic_atomic_op(intr));
+   else
+      result = nir_deref_atomic(b, 32, &word->def, intr->src[2].ssa,
+                                .atomic_op = nir_intrinsic_atomic_op(intr));
+   nir_def_replace(&intr->def, result);
+   return true;
+}
+
+static bool
+zero_descriptors_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_vulkan_descriptor &&
+       intr->intrinsic != nir_intrinsic_vulkan_resource_index &&
+       intr->intrinsic != nir_intrinsic_vulkan_resource_reindex)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components, intr->def.bit_size));
+   return true;
+}
+
+static bool
+lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *info, void *mem_ctx)
+{
+   struct word_buffers wb = {
+      .vars = _mesa_pointer_hash_table_create(mem_ctx),
+      .info = info,
+      .ubo_sizes = _mesa_pointer_hash_table_create(mem_ctx),
+   };
+   NIR_PASS(_, nir, push_constants_to_descriptor);
+   /* How big each uniform block is, before its variable goes. */
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo) {
+      void *k = (void *)(uintptr_t)(((uintptr_t)var->data.descriptor_set << 16 | var->data.binding) + 1);
+      const uint32_t bytes = glsl_get_explicit_size(glsl_without_array(var->type), false);
+      _mesa_hash_table_insert(wb.ubo_sizes, k, (void *)(uintptr_t)bytes);
+   }
+   NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo | nir_var_mem_ssbo,
+            nir_address_format_32bit_index_offset);
+   const nir_lower_mem_access_bit_sizes_options sizes = {
+      .callback = word_access,
+      .modes = nir_var_mem_ubo | nir_var_mem_ssbo,
+   };
+   NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &sizes);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   /* vtn's variables go; the words take their place. */
+   nir_foreach_variable_with_modes_safe(var, nir, nir_var_mem_ubo | nir_var_mem_ssbo)
+      exec_node_remove(&var->node);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_to_words_instr, nir_metadata_control_flow, &wb);
+   /* Every access has its binding now; what is left of the descriptors is
+    * their offset part, which is zero. */
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, zero_descriptors_instr, nir_metadata_control_flow, NULL);
+   optimize(nir);
    return true;
 }
 
@@ -706,6 +1053,9 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    split_buffer_vars(nir, &state);
    NIR_PASS(_, nir, nir_shader_instructions_pass, rewrite_resource_instr, nir_metadata_control_flow,
             &state);
+   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_integer_sample_instr, nir_metadata_control_flow,
+            NULL);
+   lower_buffers_to_words(nir, info, mem_ctx);
    optimize(nir);
    /* The combined and arrayed originals, now without a use. */
    hash_table_foreach(state.split, he)
@@ -739,6 +1089,9 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       for (unsigned i = 0; i < 3; ++i)
          shader->workgroup_size[i] = nir->info.workgroup_size[i];
    }
+
+   if (getenv("WINK_VK_DUMP_NIR"))
+      nir_print_shader(nir, stderr);
 
    /* A vertex shader twice: as Vulkan's y needs, and flipped back for a
     * viewport of negative height. */
