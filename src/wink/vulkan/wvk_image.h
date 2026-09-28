@@ -44,6 +44,9 @@ struct wvk_image_view {
    WGPUTextureView view;
    WGPUTextureFormat format;
    WGPUTextureAspect aspect;
+   /* Its components, which WebGPU views have no way to remap, for shaders
+    * to: WVK_META_TEX_SWIZZLE. */
+   uint32_t swizzle;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_image_view, vk.base, VkImageView, VK_OBJECT_TYPE_IMAGE_VIEW)

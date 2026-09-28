@@ -33,6 +33,11 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   itself, from the vertex buffer bound as storage, since WebGPU steps an
   instance attribute every instance. It is the one piece of pipeline state
   compiled into shaders.
+- **What WebGPU's objects cannot hold** of descriptors, shaders do
+  themselves: each set has a record for each of its bindings, which the
+  shader reads at the draw (`wvk_nir_descriptors.c`). Texel buffers are
+  storage buffers whose format the shader decodes and encodes, and views'
+  swizzles are applied to what is read through them.
 - **Blits and `vkCmdClearAttachments`** come from the runtime's vk_meta.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
@@ -106,13 +111,11 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 
 ## Not there yet
 
-- Texel buffers, in shaders.
 - Dynamically indexed arrays of descriptors: the first element is used.
 - Layered rendering: a pass is one layer. This affects multiview too.
 - Precise occlusion queries, and timestamps.
 - Subgroups.
-- Sampler LOD bias, border colours, and component swizzles, which the
-  portability subset says (`imageViewFormatSwizzle` is false).
+- Sampler LOD bias and border colours.
 - Blend states whose colour factors use both CONSTANT_COLOR and
   CONSTANT_ALPHA: WebGPU has one constant.
 - Blits of several layers, and 3D blits: a pass is one layer.

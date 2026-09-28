@@ -26,6 +26,7 @@
 #include "wvk_descriptor_set_layout.h"
 #include "wvk_device.h"
 #include "wvk_format.h"
+#include "wvk_nir.h"
 #include "wvk_physical_device.h"
 
 #include "gex_wgpu_nir.h"
@@ -53,6 +54,11 @@ wvk_init_nir_options(nir_shader_compiler_options *options)
     * from firstInstance. GL's gl_InstanceID does not, which is why the GL
     * driver leaves this off. */
    options->instance_id_includes_base_index = true;
+   /* Half floats in and out of words, for texel buffers and attributes:
+    * the SPIR-V emitter has them, and lowered they would be 16-bit
+    * integers, which WGSL does not have. */
+   options->lower_pack_half_2x16 = false;
+   options->lower_unpack_half_2x16 = false;
 }
 
 static const nir_shader_compiler_options *
@@ -1516,6 +1522,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    NIR_PASS(_, nir, lower_ms_arrays);
    NIR_PASS(_, nir, pad_fragment_outputs);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, demote_to_terminate_instr, nir_metadata_all, NULL);
+   NIR_PASS(_, nir, wvk_nir_lower_texel_buffers);
+   NIR_PASS(_, nir, wvk_nir_lower_view_swizzles);
    lower_buffers_to_words(nir, info, pipeline_state, shader, mem_ctx);
    optimize(nir);
    /* The combined and arrayed originals, now without a use. */

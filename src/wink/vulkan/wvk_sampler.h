@@ -7,6 +7,8 @@
 
 #include "wvk_private.h"
 
+#include "wvk_descriptor_set_layout.h"
+
 #include "vk_sampler.h"
 
 struct wvk_sampler {
@@ -14,6 +16,9 @@ struct wvk_sampler {
    WGPUSampler wgpu;
    /* What a bind group layout entry for it has to say. */
    WGPUSamplerBindingType binding_type;
+   /* What WebGPU's sampler cannot say, for shaders: its descriptor's
+    * record (WVK_META_SAMPLER_*). */
+   uint32_t meta[WVK_META_WORDS];
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_sampler, vk.base, VkSampler, VK_OBJECT_TYPE_SAMPLER)

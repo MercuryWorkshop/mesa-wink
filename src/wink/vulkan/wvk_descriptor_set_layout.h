@@ -65,7 +65,54 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
  * of bindings with a divisor other than 1, which WebGPU cannot step. */
 #define WVK_DRIVER_SLOT_VERTEX (WVK_DRIVER_SLOT_BASE + 2)
 #define WVK_MAX_PULLED_BINDINGS 4
-#define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
+
+/* What WebGPU's objects cannot hold of a set's descriptors, and shaders
+ * need -- a view's swizzle, a sampler's border colour, a texel buffer's
+ * format: a record of WVK_META_WORDS words per WebGPU binding of the set,
+ * at this binding of the set's group. It lives in the submit's push data,
+ * written the first time a submit binds the set. See wvk_nir_descriptors.c. */
+#define WVK_SET_META_SLOT (WVK_DRIVER_SLOT_BASE - 1)
+#define WVK_MAX_SET_SLOTS WVK_SET_META_SLOT
+#define WVK_META_WORDS 8
+
+/* A texture's record: its view's swizzle, 0 for none, else 3 bits a
+ * component of VkComponentSwizzle (ZERO to A). */
+#define WVK_META_TEX_SWIZZLE 0
+
+/* A sampler's record. */
+#define WVK_META_SAMPLER_FLAGS 0
+#define WVK_META_SAMPLER_BIAS 1      /* float */
+#define WVK_META_SAMPLER_MIN_LOD 2   /* float */
+#define WVK_META_SAMPLER_MAX_LOD 3   /* float */
+#define WVK_META_SAMPLER_BORDER 4    /* 4 words, float or integer as the texture is */
+/* Its flags: VkSamplerAddressMode 3 bits an axis, u, v, w, from bit 0. */
+#define WVK_SAMPLER_UNNORMALIZED (1u << 9)
+#define WVK_SAMPLER_MAG_LINEAR (1u << 10)
+#define WVK_SAMPLER_MIN_LINEAR (1u << 11)
+#define WVK_SAMPLER_MIP_LINEAR (1u << 12)
+/* VkCompareOp, 3 bits, and whether it compares. */
+#define WVK_SAMPLER_COMPARE_SHIFT 13
+#define WVK_SAMPLER_COMPARE (1u << 16)
+/* What a shader does itself when sampling a float texture: an axis
+ * clamps to the border or mirrors once, or coordinates are texels. */
+#define WVK_SAMPLER_EMULATE (1u << 17)
+
+/* A texel buffer's record. */
+#define WVK_META_TEXEL_FORMAT 0    /* enum wvk_texel_type, and bytes a texel << 8 */
+#define WVK_META_TEXEL_COUNT 1     /* elements */
+#define WVK_META_TEXEL_START 2     /* where element 0 is in the binding, in bytes */
+#define WVK_META_TEXEL_SIZES 3     /* 8 bits a channel, 0 past the last */
+#define WVK_META_TEXEL_SHIFTS 4    /* 8 bits a channel: its first bit in the texel */
+#define WVK_META_TEXEL_SWIZZLE 5   /* 4 bits for each of R, G, B, A: a channel, 4 for 0, 5 for 1 */
+
+enum wvk_texel_type {
+   WVK_TEXEL_UNORM,
+   WVK_TEXEL_SNORM,
+   WVK_TEXEL_UINT,
+   WVK_TEXEL_SINT,
+   WVK_TEXEL_FLOAT,
+   WVK_TEXEL_UFLOAT_11_11_10,
+};
 
 /* The push binding: the application's push constants, then the driver's
  * own data for the draw:

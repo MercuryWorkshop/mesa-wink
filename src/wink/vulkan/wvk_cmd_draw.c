@@ -968,6 +968,22 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       WGPUBindGroupEntry *e = &entries[i];
       *e = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       e->binding = b->binding;
+      if (b->binding == WVK_SET_META_SLOT) {
+         /* The set's records: its own buffer, or a pushed set's place in
+          * the push data. */
+         e->offset = 0;
+         e->size = set ? wvk_descriptor_set_meta_size(set->layout) : 256;
+         if (set && set->meta_buffer) {
+            e->buffer = set->meta_buffer;
+         } else if (set && !set->pool) {
+            e->buffer = dev->push_buffer;
+            e->offset = set->meta_offset;
+         } else {
+            e->buffer = dev->null_buffer;
+            e->size = 256;
+         }
+         continue;
+      }
       if (group == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
          const struct wvk_driver_buffer *d = driver_binding_buffer(st, b->binding);
          e->offset = 0;
@@ -1040,9 +1056,11 @@ driver_key(const struct wvk_device *dev, const struct wvk_bgl *bgl, uint32_t gro
            const struct wvk_bound_state *st)
 {
    struct wvk_driver_key key = { 0 };
+   /* A group with the set's records has the push buffer in it. */
+   if (bgl->count && bgl->entries[bgl->count - 1].b.binding >= WVK_SET_META_SLOT)
+      key.push_generation = dev->push_generation;
    if (group != WVK_DRIVER_GROUP)
       return key;
-   key.push_generation = dev->push_generation;
    for (uint32_t i = 0; i < bgl->count; ++i) {
       const uint32_t binding = bgl->entries[i].b.binding;
       const struct wvk_driver_buffer *d = driver_binding_buffer(st, binding);
@@ -1119,6 +1137,66 @@ push_offset(struct wvk_device *dev, struct wvk_replay *replay)
    return offset;
 }
 
+static bool
+bgl_has_meta(const struct wvk_bgl *bgl)
+{
+   for (uint32_t i = bgl->count; i-- > 0;) {
+      if (bgl->entries[i].b.binding == WVK_SET_META_SLOT)
+         return true;
+      if (bgl->entries[i].b.binding < WVK_SET_META_SLOT)
+         break;
+   }
+   return false;
+}
+
+/* The set's records, where its bind group finds them. A pushed set's go
+ * into the submit's push data, the first time a draw binds it. A pool's
+ * set has a buffer of them, written again when the set changed: a set is
+ * not written while a submit uses it, but for descriptors the submit does
+ * not use, whose records are the only ones that can differ. False on
+ * failure. */
+static bool
+set_meta(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_descriptor_set *set)
+{
+   const uint32_t size = wvk_descriptor_set_meta_size(set->layout);
+   if (!set->pool) {
+      if (set->meta_generation == set->generation + 1)
+         return true;
+      const uint32_t offset = replay->push_data.size;
+      uint32_t *words = util_dynarray_grow_bytes(&replay->push_data, 1, align(size, WVK_PUSH_STRIDE));
+      if (!words)
+         return false;
+      memset(words, 0, align(size, WVK_PUSH_STRIDE));
+      wvk_descriptor_set_meta(set, words);
+      set->meta_offset = offset;
+      set->meta_generation = set->generation + 1;
+      return true;
+   }
+   if (set->meta_buffer && set->meta_generation == set->generation + 1)
+      return true;
+   if (!set->meta_buffer) {
+      WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk descriptor records");
+      desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+      desc.size = size;
+      set->meta_buffer = wgpuDeviceCreateBuffer(dev->wgpu, &desc);
+      if (!set->meta_buffer)
+         return false;
+      /* Its bind groups, made without it, are gone. */
+      const uint64_t generation = set->generation;
+      wvk_descriptor_set_invalidate(set);
+      set->generation = generation;
+   }
+   uint32_t *words = malloc(size);
+   if (!words)
+      return false;
+   wvk_descriptor_set_meta(set, words);
+   wgpuQueueWriteBuffer(dev->queue.wgpu, set->meta_buffer, 0, words, size);
+   free(words);
+   set->meta_generation = set->generation + 1;
+   return true;
+}
+
 /* Bind every group of the layout, or only the driver's. Returns false if
  * one could not be made, and the draw is to be skipped. */
 static bool
@@ -1130,10 +1208,16 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
    /* The push buffer has to exist and hold this submit's data before any
     * bind group names it. */
    bool uses_push = false;
-   for (uint32_t g = 0; g < layout->group_count; ++g) {
+   for (uint32_t g = driver_only ? WVK_DRIVER_GROUP : 0; g < layout->group_count; ++g) {
       const struct wvk_bgl *bgl = layout->groups[g];
       for (uint32_t i = 0; i < bgl->count; ++i)
          uses_push |= g == WVK_DRIVER_GROUP && bgl->entries[i].b.binding == WVK_DRIVER_SLOT_PUSH;
+      struct wvk_descriptor_set *set = st->sets[bind_point][g].set;
+      if (bgl_has_meta(bgl)) {
+         uses_push = true;
+         if (set && !set_meta(dev, replay, set))
+            return false;
+      }
    }
    uint32_t push_at = 0;
    if (uses_push) {
@@ -1155,6 +1239,8 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
       uint32_t offset_count = 0;
       for (uint32_t i = 0; i < bgl->count; ++i) {
          const struct wvk_shader_binding *b = &bgl->entries[i].b;
+         if (b->binding == WVK_SET_META_SLOT)
+            continue;
          if (g == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
             if (b->dynamic && offset_count < WVK_MAX_DYNAMIC) {
                /* The draw binding is the push buffer unless it is not. */

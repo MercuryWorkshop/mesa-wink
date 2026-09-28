@@ -42,4 +42,9 @@ const struct wvk_format *wvk_format_get(VkFormat format);
 /* The capabilities on this physical device, optional features applied. */
 uint32_t wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format);
 
+/* A texel buffer's format as shaders decode and encode it: the words
+ * WVK_META_TEXEL_FORMAT, SIZES, SHIFTS and SWIZZLE of its record. False
+ * for formats that cannot be. */
+bool wvk_texel_buffer_format(VkFormat format, uint32_t *record);
+
 #endif

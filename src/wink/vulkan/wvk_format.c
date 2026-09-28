@@ -13,7 +13,11 @@
  */
 #include "wvk_format.h"
 
+#include "wvk_descriptor_set_layout.h"
 #include "wvk_physical_device.h"
+
+#include "vk_format.h"
+#include "util/format/u_format.h"
 
 #define TF(x) WGPUTextureFormat_##x
 #define VF(x) WGPUVertexFormat_##x
@@ -190,4 +194,57 @@ wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format)
       break;
    }
    return caps;
+}
+
+bool
+wvk_texel_buffer_format(VkFormat format, uint32_t *record)
+{
+   const enum pipe_format pf = vk_format_to_pipe_format(format);
+   const struct util_format_description *desc = util_format_description(pf);
+   if (!desc || vk_format_is_depth_or_stencil(format))
+      return false;
+   const uint32_t bytes = desc->block.bits / 8;
+   uint32_t type, sizes = 0, shifts = 0;
+   if (pf == PIPE_FORMAT_R11G11B10_FLOAT) {
+      type = WVK_TEXEL_UFLOAT_11_11_10;
+      sizes = 32;
+   } else {
+      if (desc->layout != UTIL_FORMAT_LAYOUT_PLAIN || desc->colorspace != UTIL_FORMAT_COLORSPACE_RGB ||
+          desc->block.width != 1 || desc->block.height != 1 || bytes > 16 || !desc->nr_channels)
+         return false;
+      const struct util_format_channel_description *c0 = &desc->channel[0];
+      if (c0->type == UTIL_FORMAT_TYPE_FLOAT)
+         type = WVK_TEXEL_FLOAT;
+      else if (c0->type == UTIL_FORMAT_TYPE_UNSIGNED && c0->normalized)
+         type = WVK_TEXEL_UNORM;
+      else if (c0->type == UTIL_FORMAT_TYPE_SIGNED && c0->normalized)
+         type = WVK_TEXEL_SNORM;
+      else if (c0->type == UTIL_FORMAT_TYPE_UNSIGNED && c0->pure_integer)
+         type = WVK_TEXEL_UINT;
+      else if (c0->type == UTIL_FORMAT_TYPE_SIGNED && c0->pure_integer)
+         type = WVK_TEXEL_SINT;
+      else
+         return false;
+      for (uint32_t c = 0; c < desc->nr_channels; ++c) {
+         const struct util_format_channel_description *ch = &desc->channel[c];
+         /* One type for every channel, and each of them whole in a word. */
+         if (ch->type != c0->type || ch->normalized != c0->normalized || ch->pure_integer != c0->pure_integer ||
+             ch->size > 32 || (type == WVK_TEXEL_FLOAT && ch->size != 16 && ch->size != 32) ||
+             ch->shift / 32 != (ch->shift + ch->size - 1) / 32)
+            return false;
+         sizes |= (uint32_t)ch->size << (8 * c);
+         shifts |= (uint32_t)ch->shift << (8 * c);
+      }
+   }
+   uint32_t swizzle = 0;
+   for (uint32_t i = 0; i < 4; ++i) {
+      const unsigned sw = desc->swizzle[i];
+      const uint32_t v = sw <= PIPE_SWIZZLE_W ? sw - PIPE_SWIZZLE_X : sw == PIPE_SWIZZLE_1 ? 5 : 4;
+      swizzle |= v << (4 * i);
+   }
+   record[WVK_META_TEXEL_FORMAT] = type | bytes << 8;
+   record[WVK_META_TEXEL_SIZES] = sizes;
+   record[WVK_META_TEXEL_SHIFTS] = shifts;
+   record[WVK_META_TEXEL_SWIZZLE] = swizzle;
+   return true;
 }

@@ -16,6 +16,7 @@ struct wvk_device;
 struct wvk_device_memory;
 struct wvk_image_view;
 struct wvk_sampler;
+struct vk_buffer_view;
 struct vk_descriptor_update_template;
 
 /* A descriptor as the host keeps it; WebGPU bind groups are made of these
@@ -29,6 +30,10 @@ struct wvk_descriptor {
    /* Images, and samplers. */
    struct wvk_image_view *view;
    struct wvk_sampler *sampler;
+   /* Texel buffers: the view, and where it starts in the range above,
+    * which begins on the 256-byte boundary below it. */
+   struct vk_buffer_view *buffer_view;
+   uint32_t texel_start;
 };
 
 /* Bind groups made from a set, for the layouts that asked. A layout is
@@ -55,6 +60,14 @@ struct wvk_descriptor_set {
    uint64_t generation;
    struct wvk_set_bind_group bind_groups[WVK_SET_BIND_GROUPS];
    uint32_t bind_group_next;
+
+   /* The set's records (WVK_SET_META_SLOT). A set of a pool keeps them in
+    * a buffer of its own, written again when the set has changed since.
+    * A pushed set lives for one submit, and has them in its push data, at
+    * meta_offset. */
+   WGPUBuffer meta_buffer;
+   uint64_t meta_generation;
+   uint32_t meta_offset;
 
    /* Inline uniform blocks: their bytes, and the buffer a bind group
     * shows them through. */
@@ -90,5 +103,14 @@ void wvk_descriptor_set_write_template(struct wvk_device *dev, struct wvk_descri
 
 /* Drop the bind groups made from the set: it changed. */
 void wvk_descriptor_set_invalidate(struct wvk_descriptor_set *set);
+
+/* The set's records, WVK_META_WORDS for each of its WebGPU bindings. */
+void wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words);
+
+static inline uint32_t
+wvk_descriptor_set_meta_size(const struct wvk_descriptor_set_layout *layout)
+{
+   return MAX2(layout->slot_count, 1) * WVK_META_WORDS * 4;
+}
 
 #endif

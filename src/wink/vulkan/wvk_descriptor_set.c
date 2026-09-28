@@ -16,7 +16,10 @@
 #include "wvk_image.h"
 #include "wvk_sampler.h"
 
+#include "wvk_format.h"
+
 #include "vk_alloc.h"
+#include "vk_buffer_view.h"
 #include "vk_descriptor_update_template.h"
 #include "vk_util.h"
 
@@ -60,6 +63,8 @@ wvk_descriptor_set_destroy(struct wvk_device *dev, struct wvk_descriptor_set *se
    wvk_descriptor_set_invalidate(set);
    if (set->inline_buffer)
       wgpuBufferRelease(set->inline_buffer);
+   if (set->meta_buffer)
+      wgpuBufferRelease(set->meta_buffer);
    list_del(&set->link);
    vk_descriptor_set_layout_unref(&dev->vk, &set->layout->vk);
    vk_object_free(&dev->vk, NULL, set);
@@ -81,6 +86,31 @@ write_buffer(struct wvk_device *dev, struct wvk_descriptor *d, const VkDescripto
    d->size = vk_buffer_range(&buffer->vk, info->offset, info->range);
 }
 
+/* A texel buffer is its range, as a storage buffer: from the 256-byte
+ * boundary below, where a WebGPU binding can start, and where the view
+ * starts in that is its record's to say. The memory's padding covers the
+ * rounding up. */
+static void
+write_texel_buffer(struct wvk_device *dev, struct wvk_descriptor *d, VkBufferView _view)
+{
+   VK_FROM_HANDLE(vk_buffer_view, view, _view);
+   *d = (struct wvk_descriptor){ 0 };
+   if (!view)
+      return;
+   struct wvk_buffer *buffer = container_of(view->buffer, struct wvk_buffer, vk);
+   WGPUBuffer wgpu = NULL;
+   if (!buffer->mem || wvk_device_memory_get_buffer(dev, buffer->mem, &wgpu) != VK_SUCCESS)
+      return;
+   const uint64_t at = buffer->offset + view->offset;
+   const uint64_t start = at & ~255ull;
+   d->mem = buffer->mem;
+   d->buffer = wgpu;
+   d->offset = start;
+   d->size = align64(at - start + view->range, 4);
+   d->buffer_view = view;
+   d->texel_start = (uint32_t)(at - start);
+}
+
 static void
 write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_layout *bl,
             uint32_t element, const VkDescriptorImageInfo *info)
@@ -96,7 +126,7 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
 static void
 write_one(struct wvk_device *dev, struct wvk_descriptor_set *set, uint32_t binding,
           uint32_t element, const VkDescriptorImageInfo *image,
-          const VkDescriptorBufferInfo *buffer)
+          const VkDescriptorBufferInfo *buffer, const VkBufferView *texel)
 {
    const struct wvk_descriptor_set_binding_layout *bl = &set->layout->bindings[binding];
    struct wvk_descriptor *d = &set->descriptors[bl->descriptor_index + element];
@@ -113,6 +143,10 @@ write_one(struct wvk_device *dev, struct wvk_descriptor_set *set, uint32_t bindi
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
       write_image(d, bl, element, image);
+      break;
+   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+      write_texel_buffer(dev, d, texel ? *texel : VK_NULL_HANDLE);
       break;
    default:
       mesa_logw_once("wvk: %s descriptors are not supported yet",
@@ -141,7 +175,8 @@ wvk_descriptor_set_write(struct wvk_device *dev, struct wvk_descriptor_set *set,
    for (uint32_t i = 0; i < write->descriptorCount && binding < set->layout->binding_count; ++i) {
       write_one(dev, set, binding, element,
                 write->pImageInfo ? &write->pImageInfo[i] : NULL,
-                write->pBufferInfo ? &write->pBufferInfo[i] : NULL);
+                write->pBufferInfo ? &write->pBufferInfo[i] : NULL,
+                write->pTexelBufferView ? &write->pTexelBufferView[i] : NULL);
       next_element(set->layout, &binding, &element);
    }
    wvk_descriptor_set_invalidate(set);
@@ -157,11 +192,51 @@ wvk_descriptor_set_write_template(struct wvk_device *dev, struct wvk_descriptor_
       uint32_t binding = entry->binding, element = entry->array_element;
       for (uint32_t j = 0; j < entry->array_count && binding < set->layout->binding_count; ++j) {
          const void *src = (const uint8_t *)data + entry->offset + j * entry->stride;
-         write_one(dev, set, binding, element, src, src);
+         write_one(dev, set, binding, element, src, src, src);
          next_element(set->layout, &binding, &element);
       }
    }
    wvk_descriptor_set_invalidate(set);
+}
+
+void
+wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words)
+{
+   const struct wvk_descriptor_set_layout *layout = set->layout;
+   memset(words, 0, wvk_descriptor_set_meta_size(layout));
+   for (uint32_t s = 0; s < layout->slot_count; ++s) {
+      const struct wvk_descriptor_slot *slot = &layout->slots[s];
+      const struct wvk_descriptor_set_binding_layout *bl = &layout->bindings[slot->binding];
+      const struct wvk_descriptor *d = &set->descriptors[bl->descriptor_index + slot->element];
+      uint32_t *record = words + s * WVK_META_WORDS;
+      switch (bl->type) {
+      case VK_DESCRIPTOR_TYPE_SAMPLER:
+         if (d->sampler)
+            memcpy(record, d->sampler->meta, sizeof(d->sampler->meta));
+         break;
+      case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+         if (slot->sampler && d->sampler)
+            memcpy(record, d->sampler->meta, sizeof(d->sampler->meta));
+         else if (!slot->sampler && d->view)
+            record[WVK_META_TEX_SWIZZLE] = d->view->swizzle;
+         break;
+      case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+         if (d->view)
+            record[WVK_META_TEX_SWIZZLE] = d->view->swizzle;
+         break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+         /* A format shaders cannot decode, or no view: nothing in it. */
+         if (d->buffer_view && wvk_texel_buffer_format(d->buffer_view->format, record)) {
+            record[WVK_META_TEXEL_COUNT] = (uint32_t)MIN2(d->buffer_view->elements, UINT32_MAX);
+            record[WVK_META_TEXEL_START] = d->texel_start;
+         }
+         break;
+      default:
+         break;
+      }
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL

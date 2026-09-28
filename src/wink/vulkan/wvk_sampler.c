@@ -2,9 +2,11 @@
  * Copyright 2026 wink contributors
  * SPDX-License-Identifier: MIT
  *
- * A VkSampler is a WGPUSampler. WebGPU has no border colour, so
- * clamp-to-border clamps to the edge, and no LOD bias, which
- * samplerMipLodBias reports.
+ * A VkSampler is a WGPUSampler, and what that cannot say -- a border
+ * colour, mirroring once, a LOD bias, unnormalized coordinates, and all of
+ * it for integer textures, which WebGPU does not sample -- is its record,
+ * which shaders read and act on (wvk_nir_descriptors.c). For those axes the
+ * WebGPU sampler clamps to the edge.
  */
 #include "wvk_sampler.h"
 
@@ -75,8 +77,6 @@ wvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
    if (info->anisotropyEnable && desc.magFilter == WGPUFilterMode_Linear &&
        desc.minFilter == WGPUFilterMode_Linear && desc.mipmapFilter == WGPUMipmapFilterMode_Linear)
       desc.maxAnisotropy = (uint16_t)CLAMP(info->maxAnisotropy, 1.0f, 16.0f);
-   if (info->mipLodBias != 0.0f)
-      mesa_logw_once("wvk: a sampler's LOD bias is ignored: WebGPU samplers have none");
    sampler->wgpu = wgpuDeviceCreateSampler(dev->wgpu, &desc);
    if (!sampler->wgpu) {
       vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);
@@ -90,6 +90,30 @@ wvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
       sampler->binding_type = WGPUSamplerBindingType_Filtering;
    else
       sampler->binding_type = WGPUSamplerBindingType_NonFiltering;
+
+   const VkSamplerAddressMode modes[3] = { info->addressModeU, info->addressModeV, info->addressModeW };
+   uint32_t flags = 0;
+   for (uint32_t i = 0; i < 3; ++i) {
+      flags |= ((uint32_t)modes[i] & 7) << (3 * i);
+      if (modes[i] == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER ||
+          modes[i] == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE)
+         flags |= WVK_SAMPLER_EMULATE;
+   }
+   if (info->unnormalizedCoordinates)
+      flags |= WVK_SAMPLER_UNNORMALIZED | WVK_SAMPLER_EMULATE;
+   if (info->magFilter == VK_FILTER_LINEAR)
+      flags |= WVK_SAMPLER_MAG_LINEAR;
+   if (info->minFilter == VK_FILTER_LINEAR)
+      flags |= WVK_SAMPLER_MIN_LINEAR;
+   if (info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR)
+      flags |= WVK_SAMPLER_MIP_LINEAR;
+   if (info->compareEnable)
+      flags |= WVK_SAMPLER_COMPARE | (((uint32_t)info->compareOp & 7) << WVK_SAMPLER_COMPARE_SHIFT);
+   sampler->meta[WVK_META_SAMPLER_FLAGS] = flags;
+   memcpy(&sampler->meta[WVK_META_SAMPLER_BIAS], &info->mipLodBias, 4);
+   memcpy(&sampler->meta[WVK_META_SAMPLER_MIN_LOD], &info->minLod, 4);
+   memcpy(&sampler->meta[WVK_META_SAMPLER_MAX_LOD], &info->maxLod, 4);
+   memcpy(&sampler->meta[WVK_META_SAMPLER_BORDER], &sampler->vk.border_color_value, 16);
 
    *pSampler = wvk_sampler_to_handle(sampler);
    return VK_SUCCESS;

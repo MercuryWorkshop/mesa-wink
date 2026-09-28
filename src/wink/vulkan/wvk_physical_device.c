@@ -179,7 +179,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .constantAlphaColorBlendFactors = true,
       .events = true,
       .imageViewFormatReinterpretation = false,
-      .imageViewFormatSwizzle = false, /* WebGPU views have no swizzle */
+      .imageViewFormatSwizzle = true, /* by the shader: wvk_nir_descriptors.c */
       .imageView2DOn3DImage = false,
       .multisampleArrayImage = false,
       .mutableComparisonSamplers = true,
@@ -614,9 +614,20 @@ buffer_features(const struct wvk_physical_device *pdev, VkFormat format)
 {
    const struct wvk_format *f = wvk_format_get(format);
    (void)pdev;
-   if (!f || !f->vertex)
-      return 0;
-   return VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+   VkFormatFeatureFlags2 features = 0;
+   if (f && f->vertex)
+      features |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+   /* Texel buffers are storage buffers, and any format the shader can
+    * take apart and put together will do. */
+   uint32_t record[WVK_META_WORDS];
+   if (wvk_texel_buffer_format(format, record)) {
+      features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT | VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                  VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      if (format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT)
+         features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT;
+   }
+   return features;
 }
 
 VKAPI_ATTR void VKAPI_CALL

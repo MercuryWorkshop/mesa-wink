@@ -335,6 +335,10 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    const struct wvk_format *format = wvk_format_get(view->vk.format);
    view->format = format ? format->texture : image->format;
    view->aspect = wvk_aspect(view->vk.aspects);
+   const VkComponentMapping *m = &view->vk.swizzle;
+   if (m->r != VK_COMPONENT_SWIZZLE_R || m->g != VK_COMPONENT_SWIZZLE_G || m->b != VK_COMPONENT_SWIZZLE_B ||
+       m->a != VK_COMPONENT_SWIZZLE_A)
+      view->swizzle = (uint32_t)m->r | (uint32_t)m->g << 3 | (uint32_t)m->b << 6 | (uint32_t)m->a << 9;
 
    /* Views of an image without a texture -- a swapchain's, until acquired
     * -- are made when used. */
