@@ -291,7 +291,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .mutableComparisonSamplers = true,
       .pointPolygons = false,
       .samplerMipLodBias = true,
-      .separateStencilMaskRef = false,
+      .separateStencilMaskRef = true, /* a draw for each face (wvk_cmd_draw.c) */
       .shaderSampleRateInterpolationFunctions = false,
       .tessellationIsolines = false,
       .tessellationPointMode = false,

@@ -1115,6 +1115,9 @@ placeholder_view_locked(struct wvk_device *dev, const struct wvk_shader_binding 
    return view;
 }
 
+static const struct vk_stencil_test_face_state *draw_stencil_face(const struct wvk_replay *replay,
+                                                                   const struct vk_dynamic_graphics_state *dyn);
+
 /* The copy of an image the pass renders to, if it has one. */
 static WGPUTexture
 find_snapshot(const struct wvk_replay *replay, const struct wvk_image *image)
@@ -1585,6 +1588,9 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
    k->cull_mode = dyn->rs.cull_mode == VK_CULL_MODE_FRONT_BIT  ? WGPUCullMode_Front
                   : dyn->rs.cull_mode == VK_CULL_MODE_BACK_BIT ? WGPUCullMode_Back
                                                                : WGPUCullMode_None;
+   /* A draw for one face culls the other. */
+   if (replay->draw_face)
+      k->cull_mode = replay->draw_face == 1 ? WGPUCullMode_Back : WGPUCullMode_Front;
    k->unclipped_depth = dyn->rs.depth_clamp_enable;
 
    k->samples = MAX2(replay->rendering.samples, 1);
@@ -1633,11 +1639,11 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
       /* Without a depth aspect there is no depth test, whatever it says. */
       const struct wvk_image_view *ds_view = replay->rendering.depth_stencil;
       const bool has_depth = ds_view && vk_format_has_depth(wvk_image_view_image(ds_view)->vk.format);
-      const bool depth_test = dyn->ds.depth.test_enable && has_depth;
+      const bool depth_test = dyn->ds.depth.test_enable && has_depth && !replay->rendering.depth_absent;
       k->depth_compare = depth_test ? dyn->ds.depth.compare_op : VK_COMPARE_OP_ALWAYS;
       k->depth_write = depth_test && dyn->ds.depth.write_enable && !replay->rendering.depth_read_only;
       /* WebGPU wants the stencil state left alone without a stencil. */
-      if (dyn->ds.stencil.test_enable && has_stencil) {
+      if (dyn->ds.stencil.test_enable && has_stencil && !replay->rendering.stencil_absent) {
          const struct vk_stencil_test_face_state *f = &dyn->ds.stencil.front, *b = &dyn->ds.stencil.back;
          k->front.fail = f->op.fail;
          k->front.pass = f->op.pass;
@@ -1647,9 +1653,11 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
          k->back.pass = b->op.pass;
          k->back.depth_fail = b->op.depth_fail;
          k->back.compare = b->op.compare;
-         /* WebGPU has one mask for both faces. */
-         k->stencil_read_mask = f->compare_mask;
-         k->stencil_write_mask = f->write_mask;
+         /* WebGPU has one mask for both faces: the face's this draw is
+          * for, or the one not culled. */
+         const struct vk_stencil_test_face_state *m = draw_stencil_face(replay, dyn);
+         k->stencil_read_mask = m->compare_mask;
+         k->stencil_write_mask = m->write_mask;
       } else {
          k->front.compare = k->back.compare = VK_COMPARE_OP_ALWAYS;
          k->stencil_read_mask = k->stencil_write_mask = 0xff;
@@ -1702,6 +1710,15 @@ get_render_pipeline(struct wvk_device *dev, struct wvk_cmd_buffer *cmd, bool ind
 
 /* Viewport and scissor, as WebGPU has them: inside the attachments, and a
  * viewport of positive height, the flip being the shader's. */
+/* The stencil state of the face a draw is for: the back where only the
+ * back is drawn, else the front. */
+static const struct vk_stencil_test_face_state *
+draw_stencil_face(const struct wvk_replay *replay, const struct vk_dynamic_graphics_state *dyn)
+{
+   const bool back = replay->draw_face == 2 || (!replay->draw_face && dyn->rs.cull_mode == VK_CULL_MODE_FRONT_BIT);
+   return back ? &dyn->ds.stencil.back : &dyn->ds.stencil.front;
+}
+
 static void
 set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
 {
@@ -1914,7 +1931,7 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
 
    const WGPUColor blend = blend_constant(dyn, replay->rendering.color_count);
    wgpuRenderPassEncoderSetBlendConstant(pass, &blend);
-   wgpuRenderPassEncoderSetStencilReference(pass, dyn->ds.stencil.front.reference);
+   wgpuRenderPassEncoderSetStencilReference(pass, draw_stencil_face(replay, dyn)->reference);
    return true;
 }
 
@@ -1963,16 +1980,38 @@ draw_viewports(const struct wvk_cmd_buffer *cmd)
    return st->vs && st->vs->writes_viewport && count > 1 ? MIN2(count, WVK_MAX_VIEWPORTS) : 1;
 }
 
+/* And for each face, where their stencil masks or references differ and
+ * both are drawn: WebGPU has one of each for both. */
+static uint32_t
+draw_faces(const struct wvk_cmd_buffer *cmd)
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   const struct wvk_replay *replay = cmd->replay;
+   const struct vk_stencil_test_face_state *f = &dyn->ds.stencil.front, *b = &dyn->ds.stencil.back;
+   const VkPrimitiveTopology t = dyn->ia.primitive_topology;
+   const bool triangles = t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                          t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
+                          t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY ||
+                          t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+   const bool differ = f->compare_mask != b->compare_mask || f->write_mask != b->write_mask ||
+                       f->reference != b->reference;
+   return dyn->ds.stencil.test_enable && replay->rendering.depth_stencil && triangles && differ &&
+                dyn->rs.cull_mode == VK_CULL_MODE_NONE
+             ? 2 : 1;
+}
+
 /* The next of them, or the first again once all are drawn. */
 static bool
-next_viewport(struct wvk_cmd_buffer *cmd, uint32_t v, uint32_t n)
+next_viewport(struct wvk_cmd_buffer *cmd, uint32_t v, uint32_t n, uint32_t faces)
 {
-   cmd->replay->draw_viewport = v < n ? v : 0;
+   cmd->replay->draw_viewport = v < n ? v / faces : 0;
+   cmd->replay->draw_face = v < n && faces > 1 ? 1 + v % faces : 0;
    return v < n;
 }
 
-#define foreach_viewport(cmd) \
-   for (uint32_t _v = 0, _n = draw_viewports(cmd); next_viewport(cmd, _v, _n); ++_v)
+#define foreach_viewport(cmd)                                                                          \
+   for (uint32_t _v = 0, _f = draw_faces(cmd), _n = draw_viewports(cmd) * _f; next_viewport(cmd, _v, _n, _f); \
+        ++_v)
 
 /* ---------------------------------------------------------------------- */
 /* Triangle fans, which WebGPU does not have: the list of their triangles,

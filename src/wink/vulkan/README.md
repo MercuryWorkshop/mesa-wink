@@ -70,6 +70,9 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   they do. Indirect draws of fans are drawn from the host's copy of their
   commands. **vkCmdDraw*IndirectCount** copies the draws and gives those
   past the count no instances, on the GPU.
+- **Stencil masks and references of each face**: WebGPU has one of each.
+  Where the faces' differ and both are drawn, a draw is drawn twice, each
+  culling the other face.
 - **Viewports**: WebGPU has one. A vertex shader that writes
   gl_ViewportIndex has each draw drawn once per viewport, with what is not
   that draw's out of the clip volume, as layers are.

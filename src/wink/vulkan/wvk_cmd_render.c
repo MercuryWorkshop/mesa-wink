@@ -214,6 +214,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       stencil = NULL;
    replay->rendering.depth_stencil = NULL;
    replay->rendering.depth_read_only = replay->rendering.stencil_read_only = false;
+   replay->rendering.depth_absent = replay->rendering.stencil_absent = false;
    if (depth || stencil) {
       VK_FROM_HANDLE(wvk_image_view, view, (depth ? depth : stencil)->imageView);
       replay->rendering.depth_stencil = view;
@@ -251,8 +252,12 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
             ds.depthStoreOp = replay->rendering.resolve.depth.resolveMode ? WGPUStoreOp_Store
                               : store_op(depth->storeOp, suspending);
             ds.depthClearValue = CLAMP(clear_finite(depth->clearValue.depthStencil.depth), 0.0, 1.0);
+         } else if (!depth) {
+            /* Not attached in this pass: kept as it is. */
+            ds.depthReadOnly = true;
+            replay->rendering.depth_read_only = true;
+            replay->rendering.depth_absent = true;
          } else {
-            /* Not rendered to in this pass: kept as it is. */
             ds.depthReadOnly = true;
             replay->rendering.depth_read_only = true;
          }
@@ -272,9 +277,11 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
                                 : store_op(stencil->storeOp, suspending);
             ds.stencilClearValue = stencil->clearValue.depthStencil.stencil;
          } else {
-            /* Nor is this, and pipelines then write none of it. */
+            /* Nor is this, and pipelines then write none of it; and test
+             * none of it where it is not attached. */
             ds.stencilReadOnly = true;
             replay->rendering.stencil_read_only = true;
+            replay->rendering.stencil_absent = !stencil;
          }
       }
       if (ds_clear.aspectMask)

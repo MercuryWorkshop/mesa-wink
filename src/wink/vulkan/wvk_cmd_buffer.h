@@ -55,6 +55,8 @@ struct wvk_replay {
       /* Depth and stencil the pass does not write: WebGPU lets shaders
        * read those as it tests against them. */
       bool depth_read_only, stencil_read_only;
+      /* Not attached at all: no test of them either. */
+      bool depth_absent, stencil_absent;
       /* Counts passes, so that what is bound knows when it is gone. */
       uint32_t serial;
       /* Resolves WebGPU does not do -- integer formats, modes other than
@@ -105,6 +107,10 @@ struct wvk_replay {
    /* The viewport this draw is drawn in: a draw for each, when the vertex
     * shader chooses (wvk_cmd_draw.c). */
    uint32_t draw_viewport;
+   /* The faces this draw is drawn for: 0 both, 1 the front, 2 the back --
+    * a draw for each where their stencil masks or references differ,
+    * WebGPU having one of each (wvk_cmd_draw.c). */
+   uint32_t draw_face;
    /* A triangle fan drawn as the list of its triangles (wvk_cmd_draw.c). */
    bool fan_as_list;
    /* Images with atomics whose buffer of texels is the image now, until
