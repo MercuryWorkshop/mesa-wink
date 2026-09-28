@@ -867,14 +867,90 @@ clear_pass(struct wvk_replay *replay, struct wvk_image *image, uint32_t level, u
    wgpuRenderPassEncoderRelease(pass);
 }
 
+/* A colour clear no pass can do: a linear image, which is its memory, or
+ * a format WebGPU does not render to. The value packed as the format has
+ * it, repeated over each subresource by copies. */
+static void
+clear_by_fill(struct wvk_cmd_buffer *cmd, struct wvk_image *image, const VkClearColorValue *color,
+              uint32_t range_count, const VkImageSubresourceRange *ranges)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   const enum pipe_format format = vk_format_to_pipe_format(image->vk.format);
+   const uint32_t bpp = util_format_get_blocksize(format);
+   if (util_format_is_compressed(format) || bpp > 16) {
+      mesa_logw_once("wvk: clearing %s is not supported", util_format_short_name(format));
+      return;
+   }
+   uint8_t texel[16] = { 0 };
+   util_format_pack_rgba(format, texel, color, 1);
+
+   if (image->linear) {
+      /* One level, one layer: a row of the value, into every row. */
+      const uint32_t row = image->vk.extent.width * bpp;
+      uint8_t *pattern = malloc(row);
+      if (!pattern)
+         return;
+      for (uint32_t x = 0; x < image->vk.extent.width; ++x)
+         memcpy(pattern + x * bpp, texel, bpp);
+      WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay, row, WGPUBufferUsage_Storage, pattern);
+      free(pattern);
+      if (!temp)
+         return;
+      repack(dev, replay, temp, 0, 0, 0, image->mem->buffer, image->offset, image->pitch, 0, row,
+             image->vk.extent.height, 1);
+      wvk_replay_write(replay, image->mem, image->offset, linear_bytes(image, image->vk.extent));
+      return;
+   }
+
+   for (uint32_t r = 0; r < range_count; ++r) {
+      const VkImageSubresourceRange *range = &ranges[r];
+      const uint32_t levels = vk_image_subresource_level_count(&image->vk, range);
+      for (uint32_t m = 0; m < levels; ++m) {
+         const uint32_t level = range->baseMipLevel + m;
+         const uint32_t w = u_minify(image->vk.extent.width, level);
+         const uint32_t h = image->vk.image_type == VK_IMAGE_TYPE_1D ? 1 : u_minify(image->vk.extent.height, level);
+         const uint32_t layers = image->vk.image_type == VK_IMAGE_TYPE_3D
+                                    ? u_minify(image->vk.extent.depth, level)
+                                    : vk_image_subresource_layer_count(&image->vk, range);
+         const uint32_t base = image->vk.image_type == VK_IMAGE_TYPE_3D ? 0 : range->baseArrayLayer;
+         const struct copy_layout l = {
+            .block_w = 1, .block_h = 1, .block_bytes = bpp, .row_bytes = align(w * bpp, 256), .rows_per_image = h,
+         };
+         uint8_t *pattern = calloc(h, l.row_bytes);
+         if (!pattern)
+            return;
+         for (uint32_t x = 0; x < w; ++x)
+            memcpy(pattern + x * bpp, texel, bpp);
+         for (uint32_t y = 1; y < h; ++y)
+            memcpy(pattern + (size_t)y * l.row_bytes, pattern, w * bpp);
+         WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay, (uint64_t)h * l.row_bytes, WGPUBufferUsage_CopySrc,
+                                                  pattern);
+         free(pattern);
+         if (!temp)
+            return;
+         for (uint32_t layer = 0; layer < layers; ++layer) {
+            WGPUTexelCopyTextureInfo tex = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            tex.texture = image->texture;
+            tex.mipLevel = level;
+            tex.origin.z = base + layer;
+            copy_buffer_texture(replay, true, temp, 0, &l, &tex, (WGPUExtent3D){ w, h, 1 });
+         }
+      }
+   }
+}
+
 static void
 clear_ranges(struct wvk_cmd_buffer *cmd, struct wvk_image *image, const VkClearColorValue *color,
              const VkClearDepthStencilValue *ds, uint32_t range_count, const VkImageSubresourceRange *ranges)
 {
    struct wvk_replay *replay = cmd->replay;
    wvk_replay_end_passes(replay);
-   if (!(image->usage & WGPUTextureUsage_RenderAttachment)) {
-      mesa_logw("wvk: clearing a non-renderable format (%u) is not implemented", image->vk.format);
+   if (image->linear || !(image->usage & WGPUTextureUsage_RenderAttachment)) {
+      if (color)
+         clear_by_fill(cmd, image, color, range_count, ranges);
+      else
+         mesa_logw_once("wvk: clearing a depth-stencil format WebGPU does not render to");
       return;
    }
    for (uint32_t r = 0; r < range_count; ++r) {
