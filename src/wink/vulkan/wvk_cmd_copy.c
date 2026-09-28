@@ -17,6 +17,7 @@
 #include "wvk_entrypoints.h"
 #include "wvk_format.h"
 #include "wvk_image.h"
+#include "wvk_physical_device.h"
 
 #include "vk_format.h"
 #include "util/format/u_format.h"
@@ -1138,8 +1139,8 @@ wvk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage _image, VkI
 }
 
 /* A resolve is a render pass that loads the multisampled image and
- * resolves into the other -- of whole subresources, which is all WebGPU
- * resolves. */
+ * resolves into the other -- of whole subresources of a format it can
+ * average, which is all WebGPU resolves. The rest are vk_meta's draws. */
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *pResolveImageInfo)
 {
@@ -1155,9 +1156,16 @@ wvk_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *p
                                  ? src->vk.array_layers - r->srcSubresource.baseArrayLayer
                                  : r->srcSubresource.layerCount;
       const VkExtent3D full = vk_image_mip_level_extent(&dst->vk, r->dstSubresource.mipLevel);
+      const struct wvk_physical_device *pdev = wvk_device_physical(wvk_cmd_buffer_device(cmd));
       if (r->srcOffset.x || r->srcOffset.y || r->dstOffset.x || r->dstOffset.y ||
-          r->extent.width != full.width || r->extent.height != full.height)
-         mesa_logw("wvk: resolving part of an image resolves all of it");
+          r->extent.width != full.width || r->extent.height != full.height || src->format != dst->format ||
+          !(wvk_format_caps(pdev, dst->vk.format) & WVK_CAP_RESOLVE)) {
+         VkResolveImageInfo2 one = *pResolveImageInfo;
+         one.regionCount = 1;
+         one.pRegions = r;
+         wvk_cmd_meta_resolve_image(cmd, &one);
+         continue;
+      }
       for (uint32_t l = 0; l < layers; ++l) {
          WGPUTextureView s = wvk_image_attachment_view(src, src->format, WGPUTextureAspect_All,
                                                        r->srcSubresource.mipLevel,

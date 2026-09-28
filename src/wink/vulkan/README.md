@@ -153,8 +153,12 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Integer cube textures, which need a 2D-array view to fetch from.
 - Blend states whose colour factors use both CONSTANT_COLOR and
   CONSTANT_ALPHA: WebGPU has one constant.
-- Multisampled array images: WebGPU has no multisampled arrays. This
-  affects multiview with multisampling too.
+- Multisampled array images are a texture for each layer, since WebGPU
+  has no multisampled arrays: attachments, clears and resolves are right,
+  but a shader sampling one sees its first layer.
+- Formats WebGPU does not multisample (RG32 and RGBA32 among them) have
+  one sample, though Vulkan wants every colour attachment format to have
+  framebufferColorSampleCounts.
 
 Some of these are what WebGPU has no way to express. The rest are work still
 to do.

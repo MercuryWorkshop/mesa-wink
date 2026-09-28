@@ -137,8 +137,26 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    desc.sampleCount = image->vk.samples;
    desc.viewFormatCount = view_format_count;
    desc.viewFormats = view_formats;
-   image->texture = wgpuDeviceCreateTexture(dev->wgpu, &desc);
+   if (image->vk.samples > 1 && image->vk.array_layers > 1) {
+      /* Multisampled textures are one layer: one for each. */
+      desc.size.depthOrArrayLayers = 1;
+      image->layer_textures = calloc(image->vk.array_layers, sizeof(*image->layer_textures));
+      for (uint32_t l = 0; image->layer_textures && l < image->vk.array_layers; ++l) {
+         image->layer_textures[l] = wgpuDeviceCreateTexture(dev->wgpu, &desc);
+         if (!image->layer_textures[l])
+            break;
+      }
+      image->texture = image->layer_textures && image->layer_textures[image->vk.array_layers - 1]
+                          ? image->layer_textures[0] : NULL;
+   } else {
+      image->texture = wgpuDeviceCreateTexture(dev->wgpu, &desc);
+   }
    if (!image->texture) {
+      if (image->layer_textures) {
+         for (uint32_t l = 0; l < image->vk.array_layers && image->layer_textures[l]; ++l)
+            wgpuTextureRelease(image->layer_textures[l]);
+         free(image->layer_textures);
+      }
       vk_image_destroy(&dev->vk, pAllocator, &image->vk);
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }
@@ -175,6 +193,12 @@ wvk_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks *
    /* Swapchain images belong to the surface. Released, not destroyed:
     * views of it in descriptors, which may outlive it unused, still have
     * it, and it goes with the last of them. */
+   if (image->layer_textures) {
+      /* The first is `texture`. */
+      for (uint32_t l = 1; l < image->vk.array_layers; ++l)
+         wgpuTextureRelease(image->layer_textures[l]);
+      free(image->layer_textures);
+   }
    if (image->texture)
       wgpuTextureRelease(image->texture);
    if (image->atomic_buffer)
@@ -421,16 +445,21 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
          desc.dimension = WGPUTextureViewDimension_2D;
       desc.baseMipLevel = view->vk.base_mip_level;
       desc.mipLevelCount = view->vk.level_count;
-      desc.baseArrayLayer = image->dimension == WGPUTextureDimension_3D ? 0 : view->vk.base_array_layer;
+      uint32_t texture_layer;
+      WGPUTexture texture = wvk_image_layer_texture(image, view->vk.base_array_layer, &texture_layer);
+      desc.baseArrayLayer = image->dimension == WGPUTextureDimension_3D ? 0 : texture_layer;
       desc.arrayLayerCount = image->dimension == WGPUTextureDimension_3D ? 1 : view->vk.layer_count;
+      /* Of a multisampled array, the first layer: shaders have that. */
+      if (image->vk.samples > 1)
+         desc.arrayLayerCount = 1;
       desc.aspect = view->aspect;
-      view->view = wgpuTextureCreateView(image->texture, &desc);
+      view->view = wgpuTextureCreateView(texture, &desc);
       /* Cubes as storage images, and input attachments, are 2D arrays. */
       if (desc.dimension == WGPUTextureViewDimension_Cube || desc.dimension == WGPUTextureViewDimension_CubeArray ||
           (desc.dimension == WGPUTextureViewDimension_2D && image->vk.samples == 1 &&
            (view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))) {
          desc.dimension = WGPUTextureViewDimension_2DArray;
-         view->array_view = wgpuTextureCreateView(image->texture, &desc);
+         view->array_view = wgpuTextureCreateView(texture, &desc);
       }
    }
 
@@ -462,8 +491,10 @@ wvk_image_attachment_view(struct wvk_image *image, WGPUTextureFormat format, WGP
                                                                  : WGPUTextureViewDimension_2D;
    desc.baseMipLevel = level;
    desc.mipLevelCount = 1;
-   desc.baseArrayLayer = image->dimension == WGPUTextureDimension_3D ? 0 : layer;
+   uint32_t texture_layer;
+   WGPUTexture texture = wvk_image_layer_texture(image, layer, &texture_layer);
+   desc.baseArrayLayer = image->dimension == WGPUTextureDimension_3D ? 0 : texture_layer;
    desc.arrayLayerCount = 1;
    desc.aspect = aspect;
-   return wgpuTextureCreateView(image->texture, &desc);
+   return wgpuTextureCreateView(texture, &desc);
 }

@@ -138,6 +138,8 @@ void wvk_replay_restore_state(struct wvk_replay *replay, void *saved);
 void wvk_replay_free_meta_memory(struct wvk_device *dev, struct wvk_replay *replay);
 
 /* The resolves of a render pass instance WebGPU could not do itself. */
+/* vkCmdResolveImage2 by vk_meta: what WebGPU's resolves cannot do. */
+void wvk_cmd_meta_resolve_image(struct wvk_cmd_buffer *cmd, const VkResolveImageInfo2 *info);
 void wvk_cmd_meta_resolve_rendering(struct wvk_cmd_buffer *cmd, const VkRenderingInfo *info);
 
 /* A view of an R8 texture at least `extent`, for a pass without

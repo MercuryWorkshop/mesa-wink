@@ -187,6 +187,16 @@ wvk_CmdBlitImage2(VkCommandBuffer commandBuffer, const VkBlitImageInfo2 *pBlitIm
 }
 
 void
+wvk_cmd_meta_resolve_image(struct wvk_cmd_buffer *cmd, const VkResolveImageInfo2 *info)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_meta_save save;
+   meta_begin(cmd, &save);
+   vk_meta_resolve_image2(&cmd->vk, &dev->meta, info);
+   meta_end(cmd, &save);
+}
+
+void
 wvk_cmd_meta_resolve_rendering(struct wvk_cmd_buffer *cmd, const VkRenderingInfo *info)
 {
    struct wvk_device *dev = wvk_cmd_buffer_device(cmd);

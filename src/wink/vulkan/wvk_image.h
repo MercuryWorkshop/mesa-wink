@@ -18,6 +18,9 @@ struct wvk_physical_device;
 struct wvk_image {
    struct vk_image vk;
    WGPUTexture texture;
+   /* A multisampled array, which WebGPU has no textures of: a texture of
+    * each layer, of which `texture` is the first. */
+   WGPUTexture *layer_textures;
    WGPUTextureFormat format;
    WGPUTextureDimension dimension;
    WGPUTextureUsage usage;
@@ -41,6 +44,18 @@ struct wvk_image {
    uint32_t atomic_pitch[16];
    bool atomic_in_buffer;
 };
+
+/* The texture layer `layer` of the image is in, and which layer of it. */
+static inline WGPUTexture
+wvk_image_layer_texture(const struct wvk_image *image, uint32_t layer, uint32_t *texture_layer)
+{
+   if (image->layer_textures) {
+      *texture_layer = 0;
+      return image->layer_textures[MIN2(layer, image->vk.array_layers - 1)];
+   }
+   *texture_layer = layer;
+   return image->texture;
+}
 
 /* Copy an atomic image's texels from its texture to its buffer, or back,
  * outside any pass. */
