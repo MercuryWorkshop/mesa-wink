@@ -317,7 +317,15 @@ exercise(const char *label, int api, wink_surface *surface)
    p_glGetIntegerv(GL_VIEWPORT, vp);
    wink_swap_buffers(surface);
    wink_swap_interval(surface, (init_flags & WINK_INIT_GL_ON_MAIN_THREAD) ? 1 : WINK_SWAP_UNPACED);
+
+   /* And back up, past the old size: a pixel there exists only if the
+    * default framebuffer really was rebuilt. */
    wink_surface_resize(surface, W, H);
+   p_glViewport(0, 0, W, H);
+   p_glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glReadPixels(W - 2, H - 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+   CHECK(near(px, 0, 0, 255), "%s: regrown read %u,%u,%u,%u", label, px[0], px[1], px[2], px[3]);
 
    GLenum err = p_glGetError();
    CHECK(err == GL_NO_ERROR, "%s: GL error 0x%x", label, err);

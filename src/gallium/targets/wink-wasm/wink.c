@@ -729,6 +729,13 @@ surface_resize_here(wink_surface *s, unsigned width, unsigned height)
    drop_attachments(s);
    p_atomic_inc(&s->base.stamp);
    s->configured = false;
+   /* And the stamp is only looked at while framebuffer state is dirty, as
+    * DRI's drawable invalidation knows: without this a context bound to the
+    * surface keeps drawing into, and reading from, the old size. A context
+    * bound later revalidates when it is made current. */
+   struct st_context *st = st_api_get_current();
+   if (st)
+      st_context_invalidate_state(st, ST_INVALIDATE_FB_STATE);
 }
 
 static void
