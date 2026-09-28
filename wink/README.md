@@ -37,12 +37,15 @@ needed for `--test`. Everything else goes into a cache (default
   the check.
 
   The .NET workload's own Emscripten pack (or a dotnet root, which is searched
-  for it) is also accepted, but as of 10.0.12 it cannot build wink. Its clang
-  (dotnet-llvm-project 19.1.0) emits the newer `__wasm_setjmp` helpers, while
-  its own compiler-rt still defines only `saveSetjmp`, so code with setjmp in
-  it, such as spirv_to_nir, will not link. The symbol check stops the build and
-  says so. Upstream 3.1.56 is what dotnet/runtime provisions and what the
-  runtime's own archives link against.
+  for it) is also accepted. **Compile with upstream 3.1.56 anyway.** Every
+  .NET-built emsdk measured has the same mismatch: the workload pack (10.0.12)
+  and the dotnet/runtime-provisioned one that fna-wasm-build freezes. Their
+  clang (dotnet-llvm-project 19.1.0) emits the newer `__wasm_setjmp` helpers,
+  while their compiler-rt still defines only `saveSetjmp`, so code with setjmp
+  in it, such as spirv_to_nir, will not link. ikvm-wasm-build compiles its
+  natives with upstream 3.1.56 and lets .NET's emsdk link them for the same
+  reason, and wink's default does the same. The symbol check stops the build,
+  and says why, if the compiler and compiler-rt disagree.
 * **emdawnwebgpu v20250428.134257**, the `webgpu.h` implementation, verified
   by sha512 and patched for 3.1.56 (`tools/patch-emdawnwebgpu.py`).
 * **Tint** (SPIR-V → WGSL), built for wasm from Dawn `b465e23`, once per

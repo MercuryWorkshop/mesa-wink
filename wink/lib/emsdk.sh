@@ -13,12 +13,16 @@
 #                    or a dotnet root to find it in: the very compiler a .NET
 #                    app's link uses, configured through DOTNET_EMSCRIPTEN_*
 #                    variables and a frozen cache from the sibling Cache pack
-# Without one, upstream 3.1.56 is bootstrapped, which is also what
-# dotnet/runtime provisions. The workload pack is accepted but, as of 10.0.12,
-# cannot build wink: its clang (dotnet-llvm-project 19.1.0) emits the newer
-# __wasm_setjmp helpers while its own compiler-rt still has saveSetjmp, so
-# anything with setjmp in it -- spirv_to_nir -- will not link. The packaging
-# stage's symbol check says so rather than leaving it to the app's link.
+# Without one, upstream 3.1.56 is bootstrapped, and that is the one to compile
+# with. Every .NET-built emsdk measured -- the workload pack (10.0.12) and the
+# dotnet/runtime-provisioned one fna-wasm-build freezes -- pairs a clang
+# (dotnet-llvm-project 19.1.0) that emits the newer __wasm_setjmp helpers with
+# a compiler-rt that still has only saveSetjmp, so an object with setjmp in it
+# (spirv_to_nir) built by that clang does not link, not even against .NET's own
+# libraries. ikvm-wasm-build compiles its natives with upstream 3.1.56 and
+# links with .NET's emsdk for exactly this reason. The .NET layouts are still
+# accepted, and the packaging stage's symbol check stops the build with that
+# explanation if their compiler and compiler-rt disagree.
 
 WINK_EMSDK_VERSION=3.1.56
 WINK_EMSDK_REPO=https://github.com/emscripten-core/emsdk.git
