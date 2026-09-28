@@ -367,6 +367,75 @@ lower_sample_pos_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return false;
 }
 
+/* interpolateAtCentroid, AtSample and AtOffset, which WGSL has none of:
+ * the input at the centre, moved by its derivatives to the offset --
+ * exact for what interpolates linearly across the pixel, which is all
+ * that does; the centroid is the centre. */
+static bool
+lower_interp_at_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct sample_state *s = data;
+   if (intr->intrinsic != nir_intrinsic_interp_deref_at_centroid &&
+       intr->intrinsic != nir_intrinsic_interp_deref_at_sample &&
+       intr->intrinsic != nir_intrinsic_interp_deref_at_offset)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *value = nir_load_deref(b, nir_src_as_deref(intr->src[0]));
+   nir_def *offset = NULL;
+   if (intr->intrinsic == nir_intrinsic_interp_deref_at_offset)
+      offset = intr->src[1].ssa;
+   else if (intr->intrinsic == nir_intrinsic_interp_deref_at_sample)
+      offset = nir_fadd_imm(b, sample_position(b, intr->src[1].ssa, s->samples), -0.5);
+   if (offset) {
+      value = nir_fadd(b, value, nir_fmul(b, nir_ddx(b, value), nir_channel(b, offset, 0)));
+      value = nir_fadd(b, value, nir_fmul(b, nir_ddy(b, value), nir_channel(b, offset, 1)));
+   }
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
+/* Inputs to interpolate at each sample, or at the centroid: WebGPU wants
+ * the vertex output and the fragment input to interpolate alike, and the
+ * vertex shader's is at the centre. A sample's is its value moved there,
+ * which shades per sample as Vulkan's Sample does; a centroid's the
+ * centre. */
+static bool
+lower_input_sampling(nir_shader *nir, const struct sample_state *s)
+{
+   struct set *sampled = _mesa_pointer_set_create(NULL);
+   nir_foreach_shader_in_variable(var, nir) {
+      if (var->data.location < VARYING_SLOT_VAR0)
+         continue;
+      if (var->data.sample)
+         _mesa_set_add(sampled, var);
+      var->data.sample = false;
+      var->data.centroid = false;
+   }
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            nir_variable *var = intr->intrinsic == nir_intrinsic_load_deref ? nir_intrinsic_get_var(intr, 0) : NULL;
+            if (!var || !_mesa_set_search(sampled, var))
+               continue;
+            b.cursor = nir_after_instr(instr);
+            nir_def *offset = nir_fadd_imm(&b, sample_position(&b, nir_load_sample_id(&b), s->samples), -0.5);
+            nir_def *value = nir_fadd(&b, &intr->def, nir_fmul(&b, nir_ddx(&b, &intr->def), nir_channel(&b, offset, 0)));
+            value = nir_fadd(&b, value, nir_fmul(&b, nir_ddy(&b, &intr->def), nir_channel(&b, offset, 1)));
+            nir_def_rewrite_uses_after(&intr->def, value);
+            progress = true;
+         }
+      }
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   _mesa_set_destroy(sampled, NULL);
+   return progress;
+}
+
 /* The fragment shader made to run for each sample: it reads the sample,
  * in a test that never passes and that nothing can tell never does -- the
  * draw's viewport, from the driver's data, is under 16. */
@@ -2294,6 +2363,14 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       mesa_logw_once("wvk: a pipeline layout of more descriptors than their records have room for");
 
    NIR_PASS(_, nir, lower_push_constants);
+   /* Where varyings are sampled is the fragment shader's alone: at the
+    * centre, as far as WebGPU's matching of the stages goes. */
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      nir_foreach_shader_out_variable(var, nir) {
+         var->data.sample = false;
+         var->data.centroid = false;
+      }
+   }
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       const bool per_sample = wants_sample_shading(pipeline_state);
       if (per_sample)
@@ -2303,6 +2380,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
          .frag_coord = per_sample,
       };
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_sample_pos_instr, nir_metadata_control_flow, &s);
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_interp_at_instr, nir_metadata_control_flow, &s);
+      NIR_PASS(_, nir, lower_input_sampling, &s);
    }
    /* Shared memory as words, as ntv's is, and accessed a word at a time:
     * a 64-bit or 16-bit value is words' worth, which WGSL has no types of. */
