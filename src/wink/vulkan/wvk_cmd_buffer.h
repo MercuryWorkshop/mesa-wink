@@ -49,6 +49,10 @@ struct wvk_replay {
       struct wvk_image_view *depth_stencil;
       WGPUTextureFormat depth_format;
       uint32_t samples;
+      /* A pass without attachments: whether it is one, and the samples
+       * its draws have, which its stand-in attachment has then. */
+      bool empty;
+      uint32_t empty_samples;
       VkExtent2D extent;
       VkRect2D area;
       uint32_t view_mask;

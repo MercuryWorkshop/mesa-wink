@@ -189,6 +189,15 @@ lower_quantize_instr(nir_builder *b, nir_instr *instr, void *data)
 
 /* Helper invocations, which WGSL has no builtin for: those outside the
  * primitive cover no samples, and the shader knows which it demoted. */
+/* A gather's offset that is not a constant, which WGSL's are. */
+static bool
+dynamic_gather_offset(const nir_instr *instr, const void *data)
+{
+   const nir_tex_instr *tex = nir_instr_as_tex(instr);
+   const int i = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   return tex->op == nir_texop_tg4 && i >= 0 && !nir_src_is_const(tex->src[i].src);
+}
+
 static bool
 lower_helper_invocations(nir_shader *nir)
 {
@@ -2434,8 +2443,14 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
     * swizzle takes it apart. */
    NIR_PASS(_, nir, wvk_nir_lower_view_swizzles, shader->meta_base);
    /* Projection divided out first: the samplers' lowering takes the
-    * coordinates as they are. */
-   const nir_lower_tex_options txp = { .lower_txp = ~0u };
+    * coordinates as they are. And a gather at offsets WGSL has none of --
+    * four, or one not constant -- is gathers each at one, or at the
+    * coordinates moved. */
+   const nir_lower_tex_options txp = {
+      .lower_txp = ~0u,
+      .lower_tg4_offsets = true,
+      .lower_offset_filter = dynamic_gather_offset,
+   };
    NIR_PASS(_, nir, nir_lower_tex, &txp);
    NIR_PASS(_, nir, wvk_nir_lower_samplers, shader->meta_base);
    NIR_PASS(_, nir, lower_1d_images);

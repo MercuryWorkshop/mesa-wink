@@ -751,6 +751,65 @@ sample_lambda(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t
 /* textureQueryLod, which WGSL has not: the LOD with the sampler's bias,
  * and the level that would be sampled -- within the sampler's range and
  * the view's levels, and the nearest level unless mipmaps are linear. */
+/* A sample's least LOD (shaderResourceMinLod), which WGSL has no way to
+ * give: an explicit LOD raised to it, or gradients scaled up to it --
+ * the sampler's bias, which apply_lod_bias adds after, left out. */
+static void
+lower_min_lod(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
+{
+   const int idx = nir_tex_instr_src_index(tex, nir_tex_src_min_lod);
+   if (idx < 0)
+      return;
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *min_lod = tex->src[idx].src.ssa;
+   nir_tex_instr_remove_src(tex, idx);
+   if (tex->op == nir_texop_tg4)
+      return;
+   nir_def *sampler_bias = sampler_word(b, meta, group, slot, WVK_META_SAMPLER_BIAS);
+   const int bias_idx = nir_tex_instr_src_index(tex, nir_tex_src_bias);
+   nir_def *bias = tex->op == nir_texop_txb && bias_idx >= 0 ? tex->src[bias_idx].src.ssa : nir_imm_float(b, 0.0f);
+
+   const bool implicit = tex->op == nir_texop_tex || tex->op == nir_texop_txb;
+   if (tex->op == nir_texop_txl || (implicit && b->shader->info.stage != MESA_SHADER_FRAGMENT)) {
+      /* No derivatives outside fragment shaders: the LOD given, or 0. */
+      const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+      nir_def *lod = lod_idx >= 0 ? tex->src[lod_idx].src.ssa : bias;
+      nir_def *raised = nir_fsub(b, nir_fmax(b, nir_fadd(b, lod, sampler_bias), min_lod), sampler_bias);
+      if (lod_idx >= 0) {
+         nir_src_rewrite(&tex->src[lod_idx].src, raised);
+      } else {
+         if (bias_idx >= 0)
+            nir_tex_instr_remove_src(tex, bias_idx);
+         tex->op = nir_texop_txl;
+         nir_tex_instr_add_src(tex, nir_tex_src_lod, raised);
+      }
+      return;
+   }
+   if (!implicit && tex->op != nir_texop_txd)
+      return;
+
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   const unsigned spatial = tex->coord_components - (tex->is_array ? 1 : 0);
+   nir_def *lambda = sample_lambda_raw(b, meta, tex, group, slot, coord, spatial);
+   nir_def *scale = nir_fexp2(b, nir_fadd(b, bias, nir_fmax(b, nir_fsub(b, min_lod, lambda), nir_imm_float(b, 0.0f))));
+   if (tex->op == nir_texop_txd) {
+      const int dx = nir_tex_instr_src_index(tex, nir_tex_src_ddx);
+      nir_src_rewrite(&tex->src[dx].src, nir_fmul(b, tex->src[dx].src.ssa, scale));
+      const int dy = nir_tex_instr_src_index(tex, nir_tex_src_ddy);
+      nir_src_rewrite(&tex->src[dy].src, nir_fmul(b, tex->src[dy].src.ssa, scale));
+      return;
+   }
+   nir_def *spatial_coord = nir_trim_vector(b, coord, spatial);
+   nir_def *dx = nir_fmul(b, nir_ddx(b, spatial_coord), scale);
+   nir_def *dy = nir_fmul(b, nir_ddy(b, spatial_coord), scale);
+   if (bias_idx >= 0)
+      nir_tex_instr_remove_src(tex, bias_idx);
+   tex->op = nir_texop_txd;
+   nir_tex_instr_add_src(tex, nir_tex_src_ddx, dx);
+   nir_tex_instr_add_src(tex, nir_tex_src_ddy, dy);
+}
+
 static bool
 lower_query_lod(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
 {
@@ -979,6 +1038,72 @@ lower_integer_cube_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *t
    return true;
 }
 
+/* Gathering from an integer texture, which WebGPU samples not at all:
+ * the 2x2 texels about the coordinates in the base level, each wrapped as
+ * the sampler says or the border, in gather's order. */
+static nir_def *
+integer_gather(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot,
+               nir_def *flags)
+{
+   const int texture_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   const unsigned n = tex->coord_components;
+   const unsigned spatial = n - (tex->is_array ? 1 : 0);
+   nir_def *level = nir_imm_int(b, 0);
+   nir_def *size = &texture_query(b, tex, nir_texop_txs, level)->def;
+
+   /* Each axis's two texels, and whether each is outside. */
+   nir_def *texel[2][2], *out[2][2];
+   for (unsigned i = 0; i < 2; ++i) {
+      if (i >= spatial) {
+         texel[i][0] = texel[i][1] = nir_imm_int(b, 0);
+         out[i][0] = out[i][1] = nir_imm_false(b);
+         continue;
+      }
+      nir_def *c = nir_channel(b, coord, i);
+      nir_def *extent = nir_channel(b, size, i);
+      nir_def *u = nir_bcsel(b, flag(b, flags, WVK_SAMPLER_UNNORMALIZED), c, nir_fmul(b, c, nir_i2f32(b, extent)));
+      nir_def *t0 = nir_f2i32(b, nir_ffloor(b, nir_fadd_imm(b, u, -0.5)));
+      if (offset_idx >= 0)
+         t0 = nir_iadd(b, t0, nir_channel(b, tex->src[offset_idx].src.ssa, i));
+      for (unsigned k = 0; k < 2; ++k) {
+         out[i][k] = nir_imm_false(b);
+         texel[i][k] = wrap_texel(b, nir_iadd_imm(b, t0, k), extent, address_mode(b, flags, i), &out[i][k]);
+      }
+   }
+   nir_def *layer = NULL;
+   if (tex->is_array)
+      layer = nir_imin(b, nir_imax(b, nir_f2i32(b, nir_fround_even(b, nir_channel(b, coord, spatial))),
+                                   nir_imm_int(b, 0)),
+                       nir_iadd_imm(b, nir_channel(b, size, spatial), -1));
+
+   nir_def *border[4];
+   border_texel(b, meta, tex, group, slot, false, border);
+   /* (i0, j1), (i1, j1), (i1, j0), (i0, j0). */
+   static const unsigned order[4][2] = { { 0, 1 }, { 1, 1 }, { 1, 0 }, { 0, 0 } };
+   nir_def *result[4];
+   for (unsigned q = 0; q < 4; ++q) {
+      const unsigned xi = order[q][0], yi = order[q][1];
+      nir_def *comps[3] = { texel[0][xi], texel[1][yi], layer };
+      nir_tex_instr *txf = nir_tex_instr_create(b->shader, 3);
+      txf->op = nir_texop_txf;
+      txf->sampler_dim = tex->sampler_dim;
+      txf->is_array = tex->is_array;
+      txf->dest_type = tex->dest_type;
+      txf->coord_components = n;
+      txf->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, tex->src[texture_idx].src.ssa);
+      txf->src[1] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_vec(b, comps, n));
+      txf->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, level);
+      nir_def_init(&txf->instr, &txf->def, 4, tex->def.bit_size);
+      nir_builder_instr_insert(b, &txf->instr);
+      result[q] = nir_bcsel(b, nir_ior(b, out[0][xi], out[1][yi]), border[tex->component],
+                            nir_channel(b, &txf->def, tex->component));
+   }
+   return nir_vec(b, result, 4);
+}
+
 /* Sampling an integer texture, which WebGPU does not: a fetch, of the
  * level the LOD selects (nearest; integer formats do not filter), at the
  * texel nearest the coordinates, wrapped as the sampler says, or the
@@ -1032,6 +1157,11 @@ lower_integer_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, u
    level = nir_imin(b, level, nir_iadd_imm(b, levels, -1));
    level = nir_bcsel(b, flag(b, flags, WVK_SAMPLER_UNNORMALIZED), nir_imm_int(b, 0), level);
 
+   if (tex->op == nir_texop_tg4) {
+      nir_def_replace(&tex->def, integer_gather(b, meta, tex, group, slot, flags));
+      return true;
+   }
+
    nir_def *size = &texture_query(b, tex, nir_texop_txs, level)->def;
    nir_def *outside = nir_imm_false(b);
    nir_def *comps[4];
@@ -1067,12 +1197,6 @@ lower_integer_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, u
    nir_def *border[4];
    border_texel(b, meta, tex, group, slot, false, border);
    nir_def *value = nir_trim_vector(b, nir_vec(b, border, 4), tex->def.num_components);
-   if (tex->op == nir_texop_tg4) {
-      /* Gathering an integer texture: the one texel, four times. */
-      nir_def *c = nir_channel(b, nir_bcsel(b, outside, value, &txf->def), tex->component);
-      nir_def_replace(&tex->def, nir_vec4(b, c, c, c, c));
-      return true;
-   }
    nir_def_replace(&tex->def, nir_bcsel(b, outside, value, &txf->def));
    return true;
 }
@@ -1197,6 +1321,7 @@ lower_sampler_instr(nir_builder *b, nir_instr *instr, void *data)
       return false;
    if (tex->op == nir_texop_lod)
       return lower_query_lod(b, meta, tex, group, slot);
+   lower_min_lod(b, meta, tex, group, slot);
    /* WGSL compares at level 0 or with implicit derivatives, and without a
     * bias: the rest by hand. */
    if (tex->is_shadow) {

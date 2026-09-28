@@ -170,6 +170,16 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .textureCompressionASTC_LDR = astc,
       .textureCompressionBC = bc,
       .fragmentStoresAndAtomics = true,
+      /* Gathers at several offsets, or one not constant (wvk_shader.c). */
+      .shaderImageGatherExtended = true,
+      /* Explicit LODs raised, gradients scaled (wvk_nir_descriptors.c). */
+      .shaderResourceMinLod = true,
+      /* Secondary command buffers are replayed into the primary's pass,
+       * whose queries they are in. */
+      .inheritedQueries = true,
+      /* A pass without attachments is begun again with as many samples
+       * as a draw's (wvk_cmd_draw.c). */
+      .variableMultisampleRate = true,
       /* Every sample, the fragment shader made to read its sample. */
       .sampleRateShading = true,
       /* 64-bit integers are pairs of words (nir_lower_int64). */

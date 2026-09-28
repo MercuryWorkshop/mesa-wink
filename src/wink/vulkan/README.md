@@ -198,6 +198,8 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   sRGB twin: other views are of a texture of the view's format, which
   copies through a buffer keep up to date, and WebGPU copies no
   multisampled texture.
+- Gathers from integer cube maps take one texel four times: each face's
+  2x2 footprint across its edges is not worked out.
 - Multisampled array images are a texture for each layer, since WebGPU
   has no multisampled arrays: attachments, clears and resolves are right,
   but a shader sampling one sees its first layer.

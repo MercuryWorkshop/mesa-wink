@@ -294,12 +294,17 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    bool any = depth || stencil;
    for (uint32_t i = 0; i < color_count; ++i)
       any |= colors[i].view != NULL;
+   replay->rendering.empty = !any;
    if (!any) {
       const VkExtent2D extent = {
          (uint32_t)(info->renderArea.offset.x + info->renderArea.extent.width),
          (uint32_t)(info->renderArea.offset.y + info->renderArea.extent.height),
       };
-      const uint32_t samples = MAX2(replay->rendering.samples, 1);
+      /* As many samples as the pass's draws have: each may have its own
+       * (variableMultisampleRate), and a draw of others begins it again. */
+      if (!(info->flags & VK_RENDERING_RESUMING_BIT))
+         replay->rendering.empty_samples = 1;
+      const uint32_t samples = MAX2(replay->rendering.empty_samples, 1);
       WGPUTextureView dummy = wvk_dummy_attachment(wvk_cmd_buffer_device(cmd), extent, samples);
       if (dummy) {
          util_dynarray_append(&replay->views, dummy);

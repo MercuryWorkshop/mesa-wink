@@ -2001,6 +2001,15 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
       return false;
    }
 
+   /* A pass without attachments has the samples its draws have. */
+   if (replay->rendering.empty && dyn->ms.rasterization_samples &&
+       dyn->ms.rasterization_samples != replay->rendering.samples) {
+      replay->rendering.empty_samples = dyn->ms.rasterization_samples;
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+      if (!replay->pass)
+         return false;
+   }
+
    struct wvk_render_pipeline *p = get_render_pipeline(dev, cmd, indexed);
    if (!p)
       return false;
