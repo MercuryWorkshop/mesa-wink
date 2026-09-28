@@ -2065,12 +2065,7 @@ reflect_bindings(nir_shader *nir, const struct vk_shader_compile_info *info,
          if (var->data.mode == nir_var_mem_ubo) {
             sb->kind = WVK_BINDING_UNIFORM;
             sb->min_size = glsl_get_explicit_size(type, false);
-         } else if (_mesa_set_search(u.written, k) ||
-                    (nir->info.stage != MESA_SHADER_VERTEX &&
-                     !(var->data.descriptor_set == WVK_DRIVER_GROUP && var->data.binding >= WVK_DRIVER_SLOT_BASE))) {
-            /* Read-write, even if only read: WebGPU has a buffer bound as
-             * read-only storage and writable storage in one draw or
-             * dispatch be neither, and Vulkan lets two bindings alias. */
+         } else if (_mesa_set_search(u.written, k)) {
             sb->kind = WVK_BINDING_STORAGE;
          } else {
             /* Read-only, which a vertex shader's storage has to be. */
