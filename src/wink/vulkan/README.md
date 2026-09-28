@@ -127,7 +127,8 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   storage buffers, beyond what Vulkan counts as such. Image atomics, which
   WGSL does not have.
 - Precise occlusion queries, and timestamps.
-- Subgroups.
+- Subgroups are one invocation each: Tint reads no subgroup operations from
+  SPIR-V. Every operation but the quad ones is there, trivially.
 - Compressed images whose size is not a whole number of blocks: WebGPU's
   texture is the whole blocks, and sampling it covers the padding.
 - Integer cube textures, which need a 2D-array view to fetch from.

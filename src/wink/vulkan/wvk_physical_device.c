@@ -106,6 +106,9 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_shader_draw_parameters = true,
       .KHR_shader_float_controls = true,
       .KHR_shader_non_semantic_info = true,
+      .KHR_shader_terminate_invocation = true,
+      .KHR_shader_subgroup_extended_types = true,
+      .KHR_shader_subgroup_rotate = true,
       .KHR_spirv_1_4 = true,
       .KHR_storage_buffer_storage_class = true,
       .KHR_swapchain = true,
@@ -117,6 +120,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_custom_border_color = true,
       .EXT_host_query_reset = true,
       .EXT_separate_stencil_usage = true,
+      .EXT_shader_demote_to_helper_invocation = true,
+      .EXT_subgroup_size_control = true,
       /* WebGPU steps instances one at a time: other divisors are read by
        * the shader (wvk_shader.c, pull_divided_attributes). */
       .EXT_vertex_attribute_divisor = true,
@@ -193,6 +198,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .descriptorBindingVariableDescriptorCount = true,
       .runtimeDescriptorArray = true,
       .shaderFloat16 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_ShaderF16),
+      .shaderSubgroupExtendedTypes = true,
       .imagelessFramebuffer = true,
       .uniformBufferStandardLayout = true,
       .separateDepthStencilLayouts = true,
@@ -203,10 +209,18 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .dynamicRendering = true,
       .synchronization2 = true,
       .shaderDemoteToHelperInvocation = true,
+      /* A demote, and a return (wvk_shader.c). */
+      .shaderTerminateInvocation = true,
       .shaderZeroInitializeWorkgroupMemory = true,
       .robustImageAccess = true,
       .pipelineCreationCacheControl = true,
       .privateData = true,
+      /* Subgroups are one invocation, and so are full, and of the size
+       * any shader asks for that is possible. */
+      .subgroupSizeControl = true,
+      .computeFullSubgroups = true,
+      .shaderSubgroupRotate = true,
+      .shaderSubgroupRotateClustered = true,
       .maintenance4 = false,
 
       /* Samplers' records do what WebGPU's samplers cannot
@@ -411,9 +425,15 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .nonCoherentAtomSize = 64,
 
       /* Vulkan 1.1 */
+      /* Every invocation is a subgroup of its own (wvk_nir_subgroups.c):
+       * Tint reads no subgroup operations. Quads would need four. */
       .subgroupSize = 1,
-      .subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT,
-      .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT,
+      .subgroupSupportedStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+      .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
+                                     VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
+                                     VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
+                                     VK_SUBGROUP_FEATURE_CLUSTERED_BIT | VK_SUBGROUP_FEATURE_ROTATE_BIT |
+                                     VK_SUBGROUP_FEATURE_ROTATE_CLUSTERED_BIT,
       .subgroupQuadOperationsInAllStages = false,
       .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES,
       .maxMultiviewViewCount = 8,
@@ -439,6 +459,10 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
 
       /* Vulkan 1.3 */
+      .minSubgroupSize = 1,
+      .maxSubgroupSize = 1,
+      .maxComputeWorkgroupSubgroups = l->maxComputeInvocationsPerWorkgroup,
+      .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
       .maxBufferSize = l->maxBufferSize,
 
       /* VK_KHR_push_descriptor */

@@ -106,6 +106,54 @@ optimize(nir_shader *nir)
    } while (progress);
 }
 
+/* Helper invocations, which WGSL has no builtin for: those outside the
+ * primitive cover no samples, and the shader knows which it demoted. */
+static bool
+lower_helper_invocations(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool uses = false;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             (nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_helper_invocation ||
+              nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_is_helper_invocation))
+            uses = true;
+      }
+   }
+   if (!uses)
+      return false;
+
+   nir_variable *demoted = nir_local_variable_create(impl, glsl_bool_type(), "demoted");
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_store_var(&b, demoted, nir_imm_false(&b), 0x1);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         b.cursor = nir_before_instr(instr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_demote:
+            nir_store_var(&b, demoted, nir_imm_true(&b), 0x1);
+            break;
+         case nir_intrinsic_demote_if:
+            nir_store_var(&b, demoted, nir_ior(&b, nir_load_var(&b, demoted), intr->src[0].ssa), 0x1);
+            break;
+         case nir_intrinsic_load_helper_invocation:
+         case nir_intrinsic_is_helper_invocation: {
+            nir_def *uncovered = nir_ieq_imm(&b, nir_load_sample_mask_in(&b), 0);
+            nir_def_replace(&intr->def, nir_ior(&b, uncovered, nir_load_var(&b, demoted)));
+            break;
+         }
+         default:
+            break;
+         }
+      }
+   }
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 static void
 wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
                    const struct vk_pipeline_robustness_state *rs)
@@ -114,12 +162,23 @@ wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_returns);
    NIR_PASS(_, nir, nir_inline_functions);
    nir_remove_non_entrypoints(nir);
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      /* WGSL's discard is a demote: a terminate is one, and a return. */
+      NIR_PASS(_, nir, nir_lower_terminate_to_demote);
+      NIR_PASS(_, nir, nir_lower_halt_to_return);
+      NIR_PASS(_, nir, nir_lower_returns);
+   }
    NIR_PASS(_, nir, nir_lower_variable_initializers, ~nir_var_function_temp);
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_lower_system_values);
+   NIR_PASS(_, nir, wvk_nir_lower_subgroups);
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      NIR_PASS(_, nir, lower_helper_invocations);
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   }
    /* Input attachments are textures, fetched at the fragment: the
     * runtime's subpasses are passes of their own. */
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {

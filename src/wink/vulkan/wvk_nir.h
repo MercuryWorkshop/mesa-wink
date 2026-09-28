@@ -28,5 +28,8 @@ bool wvk_nir_lower_view_swizzles(nir_shader *nir, const uint32_t *meta_base);
  * sampling integer textures at all. */
 bool wvk_nir_lower_samplers(nir_shader *nir, const uint32_t *meta_base);
 
+/* Subgroups of one invocation (wvk_nir_subgroups.c). */
+bool wvk_nir_lower_subgroups(nir_shader *nir);
+
 
 #endif
