@@ -11,6 +11,8 @@
 
 #include "wvk_device.h"
 #include "wvk_entrypoints.h"
+#include "wvk_format.h"
+#include "wvk_physical_device.h"
 #include "wvk_image.h"
 
 #include "vk_format.h"
@@ -103,9 +105,16 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
 
    wvk_replay_end_passes(replay);
 
+   const struct wvk_physical_device *pdev = wvk_device_physical(wvk_cmd_buffer_device(cmd));
    WGPURenderPassColorAttachment colors[8];
    const uint32_t color_count = MIN2(info->colorAttachmentCount, ARRAY_SIZE(colors));
    replay->rendering.color_count = color_count;
+   /* Nothing to resolve by shader, until an attachment says otherwise. */
+   memset(&replay->rendering.resolve, 0, sizeof(replay->rendering.resolve));
+   replay->rendering.resolve.suspending = suspending;
+   replay->rendering.resolve.info = *info;
+   replay->rendering.resolve.info.pNext = NULL;
+   replay->rendering.resolve.info.colorAttachmentCount = color_count;
    replay->rendering.area = info->renderArea;
    replay->rendering.depth_format = WGPUTextureFormat_Undefined;
    replay->rendering.samples = 1;
@@ -129,7 +138,17 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       colors[i].clearValue = wvk_clear_color(view->vk.format, &att->clearValue.color);
       if (att->resolveMode != VK_RESOLVE_MODE_NONE && att->resolveImageView) {
          VK_FROM_HANDLE(wvk_image_view, resolve, att->resolveImageView);
-         colors[i].resolveTarget = attachment_view(replay, resolve, WGPUTextureAspect_All);
+         /* WebGPU averages, and only formats that can be. */
+         if (att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT &&
+             (wvk_format_caps(pdev, resolve->vk.format) & WVK_CAP_RESOLVE)) {
+            colors[i].resolveTarget = attachment_view(replay, resolve, WGPUTextureAspect_All);
+         } else {
+            replay->rendering.resolve.colors[i] = *att;
+            replay->rendering.resolve.colors[i].pNext = NULL;
+            replay->rendering.resolve.pending = true;
+            /* What the shader resolves from has to outlive the pass. */
+            colors[i].storeOp = WGPUStoreOp_Store;
+         }
       }
    }
 
@@ -150,10 +169,21 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       replay->rendering.depth_format = wvk_image_view_image(view)->format;
       ds.view = attachment_view(replay, view, WGPUTextureAspect_All);
       const VkFormat format = wvk_image_view_image(view)->vk.format;
+      if (depth && depth->resolveMode != VK_RESOLVE_MODE_NONE && depth->resolveImageView) {
+         replay->rendering.resolve.depth = *depth;
+         replay->rendering.resolve.depth.pNext = NULL;
+         replay->rendering.resolve.pending = true;
+      }
+      if (stencil && stencil->resolveMode != VK_RESOLVE_MODE_NONE && stencil->resolveImageView) {
+         replay->rendering.resolve.stencil = *stencil;
+         replay->rendering.resolve.stencil.pNext = NULL;
+         replay->rendering.resolve.pending = true;
+      }
       if (vk_format_has_depth(format)) {
          if (depth) {
             ds.depthLoadOp = load_op(depth->loadOp, resuming);
-            ds.depthStoreOp = store_op(depth->storeOp, suspending);
+            ds.depthStoreOp = replay->rendering.resolve.depth.resolveMode ? WGPUStoreOp_Store
+                              : store_op(depth->storeOp, suspending);
             ds.depthClearValue = CLAMP(finite(depth->clearValue.depthStencil.depth), 0.0, 1.0);
          } else {
             /* Not rendered to in this pass: kept as it is. */
@@ -163,7 +193,8 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       if (vk_format_has_stencil(format)) {
          if (stencil) {
             ds.stencilLoadOp = load_op(stencil->loadOp, resuming);
-            ds.stencilStoreOp = store_op(stencil->storeOp, suspending);
+            ds.stencilStoreOp = replay->rendering.resolve.stencil.resolveMode ? WGPUStoreOp_Store
+                                : store_op(stencil->storeOp, suspending);
             ds.stencilClearValue = stencil->clearValue.depthStencil.stencil;
          } else {
             ds.stencilReadOnly = true;
@@ -171,8 +202,37 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       }
    }
 
+   /* WebGPU wants an attachment; Vulkan renders without any, for what the
+    * shaders store or the queries count. An R8 one of the render area's
+    * size, whose contents go. */
+   uint32_t pass_color_count = color_count;
+   bool any = depth || stencil;
+   for (uint32_t i = 0; i < color_count; ++i)
+      any |= colors[i].view != NULL;
+   if (!any) {
+      const VkExtent2D extent = {
+         (uint32_t)(info->renderArea.offset.x + info->renderArea.extent.width),
+         (uint32_t)(info->renderArea.offset.y + info->renderArea.extent.height),
+      };
+      const uint32_t samples = MAX2(replay->rendering.samples, 1);
+      WGPUTextureView dummy = wvk_dummy_attachment(wvk_cmd_buffer_device(cmd), extent, samples);
+      if (dummy) {
+         util_dynarray_append(&replay->views, dummy);
+         colors[0] = (WGPURenderPassColorAttachment)WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+         colors[0].view = dummy;
+         colors[0].loadOp = WGPULoadOp_Clear;
+         colors[0].storeOp = WGPUStoreOp_Discard;
+         pass_color_count = MAX2(pass_color_count, 1);
+         replay->rendering.color_count = pass_color_count;
+         replay->rendering.color[0] = NULL;
+         replay->rendering.color_format[0] = WGPUTextureFormat_R8Unorm;
+         replay->rendering.extent = extent;
+         replay->rendering.samples = samples;
+      }
+   }
+
    WGPURenderPassDescriptor desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-   desc.colorAttachmentCount = color_count;
+   desc.colorAttachmentCount = pass_color_count;
    desc.colorAttachments = colors;
    desc.depthStencilAttachment = (depth || stencil) ? &ds : NULL;
    desc.occlusionQuerySet = wvk_replay_query_set(wvk_cmd_buffer_device(cmd), replay);
@@ -183,7 +243,22 @@ VKAPI_ATTR void VKAPI_CALL
 wvk_CmdEndRendering(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
-   wvk_replay_end_passes(cmd->replay);
-   cmd->replay->rendering.color_count = 0;
-   cmd->replay->rendering.depth_stencil = NULL;
+   struct wvk_replay *replay = cmd->replay;
+   wvk_replay_end_passes(replay);
+   replay->rendering.color_count = 0;
+   replay->rendering.depth_stencil = NULL;
+
+   if (!replay->rendering.resolve.pending || replay->rendering.resolve.suspending)
+      return;
+   /* A copy: vk_meta's own passes begin rendering too. */
+   VkRenderingAttachmentInfo colors[8], depth, stencil;
+   memcpy(colors, replay->rendering.resolve.colors, sizeof(colors));
+   depth = replay->rendering.resolve.depth;
+   stencil = replay->rendering.resolve.stencil;
+   VkRenderingInfo info = replay->rendering.resolve.info;
+   info.pColorAttachments = colors;
+   info.pDepthAttachment = depth.resolveMode ? &depth : NULL;
+   info.pStencilAttachment = stencil.resolveMode ? &stencil : NULL;
+   replay->rendering.resolve.pending = false;
+   wvk_cmd_meta_resolve_rendering(cmd, &info);
 }

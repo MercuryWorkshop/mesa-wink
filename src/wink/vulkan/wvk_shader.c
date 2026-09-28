@@ -808,6 +808,65 @@ lower_1d_image_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* WGSL has no multisampled arrays, and multisampled images are one layer
+ * here: the array goes from the texture, and the layer from its fetches. */
+static bool
+lower_ms_array_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_MS || !tex->is_array)
+      return false;
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   b->cursor = nir_before_instr(instr);
+   if (coord_idx >= 0 && tex->op != nir_texop_txs && tex->op != nir_texop_texture_samples)
+      nir_src_rewrite(&tex->src[coord_idx].src, nir_trim_vector(b, tex->src[coord_idx].src.ssa, 2));
+   tex->is_array = false;
+   if (tex->op == nir_texop_txs) {
+      /* The size: the layers are one. */
+      b->cursor = nir_after_instr(instr);
+      tex->def.num_components = 2;
+      nir_def *size = nir_vec3(b, nir_channel(b, &tex->def, 0), nir_channel(b, &tex->def, 1), nir_imm_int(b, 1));
+      nir_def_rewrite_uses_after(&tex->def, size);
+   } else {
+      tex->coord_components = 2;
+   }
+   return true;
+}
+
+static bool
+lower_ms_arrays(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      const struct glsl_type *bare = glsl_without_array(var->type);
+      if (!glsl_type_is_texture(bare) || glsl_get_sampler_dim(bare) != GLSL_SAMPLER_DIM_MS ||
+          !glsl_sampler_type_is_array(bare))
+         continue;
+      var->type = glsl_type_wrap_in_arrays(
+         glsl_texture_type(GLSL_SAMPLER_DIM_MS, false, glsl_get_sampler_result_type(bare)), var->type);
+      progress = true;
+   }
+   if (!progress)
+      return false;
+   nir_fixup_deref_types(nir);
+   return nir_shader_instructions_pass(nir, lower_ms_array_instr, nir_metadata_control_flow, NULL);
+}
+
+/* Demote is WGSL's discard already; Tint reads only OpKill for it. */
+static bool
+demote_to_terminate_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic == nir_intrinsic_demote)
+      intr->intrinsic = nir_intrinsic_terminate;
+   else if (intr->intrinsic == nir_intrinsic_demote_if)
+      intr->intrinsic = nir_intrinsic_terminate_if;
+   else
+      return false;
+   return true;
+}
+
 static bool
 lower_1d_images(nir_shader *nir)
 {
@@ -1131,6 +1190,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    NIR_PASS(_, nir, nir_shader_instructions_pass, lower_integer_sample_instr, nir_metadata_control_flow,
             NULL);
    NIR_PASS(_, nir, lower_1d_images);
+   NIR_PASS(_, nir, lower_ms_arrays);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, demote_to_terminate_instr, nir_metadata_all, NULL);
    lower_buffers_to_words(nir, info, mem_ctx);
    optimize(nir);
    /* The combined and arrayed originals, now without a use. */

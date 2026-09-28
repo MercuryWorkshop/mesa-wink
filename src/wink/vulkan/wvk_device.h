@@ -67,6 +67,10 @@ struct wvk_device {
    WGPUComputePipeline copy_query_pipeline;
    WGPUComputePipeline repack_pipeline;
    WGPUComputePipeline depth_out_pipeline;
+   /* What a pass without attachments renders to. */
+   WGPUTexture dummy_attachment;
+   VkExtent2D dummy_extent;
+   uint32_t dummy_samples;
    /* Bound where a descriptor was never written. */
    WGPUBuffer null_buffer;
    WGPUSampler null_sampler;

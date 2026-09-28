@@ -14,6 +14,7 @@
 
 #include "wvk_query.h"
 
+struct wvk_cmd_buffer;
 struct wvk_device;
 struct wvk_device_memory;
 struct wvk_image;
@@ -52,6 +53,16 @@ struct wvk_replay {
       VkRect2D area;
       /* Counts passes, so that what is bound knows when it is gone. */
       uint32_t serial;
+      /* Resolves WebGPU does not do -- integer formats, modes other than
+       * averaging, depth and stencil -- done by vk_meta after the pass,
+       * unless it only suspends. */
+      struct {
+         bool pending;
+         bool suspending;
+         VkRenderingInfo info;
+         VkRenderingAttachmentInfo colors[8];
+         VkRenderingAttachmentInfo depth, stencil;
+      } resolve;
    } rendering;
 
    /* What is bound, as of the command buffer being replayed. */
@@ -97,6 +108,13 @@ void wvk_replay_finish_state(struct wvk_device *dev, struct wvk_replay *replay);
 void *wvk_replay_save_state(struct wvk_replay *replay);
 void wvk_replay_restore_state(struct wvk_replay *replay, void *saved);
 void wvk_replay_free_meta_memory(struct wvk_device *dev, struct wvk_replay *replay);
+
+/* The resolves of a render pass instance WebGPU could not do itself. */
+void wvk_cmd_meta_resolve_rendering(struct wvk_cmd_buffer *cmd, const VkRenderingInfo *info);
+
+/* A view of an R8 texture at least `extent`, for a pass without
+ * attachments. The caller releases it. */
+WGPUTextureView wvk_dummy_attachment(struct wvk_device *dev, VkExtent2D extent, uint32_t samples);
 
 /* The submit's push constants into the push buffer: right before it. */
 void wvk_replay_upload_push_constants(struct wvk_device *dev, struct wvk_replay *replay);

@@ -428,6 +428,8 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuBufferRelease(dev->null_buffer);
    if (dev->null_sampler)
       wgpuSamplerRelease(dev->null_sampler);
+   if (dev->dummy_attachment)
+      wgpuTextureRelease(dev->dummy_attachment);
    simple_mtx_destroy(&dev->cache_lock);
 }
 

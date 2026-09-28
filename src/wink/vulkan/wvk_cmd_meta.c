@@ -158,3 +158,38 @@ wvk_CmdBlitImage2(VkCommandBuffer commandBuffer, const VkBlitImageInfo2 *pBlitIm
    vk_meta_blit_image2(&cmd->vk, &dev->meta, pBlitImageInfo);
    meta_end(cmd, &save);
 }
+
+void
+wvk_cmd_meta_resolve_rendering(struct wvk_cmd_buffer *cmd, const VkRenderingInfo *info)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_meta_save save;
+   meta_begin(cmd, &save);
+   vk_meta_resolve_rendering(&cmd->vk, &dev->meta, info);
+   meta_end(cmd, &save);
+}
+
+/* An attachment for a pass that has none: kept by size on the device. */
+WGPUTextureView
+wvk_dummy_attachment(struct wvk_device *dev, VkExtent2D extent, uint32_t samples)
+{
+   simple_mtx_lock(&dev->cache_lock);
+   if (!dev->dummy_attachment || dev->dummy_extent.width < extent.width ||
+       dev->dummy_extent.height < extent.height || dev->dummy_samples != samples) {
+      if (dev->dummy_attachment)
+         wgpuTextureRelease(dev->dummy_attachment);
+      WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk attachment for a pass without any");
+      desc.usage = WGPUTextureUsage_RenderAttachment;
+      desc.size = (WGPUExtent3D){ MAX2(extent.width, dev->dummy_extent.width),
+                                  MAX2(extent.height, dev->dummy_extent.height), 1 };
+      desc.format = WGPUTextureFormat_R8Unorm;
+      desc.sampleCount = samples;
+      dev->dummy_attachment = wgpuDeviceCreateTexture(dev->wgpu, &desc);
+      dev->dummy_extent = (VkExtent2D){ desc.size.width, desc.size.height };
+      dev->dummy_samples = samples;
+   }
+   WGPUTextureView view = dev->dummy_attachment ? wgpuTextureCreateView(dev->dummy_attachment, NULL) : NULL;
+   simple_mtx_unlock(&dev->cache_lock);
+   return view;
+}
