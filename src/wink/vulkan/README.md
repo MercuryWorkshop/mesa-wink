@@ -163,6 +163,9 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Descriptor indexing's features, each of them, but not
   `VK_EXT_descriptor_indexing`: that asks for 500000 descriptors a stage,
   where WebGPU has a few dozen bindings.
+- 64-bit integers are pairs of words (nir_lower_int64); 64-bit floats, and
+  16-bit integers, are not there: WGSL has neither, and half floats only
+  outside workgroup memory.
 - Device-scope memory ordering between workgroups: WGSL's barriers are
   the workgroup's, and none can be in non-uniform control flow, so a
   memory barrier there is dropped.

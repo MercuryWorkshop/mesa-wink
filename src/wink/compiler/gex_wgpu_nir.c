@@ -513,6 +513,41 @@ gex_wgpu_tex_offset_is_dynamic(const nir_instr *instr, const void *data)
  * `shared uint lane[64]` summed to 3144 instead of 2016, and a shared struct
  * array to 120, which is exactly sum(0..15). Every KHR-GL44 compute_shader
  * shared-memory case failed on values with nothing in any log. */
+/* The high word of a 32-bit product, which the SPIR-V emitter has no
+ * instruction for and nir_lower_int64 makes of every 64-bit multiply: of
+ * the halves' products, and for a signed one the unsigned corrected. */
+static bool
+gex_wgpu_lower_mul_high_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   (void)data;
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if ((alu->op != nir_op_umul_high && alu->op != nir_op_imul_high) ||
+       alu->def.bit_size != 32)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
+   nir_def *y = nir_ssa_for_alu_src(b, alu, 1);
+   nir_def *xl = nir_iand_imm(b, x, 0xffff), *xh = nir_ushr_imm(b, x, 16);
+   nir_def *yl = nir_iand_imm(b, y, 0xffff), *yh = nir_ushr_imm(b, y, 16);
+   nir_def *ll = nir_imul(b, xl, yl), *lh = nir_imul(b, xl, yh);
+   nir_def *hl = nir_imul(b, xh, yl), *hh = nir_imul(b, xh, yh);
+   nir_def *mid = nir_iadd(b, nir_iadd(b, nir_ushr_imm(b, ll, 16),
+                                       nir_iand_imm(b, lh, 0xffff)),
+                           nir_iand_imm(b, hl, 0xffff));
+   nir_def *hi = nir_iadd(b, nir_iadd(b, hh, nir_ushr_imm(b, lh, 16)),
+                          nir_iadd(b, nir_ushr_imm(b, hl, 16),
+                                   nir_ushr_imm(b, mid, 16)));
+   if (alu->op == nir_op_imul_high) {
+      nir_def *zero = nir_imm_zero(b, x->num_components, 32);
+      hi = nir_isub(b, hi, nir_bcsel(b, nir_ilt(b, x, zero), y, zero));
+      hi = nir_isub(b, hi, nir_bcsel(b, nir_ilt(b, y, zero), x, zero));
+   }
+   nir_def_replace(&alu->def, hi);
+   return true;
+}
+
 /* ntv's shared block is an array of uints, which Tint makes atomic<u32>:
  * SMin and SMax on it come out as WGSL's atomicMin and atomicMax on a
  * u32, which compare unsigned. So a signed minimum or maximum is swapped
@@ -1274,6 +1309,8 @@ gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y,
     * place late enough to catch what the optimiser reintroduces. The
     * scalarisation is what nir_lower_doubles wants of vector 64-bit ops, and
     * st does the same before its own call. */
+   NIR_PASS(_, nir, nir_shader_instructions_pass, gex_wgpu_lower_mul_high_instr,
+            nir_metadata_control_flow, NULL);
    if (nir->options->lower_int64_options && gex_wgpu_has_64_bit(nir)) {
       /* A 64-bit *local variable* is not an operation and no ALU lowering
        * touches it: it reaches the emitter as OpTypePointer Function %ulong
@@ -1297,6 +1334,8 @@ gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y,
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
       NIR_PASS(_, nir, nir_lower_alu_to_scalar, gex_wgpu_is_64_bit_alu, NULL);
       NIR_PASS(_, nir, nir_lower_int64);
+      NIR_PASS(_, nir, nir_shader_instructions_pass, gex_wgpu_lower_mul_high_instr,
+               nir_metadata_control_flow, NULL);
       NIR_PASS(_, nir, gex_wgpu_split_64bit_undef);
       /* The lowering *represents* its results with pack_64_2x32_split and
        * unpack_64_2x32_split, so it leaves 64-bit values behind by
@@ -1327,6 +1366,9 @@ gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y,
        * registers rebuilt here are 32-bit, because the phis they come from
        * are. */
       NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
+      /* The 64-bit variables whose values the lowering took: gone, or the
+       * emitter declares them still, and Tint refuses the type. */
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp | nir_var_shader_temp, NULL);
       if (getenv("GEX_WGPU_INT64_LOG")) {
          nir_foreach_variable_in_shader(var, nir)
             if (glsl_type_contains_64bit(var->type))

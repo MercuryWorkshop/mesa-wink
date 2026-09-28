@@ -64,6 +64,8 @@ wvk_init_nir_options(nir_shader_compiler_options *options)
    /* Saturating arithmetic, which integer dot products have: SPIR-V's is
     * Intel's alone. */
    options->lower_uadd_sat = true;
+   /* OpUMulExtended and friends, which the emitter has not. */
+   options->lower_mul_high = true;
    options->lower_usub_sat = true;
    options->lower_iadd_sat = true;
 }
@@ -974,6 +976,22 @@ word_access(nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_size, uint32_t a
       .num_components = MIN2(DIV_ROUND_UP(bytes, 4), 4),
       .bit_size = 32,
       .align = 4,
+      .shift = nir_mem_access_shift_method_scalar,
+   };
+}
+
+/* Shared memory: 64-bit accesses as words, which WGSL has no 64-bit types
+ * for; the rest as they are, which ntv's shared block takes. */
+static nir_mem_access_size_align
+shared_access(nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_size, uint32_t align_mul, uint32_t align_offset,
+              bool offset_is_const, enum gl_access_qualifier access, const void *cb_data)
+{
+   if (bit_size == 64)
+      return word_access(intrin, bytes, bit_size, align_mul, align_offset, offset_is_const, access, cb_data);
+   return (nir_mem_access_size_align){
+      .num_components = MIN2(bytes / (bit_size / 8), 4),
+      .bit_size = bit_size,
+      .align = bit_size / 8,
       .shift = nir_mem_access_shift_method_scalar,
    };
 }
@@ -2047,7 +2065,12 @@ reflect_bindings(nir_shader *nir, const struct vk_shader_compile_info *info,
          if (var->data.mode == nir_var_mem_ubo) {
             sb->kind = WVK_BINDING_UNIFORM;
             sb->min_size = glsl_get_explicit_size(type, false);
-         } else if (_mesa_set_search(u.written, k)) {
+         } else if (_mesa_set_search(u.written, k) ||
+                    (nir->info.stage != MESA_SHADER_VERTEX &&
+                     !(var->data.descriptor_set == WVK_DRIVER_GROUP && var->data.binding >= WVK_DRIVER_SLOT_BASE))) {
+            /* Read-write, even if only read: WebGPU has a buffer bound as
+             * read-only storage and writable storage in one draw or
+             * dispatch be neither, and Vulkan lets two bindings alias. */
             sb->kind = WVK_BINDING_STORAGE;
          } else {
             /* Read-only, which a vertex shader's storage has to be. */
@@ -2197,6 +2220,28 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       mesa_logw_once("wvk: a pipeline layout of more descriptors than their records have room for");
 
    NIR_PASS(_, nir, lower_push_constants);
+   /* Shared memory as words, as ntv's is, and accessed a word at a time:
+    * a 64-bit or 16-bit value is words' worth, which WGSL has no types of. */
+   if (nir->info.stage == MESA_SHADER_COMPUTE) {
+      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
+      /* A null initializer (shaderZeroInitializeWorkgroupMemory): stores of
+       * zero, and the variable gone, which ntv would lay out again. */
+      bool initialized = false;
+      nir_foreach_variable_with_modes(var, nir, nir_var_mem_shared) {
+         initialized |= var->constant_initializer != NULL || var->pointer_initializer != NULL;
+         var->constant_initializer = NULL;
+         var->pointer_initializer = NULL;
+      }
+      if (initialized) {
+         /* In words, which the size is made a whole number of. */
+         nir->info.shared_size = align(nir->info.shared_size, 4);
+         NIR_PASS(_, nir, nir_zero_initialize_shared_memory, nir->info.shared_size, 4);
+      }
+      NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_mem_shared, NULL);
+      const nir_lower_mem_access_bit_sizes_options shared = { .callback = shared_access, .modes = nir_var_mem_shared };
+      NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &shared);
+   }
    /* Varyings WGSL can have: no structs, and a location each. */
    NIR_PASS(_, nir, split_io_structs);
    NIR_PASS(_, nir, nir_opt_vectorize_io_vars,

@@ -170,6 +170,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .textureCompressionASTC_LDR = astc,
       .textureCompressionBC = bc,
       .fragmentStoresAndAtomics = true,
+      /* 64-bit integers are pairs of words (nir_lower_int64). */
+      .shaderInt64 = true,
       .shaderClipDistance = clip,
       /* Arrays of descriptors are bindings of their own, among which a
        * dynamic index chooses in the shader (wvk_shader.c). */
