@@ -61,6 +61,19 @@ attachment_view(struct wvk_replay *replay, struct wvk_image_view *view, WGPUText
    return v;
 }
 
+/* The pass's size and sample count, which its pipelines and viewports go
+ * by: those of its attachments, which all agree. */
+static void
+note_attachment(struct wvk_replay *replay, struct wvk_image_view *view)
+{
+   const struct wvk_image *image = wvk_image_view_image(view);
+   replay->rendering.samples = image->vk.samples;
+   replay->rendering.extent = (VkExtent2D){
+      u_minify(image->vk.extent.width, view->vk.base_mip_level),
+      u_minify(image->vk.extent.height, view->vk.base_mip_level),
+   };
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRenderingInfo)
 {
@@ -76,13 +89,20 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    const uint32_t color_count = MIN2(info->colorAttachmentCount, ARRAY_SIZE(colors));
    replay->rendering.color_count = color_count;
    replay->rendering.area = info->renderArea;
+   replay->rendering.depth_format = WGPUTextureFormat_Undefined;
+   replay->rendering.samples = 1;
+   replay->rendering.extent = (VkExtent2D){ 0, 0 };
+   ++replay->rendering.serial;
    for (uint32_t i = 0; i < color_count; ++i) {
       const VkRenderingAttachmentInfo *att = &info->pColorAttachments[i];
       VK_FROM_HANDLE(wvk_image_view, view, att->imageView);
       colors[i] = (WGPURenderPassColorAttachment)WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
       replay->rendering.color[i] = view;
+      replay->rendering.color_format[i] = WGPUTextureFormat_Undefined;
       if (!view)
          continue;
+      note_attachment(replay, view);
+      replay->rendering.color_format[i] = view->format;
       colors[i].view = attachment_view(replay, view, WGPUTextureAspect_All);
       if (wvk_image_view_image(view)->dimension == WGPUTextureDimension_3D)
          colors[i].depthSlice = view->vk.base_array_layer;
@@ -108,6 +128,8 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    if (depth || stencil) {
       VK_FROM_HANDLE(wvk_image_view, view, (depth ? depth : stencil)->imageView);
       replay->rendering.depth_stencil = view;
+      note_attachment(replay, view);
+      replay->rendering.depth_format = wvk_image_view_image(view)->format;
       ds.view = attachment_view(replay, view, WGPUTextureAspect_All);
       const VkFormat format = wvk_image_view_image(view)->vk.format;
       if (vk_format_has_depth(format)) {

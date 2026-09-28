@@ -9,6 +9,7 @@
 #include "wvk_instance.h"
 #include "wvk_physical_device.h"
 #include "wvk_platform.h"
+#include "wvk_shader.h"
 
 #include "vk_cmd_enqueue_entrypoints.h"
 #include "vk_common_entrypoints.h"
@@ -74,6 +75,7 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
                                              &vk_common_device_entrypoints, false);
 
    dev->vk.command_buffer_ops = &wvk_cmd_buffer_ops;
+   dev->vk.shader_ops = &wvk_device_shader_ops;
    /* Secondary command buffers replay through the same table. */
    dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
 
@@ -94,6 +96,10 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
       goto fail_init;
    }
 
+   result = wvk_device_init_pipeline_caches(dev);
+   if (result != VK_SUCCESS)
+      goto fail_device;
+
    const VkCommandPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
@@ -101,7 +107,7 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
    };
    result = vk_command_pool_init(&dev->vk, &dev->replay_pool, &pool_info, NULL);
    if (result != VK_SUCCESS)
-      goto fail_device;
+      goto fail_caches;
    struct vk_command_buffer *replay;
    result = wvk_cmd_buffer_ops.create(&dev->replay_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, &replay);
    if (result != VK_SUCCESS)
@@ -124,6 +130,8 @@ fail_replay:
    wvk_cmd_buffer_ops.destroy(&dev->replay_cmd->vk);
 fail_pool:
    vk_command_pool_finish(&dev->replay_pool);
+fail_caches:
+   wvk_device_finish_pipeline_caches(dev);
 fail_device:
    wgpuDeviceRelease(dev->wgpu);
 fail_init:
@@ -143,6 +151,7 @@ wvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       wvk_queue_finish(dev, &dev->queue);
    wvk_cmd_buffer_ops.destroy(&dev->replay_cmd->vk);
    vk_command_pool_finish(&dev->replay_pool);
+   wvk_device_finish_pipeline_caches(dev);
    wgpuDeviceDestroy(dev->wgpu);
    wgpuDeviceRelease(dev->wgpu);
    vk_device_finish(&dev->vk);

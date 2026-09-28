@@ -47,6 +47,8 @@ wvk_cmd_buffer_create(struct vk_command_pool *pool, VkCommandBufferLevel level,
       vk_free(&pool->alloc, cmd);
       return result;
    }
+   cmd->vk.dynamic_graphics_state.vi = &cmd->dynamic_vi;
+   cmd->vk.dynamic_graphics_state.ms.sample_locations = &cmd->dynamic_sample_locations;
    *out = &cmd->vk;
    return VK_SUCCESS;
 }
@@ -200,19 +202,25 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_init(&replay.writes, NULL);
    util_dynarray_init(&replay.releases, NULL);
    util_dynarray_init(&replay.views, NULL);
+   util_dynarray_init(&replay.push_data, NULL);
+   util_dynarray_init(&replay.push_buffers, NULL);
+   util_dynarray_init(&replay.push_sets, NULL);
 
    WGPUCommandEncoderDescriptor edesc = WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
    replay.encoder = wgpuDeviceCreateCommandEncoder(dev->wgpu, &edesc);
 
-   vk_command_buffer_reset(&rcmd->vk);
    const VkCommandBufferBeginInfo begin = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
    };
-   vk_command_buffer_begin(&rcmd->vk, &begin);
    rcmd->replay = &replay;
-   for (uint32_t i = 0; i < count; ++i)
+   for (uint32_t i = 0; i < count; ++i) {
+      /* Nothing is bound across command buffers: each starts afresh. */
+      vk_command_buffer_reset(&rcmd->vk);
+      vk_command_buffer_begin(&rcmd->vk, &begin);
+      wvk_replay_reset_state(&replay);
       vk_cmd_queue_execute(&cmds[i]->cmd_queue, wvk_cmd_buffer_to_handle(rcmd), &dev->vk.dispatch_table);
+   }
    wvk_replay_end_passes(&replay);
    rcmd->replay = NULL;
    /* What the replay itself recorded is of no further use. */
@@ -254,6 +262,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
                            (const uint8_t *)r->mem->host + r->offset, r->size);
    }
 
+   wvk_replay_upload_push_constants(dev, &replay);
    wgpuQueueSubmit(queue->wgpu, 1, &commands);
    wgpuCommandBufferRelease(commands);
    wvk_queue_commit(queue, serial, readbacks, readback_count);
@@ -266,6 +275,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_fini(&replay.writes);
    util_dynarray_fini(&replay.releases);
    util_dynarray_fini(&replay.views);
+   wvk_replay_finish_state(dev, &replay);
    return VK_SUCCESS;
 }
 

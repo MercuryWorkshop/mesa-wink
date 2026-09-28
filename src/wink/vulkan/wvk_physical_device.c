@@ -14,6 +14,7 @@
 
 #include "wvk_entrypoints.h"
 #include "wvk_format.h"
+#include "wvk_shader.h"
 #include "wvk_instance.h"
 #include "wvk_platform.h"
 #include "wvk_sync.h"
@@ -99,7 +100,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_relaxed_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = false,
       .KHR_separate_depth_stencil_layouts = true,
-      .KHR_shader_draw_parameters = true,
+      .KHR_shader_draw_parameters = false, /* TODO: BaseVertex and friends from a driver buffer */
       .KHR_shader_float_controls = true,
       .KHR_shader_non_semantic_info = true,
       .KHR_spirv_1_4 = true,
@@ -147,7 +148,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .shaderStorageBufferArrayDynamicIndexing = false,
 
       /* Vulkan 1.1 */
-      .shaderDrawParameters = true,
+      .shaderDrawParameters = false,
 
       /* Vulkan 1.2 */
       .shaderFloat16 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_ShaderF16),
@@ -388,6 +389,9 @@ get_device_properties(const struct wvk_physical_device *pdev,
 
    memcpy(p->pipelineCacheUUID, instance->driver_uuid, VK_UUID_SIZE);
    memcpy(p->driverUUID, instance->driver_uuid, VK_UUID_SIZE);
+   /* Shaders are cached as WGSL, which is this build's. */
+   memcpy(p->shaderBinaryUUID, instance->driver_uuid, VK_UUID_SIZE);
+   p->shaderBinaryVersion = 1;
    /* The device: the adapter's IDs, and which backend it is reached by. */
    uint32_t uuid[4] = { pdev->info.vendorID, pdev->info.deviceID, (uint32_t)pdev->info.backendType,
                         0x77696e6b /* "wink" */ };
@@ -467,6 +471,7 @@ wvk_enumerate_physical_devices(struct vk_instance *_instance)
    get_device_features(pdev, &features);
    struct vk_properties properties;
    get_device_properties(pdev, instance, &properties);
+   wvk_init_nir_options(&pdev->nir_options);
 
    VkResult result = vk_physical_device_init(&pdev->vk, &instance->vk, &extensions,
                                              &features, &properties, &dispatch_table);

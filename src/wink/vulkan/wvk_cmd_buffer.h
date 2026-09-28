@@ -8,6 +8,7 @@
 #include "wvk_private.h"
 
 #include "vk_command_buffer.h"
+#include "vk_graphics_state.h"
 
 #include "util/u_dynarray.h"
 
@@ -36,14 +37,47 @@ struct wvk_replay {
    struct util_dynarray releases;   /* WGPUBuffer, destroyed after */
    struct util_dynarray views;      /* WGPUTextureView, released after */
 
-   /* The attachments of the current pass, for vkCmdClearAttachments. */
+   /* The attachments of the current pass: for vkCmdClearAttachments, and
+    * what a pipeline for it has to match. */
    struct {
       uint32_t color_count;
       struct wvk_image_view *color[8];
+      WGPUTextureFormat color_format[8];
       struct wvk_image_view *depth_stencil;
+      WGPUTextureFormat depth_format;
+      uint32_t samples;
+      VkExtent2D extent;
       VkRect2D area;
+      /* Counts passes, so that what is bound knows when it is gone. */
+      uint32_t serial;
    } rendering;
+
+   /* What is bound, as of the command buffer being replayed. */
+   struct wvk_bound_state *state;
+
+   /* Push constants for the submit's draws, 256 bytes apart: written to
+    * the device's push buffer just before it. */
+   struct util_dynarray push_data;
+   /* Push buffers the device grew out of during the submit. */
+   struct util_dynarray push_buffers;   /* struct wvk_push_buffer */
+   /* Descriptor sets made by vkCmdPushDescriptorSet, destroyed after. */
+   struct util_dynarray push_sets;
 };
+
+struct wvk_push_buffer {
+   WGPUBuffer buffer;
+   uint64_t size;
+};
+
+struct wvk_bound_state;
+
+/* A fresh state for the next command buffer of a submit: nothing is bound
+ * across command buffers. */
+void wvk_replay_reset_state(struct wvk_replay *replay);
+void wvk_replay_finish_state(struct wvk_device *dev, struct wvk_replay *replay);
+
+/* The submit's push constants into the push buffer: right before it. */
+void wvk_replay_upload_push_constants(struct wvk_device *dev, struct wvk_replay *replay);
 
 /* An application's command buffer is only its vk_cmd_queue: every vkCmd*
  * goes there (the exposed dispatch table), and submit replays it into an
@@ -52,6 +86,11 @@ struct wvk_replay {
 struct wvk_cmd_buffer {
    struct vk_command_buffer vk;
    struct wvk_replay *replay;
+
+   /* Where the runtime keeps what of the dynamic state is too big to be
+    * in it. */
+   struct vk_vertex_input_state dynamic_vi;
+   struct vk_sample_locations_state dynamic_sample_locations;
 };
 
 VK_DEFINE_HANDLE_CASTS(wvk_cmd_buffer, vk.base, VkCommandBuffer, VK_OBJECT_TYPE_COMMAND_BUFFER)

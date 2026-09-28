@@ -1,0 +1,360 @@
+/*
+ * Copyright 2026 wink contributors
+ * SPDX-License-Identifier: MIT
+ *
+ * The wink Vulkan driver drawing: shaders, pipelines and descriptors,
+ * checked by reading the image back.
+ *
+ *   - a quad from a vertex buffer, a colour at each corner: which corner
+ *     lands where says whether y is right
+ *   - push constants that change between two draws of one pass
+ *   - a negative viewport height (VK_KHR_maintenance1) flipping it back
+ *   - a textured quad: a uniform buffer and a combined image sampler
+ *
+ * Build: src/wink/vulkan/test/build.sh OUT
+ */
+#include "wvk_test.h"
+
+#include "quad_vert.h"
+#include "color_frag.h"
+#include "texture_frag.h"
+
+enum { W = 64, H = 64 };
+
+struct push {
+   float tint[4];
+   float offset[2];
+   float pad[2];
+};
+
+static const float quad[] = {
+   /* pos       colour */
+   -1, -1,      1, 0, 0,   /* top left: red */
+    1, -1,      0, 1, 0,   /* top right: green */
+   -1,  1,      0, 0, 1,   /* bottom left: blue */
+    1,  1,      1, 1, 1,   /* bottom right: white */
+};
+
+static VkPipeline
+make_pipeline(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs)
+{
+   const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+   const VkPipelineShaderStageCreateInfo stages[] = {
+      { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main" },
+      { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main" },
+   };
+   const VkVertexInputAttributeDescription attrs[] = {
+      { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = 0 },
+      { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = 8 },
+   };
+   const VkDynamicState dynamic[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+   VkPipeline pipeline;
+   VK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &(VkGraphicsPipelineCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+      .pNext = &(VkPipelineRenderingCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+         .colorAttachmentCount = 1, .pColorAttachmentFormats = &format,
+      },
+      .stageCount = 2, .pStages = stages,
+      .pVertexInputState = &(VkPipelineVertexInputStateCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+         .vertexBindingDescriptionCount = 1,
+         .pVertexBindingDescriptions = &(VkVertexInputBindingDescription){
+            .binding = 0, .stride = 5 * sizeof(float), .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+         },
+         .vertexAttributeDescriptionCount = 2, .pVertexAttributeDescriptions = attrs,
+      },
+      .pInputAssemblyState = &(VkPipelineInputAssemblyStateCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+         .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+      },
+      .pViewportState = &(VkPipelineViewportStateCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+         .viewportCount = 1, .scissorCount = 1,
+      },
+      .pRasterizationState = &(VkPipelineRasterizationStateCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+         .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+         .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f,
+      },
+      .pMultisampleState = &(VkPipelineMultisampleStateCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+      },
+      .pColorBlendState = &(VkPipelineColorBlendStateCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+         .attachmentCount = 1,
+         .pAttachments = &(VkPipelineColorBlendAttachmentState){
+            .colorWriteMask = 0xf,
+         },
+      },
+      .pDynamicState = &(VkPipelineDynamicStateCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+         .dynamicStateCount = 2, .pDynamicStates = dynamic,
+      },
+      .layout = layout,
+   }, NULL, &pipeline));
+   return pipeline;
+}
+
+static PFN_vkCmdBeginRenderingKHR begin_rendering;
+static PFN_vkCmdEndRenderingKHR end_rendering;
+
+static void
+begin_pass(VkCommandBuffer cmd, struct image *target, bool negative_viewport)
+{
+   const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1,
+                        &(VkImageMemoryBarrier){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+      .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .image = target->image, .subresourceRange = range,
+   });
+   begin_rendering(cmd, &(VkRenderingInfo){
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+      .renderArea = { { 0, 0 }, { W, H } }, .layerCount = 1,
+      .colorAttachmentCount = 1,
+      .pColorAttachments = &(VkRenderingAttachmentInfo){
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = target->view,
+         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      },
+   });
+   const VkViewport viewport = negative_viewport ? (VkViewport){ 0, H, W, -(float)H, 0, 1 }
+                                                 : (VkViewport){ 0, 0, W, H, 0, 1 };
+   vkCmdSetViewport(cmd, 0, 1, &viewport);
+   vkCmdSetScissor(cmd, 0, 1, &(VkRect2D){ { 0, 0 }, { W, H } });
+}
+
+static void
+end_pass_and_read(VkCommandBuffer cmd, struct image *target, struct buffer *out)
+{
+   end_rendering(cmd);
+   vkCmdCopyImageToBuffer(cmd, target->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out->buffer, 1,
+                          &(VkBufferImageCopy){
+      .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 },
+   });
+}
+
+static const uint8_t *
+pixel(const struct buffer *b, int x, int y)
+{
+   return (const uint8_t *)b->map + (y * W + x) * 4;
+}
+
+/* The colour that dominates a pixel: which corner of the quad it is. */
+static bool
+is(const uint8_t *p, int r, int g, int b)
+{
+   return near(p[0], r) && near(p[1], g) && near(p[2], b) && p[3] == 255;
+}
+
+static bool
+mostly(const uint8_t *p, bool r, bool g, bool b)
+{
+   return (p[0] > 200) == r && (p[1] > 200) == g && (p[2] > 200) == b && p[3] == 255;
+}
+
+static void
+test_colors(VkBuffer vertices)
+{
+   VkPipelineLayout layout;
+   VK(vkCreatePipelineLayout(dev, &(VkPipelineLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &(VkPushConstantRange){
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(struct push),
+      },
+   }, NULL, &layout));
+   VkShaderModule vs = make_module(spv_quad_vert, sizeof(spv_quad_vert));
+   VkShaderModule fs = make_module(spv_color_frag, sizeof(spv_color_frag));
+   VkPipeline pipeline = make_pipeline(layout, vs, fs);
+
+   struct image target = make_image(W, H, VK_FORMAT_R8G8B8A8_UNORM,
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+   struct buffer out = make_buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST);
+   const VkDeviceSize zero = 0;
+
+   /* The whole quad, then a red-only copy of it moved right by half. */
+   VkCommandBuffer cmd = begin();
+   begin_pass(cmd, &target, false);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &zero);
+   struct push push = { { 1, 1, 1, 1 }, { 0, 0 } };
+   vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                      sizeof(push), &push);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   push = (struct push){ { 1, 0, 0, 1 }, { 1, 0 } };
+   vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                      sizeof(push), &push);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   end_pass_and_read(cmd, &target, &out);
+   submit_and_wait(cmd);
+
+   const uint8_t *tl = pixel(&out, 0, 0), *bl = pixel(&out, 0, H - 1);
+   const uint8_t *tr = pixel(&out, W - 1, 0), *br = pixel(&out, W - 1, H - 1);
+   CHECK(mostly(tl, true, false, false), "top left is not red: %u %u %u %u", tl[0], tl[1], tl[2], tl[3]);
+   CHECK(mostly(bl, false, false, true), "bottom left is not blue: %u %u %u %u", bl[0], bl[1], bl[2], bl[3]);
+   /* The right half is the second draw's: red only. */
+   CHECK(tr[1] == 0 && tr[2] == 0 && tr[3] == 255, "top right is not red only: %u %u %u %u",
+         tr[0], tr[1], tr[2], tr[3]);
+   CHECK(br[1] == 0 && br[2] == 0 && br[3] == 255, "bottom right is not red only: %u %u %u %u",
+         br[0], br[1], br[2], br[3]);
+   const uint8_t *mid_left = pixel(&out, W / 4, H / 2);
+   CHECK(mid_left[1] || mid_left[2], "the first draw's left half is gone: %u %u %u", mid_left[0],
+         mid_left[1], mid_left[2]);
+
+   /* Flipped by the viewport: blue at the top. */
+   cmd = begin();
+   begin_pass(cmd, &target, true);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &zero);
+   push = (struct push){ { 1, 1, 1, 1 }, { 0, 0 } };
+   vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                      sizeof(push), &push);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   end_pass_and_read(cmd, &target, &out);
+   submit_and_wait(cmd);
+   tl = pixel(&out, 0, 0);
+   bl = pixel(&out, 0, H - 1);
+   CHECK(mostly(tl, false, false, true), "flipped: top left is not blue: %u %u %u %u", tl[0], tl[1], tl[2], tl[3]);
+   CHECK(mostly(bl, true, false, false), "flipped: bottom left is not red: %u %u %u %u", bl[0], bl[1], bl[2], bl[3]);
+
+   free_buffer(&out);
+   free_image(&target);
+   vkDestroyPipeline(dev, pipeline, NULL);
+   vkDestroyShaderModule(dev, vs, NULL);
+   vkDestroyShaderModule(dev, fs, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   printf("colors: done\n");
+}
+
+static void
+test_texture(VkBuffer vertices)
+{
+   /* A 2x2 texture, a texel per corner, sampled nearest. */
+   struct image tex = make_image(2, 2, VK_FORMAT_R8G8B8A8_UNORM,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+   struct buffer staging = make_buffer(16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST);
+   const uint8_t texels[16] = { 255, 0, 0, 255,   0, 255, 0, 255,
+                                0, 0, 255, 255,   255, 255, 255, 255 };
+   memcpy(staging.map, texels, sizeof(texels));
+   struct buffer ubo = make_buffer(256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, HOST);
+   const float scale[4] = { 1.0f, 0.5f, 1.0f, 1.0f };
+   memcpy(ubo.map, scale, sizeof(scale));
+
+   VkSampler sampler;
+   VK(vkCreateSampler(dev, &(VkSamplerCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST,
+      .minFilter = VK_FILTER_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0.25f,
+   }, NULL, &sampler));
+
+   const VkDescriptorSetLayoutBinding bindings[] = {
+      { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+      { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+   };
+   VkDescriptorSetLayout set_layout;
+   VK(vkCreateDescriptorSetLayout(dev, &(VkDescriptorSetLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2,
+      .pBindings = bindings,
+   }, NULL, &set_layout));
+   VkPipelineLayout layout;
+   VK(vkCreatePipelineLayout(dev, &(VkPipelineLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+      .pSetLayouts = &set_layout, .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &(VkPushConstantRange){ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(struct push) },
+   }, NULL, &layout));
+   const VkDescriptorPoolSize sizes[] = {
+      { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 },
+   };
+   VkDescriptorPool dpool;
+   VK(vkCreateDescriptorPool(dev, &(VkDescriptorPoolCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 2,
+      .pPoolSizes = sizes,
+   }, NULL, &dpool));
+   VkDescriptorSet set;
+   VK(vkAllocateDescriptorSets(dev, &(VkDescriptorSetAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool,
+      .descriptorSetCount = 1, .pSetLayouts = &set_layout,
+   }, &set));
+   const VkWriteDescriptorSet writes[] = {
+      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
+        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+        .pBufferInfo = &(VkDescriptorBufferInfo){ ubo.buffer, 0, VK_WHOLE_SIZE } },
+      { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1,
+        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = &(VkDescriptorImageInfo){ sampler, tex.view,
+                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } },
+   };
+   vkUpdateDescriptorSets(dev, 2, writes, 0, NULL);
+
+   VkShaderModule vs = make_module(spv_quad_vert, sizeof(spv_quad_vert));
+   VkShaderModule fs = make_module(spv_texture_frag, sizeof(spv_texture_frag));
+   VkPipeline pipeline = make_pipeline(layout, vs, fs);
+
+   struct image target = make_image(W, H, VK_FORMAT_R8G8B8A8_UNORM,
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+   struct buffer out = make_buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST);
+   const VkDeviceSize zero = 0;
+
+   VkCommandBuffer cmd = begin();
+   vkCmdCopyBufferToImage(cmd, staging.buffer, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                          &(VkBufferImageCopy){
+      .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 2, 2, 1 },
+   });
+   begin_pass(cmd, &target, false);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &zero);
+   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
+   const struct push push = { { 1, 1, 1, 1 }, { 0, 0 } };
+   vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   end_pass_and_read(cmd, &target, &out);
+   submit_and_wait(cmd);
+
+   const uint8_t *tl = pixel(&out, 0, 0), *tr = pixel(&out, W - 1, 0);
+   const uint8_t *bl = pixel(&out, 0, H - 1), *br = pixel(&out, W - 1, H - 1);
+   CHECK(is(tl, 255, 0, 0), "texture top left: %u %u %u %u", tl[0], tl[1], tl[2], tl[3]);
+   CHECK(is(tr, 0, 128, 0), "texture top right: %u %u %u %u", tr[0], tr[1], tr[2], tr[3]);
+   CHECK(is(bl, 0, 0, 255), "texture bottom left: %u %u %u %u", bl[0], bl[1], bl[2], bl[3]);
+   CHECK(is(br, 255, 128, 255), "texture bottom right: %u %u %u %u", br[0], br[1], br[2], br[3]);
+
+   free_buffer(&out);
+   free_image(&target);
+   vkDestroyPipeline(dev, pipeline, NULL);
+   vkDestroyShaderModule(dev, vs, NULL);
+   vkDestroyShaderModule(dev, fs, NULL);
+   vkDestroyDescriptorPool(dev, dpool, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   vkDestroyDescriptorSetLayout(dev, set_layout, NULL);
+   vkDestroySampler(dev, sampler, NULL);
+   free_buffer(&ubo);
+   free_buffer(&staging);
+   free_image(&tex);
+   printf("texture: done\n");
+}
+
+int
+main(void)
+{
+   const char *extensions[] = { "VK_KHR_portability_subset", "VK_KHR_dynamic_rendering" };
+   test_init(2, extensions, &(VkPhysicalDeviceDynamicRenderingFeatures){
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, .dynamicRendering = VK_TRUE,
+   });
+   begin_rendering = (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(dev, "vkCmdBeginRenderingKHR");
+   end_rendering = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(dev, "vkCmdEndRenderingKHR");
+
+   struct buffer vertices = make_buffer(sizeof(quad), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HOST);
+   memcpy(vertices.map, quad, sizeof(quad));
+
+   test_colors(vertices.buffer);
+   test_texture(vertices.buffer);
+
+   free_buffer(&vertices);
+   return test_finish();
+}

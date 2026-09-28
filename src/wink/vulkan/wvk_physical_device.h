@@ -8,6 +8,7 @@
 #include "wvk_private.h"
 
 #include "vk_physical_device.h"
+#include "compiler/nir/nir.h"
 #include "vk_sync.h"
 #include "vk_sync_timeline.h"
 
@@ -43,6 +44,8 @@ struct wvk_physical_device {
     * in-order WebGPU queue then has nothing to wait for on the GPU. */
    struct vk_sync_timeline_type sync_timeline_type;
    const struct vk_sync_type *sync_types[3];
+
+   nir_shader_compiler_options nir_options;
 };
 
 VK_DEFINE_HANDLE_CASTS(wvk_physical_device, vk.base, VkPhysicalDevice,

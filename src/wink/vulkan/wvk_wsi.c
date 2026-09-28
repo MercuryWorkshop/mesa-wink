@@ -27,6 +27,11 @@
 #include "vk_sync.h"
 
 #include "util/os_time.h"
+#include "wvk_platform.h"
+
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "util/stack_array.h"
 
 #ifdef VK_USE_PLATFORM_METAL_EXT
@@ -716,6 +721,88 @@ worse(VkResult a, VkResult b)
    return a == VK_SUBOPTIMAL_KHR ? a : b;
 }
 
+/* WINK_VK_CAPTURE=N:FILE.bmp writes what the Nth present shows to a file,
+ * for looking at what reached the screen where nothing can capture it. */
+static void
+on_capture_mapped(WGPUMapAsyncStatus status, WGPUStringView message, void *userdata1, void *userdata2)
+{
+   *(bool *)userdata1 = status == WGPUMapAsyncStatus_Success;
+}
+
+static void
+maybe_capture(struct wvk_device *dev, struct wvk_swapchain *sc, struct wvk_image *image)
+{
+   static int64_t frame = -1;
+   static uint64_t presents;
+   static char path[512];
+   if (frame < 0) {
+      const char *env = getenv("WINK_VK_CAPTURE");
+      frame = 0;
+      if (!env || sscanf(env, "%" SCNu64 ":%511s", &frame, path) != 2)
+         frame = INT64_MAX;
+   }
+   if (++presents != (uint64_t)frame)
+      return;
+
+   const uint32_t w = sc->extent.width, h = sc->extent.height;
+   const uint32_t pitch = align(w * 4, 256);
+   WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+   desc.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+   desc.size = (uint64_t)pitch * h;
+   WGPUBuffer buffer = wgpuDeviceCreateBuffer(dev->wgpu, &desc);
+   WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(dev->wgpu, NULL);
+   const WGPUTexelCopyTextureInfo src = { .texture = image->texture };
+   const WGPUTexelCopyBufferInfo dst = { .layout = { .bytesPerRow = pitch, .rowsPerImage = h }, .buffer = buffer };
+   const WGPUExtent3D size = { w, h, 1 };
+   wgpuCommandEncoderCopyTextureToBuffer(encoder, &src, &dst, &size);
+   WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
+   wgpuQueueSubmit(dev->queue.wgpu, 1, &commands);
+   wgpuCommandBufferRelease(commands);
+   wgpuCommandEncoderRelease(encoder);
+
+   bool mapped = false;
+   WGPUBufferMapCallbackInfo cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+   cb.mode = WGPUCallbackMode_WaitAnyOnly;
+   cb.callback = on_capture_mapped;
+   cb.userdata1 = &mapped;
+   struct wvk_instance *instance = (struct wvk_instance *)dev->vk.physical->instance;
+   wvk_platform_wait(instance->wgpu, wgpuBufferMapAsync(buffer, WGPUMapMode_Read, 0, desc.size, cb), UINT64_MAX);
+   const uint8_t *data = mapped ? wgpuBufferGetConstMappedRange(buffer, 0, desc.size) : NULL;
+   FILE *f = data ? fopen(path, "wb") : NULL;
+   if (f) {
+      /* A bottom-up 32-bit BMP, which is BGRA: swap for RGBA images. */
+      const bool rgba = image->format == WGPUTextureFormat_RGBA8Unorm ||
+                        image->format == WGPUTextureFormat_RGBA8UnormSrgb;
+      const uint32_t bytes = w * h * 4;
+      uint8_t header[54] = { 'B', 'M' };
+      const uint32_t fields[] = { 54 + bytes, 0, 54, 40, w, h };
+      memcpy(header + 2, &fields[0], 4);
+      memcpy(header + 10, &fields[2], 4);
+      memcpy(header + 14, &fields[3], 4);
+      memcpy(header + 18, &fields[4], 4);
+      memcpy(header + 22, &fields[5], 4);
+      header[26] = 1;
+      header[28] = 32;
+      fwrite(header, 1, sizeof(header), f);
+      uint8_t *row = malloc(w * 4);
+      for (uint32_t y = h; row && y-- > 0;) {
+         memcpy(row, data + (uint64_t)y * pitch, w * 4);
+         for (uint32_t x = 0; rgba && x < w; ++x) {
+            const uint8_t r = row[x * 4];
+            row[x * 4] = row[x * 4 + 2];
+            row[x * 4 + 2] = r;
+         }
+         fwrite(row, 1, w * 4, f);
+      }
+      free(row);
+      fclose(f);
+      mesa_logi("wvk: present %" PRIu64 " written to %s", presents, path);
+   }
+   if (mapped)
+      wgpuBufferUnmap(buffer);
+   wgpuBufferRelease(buffer);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
 {
@@ -743,6 +830,7 @@ wvk_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
       struct wvk_surface *surface = sc->surface;
 
       sc->acquired[index] = false;
+      maybe_capture(dev, sc, image);
       textures[i] = (WGPUSurfaceTexture)WGPU_SURFACE_TEXTURE_INIT;
       results[i] = swapchain_suboptimal(sc) ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
       /* An old swapchain's images, and a headless surface's, go nowhere. */
