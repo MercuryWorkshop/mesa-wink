@@ -1,0 +1,34 @@
+# Meson cross file for wink: Emscripten, as a .NET 10 browser-wasm app links it.
+# Generated per variant by wink/build.sh; @PTHREAD@ is -pthread for mt and
+# empty for st.
+#
+# -fwasm-exceptions / SUPPORT_LONGJMP=wasm: .NET's final link uses wasm
+# exception handling, so every object that calls setjmp (spirv_to_nir,
+# gl_spirv, u_cpu_detect) must emit __wasm_longjmp and not the JS
+# emscripten_longjmp/invoke_* shims.
+
+[constants]
+wbin = '@WBIN@'
+
+[binaries]
+c = wbin / 'emcc'
+cpp = wbin / 'em++'
+ar = wbin / 'emar'
+ranlib = wbin / 'emranlib'
+strip = wbin / 'emstrip'
+pkg-config = 'false'
+
+[host_machine]
+system = 'emscripten'
+cpu_family = 'wasm32'
+cpu = 'wasm32'
+endian = 'little'
+
+[properties]
+needs_exe_wrapper = true
+
+[built-in options]
+c_args = ['-D_GNU_SOURCE', '-D_POSIX_C_SOURCE=200809L', '-fwasm-exceptions', '-sSUPPORT_LONGJMP=wasm'@PTHREAD@]
+cpp_args = ['-D_GNU_SOURCE', '-D_POSIX_C_SOURCE=200809L', '-fwasm-exceptions', '-sSUPPORT_LONGJMP=wasm'@PTHREAD@]
+c_link_args = ['-fwasm-exceptions', '-sSUPPORT_LONGJMP=wasm'@PTHREAD@]
+cpp_link_args = ['-fwasm-exceptions', '-sSUPPORT_LONGJMP=wasm'@PTHREAD@]

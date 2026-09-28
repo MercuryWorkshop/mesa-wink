@@ -1,0 +1,34 @@
+Provenance: r58Playz/MobileGL feat/wasm-webgpu-backend, tools/tint/dawn-tint-emscripten.patch.
+Dawn's CMake builds only emdawnwebgpu under Emscripten; these two hunks let it
+build Tint's SPIR-V reader and WGSL writer for wasm instead. Applies to Dawn
+b465e23d19a5e27402d80191c0f8de1fb3b385b5.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9ce9f3d3..a6886ed3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -482,7 +482,7 @@ add_subdirectory(src/tint)
+ 
+ set(BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS_SAVED})
+ 
+-if (DAWN_ENABLE_D3D11 OR DAWN_ENABLE_D3D12 OR DAWN_ENABLE_METAL OR DAWN_ENABLE_NULL OR DAWN_ENABLE_DESKTOP_GL OR DAWN_ENABLE_OPENGLES OR DAWN_ENABLE_VULKAN OR EMSCRIPTEN)
++if (DAWN_ENABLE_D3D11 OR DAWN_ENABLE_D3D12 OR DAWN_ENABLE_METAL OR DAWN_ENABLE_NULL OR DAWN_ENABLE_DESKTOP_GL OR DAWN_ENABLE_OPENGLES OR DAWN_ENABLE_VULKAN)
+     add_subdirectory(generator)
+     # Note that we must add Emscripten directory first to ensure the correct
+     # headers will be exported upwards.
+diff --git a/third_party/CMakeLists.txt b/third_party/CMakeLists.txt
+index e0f80027..d67f71e1 100644
+--- a/third_party/CMakeLists.txt
++++ b/third_party/CMakeLists.txt
+@@ -72,7 +72,10 @@ endif()
+ ################################################################################
+ # End of Emscripten enabled third party directories
+ ################################################################################
+-if (EMSCRIPTEN)
++# MGL: Dawn skips these third-party deps under Emscripten because its normal wasm
++# build only produces emdawnwebgpu. We build tint's SPIR-V reader for wasm, which
++# needs SPIRV-Tools/SPIRV-Headers, so don't return early when those are requested.
++if (EMSCRIPTEN AND NOT TINT_BUILD_SPV_READER AND NOT TINT_BUILD_SPV_WRITER)
+     return()
+ endif()
+ 
