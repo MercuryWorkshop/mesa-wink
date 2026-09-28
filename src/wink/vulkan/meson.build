@@ -12,6 +12,16 @@ endif
 wvk_webgpu_include = include_directories(join_paths(wvk_emdawn_dir, 'webgpu', 'include'))
 wvk_is_wasm = host_machine.system() == 'emscripten'
 
+# The window systems a native build presents to: Metal on macOS, where
+# Dawn always has it; elsewhere Mesa's own -Dplatforms.
+wvk_c_args = []
+wvk_wsi_deps = []
+if host_machine.system() == 'darwin'
+  wvk_c_args += '-DVK_USE_PLATFORM_METAL_EXT'
+elif not wvk_is_wasm
+  wvk_wsi_deps += idep_vulkan_wsi_defines
+endif
+
 wvk_dawn_deps = []
 if not wvk_is_wasm
   wvk_dawn_dir = get_option('gex-dawn-native-dir')
@@ -58,6 +68,7 @@ wvk_files = files(
   'wvk_physical_device.c',
   'wvk_queue.c',
   'wvk_sync.c',
+  'wvk_wsi.c',
 )
 if wvk_is_wasm
   error('the browser half of the wink Vulkan driver is not written yet')
@@ -73,8 +84,9 @@ libwvk = static_library(
     idep_mesautil,
     idep_vulkan_runtime,
     idep_vulkan_util,
+    wvk_wsi_deps,
   ],
-  c_args : [c_msvc_compat_args, no_override_init_args],
+  c_args : [c_msvc_compat_args, no_override_init_args, wvk_c_args],
   gnu_symbol_visibility : 'hidden',
 )
 
@@ -82,7 +94,7 @@ if not wvk_is_wasm
   wvk_link_args = [ld_args_build_id]
   if host_machine.system() == 'darwin'
     # The runtime's weak entrypoint tables leave symbols for the loader.
-    wvk_link_args += ['-Wl,-undefined,dynamic_lookup']
+    wvk_link_args += ['-Wl,-undefined,dynamic_lookup', '-lobjc']
   else
     wvk_link_args += [ld_args_bsymbolic, ld_args_gc_sections]
   endif

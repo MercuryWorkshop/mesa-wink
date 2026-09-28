@@ -12,6 +12,8 @@
  *   - one command buffer submitted twice
  *   - fences, timeline semaphores, and a submit waiting for a value the
  *     host signals later
+ *   - a swapchain on a headless surface: acquire, render, present, and a
+ *     swapchain replacing it
  *
  * Build: cc -o wvk_smoke wvk_smoke.c $(pkg-config --cflags --libs vulkan)
  * Run:   VK_DRIVER_FILES=<build>/src/wink/vulkan/wink_devenv_icd.<arch>.json ./wvk_smoke
@@ -360,14 +362,151 @@ test_sync(void)
    printf("sync: done\n");
 }
 
+static void
+test_present(void)
+{
+   PFN_vkCreateHeadlessSurfaceEXT create_headless =
+      (PFN_vkCreateHeadlessSurfaceEXT)vkGetInstanceProcAddr(instance, "vkCreateHeadlessSurfaceEXT");
+   VkSurfaceKHR surface;
+   VK(create_headless(instance, &(VkHeadlessSurfaceCreateInfoEXT){
+      .sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT,
+   }, NULL, &surface));
+   VkBool32 supported = VK_FALSE;
+   VK(vkGetPhysicalDeviceSurfaceSupportKHR(pdev, 0, surface, &supported));
+   CHECK(supported, "the queue cannot present");
+   VkSurfaceCapabilitiesKHR caps;
+   VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pdev, surface, &caps));
+   CHECK(caps.currentExtent.width == UINT32_MAX && caps.minImageCount <= 3 && caps.maxImageCount >= 3,
+         "headless caps: %u, %u..%u", caps.currentExtent.width, caps.minImageCount, caps.maxImageCount);
+   VkSurfaceFormatKHR formats[16];
+   uint32_t format_count = 16;
+   VK(vkGetPhysicalDeviceSurfaceFormatsKHR(pdev, surface, &format_count, formats));
+   bool have_bgra = false;
+   for (uint32_t i = 0; i < format_count; ++i)
+      have_bgra |= formats[i].format == VK_FORMAT_B8G8R8A8_UNORM;
+   CHECK(have_bgra, "no B8G8R8A8_UNORM surface format");
+
+   enum { W = 32, H = 16, FRAMES = 5 };
+   VkSwapchainCreateInfoKHR info = {
+      .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = surface,
+      .minImageCount = 3, .imageFormat = VK_FORMAT_B8G8R8A8_UNORM,
+      .imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR, .imageExtent = { W, H },
+      .imageArrayLayers = 1,
+      .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+      .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+      .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+      .presentMode = VK_PRESENT_MODE_FIFO_KHR, .clipped = VK_TRUE,
+   };
+   VkSwapchainKHR sc;
+   VK(vkCreateSwapchainKHR(dev, &info, NULL, &sc));
+   uint32_t image_count = 0;
+   VK(vkGetSwapchainImagesKHR(dev, sc, &image_count, NULL));
+   VkImage images[16];
+   image_count = image_count > 16 ? 16 : image_count;
+   VK(vkGetSwapchainImagesKHR(dev, sc, &image_count, images));
+   CHECK(image_count >= 3, "%u swapchain images", image_count);
+
+   VkSemaphore acquired, rendered;
+   VK(vkCreateSemaphore(dev, &(VkSemaphoreCreateInfo){ .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO }, NULL, &acquired));
+   VK(vkCreateSemaphore(dev, &(VkSemaphoreCreateInfo){ .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO }, NULL, &rendered));
+   VkFence fence;
+   VK(vkCreateFence(dev, &(VkFenceCreateInfo){ .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }, NULL, &fence));
+   struct buffer out = make_buffer(W * H * 4 * FRAMES, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+   uint32_t last = UINT32_MAX;
+   for (uint32_t frame = 0; frame < FRAMES; ++frame) {
+      uint32_t index;
+      VK(vkAcquireNextImageKHR(dev, sc, UINT64_MAX, acquired, VK_NULL_HANDLE, &index));
+      CHECK(index < image_count && index != last, "acquired image %u after %u", index, last);
+      last = index;
+
+      VkCommandBuffer cmd = begin(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+      const VkImageSubresourceRange range = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                           0, NULL, 0, NULL, 1, &(VkImageMemoryBarrier){
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         .image = images[index], .subresourceRange = range,
+      });
+      const VkClearColorValue color = { .float32 = { frame / 4.0f, 0.5f, 1.0f - frame / 4.0f, 1.0f } };
+      vkCmdClearColorImage(cmd, images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+      vkCmdCopyImageToBuffer(cmd, images[index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.buffer, 1,
+                             &(VkBufferImageCopy){
+         .bufferOffset = frame * W * H * 4,
+         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 },
+      });
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+                           0, NULL, 0, NULL, 1, &(VkImageMemoryBarrier){
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+         .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+         .image = images[index], .subresourceRange = range,
+      });
+      VK(vkEndCommandBuffer(cmd));
+
+      const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      VK(vkQueueSubmit(queue, 1, &(VkSubmitInfo){
+         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+         .waitSemaphoreCount = 1, .pWaitSemaphores = &acquired, .pWaitDstStageMask = &stage,
+         .commandBufferCount = 1, .pCommandBuffers = &cmd,
+         .signalSemaphoreCount = 1, .pSignalSemaphores = &rendered,
+      }, fence));
+      VkResult result = VK_ERROR_UNKNOWN;
+      VK(vkQueuePresentKHR(queue, &(VkPresentInfoKHR){
+         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+         .waitSemaphoreCount = 1, .pWaitSemaphores = &rendered,
+         .swapchainCount = 1, .pSwapchains = &sc, .pImageIndices = &index, .pResults = &result,
+      }));
+      CHECK(result == VK_SUCCESS, "present result %d", result);
+      VK(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
+      VK(vkResetFences(dev, 1, &fence));
+      vkFreeCommandBuffers(dev, pool, 1, &cmd);
+   }
+   for (uint32_t frame = 0; frame < FRAMES; ++frame) {
+      const uint8_t *p = (const uint8_t *)out.map + frame * W * H * 4 + (W * (H - 1) + W - 1) * 4;
+      const float r = frame / 4.0f;
+      /* B8G8R8A8: blue first. */
+      CHECK(near(p[0], (1.0f - r) * 255) && near(p[1], 128) && near(p[2], r * 255) && p[3] == 255,
+            "frame %u: %u %u %u %u", frame, p[0], p[1], p[2], p[3]);
+   }
+
+   /* A new swapchain takes the surface over; the old one is out of date. */
+   info.oldSwapchain = sc;
+   info.imageExtent = (VkExtent2D){ W * 2, H * 2 };
+   VkSwapchainKHR sc2;
+   VK(vkCreateSwapchainKHR(dev, &info, NULL, &sc2));
+   uint32_t index;
+   VkResult result = vkAcquireNextImageKHR(dev, sc, 0, VK_NULL_HANDLE, fence, &index);
+   CHECK(result == VK_ERROR_OUT_OF_DATE_KHR, "acquiring from a replaced swapchain: %d", result);
+   vkDestroySwapchainKHR(dev, sc, NULL);
+   VK(vkAcquireNextImageKHR(dev, sc2, 0, VK_NULL_HANDLE, fence, &index));
+   VK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 0));
+   VK(vkQueuePresentKHR(queue, &(VkPresentInfoKHR){
+      .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+      .swapchainCount = 1, .pSwapchains = &sc2, .pImageIndices = &index,
+   }));
+
+   VK(vkDeviceWaitIdle(dev));
+   vkDestroySwapchainKHR(dev, sc2, NULL);
+   free_buffer(&out);
+   vkDestroyFence(dev, fence, NULL);
+   vkDestroySemaphore(dev, acquired, NULL);
+   vkDestroySemaphore(dev, rendered, NULL);
+   vkDestroySurfaceKHR(instance, surface, NULL);
+   printf("present: done\n");
+}
+
 int
 main(void)
 {
+   const char *instance_extensions[] = { "VK_KHR_surface", "VK_EXT_headless_surface" };
    VK(vkCreateInstance(&(VkInstanceCreateInfo){
       .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
       .pApplicationInfo = &(VkApplicationInfo){
          .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_2,
       },
+      .enabledExtensionCount = 2, .ppEnabledExtensionNames = instance_extensions,
    }, NULL, &instance));
    uint32_t count = 0;
    VK(vkEnumeratePhysicalDevices(instance, &count, NULL));
@@ -388,7 +527,8 @@ main(void)
    }
    vkGetPhysicalDeviceMemoryProperties(pdev, &mem_props);
 
-   const char *extensions[] = { "VK_KHR_portability_subset", "VK_KHR_dynamic_rendering" };
+   const char *extensions[] = { "VK_KHR_portability_subset", "VK_KHR_dynamic_rendering",
+                                "VK_KHR_swapchain" };
    VK(vkCreateDevice(pdev, &(VkDeviceCreateInfo){
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
       .pNext = &(VkPhysicalDeviceDynamicRenderingFeatures){
@@ -403,7 +543,7 @@ main(void)
          .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = 0, .queueCount = 1,
          .pQueuePriorities = &(float){ 1.0f },
       },
-      .enabledExtensionCount = 2, .ppEnabledExtensionNames = extensions,
+      .enabledExtensionCount = 3, .ppEnabledExtensionNames = extensions,
    }, NULL, &dev));
    begin_rendering = (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(dev, "vkCmdBeginRenderingKHR");
    end_rendering = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(dev, "vkCmdEndRenderingKHR");
@@ -420,6 +560,7 @@ main(void)
    test_buffers();
    test_clears();
    test_sync();
+   test_present();
 
    vkDestroyCommandPool(dev, pool, NULL);
    vkDestroyDevice(dev, NULL);

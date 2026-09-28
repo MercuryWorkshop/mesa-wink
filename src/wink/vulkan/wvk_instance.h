@@ -12,7 +12,8 @@
 struct wvk_instance {
    struct vk_instance vk;
 
-   /* Made when physical devices are first enumerated. */
+   /* Made when first needed: to enumerate physical devices, or to make
+    * a surface. See wvk_instance_wgpu. */
    WGPUInstance wgpu;
 
    /* Identifies this build: driverUUID, and the pipeline cache's. */
@@ -20,5 +21,8 @@ struct wvk_instance {
 };
 
 VK_DEFINE_HANDLE_CASTS(wvk_instance, vk.base, VkInstance, VK_OBJECT_TYPE_INSTANCE)
+
+/* The WebGPU instance, made if need be; NULL if there is no WebGPU. */
+WGPUInstance wvk_instance_wgpu(struct wvk_instance *instance);
 
 #endif

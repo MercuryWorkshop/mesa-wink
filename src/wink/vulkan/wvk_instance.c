@@ -34,9 +34,24 @@ static const struct vk_instance_extension_table instance_extensions = {
    .KHR_external_memory_capabilities = true,
    .KHR_external_semaphore_capabilities = true,
    .KHR_get_physical_device_properties2 = true,
+   .KHR_get_surface_capabilities2 = true,
    .KHR_portability_enumeration = true,
+   .KHR_surface = true,
    .EXT_debug_report = true,
    .EXT_debug_utils = true,
+   .EXT_headless_surface = true,
+#ifdef VK_USE_PLATFORM_METAL_EXT
+   .EXT_metal_surface = true,
+#endif
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+   .KHR_wayland_surface = true,
+#endif
+#ifdef VK_USE_PLATFORM_XCB_KHR
+   .KHR_xcb_surface = true,
+#endif
+#ifdef VK_USE_PLATFORM_XLIB_KHR
+   .KHR_xlib_surface = true,
+#endif
 };
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -86,6 +101,14 @@ wvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    *pInstance = wvk_instance_to_handle(instance);
    return VK_SUCCESS;
+}
+
+WGPUInstance
+wvk_instance_wgpu(struct wvk_instance *instance)
+{
+   if (!instance->wgpu)
+      instance->wgpu = wvk_platform_create_instance();
+   return instance->wgpu;
 }
 
 VKAPI_ATTR void VKAPI_CALL

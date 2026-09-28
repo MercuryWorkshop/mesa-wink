@@ -104,6 +104,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_shader_non_semantic_info = true,
       .KHR_spirv_1_4 = true,
       .KHR_storage_buffer_storage_class = true,
+      .KHR_swapchain = true,
       .KHR_synchronization2 = true,
       .KHR_timeline_semaphore = true,
       .KHR_uniform_buffer_standard_layout = true,
@@ -430,11 +431,8 @@ wvk_enumerate_physical_devices(struct vk_instance *_instance)
 {
    struct wvk_instance *instance = (struct wvk_instance *)_instance;
 
-   if (!instance->wgpu) {
-      instance->wgpu = wvk_platform_create_instance();
-      if (!instance->wgpu)
-         return VK_SUCCESS; /* no WebGPU: no devices, not an error */
-   }
+   if (!wvk_instance_wgpu(instance))
+      return VK_SUCCESS; /* no WebGPU: no devices, not an error */
    WGPUAdapter adapter = wvk_platform_request_adapter(instance->wgpu);
    if (!adapter)
       return VK_SUCCESS;
