@@ -11,5 +11,16 @@ var LibraryWinkTest = {
     "  Module['winkSmokeRaw'] = exports['wink_smoke_main'];" +
     "});",
   wink_test_publish: function () {},
+
+  // A fresh task, so no JS frame sits between promising and the wasm body.
+  wink_test_run_promising__deps: ['$UTF8ToString'],
+  wink_test_run_promising: function (namePtr) {
+    var name = UTF8ToString(namePtr);
+    var exports = typeof wasmExports != 'undefined' ? wasmExports : Module['asm'];
+    var run = WebAssembly.promising(exports[name]);
+    setTimeout(function () {
+      run()['catch'](function (e) { err('wink test: ' + name + ' failed: ' + (e && e.stack || e)); });
+    }, 0);
+  },
 };
 mergeInto(LibraryManager.library, LibraryWinkTest);

@@ -20,9 +20,11 @@ if [ "$variant" = st ]; then
   # test's wrapper counts one as a failure instead of letting it fail quietly.
   extra+=(-Wl,--wrap=pthread_create)
 else
-  # The main-thread-GL page runs the suite on a worker of its own.
-  extra+=(-sPTHREAD_POOL_SIZE=2)
-  exports=$exports,_wink_smoke_start_worker
+  # The main-thread-GL and OffscreenCanvas pages each run the suite on a
+  # worker of their own; the latter transfers the canvas to it, as
+  # ikvmcraft does for its .NET deputy thread.
+  extra+=(-sPTHREAD_POOL_SIZE=2 -sOFFSCREENCANVAS_SUPPORT)
+  exports=$exports,_wink_smoke_start_worker,_wink_smoke_start_offscreen,_wink_smoke_offscreen_body
 fi
 
 "$emcc" -O2 -I"$pkg/include" -I"$MESA/include" \
@@ -37,5 +39,8 @@ fi
   -sINITIAL_MEMORY=64MB -sASSERTIONS=1 --profiling-funcs \
   -o "$out/wink-smoke.js"
 cp "$HERE/smoke.html" "$out/index.html"
-[ "$variant" = mt ] && cp "$HERE/smoke-main-thread.html" "$out/main-thread.html"
+if [ "$variant" = mt ]; then
+  cp "$HERE/smoke-main-thread.html" "$out/main-thread.html"
+  cp "$HERE/smoke-offscreen.html" "$out/offscreen.html"
+fi
 echo "$out/index.html"

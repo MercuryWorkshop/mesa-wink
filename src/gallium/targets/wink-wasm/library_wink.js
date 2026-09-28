@@ -23,7 +23,8 @@
 //   Module.winkDevice          a GPUDevice to use (or preinitializedWebGPUDevice)
 //   Module.winkAdapterOptions  passed to navigator.gpu.requestAdapter
 //   Module.winkDeviceDescriptor(adapter, desc)  may amend or replace desc
-//   Module.winkCanvas          a canvas, or function(selector) -> canvas
+//   Module.winkCanvas          a canvas, or function(selector) -> canvas; on a
+//                              worker, the worker's own Module
 //   Module.winkEnv             {NAME: value} or ["NAME=value"], applied as setenv
 //   Module.winkRunnerStackSize the main-thread runner's stack (default 16MB)
 
@@ -237,21 +238,35 @@ var LibraryWink = {
   // wgpuInstanceCreateSurface's work, with a wider idea of where the canvas
   // is: a worker has no document to query, and an embedder may already hold
   // the canvas (or its OffscreenCanvas) rather than a selector for it.
-  wink_js_create_surface__deps: ['$WebGPU', 'emwgpuCreateSurface', '$UTF8ToString'],
+  //
+  // A worker's canvas is one pthread_create transferred to it
+  // (-sOFFSCREENCANVAS_SUPPORT, emscripten_pthread_attr_settransferredcanvases).
+  // Emscripten files those under GL.offscreenCanvases by the element's DOM id,
+  // whatever selector named them, and drops them unless $GL is linked in --
+  // hence the dependency. A worker that owns exactly one takes it for any
+  // selector: ikvmcraft transfers ".canvas", for one.
+  wink_js_create_surface__deps: ['$WebGPU', 'emwgpuCreateSurface', '$UTF8ToString',
+#if OFFSCREENCANVAS_SUPPORT
+    '$GL',
+#endif
+  ],
   wink_js_create_surface: function (selectorPtr) {
     var selector = selectorPtr ? UTF8ToString(selectorPtr) : '';
     var provided = Module['winkCanvas'];
     var canvas = null;
     if (typeof provided == 'function') canvas = provided(selector);
     else if (provided && !selector) canvas = provided;
+    var owned = typeof GL != 'undefined' && GL.offscreenCanvases || {};
     if (!canvas && selector) {
       var id = selector.charAt(0) == '#' ? selector.substr(1) : selector;
-      if (typeof GL != 'undefined' && GL.offscreenCanvases && GL.offscreenCanvases[id])
-        canvas = GL.offscreenCanvases[id].offscreenCanvas;
-      else if (typeof document != 'undefined')
-        canvas = document.querySelector(selector);
+      if (owned[id]) canvas = owned[id].offscreenCanvas;
     }
-    if (!canvas && !selector) canvas = Module['canvas'];
+    if (!canvas && (!selector || selector == '#canvas')) canvas = Module['canvas'];
+    if (!canvas && selector && typeof document != 'undefined') canvas = document.querySelector(selector);
+    if (!canvas && typeof document == 'undefined') {
+      var ids = Object.keys(owned).filter(function (k) { return owned[k]; });
+      if (ids.length == 1) canvas = owned[ids[0]].offscreenCanvas;
+    }
     if (!canvas) {
       err('wink: no canvas' + (selector ? ' for ' + selector : ''));
       return 0;

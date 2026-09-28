@@ -122,6 +122,9 @@ for v in $WINK_VARIANTS; do
       # And GL from a worker, executed on the main thread.
       run node "$WINK_DIR/test/run-browser.mjs" "$WINK_BUILD_ROOT/test/$v" --page=main-thread.html \
         || die "main-thread smoke test failed"
+      # And the canvas, the device and GL all on a worker.
+      run node "$WINK_DIR/test/run-browser.mjs" "$WINK_BUILD_ROOT/test/$v" --page=offscreen.html \
+        || die "OffscreenCanvas smoke test failed"
     fi
   fi
 done

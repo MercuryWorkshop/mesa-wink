@@ -172,6 +172,32 @@ wink_swap_buffers(surface);                        /* never suspends */
 * **Frames.** A frame reaches the canvas when the owning thread returns to its
   event loop. Pacing (requestAnimationFrame) is the caller's job.
 
+#### The canvas on a worker
+
+This is the arrangement ikvmcraft uses for its .NET deputy thread:
+
+1. Link with `-sOFFSCREENCANVAS_SUPPORT`.
+2. Create the pthread with
+   `emscripten_pthread_attr_settransferredcanvases(&attr, "#canvas")`. The
+   worker receives the canvas as an OffscreenCanvas, and there `wink_init`,
+   the device, the surface and GL all work in the ordinary mode.
+3. On the worker, find the canvas. `wink_surface_create` looks it up as
+   follows:
+   * `Module.winkCanvas` wins;
+   * then the canvas the worker owns under that DOM id (`#id`);
+   * then `Module.canvas` for `#canvas` or no selector;
+   * and, on a worker that owns exactly one canvas, that one, whatever the
+     selector. ikvmcraft transfers `.canvas`, for one.
+4. Enter wink through `WebAssembly.promising` on the worker too. A pthread's
+   entry point isn't entered that way. The smoke test returns from it with
+   the runtime kept alive, then calls its body through `promising` from a
+   fresh task (`library_wink_test.js`). The .NET runtime wraps its mailbox
+   and JSExports the same way.
+
+`Module` on a worker is that worker's own. Emscripten doesn't copy the
+page's `winkEnv` or `winkDevice` onto it, and a `GPUDevice` can't be
+transferred anyway, so use `wink_setenv` there.
+
 #### GL from a worker, run on the main thread
 
 In `mt`, `WINK_INIT_GL_ON_MAIN_THREAD` in `wink_init_attribs.flags` keeps the
@@ -264,8 +290,9 @@ emcc, exactly as the manifest says to, and runs it in headless Chrome
 It also samples ASTC (4x4, and 6x6 blocks on a 7x5 texture) and ETC2 blocks.
 Then it shuts down and repeats everything on a fresh device with ASTC and ETC2
 hidden, to exercise st/mesa's CPU decode. In `st` it also proves Mesa never
-starts a thread. In `mt` it runs the whole suite a second time from a pthread
-with `WINK_INIT_GL_ON_MAIN_THREAD` (`main-thread.html`).
+starts a thread. In `mt` it runs the whole suite twice more, from pthreads:
+once with `WINK_INIT_GL_ON_MAIN_THREAD` (`main-thread.html`), and once with
+the canvas transferred to the worker and JSPI there (`offscreen.html`).
 
 `test/dotnet/` links a variant into a real .NET 10 browser-wasm app through
 `wink.targets`, then checks from managed code that the native side is there.

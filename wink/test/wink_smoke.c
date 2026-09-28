@@ -14,6 +14,7 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <emscripten/emscripten.h>
+#include <emscripten/threading.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -436,6 +437,51 @@ wink_smoke_start_worker(void)
 {
    pthread_t thread;
    if (pthread_create(&thread, NULL, smoke_thread, NULL) != 0)
+      return 1;
+   pthread_detach(thread);
+   return 0;
+}
+
+/* library_wink_test.js: on this thread's event loop, call the named export
+ * through WebAssembly.promising, as the .NET runtime enters its exports. */
+void wink_test_run_promising(const char *export_name);
+
+/* The same suite again, on a worker that owns the canvas: wink in its
+ * ordinary mode, with the device, the OffscreenCanvas and JSPI all on the
+ * worker. The body is entered through promising from the worker's event
+ * loop -- pthread entry points are not -- and reports to the main thread. */
+EMSCRIPTEN_KEEPALIVE int
+wink_smoke_offscreen_body(void)
+{
+   init_flags = 0;
+   CHECK(!emscripten_is_main_browser_thread(), "offscreen body on the main thread");
+   int rc = run_all();
+   MAIN_THREAD_ASYNC_EM_ASM({ Module['winkSmokeDone']($0); }, rc);
+   emscripten_runtime_keepalive_pop();
+   return rc;
+}
+
+static void *
+offscreen_thread(void *arg)
+{
+   (void)arg;
+   /* Return from the entry point, but keep the worker for the body. */
+   emscripten_runtime_keepalive_push();
+   wink_test_run_promising("wink_smoke_offscreen_body");
+   return NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE int
+wink_smoke_start_offscreen(void)
+{
+   pthread_attr_t attr;
+   pthread_attr_init(&attr);
+   /* "#canvas" is Module.canvas; it arrives as an OffscreenCanvas. */
+   emscripten_pthread_attr_settransferredcanvases(&attr, "#canvas");
+   pthread_t thread;
+   int rc = pthread_create(&thread, &attr, offscreen_thread, NULL);
+   pthread_attr_destroy(&attr);
+   if (rc != 0)
       return 1;
    pthread_detach(thread);
    return 0;

@@ -1,0 +1,28 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<meta charset="utf-8">
+<title>wink smoke: the canvas, the device and GL on a worker</title>
+<canvas id="canvas" width="64" height="48"></canvas>
+<script type="module">
+  const log = [];
+  globalThis.__winkResult = null;
+  try {
+    const { default: create } = await import('./wink-smoke.js');
+    let done;
+    const finished = new Promise((resolve) => { done = resolve; });
+    const Module = await create({
+      print: (s) => { log.push(s); console.log(s); },
+      printErr: (s) => { log.push(s); console.warn(s); },
+      canvas: document.getElementById('canvas'),
+      winkSmokeDone: (rc) => done(rc),
+    });
+    // The canvas goes to the worker as an OffscreenCanvas; the worker enters
+    // the suite through WebAssembly.promising itself.
+    if (Module._wink_smoke_start_offscreen() !== 0) throw new Error('no worker');
+    const rc = await finished;
+    globalThis.__winkResult = { pass: rc === 0, rc, log };
+  } catch (e) {
+    console.error('exception: ' + (e && e.stack || e));
+    globalThis.__winkResult = { pass: false, rc: -1, log };
+  }
+</script>
