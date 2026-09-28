@@ -640,18 +640,3 @@ wvk_GetDeviceMemoryOpaqueCaptureAddress(VkDevice device,
    return 0;
 }
 
-VKAPI_ATTR void VKAPI_CALL
-wvk_CmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
-                         VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
-                         uint32_t stride)
-{
-   mesa_logw_once("wvk: vkCmdDrawIndirectCount is not supported (drawIndirectCount)");
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wvk_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
-                                VkBuffer countBuffer, VkDeviceSize countBufferOffset,
-                                uint32_t maxDrawCount, uint32_t stride)
-{
-   mesa_logw_once("wvk: vkCmdDrawIndexedIndirectCount is not supported (drawIndirectCount)");
-}

@@ -64,6 +64,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **Arrays of descriptors** are bindings of their own. A dynamic or
   non-uniform index chooses among them in the shader: reads from each,
   selected; writes only where the index is.
+- **Triangle fans** are the lists of their triangles, each in the order
+  Vulkan's fan has it: a list the host makes, or for a draw by index one a
+  compute shader makes of the application's indices, restarting where
+  they do. Indirect draws of fans are drawn from the host's copy of their
+  commands. **vkCmdDraw*IndirectCount** copies the draws and gives those
+  past the count no instances, on the GPU.
 - **Viewports**: WebGPU has one. A vertex shader that writes
   gl_ViewportIndex has each draw drawn once per viewport, with what is not
   that draw's out of the clip volume, as layers are.
@@ -161,7 +167,8 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   the workgroup's, and none can be in non-uniform control flow, so a
   memory barrier there is dropped.
 - An attribute larger than its binding's dynamic stride, which WebGPU
-  cannot describe.
+  cannot describe. Strips of 16-bit indices with primitive restart off
+  still restart at 0xFFFF, as WebGPU's always do.
 - Precise occlusion queries: WebGPU's count is exact on some backends
   only. Alpha to coverage with a sample mask the shader writes.
 - Subgroups are one invocation each: Tint reads no subgroup operations from

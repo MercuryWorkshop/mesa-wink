@@ -449,6 +449,10 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuComputePipelineRelease(dev->copy_query_pipeline);
    if (dev->add_query_pipeline)
       wgpuComputePipelineRelease(dev->add_query_pipeline);
+   if (dev->fan_pipeline)
+      wgpuComputePipelineRelease(dev->fan_pipeline);
+   if (dev->draw_count_pipeline)
+      wgpuComputePipelineRelease(dev->draw_count_pipeline);
    if (dev->repack_pipeline)
       wgpuComputePipelineRelease(dev->repack_pipeline);
    for (uint32_t i = 0; i < ARRAY_SIZE(dev->packed16_pipelines); ++i) {
@@ -664,6 +668,9 @@ struct wvk_bound_buffer {
    WGPUBuffer buffer;
    uint64_t offset;
    uint64_t size;
+   /* A buffer of the driver's own, which has no memory: its own serial,
+    * for bind groups kept by what they name. */
+   uint64_t serial;
 };
 
 /* A driver binding on an application's buffer: the draw binding on an
@@ -1570,7 +1577,7 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
                              ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
    }
 
-   k->topology = topology(dyn->ia.primitive_topology);
+   k->topology = replay->fan_as_list ? WGPUPrimitiveTopology_TriangleList : topology(dyn->ia.primitive_topology);
    if (indexed && (k->topology == WGPUPrimitiveTopology_LineStrip ||
                    k->topology == WGPUPrimitiveTopology_TriangleStrip))
       k->strip_index_format = index_format(st->index_type);
@@ -1851,8 +1858,8 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
       return false;
    if (dyn->rs.rasterizer_discard_enable || dyn->rs.cull_mode == VK_CULL_MODE_FRONT_AND_BACK)
       return false;
-   if (dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
-      mesa_logw_once("wvk: triangle fans are not supported (VK_KHR_portability_subset)");
+   if (dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && !replay->fan_as_list) {
+      mesa_logw_once("wvk: an indirect draw of a triangle fan");
       return false;
    }
 
@@ -1927,8 +1934,8 @@ set_draw_parameters(struct wvk_bound_state *st, const struct wvk_bound_buffer *i
        * firstVertex and firstInstance of a VkDrawIndirectCommand. */
       words[0] = first + (indexed ? 3 : 2);
       words[1] = first + (indexed ? 4 : 3);
-      st->draw = (struct wvk_driver_buffer){ indirect->buffer, indirect->mem->serial, (uint32_t)start,
-                                             WVK_DRAW_WINDOW };
+      st->draw = (struct wvk_driver_buffer){ indirect->buffer, indirect->mem ? indirect->mem->serial : indirect->serial,
+                                             (uint32_t)start, WVK_DRAW_WINDOW };
    } else {
       words[0] = WVK_DRIVER_DRAW_VALUES / 4;
       words[1] = WVK_DRIVER_DRAW_VALUES / 4 + 1;
@@ -1964,6 +1971,177 @@ next_viewport(struct wvk_cmd_buffer *cmd, uint32_t v, uint32_t n)
 #define foreach_viewport(cmd) \
    for (uint32_t _v = 0, _n = draw_viewports(cmd); next_viewport(cmd, _v, _n); ++_v)
 
+/* ---------------------------------------------------------------------- */
+/* Triangle fans, which WebGPU does not have: the list of their triangles,
+ * each (i + 1, i + 2, 0) as Vulkan's fan has it, so that the provoking
+ * vertex is the same. Of a fan drawn by index, a compute shader makes the
+ * list of the application's indices. */
+
+static const char fan_wgsl[] =
+   "struct P { first: u32, wide: u32, triangles: u32, restart: u32 }\n"
+   "@group(0) @binding(0) var<storage, read> src: array<u32>;\n"
+   "@group(0) @binding(1) var<storage, read_write> dst: array<u32>;\n"
+   "@group(0) @binding(2) var<uniform> p: P;\n"
+   "fn index(i: u32) -> u32 {\n"
+   "  if (p.wide != 0u) { return src[p.first / 4u + i]; }\n"
+   "  let byte = p.first + i * 2u;\n"
+   "  return (src[byte / 4u] >> ((byte & 2u) * 8u)) & 0xffffu;\n"
+   "}\n"
+   /* With primitive restart, one invocation goes through them, each fan
+    * begun again after the restart index, and the list's rest degenerate. */
+   "fn restarting() {\n"
+   "  var out = 0u;\n"
+   "  var start = 0u;\n"
+   "  var prev = 0u;\n"
+   "  var n = 0u;\n"
+   "  for (var i = 0u; i < p.triangles + 2u; i++) {\n"
+   "    let v = index(i);\n"
+   "    if (v == p.restart) { n = 0u; continue; }\n"
+   "    if (n == 0u) { start = v; }\n"
+   "    else if (n >= 2u) { dst[out * 3u] = prev; dst[out * 3u + 1u] = v; dst[out * 3u + 2u] = start; out++; }\n"
+   "    prev = v;\n"
+   "    n++;\n"
+   "  }\n"
+   "  for (; out < p.triangles; out++) { dst[out * 3u] = 0u; dst[out * 3u + 1u] = 0u; dst[out * 3u + 2u] = 0u; }\n"
+   "}\n"
+   "@compute @workgroup_size(64)\n"
+   "fn main(@builtin(global_invocation_id) id: vec3u) {\n"
+   "  let t = id.x + id.y * 65535u * 64u;\n"
+   "  if (p.restart != 0u) {\n"
+   "    if (t == 0u) { restarting(); }\n"
+   "    return;\n"
+   "  }\n"
+   "  if (t >= p.triangles) { return; }\n"
+   "  dst[t * 3u] = index(t + 1u);\n"
+   "  dst[t * 3u + 1u] = index(t + 2u);\n"
+   "  dst[t * 3u + 2u] = index(0u);\n"
+   "}\n";
+
+/* The fan's list of indices, from the bound index buffer's, from index
+ * `first` on: made before the pass goes on. */
+static WGPUBuffer
+fan_indices_on_gpu(struct wvk_cmd_buffer *cmd, uint32_t first, uint32_t count)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   const uint32_t triangles = count - 2;
+   simple_mtx_lock(&dev->cache_lock);
+   if (!dev->fan_pipeline) {
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(fan_wgsl);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk triangle fan");
+      desc.compute.module = module;
+      desc.compute.entryPoint = wvk_sv("main");
+      dev->fan_pipeline = wgpuDeviceCreateComputePipeline(dev->wgpu, &desc);
+      wgpuShaderModuleRelease(module);
+   }
+   simple_mtx_unlock(&dev->cache_lock);
+   const struct wvk_bound_buffer *ib = &st->ib;
+   if (!dev->fan_pipeline || !ib->buffer)
+      return NULL;
+   const bool wide = st->index_type == VK_INDEX_TYPE_UINT32;
+   const uint64_t start = ib->offset + (uint64_t)first * (wide ? 4 : 2);
+   const uint64_t base = start & ~255ull;
+   const uint64_t end = start + (uint64_t)count * (wide ? 4 : 2);
+   WGPUBuffer out = wvk_replay_temp_buffer(dev, replay, (uint64_t)triangles * 12,
+                                           WGPUBufferUsage_Storage | WGPUBufferUsage_Index, NULL);
+   /* The restart index, or 0 for none: no index is 0 and restarts. */
+   const uint32_t restart = cmd->vk.dynamic_graphics_state.ia.primitive_restart_enable ? (wide ? 0xffffffffu : 0xffffu)
+                                                                                      : 0;
+   const uint32_t params[4] = { (uint32_t)(start - base), wide, triangles, restart };
+   WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
+   if (!out || !params_buffer)
+      return NULL;
+   wvk_replay_read(replay, ib->mem, start, end - start);
+   const WGPUBindGroupEntry entries[] = {
+      { .binding = 0, .buffer = ib->buffer, .offset = base, .size = align64(end - base, 4) },
+      { .binding = 1, .buffer = out, .offset = 0, .size = align64((uint64_t)triangles * 12, 4) },
+      { .binding = 2, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
+   };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = wgpuComputePipelineGetBindGroupLayout(dev->fan_pipeline, 0);
+   bg.entryCount = ARRAY_SIZE(entries);
+   bg.entries = entries;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bg.layout);
+   const bool in_pass = replay->pass != NULL;
+   wvk_replay_end_passes(replay);
+   WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
+   wgpuComputePassEncoderSetPipeline(pass, dev->fan_pipeline);
+   wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   const uint32_t groups = DIV_ROUND_UP(triangles, 64);
+   wgpuComputePassEncoderDispatchWorkgroups(pass, MIN2(groups, 65535), DIV_ROUND_UP(groups, 65535), 1);
+   wgpuComputePassEncoderEnd(pass);
+   wgpuComputePassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+   if (in_pass)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+   return out;
+}
+
+/* A fan drawn as its list: `indices` the list's, as the bound index
+ * buffer for the draw. */
+static void
+draw_fan(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint32_t triangles, uint32_t instances,
+         int32_t base_vertex, uint32_t first_instance, bool indexed, uint32_t draw_id)
+{
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   const struct wvk_bound_buffer ib = st->ib;
+   const VkIndexType type = st->index_type;
+   st->ib = (struct wvk_bound_buffer){ NULL, indices, 0, (uint64_t)triangles * 12 };
+   st->index_type = VK_INDEX_TYPE_UINT32;
+   replay->fan_as_list = true;
+   foreach_viewport(cmd) {
+      set_draw_parameters(st, NULL, 0, indexed, base_vertex, first_instance, draw_id);
+      if (!flush_draw(cmd, true))
+         continue;
+      wgpuRenderPassEncoderDrawIndexed(replay->pass, triangles * 3, instances, 0, base_vertex, first_instance);
+   }
+   replay->fan_as_list = false;
+   st->ib = ib;
+   st->index_type = type;
+}
+
+static void
+draw_fan_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertex_count, uint32_t instances, uint32_t first_vertex,
+                uint32_t first_instance, uint32_t draw_id)
+{
+   if (vertex_count < 3 || !instances)
+      return;
+   const uint32_t triangles = vertex_count - 2;
+   uint32_t *list = malloc((size_t)triangles * 12);
+   if (!list)
+      return;
+   for (uint32_t t = 0; t < triangles; ++t) {
+      list[t * 3] = t + 1;
+      list[t * 3 + 1] = t + 2;
+      list[t * 3 + 2] = 0;
+   }
+   WGPUBuffer indices = wvk_replay_temp_buffer(wvk_cmd_buffer_device(cmd), cmd->replay, (uint64_t)triangles * 12,
+                                               WGPUBufferUsage_Index, list);
+   free(list);
+   if (indices)
+      draw_fan(cmd, indices, triangles, instances, (int32_t)first_vertex, first_instance, false, draw_id);
+}
+
+static void
+draw_fan_elements(struct wvk_cmd_buffer *cmd, uint32_t first_index, uint32_t index_count, uint32_t instances,
+                  int32_t vertex_offset, uint32_t first_instance, uint32_t draw_id)
+{
+   if (index_count < 3 || !instances)
+      return;
+   WGPUBuffer indices = fan_indices_on_gpu(cmd, first_index, index_count);
+   if (indices)
+      draw_fan(cmd, indices, index_count - 2, instances, vertex_offset, first_instance, true, draw_id);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
             uint32_t firstVertex, uint32_t firstInstance)
@@ -1971,6 +2149,10 @@ wvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instan
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    if (!vertexCount || !instanceCount)
       return;
+   if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+      draw_fan_arrays(cmd, vertexCount, instanceCount, firstVertex, firstInstance, 0);
+      return;
+   }
    foreach_viewport(cmd) {
       set_draw_parameters(cmd->replay->state, NULL, 0, false, (int32_t)firstVertex, firstInstance, 0);
       if (!flush_draw(cmd, false))
@@ -1986,6 +2168,10 @@ wvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t 
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    if (!indexCount || !instanceCount)
       return;
+   if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+      draw_fan_elements(cmd, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, 0);
+      return;
+   }
    foreach_viewport(cmd) {
       set_draw_parameters(cmd->replay->state, NULL, 0, true, vertexOffset, firstInstance, 0);
       if (!flush_draw(cmd, true))
@@ -1996,18 +2182,34 @@ wvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t 
 }
 
 static void
-draw_indirect(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer _buffer, VkDeviceSize offset,
-              uint32_t drawCount, uint32_t stride)
+draw_indirect_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_buffer b, uint32_t drawCount,
+                    uint32_t stride)
 {
    struct wvk_replay *replay = cmd->replay;
    struct wvk_bound_state *st = replay->state;
-   if (!drawCount)
+   if (!drawCount || !b.buffer)
       return;
-   const uint32_t size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
-   struct wvk_bound_buffer b = bound_buffer(cmd, _buffer, offset,
-                                            (uint64_t)(drawCount - 1) * stride + size);
-   if (!b.buffer)
+   /* A fan's draws, as the host has them, one by one as the list of its
+    * triangles. */
+   if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+      if (!b.mem || !b.mem->host) {
+         mesa_logw_once("wvk: an indirect draw of a triangle fan in memory the host has no copy of");
+         return;
+      }
+      for (uint32_t i = 0; i < drawCount; ++i) {
+         const uint8_t *at = (const uint8_t *)b.mem->host + b.offset + (uint64_t)i * stride;
+         if (indexed) {
+            VkDrawIndexedIndirectCommand c;
+            memcpy(&c, at, sizeof(c));
+            draw_fan_elements(cmd, c.firstIndex, c.indexCount, c.instanceCount, c.vertexOffset, c.firstInstance, i);
+         } else {
+            VkDrawIndirectCommand c;
+            memcpy(&c, at, sizeof(c));
+            draw_fan_arrays(cmd, c.vertexCount, c.instanceCount, c.firstVertex, c.firstInstance, i);
+         }
+      }
       return;
+   }
    foreach_viewport(cmd) {
    set_draw_parameters(st, &b, b.offset, indexed, 0, 0, 0);
    if (!flush_draw(cmd, indexed))
@@ -2030,6 +2232,126 @@ draw_indirect(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer _buffer, VkDevi
          wgpuRenderPassEncoderDrawIndirect(cmd->replay->pass, b.buffer, at);
    }
    }
+}
+
+static void
+draw_indirect(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount,
+              uint32_t stride)
+{
+   if (!drawCount)
+      return;
+   const uint32_t size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+   draw_indirect_bound(cmd, indexed, bound_buffer(cmd, buffer, offset, (uint64_t)(drawCount - 1) * stride + size),
+                       drawCount, stride);
+}
+
+/* vkCmdDraw*IndirectCount, which WebGPU does not have: the draws copied,
+ * those past the count given no instances by a compute shader, and all
+ * of them drawn. */
+static const char draw_count_wgsl[] =
+   "struct P { count_word: u32, stride_words: u32, max: u32 }\n"
+   "@group(0) @binding(0) var<storage, read> count: array<u32>;\n"
+   "@group(0) @binding(1) var<storage, read_write> draws: array<u32>;\n"
+   "@group(0) @binding(2) var<uniform> p: P;\n"
+   "@compute @workgroup_size(64)\n"
+   "fn main(@builtin(global_invocation_id) id: vec3u) {\n"
+   "  if (id.x >= p.max) { return; }\n"
+   "  if (id.x >= count[p.count_word]) { draws[id.x * p.stride_words + 1u] = 0u; }\n"
+   "}\n";
+
+static void
+draw_indirect_count(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDeviceSize offset,
+                    VkBuffer count_buffer, VkDeviceSize count_offset, uint32_t max_draws, uint32_t stride)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   if (!max_draws)
+      return;
+   const uint32_t size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+   const uint64_t bytes = (uint64_t)(max_draws - 1) * stride + size;
+   const struct wvk_bound_buffer b = bound_buffer(cmd, buffer, offset, bytes);
+   const struct wvk_bound_buffer c = bound_buffer(cmd, count_buffer, count_offset, 4);
+   if (!b.buffer || !c.buffer)
+      return;
+   /* A fan's are drawn from the host's copy, the count too. */
+   if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+      uint32_t count = max_draws;
+      if (c.mem && c.mem->host)
+         memcpy(&count, (const uint8_t *)c.mem->host + c.offset, 4);
+      draw_indirect_bound(cmd, indexed, b, MIN2(count, max_draws), stride);
+      return;
+   }
+   simple_mtx_lock(&dev->cache_lock);
+   if (!dev->draw_count_pipeline) {
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(draw_count_wgsl);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk draw count");
+      desc.compute.module = module;
+      desc.compute.entryPoint = wvk_sv("main");
+      dev->draw_count_pipeline = wgpuDeviceCreateComputePipeline(dev->wgpu, &desc);
+      wgpuShaderModuleRelease(module);
+   }
+   const uint64_t serial = ++dev->temp_serial | (1ull << 62);
+   simple_mtx_unlock(&dev->cache_lock);
+   /* Room after them for the window the draw binding shows of them. */
+   WGPUBuffer draws = wvk_replay_temp_buffer(dev, replay, bytes + WVK_DRAW_WINDOW,
+                                             WGPUBufferUsage_Storage | WGPUBufferUsage_Indirect |
+                                             WGPUBufferUsage_CopyDst, NULL);
+   const uint64_t count_base = c.offset & ~255ull;
+   const uint32_t params[4] = { (uint32_t)((c.offset - count_base) / 4), stride / 4, max_draws };
+   WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
+   if (!dev->draw_count_pipeline || !draws || !params_buffer)
+      return;
+   wvk_replay_read(replay, b.mem, b.offset, bytes);
+   wvk_replay_read(replay, c.mem, c.offset, 4);
+   const bool in_pass = replay->pass != NULL;
+   wvk_replay_end_passes(replay);
+   wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, b.buffer, b.offset, draws, 0, align64(bytes, 4));
+   const WGPUBindGroupEntry entries[] = {
+      { .binding = 0, .buffer = c.buffer, .offset = count_base, .size = align64(c.offset + 4 - count_base, 4) },
+      { .binding = 1, .buffer = draws, .offset = 0, .size = align64(bytes, 4) },
+      { .binding = 2, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
+   };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = wgpuComputePipelineGetBindGroupLayout(dev->draw_count_pipeline, 0);
+   bg.entryCount = ARRAY_SIZE(entries);
+   bg.entries = entries;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bg.layout);
+   WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
+   wgpuComputePassEncoderSetPipeline(pass, dev->draw_count_pipeline);
+   wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuComputePassEncoderDispatchWorkgroups(pass, DIV_ROUND_UP(max_draws, 64), 1, 1);
+   wgpuComputePassEncoderEnd(pass);
+   wgpuComputePassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+   if (in_pass)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+   const struct wvk_bound_buffer copy = { NULL, draws, 0, bytes, serial };
+   draw_indirect_bound(cmd, indexed, copy, max_draws, stride);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdDrawIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
+                         VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
+                         uint32_t stride)
+{
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   draw_indirect_count(cmd, false, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDeviceSize offset,
+                                VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
+                                uint32_t stride)
+{
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   draw_indirect_count(cmd, true, buffer, offset, countBuffer, countBufferOffset, maxDrawCount, stride);
 }
 
 VKAPI_ATTR void VKAPI_CALL

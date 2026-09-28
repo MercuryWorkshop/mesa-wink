@@ -85,6 +85,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_copy_commands2 = true,
       .KHR_create_renderpass2 = true,
       .KHR_dedicated_allocation = true,
+      .KHR_draw_indirect_count = true,
       .KHR_depth_stencil_resolve = true,
       .KHR_descriptor_update_template = true,
       .KHR_device_group = true,
@@ -186,6 +187,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
 
       /* Vulkan 1.2 */
       .samplerMirrorClampToEdge = true,
+      /* The draws past the count given no instances (wvk_cmd_draw.c). */
+      .drawIndirectCount = true,
       /* A vertex shader's gl_Layer: vertices of other layers leave the
        * clip volume in each layer's pass. */
       .shaderOutputLayer = true,
@@ -288,7 +291,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .shaderSampleRateInterpolationFunctions = false,
       .tessellationIsolines = false,
       .tessellationPointMode = false,
-      .triangleFans = false,
+      .triangleFans = true, /* as triangle lists (wvk_cmd_draw.c) */
       .vertexAttributeAccessBeyondStride = true,
    };
 }

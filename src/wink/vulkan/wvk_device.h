@@ -68,6 +68,10 @@ struct wvk_device {
     * between buffer layouts, and depth out of a texture. */
    WGPUComputePipeline copy_query_pipeline;
    WGPUComputePipeline add_query_pipeline;
+   WGPUComputePipeline fan_pipeline;
+   WGPUComputePipeline draw_count_pipeline;
+   /* Serials for the driver's own indirect buffers, above any memory's. */
+   uint64_t temp_serial;
    WGPUComputePipeline repack_pipeline;
    /* 16-bit packed texels into and out of RGBA8 textures: 2D arrays and
     * 3D, each way (wvk_cmd_copy.c). */

@@ -105,6 +105,8 @@ struct wvk_replay {
    /* The viewport this draw is drawn in: a draw for each, when the vertex
     * shader chooses (wvk_cmd_draw.c). */
    uint32_t draw_viewport;
+   /* A triangle fan drawn as the list of its triangles (wvk_cmd_draw.c). */
+   bool fan_as_list;
    /* Images with atomics whose buffer of texels is the image now, until
     * the next barrier (wvk_replay_sync_atomic_images). */
    struct util_dynarray atomic_images; /* struct wvk_image * */
