@@ -1698,8 +1698,14 @@ set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
    struct wvk_bound_state *st = cmd->replay->state;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    const VkExtent2D extent = cmd->replay->rendering.extent;
+   /* The draw's viewport, of those a vertex shader chooses among. */
+   const uint32_t index = cmd->replay->draw_viewport;
+   if (memcmp(st->push + WVK_DRIVER_VIEWPORT, &index, 4)) {
+      memcpy(st->push + WVK_DRIVER_VIEWPORT, &index, 4);
+      st->push_offset = UINT32_MAX;
+   }
    if (dyn->vp.viewport_count) {
-      VkViewport v = dyn->vp.viewports[0];
+      VkViewport v = dyn->vp.viewports[MIN2(index, dyn->vp.viewport_count - 1)];
       if (v.height < 0) {
          v.y += v.height;
          v.height = -v.height;
@@ -1738,7 +1744,7 @@ set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
       wgpuRenderPassEncoderSetViewport(pass, x0, y0, x1 - x0, y1 - y0, min_depth, max_depth);
    }
    if (dyn->vp.scissor_count) {
-      const VkRect2D s = dyn->vp.scissors[0];
+      const VkRect2D s = dyn->vp.scissors[MIN2(index, dyn->vp.scissor_count - 1)];
       const int64_t x0 = CLAMP((int64_t)s.offset.x, 0, (int64_t)extent.width);
       const int64_t y0 = CLAMP((int64_t)s.offset.y, 0, (int64_t)extent.height);
       const int64_t x1 = CLAMP((int64_t)s.offset.x + s.extent.width, 0, (int64_t)extent.width);
@@ -1937,6 +1943,27 @@ set_draw_parameters(struct wvk_bound_state *st, const struct wvk_bound_buffer *i
    }
 }
 
+/* How many times a draw is drawn: once in each viewport, when the vertex
+ * shader chooses among them; WebGPU has one. */
+static uint32_t
+draw_viewports(const struct wvk_cmd_buffer *cmd)
+{
+   const struct wvk_bound_state *st = cmd->replay->state;
+   const uint32_t count = cmd->vk.dynamic_graphics_state.vp.viewport_count;
+   return st->vs && st->vs->writes_viewport && count > 1 ? MIN2(count, WVK_MAX_VIEWPORTS) : 1;
+}
+
+/* The next of them, or the first again once all are drawn. */
+static bool
+next_viewport(struct wvk_cmd_buffer *cmd, uint32_t v, uint32_t n)
+{
+   cmd->replay->draw_viewport = v < n ? v : 0;
+   return v < n;
+}
+
+#define foreach_viewport(cmd) \
+   for (uint32_t _v = 0, _n = draw_viewports(cmd); next_viewport(cmd, _v, _n); ++_v)
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
             uint32_t firstVertex, uint32_t firstInstance)
@@ -1944,10 +1971,12 @@ wvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instan
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    if (!vertexCount || !instanceCount)
       return;
-   set_draw_parameters(cmd->replay->state, NULL, 0, false, (int32_t)firstVertex, firstInstance, 0);
-   if (!flush_draw(cmd, false))
-      return;
-   wgpuRenderPassEncoderDraw(cmd->replay->pass, vertexCount, instanceCount, firstVertex, firstInstance);
+   foreach_viewport(cmd) {
+      set_draw_parameters(cmd->replay->state, NULL, 0, false, (int32_t)firstVertex, firstInstance, 0);
+      if (!flush_draw(cmd, false))
+         continue;
+      wgpuRenderPassEncoderDraw(cmd->replay->pass, vertexCount, instanceCount, firstVertex, firstInstance);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1957,11 +1986,13 @@ wvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t 
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    if (!indexCount || !instanceCount)
       return;
-   set_draw_parameters(cmd->replay->state, NULL, 0, true, vertexOffset, firstInstance, 0);
-   if (!flush_draw(cmd, true))
-      return;
-   wgpuRenderPassEncoderDrawIndexed(cmd->replay->pass, indexCount, instanceCount, firstIndex,
-                                    vertexOffset, firstInstance);
+   foreach_viewport(cmd) {
+      set_draw_parameters(cmd->replay->state, NULL, 0, true, vertexOffset, firstInstance, 0);
+      if (!flush_draw(cmd, true))
+         continue;
+      wgpuRenderPassEncoderDrawIndexed(cmd->replay->pass, indexCount, instanceCount, firstIndex,
+                                       vertexOffset, firstInstance);
+   }
 }
 
 static void
@@ -1977,9 +2008,10 @@ draw_indirect(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer _buffer, VkDevi
                                             (uint64_t)(drawCount - 1) * stride + size);
    if (!b.buffer)
       return;
+   foreach_viewport(cmd) {
    set_draw_parameters(st, &b, b.offset, indexed, 0, 0, 0);
    if (!flush_draw(cmd, indexed))
-      return;
+      continue;
    wvk_replay_read(replay, b.mem, b.offset, b.size);
    /* WebGPU draws one command at a time; where a shader reads the draw's
     * parameters, every one moves the driver's group to its own. */
@@ -1996,6 +2028,7 @@ draw_indirect(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer _buffer, VkDevi
          wgpuRenderPassEncoderDrawIndexedIndirect(cmd->replay->pass, b.buffer, at);
       else
          wgpuRenderPassEncoderDrawIndirect(cmd->replay->pass, b.buffer, at);
+   }
    }
 }
 

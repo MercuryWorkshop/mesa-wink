@@ -102,6 +102,9 @@ struct wvk_replay {
    /* Memory for vk_meta's vertices, freed after. */
    struct util_dynarray meta_memory;   /* VkDeviceMemory */
    struct wvk_device *dev;
+   /* The viewport this draw is drawn in: a draw for each, when the vertex
+    * shader chooses (wvk_cmd_draw.c). */
+   uint32_t draw_viewport;
    /* Images with atomics whose buffer of texels is the image now, until
     * the next barrier (wvk_replay_sync_atomic_images). */
    struct util_dynarray atomic_images; /* struct wvk_image * */

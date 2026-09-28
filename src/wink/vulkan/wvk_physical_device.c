@@ -130,6 +130,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_pipeline_creation_feedback = true,
       .EXT_private_data = true,
       .EXT_separate_stencil_usage = true,
+      .EXT_shader_viewport_index_layer = true,
       .EXT_shader_demote_to_helper_invocation = true,
       .EXT_subgroup_size_control = true,
       .EXT_texel_buffer_alignment = true,
@@ -179,12 +180,16 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Vulkan 1.1. A pass of several views is one for each. */
       .shaderDrawParameters = true,
       .multiview = true,
+      /* A draw in each viewport, the vertex shader's gl_ViewportIndex
+       * choosing which (wvk_shader.c). */
+      .multiViewport = true,
 
       /* Vulkan 1.2 */
       .samplerMirrorClampToEdge = true,
       /* A vertex shader's gl_Layer: vertices of other layers leave the
        * clip volume in each layer's pass. */
       .shaderOutputLayer = true,
+      .shaderOutputViewportIndex = true,
       /* Descriptor indexing: bind groups are made when the submit is
        * replayed, so updates after binding are what it sees; a binding
        * never written shows a placeholder. */
@@ -410,7 +415,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
       /* Vulkan's minimum. WebGPU samplers have no bias: it is ignored. */
       .maxSamplerLodBias = WVK_MAX_SAMPLER_LOD_BIAS,
       .maxSamplerAnisotropy = 16.0f,
-      .maxViewports = 1,
+      .maxViewports = WVK_MAX_VIEWPORTS,
       .maxViewportDimensions = { max_2d, max_2d },
       .viewportBoundsRange = { -2.0f * max_2d, 2.0f * max_2d - 1.0f },
       .viewportSubPixelBits = 0,

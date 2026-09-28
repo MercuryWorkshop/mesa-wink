@@ -152,7 +152,8 @@ enum wvk_texel_type {
  *     view a pass renders, 2 uints (a pass per layer or view, see
  *     wvk_cmd_buffer.c);
  *   - each pulled vertex buffer's stride, which may be dynamic, 4 uints;
- *   - a dispatch's base workgroup, 3 uints and one unused. */
+ *   - a dispatch's base workgroup, 3 uints; and the viewport a draw is
+ *     drawn in, a uint (a draw per viewport, see wvk_cmd_draw.c). */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
@@ -162,6 +163,7 @@ enum wvk_texel_type {
 #define WVK_DRIVER_LAYER_OFFSET (WVK_DRIVER_DEPTH_OFFSET + 8)
 #define WVK_DRIVER_PULL_STRIDES (WVK_DRIVER_DATA_OFFSET + 80)
 #define WVK_DRIVER_BASE_GROUP (WVK_DRIVER_DATA_OFFSET + 96)
+#define WVK_DRIVER_VIEWPORT (WVK_DRIVER_BASE_GROUP + 12)
 #define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 112)
 #define WVK_META_OFFSET WVK_PUSH_DATA_SIZE
 /* How much of the push buffer the push binding shows: its data, and as

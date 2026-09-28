@@ -32,6 +32,9 @@
 /* What Vulkan version this driver reports; WINK_VK_API_VERSION=1.3 raises
  * it for applications that check, with 1.3's extra features reported as
  * absent. See wvk_physical_device.c. */
+/* Viewports a vertex shader chooses among, each a draw of its own. */
+#define WVK_MAX_VIEWPORTS 16
+
 /* Vulkan 1.3, but for bufferDeviceAddress: WebGPU has no pointers. */
 #define WVK_API_VERSION VK_MAKE_API_VERSION(0, 1, 3, VK_HEADER_VERSION)
 

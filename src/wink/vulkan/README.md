@@ -64,6 +64,9 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **Arrays of descriptors** are bindings of their own. A dynamic or
   non-uniform index chooses among them in the shader: reads from each,
   selected; writes only where the index is.
+- **Viewports**: WebGPU has one. A vertex shader that writes
+  gl_ViewportIndex has each draw drawn once per viewport, with what is not
+  that draw's out of the clip volume, as layers are.
 - **Passes of several layers or views** are replayed once for each: a
   WebGPU pass renders one layer. A vertex shader's `gl_Layer` chooses by
   moving vertices of other layers out of the clip volume, and the view

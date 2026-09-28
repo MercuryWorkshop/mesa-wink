@@ -827,27 +827,48 @@ lower_layer_outputs(nir_shader *nir, struct wvk_shader *shader)
    if (nir->info.stage != MESA_SHADER_VERTEX)
       return false;
    bool progress = false;
-   nir_variable *layer = NULL, *position = NULL;
+   nir_variable *layer = NULL, *viewport = NULL, *position = NULL;
    nir_foreach_shader_out_variable(var, nir) {
       if (var->data.location == VARYING_SLOT_POS)
          position = var;
       if (var->data.location == VARYING_SLOT_LAYER || var->data.location == VARYING_SLOT_VIEWPORT) {
          if (var->data.location == VARYING_SLOT_LAYER)
             layer = var;
+         else
+            viewport = var;
          var->data.mode = nir_var_shader_temp;
          progress = true;
       }
    }
-   if (layer && position && glsl_type_is_scalar(layer->type)) {
+   if (layer && !glsl_type_is_scalar(layer->type))
+      layer = NULL;
+   if (viewport && !glsl_type_is_scalar(viewport->type))
+      viewport = NULL;
+   /* A viewport is a draw of its own, as a layer is a pass: what is not
+    * the draw's goes out of the clip volume. */
+   if ((layer || viewport) && position) {
       nir_function_impl *impl = nir_shader_get_entrypoint(nir);
       nir_builder b = nir_builder_at(nir_before_impl(impl));
-      nir_store_var(&b, layer, nir_imm_int(&b, 0), 0x1);
+      if (layer)
+         nir_store_var(&b, layer, nir_imm_int(&b, 0), 0x1);
+      if (viewport)
+         nir_store_var(&b, viewport, nir_imm_int(&b, 0), 0x1);
       b.cursor = nir_after_impl(impl);
-      nir_push_if(&b, nir_ine(&b, nir_load_var(&b, layer), driver_layer(&b, 0)));
+      nir_def *elsewhere = nir_imm_false(&b);
+      if (layer)
+         elsewhere = nir_ior(&b, elsewhere, nir_ine(&b, nir_load_var(&b, layer), driver_layer(&b, 0)));
+      if (viewport) {
+         nir_def *drawn = nir_load_ssbo(&b, 1, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                        nir_imm_int(&b, WVK_DRIVER_VIEWPORT), .align_mul = 4,
+                                        .access = ACCESS_NON_WRITEABLE);
+         elsewhere = nir_ior(&b, elsewhere, nir_ine(&b, nir_load_var(&b, viewport), drawn));
+      }
+      nir_push_if(&b, elsewhere);
       nir_store_var(&b, position, nir_imm_vec4(&b, 2.0f, 2.0f, 0.0f, 1.0f), 0xf);
       nir_pop_if(&b, NULL);
       nir_progress(true, impl, nir_metadata_none);
-      shader->writes_layer = true;
+      shader->writes_layer = layer != NULL;
+      shader->writes_viewport = viewport != NULL;
    }
    if (progress) {
       nir_fixup_deref_modes(nir);
@@ -864,6 +885,16 @@ lower_layer_outputs(nir_shader *nir, struct wvk_shader *shader)
 static bool
 lower_layer_id_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
+   if (intr->intrinsic == nir_intrinsic_load_deref && b->shader->info.stage == MESA_SHADER_FRAGMENT &&
+       nir_intrinsic_get_var(intr, 0) && nir_intrinsic_get_var(intr, 0)->data.mode == nir_var_shader_in &&
+       nir_intrinsic_get_var(intr, 0)->data.location == VARYING_SLOT_VIEWPORT) {
+      /* The draw's, of the draw per viewport. */
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def_replace(&intr->def, nir_load_ssbo(b, 1, 32, driver_buffer(b, WVK_DRIVER_SLOT_PUSH),
+                                                nir_imm_int(b, WVK_DRIVER_VIEWPORT), .align_mul = 4,
+                                                .access = ACCESS_NON_WRITEABLE));
+      return true;
+   }
    if (intr->intrinsic != nir_intrinsic_load_layer_id && intr->intrinsic != nir_intrinsic_load_view_index)
       return false;
    b->cursor = nir_before_instr(&intr->instr);
@@ -2172,7 +2203,13 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
             nir->info.stage == MESA_SHADER_VERTEX ? nir_var_shader_out
             : nir->info.stage == MESA_SHADER_FRAGMENT ? nir_var_shader_in : 0);
    NIR_PASS(_, nir, lower_layer_outputs, shader);
-   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_layer_id_instr, nir_metadata_control_flow, NULL);
+   bool viewport_read = false;
+   NIR_PASS(viewport_read, nir, nir_shader_intrinsics_pass, lower_layer_id_instr, nir_metadata_control_flow, NULL);
+   /* gl_ViewportIndex, read from the driver's data: no input of its own. */
+   if (viewport_read && nir->info.stage == MESA_SHADER_FRAGMENT) {
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_in, NULL);
+   }
    if (nir->info.stage == MESA_SHADER_COMPUTE)
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_base_workgroup_instr, nir_metadata_control_flow, NULL);
    split_resource_vars(nir, &state);
@@ -2370,6 +2407,7 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->uses_push_constants);
    blob_write_uint8(blob, shader->uses_draw_parameters);
    blob_write_uint8(blob, shader->writes_layer);
+   blob_write_uint8(blob, shader->writes_viewport);
    blob_write_bytes(blob, shader->meta_base, sizeof(shader->meta_base));
    blob_write_uint32(blob, shader->meta_words);
    blob_write_uint8(blob, shader->pulled_count);
@@ -2397,6 +2435,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const bool uses_push_constants = blob_read_uint8(blob);
    const bool uses_draw_parameters = blob_read_uint8(blob);
    const bool writes_layer = blob_read_uint8(blob);
+   const bool writes_viewport = blob_read_uint8(blob);
    uint32_t meta_base[4];
    blob_copy_bytes(blob, meta_base, sizeof(meta_base));
    const uint32_t meta_words = blob_read_uint32(blob);
@@ -2432,6 +2471,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->uses_push_constants = uses_push_constants;
    shader->uses_draw_parameters = uses_draw_parameters;
    shader->writes_layer = writes_layer;
+   shader->writes_viewport = writes_viewport;
    memcpy(shader->meta_base, meta_base, sizeof(meta_base));
    shader->meta_words = meta_words;
    shader->pulled_count = MIN2(pulled_count, WVK_MAX_PULLED_BINDINGS);

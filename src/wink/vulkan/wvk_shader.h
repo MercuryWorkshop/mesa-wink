@@ -44,7 +44,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 7
+#define WVK_SHADER_BINARY_VERSION 8
 
 enum wvk_shader_variant {
    /* Vulkan's y points down, WebGPU's up: gl_Position.y negated. */
@@ -83,6 +83,8 @@ struct wvk_shader {
    /* Vertex: gl_Layer written, so that a pass per layer draws it in every
     * one. */
    bool writes_layer;
+   /* The vertex shader writes gl_ViewportIndex: a draw for each viewport. */
+   bool writes_viewport;
    /* Where each set's records start among the records in the push
     * binding, in words, and how many there are: the pipeline layout's. */
    uint32_t meta_base[4];
