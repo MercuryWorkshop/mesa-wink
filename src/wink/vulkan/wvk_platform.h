@@ -40,6 +40,9 @@ WGPUAdapter wvk_platform_request_adapter(WGPUInstance instance);
 WGPUDevice wvk_platform_request_device(WGPUInstance instance, WGPUAdapter adapter,
                                        const WGPUDeviceDescriptor *desc);
 
+/* How big a canvas's surface is, in a browser; natively false. */
+bool wvk_platform_surface_extent(WGPUSurface surface, VkExtent2D *extent);
+
 /* Let the frame go to the screen: in a browser, the event loop has to run
  * for the canvas to present, and FIFO waits for the next frame there. */
 void wvk_platform_present_yield(bool fifo);

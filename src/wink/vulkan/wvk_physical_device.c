@@ -389,9 +389,21 @@ get_device_properties(const struct wvk_physical_device *pdev,
    case WGPUBackendType_WebGPU: backend = "browser"; break;
    default: backend = "WebGPU"; break;
    }
-   const WGPUStringView name = wvk_sv_len(pdev->info.device) ? pdev->info.device : pdev->info.description;
-   snprintf(p->deviceName, sizeof(p->deviceName), "wink on %.*s (%s)",
-            wvk_sv_len(name), name.data ? name.data : "WebGPU", backend);
+   /* A browser keeps the device's name to itself, and says at most the
+    * vendor and the architecture. */
+   const WGPUAdapterInfo *info = &pdev->info;
+   char what[128];
+   if (wvk_sv_len(info->device) || wvk_sv_len(info->description)) {
+      const WGPUStringView name = wvk_sv_len(info->device) ? info->device : info->description;
+      snprintf(what, sizeof(what), "%.*s", wvk_sv_len(name), name.data);
+   } else if (wvk_sv_len(info->vendor)) {
+      snprintf(what, sizeof(what), "%.*s%s%.*s", wvk_sv_len(info->vendor), info->vendor.data,
+               wvk_sv_len(info->architecture) ? " " : "", wvk_sv_len(info->architecture),
+               info->architecture.data ? info->architecture.data : "");
+   } else {
+      snprintf(what, sizeof(what), "WebGPU");
+   }
+   snprintf(p->deviceName, sizeof(p->deviceName), "wink on %s (%s)", what, backend);
 
    memcpy(p->pipelineCacheUUID, instance->driver_uuid, VK_UUID_SIZE);
    memcpy(p->driverUUID, instance->driver_uuid, VK_UUID_SIZE);

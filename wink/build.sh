@@ -126,6 +126,16 @@ for v in $WINK_VARIANTS; do
       run node "$WINK_DIR/test/run-browser.mjs" "$WINK_BUILD_ROOT/test/$v" --page=offscreen.html \
         || die "OffscreenCanvas smoke test failed"
     fi
+    # The Vulkan driver: its native tests, with a shim for a loader.
+    if have glslangValidator; then
+      run bash "$WINK_DIR/test/vk/build-vk.sh" "$v" "$WINK_OUT/$v" "$WINK_EMBIN/emcc" "$WINK_BUILD_ROOT/test/vk-$v" >/dev/null
+      for t in wvk_smoke wvk_draw; do
+        run node "$WINK_DIR/test/run-browser.mjs" "$WINK_BUILD_ROOT/test/vk-$v" "--page=vk.html?test=$t" \
+          || die "Vulkan test $t failed"
+      done
+    else
+      log "no glslangValidator: skipping the Vulkan tests"
+    fi
   fi
 done
 WINK_STAGE=wink

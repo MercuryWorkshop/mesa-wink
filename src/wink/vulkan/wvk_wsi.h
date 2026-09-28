@@ -35,6 +35,8 @@ struct wvk_surface {
 
    /* NULL for a headless surface: presenting to it shows nothing. */
    WGPUSurface wgpu;
+   /* A canvas's, whose size the swapchain has to have. */
+   bool canvas;
 
    /* The swapchain the surface is configured for: the newest one. */
    struct wvk_swapchain *swapchain;
@@ -57,6 +59,11 @@ wvk_surface_to_handle(struct wvk_surface *surface)
 VkResult wvk_surface_create(struct wvk_instance *instance, VkIcdWsiPlatform platform,
                             WGPUSurface wgpu, const VkAllocationCallbacks *pAllocator,
                             VkSurfaceKHR *pSurface);
+
+/* In a browser: a surface on the canvas `selector` names (libwink's
+ * wink_vk_create_surface). */
+VkResult wvk_create_canvas_surface(VkInstance instance, const char *selector,
+                                   const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface);
 
 struct wvk_swapchain {
    struct vk_object_base base;

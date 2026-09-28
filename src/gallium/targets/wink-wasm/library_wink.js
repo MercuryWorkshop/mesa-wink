@@ -202,6 +202,37 @@ var LibraryWink = {
     WINK.wakeAll();
   },
 
+  // The Vulkan driver's waits (wvk_platform_emscripten.c): until a WebGPU
+  // callback signals, or `ms` pass (negative: no timeout). Waiters share
+  // gex's list: any callback is reason for every waiter to look again.
+  wvk_js_wait__deps: ['$WINK'],
+  wvk_js_wait: function (ms) {
+    if (WINK.lost) return;
+    return WINK.suspend(new Promise(function (resolve) {
+      WINK.waiting.push(resolve);
+      if (ms >= 0) setTimeout(resolve, ms);
+    }));
+  },
+  wvk_js_wait__postset:
+    "if (typeof WebAssembly.Suspending == 'function') _wvk_js_wait = new WebAssembly.Suspending(_wvk_js_wait);",
+
+  wvk_js_signal__deps: ['$WINK'],
+  wvk_js_signal: function () {
+    WINK.wakeAll();
+  },
+
+  // The size of the canvas behind a surface: what a Vulkan swapchain on it
+  // has to be, as the canvas's texture is its drawing buffer.
+  wvk_js_surface_extent__deps: ['$WebGPU'],
+  wvk_js_surface_extent: function (surfacePtr, widthPtr, heightPtr) {
+    var context = WebGPU.getJsObject(surfacePtr);
+    var canvas = context && context['canvas'];
+    if (!canvas) return 0;
+    HEAPU32[widthPtr >> 2] = canvas['width'];
+    HEAPU32[heightPtr >> 2] = canvas['height'];
+    return 1;
+  },
+
   wink_js_has_jspi: function () {
     return (typeof WebAssembly.Suspending == 'function' &&
             typeof WebAssembly.promising == 'function') ? 1 : 0;

@@ -1189,3 +1189,44 @@ wink_swap_buffers(wink_surface *s)
       wink_js_yield_frame(s->swap_interval);
    return WINK_OK;
 }
+
+/* ---------------------------------------------------------------------- */
+/* Vulkan: src/wink/vulkan's entry points, under wink's names. */
+
+#ifdef WINK_HAVE_VULKAN
+#include <vulkan/vulkan_core.h>
+
+PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);
+VkResult wvk_create_canvas_surface(VkInstance instance, const char *selector,
+                                   const VkAllocationCallbacks *allocator, VkSurfaceKHR *surface);
+
+WINK_EXPORT wink_vk_void_function
+wink_vk_get_instance_proc_addr(void *instance, const char *name)
+{
+   return (wink_vk_void_function)vk_icdGetInstanceProcAddr((VkInstance)instance, name);
+}
+
+WINK_EXPORT int
+wink_vk_create_surface(void *instance, const char *selector, uint64_t *surface)
+{
+   VkSurfaceKHR s = VK_NULL_HANDLE;
+   const VkResult result = wvk_create_canvas_surface((VkInstance)instance, selector, NULL, &s);
+   *surface = (uint64_t)s;
+   return result;
+}
+#else
+/* Built without the Vulkan driver: there is none to find, so windowing
+ * layers can ask without knowing how wink was built. */
+WINK_EXPORT wink_vk_void_function
+wink_vk_get_instance_proc_addr(void *instance, const char *name)
+{
+   return NULL;
+}
+
+WINK_EXPORT int
+wink_vk_create_surface(void *instance, const char *selector, uint64_t *surface)
+{
+   *surface = 0;
+   return -3; /* VK_ERROR_INITIALIZATION_FAILED */
+}
+#endif

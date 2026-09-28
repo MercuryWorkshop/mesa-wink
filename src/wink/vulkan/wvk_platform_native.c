@@ -48,3 +48,9 @@ wvk_platform_present_yield(bool fifo)
 {
    /* Dawn's surface paces FIFO itself, in getCurrentTexture. */
 }
+
+bool
+wvk_platform_surface_extent(WGPUSurface surface, VkExtent2D *extent)
+{
+   return false;
+}

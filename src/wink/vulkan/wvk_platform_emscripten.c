@@ -8,6 +8,8 @@
  * of them signals, or a timer does. The caller then looks at its flags.
  */
 #include "wvk_platform.h"
+#include "wvk_instance.h"
+#include "wvk_wsi.h"
 
 #include <math.h>
 
@@ -16,6 +18,8 @@
 extern void wvk_js_wait(double timeout_ms);
 extern void wvk_js_signal(void);
 extern void wink_js_yield_frame(int frames);
+extern WGPUSurface wink_js_create_surface(const char *selector);
+extern int wvk_js_surface_extent(WGPUSurface surface, uint32_t *width, uint32_t *height);
 
 WGPUInstance
 wvk_platform_create_instance(void)
@@ -61,4 +65,29 @@ wvk_platform_present_yield(bool fifo)
    /* The canvas presents when the task ends: FIFO waits for the next
     * frame, and the rest only let the event loop run. */
    wink_js_yield_frame(fifo ? 1 : 0);
+}
+
+/* A surface on a canvas, found as GL's surfaces are (library_wink.js):
+ * what wink_vk_create_surface gives an application, since Vulkan has no
+ * surface extension for a canvas. */
+PUBLIC VkResult
+wvk_create_canvas_surface(VkInstance _instance, const char *selector,
+                          const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface)
+{
+   VK_FROM_HANDLE(wvk_instance, instance, _instance);
+   if (!wvk_instance_wgpu(instance))
+      return vk_error(instance, VK_ERROR_INITIALIZATION_FAILED);
+   WGPUSurface wgpu = wink_js_create_surface(selector);
+   if (!wgpu)
+      return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED, "no canvas for %s", selector ? selector : "(none)");
+   VkResult result = wvk_surface_create(instance, VK_ICD_WSI_PLATFORM_HEADLESS, wgpu, pAllocator, pSurface);
+   if (result == VK_SUCCESS)
+      wvk_surface_from_handle(*pSurface)->canvas = true;
+   return result;
+}
+
+bool
+wvk_platform_surface_extent(WGPUSurface surface, VkExtent2D *extent)
+{
+   return wvk_js_surface_extent(surface, &extent->width, &extent->height) != 0;
 }

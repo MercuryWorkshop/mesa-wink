@@ -22,6 +22,7 @@
 libwink_api = static_library(
   'wink_api',
   files('wink.c', 'wink_driconf.c', 'wink_emscripten_compat.c'),
+  c_args : with_wink_vk ? ['-DWINK_HAVE_VULKAN'] : [],
   include_directories : [
     inc_include,
     inc_src,
@@ -37,12 +38,18 @@ libwink_api = static_library(
   build_by_default : false,
 )
 
+# The Vulkan driver, whole: its entrypoint tables reach the driver's and
+# the runtime's functions only weakly, which pulls nothing from an archive.
+# libwvk holds the runtime's objects already (it links the runtime whole).
+wink_vk_whole = with_wink_vk ? [libwvk] : []
+wink_vk_deps = with_wink_vk ? [idep_vulkan_util] : []
+
 wink_reloc = executable(
   'wink',
   name_suffix : 'o',
-  link_whole : [libwink_api],
+  link_whole : [libwink_api] + wink_vk_whole,
   link_with : [libglapi, libgallium, libmesa, libgex_wgpu],
-  dependencies : [idep_mesautil, idep_nir, idep_libglsl, idep_xmlconfig, dep_thread, dep_clock],
+  dependencies : [idep_mesautil, idep_nir, idep_libglsl, idep_xmlconfig, dep_thread, dep_clock] + wink_vk_deps,
   link_args : ['-r'],
   install : false,
 )

@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<meta charset="utf-8">
+<title>wink Vulkan test</title>
+<canvas id="canvas" width="64" height="48"></canvas>
+<script type="module">
+  const log = [];
+  globalThis.__winkResult = null;
+  const test = new URLSearchParams(location.search).get('test') || 'wvk_smoke';
+  try {
+    const { default: create } = await import('./' + test + '.js');
+    const Module = await create({
+      print: (s) => { log.push(s); console.log(s); },
+      printErr: (s) => { log.push(s); console.warn(s); },
+      canvas: document.getElementById('canvas'),
+    });
+    const main = WebAssembly.promising(Module.wvkTestRaw);
+    const rc = await main();
+    globalThis.__winkResult = { pass: rc === 0, rc, log };
+  } catch (e) {
+    log.push('exception: ' + (e && e.stack || e));
+    console.error('exception: ' + (e && e.stack || e));
+    globalThis.__winkResult = { pass: false, rc: -1, log };
+  }
+</script>

@@ -5,6 +5,7 @@
 // console, and wait for the page to set globalThis.__winkResult.
 //
 //   node run-browser.mjs <dir> [--page=index.html] [--timeout=SECONDS]
+//                               [--pause-after=SECONDS]  (print where the page is)
 //
 // The server always sends COOP/COEP: the mt build needs SharedArrayBuffer,
 // and the st build does not mind them. CHROME overrides the browser;
@@ -18,8 +19,10 @@ import { extname, join, normalize } from 'node:path';
 
 const dir = process.argv[2];
 const timeout = Number((process.argv.find((a) => a.startsWith('--timeout=')) || '=120').split('=')[1]) * 1000;
-const pageName = (process.argv.find((a) => a.startsWith('--page=')) || '=index.html').split('=')[1];
-if (!dir || !existsSync(join(dir, pageName))) {
+const pageArg = process.argv.find((a) => a.startsWith('--page=')) || '--page=index.html';
+const pageName = pageArg.slice(pageArg.indexOf('=') + 1);
+// A page may take a query (vk.html?test=...): the file is what precedes it.
+if (!dir || !existsSync(join(dir, pageName.split('?')[0]))) {
   console.error('usage: run-browser.mjs <dir> [--page=index.html] [--timeout=SECONDS]');
   process.exit(2);
 }
@@ -99,16 +102,23 @@ ws.addEventListener('message', (e) => {
     pending.delete(msg.id);
   } else if (msg.method === 'Runtime.consoleAPICalled') {
     console.log('[page]', msg.params.args.map((a) => a.value ?? a.description ?? '').join(' '));
+  } else if (msg.method === 'Debugger.paused') {
+    // --pause-after: where the page was, innermost first.
+    console.log('[paused]\n  ' + msg.params.callFrames.map((f) => f.functionName || '(anonymous)').join('\n  '));
   } else if (msg.method === 'Runtime.exceptionThrown') {
     console.log('[page exception]', msg.params.exceptionDetails.exception?.description || msg.params.exceptionDetails.text);
   }
 });
 await new Promise((r) => ws.addEventListener('open', r, { once: true }));
+// A page busy in wasm answers nothing: every call gives up after 10s, so
+// the overall timeout still ends the run.
 const call = (method, params = {}) => new Promise((resolve) => {
   const id = ++nextId;
-  pending.set(id, resolve);
+  const timer = setTimeout(() => { pending.delete(id); resolve({}); }, 10000);
+  pending.set(id, (msg) => { clearTimeout(timer); resolve(msg); });
   ws.send(JSON.stringify({ id, method, params }));
 });
+const pauseAfter = Number((process.argv.find((a) => a.startsWith('--pause-after=')) || '=0').split('=')[1]);
 
 let result = null;
 let code = 1;
@@ -116,6 +126,10 @@ try {
   await call('Runtime.enable');
   await call('Page.navigate', { url });
   const deadline = Date.now() + timeout;
+  if (pauseAfter) {
+    await call('Debugger.enable');
+    setTimeout(() => { call('Debugger.pause'); }, pauseAfter * 1000);
+  }
   while (Date.now() < deadline) {
     const r = await call('Runtime.evaluate', { expression: 'JSON.stringify(globalThis.__winkResult ?? null)', returnByValue: true });
     const v = r.result?.result?.value;

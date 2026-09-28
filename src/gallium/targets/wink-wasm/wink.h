@@ -185,6 +185,28 @@ WINK_EXPORT int wink_swap_interval(wink_surface *surface, int interval);
  * windowing layer whose WebGL fallback shares the loop. */
 WINK_EXPORT void wink_yield_frames(int frames);
 
+/* ---------------------------------------------------------------------- */
+/* Vulkan
+ *
+ * Vulkan 1.2, with VK_KHR_portability_subset, on WebGPU too: for an
+ * application that links wink and no loader. It needs no wink_init, as an
+ * instance requests its own WebGPU device. What waits -- vkCreateDevice,
+ * fences, vkQueuePresentKHR's frame pacing -- suspends through JSPI, so the
+ * export that leads there must have been entered through
+ * WebAssembly.promising. Present shows the frame when the calling thread
+ * next returns to its event loop, which a FIFO present waits for. */
+
+/* vkGetInstanceProcAddr, from which everything else comes; NULL for every
+ * name if wink was built without the Vulkan driver. */
+typedef void (*wink_vk_void_function)(void);
+WINK_EXPORT wink_vk_void_function wink_vk_get_instance_proc_addr(void *instance, const char *name);
+
+/* A VkSurfaceKHR on the canvas that `selector` names, found as
+ * wink_create_surface finds one; the instance needs VK_KHR_surface. Returns
+ * a VkResult. The swapchain on it has to be the canvas's size, which is its
+ * currentExtent. */
+WINK_EXPORT int wink_vk_create_surface(void *instance, const char *selector, uint64_t *surface);
+
 /* Non-zero once the WebGPU device is lost; every later call fails. */
 WINK_EXPORT int wink_device_lost(void);
 WINK_EXPORT const char *wink_status_string(int status);

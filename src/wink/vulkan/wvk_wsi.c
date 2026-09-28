@@ -203,6 +203,9 @@ surface_current_extent(const struct wvk_surface *surface)
    if (surface->icd.base.platform == VK_ICD_WSI_PLATFORM_METAL)
       return metal_layer_extent(surface->icd.metal.pLayer);
 #endif
+   VkExtent2D extent;
+   if (surface->canvas && wvk_platform_surface_extent(surface->wgpu, &extent))
+      return extent;
    return (VkExtent2D){ UINT32_MAX, UINT32_MAX };
 }
 
