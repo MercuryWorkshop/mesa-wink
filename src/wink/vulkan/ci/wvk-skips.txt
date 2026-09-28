@@ -1,2 +1,7 @@
 # Tests not run on the wink Vulkan driver: they hang, or take far longer
 # than they tell anything.
+
+# Invalid on this device: a vertex stride of 2, where the portability
+# subset's minVertexInputBindingStrideAlignment is 4. The test's own check
+# for that only covers the array group.
+dEQP-VK.draw.*.output_location.shuffle.inputs-outputs-mod

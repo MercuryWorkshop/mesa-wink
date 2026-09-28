@@ -75,13 +75,15 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
  *   - a direct draw's BaseVertex and BaseInstance, which those words name
  *     then, 4 uints;
  *   - where each pulled vertex buffer's bound range starts in its binding,
- *     in bytes, 4 uints. */
+ *     in bytes, 4 uints;
+ *   - the viewport transform's depth part, 2 floats and 2 of padding. */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
 #define WVK_DRIVER_DRAW_VALUES (WVK_DRIVER_DATA_OFFSET + 32)
 #define WVK_DRIVER_PULL_OFFSET (WVK_DRIVER_DATA_OFFSET + 48)
-#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 64)
+#define WVK_DRIVER_DEPTH_OFFSET (WVK_DRIVER_DATA_OFFSET + 64)
+#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 80)
 
 /* What a group-3 bind group's driver bindings are bound to: the push
  * buffer's generation, and memory serials (0: none) for the draw binding

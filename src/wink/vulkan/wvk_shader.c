@@ -966,7 +966,14 @@ lower_viewport_transform(nir_shader *nir)
                                   nir_fmul(&b, w, nir_channel(&b, t, 1)));
             nir_def *y = nir_ffma(&b, nir_channel(&b, pos, 1), nir_channel(&b, t, 2),
                                   nir_fmul(&b, w, nir_channel(&b, t, 3)));
-            nir_src_rewrite(&intr->src[1], nir_vec4(&b, x, y, nir_channel(&b, pos, 2), w));
+            /* Depth: w - z where Vulkan's range is inverted, which WebGPU's
+             * cannot be. */
+            nir_def *d = nir_load_ssbo(&b, 2, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                       nir_imm_int(&b, WVK_DRIVER_DEPTH_OFFSET), .align_mul = 16,
+                                       .access = ACCESS_NON_WRITEABLE);
+            nir_def *z = nir_ffma(&b, nir_channel(&b, pos, 2), nir_channel(&b, d, 0),
+                                  nir_fmul(&b, w, nir_channel(&b, d, 1)));
+            nir_src_rewrite(&intr->src[1], nir_vec4(&b, x, y, z, w));
             progress = true;
          }
       }
@@ -1133,13 +1140,14 @@ pad_fragment_outputs(nir_shader *nir)
       return false;
    bool progress = false;
    nir_foreach_shader_out_variable(var, nir) {
-      if (var->data.location < FRAG_RESULT_DATA0 || glsl_type_is_array(var->type))
+      if (var->data.location < FRAG_RESULT_DATA0)
          continue;
-      const unsigned n = glsl_get_vector_elements(var->type);
-      if (n == 4 || !glsl_type_is_vector_or_scalar(var->type))
+      /* An array is an output per element. */
+      const struct glsl_type *old = glsl_without_array(var->type);
+      if (!glsl_type_is_vector_or_scalar(old) || glsl_get_vector_elements(old) == 4)
          continue;
-      const struct glsl_type *old = var->type;
-      var->type = glsl_vector_type(glsl_get_base_type(old), 4);
+      const struct glsl_type *vec4 = glsl_vector_type(glsl_get_base_type(old), 4);
+      var->type = glsl_type_is_array(var->type) ? glsl_array_type(vec4, glsl_get_length(var->type), 0) : vec4;
       nir_foreach_function_impl(impl, nir) {
          nir_builder b = nir_builder_create(impl);
          nir_foreach_block(block, impl) {
@@ -1147,9 +1155,20 @@ pad_fragment_outputs(nir_shader *nir)
                if (instr->type != nir_instr_type_intrinsic)
                   continue;
                nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-               if (intr->intrinsic != nir_intrinsic_store_deref ||
-                   nir_intrinsic_get_var(intr, 0) != var)
+               if ((intr->intrinsic != nir_intrinsic_store_deref && intr->intrinsic != nir_intrinsic_load_deref) ||
+                   nir_intrinsic_get_var(intr, 0) != var ||
+                   !glsl_type_is_vector_or_scalar(nir_src_as_deref(intr->src[0])->type))
                   continue;
+               if (intr->intrinsic == nir_intrinsic_load_deref) {
+                  /* Reading the output back: the components it had. */
+                  const unsigned n = intr->def.num_components;
+                  b.cursor = nir_after_instr(instr);
+                  intr->num_components = 4;
+                  intr->def.num_components = 4;
+                  nir_def *trimmed = nir_trim_vector(&b, &intr->def, n);
+                  nir_def_rewrite_uses_after(&intr->def, trimmed);
+                  continue;
+               }
                b.cursor = nir_before_instr(instr);
                nir_def *value = intr->src[1].ssa;
                nir_def *comps[4];
@@ -1157,6 +1176,7 @@ pad_fragment_outputs(nir_shader *nir)
                   comps[c] = c < value->num_components ? nir_channel(&b, value, c)
                                                        : nir_imm_zero(&b, 1, value->bit_size);
                nir_src_rewrite(&intr->src[1], nir_vec(&b, comps, 4));
+               intr->num_components = 4;
                nir_intrinsic_set_write_mask(intr, 0xf);
             }
          }
@@ -1579,12 +1599,43 @@ fail:
    return result;
 }
 
+/* WebGPU wants a vertex output interpolated and sampled as the fragment
+ * input it feeds is, where Vulkan goes by the fragment shader alone. A
+ * pipeline's stages are compiled together, and hashed together, so the
+ * vertex shader takes the fragment shader's. */
+static void
+link_interpolation(nir_shader *producer, nir_shader *fs)
+{
+   nir_foreach_shader_out_variable(out, producer) {
+      if (out->data.location < VARYING_SLOT_VAR0)
+         continue;
+      const unsigned out_end = out->data.location + glsl_count_attribute_slots(out->type, false);
+      nir_foreach_shader_in_variable(in, fs) {
+         const unsigned in_end = in->data.location + glsl_count_attribute_slots(in->type, false);
+         if (in->data.location >= out_end || out->data.location >= in_end)
+            continue;
+         out->data.interpolation = in->data.interpolation;
+         out->data.centroid = in->data.centroid;
+         out->data.sample = in->data.sample;
+      }
+   }
+}
+
 static VkResult
 wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_compile_info *infos,
             const struct vk_graphics_pipeline_state *state, const struct vk_features *enabled_features,
             const VkAllocationCallbacks *pAllocator, struct vk_shader **shaders_out)
 {
    struct wvk_device *dev = container_of(vk_dev, struct wvk_device, vk);
+   nir_shader *vs = NULL, *fs = NULL;
+   for (uint32_t i = 0; i < shader_count; ++i) {
+      if (infos[i].stage == MESA_SHADER_VERTEX)
+         vs = infos[i].nir;
+      else if (infos[i].stage == MESA_SHADER_FRAGMENT)
+         fs = infos[i].nir;
+   }
+   if (vs && fs)
+      link_interpolation(vs, fs);
    for (uint32_t i = 0; i < shader_count; ++i) {
       VkResult result = compile_one(dev, &infos[i], state, pAllocator, &shaders_out[i]);
       if (result != VK_SUCCESS) {

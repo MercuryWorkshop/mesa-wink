@@ -677,6 +677,8 @@ wvk_replay_reset_state(struct wvk_replay *replay)
       replay->state->push_offset = UINT32_MAX;
       const float identity[4] = { 1, 0, 1, 0 };
       memcpy(replay->state->push + WVK_DRIVER_DATA_OFFSET, identity, sizeof(identity));
+      const float depth[2] = { 1, 0 };
+      memcpy(replay->state->push + WVK_DRIVER_DEPTH_OFFSET, depth, sizeof(depth));
    }
 }
 
@@ -1374,8 +1376,17 @@ set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
          memcpy(st->push + WVK_DRIVER_DATA_OFFSET, transform, sizeof(transform));
          st->push_offset = UINT32_MAX;
       }
+      /* An inverted depth range is the range the right way round, and the
+       * shader's depth w - z: minDepth + z (maxDepth - minDepth) is
+       * maxDepth + (1 - z) (minDepth - maxDepth). */
+      const bool inverted = v.minDepth > v.maxDepth;
       const float min_depth = CLAMP(MIN2(v.minDepth, v.maxDepth), 0.0f, 1.0f);
       const float max_depth = CLAMP(MAX2(v.minDepth, v.maxDepth), 0.0f, 1.0f);
+      const float depth[2] = { inverted ? -1.0f : 1.0f, inverted ? 1.0f : 0.0f };
+      if (memcmp(st->push + WVK_DRIVER_DEPTH_OFFSET, depth, sizeof(depth))) {
+         memcpy(st->push + WVK_DRIVER_DEPTH_OFFSET, depth, sizeof(depth));
+         st->push_offset = UINT32_MAX;
+      }
       wgpuRenderPassEncoderSetViewport(pass, x0, y0, x1 - x0, y1 - y0, min_depth, max_depth);
    }
    if (dyn->vp.scissor_count) {
