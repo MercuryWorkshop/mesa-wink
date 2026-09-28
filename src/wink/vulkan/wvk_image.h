@@ -21,6 +21,12 @@ struct wvk_image {
    /* A multisampled array, which WebGPU has no textures of: a texture of
     * each layer, of which `texture` is the first. */
    WGPUTexture *layer_textures;
+   /* A compressed image whose size is not whole blocks: its texture is the
+    * next size up, which sampling would see. So it is sampled from this,
+    * of its own size and uncompressed, which what is copied to the image
+    * is decoded into (wvk_cmd_copy.c). */
+   WGPUTexture shadow;
+   WGPUTextureFormat shadow_format;
    WGPUTextureFormat format;
    WGPUTextureDimension dimension;
    WGPUTextureUsage usage;
@@ -44,6 +50,11 @@ struct wvk_image {
    uint32_t atomic_pitch[16];
    bool atomic_in_buffer;
 };
+
+/* Decode what the image's texture has at a level, in layers or a 3D
+ * image's every slice, into its shadow, after a copy there. */
+void wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+                             uint32_t level, uint32_t base_layer, uint32_t layer_count);
 
 /* The texture layer `layer` of the image is in, and which layer of it. */
 static inline WGPUTexture

@@ -179,8 +179,6 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   only. Alpha to coverage with a sample mask the shader writes.
 - Subgroups are one invocation each: Tint reads no subgroup operations from
   SPIR-V. Every operation but the quad ones is there, trivially.
-- Compressed images whose size is not a whole number of blocks: WebGPU's
-  texture is the whole blocks, and sampling it covers the padding.
 - Blend states whose colour factors use both CONSTANT_COLOR and
   CONSTANT_ALPHA: WebGPU has one constant.
 - Multisampled array images are a texture for each layer, since WebGPU

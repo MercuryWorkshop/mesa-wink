@@ -292,7 +292,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .pointPolygons = false,
       .samplerMipLodBias = true,
       .separateStencilMaskRef = true, /* a draw for each face (wvk_cmd_draw.c) */
-      .shaderSampleRateInterpolationFunctions = false,
+      .shaderSampleRateInterpolationFunctions = true, /* by derivatives (wvk_shader.c) */
       .tessellationIsolines = false,
       .tessellationPointMode = false,
       .triangleFans = true, /* as triangle lists (wvk_cmd_draw.c) */

@@ -21,6 +21,7 @@
 
 #include "vk_format.h"
 #include "util/format/u_format.h"
+#include "util/ralloc.h"
 
 static WGPUBuffer
 buffer_wgpu(const struct wvk_buffer *buffer)
@@ -726,6 +727,121 @@ depth_in(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *im
    wgpuBindGroupLayoutRelease(bgl);
 }
 
+/* Compressed texels into a shadow of a size not whole blocks: a triangle
+ * over a layer or slice, which the instance is, loading each texel. */
+static const char shadow_wgsl[] =
+   "struct V { @builtin(position) pos: vec4f, @location(0) @interpolate(flat) z: u32 }\n"
+   "@vertex fn vs(@builtin(vertex_index) i: u32, @builtin(instance_index) z: u32) -> V {\n"
+   "  let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n"
+   "  return V(vec4f(uv * 2.0 - 1.0, 0.0, 1.0), z);\n"
+   "}\n"
+   "@fragment fn fs(v: V) -> @location(0) vec4f {\n"
+   "  return LOAD;\n"
+   "}\n";
+
+static WGPURenderPipeline
+shadow_pipeline(struct wvk_device *dev, WGPUTextureFormat format, bool is_3d)
+{
+   const uint32_t which = format == WGPUTextureFormat_RGBA8Unorm ? 0
+                          : format == WGPUTextureFormat_RGBA8UnormSrgb ? 1 : 2;
+   simple_mtx_lock(&dev->cache_lock);
+   WGPURenderPipeline *slot = &dev->shadow_pipelines[which][is_3d];
+   if (!*slot) {
+      const char *decl = is_3d ? "@group(0) @binding(0) var src: texture_3d<f32>;\n"
+                               : "@group(0) @binding(0) var src: texture_2d_array<f32>;\n";
+      const char *load = is_3d ? "textureLoad(src, vec3i(vec2i(v.pos.xy), i32(v.z)), 0)"
+                               : "textureLoad(src, vec2i(v.pos.xy), i32(v.z), 0)";
+      char *body = strdup(shadow_wgsl);
+      char *at = strstr(body, "LOAD");
+      *at = '\0';
+      char *code = ralloc_asprintf(NULL, "%s%s%s%s", decl, body, load, at + 4);
+      free(body);
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(code);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      sm.label = wvk_sv("wvk shadow");
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      ralloc_free(code);
+      WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+      target.format = format;
+      WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+      fragment.module = module;
+      fragment.entryPoint = wvk_sv("fs");
+      fragment.targetCount = 1;
+      fragment.targets = &target;
+      WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk shadow");
+      desc.vertex.module = module;
+      desc.vertex.entryPoint = wvk_sv("vs");
+      desc.fragment = &fragment;
+      *slot = wgpuDeviceCreateRenderPipeline(dev->wgpu, &desc);
+      wgpuShaderModuleRelease(module);
+   }
+   WGPURenderPipeline pipeline = *slot;
+   simple_mtx_unlock(&dev->cache_lock);
+   return pipeline;
+}
+
+void
+wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+                        uint32_t level, uint32_t base_layer, uint32_t layer_count)
+{
+   const bool is_3d = image->dimension == WGPUTextureDimension_3D;
+   WGPURenderPipeline pipeline = shadow_pipeline(dev, image->shadow_format, is_3d);
+   if (!pipeline)
+      return;
+   if (is_3d) {
+      base_layer = 0;
+      layer_count = u_minify(image->vk.extent.depth, level);
+   }
+
+   WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   vd.dimension = is_3d ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2DArray;
+   vd.baseMipLevel = level;
+   vd.mipLevelCount = 1;
+   vd.baseArrayLayer = 0;
+   vd.arrayLayerCount = is_3d ? 1 : image->vk.array_layers;
+   WGPUTextureView src = wgpuTextureCreateView(image->texture, &vd);
+   util_dynarray_append(&replay->views, src);
+   WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+   const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = bgl;
+   bg.entryCount = 1;
+   bg.entries = &entry;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bgl);
+
+   wvk_replay_end_passes(replay);
+   for (uint32_t z = base_layer; z < base_layer + layer_count; ++z) {
+      WGPUTextureViewDescriptor ad = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+      ad.dimension = is_3d ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2D;
+      ad.baseMipLevel = level;
+      ad.mipLevelCount = 1;
+      ad.baseArrayLayer = is_3d ? 0 : z;
+      ad.arrayLayerCount = 1;
+      WGPUTextureView view = wgpuTextureCreateView(image->shadow, &ad);
+      util_dynarray_append(&replay->views, view);
+      WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+      color.view = view;
+      color.depthSlice = is_3d ? z : WGPU_DEPTH_SLICE_UNDEFINED;
+      color.loadOp = WGPULoadOp_Clear;
+      color.storeOp = WGPUStoreOp_Store;
+      WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+      pd.label = wvk_sv("wvk shadow");
+      pd.colorAttachmentCount = 1;
+      pd.colorAttachments = &color;
+      WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &pd);
+      wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+      wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+      wgpuRenderPassEncoderDraw(pass, 3, 1, 0, z);
+      wgpuRenderPassEncoderEnd(pass);
+      wgpuRenderPassEncoderRelease(pass);
+   }
+   wgpuBindGroupRelease(group);
+}
+
 /* A depth or stencil aspect to a buffer. */
 static void
 copy_ds_to_buffer(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
@@ -807,6 +923,10 @@ wvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIma
                            size, buffer_wgpu(src), off, &l);
       else
          copy_color(wvk_cmd_buffer_device(cmd), replay, dst, true, buffer_wgpu(src), off, &l, &tex, size);
+      if (dst->shadow)
+         wvk_image_update_shadow(wvk_cmd_buffer_device(cmd), replay, dst, r->imageSubresource.mipLevel,
+                                 r->imageSubresource.baseArrayLayer,
+                                 vk_image_subresource_layer_count(&dst->vk, &r->imageSubresource));
    }
 }
 
@@ -978,6 +1098,13 @@ wvk_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyIm
       dl.block_w = util_format_get_blockwidth(df);
       dl.block_h = util_format_get_blockheight(df);
       copy_color(dev, replay, dst, true, temp, 0, &dl, &d, dsize);
+   }
+   if (dst->shadow) {
+      for (uint32_t i = 0; i < pCopyImageInfo->regionCount; ++i) {
+         const VkImageSubresourceLayers *sub = &pCopyImageInfo->pRegions[i].dstSubresource;
+         wvk_image_update_shadow(dev, replay, dst, sub->mipLevel, sub->baseArrayLayer,
+                                 vk_image_subresource_layer_count(&dst->vk, sub));
+      }
    }
 }
 

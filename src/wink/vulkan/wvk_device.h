@@ -82,6 +82,9 @@ struct wvk_device {
       WGPUTextureFormat format;
       WGPURenderPipeline pipeline;
    } depth_in_pipelines[4];
+   /* Compressed texels into a shadow (wvk_image.h): for each format of
+    * shadow, from a 2D array and from a 3D texture. */
+   WGPURenderPipeline shadow_pipelines[3][2];
    /* What a binding with no descriptor written shows: 1x1 textures of
     * each kind a bind group layout can want (descriptorBindingPartiallyBound). */
    struct {

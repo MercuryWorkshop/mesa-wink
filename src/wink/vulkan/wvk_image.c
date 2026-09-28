@@ -125,7 +125,7 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    desc.dimension = image->dimension;
    /* WebGPU wants a block-compressed texture a whole number of blocks;
     * Vulkan takes any size. The texture is the next size up, and edge
-    * copies go to its blocks. TODO: sampling sees the padded size. */
+    * copies go to its blocks; sampling is of a shadow of its own size. */
    const enum pipe_format pformat = vk_format_to_pipe_format(pCreateInfo->format);
    desc.size.width = util_align_npot(image->vk.extent.width, util_format_get_blockwidth(pformat));
    desc.size.height = image->vk.image_type == VK_IMAGE_TYPE_1D
@@ -159,6 +159,30 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       }
       vk_image_destroy(&dev->vk, pAllocator, &image->vk);
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+
+   /* A compressed image of a size not whole blocks, sampled from a texture
+    * of its size, uncompressed. */
+   if ((caps & WVK_CAP_COMPRESSED) && (wusage & WGPUTextureUsage_TextureBinding) &&
+       (desc.size.width != image->vk.extent.width ||
+        (image->vk.image_type != VK_IMAGE_TYPE_1D && desc.size.height != image->vk.extent.height))) {
+      const VkFormat f = pCreateInfo->format;
+      const bool wide = f == VK_FORMAT_BC4_SNORM_BLOCK || f == VK_FORMAT_BC5_SNORM_BLOCK ||
+                        f == VK_FORMAT_BC6H_UFLOAT_BLOCK || f == VK_FORMAT_BC6H_SFLOAT_BLOCK ||
+                        (f >= VK_FORMAT_EAC_R11_UNORM_BLOCK && f <= VK_FORMAT_EAC_R11G11_SNORM_BLOCK);
+      image->shadow_format = wide ? WGPUTextureFormat_RGBA16Float
+                             : vk_format_is_srgb(f) ? WGPUTextureFormat_RGBA8UnormSrgb
+                                                    : WGPUTextureFormat_RGBA8Unorm;
+      WGPUTextureFormat twin[1] = { srgb_twin(image->shadow_format) };
+      WGPUTextureDescriptor sd = desc;
+      sd.label = wvk_sv("VkImage decoded");
+      sd.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
+      sd.format = image->shadow_format;
+      sd.size.width = image->vk.extent.width;
+      sd.size.height = image->vk.image_type == VK_IMAGE_TYPE_1D ? 1 : image->vk.extent.height;
+      sd.viewFormatCount = twin[0] != WGPUTextureFormat_Undefined && (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+      sd.viewFormats = twin;
+      image->shadow = wgpuDeviceCreateTexture(dev->wgpu, &sd);
    }
 
    /* Texels atomics can be done on, as a buffer too. */
@@ -203,6 +227,8 @@ wvk_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks *
       wgpuTextureRelease(image->texture);
    if (image->atomic_buffer)
       wgpuBufferRelease(image->atomic_buffer);
+   if (image->shadow)
+      wgpuTextureRelease(image->shadow);
    vk_image_destroy(&dev->vk, pAllocator, &image->vk);
 }
 
@@ -486,6 +512,14 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
       desc.mipLevelCount = view->vk.level_count;
       uint32_t texture_layer;
       WGPUTexture texture = wvk_image_layer_texture(image, view->vk.base_array_layer, &texture_layer);
+      /* A compressed image of a size not whole blocks is sampled from what
+       * it decodes to. */
+      if (image->shadow && vk_format_is_compressed(view->vk.view_format)) {
+         texture = image->shadow;
+         desc.format = vk_format_is_srgb(view->vk.view_format) ? WGPUTextureFormat_RGBA8UnormSrgb
+                       : image->shadow_format == WGPUTextureFormat_RGBA8UnormSrgb ? WGPUTextureFormat_RGBA8Unorm
+                                                                                   : image->shadow_format;
+      }
       desc.baseArrayLayer = image->dimension == WGPUTextureDimension_3D ? 0 : texture_layer;
       desc.arrayLayerCount = image->dimension == WGPUTextureDimension_3D ? 1 : view->vk.layer_count;
       /* Of a multisampled array, the first layer: shaders have that. */
