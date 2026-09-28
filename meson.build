@@ -314,6 +314,7 @@ with_nouveau_vk = _vulkan_drivers.contains('nouveau')
 with_asahi_vk = _vulkan_drivers.contains('asahi')
 with_gfxstream_vk = _vulkan_drivers.contains('gfxstream')
 with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
+with_wink_vk = _vulkan_drivers.contains('wink')
 with_any_vk = _vulkan_drivers.length() != 0
 
 with_llvm = with_llvm \

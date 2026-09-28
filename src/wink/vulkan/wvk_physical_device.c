@@ -1,0 +1,745 @@
+/*
+ * Copyright 2026 wink contributors
+ * SPDX-License-Identifier: MIT
+ *
+ * The physical device: one WebGPU adapter, described as Vulkan.
+ *
+ * Limits are the adapter's, since vkCreateDevice asks for all of them.
+ * Features are what WebGPU can do and the driver implements; where
+ * Vulkan requires more than WebGPU has, the smaller truth is reported
+ * rather than the requirement -- 8 vertex bindings, not 16 -- which is
+ * knowingly non-conformant and why VK_KHR_portability_subset is exposed.
+ */
+#include "wvk_physical_device.h"
+
+#include "wvk_entrypoints.h"
+#include "wvk_format.h"
+#include "wvk_instance.h"
+#include "wvk_platform.h"
+#include "wvk_sync.h"
+
+#include "vk_enum_defines.h"
+#include "vk_format.h"
+
+#include "git_sha1.h"
+#include "util/u_debug.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+
+/* The WebGPU features the driver has a use for; a device asks for those
+ * the adapter has. Deliberately not the 16-bit normalized formats: the
+ * browser has none, and the native path should not be able to do what the
+ * browser cannot. */
+static const WGPUFeatureName wanted_features[] = {
+   WGPUFeatureName_DepthClipControl,
+   WGPUFeatureName_Depth32FloatStencil8,
+   WGPUFeatureName_TimestampQuery,
+   WGPUFeatureName_TextureCompressionBC,
+   WGPUFeatureName_TextureCompressionBCSliced3D,
+   WGPUFeatureName_TextureCompressionETC2,
+   WGPUFeatureName_TextureCompressionASTC,
+   WGPUFeatureName_TextureCompressionASTCSliced3D,
+   WGPUFeatureName_IndirectFirstInstance,
+   WGPUFeatureName_ShaderF16,
+   WGPUFeatureName_RG11B10UfloatRenderable,
+   WGPUFeatureName_BGRA8UnormStorage,
+   WGPUFeatureName_Float32Filterable,
+   WGPUFeatureName_Float32Blendable,
+   WGPUFeatureName_ClipDistances,
+   WGPUFeatureName_DualSourceBlending,
+};
+
+bool
+wvk_physical_device_has_feature(const struct wvk_physical_device *pdev,
+                                WGPUFeatureName feature)
+{
+   for (uint32_t i = 0; i < pdev->feature_count; ++i) {
+      if (pdev->features[i] == feature)
+         return true;
+   }
+   return false;
+}
+
+static uint32_t
+api_version(void)
+{
+   const uint32_t override = vk_get_version_override();
+   if (override)
+      return override;
+   const char *v = getenv("WINK_VK_API_VERSION");
+   if (v && strcmp(v, "1.3") == 0)
+      return VK_MAKE_API_VERSION(0, 1, 3, VK_HEADER_VERSION);
+   return WVK_API_VERSION;
+}
+
+static void
+get_device_extensions(const struct wvk_physical_device *pdev,
+                      struct vk_device_extension_table *ext)
+{
+   *ext = (struct vk_device_extension_table){
+      .KHR_bind_memory2 = true,
+      .KHR_copy_commands2 = true,
+      .KHR_create_renderpass2 = true,
+      .KHR_dedicated_allocation = true,
+      .KHR_depth_stencil_resolve = true,
+      .KHR_descriptor_update_template = true,
+      .KHR_device_group = true,
+      .KHR_driver_properties = true,
+      .KHR_dynamic_rendering = true,
+      .KHR_format_feature_flags2 = true,
+      .KHR_get_memory_requirements2 = true,
+      .KHR_image_format_list = true,
+      .KHR_imageless_framebuffer = true,
+      .KHR_maintenance1 = true,
+      .KHR_maintenance2 = true,
+      .KHR_maintenance3 = true,
+      .KHR_portability_subset = true,
+      .KHR_push_descriptor = true,
+      .KHR_relaxed_block_layout = true,
+      .KHR_sampler_mirror_clamp_to_edge = false,
+      .KHR_separate_depth_stencil_layouts = true,
+      .KHR_shader_draw_parameters = true,
+      .KHR_shader_float_controls = true,
+      .KHR_shader_non_semantic_info = true,
+      .KHR_spirv_1_4 = true,
+      .KHR_storage_buffer_storage_class = true,
+      .KHR_synchronization2 = true,
+      .KHR_timeline_semaphore = true,
+      .KHR_uniform_buffer_standard_layout = true,
+      .EXT_host_query_reset = true,
+      .EXT_separate_stencil_usage = true,
+      .EXT_vertex_attribute_divisor = true,
+      .KHR_vertex_attribute_divisor = true,
+   };
+   (void)pdev;
+}
+
+static void
+get_device_features(const struct wvk_physical_device *pdev, struct vk_features *f)
+{
+   const bool bc = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureCompressionBC);
+   const bool etc2 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureCompressionETC2);
+   const bool astc = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureCompressionASTC);
+   const bool clip = wvk_physical_device_has_feature(pdev, WGPUFeatureName_ClipDistances);
+
+   *f = (struct vk_features){
+      /* Vulkan 1.0. WebGPU bounds-checks every access. */
+      .robustBufferAccess = true,
+      .fullDrawIndexUint32 = true,
+      .imageCubeArray = true,
+      .independentBlend = true,
+      .dualSrcBlend = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DualSourceBlending),
+      /* A CPU loop over indirect draws. */
+      .multiDrawIndirect = true,
+      .drawIndirectFirstInstance = wvk_physical_device_has_feature(pdev, WGPUFeatureName_IndirectFirstInstance),
+      /* WebGPU clamps depth always; unclippedDepth turns off the clipping. */
+      .depthClamp = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
+      .depthBiasClamp = true,
+      .samplerAnisotropy = true,
+      .textureCompressionETC2 = etc2,
+      .textureCompressionASTC_LDR = astc,
+      .textureCompressionBC = bc,
+      .fragmentStoresAndAtomics = true,
+      .shaderClipDistance = clip,
+      .shaderSampledImageArrayDynamicIndexing = false,
+      .shaderStorageBufferArrayDynamicIndexing = false,
+
+      /* Vulkan 1.1 */
+      .shaderDrawParameters = true,
+
+      /* Vulkan 1.2 */
+      .shaderFloat16 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_ShaderF16),
+      .imagelessFramebuffer = true,
+      .uniformBufferStandardLayout = true,
+      .separateDepthStencilLayouts = true,
+      .hostQueryReset = true,
+      .timelineSemaphore = true,
+
+      /* Vulkan 1.3, or their extensions */
+      .dynamicRendering = true,
+      .synchronization2 = true,
+      .shaderDemoteToHelperInvocation = true,
+      .shaderZeroInitializeWorkgroupMemory = true,
+      .robustImageAccess = true,
+      .pipelineCreationCacheControl = true,
+      .privateData = true,
+      .maintenance4 = false,
+
+      /* VK_KHR_vertex_attribute_divisor */
+      .vertexAttributeInstanceRateDivisor = true,
+      .vertexAttributeInstanceRateZeroDivisor = true,
+
+      /* VK_KHR_portability_subset: what WebGPU leaves out */
+      .constantAlphaColorBlendFactors = true,
+      .events = true,
+      .imageViewFormatReinterpretation = false,
+      .imageViewFormatSwizzle = true,
+      .imageView2DOn3DImage = false,
+      .multisampleArrayImage = false,
+      .mutableComparisonSamplers = true,
+      .pointPolygons = false,
+      .samplerMipLodBias = false,
+      .separateStencilMaskRef = false,
+      .shaderSampleRateInterpolationFunctions = false,
+      .tessellationIsolines = false,
+      .tessellationPointMode = false,
+      .triangleFans = false,
+      .vertexAttributeAccessBeyondStride = false,
+   };
+}
+
+static void
+get_device_properties(const struct wvk_physical_device *pdev,
+                      const struct wvk_instance *instance,
+                      struct vk_properties *p)
+{
+   const WGPULimits *l = &pdev->limits;
+   const uint32_t max_2d = l->maxTextureDimension2D;
+   const bool clip = wvk_physical_device_has_feature(pdev, WGPUFeatureName_ClipDistances);
+
+   VkPhysicalDeviceType type;
+   switch (pdev->info.adapterType) {
+   case WGPUAdapterType_DiscreteGPU: type = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU; break;
+   case WGPUAdapterType_IntegratedGPU: type = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU; break;
+   case WGPUAdapterType_CPU: type = VK_PHYSICAL_DEVICE_TYPE_CPU; break;
+   default: type = VK_PHYSICAL_DEVICE_TYPE_OTHER; break;
+   }
+
+   /* The driver keeps one uniform buffer and one storage buffer per stage
+    * for itself: push constants and draw parameters. */
+   const uint32_t ubos = l->maxUniformBuffersPerShaderStage - 1;
+   const uint32_t ssbos = l->maxStorageBuffersPerShaderStage - 1;
+
+   *p = (struct vk_properties){
+      .apiVersion = api_version(),
+      .driverVersion = vk_get_driver_version(),
+      .vendorID = pdev->info.vendorID,
+      .deviceID = pdev->info.deviceID,
+      .deviceType = type,
+
+      .maxImageDimension1D = l->maxTextureDimension1D,
+      .maxImageDimension2D = max_2d,
+      .maxImageDimension3D = l->maxTextureDimension3D,
+      .maxImageDimensionCube = max_2d,
+      .maxImageArrayLayers = l->maxTextureArrayLayers,
+      /* Texel buffers are storage buffers with the format decoded in the
+       * shader. */
+      .maxTexelBufferElements = (uint32_t)MIN2(l->maxStorageBufferBindingSize / 16, 1u << 27),
+      .maxUniformBufferRange = (uint32_t)MIN2(l->maxUniformBufferBindingSize, UINT32_MAX),
+      .maxStorageBufferRange = (uint32_t)MIN2(l->maxStorageBufferBindingSize, UINT32_MAX),
+      .maxPushConstantsSize = 128,
+      .maxMemoryAllocationCount = 4096,
+      .maxSamplerAllocationCount = 4000,
+      /* Buffers and images are separate WebGPU objects. */
+      .bufferImageGranularity = 1,
+      .sparseAddressSpaceSize = 0,
+      .maxBoundDescriptorSets = l->maxBindGroups,
+      .maxPerStageDescriptorSamplers = l->maxSamplersPerShaderStage,
+      .maxPerStageDescriptorUniformBuffers = ubos,
+      .maxPerStageDescriptorStorageBuffers = ssbos,
+      .maxPerStageDescriptorSampledImages = l->maxSampledTexturesPerShaderStage,
+      .maxPerStageDescriptorStorageImages = l->maxStorageTexturesPerShaderStage,
+      .maxPerStageDescriptorInputAttachments = MIN2(l->maxSampledTexturesPerShaderStage, 8),
+      .maxPerStageResources = l->maxSamplersPerShaderStage + ubos + ssbos +
+                              l->maxSampledTexturesPerShaderStage +
+                              l->maxStorageTexturesPerShaderStage + l->maxColorAttachments,
+      .maxDescriptorSetSamplers = 6 * l->maxSamplersPerShaderStage,
+      .maxDescriptorSetUniformBuffers = 6 * ubos,
+      .maxDescriptorSetUniformBuffersDynamic = l->maxDynamicUniformBuffersPerPipelineLayout,
+      .maxDescriptorSetStorageBuffers = 6 * ssbos,
+      .maxDescriptorSetStorageBuffersDynamic = l->maxDynamicStorageBuffersPerPipelineLayout,
+      .maxDescriptorSetSampledImages = 6 * l->maxSampledTexturesPerShaderStage,
+      .maxDescriptorSetStorageImages = 6 * l->maxStorageTexturesPerShaderStage,
+      .maxDescriptorSetInputAttachments = MIN2(l->maxSampledTexturesPerShaderStage, 8),
+      .maxVertexInputAttributes = l->maxVertexAttributes,
+      .maxVertexInputBindings = l->maxVertexBuffers,
+      .maxVertexInputAttributeOffset = l->maxVertexBufferArrayStride - 1,
+      .maxVertexInputBindingStride = l->maxVertexBufferArrayStride,
+      .maxVertexOutputComponents = l->maxInterStageShaderVariables * 4,
+      .maxFragmentInputComponents = l->maxInterStageShaderVariables * 4,
+      .maxFragmentOutputAttachments = l->maxColorAttachments,
+      .maxFragmentDualSrcAttachments =
+         wvk_physical_device_has_feature(pdev, WGPUFeatureName_DualSourceBlending) ? 1 : 0,
+      .maxFragmentCombinedOutputResources = l->maxColorAttachments + ssbos +
+                                            l->maxStorageTexturesPerShaderStage,
+      .maxComputeSharedMemorySize = l->maxComputeWorkgroupStorageSize,
+      .maxComputeWorkGroupCount = { l->maxComputeWorkgroupsPerDimension,
+                                    l->maxComputeWorkgroupsPerDimension,
+                                    l->maxComputeWorkgroupsPerDimension },
+      .maxComputeWorkGroupInvocations = l->maxComputeInvocationsPerWorkgroup,
+      .maxComputeWorkGroupSize = { l->maxComputeWorkgroupSizeX, l->maxComputeWorkgroupSizeY,
+                                   l->maxComputeWorkgroupSizeZ },
+      .subPixelPrecisionBits = 4,
+      .subTexelPrecisionBits = 4,
+      .mipmapPrecisionBits = 4,
+      .maxDrawIndexedIndexValue = UINT32_MAX,
+      .maxDrawIndirectCount = UINT32_MAX,
+      /* WebGPU samplers have no LOD bias. */
+      .maxSamplerLodBias = 0.0f,
+      .maxSamplerAnisotropy = 16.0f,
+      .maxViewports = 1,
+      .maxViewportDimensions = { max_2d, max_2d },
+      .viewportBoundsRange = { -2.0f * max_2d, 2.0f * max_2d - 1.0f },
+      .viewportSubPixelBits = 0,
+      .minMemoryMapAlignment = 64,
+      .minTexelBufferOffsetAlignment = l->minStorageBufferOffsetAlignment,
+      .minUniformBufferOffsetAlignment = l->minUniformBufferOffsetAlignment,
+      .minStorageBufferOffsetAlignment = l->minStorageBufferOffsetAlignment,
+      /* WGSL's constant texel offsets. */
+      .minTexelOffset = -8,
+      .maxTexelOffset = 7,
+      .minTexelGatherOffset = -8,
+      .maxTexelGatherOffset = 7,
+      .minInterpolationOffset = -0.5f,
+      .maxInterpolationOffset = 0.4375f,
+      .subPixelInterpolationOffsetBits = 4,
+      .maxFramebufferWidth = max_2d,
+      .maxFramebufferHeight = max_2d,
+      /* A WebGPU attachment is one layer. */
+      .maxFramebufferLayers = 1,
+      .framebufferColorSampleCounts = WVK_SAMPLE_COUNTS,
+      .framebufferDepthSampleCounts = WVK_SAMPLE_COUNTS,
+      .framebufferStencilSampleCounts = WVK_SAMPLE_COUNTS,
+      .framebufferNoAttachmentsSampleCounts = WVK_SAMPLE_COUNTS,
+      .maxColorAttachments = l->maxColorAttachments,
+      .sampledImageColorSampleCounts = WVK_SAMPLE_COUNTS,
+      .sampledImageIntegerSampleCounts = WVK_SAMPLE_COUNTS,
+      .sampledImageDepthSampleCounts = WVK_SAMPLE_COUNTS,
+      .sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .maxSampleMaskWords = 1,
+      /* Timestamps exist only at pass boundaries in WebGPU. */
+      .timestampComputeAndGraphics = false,
+      .timestampPeriod = 1.0f,
+      .maxClipDistances = clip ? 8 : 0,
+      .maxCullDistances = 0,
+      .maxCombinedClipAndCullDistances = clip ? 8 : 0,
+      .discreteQueuePriorities = 2,
+      .pointSizeRange = { 1.0f, 1.0f },
+      .lineWidthRange = { 1.0f, 1.0f },
+      .pointSizeGranularity = 0.0f,
+      .lineWidthGranularity = 0.0f,
+      .strictLines = false,
+      .standardSampleLocations = true,
+      /* WebGPU's own copy rules: rows of 256 bytes. */
+      .optimalBufferCopyOffsetAlignment = 256,
+      .optimalBufferCopyRowPitchAlignment = 256,
+      .nonCoherentAtomSize = 64,
+
+      /* Vulkan 1.1 */
+      .subgroupSize = 1,
+      .subgroupSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT,
+      .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT,
+      .subgroupQuadOperationsInAllStages = false,
+      .pointClippingBehavior = VK_POINT_CLIPPING_BEHAVIOR_ALL_CLIP_PLANES,
+      .maxMultiviewViewCount = 0,
+      .maxMultiviewInstanceIndex = 0,
+      .protectedNoFault = false,
+      .maxPerSetDescriptors = 1024,
+      .maxMemoryAllocationSize = l->maxBufferSize,
+
+      /* Vulkan 1.2 */
+      .driverID = VK_DRIVER_ID_MESA_VENUS,
+      .conformanceVersion = { 0, 0, 0, 0 },
+      .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
+      .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
+      .shaderSignedZeroInfNanPreserveFloat32 = false,
+      .maxUpdateAfterBindDescriptorsInAllPools = 0,
+      .supportedDepthResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+      .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+      .independentResolveNone = true,
+      .independentResolve = true,
+      .filterMinmaxSingleComponentFormats = false,
+      .filterMinmaxImageComponentMapping = false,
+      .maxTimelineSemaphoreValueDifference = UINT64_MAX,
+      .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+
+      /* Vulkan 1.3 */
+      .maxBufferSize = l->maxBufferSize,
+
+      /* VK_KHR_push_descriptor */
+      .maxPushDescriptors = 32,
+
+      /* VK_KHR_vertex_attribute_divisor */
+      .maxVertexAttribDivisor = UINT32_MAX,
+      .supportsNonZeroFirstInstance = true,
+
+      /* VK_KHR_portability_subset */
+      .minVertexInputBindingStrideAlignment = 4,
+   };
+
+   /* "wink on Apple M2 (Metal)": what the device is, and what it is on. */
+   const char *backend;
+   switch (pdev->info.backendType) {
+   case WGPUBackendType_Metal: backend = "Metal"; break;
+   case WGPUBackendType_Vulkan: backend = "Vulkan"; break;
+   case WGPUBackendType_D3D12: backend = "D3D12"; break;
+   case WGPUBackendType_D3D11: backend = "D3D11"; break;
+   case WGPUBackendType_OpenGL: backend = "OpenGL"; break;
+   case WGPUBackendType_OpenGLES: backend = "OpenGL ES"; break;
+   case WGPUBackendType_WebGPU: backend = "browser"; break;
+   default: backend = "WebGPU"; break;
+   }
+   const WGPUStringView name = wvk_sv_len(pdev->info.device) ? pdev->info.device : pdev->info.description;
+   snprintf(p->deviceName, sizeof(p->deviceName), "wink on %.*s (%s)",
+            wvk_sv_len(name), name.data ? name.data : "WebGPU", backend);
+
+   memcpy(p->pipelineCacheUUID, instance->driver_uuid, VK_UUID_SIZE);
+   memcpy(p->driverUUID, instance->driver_uuid, VK_UUID_SIZE);
+   /* The device: the adapter's IDs, and which backend it is reached by. */
+   uint32_t uuid[4] = { pdev->info.vendorID, pdev->info.deviceID, (uint32_t)pdev->info.backendType,
+                        0x77696e6b /* "wink" */ };
+   memcpy(p->deviceUUID, uuid, VK_UUID_SIZE);
+   snprintf(p->driverName, VK_MAX_DRIVER_NAME_SIZE, "wink");
+   snprintf(p->driverInfo, VK_MAX_DRIVER_INFO_SIZE, "Mesa " PACKAGE_VERSION MESA_GIT_SHA1
+            ", Vulkan on WebGPU (%s)", backend);
+}
+
+static void
+init_memory(struct wvk_physical_device *pdev)
+{
+   /* WebGPU says nothing about memory size. In a browser, host-visible
+    * memory is a copy in the wasm heap, which a 32-bit address space
+    * bounds; natively, report what a mid-range GPU has. */
+#ifdef __EMSCRIPTEN__
+   pdev->heap_size = 1ull << 30;
+#else
+   pdev->heap_size = 4ull << 30;
+#endif
+   /* Ordered as Vulkan requires: a type before any whose flags are a
+    * superset of its own. */
+   pdev->memory_types[WVK_MEMORY_DEVICE] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+   };
+   pdev->memory_types[WVK_MEMORY_UPLOAD] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+   };
+   pdev->memory_types[WVK_MEMORY_READBACK] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+   };
+   pdev->memory_types[WVK_MEMORY_DEVICE_UPLOAD] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+   };
+}
+
+VkResult
+wvk_enumerate_physical_devices(struct vk_instance *_instance)
+{
+   struct wvk_instance *instance = (struct wvk_instance *)_instance;
+
+   if (!instance->wgpu) {
+      instance->wgpu = wvk_platform_create_instance();
+      if (!instance->wgpu)
+         return VK_SUCCESS; /* no WebGPU: no devices, not an error */
+   }
+   WGPUAdapter adapter = wvk_platform_request_adapter(instance->wgpu);
+   if (!adapter)
+      return VK_SUCCESS;
+
+   struct wvk_physical_device *pdev =
+      vk_zalloc(&instance->vk.alloc, sizeof(*pdev), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+   if (!pdev) {
+      wgpuAdapterRelease(adapter);
+      return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+   pdev->adapter = adapter;
+   pdev->info = (WGPUAdapterInfo)WGPU_ADAPTER_INFO_INIT;
+   wgpuAdapterGetInfo(adapter, &pdev->info);
+   pdev->limits = (WGPULimits)WGPU_LIMITS_INIT;
+   if (wgpuAdapterGetLimits(adapter, &pdev->limits) != WGPUStatus_Success) {
+      mesa_logw("wvk: the adapter reports no limits");
+      pdev->limits = (WGPULimits)WGPU_LIMITS_INIT;
+   }
+   for (size_t i = 0; i < ARRAY_SIZE(wanted_features); ++i) {
+      if (wgpuAdapterHasFeature(adapter, wanted_features[i]) &&
+          pdev->feature_count < ARRAY_SIZE(pdev->features))
+         pdev->features[pdev->feature_count++] = wanted_features[i];
+   }
+
+   struct vk_physical_device_dispatch_table dispatch_table;
+   vk_physical_device_dispatch_table_from_entrypoints(&dispatch_table,
+                                                      &wvk_physical_device_entrypoints, true);
+
+   struct vk_device_extension_table extensions;
+   get_device_extensions(pdev, &extensions);
+   struct vk_features features;
+   get_device_features(pdev, &features);
+   struct vk_properties properties;
+   get_device_properties(pdev, instance, &properties);
+
+   VkResult result = vk_physical_device_init(&pdev->vk, &instance->vk, &extensions,
+                                             &features, &properties, &dispatch_table);
+   if (result != VK_SUCCESS) {
+      wgpuAdapterInfoFreeMembers(pdev->info);
+      wgpuAdapterRelease(adapter);
+      vk_free(&instance->vk.alloc, pdev);
+      return result;
+   }
+
+   init_memory(pdev);
+
+   pdev->sync_timeline_type = vk_sync_timeline_get_type(&wvk_sync_type);
+   pdev->sync_types[0] = &wvk_sync_type;
+   pdev->sync_types[1] = &pdev->sync_timeline_type.sync;
+   pdev->sync_types[2] = NULL;
+   pdev->vk.supported_sync_types = pdev->sync_types;
+
+   list_addtail(&pdev->vk.link, &instance->vk.physical_devices.list);
+   return VK_SUCCESS;
+}
+
+void
+wvk_physical_device_destroy(struct vk_physical_device *vk_pdev)
+{
+   struct wvk_physical_device *pdev = container_of(vk_pdev, struct wvk_physical_device, vk);
+   vk_physical_device_finish(&pdev->vk);
+   wgpuAdapterInfoFreeMembers(pdev->info);
+   wgpuAdapterRelease(pdev->adapter);
+   vk_free(&pdev->vk.instance->alloc, pdev);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
+                                            uint32_t *pQueueFamilyPropertyCount,
+                                            VkQueueFamilyProperties2 *pQueueFamilyProperties)
+{
+   VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyProperties2, out, pQueueFamilyProperties,
+                          pQueueFamilyPropertyCount);
+
+   /* One WebGPU queue, which does everything, in order. */
+   vk_outarray_append_typed(VkQueueFamilyProperties2, &out, p) {
+      p->queueFamilyProperties = (VkQueueFamilyProperties){
+         .queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+         .queueCount = 1,
+         .timestampValidBits = 0,
+         .minImageTransferGranularity = { 1, 1, 1 },
+      };
+      vk_foreach_struct(stype, ext, p->pNext) {
+         vk_debug_ignored_stype(stype);
+      }
+   }
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
+                                       VkPhysicalDeviceMemoryProperties2 *pMemoryProperties)
+{
+   VK_FROM_HANDLE(wvk_physical_device, pdev, physicalDevice);
+   VkPhysicalDeviceMemoryProperties *props = &pMemoryProperties->memoryProperties;
+
+   props->memoryHeapCount = 1;
+   props->memoryHeaps[0] = (VkMemoryHeap){
+      .size = pdev->heap_size,
+      .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
+   };
+   props->memoryTypeCount = WVK_MEMORY_TYPE_COUNT;
+   for (uint32_t i = 0; i < WVK_MEMORY_TYPE_COUNT; ++i)
+      props->memoryTypes[i] = pdev->memory_types[i];
+
+   vk_foreach_struct(stype, ext, pMemoryProperties->pNext) {
+      vk_debug_ignored_stype(stype);
+   }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Formats */
+
+static VkFormatFeatureFlags2
+optimal_features(const struct wvk_physical_device *pdev, VkFormat format)
+{
+   const uint32_t caps = wvk_format_caps(pdev, format);
+   VkFormatFeatureFlags2 f = 0;
+   if (!caps)
+      return 0;
+
+   if (caps & WVK_CAP_SAMPLE) {
+      f |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
+      if (caps & WVK_CAP_FILTER)
+         f |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+      if (caps & WVK_CAP_DEPTH)
+         f |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+   }
+   if (caps & WVK_CAP_RENDER) {
+      f |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
+      if (caps & WVK_CAP_BLEND)
+         f |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BLEND_BIT;
+   }
+   if (caps & (WVK_CAP_DEPTH | WVK_CAP_STENCIL))
+      f |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+   if (caps & WVK_CAP_STORAGE) {
+      f |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
+      if (caps & WVK_CAP_STORAGE_RW)
+         f |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+              VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+   }
+   /* Transfers work on every format: the ones WebGPU will not copy --
+    * Depth24Plus at all, Depth32Float into -- go through a shader. */
+   f |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+   return f;
+}
+
+static VkFormatFeatureFlags2
+buffer_features(const struct wvk_physical_device *pdev, VkFormat format)
+{
+   const struct wvk_format *f = wvk_format_get(format);
+   (void)pdev;
+   if (!f || !f->vertex)
+      return 0;
+   return VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat format,
+                                       VkFormatProperties2 *pFormatProperties)
+{
+   VK_FROM_HANDLE(wvk_physical_device, pdev, physicalDevice);
+
+   const VkFormatFeatureFlags2 optimal = optimal_features(pdev, format);
+   const VkFormatFeatureFlags2 buffer = buffer_features(pdev, format);
+
+   pFormatProperties->formatProperties = (VkFormatProperties){
+      /* WebGPU has no linear textures. */
+      .linearTilingFeatures = 0,
+      .optimalTilingFeatures = vk_format_features2_to_features(optimal),
+      .bufferFeatures = vk_format_features2_to_features(buffer),
+   };
+
+   vk_foreach_struct(stype, ext, pFormatProperties->pNext) {
+      switch (stype) {
+      case VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3: {
+         VkFormatProperties3 *p = ext;
+         p->linearTilingFeatures = 0;
+         p->optimalTilingFeatures = optimal;
+         p->bufferFeatures = buffer;
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(stype);
+         break;
+      }
+   }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
+                                            const VkPhysicalDeviceImageFormatInfo2 *info,
+                                            VkImageFormatProperties2 *pImageFormatProperties)
+{
+   VK_FROM_HANDLE(wvk_physical_device, pdev, physicalDevice);
+   const WGPULimits *l = &pdev->limits;
+
+   pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){ 0 };
+
+   const uint32_t caps = wvk_format_caps(pdev, info->format);
+   if (!caps || info->tiling != VK_IMAGE_TILING_OPTIMAL)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   VkImageUsageFlags usage = info->usage;
+   const VkImageStencilUsageCreateInfo *stencil_usage =
+      vk_find_struct_const(info->pNext, IMAGE_STENCIL_USAGE_CREATE_INFO);
+   if (stencil_usage)
+      usage |= stencil_usage->stencilUsage;
+
+   if ((usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) &&
+       !(caps & WVK_CAP_SAMPLE))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(caps & WVK_CAP_STORAGE))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if ((usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !(caps & WVK_CAP_RENDER))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if ((usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
+       !(caps & (WVK_CAP_DEPTH | WVK_CAP_STENCIL)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (info->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                      VK_IMAGE_CREATE_SPARSE_ALIASED_BIT))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   VkExtent3D extent;
+   uint32_t layers;
+   switch (info->type) {
+   case VK_IMAGE_TYPE_1D:
+      /* A 1D image is a 2D texture one texel high, so it can have mips. */
+      extent = (VkExtent3D){ l->maxTextureDimension1D, 1, 1 };
+      layers = l->maxTextureArrayLayers;
+      if (caps & (WVK_CAP_DEPTH | WVK_CAP_STENCIL | WVK_CAP_COMPRESSED))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      break;
+   case VK_IMAGE_TYPE_2D:
+      extent = (VkExtent3D){ l->maxTextureDimension2D, l->maxTextureDimension2D, 1 };
+      layers = l->maxTextureArrayLayers;
+      break;
+   case VK_IMAGE_TYPE_3D:
+      extent = (VkExtent3D){ l->maxTextureDimension3D, l->maxTextureDimension3D,
+                             l->maxTextureDimension3D };
+      layers = 1;
+      if (caps & (WVK_CAP_DEPTH | WVK_CAP_STENCIL))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      /* Compressed 3D needs the sliced-3D features. */
+      if (caps & WVK_CAP_COMPRESSED) {
+         const struct wvk_format *f = wvk_format_get(info->format);
+         const WGPUFeatureName sliced =
+            f->feature == WGPUFeatureName_TextureCompressionBC ? WGPUFeatureName_TextureCompressionBCSliced3D :
+            f->feature == WGPUFeatureName_TextureCompressionASTC ? WGPUFeatureName_TextureCompressionASTCSliced3D :
+            WGPUFeatureName_Force32;
+         if (!wvk_physical_device_has_feature(pdev, sliced))
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      }
+      break;
+   default:
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
+
+   VkSampleCountFlags samples = VK_SAMPLE_COUNT_1_BIT;
+   if (info->type == VK_IMAGE_TYPE_2D && (caps & WVK_CAP_MSAA) &&
+       !(info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
+       !(usage & VK_IMAGE_USAGE_STORAGE_BIT))
+      samples = WVK_SAMPLE_COUNTS;
+
+   pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
+      .maxExtent = extent,
+      .maxMipLevels = util_logbase2(MAX3(extent.width, extent.height, extent.depth)) + 1,
+      .maxArrayLayers = layers,
+      .sampleCounts = samples,
+      .maxResourceSize = UINT32_MAX,
+   };
+
+   vk_foreach_struct(stype, ext, pImageFormatProperties->pNext) {
+      switch (stype) {
+      case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES: {
+         VkExternalImageFormatProperties *p = ext;
+         p->externalMemoryProperties = (VkExternalMemoryProperties){ 0 };
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(stype);
+         break;
+      }
+   }
+
+   const VkPhysicalDeviceExternalImageFormatInfo *external =
+      vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+   if (external && external->handleType)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_GetPhysicalDeviceSparseImageFormatProperties2(VkPhysicalDevice physicalDevice,
+                                                  const VkPhysicalDeviceSparseImageFormatInfo2 *pFormatInfo,
+                                                  uint32_t *pPropertyCount,
+                                                  VkSparseImageFormatProperties2 *pProperties)
+{
+   *pPropertyCount = 0;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice,
+                                              const VkPhysicalDeviceExternalBufferInfo *pExternalBufferInfo,
+                                              VkExternalBufferProperties *pExternalBufferProperties)
+{
+   pExternalBufferProperties->externalMemoryProperties = (VkExternalMemoryProperties){ 0 };
+}

@@ -17,7 +17,7 @@
 #               a superset, so a native build needs nothing from that package.
 set -euo pipefail
 ROOT="${GEX_DAWN_ROOT:-$HOME/.cache/gex-wgpu-dawn}"
-SRC="$ROOT/dawn"
+SRC="${GEX_DAWN_SRC:-$ROOT/dawn}"
 BUILD="$ROOT/build"
 OUT="${GEX_DAWN_PKG:-$ROOT/pkg}"
 
@@ -31,12 +31,17 @@ mapfile -t ARCHIVES < <(
 )
 echo "[pkg] ${#ARCHIVES[@]} archives -> $OUT/lib/libtint.a"
 rm -f "$OUT/lib/libtint.a"
-{
-  echo "create $OUT/lib/libtint.a"
-  for a in "${ARCHIVES[@]}"; do echo "addlib $a"; done
-  echo save
-  echo end
-} | ar -M
+if [ "$(uname -s)" = Darwin ]; then
+  # BSD ar has no MRI scripts; libtool merges archives.
+  libtool -static -no_warning_for_no_symbols -o "$OUT/lib/libtint.a" "${ARCHIVES[@]}"
+else
+  {
+    echo "create $OUT/lib/libtint.a"
+    for a in "${ARCHIVES[@]}"; do echo "addlib $a"; done
+    echo save
+    echo end
+  } | ar -M
+fi
 ar t "$OUT/lib/libtint.a" >/dev/null
 # find_library(dirs: <pkg>) looks in the directory itself, not in lib/.
 ln -sf lib/libtint.a "$OUT/libtint.a"
@@ -57,7 +62,7 @@ CPP=$(find "$BUILD" -path '*include/webgpu/webgpu_cpp.h' | head -1)
 [ -n "$CPP" ] && { mkdir -p "$OUT/webgpu_cpp/include/webgpu"; cp "$CPP" "$OUT/webgpu_cpp/include/webgpu/"; }
 
 echo "[pkg] libwebgpu_dawn"
-for f in $(find "$BUILD" -name 'libwebgpu_dawn.so*'); do cp -a "$f" "$OUT/lib/" 2>/dev/null || true; done
+for f in $(find "$BUILD" -name 'libwebgpu_dawn.so*' -o -name 'libwebgpu_dawn*.dylib'); do cp -a "$f" "$OUT/lib/" 2>/dev/null || true; done
 
 echo "[pkg] done -> $OUT"
 ls -la "$OUT/lib" | sed 's/^/  /'

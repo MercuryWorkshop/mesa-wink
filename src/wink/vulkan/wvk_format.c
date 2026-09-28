@@ -1,0 +1,193 @@
+/*
+ * Copyright 2026 wink contributors
+ * SPDX-License-Identifier: MIT
+ *
+ * VkFormat to WebGPU. WebGPU has no query for what a format can do, so the
+ * capabilities are Dawn's table at the pinned revision
+ * (src/dawn/native/Format.cpp, non-compatibility mode), and optional
+ * features extend them in wvk_format_caps.
+ *
+ * A packed Vulkan format and a WebGPU format are the same when their bytes
+ * are: A8B8G8R8_*_PACK32 is R8G8B8A8, A2B10G10R10_UNORM_PACK32 is
+ * rgb10a2unorm, B10G11R11_UFLOAT_PACK32 is rg11b10ufloat.
+ */
+#include "wvk_format.h"
+
+#include "wvk_physical_device.h"
+
+#define TF(x) WGPUTextureFormat_##x
+#define VF(x) WGPUVertexFormat_##x
+
+#define SAMPLE_F   (WVK_CAP_SAMPLE | WVK_CAP_FILTER | WVK_CAP_COPY_SRC | WVK_CAP_COPY_DST)
+#define SAMPLE_UF  (WVK_CAP_SAMPLE | WVK_CAP_COPY_SRC | WVK_CAP_COPY_DST)   /* unfilterable float */
+#define SAMPLE_I   (WVK_CAP_SAMPLE | WVK_CAP_INT | WVK_CAP_COPY_SRC | WVK_CAP_COPY_DST)
+#define RT         WVK_CAP_RENDER
+#define RT_FULL    (WVK_CAP_RENDER | WVK_CAP_BLEND | WVK_CAP_MSAA | WVK_CAP_RESOLVE)
+#define MS         WVK_CAP_MSAA
+#define ST         WVK_CAP_STORAGE
+#define ST_RW      (WVK_CAP_STORAGE | WVK_CAP_STORAGE_RW)
+#define COMP       (WVK_CAP_SAMPLE | WVK_CAP_FILTER | WVK_CAP_COPY_SRC | WVK_CAP_COPY_DST | WVK_CAP_COMPRESSED)
+
+#define FMT(vk, tex, vtx, caps_) \
+   [VK_FORMAT_##vk] = { .texture = TF(tex), .vertex = VF(vtx), .caps = (caps_) }
+#define TEX(vk, tex, caps_) \
+   [VK_FORMAT_##vk] = { .texture = TF(tex), .caps = (caps_) }
+#define VTX(vk, vtx) \
+   [VK_FORMAT_##vk] = { .texture = WGPUTextureFormat_Undefined, .vertex = VF(vtx), .caps = 0 }
+#define FEAT(vk, tex, feat, caps_) \
+   [VK_FORMAT_##vk] = { .texture = TF(tex), .feature = WGPUFeatureName_##feat, .caps = (caps_) }
+
+/* Indexed by VkFormat; the core formats end at VK_FORMAT_ASTC_12x12_SRGB_BLOCK. */
+static const struct wvk_format formats[VK_FORMAT_ASTC_12x12_SRGB_BLOCK + 1] = {
+   /* 8-bit */
+   FMT(R8_UNORM, R8Unorm, Unorm8, SAMPLE_F | RT_FULL),
+   FMT(R8_SNORM, R8Snorm, Snorm8, SAMPLE_F),
+   FMT(R8_UINT, R8Uint, Uint8, SAMPLE_I | RT | MS),
+   FMT(R8_SINT, R8Sint, Sint8, SAMPLE_I | RT | MS),
+   FMT(R8G8_UNORM, RG8Unorm, Unorm8x2, SAMPLE_F | RT_FULL),
+   FMT(R8G8_SNORM, RG8Snorm, Snorm8x2, SAMPLE_F),
+   FMT(R8G8_UINT, RG8Uint, Uint8x2, SAMPLE_I | RT | MS),
+   FMT(R8G8_SINT, RG8Sint, Sint8x2, SAMPLE_I | RT | MS),
+   FMT(R8G8B8A8_UNORM, RGBA8Unorm, Unorm8x4, SAMPLE_F | RT_FULL | ST),
+   TEX(R8G8B8A8_SRGB, RGBA8UnormSrgb, SAMPLE_F | RT_FULL),
+   FMT(R8G8B8A8_SNORM, RGBA8Snorm, Snorm8x4, SAMPLE_F | ST),
+   FMT(R8G8B8A8_UINT, RGBA8Uint, Uint8x4, SAMPLE_I | RT | MS | ST),
+   FMT(R8G8B8A8_SINT, RGBA8Sint, Sint8x4, SAMPLE_I | RT | MS | ST),
+   FMT(A8B8G8R8_UNORM_PACK32, RGBA8Unorm, Unorm8x4, SAMPLE_F | RT_FULL | ST),
+   TEX(A8B8G8R8_SRGB_PACK32, RGBA8UnormSrgb, SAMPLE_F | RT_FULL),
+   FMT(A8B8G8R8_SNORM_PACK32, RGBA8Snorm, Snorm8x4, SAMPLE_F | ST),
+   FMT(A8B8G8R8_UINT_PACK32, RGBA8Uint, Uint8x4, SAMPLE_I | RT | MS | ST),
+   FMT(A8B8G8R8_SINT_PACK32, RGBA8Sint, Sint8x4, SAMPLE_I | RT | MS | ST),
+   FMT(B8G8R8A8_UNORM, BGRA8Unorm, Unorm8x4BGRA, SAMPLE_F | RT_FULL),
+   TEX(B8G8R8A8_SRGB, BGRA8UnormSrgb, SAMPLE_F | RT_FULL),
+
+   /* 10-bit and packed float */
+   FMT(A2B10G10R10_UNORM_PACK32, RGB10A2Unorm, Unorm10_10_10_2, SAMPLE_F | RT_FULL),
+   TEX(A2B10G10R10_UINT_PACK32, RGB10A2Uint, SAMPLE_I | RT | MS),
+   TEX(B10G11R11_UFLOAT_PACK32, RG11B10Ufloat, SAMPLE_F),
+   TEX(E5B9G9R9_UFLOAT_PACK32, RGB9E5Ufloat, SAMPLE_F),
+
+   /* 16-bit */
+   FMT(R16_UINT, R16Uint, Uint16, SAMPLE_I | RT | MS),
+   FMT(R16_SINT, R16Sint, Sint16, SAMPLE_I | RT | MS),
+   FMT(R16_SFLOAT, R16Float, Float16, SAMPLE_F | RT_FULL),
+   VTX(R16_UNORM, Unorm16),
+   VTX(R16_SNORM, Snorm16),
+   FMT(R16G16_UINT, RG16Uint, Uint16x2, SAMPLE_I | RT | MS),
+   FMT(R16G16_SINT, RG16Sint, Sint16x2, SAMPLE_I | RT | MS),
+   FMT(R16G16_SFLOAT, RG16Float, Float16x2, SAMPLE_F | RT_FULL),
+   VTX(R16G16_UNORM, Unorm16x2),
+   VTX(R16G16_SNORM, Snorm16x2),
+   FMT(R16G16B16A16_UINT, RGBA16Uint, Uint16x4, SAMPLE_I | RT | MS | ST),
+   FMT(R16G16B16A16_SINT, RGBA16Sint, Sint16x4, SAMPLE_I | RT | MS | ST),
+   FMT(R16G16B16A16_SFLOAT, RGBA16Float, Float16x4, SAMPLE_F | RT_FULL | ST),
+   VTX(R16G16B16A16_UNORM, Unorm16x4),
+   VTX(R16G16B16A16_SNORM, Snorm16x4),
+
+   /* 32-bit: floats are unfilterable and unblendable without features */
+   FMT(R32_UINT, R32Uint, Uint32, SAMPLE_I | RT | ST_RW),
+   FMT(R32_SINT, R32Sint, Sint32, SAMPLE_I | RT | ST_RW),
+   FMT(R32_SFLOAT, R32Float, Float32, SAMPLE_UF | RT | MS | ST_RW),
+   FMT(R32G32_UINT, RG32Uint, Uint32x2, SAMPLE_I | RT | ST),
+   FMT(R32G32_SINT, RG32Sint, Sint32x2, SAMPLE_I | RT | ST),
+   FMT(R32G32_SFLOAT, RG32Float, Float32x2, SAMPLE_UF | RT | ST),
+   VTX(R32G32B32_UINT, Uint32x3),
+   VTX(R32G32B32_SINT, Sint32x3),
+   VTX(R32G32B32_SFLOAT, Float32x3),
+   FMT(R32G32B32A32_UINT, RGBA32Uint, Uint32x4, SAMPLE_I | RT | ST),
+   FMT(R32G32B32A32_SINT, RGBA32Sint, Sint32x4, SAMPLE_I | RT | ST),
+   FMT(R32G32B32A32_SFLOAT, RGBA32Float, Float32x4, SAMPLE_UF | RT | ST),
+
+   /* Depth and stencil. Depth24Plus has no copies at all in WebGPU, and
+    * Depth32Float copies only out; wvk_cmd_copy works around both. */
+   TEX(D16_UNORM, Depth16Unorm, WVK_CAP_SAMPLE | WVK_CAP_DEPTH | MS | WVK_CAP_COPY_SRC | WVK_CAP_COPY_DST),
+   TEX(X8_D24_UNORM_PACK32, Depth24Plus, WVK_CAP_SAMPLE | WVK_CAP_DEPTH | MS),
+   TEX(D32_SFLOAT, Depth32Float, WVK_CAP_SAMPLE | WVK_CAP_DEPTH | MS | WVK_CAP_COPY_SRC),
+   TEX(S8_UINT, Stencil8, WVK_CAP_SAMPLE | WVK_CAP_INT | WVK_CAP_STENCIL | MS | WVK_CAP_COPY_SRC | WVK_CAP_COPY_DST),
+   TEX(D24_UNORM_S8_UINT, Depth24PlusStencil8, WVK_CAP_SAMPLE | WVK_CAP_DEPTH | WVK_CAP_STENCIL | MS),
+   FEAT(D32_SFLOAT_S8_UINT, Depth32FloatStencil8, Depth32FloatStencil8,
+        WVK_CAP_SAMPLE | WVK_CAP_DEPTH | WVK_CAP_STENCIL | MS | WVK_CAP_COPY_SRC),
+
+   /* BC. Vulkan's RGB variants decode punch-through texels with alpha one;
+    * WebGPU has only the RGBA ones, and the view makes up the difference. */
+   FEAT(BC1_RGB_UNORM_BLOCK, BC1RGBAUnorm, TextureCompressionBC, COMP),
+   FEAT(BC1_RGB_SRGB_BLOCK, BC1RGBAUnormSrgb, TextureCompressionBC, COMP),
+   FEAT(BC1_RGBA_UNORM_BLOCK, BC1RGBAUnorm, TextureCompressionBC, COMP),
+   FEAT(BC1_RGBA_SRGB_BLOCK, BC1RGBAUnormSrgb, TextureCompressionBC, COMP),
+   FEAT(BC2_UNORM_BLOCK, BC2RGBAUnorm, TextureCompressionBC, COMP),
+   FEAT(BC2_SRGB_BLOCK, BC2RGBAUnormSrgb, TextureCompressionBC, COMP),
+   FEAT(BC3_UNORM_BLOCK, BC3RGBAUnorm, TextureCompressionBC, COMP),
+   FEAT(BC3_SRGB_BLOCK, BC3RGBAUnormSrgb, TextureCompressionBC, COMP),
+   FEAT(BC4_UNORM_BLOCK, BC4RUnorm, TextureCompressionBC, COMP),
+   FEAT(BC4_SNORM_BLOCK, BC4RSnorm, TextureCompressionBC, COMP),
+   FEAT(BC5_UNORM_BLOCK, BC5RGUnorm, TextureCompressionBC, COMP),
+   FEAT(BC5_SNORM_BLOCK, BC5RGSnorm, TextureCompressionBC, COMP),
+   FEAT(BC6H_UFLOAT_BLOCK, BC6HRGBUfloat, TextureCompressionBC, COMP),
+   FEAT(BC6H_SFLOAT_BLOCK, BC6HRGBFloat, TextureCompressionBC, COMP),
+   FEAT(BC7_UNORM_BLOCK, BC7RGBAUnorm, TextureCompressionBC, COMP),
+   FEAT(BC7_SRGB_BLOCK, BC7RGBAUnormSrgb, TextureCompressionBC, COMP),
+
+   /* ETC2 and EAC */
+   FEAT(ETC2_R8G8B8_UNORM_BLOCK, ETC2RGB8Unorm, TextureCompressionETC2, COMP),
+   FEAT(ETC2_R8G8B8_SRGB_BLOCK, ETC2RGB8UnormSrgb, TextureCompressionETC2, COMP),
+   FEAT(ETC2_R8G8B8A1_UNORM_BLOCK, ETC2RGB8A1Unorm, TextureCompressionETC2, COMP),
+   FEAT(ETC2_R8G8B8A1_SRGB_BLOCK, ETC2RGB8A1UnormSrgb, TextureCompressionETC2, COMP),
+   FEAT(ETC2_R8G8B8A8_UNORM_BLOCK, ETC2RGBA8Unorm, TextureCompressionETC2, COMP),
+   FEAT(ETC2_R8G8B8A8_SRGB_BLOCK, ETC2RGBA8UnormSrgb, TextureCompressionETC2, COMP),
+   FEAT(EAC_R11_UNORM_BLOCK, EACR11Unorm, TextureCompressionETC2, COMP),
+   FEAT(EAC_R11_SNORM_BLOCK, EACR11Snorm, TextureCompressionETC2, COMP),
+   FEAT(EAC_R11G11_UNORM_BLOCK, EACRG11Unorm, TextureCompressionETC2, COMP),
+   FEAT(EAC_R11G11_SNORM_BLOCK, EACRG11Snorm, TextureCompressionETC2, COMP),
+
+   /* ASTC */
+#define ASTC(w, h)                                                                  \
+   FEAT(ASTC_##w##x##h##_UNORM_BLOCK, ASTC##w##x##h##Unorm, TextureCompressionASTC, COMP), \
+   FEAT(ASTC_##w##x##h##_SRGB_BLOCK, ASTC##w##x##h##UnormSrgb, TextureCompressionASTC, COMP)
+   ASTC(4, 4), ASTC(5, 4), ASTC(5, 5), ASTC(6, 5), ASTC(6, 6), ASTC(8, 5), ASTC(8, 6),
+   ASTC(8, 8), ASTC(10, 5), ASTC(10, 6), ASTC(10, 8), ASTC(10, 10), ASTC(12, 10), ASTC(12, 12),
+#undef ASTC
+};
+
+const struct wvk_format *
+wvk_format_get(VkFormat format)
+{
+   if ((unsigned)format >= ARRAY_SIZE(formats))
+      return NULL;
+   const struct wvk_format *f = &formats[format];
+   if (f->texture == WGPUTextureFormat_Undefined && !f->vertex)
+      return NULL;
+   return f;
+}
+
+uint32_t
+wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format)
+{
+   const struct wvk_format *f = wvk_format_get(format);
+   if (!f || f->texture == WGPUTextureFormat_Undefined)
+      return 0;
+   if (f->feature && !wvk_physical_device_has_feature(pdev, f->feature))
+      return 0;
+
+   uint32_t caps = f->caps;
+   switch (f->texture) {
+   case WGPUTextureFormat_R32Float:
+   case WGPUTextureFormat_RG32Float:
+   case WGPUTextureFormat_RGBA32Float:
+      if (wvk_physical_device_has_feature(pdev, WGPUFeatureName_Float32Filterable))
+         caps |= WVK_CAP_FILTER;
+      if (wvk_physical_device_has_feature(pdev, WGPUFeatureName_Float32Blendable))
+         caps |= WVK_CAP_BLEND;
+      break;
+   case WGPUTextureFormat_RG11B10Ufloat:
+      if (wvk_physical_device_has_feature(pdev, WGPUFeatureName_RG11B10UfloatRenderable))
+         caps |= RT_FULL;
+      break;
+   case WGPUTextureFormat_BGRA8Unorm:
+      if (wvk_physical_device_has_feature(pdev, WGPUFeatureName_BGRA8UnormStorage))
+         caps |= ST;
+      break;
+   default:
+      break;
+   }
+   return caps;
+}

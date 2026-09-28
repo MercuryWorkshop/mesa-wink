@@ -124,6 +124,9 @@ endif
 if with_kosmickrisp_vk
   subdir('kosmickrisp')
 endif
+if with_wink_vk
+  subdir('wink')
+endif
 if with_gallium
   subdir('mesa')
 endif
