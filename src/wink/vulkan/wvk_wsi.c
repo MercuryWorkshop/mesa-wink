@@ -228,7 +228,15 @@ get_capabilities(const struct wvk_physical_device *pdev, const struct wvk_surfac
    *caps = (WGPUSurfaceCapabilities)WGPU_SURFACE_CAPABILITIES_INIT;
    if (!surface->wgpu)
       return false;
-   return wgpuSurfaceGetCapabilities(surface->wgpu, pdev->adapter, caps) == WGPUStatus_Success;
+   if (wgpuSurfaceGetCapabilities(surface->wgpu, pdev->adapter, caps) != WGPUStatus_Success)
+      return false;
+   /* emdawnwebgpu leaves the usages unsaid, and a canvas's texture takes
+    * any a texture of its format can have. */
+   if (surface->canvas && !caps->usages) {
+      caps->usages = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc |
+                     WGPUTextureUsage_CopyDst | WGPUTextureUsage_TextureBinding;
+   }
+   return true;
 }
 
 static bool
@@ -900,7 +908,7 @@ wvk_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
    for (uint32_t i = 0; i < count; ++i) {
       VK_FROM_HANDLE(wvk_swapchain, sc, pPresentInfo->pSwapchains[i]);
       if (textures[i].texture) {
-         wgpuSurfacePresent(sc->surface->wgpu);
+         wvk_platform_surface_present(sc->surface->wgpu);
          wgpuTextureRelease(textures[i].texture);
       }
       if (pPresentInfo->pResults)

@@ -60,6 +60,13 @@ wvk_platform_sleep(uint64_t ns)
 }
 
 void
+wvk_platform_surface_present(WGPUSurface surface)
+{
+   /* emdawnwebgpu's wgpuSurfacePresent aborts: the canvas presents when
+    * the task ends, which wvk_platform_present_yield lets happen. */
+}
+
+void
 wvk_platform_present_yield(bool fifo)
 {
    /* The canvas presents when the task ends: FIFO waits for the next

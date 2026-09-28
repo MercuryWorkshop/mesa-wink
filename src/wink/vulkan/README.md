@@ -4,8 +4,7 @@ The wink Vulkan driver: Vulkan 1.2 with `VK_KHR_portability_subset`, on a
 WebGPU device. It is Mesa's Vulkan runtime on top, and underneath it is the
 shader compiler the GL driver (`gex_wgpu`) uses, in `src/wink/compiler`.
 Natively it is an ICD over Dawn, which is where Vulkan's tools, vkcube and
-dEQP-VK run. The browser build, a static library for libwink, is still to
-come.
+dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 
 ## How it works
 
@@ -68,6 +67,29 @@ dEQP-VK: `test/build-cts.sh` builds it, and `test/run-cts.sh OUT GROUP...`
 runs mustpass groups (`api`, `draw`, `texture`, …) with deqp-runner.
 Anything after `--` goes to deqp-runner, such as `--fraction 25`.
 
+## In a browser
+
+`wink/build.sh` builds it into libwink. There is no loader, so an app
+gets everything from `wink_vk_get_instance_proc_addr`, and a surface for
+a canvas from `wink_vk_create_surface(instance, "#canvas", &surface)`.
+The only instance extension it needs is `VK_KHR_surface`. The wink fork of
+SDL does both when it is built with wink, so `SDL_Vulkan_*` just work.
+
+Waiting suspends the wasm stack through JSPI. So the thread that calls
+Vulkan has to be entered through `WebAssembly.promising`, the way .NET
+enters its exports, on the main thread or on a worker that holds the
+canvas as an OffscreenCanvas. The swapchain is the canvas's size, and
+presenting ends the task: FIFO waits there for the next frame.
+
+`wink/build.sh --test` runs `wvk_smoke` and `wvk_draw` in headless Chrome,
+with a generated shim standing in for the loader (`wink/test/vk`). By
+hand:
+
+```sh
+wink/test/vk/build-vk.sh st build/wink/out/st "$(command -v emcc)" OUT
+node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
+```
+
 ## Environment
 
 | variable | effect |
@@ -84,12 +106,10 @@ Anything after `--` goes to deqp-runner, such as `--fraction 25`.
 - Dynamically indexed arrays of descriptors: the first element is used.
 - Layered rendering: a pass is one layer. This affects blits of several
   layers and 3D blits, and multiview.
-- Depth and stencil resolves.
 - Copies into a depth32 or depth24 aspect.
 - `shaderDrawParameters`.
 - Precise occlusion queries, and timestamps.
 - Subgroups.
-- Viewports outside the attachments, which are clamped.
 - Sampler LOD bias, border colours, and component swizzles.
 
 Some of these are what WebGPU has no way to express. The rest are work still

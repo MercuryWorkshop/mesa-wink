@@ -44,6 +44,12 @@ wvk_platform_sleep(uint64_t ns)
 }
 
 void
+wvk_platform_surface_present(WGPUSurface surface)
+{
+   wgpuSurfacePresent(surface);
+}
+
+void
 wvk_platform_present_yield(bool fifo)
 {
    /* Dawn's surface paces FIFO itself, in getCurrentTexture. */
