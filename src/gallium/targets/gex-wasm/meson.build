@@ -33,42 +33,53 @@ gex_mesa_smoke = executable(
 # MobileGL differential backend and the Mesa production backend consume the
 # same packet implementation.
 gex_root = join_paths(meson.project_source_root(), '..', '..')
-gex_replay = executable(
-  'gex-mesa-replay',
-  join_paths(gex_root, 'web', 'mobilegl', 'gexgl-mobilegl.cpp'),
-  include_directories : [
-    inc_include,
-    inc_src,
-    inc_mesa,
-    inc_gallium,
-    inc_gallium_aux,
-    inc_gallium_winsys,
-    inc_gallium_drivers,
-  ],
-  cpp_args : ['-DGEX_MESA_WASM=1'],
-  link_whole : [libglapi_bridge],
-  link_with : [libglapi, libgallium, libmesa, libws_null],
-  dependencies : [
-    idep_mesautil,
-    idep_nir,
-    idep_libglsl,
-    driver_softpipe,
-    dep_thread,
-    dep_clock,
-  ],
-  link_args : [
-    '--no-entry',
-    '-sALLOW_MEMORY_GROWTH=1',
-    '-sASSERTIONS=2',
-    '-sMODULARIZE=1',
-    '-sEXPORT_ES6=1',
-    '-sEXPORT_NAME=createGexMesa',
-    '-sENVIRONMENT=web,worker,node',
-    '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_setenv,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_malloc,_free',
-    '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
-  ],
-  install : false,
-)
+gex_decoder = join_paths(gex_root, 'web', 'mobilegl', 'gexgl-mobilegl.cpp')
+gex_jspi_js = join_paths(gex_root, 'web', 'gex-wgpu-jspi.js')
+# Both live in gex, which holds this tree at third_party/mesa. Anywhere else
+# the targets built from them are skipped rather than failing configuration.
+have_gex_decoder = fs.exists(gex_decoder)
+have_gex_jspi = fs.exists(gex_jspi_js)
+if not have_gex_decoder
+  message('gex-wasm: no gex checkout at @0@; skipping the replay targets'.format(gex_root))
+endif
+if have_gex_decoder
+  gex_replay = executable(
+    'gex-mesa-replay',
+    gex_decoder,
+    include_directories : [
+      inc_include,
+      inc_src,
+      inc_mesa,
+      inc_gallium,
+      inc_gallium_aux,
+      inc_gallium_winsys,
+      inc_gallium_drivers,
+    ],
+    cpp_args : ['-DGEX_MESA_WASM=1'],
+    link_whole : [libglapi_bridge],
+    link_with : [libglapi, libgallium, libmesa, libws_null],
+    dependencies : [
+      idep_mesautil,
+      idep_nir,
+      idep_libglsl,
+      driver_softpipe,
+      dep_thread,
+      dep_clock,
+    ],
+    link_args : [
+      '--no-entry',
+      '-sALLOW_MEMORY_GROWTH=1',
+      '-sASSERTIONS=2',
+      '-sMODULARIZE=1',
+      '-sEXPORT_ES6=1',
+      '-sEXPORT_NAME=createGexMesa',
+      '-sENVIRONMENT=web,worker,node',
+      '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_setenv,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_malloc,_free',
+      '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
+    ],
+    install : false,
+  )
+endif
 
 # Sanitizer shadow memory and metadata make the instrumented static image much
 # larger.  Apply the larger heap only to these diagnostic targets; release
@@ -124,86 +135,92 @@ if gex_emdawn_dir != ''
   foreach js_library : gex_emdawn_js
     gex_emdawn_link_args += '--js-library=' + js_library
   endforeach
-  gex_emdawn_link_args += '--js-library=' + join_paths(gex_root, 'web', 'gex-wgpu-jspi.js')
+  if have_gex_jspi
+    gex_emdawn_link_args += '--js-library=' + gex_jspi_js
+  endif
 
   # The production shape: gex's wire decoder, Mesa's frontend, and the WebGPU
   # Gallium driver.  Same source and same exported ABI as gex-mesa-replay, so
   # one recorded guest stream runs against softpipe and WebGPU unchanged and
   # the two can be compared directly.
-  gex_wgpu_replay = executable(
-    'gex-wgpu-replay',
-    join_paths(gex_root, 'web', 'mobilegl', 'gexgl-mobilegl.cpp'),
-    join_paths(gex_emdawn_dir, 'webgpu', 'src', 'webgpu.cpp'),
-    include_directories : [
-      inc_include,
-      inc_src,
-      inc_mesa,
-      inc_gallium,
-      inc_gallium_aux,
-      inc_gallium_winsys,
-      inc_gallium_drivers,
-      gex_emdawn_include,
-    ],
-    cpp_args : ['-DGEX_MESA_WASM=1', '-DGEX_MESA_WGPU=1'],
-    link_whole : [libglapi_bridge],
-    link_with : [libglapi, libgallium, libmesa],
-    dependencies : [
-      idep_mesautil,
-      idep_nir,
-      idep_libglsl,
-      driver_gex_wgpu,
-      dep_thread,
-      dep_clock,
-    ],
-    link_depends : gex_emdawn_js + [join_paths(gex_root, 'web', 'gex-wgpu-jspi.js')],
-    link_args : gex_emdawn_link_args + [
-      '--no-entry',
-      '-sWASM_BIGINT=1',
-      '-sSTACK_SIZE=16MB',
-      gex_wgpu_initial_memory,
-      '-sALLOW_MEMORY_GROWTH=1',
-      '-sASSERTIONS=2',
-      '-sMODULARIZE=1',
-      '-sEXPORT_ES6=1',
-      '-sEXPORT_NAME=createGexWgpuReplay',
-      '-sENVIRONMENT=web,worker',
-      # Keep the name section: st/mesa calling a hook this driver leaves NULL
-      # is the expected failure here, and an index is not a diagnosis.
-      '--profiling-funcs',
-      '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_setenv,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_malloc,_free',
-      '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
-    ],
-    install : false,
-  )
+  if have_gex_decoder and have_gex_jspi
+    gex_wgpu_replay = executable(
+      'gex-wgpu-replay',
+      gex_decoder,
+      join_paths(gex_emdawn_dir, 'webgpu', 'src', 'webgpu.cpp'),
+      include_directories : [
+        inc_include,
+        inc_src,
+        inc_mesa,
+        inc_gallium,
+        inc_gallium_aux,
+        inc_gallium_winsys,
+        inc_gallium_drivers,
+        gex_emdawn_include,
+      ],
+      cpp_args : ['-DGEX_MESA_WASM=1', '-DGEX_MESA_WGPU=1'],
+      link_whole : [libglapi_bridge],
+      link_with : [libglapi, libgallium, libmesa],
+      dependencies : [
+        idep_mesautil,
+        idep_nir,
+        idep_libglsl,
+        driver_gex_wgpu,
+        dep_thread,
+        dep_clock,
+      ],
+      link_depends : gex_emdawn_js + [gex_jspi_js],
+      link_args : gex_emdawn_link_args + [
+        '--no-entry',
+        '-sWASM_BIGINT=1',
+        '-sSTACK_SIZE=16MB',
+        gex_wgpu_initial_memory,
+        '-sALLOW_MEMORY_GROWTH=1',
+        '-sASSERTIONS=2',
+        '-sMODULARIZE=1',
+        '-sEXPORT_ES6=1',
+        '-sEXPORT_NAME=createGexWgpuReplay',
+        '-sENVIRONMENT=web,worker',
+        # Keep the name section: st/mesa calling a hook this driver leaves NULL
+        # is the expected failure here, and an index is not a diagnosis.
+        '--profiling-funcs',
+        '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_setenv,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_malloc,_free',
+        '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
+      ],
+      install : false,
+    )
+  endif
 
-  gex_wgpu_smoke = executable(
-    'gex-wgpu-smoke',
-    files('gex_wgpu_smoke.c'),
-    join_paths(gex_emdawn_dir, 'webgpu', 'src', 'webgpu.cpp'),
-    include_directories : [
-      inc_include,
-      inc_src,
-      inc_gallium,
-      inc_gallium_aux,
-      inc_gallium_drivers,
-      gex_emdawn_include,
-    ],
-    link_with : [libgallium],
-    dependencies : [idep_mesautil, idep_nir, driver_gex_wgpu, dep_thread, dep_clock],
-    link_depends : gex_emdawn_js + [join_paths(gex_root, 'web', 'gex-wgpu-jspi.js')],
-    link_args : gex_emdawn_link_args + [
-      '--no-entry',
-      '-sWASM_BIGINT=1',
-      '-sSTACK_SIZE=16MB',
-      gex_wgpu_initial_memory,
-      '-sALLOW_MEMORY_GROWTH=1',
-      '-sASSERTIONS=2',
-      '-sMODULARIZE=1',
-      '-sEXPORT_ES6=1',
-      '-sEXPORT_NAME=createGexWgpuSmoke',
-      '-sENVIRONMENT=web,worker',
-      '-sEXPORTED_FUNCTIONS=_gex_wgpu_smoke',
-    ],
-    install : false,
-  )
+  if have_gex_jspi
+    gex_wgpu_smoke = executable(
+      'gex-wgpu-smoke',
+      files('gex_wgpu_smoke.c'),
+      join_paths(gex_emdawn_dir, 'webgpu', 'src', 'webgpu.cpp'),
+      include_directories : [
+        inc_include,
+        inc_src,
+        inc_gallium,
+        inc_gallium_aux,
+        inc_gallium_drivers,
+        gex_emdawn_include,
+      ],
+      link_with : [libgallium],
+      dependencies : [idep_mesautil, idep_nir, driver_gex_wgpu, dep_thread, dep_clock],
+      link_depends : gex_emdawn_js + [gex_jspi_js],
+      link_args : gex_emdawn_link_args + [
+        '--no-entry',
+        '-sWASM_BIGINT=1',
+        '-sSTACK_SIZE=16MB',
+        gex_wgpu_initial_memory,
+        '-sALLOW_MEMORY_GROWTH=1',
+        '-sASSERTIONS=2',
+        '-sMODULARIZE=1',
+        '-sEXPORT_ES6=1',
+        '-sEXPORT_NAME=createGexWgpuSmoke',
+        '-sENVIRONMENT=web,worker',
+        '-sEXPORTED_FUNCTIONS=_gex_wgpu_smoke',
+      ],
+      install : false,
+    )
+  endif
 endif

@@ -44,6 +44,8 @@ usage: wink/build.sh [options]
   --until=STAGE            stop after deps|venv|emsdk|emdawn|tint|mesa|package
   --wipe                   reconfigure the meson build trees from scratch
   --check-against=A:B      report symbol collisions with these consumer archives
+  --test                   link wink/test/wink_smoke.c against each packaged variant
+                           with plain emcc and run it in headless Chrome
   -v, --verbose            echo commands
   -h, --help
 
@@ -68,6 +70,7 @@ WINK_INSTALL_DEPS=0
 WINK_UNTIL=
 WINK_WIPE=0
 WINK_CHECK_AGAINST=
+WINK_TEST=0
 WINK_VERBOSE=0
 
 for arg in "$@"; do
@@ -84,6 +87,7 @@ for arg in "$@"; do
     --until=*) WINK_UNTIL=${arg#*=} ;;
     --wipe) WINK_WIPE=1 ;;
     --check-against=*) WINK_CHECK_AGAINST=${arg#*=} ;;
+    --test) WINK_TEST=1 ;;
     -v|--verbose) WINK_VERBOSE=1 ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; die "unknown argument: $arg" ;;
@@ -109,6 +113,12 @@ for v in $WINK_VARIANTS; do
   mesa_build "$v"
   [ "$WINK_UNTIL" = mesa ] && continue
   package_variant "$v"
+  if [ "$WINK_TEST" = 1 ]; then
+    WINK_STAGE="test/$v"
+    have node || die "--test needs node (22 or newer)"
+    run bash "$WINK_DIR/test/build-smoke.sh" "$v" "$WINK_OUT/$v" "$WINK_EMBIN/emcc" "$WINK_BUILD_ROOT/test/$v" >/dev/null
+    run node "$WINK_DIR/test/run-browser.mjs" "$WINK_BUILD_ROOT/test/$v" || die "smoke test failed"
+  fi
 done
 WINK_STAGE=wink
 case $WINK_UNTIL in

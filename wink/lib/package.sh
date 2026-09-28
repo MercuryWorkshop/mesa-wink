@@ -7,6 +7,23 @@
 
 WINK_JS_ORDER="library_webgpu_enum_tables.js library_webgpu_generated_struct_info.js library_webgpu_generated_sig_info.js library_webgpu.js library_wink.js"
 
+# Meson makes uninstalled static libraries thin archives, which only name
+# their members' paths: copied anywhere else they point at nothing. Rebuild a
+# real archive from the members; `q` rather than `r`, so two members with the
+# same basename are both kept.
+package_archive() {  # <src.a> <dst.a>
+  local src=$1 dst=$2 dir
+  if [ "$(head -c 7 "$src")" != '!<thin>' ]; then
+    cp "$src" "$dst"
+    return 0
+  fi
+  dir=$(dirname "$src")
+  rm -f "$dst"
+  ( cd "$dir" && "$WINK_EMBIN/emar" t "$src" | while IFS= read -r m; do
+      "$WINK_EMBIN/emar" qc "$dst" "$m"; done )
+  "$WINK_EMBIN/emranlib" "$dst"
+}
+
 package_variant() {  # <variant>
   local v=$1
   WINK_STAGE="package/$v"
@@ -17,7 +34,7 @@ package_variant() {  # <variant>
 
   # One member, so the consumer's link takes all of wink or none of it.
   ( cd "$target" && "$WINK_EMBIN/emar" rcs "$tmp/lib/libwink.a" wink.o )
-  cp "$target/libwink_webgpu.a" "$tmp/lib/"
+  package_archive "$target/libwink_webgpu.a" "$tmp/lib/libwink_webgpu.a"
   cp "$WINK_TINT/libtint.a" "$tmp/lib/libwink_tint.a"
 
   local f
@@ -48,7 +65,8 @@ v, tmp = e['WINK_V'], e['WINK_TMP']
 mt = v == 'mt'
 js = e['WINK_JS_ORDER'].split()
 required = ['-fwasm-exceptions', '-sSUPPORT_LONGJMP=wasm', '-sWASM_BIGINT=1'] + (['-pthread'] if mt else [])
-recommended = ['-sALLOW_MEMORY_GROWTH=1', '-sMAXIMUM_MEMORY=4GB', '-sSTACK_SIZE=16MB']
+# Tint's passes recurse deeply; a 16 MB stack needs an initial memory above it.
+recommended = ['-sALLOW_MEMORY_GROWTH=1', '-sMAXIMUM_MEMORY=4GB', '-sSTACK_SIZE=16MB', '-sINITIAL_MEMORY>=32MB']
 forbidden = ['-sUSE_WEBGPU=1', '-fexceptions (JS exceptions)', '-sDISABLE_EXCEPTION_CATCHING=0',
              '-sSUPPORT_LONGJMP=emscripten', '-fPIC objects in the same link']
 files = {}
@@ -78,7 +96,7 @@ manifest = {
     'files': files,
 }
 json.dump(manifest, open(os.path.join(tmp, 'manifest.json'), 'w'), indent=2, sort_keys=True)
-flags = required + recommended + ['--js-library=%s' % os.path.join(tmp.rsplit('.tmp', 1)[0], 'js', j) for j in js]
+flags = required + [f for f in recommended if '>=' not in f] + ['--js-library=%s' % os.path.join(tmp.rsplit('.tmp', 1)[0], 'js', j) for j in js]
 open(os.path.join(tmp, 'wink.rsp'), 'w').write('\n'.join(flags) + '\n')
 msb = ' '.join(required + ['--js-library=&quot;$(WinkRoot)js/%s&quot;' % j for j in js])
 t = open(e['WINK_TARGETS_IN']).read().replace('@VARIANT@', v).replace('@LINK_FLAGS@', msb)

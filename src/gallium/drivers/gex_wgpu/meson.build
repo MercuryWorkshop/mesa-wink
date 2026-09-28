@@ -41,7 +41,11 @@ libgex_wgpu = static_library(
     include_directories('../zink/nir_to_spirv'),
     gex_tint_include,
   ],
-  dependencies : [idep_mesautil, idep_nir, idep_ntv, gex_tint],
+  # Not gex_tint: a static library's dependencies travel to everything that
+  # links it, and wink ships Tint as its own archive so a consumer that
+  # already links the same Tint (MobileGL's, from the same Dawn revision) can
+  # leave one copy out. driver_gex_wgpu below still carries it.
+  dependencies : [idep_mesautil, idep_nir, idep_ntv],
   cpp_args : [
     '-std=c++20',
     '-fno-rtti',

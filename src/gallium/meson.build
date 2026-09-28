@@ -271,6 +271,18 @@ if host_machine.system() == 'emscripten' and with_opengl and with_gallium_softpi
   subdir('targets/gex-wasm')
 endif
 
+# wink: the same frontend and driver as one relocatable object for an app
+# that links Mesa statically (a .NET browser-wasm build), with its own small
+# API in place of the gex wire decoder.
+_want_wink = host_machine.system() == 'emscripten' and with_opengl and \
+  gallium_drivers.contains('gex_wgpu') and get_option('gex-emdawn-dir') != ''
+if get_option('wink').enabled() and not _want_wink
+  error('-Dwink=enabled needs an emscripten host, -Dgallium-drivers=gex_wgpu and -Dgex-emdawn-dir')
+endif
+if _want_wink and get_option('wink').allowed()
+  subdir('targets/wink-wasm')
+endif
+
 if with_teflon
   subdir('frontends/teflon')
   subdir('targets/teflon')

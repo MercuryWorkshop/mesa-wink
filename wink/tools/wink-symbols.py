@@ -10,8 +10,9 @@ thing. Failures:
     through wink_get_proc_address(); a bare undefined glFoo would be silently
     bound by emscripten's library_webgl.js, a defined one collides with every
     other GL in the app.
-  * the JS exception / setjmp shims (invoke_*, emscripten_longjmp, ...): an
-    object built without -fwasm-exceptions, which .NET's link rejects.
+  * the JS exception / setjmp shims (invoke_*, emscripten_longjmp, ...), or
+    setjmp helpers without __wasm_longjmp: an object built without
+    -fwasm-exceptions, which .NET's wasm-EH link rejects.
   * emscripten_webgl_*: WebGL reached from the WebGPU build.
   * a strong symbol defined both in wink.o and in the Tint or webgpu archive.
   * (st) a pthread_* reference the single-threaded libc does not define.
@@ -26,8 +27,13 @@ import subprocess
 import sys
 
 GL_RE = re.compile(r'^(gl|egl|glX)[A-Z]')
-SHIM_RE = re.compile(r'^(invoke_|emscripten_longjmp$|saveSetjmp$|testSetjmp$|setThrew$|'
-                     r'__cxa_find_matching_catch|__resumeException$|getTempRet0$)')
+# The JS-mode exception and longjmp machinery. saveSetjmp, testSetjmp and
+# getTempRet0 are not on this list: 3.1.56's LLVM uses those compiler-rt
+# helpers in both modes, and what tells them apart is the longjmp itself --
+# __wasm_longjmp in wasm mode, emscripten_longjmp plus invoke_* in JS mode.
+SHIM_RE = re.compile(r'^(invoke_|emscripten_longjmp$|setThrew$|'
+                     r'__cxa_find_matching_catch|__resumeException$)')
+SJLJ_HELPERS = ('saveSetjmp', 'testSetjmp')
 WEBGL_RE = re.compile(r'^emscripten_webgl_')
 JS_RE = re.compile(r'^(wink_js_|gex_wgpu_jspi_|wgpu[A-Z]|emwgpu|emscripten_|_emscripten_|__syscall_|_tzset_js|_mktime_js|_localtime_js|_gmtime_js|_abort_js|_emval|__call_sighandler)')
 
@@ -81,6 +87,8 @@ def main():
     shims = sorted(s for s in w_undef if SHIM_RE.match(s))
     if shims:
         fails.append('JS exception/setjmp shims referenced (missing -fwasm-exceptions?): ' + ' '.join(shims[:30]))
+    if any(h in w_undef for h in SJLJ_HELPERS) and '__wasm_longjmp' not in w_undef:
+        fails.append('setjmp is used but not in wasm mode: no __wasm_longjmp reference')
     webgl = sorted(s for s in w_undef if WEBGL_RE.match(s))
     if webgl:
         fails.append('WebGL referenced: ' + ' '.join(webgl))

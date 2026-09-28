@@ -944,3 +944,17 @@ option(
   value : false,
   description : 'Reserve the larger initial Wasm heap required by ASan/UBSan gex corpus targets.'
 )
+
+option(
+  'wink',
+  type : 'feature',
+  value : 'auto',
+  description : 'libwink: st/mesa and gex_wgpu flattened into one relocatable object for a static Emscripten link (.NET browser-wasm). Needs an emscripten host, -Dgallium-drivers=gex_wgpu and -Dgex-emdawn-dir.'
+)
+
+option(
+  'gex-wasm-threads',
+  type : 'feature',
+  value : 'auto',
+  description : 'Emscripten only: build with pthreads (enabled) or single-threaded (disabled). auto follows whether the cross file compiles with -pthread.'
+)

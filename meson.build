@@ -1897,11 +1897,30 @@ elif with_shader_cache
   error('Shader Cache requires compression')
 endif
 
+# On Emscripten, dependency('threads') means -pthread: shared memory and
+# atomics in every object, which a single-threaded wasm app (e.g. .NET's
+# default browser runtime) cannot link. Such a build still needs a *found*
+# thread dependency -- c11/threads.h requires HAVE_PTHREAD -- and gets one
+# without flags: Emscripten's non-pthread libc carries pthread.h and stubs.
+with_wasm_threads = true
+if host_machine.system() == 'emscripten'
+  _cross_pthreads = cc.get_define('__EMSCRIPTEN_PTHREADS__') != ''
+  _wasm_threads_opt = get_option('gex-wasm-threads')
+  with_wasm_threads = _wasm_threads_opt.enabled() or (_wasm_threads_opt.auto() and _cross_pthreads)
+  if with_wasm_threads != _cross_pthreads
+    error('-Dgex-wasm-threads=@0@ but the cross file c_args @1@ -pthread'.format(
+      _wasm_threads_opt.enabled() ? 'enabled' : 'disabled',
+      _cross_pthreads ? 'have' : 'lack'))
+  endif
+endif
+
 if host_machine.system() == 'windows'
   # For MSVC and MinGW we aren't using pthreads, and dependency('threads') will add linkage
   # to pthread for MinGW, so leave the dependency null_dep for Windows. For Windows linking to
   # kernel32 is enough for c11/threads.h and it's already linked by meson by default
   dep_thread = null_dep
+elif not with_wasm_threads
+  dep_thread = declare_dependency()
 else
   dep_thread = dependency('threads')
 endif
