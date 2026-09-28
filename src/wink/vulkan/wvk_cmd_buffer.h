@@ -52,6 +52,9 @@ struct wvk_replay {
       VkExtent2D extent;
       VkRect2D area;
       uint32_t view_mask;
+      /* Depth and stencil the pass does not write: WebGPU lets shaders
+       * read those as it tests against them. */
+      bool depth_read_only, stencil_read_only;
       /* Counts passes, so that what is bound knows when it is gone. */
       uint32_t serial;
       /* Resolves WebGPU does not do -- integer formats, modes other than
@@ -101,6 +104,9 @@ struct wvk_replay {
    /* Images with atomics whose buffer of texels is the image now, until
     * the next barrier (wvk_replay_sync_atomic_images). */
    struct util_dynarray atomic_images; /* struct wvk_image * */
+   /* Copies of images the pass reads as it renders to them, until the
+    * pass ends or a barrier (wvk_cmd_draw.c). */
+   struct util_dynarray snapshots;     /* struct wvk_snapshot */
 
    /* The serial this submit finishes at. */
    uint64_t serial;
@@ -184,6 +190,14 @@ WGPUColor wvk_clear_color(VkFormat format, const VkClearColorValue *value);
 
 /* End whatever pass is open: copies and clears happen between passes. */
 void wvk_replay_end_passes(struct wvk_replay *replay);
+
+struct wvk_snapshot {
+   const struct wvk_image *image;
+   WGPUTexture texture;
+};
+
+/* Forget the copies of what the pass renders to: it may render more. */
+void wvk_replay_drop_snapshots(struct wvk_replay *replay);
 
 /* Images with atomics, their buffers of texels copied back to their
  * textures: at a barrier, which is when anything else may see them, and

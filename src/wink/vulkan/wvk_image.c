@@ -206,6 +206,45 @@ wvk_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks *
    vk_image_destroy(&dev->vk, pAllocator, &image->vk);
 }
 
+WGPUTexture
+wvk_image_snapshot(WGPUDevice device, const struct wvk_image *image, WGPUCommandEncoder encoder)
+{
+   if (!image->texture || image->vk.samples > 1 || image->layer_textures ||
+       (image->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)))
+      return NULL;
+   WGPUTextureFormat view_formats[1];
+   WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+   desc.label = wvk_sv("VkImage copy");
+   desc.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+   desc.dimension = image->dimension;
+   desc.size = (WGPUExtent3D){ wgpuTextureGetWidth(image->texture), wgpuTextureGetHeight(image->texture),
+                               wgpuTextureGetDepthOrArrayLayers(image->texture) };
+   desc.format = image->format;
+   desc.mipLevelCount = wgpuTextureGetMipLevelCount(image->texture);
+   if (image->vk.create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+      view_formats[0] = srgb_twin(image->format);
+      desc.viewFormatCount = view_formats[0] != WGPUTextureFormat_Undefined;
+      desc.viewFormats = view_formats;
+   }
+   WGPUTexture copy = wgpuDeviceCreateTexture(device, &desc);
+   if (!copy)
+      return NULL;
+   for (uint32_t l = 0; l < desc.mipLevelCount; ++l) {
+      WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+      src.texture = image->texture;
+      src.mipLevel = l;
+      dst.texture = copy;
+      dst.mipLevel = l;
+      const WGPUExtent3D extent = {
+         MAX2(desc.size.width >> l, 1), MAX2(desc.size.height >> l, 1),
+         desc.dimension == WGPUTextureDimension_3D ? MAX2(desc.size.depthOrArrayLayers >> l, 1)
+                                                    : desc.size.depthOrArrayLayers,
+      };
+      wgpuCommandEncoderCopyTextureToTexture(encoder, &src, &dst, &extent);
+   }
+   return copy;
+}
+
 void
 wvk_image_copy_atomic(struct wvk_image *image, WGPUCommandEncoder encoder, bool to_buffer)
 {
@@ -454,12 +493,14 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
          desc.arrayLayerCount = 1;
       desc.aspect = view->aspect;
       view->view = wgpuTextureCreateView(texture, &desc);
+      view->view_desc = desc;
       /* Cubes as storage images, and input attachments, are 2D arrays. */
       if (desc.dimension == WGPUTextureViewDimension_Cube || desc.dimension == WGPUTextureViewDimension_CubeArray ||
           (desc.dimension == WGPUTextureViewDimension_2D && image->vk.samples == 1 &&
            (view->vk.usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))) {
          desc.dimension = WGPUTextureViewDimension_2DArray;
          view->array_view = wgpuTextureCreateView(texture, &desc);
+         view->array_desc = desc;
       }
    }
 

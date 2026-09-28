@@ -29,8 +29,12 @@ struct wvk_descriptor {
    WGPUBuffer buffer;
    uint64_t offset;
    uint64_t size;
-   /* Images: the view, its format, and its record's swizzle and channels. */
+   /* Images: the view, its format, and its record's swizzle and channels;
+    * and the image and how the view was made, for when a pass renders to
+    * the image as it reads it. */
    WGPUTextureView view;
+   struct wvk_image *view_image;
+   WGPUTextureViewDescriptor view_desc;
    VkFormat view_format;
    uint32_t swizzle;
    uint32_t channels;

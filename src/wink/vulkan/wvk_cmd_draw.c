@@ -1106,9 +1106,22 @@ placeholder_view_locked(struct wvk_device *dev, const struct wvk_shader_binding 
    return view;
 }
 
+/* The copy of an image the pass renders to, if it has one. */
+static WGPUTexture
+find_snapshot(const struct wvk_replay *replay, const struct wvk_image *image)
+{
+   util_dynarray_foreach(&replay->snapshots, struct wvk_snapshot, s) {
+      if (s->image == image)
+         return s->texture;
+   }
+   return NULL;
+}
+
+/* A bind group of the set; with `replay`, what it reads of images the
+ * pass renders to read their copies instead. */
 static WGPUBindGroup
 make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct wvk_descriptor_set *set,
-                uint32_t group, const struct wvk_bound_state *st)
+                uint32_t group, const struct wvk_bound_state *st, struct wvk_replay *replay)
 {
    const struct wvk_physical_device *pdev = wvk_device_physical(dev);
    WGPUBindGroupEntry *entries = calloc(MAX2(bgl->count, 1), sizeof(*entries));
@@ -1168,6 +1181,14 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       case WVK_BINDING_TEXTURE:
       case WVK_BINDING_STORAGE_TEXTURE:
          e->textureView = d && d->view ? d->view : placeholder_view(dev, b);
+         if (replay && d && d->view_image && b->kind == WVK_BINDING_TEXTURE) {
+            WGPUTexture copy = find_snapshot(replay, d->view_image);
+            WGPUTextureView v = copy ? wgpuTextureCreateView(copy, &d->view_desc) : NULL;
+            if (v) {
+               util_dynarray_append(&replay->views, v);
+               e->textureView = v;
+            }
+         }
          if (!e->textureView) {
             free(entries);
             return NULL;
@@ -1243,6 +1264,97 @@ sync_atomic_buffers(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout,
       wvk_replay_restart_pass(cmd, replay->pass_layer);
 }
 
+/* A set's inline uniform blocks as it has them now: written before the
+ * submit, in the queue's order, after what used them before. */
+static void
+upload_inline_blocks(struct wvk_device *dev, struct wvk_descriptor_set *set)
+{
+   if (set->inline_buffer && set->inline_uploaded != set->generation) {
+      wgpuQueueWriteBuffer(dev->queue.wgpu, set->inline_buffer, 0, set->inline_data, set->inline_size);
+      set->inline_uploaded = set->generation;
+   }
+}
+
+/* Whether the layout's shaders read, through the set, an image the pass
+ * renders to and has a copy of. */
+static bool
+reads_snapshot(const struct wvk_replay *replay, const struct wvk_bgl *bgl, const struct wvk_descriptor_set *set)
+{
+   for (uint32_t i = 0; i < bgl->count; ++i) {
+      const struct wvk_shader_binding *b = &bgl->entries[i].b;
+      if (b->kind != WVK_BINDING_TEXTURE)
+         continue;
+      bool sampler;
+      uint32_t dynamic_index;
+      const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
+      if (d && d->view_image && find_snapshot(replay, d->view_image))
+         return true;
+   }
+   return false;
+}
+
+/* Whether the pass renders to what a descriptor reads of an image, which
+ * WebGPU will not let it read as well: an aspect of depth or stencil it
+ * may, read-only. */
+static bool
+is_rendered_to(const struct wvk_replay *replay, const struct wvk_descriptor *d)
+{
+   for (uint32_t i = 0; i < replay->rendering.color_count; ++i) {
+      if (replay->rendering.color[i] && wvk_image_view_image(replay->rendering.color[i]) == d->view_image)
+         return true;
+   }
+   const struct wvk_image_view *ds = replay->rendering.depth_stencil;
+   if (!ds || wvk_image_view_image(ds) != d->view_image)
+      return false;
+   switch (d->view_desc.aspect) {
+   case WGPUTextureAspect_DepthOnly:
+      return !replay->rendering.depth_read_only;
+   case WGPUTextureAspect_StencilOnly:
+      return !replay->rendering.stencil_read_only;
+   default:
+      return !(replay->rendering.depth_read_only && replay->rendering.stencil_read_only);
+   }
+}
+
+/* What a draw reads of images the pass renders to: copies, made before it
+ * with the pass begun again after, and kept until a barrier or the pass
+ * ends -- which is when Vulkan has what it rendered visible to reads. */
+static void
+snapshot_feedback(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   bool ended = false;
+   for (uint32_t g = 0; g < layout->group_count; ++g) {
+      const struct wvk_bgl *bgl = layout->groups[g];
+      const struct wvk_descriptor_set *set = st->sets[WVK_BIND_GRAPHICS][g].set;
+      for (uint32_t i = 0; set && i < bgl->count; ++i) {
+         const struct wvk_shader_binding *b = &bgl->entries[i].b;
+         if (b->kind != WVK_BINDING_TEXTURE)
+            continue;
+         bool sampler;
+         uint32_t dynamic_index;
+         const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
+         if (!d || !d->view_image || !is_rendered_to(replay, d) || find_snapshot(replay, d->view_image))
+            continue;
+         if (!ended) {
+            wvk_replay_end_passes(replay);
+            ended = true;
+         }
+         WGPUTexture copy = wvk_image_snapshot(dev->wgpu, d->view_image, replay->encoder);
+         if (!copy) {
+            mesa_logw_once("wvk: a pass reads a multisampled or depth image it renders to");
+            continue;
+         }
+         const struct wvk_snapshot snapshot = { d->view_image, copy };
+         util_dynarray_append(&replay->snapshots, snapshot);
+      }
+   }
+   if (ended)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+}
+
 /* A set's bind group for this layout: kept in the set until it changes. */
 static WGPUBindGroup
 get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descriptor_set *set, uint32_t group,
@@ -1258,7 +1370,7 @@ get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descripto
              !memcmp(&dev->driver_groups[i].driver, &key, sizeof(key)))
             return dev->driver_groups[i].group;
       }
-      WGPUBindGroup bg = make_bind_group(dev, bgl, NULL, group, st);
+      WGPUBindGroup bg = make_bind_group(dev, bgl, NULL, group, st, NULL);
       if (!bg)
          return NULL;
       const uint32_t i = dev->driver_group_next;
@@ -1270,19 +1382,14 @@ get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descripto
       dev->driver_groups[i].group = bg;
       return bg;
    }
-   /* Its inline uniform blocks as the set has them now: written before
-    * the submit, in the queue's order, after what used them before. */
-   if (set->inline_buffer && set->inline_uploaded != set->generation) {
-      wgpuQueueWriteBuffer(dev->queue.wgpu, set->inline_buffer, 0, set->inline_data, set->inline_size);
-      set->inline_uploaded = set->generation;
-   }
+   upload_inline_blocks(dev, set);
    for (uint32_t i = 0; i < WVK_SET_BIND_GROUPS; ++i) {
       struct wvk_set_bind_group *c = &set->bind_groups[i];
       if (c->group && c->layout == bgl->layout && c->generation == set->generation &&
           !memcmp(&c->driver, &key, sizeof(key)))
          return c->group;
    }
-   WGPUBindGroup bg = make_bind_group(dev, bgl, set, group, st);
+   WGPUBindGroup bg = make_bind_group(dev, bgl, set, group, st, NULL);
    if (!bg)
       return NULL;
    struct wvk_set_bind_group *c = &set->bind_groups[set->bind_group_next];
@@ -1352,7 +1459,16 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
    for (uint32_t g = driver_only ? WVK_DRIVER_GROUP : 0; g < layout->group_count; ++g) {
       struct wvk_bgl *bgl = layout->groups[g];
       struct wvk_bound_set *bound = &st->sets[bind_point][g];
-      WGPUBindGroup bg = get_bind_group(dev, bgl, bgl->count ? bound->set : NULL, g, st);
+      /* One of its own, for this draw alone, where it reads copies. */
+      const bool reads_copies = pass && replay->snapshots.size && bgl->count && bound->set &&
+                                reads_snapshot(replay, bgl, bound->set);
+      WGPUBindGroup bg;
+      if (reads_copies) {
+         upload_inline_blocks(dev, bound->set);
+         bg = make_bind_group(dev, bgl, bound->set, g, st, replay);
+      } else {
+         bg = get_bind_group(dev, bgl, bgl->count ? bound->set : NULL, g, st);
+      }
       if (!bg)
          return false;
 
@@ -1392,6 +1508,8 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
          wgpuRenderPassEncoderSetBindGroup(pass, g, bg, offset_count, offsets);
       else
          wgpuComputePassEncoderSetBindGroup(compute, g, bg, offset_count, offsets);
+      if (reads_copies)
+         wgpuBindGroupRelease(bg);
    }
    return true;
 }
@@ -1505,7 +1623,7 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
    if (k->depth_format) {
       const bool depth_test = dyn->ds.depth.test_enable;
       k->depth_compare = depth_test ? dyn->ds.depth.compare_op : VK_COMPARE_OP_ALWAYS;
-      k->depth_write = depth_test && dyn->ds.depth.write_enable;
+      k->depth_write = depth_test && dyn->ds.depth.write_enable && !replay->rendering.depth_read_only;
       /* WebGPU wants the stencil state left alone without a stencil. */
       if (dyn->ds.stencil.test_enable && has_stencil) {
          const struct vk_stencil_test_face_state *f = &dyn->ds.stencil.front, *b = &dyn->ds.stencil.back;
@@ -1523,6 +1641,11 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
       } else {
          k->front.compare = k->back.compare = VK_COMPARE_OP_ALWAYS;
          k->stencil_read_mask = k->stencil_write_mask = 0xff;
+      }
+      if (replay->rendering.stencil_read_only) {
+         k->front.fail = k->front.pass = k->front.depth_fail = VK_STENCIL_OP_KEEP;
+         k->back.fail = k->back.pass = k->back.depth_fail = VK_STENCIL_OP_KEEP;
+         k->stencil_write_mask = 0;
       }
       if (dyn->rs.depth_bias.enable) {
          k->depth_bias = (int32_t)dyn->rs.depth_bias.constant_factor;
@@ -1729,6 +1852,7 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    if (!p)
       return false;
    sync_atomic_buffers(cmd, p->layout, WVK_BIND_GRAPHICS);
+   snapshot_feedback(cmd, p->layout);
    pass = replay->pass;
    if (!pass)
       return false;

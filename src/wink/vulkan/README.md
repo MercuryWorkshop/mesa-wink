@@ -47,6 +47,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   texture, and a shader that does atomics on it uses it for everything.
   Between barriers one or the other is the image: the texture is copied to
   the buffer before such a shader runs, and back at the next barrier.
+- **A pass that reads what it renders to** -- an input attachment of its own
+  subpass, a feedback loop -- reads a copy, which WebGPU wants: a texture is
+  an attachment or bound in a pass, not both. The copy is made before the
+  draw, with the pass begun again after, and kept until a barrier. Depth
+  and stencil in read-only layouts are read-only to WebGPU, which lets
+  shaders read them as they are.
 - **16-bit packed formats** (565, 4444, 5551, 1555), which WebGPU does not
   have, are RGBA8 textures. Copies to and from buffers are a shader's,
   which packs and unpacks the texels; a format without alpha keeps its
@@ -156,6 +162,8 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Multisampled array images are a texture for each layer, since WebGPU
   has no multisampled arrays: attachments, clears and resolves are right,
   but a shader sampling one sees its first layer.
+- Feedback loops on multisampled images, and on depth or stencil that is
+  written: WebGPU copies neither.
 - Formats WebGPU does not multisample (RG32 and RGBA32 among them) have
   one sample, though Vulkan wants every colour attachment format to have
   framebufferColorSampleCounts.

@@ -215,10 +215,16 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
       /* A storage image of a cube is the 2D array of its faces, and an
        * input attachment an array, fetched at the pass's layer. */
       WGPUTextureView wgpu = view ? view->view : NULL;
+      const WGPUTextureViewDescriptor *desc = view ? &view->view_desc : NULL;
       if (view && view->array_view &&
-          (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT))
+          (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)) {
          wgpu = view->array_view;
+         desc = &view->array_desc;
+      }
       if (wgpu) {
+         d->view_image = wvk_image_view_image(view);
+         d->view_desc = *desc;
+         d->view_desc.label = (WGPUStringView)WGPU_STRING_VIEW_INIT;
          d->view = wgpu;
          wgpuTextureViewAddRef(d->view);
          d->view_format = view->vk.view_format;

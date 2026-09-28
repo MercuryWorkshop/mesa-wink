@@ -309,6 +309,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_init(&replay.push_sets, NULL);
    util_dynarray_init(&replay.meta_memory, NULL);
    util_dynarray_init(&replay.atomic_images, NULL);
+   util_dynarray_init(&replay.snapshots, NULL);
    util_dynarray_init(&replay.pass_queries, NULL);
    replay.serial = serial;
 
@@ -331,6 +332,8 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    wvk_replay_end_passes(&replay);
    wvk_replay_sync_atomic_images(NULL, &replay);
    util_dynarray_fini(&replay.atomic_images);
+   wvk_replay_drop_snapshots(&replay);
+   util_dynarray_fini(&replay.snapshots);
    rcmd->replay = NULL;
    /* What the replay itself recorded is of no further use. */
    vk_command_buffer_reset(&rcmd->vk);
@@ -394,6 +397,15 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
 /* Synchronization: one in-order queue has nothing to wait for. */
 
 void
+wvk_replay_drop_snapshots(struct wvk_replay *replay)
+{
+   /* What was encoded has them still. */
+   util_dynarray_foreach(&replay->snapshots, struct wvk_snapshot, s)
+      wgpuTextureRelease(s->texture);
+   util_dynarray_clear(&replay->snapshots);
+}
+
+void
 wvk_replay_sync_atomic_images(struct wvk_cmd_buffer *cmd, struct wvk_replay *replay)
 {
    if (!replay->atomic_images.size)
@@ -416,6 +428,7 @@ wvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDependencyInfo *p
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    wvk_replay_sync_atomic_images(cmd, cmd->replay);
+   wvk_replay_drop_snapshots(cmd->replay);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -424,4 +437,5 @@ wvk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount, const VkE
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    wvk_replay_sync_atomic_images(cmd, cmd->replay);
+   wvk_replay_drop_snapshots(cmd->replay);
 }

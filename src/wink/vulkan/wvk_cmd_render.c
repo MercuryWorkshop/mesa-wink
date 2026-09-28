@@ -213,6 +213,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    if (stencil && !stencil->imageView)
       stencil = NULL;
    replay->rendering.depth_stencil = NULL;
+   replay->rendering.depth_read_only = replay->rendering.stencil_read_only = false;
    if (depth || stencil) {
       VK_FROM_HANDLE(wvk_image_view, view, (depth ? depth : stencil)->imageView);
       replay->rendering.depth_stencil = view;
@@ -232,8 +233,16 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
          replay->rendering.resolve.stencil.pNext = NULL;
          replay->rendering.resolve.pending = true;
       }
+      /* An aspect in a read-only layout is read-only to WebGPU too, which
+       * then lets shaders read the image as the pass tests against it. */
+      const bool depth_ro = depth && !replay->rendering.resolve.depth.resolveMode &&
+                            vk_image_layout_is_read_only(depth->imageLayout, VK_IMAGE_ASPECT_DEPTH_BIT);
+      const bool stencil_ro = stencil && !replay->rendering.resolve.stencil.resolveMode &&
+                              vk_image_layout_is_read_only(stencil->imageLayout, VK_IMAGE_ASPECT_STENCIL_BIT);
+      replay->rendering.depth_read_only = depth_ro;
+      replay->rendering.stencil_read_only = stencil_ro;
       if (vk_format_has_depth(format)) {
-         if (depth) {
+         if (depth && !depth_ro) {
             ds.depthLoadOp = whole ? load_op(depth->loadOp, resuming) : WGPULoadOp_Load;
             if (!whole && depth->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
                ds_clear.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -248,7 +257,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
          }
       }
       if (vk_format_has_stencil(format)) {
-         if (stencil) {
+         if (stencil && !stencil_ro) {
             ds.stencilLoadOp = whole ? load_op(stencil->loadOp, resuming) : WGPULoadOp_Load;
             if (!whole && stencil->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
                ds_clear.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -330,6 +339,7 @@ wvk_CmdEndRendering(VkCommandBuffer commandBuffer)
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    struct wvk_replay *replay = cmd->replay;
    wvk_replay_end_passes(replay);
+   wvk_replay_drop_snapshots(replay);
    replay->rendering.color_count = 0;
    replay->rendering.depth_stencil = NULL;
    replay->pass_info = NULL;

@@ -57,6 +57,11 @@ wvk_image_layer_texture(const struct wvk_image *image, uint32_t layer, uint32_t 
    return image->texture;
 }
 
+/* A copy of the image's texture, every level and layer of it, for a pass
+ * that reads the image as it renders to it. Colour images of one sample
+ * only; NULL for the rest. */
+WGPUTexture wvk_image_snapshot(WGPUDevice device, const struct wvk_image *image, WGPUCommandEncoder encoder);
+
 /* Copy an atomic image's texels from its texture to its buffer, or back,
  * outside any pass. */
 void wvk_image_copy_atomic(struct wvk_image *image, WGPUCommandEncoder encoder, bool to_buffer);
@@ -76,6 +81,9 @@ struct wvk_image_view {
     * attachment's, as a 2D array, fetched at the layer drawn. */
    WGPUTextureView view;
    WGPUTextureView array_view;
+   /* How they were made, for a view alike of a copy of the image: a pass
+    * that reads what it renders to reads a copy (wvk_cmd_draw.c). */
+   WGPUTextureViewDescriptor view_desc, array_desc;
    WGPUTextureFormat format;
    WGPUTextureAspect aspect;
    /* Its components, which WebGPU views have no way to remap, for shaders
