@@ -461,6 +461,10 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuSamplerRelease(dev->null_sampler);
    if (dev->dummy_attachment)
       wgpuTextureRelease(dev->dummy_attachment);
+   for (uint32_t i = 0; i < dev->placeholder_count; ++i) {
+      wgpuTextureViewRelease(dev->placeholders[i].view);
+      wgpuTextureRelease(dev->placeholders[i].texture);
+   }
    simple_mtx_destroy(&dev->cache_lock);
 }
 
@@ -683,8 +687,10 @@ struct wvk_bound_state {
    /* The push constants, and the driver's data after them. */
    uint8_t push[WVK_PUSH_DATA_SIZE];
    /* Where push[] is in the submit's push data, or UINT32_MAX if it
-    * changed since. */
+    * changed since; and whose records went with it. */
    uint32_t push_offset;
+   uint32_t push_bind_point;
+   const struct wvk_shader *push_shader;
    /* What the draw binding is: the push buffer, or (buffer set) an
     * indirect buffer from a 256-byte boundary. See set_draw_parameters. */
    struct wvk_driver_buffer draw;
@@ -823,6 +829,8 @@ wvk_CmdBindDescriptorSets2(VkCommandBuffer commandBuffer, const VkBindDescriptor
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    struct wvk_bound_state *st = cmd->replay->state;
    uint32_t next_dynamic = 0;
+   /* The push data carries the bound sets' records. */
+   st->push_offset = UINT32_MAX;
    for (uint32_t i = 0; i < info->descriptorSetCount; ++i) {
       VK_FROM_HANDLE(wvk_descriptor_set, set, info->pDescriptorSets[i]);
       const uint32_t index = info->firstSet + i;
@@ -857,6 +865,7 @@ push_set(struct wvk_cmd_buffer *cmd, VkShaderStageFlags stages, VkPipelineLayout
    if (!set)
       return NULL;
    util_dynarray_append(&cmd->replay->push_sets, set);
+   cmd->replay->state->push_offset = UINT32_MAX;
    for (uint32_t bp = 0; bp < WVK_BIND_POINTS; ++bp) {
       const VkShaderStageFlags want = bp == WVK_BIND_COMPUTE ? VK_SHADER_STAGE_COMPUTE_BIT
                                                              : VK_SHADER_STAGE_ALL_GRAPHICS;
@@ -989,9 +998,9 @@ binding_variant(struct wvk_device *dev, const struct wvk_bound_state *st, uint32
                                                           &sampler, &dynamic_index);
          bool unfiltered = false;
          if (b->kind == WVK_BINDING_TEXTURE)
-            unfiltered = d && d->view && !(wvk_format_caps(pdev, d->view->vk.view_format) & WVK_CAP_FILTER);
+            unfiltered = d && d->view && !(wvk_format_caps(pdev, d->view_format) & WVK_CAP_FILTER);
          else
-            unfiltered = d && d->sampler && d->sampler->binding_type == WGPUSamplerBindingType_NonFiltering;
+            unfiltered = d && d->sampler && d->sampler_type == WGPUSamplerBindingType_NonFiltering;
          if (unfiltered)
             variant |= 1ull << this_bit;
       }
@@ -1021,6 +1030,67 @@ driver_binding_buffer(const struct wvk_bound_state *st, uint32_t binding)
    return NULL;
 }
 
+/* A 1x1 texture of what the binding wants, for a descriptor never
+ * written, which a partially bound set may leave. Its contents are not
+ * the point: nothing reads it that the set uses. */
+static WGPUTextureView
+placeholder_view_locked(struct wvk_device *dev, const struct wvk_shader_binding *b);
+
+static WGPUTextureView
+placeholder_view(struct wvk_device *dev, const struct wvk_shader_binding *b)
+{
+   simple_mtx_lock(&dev->cache_lock);
+   WGPUTextureView view = placeholder_view_locked(dev, b);
+   simple_mtx_unlock(&dev->cache_lock);
+   return view;
+}
+
+static WGPUTextureView
+placeholder_view_locked(struct wvk_device *dev, const struct wvk_shader_binding *b)
+{
+   const bool storage = b->kind == WVK_BINDING_STORAGE_TEXTURE;
+   const uint64_t key = (uint64_t)b->view_dimension | (uint64_t)b->sample_type << 8 |
+                        (uint64_t)b->multisampled << 16 | (uint64_t)storage << 17 |
+                        (uint64_t)(storage ? b->format : 0) << 24;
+   for (uint32_t i = 0; i < dev->placeholder_count; ++i) {
+      if (dev->placeholders[i].key == key)
+         return dev->placeholders[i].view;
+   }
+   if (dev->placeholder_count == ARRAY_SIZE(dev->placeholders))
+      return NULL;
+   WGPUTextureFormat format = WGPUTextureFormat_RGBA8Unorm;
+   if (storage)
+      format = b->format;
+   else if (b->sample_type == WGPUTextureSampleType_Sint)
+      format = WGPUTextureFormat_RGBA8Sint;
+   else if (b->sample_type == WGPUTextureSampleType_Uint)
+      format = WGPUTextureFormat_RGBA8Uint;
+   else if (b->sample_type == WGPUTextureSampleType_Depth)
+      format = WGPUTextureFormat_Depth32Float;
+   const bool cube = b->view_dimension == WGPUTextureViewDimension_Cube ||
+                     b->view_dimension == WGPUTextureViewDimension_CubeArray;
+   WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+   td.label = wvk_sv("wvk placeholder");
+   td.dimension = b->view_dimension == WGPUTextureViewDimension_3D ? WGPUTextureDimension_3D
+                                                                   : WGPUTextureDimension_2D;
+   td.size = (WGPUExtent3D){ 1, 1, cube ? 6 : 1 };
+   td.format = format;
+   td.sampleCount = b->multisampled ? 4 : 1;
+   td.usage = storage ? WGPUTextureUsage_StorageBinding : WGPUTextureUsage_TextureBinding;
+   if (b->multisampled)
+      td.usage |= WGPUTextureUsage_RenderAttachment;
+   WGPUTexture texture = wgpuDeviceCreateTexture(dev->wgpu, &td);
+   if (!texture)
+      return NULL;
+   WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   vd.dimension = b->view_dimension;
+   WGPUTextureView view = wgpuTextureCreateView(texture, &vd);
+   dev->placeholders[dev->placeholder_count].key = key;
+   dev->placeholders[dev->placeholder_count].texture = texture;
+   dev->placeholders[dev->placeholder_count++].view = view;
+   return view;
+}
+
 static WGPUBindGroup
 make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct wvk_descriptor_set *set,
                 uint32_t group, const struct wvk_bound_state *st)
@@ -1034,22 +1104,6 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       WGPUBindGroupEntry *e = &entries[i];
       *e = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       e->binding = b->binding;
-      if (b->binding == WVK_SET_META_SLOT) {
-         /* The set's records: its own buffer, or a pushed set's place in
-          * the push data. */
-         e->offset = 0;
-         e->size = set ? wvk_descriptor_set_meta_size(set->layout) : 256;
-         if (set && set->meta_buffer) {
-            e->buffer = set->meta_buffer;
-         } else if (set && !set->pool) {
-            e->buffer = dev->push_buffer;
-            e->offset = set->meta_offset;
-         } else {
-            e->buffer = dev->null_buffer;
-            e->size = 256;
-         }
-         continue;
-      }
       if (group == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
          const struct wvk_driver_buffer *d = driver_binding_buffer(st, b->binding);
          e->offset = 0;
@@ -1060,8 +1114,9 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
             e->buffer = dev->null_buffer;
             e->size = 256;
          } else {
+            /* The push data, the driver's, and the bound sets' records. */
             e->buffer = dev->push_buffer;
-            e->size = WVK_PUSH_DATA_SIZE;
+            e->size = b->binding == WVK_DRIVER_SLOT_PUSH ? WVK_PUSH_WINDOW : WVK_PUSH_DATA_SIZE;
          }
          continue;
       }
@@ -1093,14 +1148,12 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       case WVK_BINDING_SAMPLER:
       case WVK_BINDING_SAMPLER_COMPARE:
       case WVK_BINDING_SAMPLER_NONFILTERING:
-         e->sampler = d && d->sampler ? d->sampler->wgpu : dev->null_sampler;
+         e->sampler = d && d->sampler ? d->sampler : dev->null_sampler;
          break;
       case WVK_BINDING_TEXTURE:
       case WVK_BINDING_STORAGE_TEXTURE:
-         if (d && d->view) {
-            e->textureView = d->view->view;
-         } else {
-            mesa_logw_once("wvk: a texture that was never written is bound");
+         e->textureView = d && d->view ? d->view : placeholder_view(dev, b);
+         if (!e->textureView) {
             free(entries);
             return NULL;
          }
@@ -1123,11 +1176,9 @@ driver_key(const struct wvk_device *dev, const struct wvk_bgl *bgl, uint32_t gro
            const struct wvk_bound_state *st)
 {
    struct wvk_driver_key key = { 0 };
-   /* A group with the set's records has the push buffer in it. */
-   if (bgl->count && bgl->entries[bgl->count - 1].b.binding >= WVK_SET_META_SLOT)
-      key.push_generation = dev->push_generation;
    if (group != WVK_DRIVER_GROUP)
       return key;
+   key.push_generation = dev->push_generation;
    for (uint32_t i = 0; i < bgl->count; ++i) {
       const uint32_t binding = bgl->entries[i].b.binding;
       const struct wvk_driver_buffer *d = driver_binding_buffer(st, binding);
@@ -1187,81 +1238,35 @@ get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descripto
    return bg;
 }
 
-/* The push constants' place in the submit's push data. */
+/* The push constants' place in the submit's push data: them, the driver's
+ * data, and the records of the sets bound at `bind_point`, as far as the
+ * shaders' pipeline layout has them. */
 static uint32_t
-push_offset(struct wvk_device *dev, struct wvk_replay *replay)
+push_offset(struct wvk_device *dev, struct wvk_replay *replay, uint32_t bind_point)
 {
    struct wvk_bound_state *st = replay->state;
-   if (st->push_offset != UINT32_MAX)
+   const struct wvk_shader *shader = bind_point == WVK_BIND_COMPUTE ? st->cs : st->vs;
+   if (st->push_offset != UINT32_MAX && st->push_bind_point == bind_point && st->push_shader == shader)
       return st->push_offset;
+   const uint32_t meta_words = shader ? MIN2(shader->meta_words, (WVK_PUSH_WINDOW - WVK_META_OFFSET) / 4) : 0;
+   const uint32_t size = align(WVK_PUSH_DATA_SIZE + meta_words * 4, WVK_PUSH_STRIDE);
    const uint32_t offset = replay->push_data.size;
-   uint8_t *slot = util_dynarray_grow_bytes(&replay->push_data, 1, WVK_PUSH_STRIDE);
+   uint8_t *slot = util_dynarray_grow_bytes(&replay->push_data, 1, size);
    if (!slot)
       return 0;
    memcpy(slot, st->push, WVK_PUSH_DATA_SIZE);
-   memset(slot + WVK_PUSH_DATA_SIZE, 0, WVK_PUSH_STRIDE - WVK_PUSH_DATA_SIZE);
+   memset(slot + WVK_PUSH_DATA_SIZE, 0, size - WVK_PUSH_DATA_SIZE);
+   uint32_t *records = (uint32_t *)(slot + WVK_META_OFFSET);
+   for (uint32_t g = 0; shader && g < WVK_MAX_GROUPS; ++g) {
+      const struct wvk_descriptor_set *set = st->sets[bind_point][g].set;
+      const uint32_t end = g + 1 < WVK_MAX_GROUPS ? shader->meta_base[g + 1] : shader->meta_words;
+      if (set && shader->meta_base[g] < meta_words)
+         wvk_descriptor_set_meta(set, records + shader->meta_base[g], MIN2(end, meta_words) - shader->meta_base[g]);
+   }
    st->push_offset = offset;
+   st->push_bind_point = bind_point;
+   st->push_shader = shader;
    return offset;
-}
-
-static bool
-bgl_has_meta(const struct wvk_bgl *bgl)
-{
-   for (uint32_t i = bgl->count; i-- > 0;) {
-      if (bgl->entries[i].b.binding == WVK_SET_META_SLOT)
-         return true;
-      if (bgl->entries[i].b.binding < WVK_SET_META_SLOT)
-         break;
-   }
-   return false;
-}
-
-/* The set's records, where its bind group finds them. A pushed set's go
- * into the submit's push data, the first time a draw binds it. A pool's
- * set has a buffer of them, written again when the set changed: a set is
- * not written while a submit uses it, but for descriptors the submit does
- * not use, whose records are the only ones that can differ. False on
- * failure. */
-static bool
-set_meta(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_descriptor_set *set)
-{
-   const uint32_t size = wvk_descriptor_set_meta_size(set->layout);
-   if (!set->pool) {
-      if (set->meta_generation == set->generation + 1)
-         return true;
-      const uint32_t offset = replay->push_data.size;
-      uint32_t *words = util_dynarray_grow_bytes(&replay->push_data, 1, align(size, WVK_PUSH_STRIDE));
-      if (!words)
-         return false;
-      memset(words, 0, align(size, WVK_PUSH_STRIDE));
-      wvk_descriptor_set_meta(set, words);
-      set->meta_offset = offset;
-      set->meta_generation = set->generation + 1;
-      return true;
-   }
-   if (set->meta_buffer && set->meta_generation == set->generation + 1)
-      return true;
-   if (!set->meta_buffer) {
-      WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
-      desc.label = wvk_sv("wvk descriptor records");
-      desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
-      desc.size = size;
-      set->meta_buffer = wgpuDeviceCreateBuffer(dev->wgpu, &desc);
-      if (!set->meta_buffer)
-         return false;
-      /* Its bind groups, made without it, are gone. */
-      const uint64_t generation = set->generation;
-      wvk_descriptor_set_invalidate(set);
-      set->generation = generation;
-   }
-   uint32_t *words = malloc(size);
-   if (!words)
-      return false;
-   wvk_descriptor_set_meta(set, words);
-   wgpuQueueWriteBuffer(dev->queue.wgpu, set->meta_buffer, 0, words, size);
-   free(words);
-   set->meta_generation = set->generation + 1;
-   return true;
 }
 
 /* Bind every group of the layout, or only the driver's. Returns false if
@@ -1279,17 +1284,11 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
       const struct wvk_bgl *bgl = layout->groups[g];
       for (uint32_t i = 0; i < bgl->count; ++i)
          uses_push |= g == WVK_DRIVER_GROUP && bgl->entries[i].b.binding == WVK_DRIVER_SLOT_PUSH;
-      struct wvk_descriptor_set *set = st->sets[bind_point][g].set;
-      if (bgl_has_meta(bgl)) {
-         uses_push = true;
-         if (set && !set_meta(dev, replay, set))
-            return false;
-      }
    }
    uint32_t push_at = 0;
    if (uses_push) {
-      push_at = push_offset(dev, replay);
-      if (!reserve_push_buffer(dev, replay, replay->push_data.size))
+      push_at = push_offset(dev, replay, bind_point);
+      if (!reserve_push_buffer(dev, replay, replay->push_data.size + WVK_PUSH_WINDOW))
          return false;
    }
 
@@ -1306,8 +1305,6 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
       uint32_t offset_count = 0;
       for (uint32_t i = 0; i < bgl->count; ++i) {
          const struct wvk_shader_binding *b = &bgl->entries[i].b;
-         if (b->binding == WVK_SET_META_SLOT)
-            continue;
          if (g == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
             if (b->dynamic && offset_count < WVK_MAX_DYNAMIC) {
                /* The draw binding is the push buffer unless it is not. */

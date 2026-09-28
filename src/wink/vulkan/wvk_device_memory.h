@@ -28,11 +28,22 @@ struct wvk_device_memory {
    /* Unique on the device, for caches that name the buffer. */
    uint64_t serial;
 
+   /* The application's reference, and descriptors': a descriptor may
+    * outlive what it names, when nothing uses it, and bind groups still
+    * have it. The last reference frees the memory, with the allocator
+    * vkFreeMemory was given. */
+   uint32_t refs;
+   VkAllocationCallbacks free_alloc;
+   bool free_with_alloc;
+
    void *host;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_device_memory, vk.base, VkDeviceMemory,
                                VK_OBJECT_TYPE_DEVICE_MEMORY)
+
+void wvk_device_memory_ref(struct wvk_device_memory *mem);
+void wvk_device_memory_unref(struct wvk_device_memory *mem);
 
 /* What the WGPUBuffer, and the host copy, of memory of `size` bytes are:
  * whole words, and 256 bytes more. WebGPU wants a uniform binding to hold

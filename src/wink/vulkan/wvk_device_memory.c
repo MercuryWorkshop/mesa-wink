@@ -51,9 +51,30 @@ wvk_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
       }
       memset(mem->host, 0, host_size);
    }
+   mem->refs = 1;
 
    *pMem = wvk_device_memory_to_handle(mem);
    return VK_SUCCESS;
+}
+
+void
+wvk_device_memory_ref(struct wvk_device_memory *mem)
+{
+   p_atomic_inc(&mem->refs);
+}
+
+void
+wvk_device_memory_unref(struct wvk_device_memory *mem)
+{
+   if (!p_atomic_dec_zero(&mem->refs))
+      return;
+   if (mem->buffer) {
+      wgpuBufferDestroy(mem->buffer);
+      wgpuBufferRelease(mem->buffer);
+   }
+   os_free_aligned(mem->host);
+   struct vk_device *dev = mem->vk.base.device;
+   vk_device_memory_destroy(dev, mem->free_with_alloc ? &mem->free_alloc : NULL, &mem->vk);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -63,12 +84,12 @@ wvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem, const VkAllocationCallback
    VK_FROM_HANDLE(wvk_device_memory, mem, _mem);
    if (!mem)
       return;
-   if (mem->buffer) {
-      wgpuBufferDestroy(mem->buffer);
-      wgpuBufferRelease(mem->buffer);
+   (void)dev;
+   if (pAllocator) {
+      mem->free_alloc = *pAllocator;
+      mem->free_with_alloc = true;
    }
-   os_free_aligned(mem->host);
-   vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
+   wvk_device_memory_unref(mem);
 }
 
 VkResult

@@ -40,8 +40,11 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE
 
 struct wvk_image_view {
    struct vk_image_view vk;
-   /* For binding: the whole subresource range, in the view's dimension. */
+   /* For binding: the whole subresource range, in the view's dimension;
+    * and for a cube's, as a 2D array of its faces, which is how a storage
+    * image of it binds, and how one is fetched from. */
    WGPUTextureView view;
+   WGPUTextureView array_view;
    WGPUTextureFormat format;
    WGPUTextureAspect aspect;
    /* Its components, which WebGPU views have no way to remap, for shaders

@@ -66,13 +66,15 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 #define WVK_DRIVER_SLOT_VERTEX (WVK_DRIVER_SLOT_BASE + 2)
 #define WVK_MAX_PULLED_BINDINGS 4
 
+#define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
+
 /* What WebGPU's objects cannot hold of a set's descriptors, and shaders
  * need -- a view's swizzle, a sampler's border colour, a texel buffer's
- * format: a record of WVK_META_WORDS words per WebGPU binding of the set,
- * at this binding of the set's group. It lives in the submit's push data,
- * written the first time a submit binds the set. See wvk_nir_descriptors.c. */
-#define WVK_SET_META_SLOT (WVK_DRIVER_SLOT_BASE - 1)
-#define WVK_MAX_SET_SLOTS WVK_SET_META_SLOT
+ * format: a record of WVK_META_WORDS words per WebGPU binding of the set.
+ * The records of every bound set follow the driver's data in the push
+ * binding, from WVK_META_OFFSET, set after set as the pipeline layout
+ * has them: no binding of their own, of which WebGPU has few. See
+ * wvk_nir_descriptors.c. */
 #define WVK_META_WORDS 8
 
 /* A texture's record: its view's swizzle, 0 for none, else 3 bits a
@@ -135,6 +137,10 @@ enum wvk_texel_type {
 #define WVK_DRIVER_PULL_OFFSET (WVK_DRIVER_DATA_OFFSET + 48)
 #define WVK_DRIVER_DEPTH_OFFSET (WVK_DRIVER_DATA_OFFSET + 64)
 #define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 80)
+#define WVK_META_OFFSET WVK_PUSH_DATA_SIZE
+/* How much of the push buffer the push binding shows: its data, and as
+ * many records as that leaves room for. */
+#define WVK_PUSH_WINDOW (64 * 1024)
 
 /* What a group-3 bind group's driver bindings are bound to: the push
  * buffer's generation, and memory serials (0: none) for the draw binding

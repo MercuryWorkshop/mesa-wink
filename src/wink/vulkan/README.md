@@ -35,12 +35,16 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   compiled into shaders.
 - **What WebGPU's objects cannot hold** of descriptors, shaders do
   themselves: each set has a record for each of its bindings, which the
-  shader reads at the draw (`wvk_nir_descriptors.c`). Texel buffers are
+  shader reads at the draw (`wvk_nir_descriptors.c`), from the push binding
+  after the push constants. Texel buffers are
   storage buffers whose format the shader decodes and encodes, views'
   swizzles are applied to what is read through them, and samplers' border
   colours, mirroring once, LOD bias and unnormalized coordinates are the
   shader's. Integer textures, which WebGPU does not sample, are fetched
   from, with the sampler's address modes and LOD applied.
+- **Arrays of descriptors** are bindings of their own. A dynamic or
+  non-uniform index chooses among them in the shader: reads from each,
+  selected; writes only where the index is.
 - **Blits and `vkCmdClearAttachments`** come from the runtime's vk_meta.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
@@ -114,7 +118,9 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 
 ## Not there yet
 
-- Dynamically indexed arrays of descriptors: the first element is used.
+- WebGPU has 10 storage buffers a stage in browsers, and texel buffers are
+  storage buffers, beyond what Vulkan counts as such. Image atomics, which
+  WGSL does not have.
 - Layered rendering: a pass is one layer. This affects multiview too.
 - Precise occlusion queries, and timestamps.
 - Subgroups.

@@ -232,7 +232,8 @@ split_resource_vars(nir_shader *nir, struct lower_state *state)
          continue;
       }
       struct split_var *s = rzalloc(state->split, struct split_var);
-      s->count = glsl_type_is_array(var->type) ? glsl_get_aoa_size(var->type) : 1;
+      /* The layout's count: an array without a size is as big as that. */
+      s->count = glsl_type_is_array(var->type) ? MAX2(bl->count, 1) : 1;
       s->texture = rzalloc_array(s, nir_variable *, s->count);
       const bool combined = glsl_type_is_sampler(bare) && !glsl_type_is_bare_sampler(bare);
       if (combined)
@@ -255,6 +256,12 @@ split_resource_vars(nir_shader *nir, struct lower_state *state)
                glsl_texture_type(ms ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D, false,
                                  glsl_get_sampler_result_type(bare));
             s->texture[e] = new_var(nir, nir_var_uniform, texture, var, bl->slot + e, "_ia", e);
+         } else if (glsl_type_is_image(bare) && glsl_get_sampler_dim(bare) == GLSL_SAMPLER_DIM_CUBE) {
+            /* A cube image is a 2D array of its faces, as Vulkan addresses
+             * it, and as WebGPU can bind it: no storage cube textures. */
+            const struct glsl_type *array =
+               glsl_image_type(GLSL_SAMPLER_DIM_2D, true, glsl_get_sampler_result_type(bare));
+            s->texture[e] = new_var(nir, var->data.mode, array, var, bl->slot + e, "_", e);
          } else {
             s->texture[e] = new_var(nir, var->data.mode, bare, var, bl->slot + e, "_", e);
          }
@@ -263,34 +270,156 @@ split_resource_vars(nir_shader *nir, struct lower_state *state)
    }
 }
 
-/* Which element of its binding a deref is of: arrays of textures are
- * separate bindings, so the index has to be known. */
-static nir_variable *
-element_var(struct lower_state *state, nir_deref_instr *deref, bool sampler)
+/* Where a deref of a split resource points: its elements, the constant
+ * part of which one, and the rest, NULL if the index is constant. Arrays
+ * of arrays are flattened, as the layout's elements are. */
+struct element_ref {
+   struct split_var *s;
+   uint32_t base;
+   nir_def *index;
+};
+
+static bool
+resolve_element(struct lower_state *state, nir_builder *b, nir_deref_instr *deref, struct element_ref *out)
 {
-   uint32_t element = 0;
-   nir_deref_instr *d = deref;
-   while (d->deref_type != nir_deref_type_var) {
-      if (d->deref_type == nir_deref_type_array) {
-         if (!nir_src_is_const(d->arr.index)) {
-            mesa_logw_once("wvk: a dynamically indexed array of textures is not supported yet; "
-                           "the first element is used");
-         } else {
-            element += nir_src_as_uint(d->arr.index);
+   *out = (struct element_ref){ 0 };
+   for (nir_deref_instr *d = deref; d; d = nir_deref_instr_parent(d)) {
+      if (d->deref_type == nir_deref_type_var) {
+         struct hash_entry *he = _mesa_hash_table_search(state->split, d->var);
+         if (!he)
+            return false;
+         out->s = he->data;
+         out->base = MIN2(out->base, out->s->count - 1);
+         return true;
+      }
+      if (d->deref_type != nir_deref_type_array)
+         continue;
+      const uint32_t stride = glsl_type_is_array(d->type) ? glsl_get_aoa_size(d->type) : 1;
+      if (nir_src_is_const(d->arr.index)) {
+         out->base += nir_src_as_uint(d->arr.index) * stride;
+      } else {
+         b->cursor = nir_before_instr(&deref->instr);
+         nir_def *i = nir_imul_imm(b, d->arr.index.ssa, stride);
+         out->index = out->index ? nir_iadd(b, out->index, i) : i;
+      }
+   }
+   return false;
+}
+
+static nir_variable *
+ref_var(const struct element_ref *r, uint32_t element, bool sampler)
+{
+   element = MIN2(element, r->s->count - 1);
+   return sampler && r->s->sampler ? r->s->sampler[element] : r->s->texture[element];
+}
+
+/* How many elements a dynamic index chooses among, from the constant
+ * part on. */
+static uint32_t
+ref_choices(const struct element_ref *r)
+{
+   return r->index ? r->s->count - r->base : 1;
+}
+
+/* An instruction on dynamically indexed arrays of resources: one on each
+ * element they can be, and what the index says of their results. Reads
+ * are all done, and selected from, which keeps them in uniform control
+ * flow for derivatives; stores and atomics only where the index is.
+ * `srcs` are the indices of the instruction's resource sources, `refs`
+ * where they point: sources with the same index choose together. */
+static nir_src *
+instr_src(nir_instr *instr, unsigned index)
+{
+   if (instr->type == nir_instr_type_tex)
+      return &nir_instr_as_tex(instr)->src[index].src;
+   return &nir_instr_as_intrinsic(instr)->src[index];
+}
+
+static void
+rewrite_dynamic(nir_builder *b, nir_instr *instr, const unsigned *srcs, const bool *samplers,
+                struct element_ref *refs, unsigned count, bool writes)
+{
+   /* The indices, each once. */
+   nir_def *indices[2] = { NULL, NULL };
+   uint32_t choices[2] = { 1, 1 };
+   unsigned which[2];
+   unsigned n_indices = 0;
+   for (unsigned i = 0; i < count; ++i) {
+      which[i] = 0;
+      if (!refs[i].index)
+         continue;
+      unsigned k = 0;
+      while (k < n_indices && indices[k] != refs[i].index)
+         ++k;
+      if (k == n_indices) {
+         indices[n_indices] = refs[i].index;
+         choices[n_indices++] = ref_choices(&refs[i]);
+      } else {
+         choices[k] = MIN2(choices[k], ref_choices(&refs[i]));
+      }
+      which[i] = k;
+   }
+   b->cursor = nir_before_instr(instr);
+   nir_def *def = nir_instr_def(instr);
+   nir_def *result = NULL;
+   for (uint32_t c0 = 0; c0 < choices[0]; ++c0) {
+      for (uint32_t c1 = 0; c1 < choices[1]; ++c1) {
+         const uint32_t picked[2] = { c0, c1 };
+         nir_def *cond = nir_imm_true(b);
+         for (unsigned k = 0; k < n_indices; ++k)
+            cond = nir_iand(b, cond, nir_ieq_imm(b, indices[k], picked[k]));
+         if (writes)
+            nir_push_if(b, cond);
+         /* The clone's resource sources, at the same places, made before
+          * it. */
+         nir_def *derefs[2];
+         for (unsigned i = 0; i < count; ++i) {
+            const uint32_t element = refs[i].base + (refs[i].index ? picked[which[i]] : 0);
+            derefs[i] = &nir_build_deref_var(b, ref_var(&refs[i], element, samplers[i]))->def;
+         }
+         nir_instr *clone = nir_instr_clone(b->shader, instr);
+         nir_builder_instr_insert(b, clone);
+         for (unsigned i = 0; i < count; ++i)
+            nir_src_rewrite(instr_src(clone, srcs[i]), derefs[i]);
+         nir_def *value = nir_instr_def(clone);
+         if (writes) {
+            nir_pop_if(b, NULL);
+            if (value)
+               value = nir_if_phi(b, value, result ? result : nir_undef(b, value->num_components, value->bit_size));
+            result = value;
+         } else if (value) {
+            result = result ? nir_bcsel(b, cond, value, result) : value;
          }
       }
-      d = nir_deref_instr_parent(d);
-      if (!d)
-         return NULL;
    }
-   struct hash_entry *he = _mesa_hash_table_search(state->split, d->var);
-   if (!he)
-      return NULL;
-   struct split_var *s = he->data;
-   element = MIN2(element, s->count - 1);
-   if (sampler && s->sampler)
-      return s->sampler[element];
-   return s->texture[element];
+   if (def)
+      nir_def_rewrite_uses(def, result);
+   nir_instr_remove(instr);
+}
+
+/* An access to a cube image as one to the 2D array of its faces, which
+ * the variable now is: the coordinates are the same, and a size has the
+ * faces as layers, which are six a cube. */
+static void
+cube_image_as_array(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   const bool arrayed = nir_intrinsic_image_array(intr);
+   nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
+   nir_intrinsic_set_image_array(intr, true);
+   if (intr->intrinsic != nir_intrinsic_image_deref_size)
+      return;
+   const unsigned n = intr->def.num_components;
+   intr->num_components = 3;
+   intr->def.num_components = 3;
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *placeholder = nir_undef(b, n, intr->def.bit_size);
+   nir_def_rewrite_uses(&intr->def, placeholder);
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *size = arrayed ? nir_vec3(b, nir_channel(b, &intr->def, 0), nir_channel(b, &intr->def, 1),
+                                      nir_udiv_imm(b, nir_channel(b, &intr->def, 2), 6))
+                           : nir_trim_vector(b, &intr->def, 2);
+   nir_def_rewrite_uses(placeholder, nir_trim_vector(b, size, n));
+   nir_instr_remove(nir_def_instr(placeholder));
 }
 
 static bool
@@ -299,22 +428,36 @@ rewrite_resource_instr(nir_builder *b, nir_instr *instr, void *data)
    struct lower_state *state = data;
    if (instr->type == nir_instr_type_tex) {
       nir_tex_instr *tex = nir_instr_as_tex(instr);
-      bool progress = false;
       /* A combined sampler has only its texture deref for fetches and
        * queries, and both for sampling; either way each half goes to its
        * own variable. */
-      for (unsigned i = 0; i < tex->num_srcs; ++i) {
+      unsigned srcs[2];
+      bool samplers[2];
+      struct element_ref refs[2];
+      unsigned count = 0;
+      bool dynamic = false;
+      for (unsigned i = 0; i < tex->num_srcs && count < 2; ++i) {
          const bool is_sampler = tex->src[i].src_type == nir_tex_src_sampler_deref;
          if (tex->src[i].src_type != nir_tex_src_texture_deref && !is_sampler)
             continue;
-         nir_variable *var = element_var(state, nir_src_as_deref(tex->src[i].src), is_sampler);
-         if (!var)
+         if (!resolve_element(state, b, nir_src_as_deref(tex->src[i].src), &refs[count]))
             continue;
-         b->cursor = nir_before_instr(instr);
-         nir_src_rewrite(&tex->src[i].src, &nir_build_deref_var(b, var)->def);
-         progress = true;
+         srcs[count] = i;
+         samplers[count] = is_sampler;
+         dynamic |= refs[count].index != NULL;
+         ++count;
       }
-      return progress;
+      if (!count)
+         return false;
+      if (dynamic) {
+         rewrite_dynamic(b, instr, srcs, samplers, refs, count, false);
+         return true;
+      }
+      b->cursor = nir_before_instr(instr);
+      for (unsigned i = 0; i < count; ++i)
+         nir_src_rewrite(&tex->src[srcs[i]].src,
+                         &nir_build_deref_var(b, ref_var(&refs[i], refs[i].base, samplers[i]))->def);
+      return true;
    }
    if (instr->type != nir_instr_type_intrinsic)
       return false;
@@ -327,16 +470,28 @@ rewrite_resource_instr(nir_builder *b, nir_instr *instr, void *data)
    case nir_intrinsic_image_deref_size:
    case nir_intrinsic_image_deref_samples:
    case nir_intrinsic_image_deref_levels: {
-      nir_variable *var = element_var(state, nir_src_as_deref(intr->src[0]), false);
-      if (!var)
+      struct element_ref ref;
+      if (!resolve_element(state, b, nir_src_as_deref(intr->src[0]), &ref))
          return false;
+      if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_CUBE)
+         cube_image_as_array(b, intr);
+      if (ref.index) {
+         const unsigned src = 0;
+         const bool sampler = false;
+         const bool writes = intr->intrinsic == nir_intrinsic_image_deref_store ||
+                             intr->intrinsic == nir_intrinsic_image_deref_atomic ||
+                             intr->intrinsic == nir_intrinsic_image_deref_atomic_swap;
+         rewrite_dynamic(b, instr, &src, &sampler, &ref, 1, writes);
+         return true;
+      }
       b->cursor = nir_before_instr(instr);
-      nir_src_rewrite(&intr->src[0], &nir_build_deref_var(b, var)->def);
+      nir_src_rewrite(&intr->src[0], &nir_build_deref_var(b, ref_var(&ref, ref.base, false))->def);
       return true;
    }
    case nir_intrinsic_vulkan_resource_index: {
       /* Buffers: each element its own binding, found by (set, binding) in
-       * zink's emitter. */
+       * zink's emitter. A dynamic index stays, from the binding's first
+       * element: lower_to_words chooses among them. */
       const uint32_t set = nir_intrinsic_desc_set(intr);
       const uint32_t binding = nir_intrinsic_binding(intr);
       const struct wvk_descriptor_set_binding_layout *bl = binding_layout(state->info, set, binding);
@@ -346,15 +501,12 @@ rewrite_resource_instr(nir_builder *b, nir_instr *instr, void *data)
          state->failed = true;
          return false;
       }
-      uint32_t element = 0;
-      if (nir_src_is_const(intr->src[0]))
-         element = MIN2(nir_src_as_uint(intr->src[0]), bl->count - 1);
-      else
-         mesa_logw_once("wvk: a dynamically indexed array of buffers is not supported yet; "
-                        "the first element is used");
-      nir_intrinsic_set_binding(intr, bl->slot + element);
-      b->cursor = nir_before_instr(instr);
-      nir_src_rewrite(&intr->src[0], nir_imm_int(b, 0));
+      nir_intrinsic_set_binding(intr, bl->slot);
+      if (nir_src_is_const(intr->src[0])) {
+         nir_intrinsic_set_binding(intr, bl->slot + MIN2(nir_src_as_uint(intr->src[0]), bl->count - 1));
+         b->cursor = nir_before_instr(instr);
+         nir_src_rewrite(&intr->src[0], nir_imm_int(b, 0));
+      }
       return true;
    }
    default:
@@ -540,11 +692,14 @@ struct word_buffers {
 };
 
 /* The binding an index operand of load_ssbo and friends came from:
- * vulkan_resource_index, through load_vulkan_descriptor. */
+ * vulkan_resource_index, through load_vulkan_descriptor; and for a
+ * dynamically indexed array of buffers, the index, else NULL. */
 static bool
-index_binding(nir_src src, uint32_t *set, uint32_t *binding)
+index_binding(nir_src src, uint32_t *set, uint32_t *binding, nir_def **dynamic)
 {
    nir_scalar s = nir_scalar_resolved(src.ssa, 0);
+   if (dynamic)
+      *dynamic = NULL;
    for (unsigned depth = 0; depth < 8; ++depth) {
       if (!nir_scalar_is_intrinsic(s))
          return false;
@@ -552,6 +707,8 @@ index_binding(nir_src src, uint32_t *set, uint32_t *binding)
       if (intr->intrinsic == nir_intrinsic_vulkan_resource_index) {
          *set = nir_intrinsic_desc_set(intr);
          *binding = nir_intrinsic_binding(intr);
+         if (dynamic && !nir_src_is_const(intr->src[0]))
+            *dynamic = intr->src[0].ssa;
          return true;
       }
       if (intr->intrinsic != nir_intrinsic_load_vulkan_descriptor &&
@@ -560,6 +717,23 @@ index_binding(nir_src src, uint32_t *set, uint32_t *binding)
       s = nir_scalar_resolved(intr->src[0].ssa, 0);
    }
    return false;
+}
+
+/* How many elements the binding starting at WebGPU binding `slot` of
+ * `set` has. */
+static uint32_t
+slot_elements(const struct vk_shader_compile_info *info, uint32_t set, uint32_t slot)
+{
+   if (set >= info->set_layout_count || !info->set_layouts[set])
+      return 1;
+   const struct wvk_descriptor_set_layout *layout =
+      container_of(info->set_layouts[set], struct wvk_descriptor_set_layout, vk);
+   for (uint32_t i = 0; i < layout->binding_count; ++i) {
+      const struct wvk_descriptor_set_binding_layout *bl = &layout->bindings[i];
+      if (bl->type != VK_DESCRIPTOR_TYPE_MAX_ENUM && bl->slot == slot)
+         return MAX2(bl->count, 1);
+   }
+   return 1;
 }
 
 static nir_variable *
@@ -602,83 +776,121 @@ load_word(nir_builder *b, nir_variable *var, bool ubo, nir_def *word)
    return nir_vector_extract(b, vec, nir_iand_imm(b, word, 3));
 }
 
-static bool
-lower_to_words_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+/* The access, on the words of buffer (set, binding): its value, or NULL
+ * for a store. */
+static nir_def *
+lower_word_access(nir_builder *b, struct word_buffers *wb, nir_intrinsic_instr *intr, bool ubo, uint32_t set,
+                  uint32_t binding)
 {
-   struct word_buffers *wb = data;
-   bool ubo = false;
-   int index_src;
-   switch (intr->intrinsic) {
-   case nir_intrinsic_load_ubo:
-      ubo = true;
-      FALLTHROUGH;
-   case nir_intrinsic_load_ssbo:
-   case nir_intrinsic_ssbo_atomic:
-   case nir_intrinsic_ssbo_atomic_swap:
-   case nir_intrinsic_get_ssbo_size:
-      index_src = 0;
-      break;
-   case nir_intrinsic_store_ssbo:
-      index_src = 1;
-      break;
-   default:
-      return false;
-   }
-   uint32_t set, binding;
-   if (!index_binding(intr->src[index_src], &set, &binding)) {
-      mesa_loge("wvk: a buffer access whose binding cannot be told");
-      return false;
-   }
    nir_variable *var = word_var(b->shader, wb, ubo, set, binding);
-   b->cursor = nir_before_instr(&intr->instr);
-
    if (intr->intrinsic == nir_intrinsic_get_ssbo_size) {
       nir_deref_instr *words = nir_build_deref_struct(b, nir_build_deref_var(b, var), 0);
       nir_def *length = nir_deref_buffer_array_length(b, 32, &words->def, .access = ACCESS_NON_WRITEABLE);
-      nir_def_replace(&intr->def, nir_imul_imm(b, length, 4));
-      return true;
+      return nir_imul_imm(b, length, 4);
    }
 
    const int offset_src = intr->intrinsic == nir_intrinsic_store_ssbo ? 2 : 1;
    nir_def *first = nir_ushr_imm(b, intr->src[offset_src].ssa, 2);
 
    if (intr->intrinsic == nir_intrinsic_load_ubo || intr->intrinsic == nir_intrinsic_load_ssbo) {
-      if (intr->def.bit_size != 32) {
-         mesa_loge("wvk: a %u-bit buffer load", intr->def.bit_size);
-         return false;
-      }
       nir_def *comps[NIR_MAX_VEC_COMPONENTS];
       for (unsigned c = 0; c < intr->def.num_components; ++c)
          comps[c] = load_word(b, var, ubo, nir_iadd_imm(b, first, c));
-      nir_def_replace(&intr->def, nir_vec(b, comps, intr->def.num_components));
-      return true;
+      return nir_vec(b, comps, intr->def.num_components);
    }
 
    nir_deref_instr *words = nir_build_deref_struct(b, nir_build_deref_var(b, var), 0);
    if (intr->intrinsic == nir_intrinsic_store_ssbo) {
       nir_def *value = intr->src[0].ssa;
-      if (value->bit_size != 32) {
-         mesa_loge("wvk: a %u-bit buffer store", value->bit_size);
-         return false;
-      }
       u_foreach_bit(c, nir_intrinsic_write_mask(intr)) {
          nir_store_deref(b, nir_build_deref_array(b, words, nir_iadd_imm(b, first, c)),
                          nir_channel(b, value, c), 0x1);
       }
-      nir_instr_remove(&intr->instr);
-      return true;
+      return NULL;
    }
 
    /* Atomics, on one word. */
    nir_deref_instr *word = nir_build_deref_array(b, words, first);
-   nir_def *result;
    if (intr->intrinsic == nir_intrinsic_ssbo_atomic_swap)
-      result = nir_deref_atomic_swap(b, 32, &word->def, intr->src[2].ssa, intr->src[3].ssa,
-                                     .atomic_op = nir_intrinsic_atomic_op(intr));
+      return nir_deref_atomic_swap(b, 32, &word->def, intr->src[2].ssa, intr->src[3].ssa,
+                                   .atomic_op = nir_intrinsic_atomic_op(intr));
+   return nir_deref_atomic(b, 32, &word->def, intr->src[2].ssa, .atomic_op = nir_intrinsic_atomic_op(intr));
+}
+
+static bool
+lower_to_words_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct word_buffers *wb = data;
+   bool ubo = false, writes = false;
+   int index_src;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ubo:
+      ubo = true;
+      FALLTHROUGH;
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_get_ssbo_size:
+      index_src = 0;
+      break;
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
+      index_src = 0;
+      writes = true;
+      break;
+   case nir_intrinsic_store_ssbo:
+      index_src = 1;
+      writes = true;
+      break;
+   default:
+      return false;
+   }
+   uint32_t set, binding;
+   nir_def *dynamic;
+   if (!index_binding(intr->src[index_src], &set, &binding, &dynamic)) {
+      mesa_loge("wvk: a buffer access whose binding cannot be told");
+      return false;
+   }
+   if ((intr->intrinsic == nir_intrinsic_load_ubo || intr->intrinsic == nir_intrinsic_load_ssbo) &&
+       intr->def.bit_size != 32) {
+      mesa_loge("wvk: a %u-bit buffer load", intr->def.bit_size);
+      return false;
+   }
+   if (intr->intrinsic == nir_intrinsic_store_ssbo && intr->src[0].ssa->bit_size != 32) {
+      mesa_loge("wvk: a %u-bit buffer store", intr->src[0].ssa->bit_size);
+      return false;
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+
+   if (!dynamic) {
+      nir_def *result = lower_word_access(b, wb, intr, ubo, set, binding);
+      if (result)
+         nir_def_replace(&intr->def, result);
+      else
+         nir_instr_remove(&intr->instr);
+      return true;
+   }
+
+   /* An array of buffers, dynamically indexed: each element that can be,
+    * reads selected from, writes where the index is. */
+   const uint32_t count = slot_elements(wb->info, set, binding);
+   nir_def *result = NULL;
+   for (uint32_t e = 0; e < count; ++e) {
+      nir_def *here = nir_ieq_imm(b, dynamic, e);
+      if (writes)
+         nir_push_if(b, here);
+      nir_def *value = lower_word_access(b, wb, intr, ubo, set, binding + e);
+      if (writes) {
+         nir_pop_if(b, NULL);
+         if (value)
+            value = nir_if_phi(b, value, result ? result : nir_undef(b, value->num_components, value->bit_size));
+         result = value;
+      } else {
+         result = result ? nir_bcsel(b, here, value, result) : value;
+      }
+   }
+   if (result)
+      nir_def_replace(&intr->def, result);
    else
-      result = nir_deref_atomic(b, 32, &word->def, intr->src[2].ssa,
-                                .atomic_op = nir_intrinsic_atomic_op(intr));
-   nir_def_replace(&intr->def, result);
+      nir_instr_remove(&intr->instr);
    return true;
 }
 
@@ -1232,6 +1444,12 @@ gather_usage_instr(nir_builder *b, nir_instr *instr, void *data)
       case nir_intrinsic_deref_atomic_swap:
          writes = true;
          break;
+      case nir_intrinsic_image_deref_store:
+      case nir_intrinsic_image_deref_atomic:
+      case nir_intrinsic_image_deref_atomic_swap:
+         /* An image never written is read-only, as Tint takes it. */
+         note_var_deref(u->written, &intr->src[0]);
+         return false;
       default:
          break;
       }
@@ -1340,7 +1558,9 @@ reflect_bindings(nir_shader *nir, const struct vk_shader_compile_info *info,
       } else if (glsl_type_is_bare_sampler(type)) {
          sb->kind = glsl_sampler_type_is_shadow(type) || _mesa_set_search(u.compared, k)
                        ? WVK_BINDING_SAMPLER_COMPARE : WVK_BINDING_SAMPLER;
-      } else if (glsl_type_is_image(type) && (var->data.access & ACCESS_NON_WRITEABLE)) {
+      } else if (glsl_type_is_image(type) &&
+                 ((var->data.access & ACCESS_NON_WRITEABLE) || !_mesa_set_search(u.written, k))) {
+         var->data.access |= ACCESS_NON_WRITEABLE;
          /* Tint makes a read-only storage image a texture it loads from. */
          sb->kind = WVK_BINDING_TEXTURE;
          sb->view_dimension = view_dimension(type);
@@ -1444,6 +1664,20 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       .info = info,
       .split = _mesa_pointer_hash_table_create(mem_ctx),
    };
+   /* The records of the pipeline layout's sets, set after set. */
+   uint32_t meta_words = 0;
+   for (uint32_t g = 0; g < 4; ++g) {
+      shader->meta_base[g] = meta_words;
+      if (g < info->set_layout_count && info->set_layouts[g]) {
+         const struct wvk_descriptor_set_layout *layout =
+            container_of(info->set_layouts[g], struct wvk_descriptor_set_layout, vk);
+         meta_words += layout->slot_count * WVK_META_WORDS;
+      }
+   }
+   shader->meta_words = meta_words;
+   if (WVK_META_OFFSET + meta_words * 4 > WVK_PUSH_WINDOW)
+      mesa_logw_once("wvk: a pipeline layout of more descriptors than their records have room for");
+
    NIR_PASS(_, nir, lower_push_constants);
    NIR_PASS(_, nir, drop_layer_outputs);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_layer_id_instr, nir_metadata_control_flow, NULL);
@@ -1454,13 +1688,13 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    /* Swizzles first: a gather's is a gather of another component, which
     * then samples as its own; and the border replaces a texel before the
     * swizzle takes it apart. */
-   NIR_PASS(_, nir, wvk_nir_lower_view_swizzles);
-   NIR_PASS(_, nir, wvk_nir_lower_samplers);
+   NIR_PASS(_, nir, wvk_nir_lower_view_swizzles, shader->meta_base);
+   NIR_PASS(_, nir, wvk_nir_lower_samplers, shader->meta_base);
    NIR_PASS(_, nir, lower_1d_images);
    NIR_PASS(_, nir, lower_ms_arrays);
    NIR_PASS(_, nir, pad_fragment_outputs);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, demote_to_terminate_instr, nir_metadata_all, NULL);
-   NIR_PASS(_, nir, wvk_nir_lower_texel_buffers);
+   NIR_PASS(_, nir, wvk_nir_lower_texel_buffers, shader->meta_base);
    lower_buffers_to_words(nir, info, pipeline_state, shader, mem_ctx);
    optimize(nir);
    /* The combined and arrayed originals, now without a use. */
@@ -1629,6 +1863,8 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->writes_depth);
    blob_write_uint8(blob, shader->uses_push_constants);
    blob_write_uint8(blob, shader->uses_draw_parameters);
+   blob_write_bytes(blob, shader->meta_base, sizeof(shader->meta_base));
+   blob_write_uint32(blob, shader->meta_words);
    blob_write_uint8(blob, shader->pulled_count);
    blob_write_bytes(blob, shader->pulled_bindings, sizeof(shader->pulled_bindings));
    blob_write_bytes(blob, shader->workgroup_size, sizeof(shader->workgroup_size));
@@ -1653,6 +1889,9 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const bool writes_depth = blob_read_uint8(blob);
    const bool uses_push_constants = blob_read_uint8(blob);
    const bool uses_draw_parameters = blob_read_uint8(blob);
+   uint32_t meta_base[4];
+   blob_copy_bytes(blob, meta_base, sizeof(meta_base));
+   const uint32_t meta_words = blob_read_uint32(blob);
    const uint8_t pulled_count = blob_read_uint8(blob);
    uint8_t pulled_bindings[WVK_MAX_PULLED_BINDINGS];
    blob_copy_bytes(blob, pulled_bindings, sizeof(pulled_bindings));
@@ -1684,6 +1923,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->writes_depth = writes_depth;
    shader->uses_push_constants = uses_push_constants;
    shader->uses_draw_parameters = uses_draw_parameters;
+   memcpy(shader->meta_base, meta_base, sizeof(meta_base));
+   shader->meta_words = meta_words;
    shader->pulled_count = MIN2(pulled_count, WVK_MAX_PULLED_BINDINGS);
    memcpy(shader->pulled_bindings, pulled_bindings, sizeof(pulled_bindings));
    memcpy(shader->workgroup_size, workgroup_size, sizeof(workgroup_size));

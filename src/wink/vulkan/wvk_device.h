@@ -74,6 +74,14 @@ struct wvk_device {
       WGPUTextureFormat format;
       WGPURenderPipeline pipeline;
    } depth_in_pipelines[4];
+   /* What a binding with no descriptor written shows: 1x1 textures of
+    * each kind a bind group layout can want (descriptorBindingPartiallyBound). */
+   struct {
+      uint64_t key;
+      WGPUTexture texture;
+      WGPUTextureView view;
+   } placeholders[16];
+   uint32_t placeholder_count;
    /* What a pass without attachments renders to. */
    WGPUTexture dummy_attachment;
    VkExtent2D dummy_extent;

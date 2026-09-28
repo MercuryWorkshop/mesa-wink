@@ -3,9 +3,8 @@
  * SPDX-License-Identifier: MIT
  *
  * What shaders do themselves with descriptors, for what WebGPU's objects
- * cannot hold. Each set has a record for each of its WebGPU bindings, at
- * binding WVK_SET_META_SLOT of its group (wvk_descriptor_set_layout.h), and
- * the shader reads it at the draw:
+ * cannot hold. Each set has a record for each of its WebGPU bindings
+ * (wvk_descriptor_set_layout.h), and the shader reads it at the draw:
  *
  *   - texel buffers, which WebGPU does not have, are storage buffers:
  *     fetches, stores, atomics and size queries become word accesses, the
@@ -15,7 +14,9 @@
  *
  * These run after the resource variables are split, when every texture,
  * image and sampler is a variable at its (group, binding), and before
- * buffers become words, which the accesses here then do too.
+ * buffers become words, which the accesses here then do too. The records
+ * are in the push binding (WVK_META_OFFSET), each group's where `meta_base`
+ * says: the pipeline layout's order.
  */
 #include "wvk_nir.h"
 
@@ -36,12 +37,15 @@ buffer_index(nir_builder *b, uint32_t group, uint32_t binding)
    return nir_channel(b, desc, 0);
 }
 
-/* Word `word` of the record of binding `slot` of `group`. */
+/* Word `word` of the record of binding `slot` of `group`: in the push
+ * binding, after the driver's data, where the pipeline layout puts the
+ * group's records. */
 nir_def *
-wvk_nir_load_meta(nir_builder *b, uint32_t group, nir_def *slot, uint32_t word)
+wvk_nir_load_meta(nir_builder *b, const uint32_t *meta, uint32_t group, nir_def *slot, uint32_t word)
 {
-   nir_def *at = nir_ishl_imm(b, nir_iadd_imm(b, nir_imul_imm(b, slot, WVK_META_WORDS), word), 2);
-   return nir_load_ssbo(b, 1, 32, buffer_index(b, group, WVK_SET_META_SLOT), at, .align_mul = 4,
+   const uint32_t first = WVK_META_OFFSET / 4 + meta[MIN2(group, 3)] + word;
+   nir_def *at = nir_ishl_imm(b, nir_iadd_imm(b, nir_imul_imm(b, slot, WVK_META_WORDS), first), 2);
+   return nir_load_ssbo(b, 1, 32, buffer_index(b, WVK_DRIVER_GROUP, WVK_DRIVER_SLOT_PUSH), at, .align_mul = 4,
                         .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER);
 }
 
@@ -72,18 +76,18 @@ struct texel_format {
 };
 
 static struct texel_format
-texel_format(nir_builder *b, uint32_t group, uint32_t slot)
+texel_format(nir_builder *b, const uint32_t *meta, uint32_t group, uint32_t slot)
 {
    nir_def *s = nir_imm_int(b, slot);
-   nir_def *format = wvk_nir_load_meta(b, group, s, WVK_META_TEXEL_FORMAT);
+   nir_def *format = wvk_nir_load_meta(b, meta, group, s, WVK_META_TEXEL_FORMAT);
    return (struct texel_format){
       .type = nir_iand_imm(b, format, 0xff),
       .bytes = nir_ubitfield_extract_imm(b, format, 8, 8),
-      .count = wvk_nir_load_meta(b, group, s, WVK_META_TEXEL_COUNT),
-      .start = wvk_nir_load_meta(b, group, s, WVK_META_TEXEL_START),
-      .sizes = wvk_nir_load_meta(b, group, s, WVK_META_TEXEL_SIZES),
-      .shifts = wvk_nir_load_meta(b, group, s, WVK_META_TEXEL_SHIFTS),
-      .swizzle = wvk_nir_load_meta(b, group, s, WVK_META_TEXEL_SWIZZLE),
+      .count = wvk_nir_load_meta(b, meta, group, s, WVK_META_TEXEL_COUNT),
+      .start = wvk_nir_load_meta(b, meta, group, s, WVK_META_TEXEL_START),
+      .sizes = wvk_nir_load_meta(b, meta, group, s, WVK_META_TEXEL_SIZES),
+      .shifts = wvk_nir_load_meta(b, meta, group, s, WVK_META_TEXEL_SHIFTS),
+      .swizzle = wvk_nir_load_meta(b, meta, group, s, WVK_META_TEXEL_SWIZZLE),
    };
 }
 
@@ -120,9 +124,9 @@ unpack_11f11f10f(nir_builder *b, nir_def *packed)
  * words, converted as the type is, put where the format's swizzle says.
  * Nothing past the end. */
 static nir_def *
-texel_fetch(nir_builder *b, uint32_t group, uint32_t slot, nir_def *index, nir_alu_type dest, bool writable)
+texel_fetch(nir_builder *b, const uint32_t *meta, uint32_t group, uint32_t slot, nir_def *index, nir_alu_type dest, bool writable)
 {
-   const struct texel_format f = texel_format(b, group, slot);
+   const struct texel_format f = texel_format(b, meta, group, slot);
    nir_def *buffer = buffer_index(b, group, slot);
    const nir_alu_type base = nir_alu_type_get_base_type(dest);
    nir_def *zero = base == nir_type_float ? nir_imm_float(b, 0.0f) : nir_imm_int(b, 0);
@@ -215,9 +219,9 @@ encode_channel(nir_builder *b, const struct texel_format *f, nir_def *value, nir
  * stored, parts of one with atomics, so that neighbours written at the
  * same time stay. Nothing past the end. */
 static void
-texel_store(nir_builder *b, uint32_t group, uint32_t slot, nir_def *index, nir_def *value, nir_alu_type src)
+texel_store(nir_builder *b, const uint32_t *meta, uint32_t group, uint32_t slot, nir_def *index, nir_def *value, nir_alu_type src)
 {
-   const struct texel_format f = texel_format(b, group, slot);
+   const struct texel_format f = texel_format(b, meta, group, slot);
    nir_def *buffer = buffer_index(b, group, slot);
    value = nir_pad_vector_imm_int(b, value, 0, 4);
 
@@ -251,9 +255,9 @@ texel_store(nir_builder *b, uint32_t group, uint32_t slot, nir_def *index, nir_d
 
 /* An atomic on texel `index` of a 32-bit integer texel buffer. */
 static nir_def *
-texel_atomic(nir_builder *b, uint32_t group, uint32_t slot, nir_intrinsic_instr *intr, nir_def *index)
+texel_atomic(nir_builder *b, const uint32_t *meta, uint32_t group, uint32_t slot, nir_intrinsic_instr *intr, nir_def *index)
 {
-   const struct texel_format f = texel_format(b, group, slot);
+   const struct texel_format f = texel_format(b, meta, group, slot);
    nir_def *buffer = buffer_index(b, group, slot);
    nir_def *nothing = nir_imm_int(b, 0);
    nir_push_if(b, nir_ult(b, index, f.count));
@@ -269,15 +273,16 @@ texel_atomic(nir_builder *b, uint32_t group, uint32_t slot, nir_intrinsic_instr 
 }
 
 static nir_def *
-texel_count(nir_builder *b, uint32_t group, uint32_t slot, unsigned components)
+texel_count(nir_builder *b, const uint32_t *meta, uint32_t group, uint32_t slot, unsigned components)
 {
-   nir_def *count = wvk_nir_load_meta(b, group, nir_imm_int(b, slot), WVK_META_TEXEL_COUNT);
+   nir_def *count = wvk_nir_load_meta(b, meta, group, nir_imm_int(b, slot), WVK_META_TEXEL_COUNT);
    return nir_pad_vector_imm_int(b, count, 1, components);
 }
 
 static bool
 lower_texel_buffer_instr(nir_builder *b, nir_instr *instr, void *data)
 {
+   const uint32_t *meta = data;
    uint32_t group, slot;
    if (instr->type == nir_instr_type_tex) {
       nir_tex_instr *tex = nir_instr_as_tex(instr);
@@ -288,11 +293,11 @@ lower_texel_buffer_instr(nir_builder *b, nir_instr *instr, void *data)
       b->cursor = nir_before_instr(instr);
       nir_def *result;
       if (tex->op == nir_texop_txs) {
-         result = texel_count(b, group, slot, tex->def.num_components);
+         result = texel_count(b, meta, group, slot, tex->def.num_components);
       } else {
          const int coord = nir_tex_instr_src_index(tex, nir_tex_src_coord);
          nir_def *index = coord >= 0 ? nir_channel(b, tex->src[coord].src.ssa, 0) : nir_imm_int(b, 0);
-         result = nir_trim_vector(b, texel_fetch(b, group, slot, index, tex->dest_type, false),
+         result = nir_trim_vector(b, texel_fetch(b, meta, group, slot, index, tex->dest_type, false),
                                   tex->def.num_components);
       }
       nir_def_replace(&tex->def, result);
@@ -315,28 +320,28 @@ lower_texel_buffer_instr(nir_builder *b, nir_instr *instr, void *data)
       return false;
    b->cursor = nir_before_instr(instr);
    if (intr->intrinsic == nir_intrinsic_image_deref_size) {
-      nir_def_replace(&intr->def, texel_count(b, group, slot, intr->def.num_components));
+      nir_def_replace(&intr->def, texel_count(b, meta, group, slot, intr->def.num_components));
       return true;
    }
    nir_def *index = nir_channel(b, intr->src[1].ssa, 0);
    if (intr->intrinsic == nir_intrinsic_image_deref_store) {
-      texel_store(b, group, slot, index, intr->src[3].ssa, nir_intrinsic_src_type(intr));
+      texel_store(b, meta, group, slot, index, intr->src[3].ssa, nir_intrinsic_src_type(intr));
       nir_instr_remove(instr);
       return true;
    }
    if (intr->intrinsic == nir_intrinsic_image_deref_load) {
-      nir_def *texel = texel_fetch(b, group, slot, index, nir_intrinsic_dest_type(intr), true);
+      nir_def *texel = texel_fetch(b, meta, group, slot, index, nir_intrinsic_dest_type(intr), true);
       nir_def_replace(&intr->def, nir_trim_vector(b, texel, intr->def.num_components));
       return true;
    }
-   nir_def_replace(&intr->def, texel_atomic(b, group, slot, intr, index));
+   nir_def_replace(&intr->def, texel_atomic(b, meta, group, slot, intr, index));
    return true;
 }
 
 bool
-wvk_nir_lower_texel_buffers(nir_shader *nir)
+wvk_nir_lower_texel_buffers(nir_shader *nir, const uint32_t *meta_base)
 {
-   return nir_shader_instructions_pass(nir, lower_texel_buffer_instr, nir_metadata_none, NULL);
+   return nir_shader_instructions_pass(nir, lower_texel_buffer_instr, nir_metadata_none, (void *)meta_base);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -373,6 +378,7 @@ reads_texels(const nir_tex_instr *tex)
 static bool
 lower_swizzle_instr(nir_builder *b, nir_instr *instr, void *data)
 {
+   const uint32_t *meta = data;
    if (instr->type != nir_instr_type_tex)
       return false;
    nir_tex_instr *tex = nir_instr_as_tex(instr);
@@ -390,7 +396,7 @@ lower_swizzle_instr(nir_builder *b, nir_instr *instr, void *data)
    const bool is_float = nir_alu_type_get_base_type(tex->dest_type) == nir_type_float;
    nir_def *zero = is_float ? nir_imm_float(b, 0.0f) : nir_imm_int(b, 0);
    nir_def *one = is_float ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1);
-   nir_def *code = wvk_nir_load_meta(b, group, nir_imm_int(b, slot), WVK_META_TEX_SWIZZLE);
+   nir_def *code = wvk_nir_load_meta(b, meta, group, nir_imm_int(b, slot), WVK_META_TEX_SWIZZLE);
    nir_push_if(b, nir_ine_imm(b, code, 0));
    nir_def *swizzled;
    if (tex->op == nir_texop_tg4) {
@@ -429,18 +435,18 @@ lower_swizzle_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 bool
-wvk_nir_lower_view_swizzles(nir_shader *nir)
+wvk_nir_lower_view_swizzles(nir_shader *nir, const uint32_t *meta_base)
 {
-   return nir_shader_instructions_pass(nir, lower_swizzle_instr, nir_metadata_none, NULL);
+   return nir_shader_instructions_pass(nir, lower_swizzle_instr, nir_metadata_none, (void *)meta_base);
 }
 
 /* ---------------------------------------------------------------------- */
 /* Samplers */
 
 static nir_def *
-sampler_word(nir_builder *b, uint32_t group, uint32_t slot, unsigned word)
+sampler_word(nir_builder *b, const uint32_t *meta, uint32_t group, uint32_t slot, unsigned word)
 {
-   return wvk_nir_load_meta(b, group, nir_imm_int(b, slot), word);
+   return wvk_nir_load_meta(b, meta, group, nir_imm_int(b, slot), word);
 }
 
 static nir_def *
@@ -525,18 +531,54 @@ apply_lod_bias(nir_builder *b, nir_tex_instr *tex, nir_def *bias)
 /* The border colour as a texel of the view: channels its format lacks are
  * 0, alpha 1 ("Conversion to RGBA"). */
 static void
-border_texel(nir_builder *b, nir_tex_instr *tex, uint32_t group, uint32_t slot, bool is_float, nir_def *out[4])
+border_texel(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot, bool is_float, nir_def *out[4])
 {
    const int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
    uint32_t tex_group, tex_slot;
    nir_def *channels = nir_imm_int(b, 0xf);
    if (texture >= 0 && deref_binding(tex->src[texture].src, &tex_group, &tex_slot))
-      channels = wvk_nir_load_meta(b, tex_group, nir_imm_int(b, tex_slot), WVK_META_TEX_CHANNELS);
+      channels = wvk_nir_load_meta(b, meta, tex_group, nir_imm_int(b, tex_slot), WVK_META_TEX_CHANNELS);
    for (unsigned c = 0; c < 4; ++c) {
       nir_def *missing = c == 3 ? (is_float ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1)) : nir_imm_int(b, 0);
       out[c] = nir_bcsel(b, nir_test_mask(b, channels, 1u << c),
-                         sampler_word(b, group, slot, WVK_META_SAMPLER_BORDER + c), missing);
+                         sampler_word(b, meta, group, slot, WVK_META_SAMPLER_BORDER + c), missing);
    }
+}
+
+/* The LOD a sample selects: given, or from the derivatives or gradients
+ * of the coordinates in texels of the base level; with the sampler's bias
+ * and LOD range. Before the bias went into the instruction. */
+static nir_def *
+sample_lambda(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot,
+              nir_def *coord, unsigned spatial)
+{
+   nir_def *lambda;
+   const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   if (tex->op == nir_texop_txl && lod_idx >= 0) {
+      lambda = tex->src[lod_idx].src.ssa;
+   } else if (tex->op == nir_texop_txd || (b->shader->info.stage == MESA_SHADER_FRAGMENT &&
+                                           (tex->op == nir_texop_tex || tex->op == nir_texop_txb))) {
+      nir_def *base = &texture_query(b, tex, nir_texop_txs, nir_imm_int(b, 0))->def;
+      nir_def *dx, *dy;
+      if (tex->op == nir_texop_txd) {
+         dx = tex->src[nir_tex_instr_src_index(tex, nir_tex_src_ddx)].src.ssa;
+         dy = tex->src[nir_tex_instr_src_index(tex, nir_tex_src_ddy)].src.ssa;
+      } else {
+         dx = nir_ddx(b, nir_trim_vector(b, coord, spatial));
+         dy = nir_ddy(b, nir_trim_vector(b, coord, spatial));
+      }
+      nir_def *scale = nir_i2f32(b, nir_trim_vector(b, base, spatial));
+      nir_def *rho = nir_fmax(b, nir_fast_length(b, nir_fmul(b, dx, scale)), nir_fast_length(b, nir_fmul(b, dy, scale)));
+      lambda = nir_flog2(b, nir_fmax(b, rho, nir_imm_float(b, 1e-20f)));
+      const int bias_idx = nir_tex_instr_src_index(tex, nir_tex_src_bias);
+      if (tex->op == nir_texop_txb && bias_idx >= 0)
+         lambda = nir_fadd(b, lambda, tex->src[bias_idx].src.ssa);
+   } else {
+      lambda = nir_imm_float(b, 0.0f);
+   }
+   lambda = nir_fadd(b, lambda, sampler_word(b, meta, group, slot, WVK_META_SAMPLER_BIAS));
+   return nir_fclamp(b, lambda, sampler_word(b, meta, group, slot, WVK_META_SAMPLER_MIN_LOD),
+                     sampler_word(b, meta, group, slot, WVK_META_SAMPLER_MAX_LOD));
 }
 
 /* Sampling a float texture: the bias, and where the sampler clamps to the
@@ -546,11 +588,24 @@ border_texel(nir_builder *b, nir_tex_instr *tex, uint32_t group, uint32_t slot, 
  * is outside, at the level's size: exact for nearest and for bilinear on
  * one level. */
 static bool
-lower_float_sample(nir_builder *b, nir_tex_instr *tex, uint32_t group, uint32_t slot)
+lower_float_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
 {
    b->cursor = nir_before_instr(&tex->instr);
-   nir_def *flags = sampler_word(b, group, slot, WVK_META_SAMPLER_FLAGS);
-   apply_lod_bias(b, tex, nir_fclamp(b, sampler_word(b, group, slot, WVK_META_SAMPLER_BIAS),
+   nir_def *flags = sampler_word(b, meta, group, slot, WVK_META_SAMPLER_FLAGS);
+   /* What the emulation below needs of the LOD, before the bias is in. */
+   const int coord_at = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const bool emulable = tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE && tex->op != nir_texop_lod && coord_at >= 0 &&
+                         tex->op != nir_texop_tg4;
+   nir_def *lambda = NULL;
+   if (emulable) {
+      nir_def *none = nir_imm_float(b, 0.0f);
+      nir_push_if(b, flag(b, flags, WVK_SAMPLER_EMULATE));
+      nir_def *l = sample_lambda(b, meta, tex, group, slot, tex->src[coord_at].src.ssa,
+                                 tex->coord_components - (tex->is_array ? 1 : 0));
+      nir_pop_if(b, NULL);
+      lambda = nir_if_phi(b, l, none);
+   }
+   apply_lod_bias(b, tex, nir_fclamp(b, sampler_word(b, meta, group, slot, WVK_META_SAMPLER_BIAS),
                                      nir_imm_float(b, -WVK_MAX_SAMPLER_LOD_BIAS),
                                      nir_imm_float(b, WVK_MAX_SAMPLER_LOD_BIAS)));
    /* A cube's address modes are the cube's. */
@@ -562,10 +617,17 @@ lower_float_sample(nir_builder *b, nir_tex_instr *tex, uint32_t group, uint32_t 
    const unsigned spatial = tex->coord_components - (tex->is_array ? 1 : 0);
    nir_def *one = nir_imm_float(b, 1.0f);
    nir_push_if(b, flag(b, flags, WVK_SAMPLER_EMULATE));
+   /* Minified, the minification filter at the level the LOD selects;
+    * magnified, the magnification filter at the base. */
+   nir_def *minified = lambda ? nir_flt(b, nir_imm_float(b, 0.0f), lambda) : nir_imm_false(b);
    nir_def *level = nir_imm_int(b, 0);
-   const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
-   if (tex->op == nir_texop_txl && lod_idx >= 0)
-      level = nir_imax(b, nir_f2i32(b, nir_ffloor(b, tex->src[lod_idx].src.ssa)), nir_imm_int(b, 0));
+   if (lambda) {
+      nir_def *levels = &texture_query(b, tex, nir_texop_query_levels, NULL)->def;
+      nir_def *chosen = nir_bcsel(b, flag(b, flags, WVK_SAMPLER_MIP_LINEAR), nir_ffloor(b, lambda),
+                                  nir_fround_even(b, lambda));
+      level = nir_imin(b, nir_imax(b, nir_f2i32(b, chosen), nir_imm_int(b, 0)), nir_iadd_imm(b, levels, -1));
+      level = nir_bcsel(b, minified, level, nir_imm_int(b, 0));
+   }
    nir_def *size = &texture_query(b, tex, nir_texop_txs, level)->def;
    nir_def *comps[4];
    for (unsigned i = 0; i < tex->coord_components; ++i)
@@ -577,7 +639,8 @@ lower_float_sample(nir_builder *b, nir_tex_instr *tex, uint32_t group, uint32_t 
       nir_def *c = nir_bcsel(b, flag(b, flags, WVK_SAMPLER_UNNORMALIZED), nir_fdiv(b, comps[i], extent), comps[i]);
       c = nir_bcsel(b, nir_ieq_imm(b, mode, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE), nir_fabs(b, c), c);
       nir_def *border = nir_ieq_imm(b, mode, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
-      nir_def *linear = flag(b, flags, WVK_SAMPLER_MAG_LINEAR);
+      nir_def *linear = nir_bcsel(b, minified, flag(b, flags, WVK_SAMPLER_MIN_LINEAR),
+                                  flag(b, flags, WVK_SAMPLER_MAG_LINEAR));
       nir_def *texel = nir_fmul(b, c, extent);
       nir_def *w_linear = nir_fsat(b, nir_fadd_imm(b, nir_fmin(b, texel, nir_fsub(b, extent, texel)), 0.5));
       nir_def *w_nearest = nir_b2f32(b, nir_iand(b, nir_fge_imm(b, c, 0.0), nir_flt_imm(b, c, 1.0)));
@@ -599,7 +662,7 @@ lower_float_sample(nir_builder *b, nir_tex_instr *tex, uint32_t group, uint32_t 
    b->cursor = nir_after_instr(&tex->instr);
    nir_push_if(b, nir_fneu_imm(b, weight, 1.0));
    nir_def *border[4];
-   border_texel(b, tex, group, slot, true, border);
+   border_texel(b, meta, tex, group, slot, true, border);
    nir_def *value;
    if (tex->is_shadow) {
       const int ref = nir_tex_instr_src_index(tex, nir_tex_src_comparator);
@@ -654,7 +717,7 @@ wrap_texel(nir_builder *b, nir_def *t, nir_def *extent, nir_def *mode, nir_def *
  * texel nearest the coordinates, wrapped as the sampler says, or the
  * border. */
 static bool
-lower_integer_sample(nir_builder *b, nir_tex_instr *tex, uint32_t group, uint32_t slot)
+lower_integer_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
 {
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE || tex->is_shadow)
       return false;
@@ -664,8 +727,8 @@ lower_integer_sample(nir_builder *b, nir_tex_instr *tex, uint32_t group, uint32_
    const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
    if (texture_idx < 0 || coord_idx < 0)
       return false;
-   nir_def *flags = sampler_word(b, group, slot, WVK_META_SAMPLER_FLAGS);
-   nir_def *bias = sampler_word(b, group, slot, WVK_META_SAMPLER_BIAS);
+   nir_def *flags = sampler_word(b, meta, group, slot, WVK_META_SAMPLER_FLAGS);
+   nir_def *bias = sampler_word(b, meta, group, slot, WVK_META_SAMPLER_BIAS);
    nir_def *coord = tex->src[coord_idx].src.ssa;
    const unsigned n = tex->coord_components;
    const unsigned spatial = n - (tex->is_array ? 1 : 0);
@@ -695,8 +758,8 @@ lower_integer_sample(nir_builder *b, nir_tex_instr *tex, uint32_t group, uint32_
       lambda = nir_imm_float(b, 0.0f);
    }
    lambda = nir_fadd(b, lambda, bias);
-   lambda = nir_fclamp(b, lambda, sampler_word(b, group, slot, WVK_META_SAMPLER_MIN_LOD),
-                       sampler_word(b, group, slot, WVK_META_SAMPLER_MAX_LOD));
+   lambda = nir_fclamp(b, lambda, sampler_word(b, meta, group, slot, WVK_META_SAMPLER_MIN_LOD),
+                       sampler_word(b, meta, group, slot, WVK_META_SAMPLER_MAX_LOD));
    nir_def *levels = &texture_query(b, tex, nir_texop_query_levels, NULL)->def;
    nir_def *level = nir_f2i32(b, nir_fround_even(b, nir_fmax(b, lambda, nir_imm_float(b, 0.0f))));
    level = nir_imin(b, level, nir_iadd_imm(b, levels, -1));
@@ -735,7 +798,7 @@ lower_integer_sample(nir_builder *b, nir_tex_instr *tex, uint32_t group, uint32_
    nir_builder_instr_insert(b, &txf->instr);
 
    nir_def *border[4];
-   border_texel(b, tex, group, slot, false, border);
+   border_texel(b, meta, tex, group, slot, false, border);
    nir_def *value = nir_trim_vector(b, nir_vec(b, border, 4), tex->def.num_components);
    if (tex->op == nir_texop_tg4) {
       /* Gathering an integer texture: the one texel, four times. */
@@ -750,6 +813,7 @@ lower_integer_sample(nir_builder *b, nir_tex_instr *tex, uint32_t group, uint32_
 static bool
 lower_sampler_instr(nir_builder *b, nir_instr *instr, void *data)
 {
+   const uint32_t *meta = data;
    if (instr->type != nir_instr_type_tex)
       return false;
    nir_tex_instr *tex = nir_instr_as_tex(instr);
@@ -768,12 +832,12 @@ lower_sampler_instr(nir_builder *b, nir_instr *instr, void *data)
    if (sampler < 0 || !deref_binding(tex->src[sampler].src, &group, &slot))
       return false;
    if (nir_alu_type_get_base_type(tex->dest_type) != nir_type_float && !tex->is_shadow)
-      return lower_integer_sample(b, tex, group, slot);
-   return lower_float_sample(b, tex, group, slot);
+      return lower_integer_sample(b, meta, tex, group, slot);
+   return lower_float_sample(b, meta, tex, group, slot);
 }
 
 bool
-wvk_nir_lower_samplers(nir_shader *nir)
+wvk_nir_lower_samplers(nir_shader *nir, const uint32_t *meta_base)
 {
-   return nir_shader_instructions_pass(nir, lower_sampler_instr, nir_metadata_none, NULL);
+   return nir_shader_instructions_pass(nir, lower_sampler_instr, nir_metadata_none, (void *)meta_base);
 }

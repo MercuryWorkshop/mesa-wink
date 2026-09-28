@@ -153,8 +153,21 @@ wvk_GetDescriptorSetLayoutSupport(VkDevice _device, const VkDescriptorSetLayoutC
    vk_foreach_struct(stype, ext, pSupport->pNext) {
       switch (stype) {
       case VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_LAYOUT_SUPPORT: {
+         /* The variable binding is the last: as many of it as the rest
+          * leave room for. */
          VkDescriptorSetVariableDescriptorCountLayoutSupport *vs = ext;
          vs->maxVariableDescriptorCount = 0;
+         const VkDescriptorSetLayoutBinding *last = NULL;
+         for (uint32_t i = 0; i < pCreateInfo->bindingCount; ++i) {
+            if (!last || pCreateInfo->pBindings[i].binding > last->binding)
+               last = &pCreateInfo->pBindings[i];
+         }
+         if (last && pSupport->supported) {
+            const uint32_t per = last->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK
+                                    ? 0 : wvk_descriptor_type_slots(last->descriptorType);
+            const uint32_t others = slot_count - (per ? last->descriptorCount * per : 1);
+            vs->maxVariableDescriptorCount = per ? (WVK_MAX_SET_SLOTS - others) / per : 4096;
+         }
          break;
       }
       default:

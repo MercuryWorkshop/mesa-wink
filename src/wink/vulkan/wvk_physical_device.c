@@ -112,6 +112,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_timeline_semaphore = true,
       .KHR_uniform_buffer_standard_layout = true,
       .EXT_border_color_swizzle = true,
+      .EXT_descriptor_indexing = true,
       .EXT_custom_border_color = true,
       .EXT_host_query_reset = true,
       .EXT_separate_stencil_usage = true,
@@ -150,14 +151,42 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .textureCompressionBC = bc,
       .fragmentStoresAndAtomics = true,
       .shaderClipDistance = clip,
-      .shaderSampledImageArrayDynamicIndexing = false,
-      .shaderStorageBufferArrayDynamicIndexing = false,
+      /* Arrays of descriptors are bindings of their own, among which a
+       * dynamic index chooses in the shader (wvk_shader.c). */
+      .shaderUniformBufferArrayDynamicIndexing = true,
+      .shaderSampledImageArrayDynamicIndexing = true,
+      .shaderStorageBufferArrayDynamicIndexing = true,
+      .shaderStorageImageArrayDynamicIndexing = true,
 
       /* Vulkan 1.1 */
       .shaderDrawParameters = true,
 
       /* Vulkan 1.2 */
       .samplerMirrorClampToEdge = true,
+      /* Descriptor indexing: bind groups are made when the submit is
+       * replayed, so updates after binding are what it sees; a binding
+       * never written shows a placeholder. */
+      .descriptorIndexing = true,
+      .shaderInputAttachmentArrayDynamicIndexing = true,
+      .shaderUniformTexelBufferArrayDynamicIndexing = true,
+      .shaderStorageTexelBufferArrayDynamicIndexing = true,
+      .shaderUniformBufferArrayNonUniformIndexing = true,
+      .shaderSampledImageArrayNonUniformIndexing = true,
+      .shaderStorageBufferArrayNonUniformIndexing = true,
+      .shaderStorageImageArrayNonUniformIndexing = true,
+      .shaderInputAttachmentArrayNonUniformIndexing = true,
+      .shaderUniformTexelBufferArrayNonUniformIndexing = true,
+      .shaderStorageTexelBufferArrayNonUniformIndexing = true,
+      .descriptorBindingUniformBufferUpdateAfterBind = true,
+      .descriptorBindingSampledImageUpdateAfterBind = true,
+      .descriptorBindingStorageImageUpdateAfterBind = true,
+      .descriptorBindingStorageBufferUpdateAfterBind = true,
+      .descriptorBindingUniformTexelBufferUpdateAfterBind = true,
+      .descriptorBindingStorageTexelBufferUpdateAfterBind = true,
+      .descriptorBindingUpdateUnusedWhilePending = true,
+      .descriptorBindingPartiallyBound = true,
+      .descriptorBindingVariableDescriptorCount = true,
+      .runtimeDescriptorArray = true,
       .shaderFloat16 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_ShaderF16),
       .imagelessFramebuffer = true,
       .uniformBufferStandardLayout = true,
@@ -222,10 +251,12 @@ get_device_properties(const struct wvk_physical_device *pdev,
    default: type = VK_PHYSICAL_DEVICE_TYPE_OTHER; break;
    }
 
-   /* The driver keeps one storage buffer per stage for itself: the push
-    * constants. */
+   /* The driver keeps two storage buffers per stage for itself: the push
+    * binding, with the push constants, its own data and the descriptors'
+    * records, and the draw's parameters. Texel buffers are storage
+    * buffers too, beyond what Vulkan counts as such. */
    const uint32_t ubos = l->maxUniformBuffersPerShaderStage;
-   const uint32_t ssbos = l->maxStorageBuffersPerShaderStage - 1;
+   const uint32_t ssbos = l->maxStorageBuffersPerShaderStage - 2;
 
    *p = (struct vk_properties){
       .apiVersion = api_version(),
@@ -268,6 +299,34 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxDescriptorSetSampledImages = 6 * l->maxSampledTexturesPerShaderStage,
       .maxDescriptorSetStorageImages = 6 * l->maxStorageTexturesPerShaderStage,
       .maxDescriptorSetInputAttachments = MIN2(l->maxSampledTexturesPerShaderStage, 8),
+
+      /* Descriptor indexing: WebGPU's limits are the limits after binding
+       * too, which is less than Vulkan asks of them. */
+      .maxUpdateAfterBindDescriptorsInAllPools = 1u << 20,
+      .shaderUniformBufferArrayNonUniformIndexingNative = false,
+      .shaderSampledImageArrayNonUniformIndexingNative = false,
+      .shaderStorageBufferArrayNonUniformIndexingNative = false,
+      .shaderStorageImageArrayNonUniformIndexingNative = false,
+      .shaderInputAttachmentArrayNonUniformIndexingNative = false,
+      .robustBufferAccessUpdateAfterBind = true,
+      .quadDivergentImplicitLod = false,
+      .maxPerStageDescriptorUpdateAfterBindSamplers = l->maxSamplersPerShaderStage,
+      .maxPerStageDescriptorUpdateAfterBindUniformBuffers = ubos,
+      .maxPerStageDescriptorUpdateAfterBindStorageBuffers = ssbos,
+      .maxPerStageDescriptorUpdateAfterBindSampledImages = l->maxSampledTexturesPerShaderStage,
+      .maxPerStageDescriptorUpdateAfterBindStorageImages = l->maxStorageTexturesPerShaderStage,
+      .maxPerStageDescriptorUpdateAfterBindInputAttachments = MIN2(l->maxSampledTexturesPerShaderStage, 8),
+      .maxPerStageUpdateAfterBindResources = l->maxSamplersPerShaderStage + ubos + ssbos +
+                                             l->maxSampledTexturesPerShaderStage +
+                                             l->maxStorageTexturesPerShaderStage + l->maxColorAttachments,
+      .maxDescriptorSetUpdateAfterBindSamplers = 6 * l->maxSamplersPerShaderStage,
+      .maxDescriptorSetUpdateAfterBindUniformBuffers = 6 * ubos,
+      .maxDescriptorSetUpdateAfterBindUniformBuffersDynamic = l->maxDynamicUniformBuffersPerPipelineLayout,
+      .maxDescriptorSetUpdateAfterBindStorageBuffers = 6 * ssbos,
+      .maxDescriptorSetUpdateAfterBindStorageBuffersDynamic = l->maxDynamicStorageBuffersPerPipelineLayout,
+      .maxDescriptorSetUpdateAfterBindSampledImages = 6 * l->maxSampledTexturesPerShaderStage,
+      .maxDescriptorSetUpdateAfterBindStorageImages = 6 * l->maxStorageTexturesPerShaderStage,
+      .maxDescriptorSetUpdateAfterBindInputAttachments = MIN2(l->maxSampledTexturesPerShaderStage, 8),
       .maxVertexInputAttributes = l->maxVertexAttributes,
       /* Binding numbers up to Vulkan's minimum, onto WebGPU's slots: a
        * pipeline can use as many bindings as WebGPU has buffers. */

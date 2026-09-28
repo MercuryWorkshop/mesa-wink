@@ -34,6 +34,64 @@ wvk_descriptor_set_invalidate(struct wvk_descriptor_set *set)
    }
 }
 
+static void
+set_sampler(struct wvk_descriptor *d, const struct wvk_sampler *sampler)
+{
+   if (d->sampler)
+      wgpuSamplerRelease(d->sampler);
+   d->sampler = NULL;
+   memset(d->sampler_meta, 0, sizeof(d->sampler_meta));
+   if (!sampler)
+      return;
+   d->sampler = sampler->wgpu;
+   wgpuSamplerAddRef(d->sampler);
+   d->sampler_type = sampler->binding_type;
+   memcpy(d->sampler_meta, sampler->meta, sizeof(d->sampler_meta));
+}
+
+/* What the descriptor names, let go of; the sampler too unless it is
+ * immutable, which stays. */
+static void
+clear_descriptor(struct wvk_descriptor *d, bool keep_sampler)
+{
+   if (d->mem)
+      wvk_device_memory_unref(d->mem);
+   if (d->buffer)
+      wgpuBufferRelease(d->buffer);
+   if (d->view)
+      wgpuTextureViewRelease(d->view);
+   struct wvk_descriptor kept = { 0 };
+   if (keep_sampler) {
+      kept.sampler = d->sampler;
+      kept.sampler_type = d->sampler_type;
+      memcpy(kept.sampler_meta, d->sampler_meta, sizeof(kept.sampler_meta));
+   } else if (d->sampler) {
+      wgpuSamplerRelease(d->sampler);
+   }
+   *d = kept;
+}
+
+static void
+copy_descriptor(struct wvk_descriptor *dst, const struct wvk_descriptor *src, bool keep_sampler)
+{
+   clear_descriptor(dst, keep_sampler);
+   const struct wvk_descriptor kept = *dst;
+   *dst = *src;
+   if (dst->mem)
+      wvk_device_memory_ref(dst->mem);
+   if (dst->buffer)
+      wgpuBufferAddRef(dst->buffer);
+   if (dst->view)
+      wgpuTextureViewAddRef(dst->view);
+   if (keep_sampler) {
+      dst->sampler = kept.sampler;
+      dst->sampler_type = kept.sampler_type;
+      memcpy(dst->sampler_meta, kept.sampler_meta, sizeof(dst->sampler_meta));
+   } else if (dst->sampler) {
+      wgpuSamplerAddRef(dst->sampler);
+   }
+}
+
 struct wvk_descriptor_set *
 wvk_descriptor_set_create(struct wvk_device *dev, struct wvk_descriptor_set_layout *layout)
 {
@@ -52,7 +110,7 @@ wvk_descriptor_set_create(struct wvk_device *dev, struct wvk_descriptor_set_layo
       if (!bl->immutable_samplers)
          continue;
       for (uint32_t e = 0; e < bl->count; ++e)
-         set->descriptors[bl->descriptor_index + e].sampler = bl->immutable_samplers[e];
+         set_sampler(&set->descriptors[bl->descriptor_index + e], bl->immutable_samplers[e]);
    }
    return set;
 }
@@ -61,10 +119,10 @@ void
 wvk_descriptor_set_destroy(struct wvk_device *dev, struct wvk_descriptor_set *set)
 {
    wvk_descriptor_set_invalidate(set);
+   for (uint32_t i = 0; i < set->layout->descriptor_count; ++i)
+      clear_descriptor(&set->descriptors[i], false);
    if (set->inline_buffer)
       wgpuBufferRelease(set->inline_buffer);
-   if (set->meta_buffer)
-      wgpuBufferRelease(set->meta_buffer);
    list_del(&set->link);
    vk_descriptor_set_layout_unref(&dev->vk, &set->layout->vk);
    vk_object_free(&dev->vk, NULL, set);
@@ -74,14 +132,16 @@ static void
 write_buffer(struct wvk_device *dev, struct wvk_descriptor *d, const VkDescriptorBufferInfo *info)
 {
    VK_FROM_HANDLE(wvk_buffer, buffer, info->buffer);
-   *d = (struct wvk_descriptor){ 0 };
+   clear_descriptor(d, false);
    if (!buffer || !buffer->mem)
       return;
    WGPUBuffer wgpu = NULL;
    if (wvk_device_memory_get_buffer(dev, buffer->mem, &wgpu) != VK_SUCCESS)
       return;
    d->mem = buffer->mem;
+   wvk_device_memory_ref(d->mem);
    d->buffer = wgpu;
+   wgpuBufferAddRef(d->buffer);
    d->offset = buffer->offset + info->offset;
    d->size = vk_buffer_range(&buffer->vk, info->offset, info->range);
 }
@@ -94,7 +154,7 @@ static void
 write_texel_buffer(struct wvk_device *dev, struct wvk_descriptor *d, VkBufferView _view)
 {
    VK_FROM_HANDLE(vk_buffer_view, view, _view);
-   *d = (struct wvk_descriptor){ 0 };
+   clear_descriptor(d, false);
    if (!view)
       return;
    struct wvk_buffer *buffer = container_of(view->buffer, struct wvk_buffer, vk);
@@ -104,10 +164,13 @@ write_texel_buffer(struct wvk_device *dev, struct wvk_descriptor *d, VkBufferVie
    const uint64_t at = buffer->offset + view->offset;
    const uint64_t start = at & ~255ull;
    d->mem = buffer->mem;
+   wvk_device_memory_ref(d->mem);
    d->buffer = wgpu;
+   wgpuBufferAddRef(d->buffer);
    d->offset = start;
    d->size = align64(at - start + view->range, 4);
-   d->buffer_view = view;
+   d->texel_format = view->format;
+   d->texel_elements = (uint32_t)MIN2(view->elements, UINT32_MAX);
    d->texel_start = (uint32_t)(at - start);
 }
 
@@ -116,11 +179,24 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
             uint32_t element, const VkDescriptorImageInfo *info)
 {
    const VkDescriptorType type = bl->type;
-   if (type != VK_DESCRIPTOR_TYPE_SAMPLER)
-      d->view = wvk_image_view_from_handle(info->imageView);
-   if ((type == VK_DESCRIPTOR_TYPE_SAMPLER || type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) &&
-       !bl->immutable_samplers)
-      d->sampler = wvk_sampler_from_handle(info->sampler);
+   const bool has_sampler = type == VK_DESCRIPTOR_TYPE_SAMPLER || type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+   clear_descriptor(d, bl->immutable_samplers != NULL);
+   if (type != VK_DESCRIPTOR_TYPE_SAMPLER) {
+      const struct wvk_image_view *view = wvk_image_view_from_handle(info->imageView);
+      /* A storage image of a cube is the 2D array of its faces. */
+      WGPUTextureView wgpu = view ? view->view : NULL;
+      if (view && view->array_view && type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+         wgpu = view->array_view;
+      if (wgpu) {
+         d->view = wgpu;
+         wgpuTextureViewAddRef(d->view);
+         d->view_format = view->vk.view_format;
+         d->swizzle = view->swizzle;
+         d->channels = view->channels;
+      }
+   }
+   if (has_sampler && !bl->immutable_samplers)
+      set_sampler(d, wvk_sampler_from_handle(info->sampler));
 }
 
 static void
@@ -200,40 +276,38 @@ wvk_descriptor_set_write_template(struct wvk_device *dev, struct wvk_descriptor_
 }
 
 void
-wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words)
+wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words, uint32_t max_words)
 {
    const struct wvk_descriptor_set_layout *layout = set->layout;
-   memset(words, 0, wvk_descriptor_set_meta_size(layout));
-   for (uint32_t s = 0; s < layout->slot_count; ++s) {
+   const uint32_t slots = MIN2(layout->slot_count, max_words / WVK_META_WORDS);
+   memset(words, 0, slots * WVK_META_WORDS * 4);
+   for (uint32_t s = 0; s < slots; ++s) {
       const struct wvk_descriptor_slot *slot = &layout->slots[s];
       const struct wvk_descriptor_set_binding_layout *bl = &layout->bindings[slot->binding];
       const struct wvk_descriptor *d = &set->descriptors[bl->descriptor_index + slot->element];
       uint32_t *record = words + s * WVK_META_WORDS;
       switch (bl->type) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
-         if (d->sampler)
-            memcpy(record, d->sampler->meta, sizeof(d->sampler->meta));
+         memcpy(record, d->sampler_meta, sizeof(d->sampler_meta));
          break;
       case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-         if (slot->sampler && d->sampler)
-            memcpy(record, d->sampler->meta, sizeof(d->sampler->meta));
-         else if (!slot->sampler && d->view) {
-            record[WVK_META_TEX_SWIZZLE] = d->view->swizzle;
-            record[WVK_META_TEX_CHANNELS] = d->view->channels;
+         if (slot->sampler) {
+            memcpy(record, d->sampler_meta, sizeof(d->sampler_meta));
+         } else {
+            record[WVK_META_TEX_SWIZZLE] = d->swizzle;
+            record[WVK_META_TEX_CHANNELS] = d->channels;
          }
          break;
       case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
       case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-         if (d->view) {
-            record[WVK_META_TEX_SWIZZLE] = d->view->swizzle;
-            record[WVK_META_TEX_CHANNELS] = d->view->channels;
-         }
+         record[WVK_META_TEX_SWIZZLE] = d->swizzle;
+         record[WVK_META_TEX_CHANNELS] = d->channels;
          break;
       case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
       case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
          /* A format shaders cannot decode, or no view: nothing in it. */
-         if (d->buffer_view && wvk_texel_buffer_format(d->buffer_view->format, record)) {
-            record[WVK_META_TEXEL_COUNT] = (uint32_t)MIN2(d->buffer_view->elements, UINT32_MAX);
+         if (d->buffer && wvk_texel_buffer_format(d->texel_format, record)) {
+            record[WVK_META_TEXEL_COUNT] = d->texel_elements;
             record[WVK_META_TEXEL_START] = d->texel_start;
          }
          break;
@@ -266,11 +340,7 @@ wvk_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
             &src->descriptors[src->layout->bindings[sb].descriptor_index + se];
          struct wvk_descriptor *d =
             &dst->descriptors[dst->layout->bindings[db].descriptor_index + de];
-         struct wvk_sampler *immutable = dst->layout->bindings[db].immutable_samplers
-                                            ? d->sampler : NULL;
-         *d = *s;
-         if (immutable)
-            d->sampler = immutable;
+         copy_descriptor(d, s, dst->layout->bindings[db].immutable_samplers != NULL);
          next_element(src->layout, &sb, &se);
          next_element(dst->layout, &db, &de);
       }

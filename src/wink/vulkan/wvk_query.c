@@ -478,7 +478,6 @@ wvk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo
    struct vk_buffer_view *view = vk_buffer_view_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*view));
    if (!view)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-   mesa_logw_once("wvk: texel buffers are not supported yet");
    *pView = vk_buffer_view_to_handle(view);
    return VK_SUCCESS;
 }

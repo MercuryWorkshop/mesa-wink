@@ -151,11 +151,11 @@ wvk_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks *
    VK_FROM_HANDLE(wvk_image, image, _image);
    if (!image)
       return;
-   /* Swapchain images belong to the surface. */
-   if (image->texture) {
-      wgpuTextureDestroy(image->texture);
+   /* Swapchain images belong to the surface. Released, not destroyed:
+    * views of it in descriptors, which may outlive it unused, still have
+    * it, and it goes with the last of them. */
+   if (image->texture)
       wgpuTextureRelease(image->texture);
-   }
    vk_image_destroy(&dev->vk, pAllocator, &image->vk);
 }
 
@@ -368,6 +368,10 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
       desc.arrayLayerCount = image->dimension == WGPUTextureDimension_3D ? 1 : view->vk.layer_count;
       desc.aspect = view->aspect;
       view->view = wgpuTextureCreateView(image->texture, &desc);
+      if (desc.dimension == WGPUTextureViewDimension_Cube || desc.dimension == WGPUTextureViewDimension_CubeArray) {
+         desc.dimension = WGPUTextureViewDimension_2DArray;
+         view->array_view = wgpuTextureCreateView(image->texture, &desc);
+      }
    }
 
    *pView = wvk_image_view_to_handle(view);
@@ -383,6 +387,8 @@ wvk_DestroyImageView(VkDevice _device, VkImageView _view, const VkAllocationCall
       return;
    if (view->view)
       wgpuTextureViewRelease(view->view);
+   if (view->array_view)
+      wgpuTextureViewRelease(view->array_view);
    vk_image_view_destroy(&dev->vk, pAllocator, &view->vk);
 }
 
