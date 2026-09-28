@@ -112,6 +112,50 @@ optimize(nir_shader *nir)
    } while (progress);
 }
 
+static nir_def *driver_buffer(nir_builder *b, uint32_t binding);
+
+/* vkCmdDispatchBase's base workgroup, from the driver's data: WebGPU's
+ * workgroup ids start at zero. */
+static bool
+lower_base_workgroup_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_workgroup_id &&
+       intr->intrinsic != nir_intrinsic_load_global_invocation_id &&
+       intr->intrinsic != nir_intrinsic_load_base_workgroup_id)
+      return false;
+   if (intr->def.bit_size != 32 || intr->def.num_components != 3)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *base = nir_load_ssbo(b, 3, 32, driver_buffer(b, WVK_DRIVER_SLOT_PUSH), nir_imm_int(b, WVK_DRIVER_BASE_GROUP),
+                                 .align_mul = 16, .access = ACCESS_NON_WRITEABLE);
+   if (intr->intrinsic == nir_intrinsic_load_base_workgroup_id) {
+      nir_def_replace(&intr->def, base);
+      return true;
+   }
+   if (intr->intrinsic == nir_intrinsic_load_global_invocation_id) {
+      const uint16_t *size = b->shader->info.workgroup_size;
+      base = nir_imul(b, base, nir_imm_ivec3(b, size[0], size[1], size[2]));
+   }
+   nir_def *sum = nir_iadd(b, &intr->def, base);
+   nir_def_rewrite_uses_after(&intr->def, sum);
+   return true;
+}
+
+/* gl_DeviceIndex, of the one device there is, which NIR has no intrinsic
+ * for. */
+static bool
+lower_device_index_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_deref)
+      return false;
+   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_system_value || var->data.location != SYSTEM_VALUE_DEVICE_INDEX)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_intN_t(b, 0, intr->def.bit_size));
+   return true;
+}
+
 /* OpQuantizeToF16, through WGSL's pack2x16float, which leaves what
  * f16 cannot hold undefined: those, and denormals, which flush, by hand. */
 static bool
@@ -207,6 +251,7 @@ wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_device_index_instr, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, wvk_nir_lower_subgroups);
    /* ALU the SPIR-V emitter has no instruction for. */
@@ -2036,6 +2081,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
             : nir->info.stage == MESA_SHADER_FRAGMENT ? nir_var_shader_in : 0);
    NIR_PASS(_, nir, lower_layer_outputs, shader);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_layer_id_instr, nir_metadata_control_flow, NULL);
+   if (nir->info.stage == MESA_SHADER_COMPUTE)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_base_workgroup_instr, nir_metadata_control_flow, NULL);
    split_resource_vars(nir, &state);
    split_buffer_vars(nir, &state);
    /* Writes by a dynamic index are ladders of ifs. */

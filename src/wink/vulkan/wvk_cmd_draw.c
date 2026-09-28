@@ -1928,6 +1928,19 @@ get_compute_pipeline(struct wvk_device *dev, const struct wvk_bound_state *st, s
    return p;
 }
 
+/* A dispatch's base workgroup, which shaders add to their workgroup ids
+ * (wvk_shader.c): WebGPU's start at zero. */
+static void
+set_base_group(struct wvk_replay *replay, uint32_t x, uint32_t y, uint32_t z)
+{
+   struct wvk_bound_state *st = replay->state;
+   const uint32_t words[4] = { x, y, z, 0 };
+   if (memcmp(st->push + WVK_DRIVER_BASE_GROUP, words, sizeof(words))) {
+      memcpy(st->push + WVK_DRIVER_BASE_GROUP, words, sizeof(words));
+      st->push_offset = UINT32_MAX;
+   }
+}
+
 static WGPUComputePassEncoder
 flush_dispatch(struct wvk_cmd_buffer *cmd)
 {
@@ -1961,10 +1974,9 @@ wvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX, uint32_t
                     uint32_t baseGroupZ, uint32_t groupCountX, uint32_t groupCountY, uint32_t groupCountZ)
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
-   if (baseGroupX || baseGroupY || baseGroupZ)
-      mesa_logw_once("wvk: a dispatch with a base workgroup is not supported yet");
    if (!groupCountX || !groupCountY || !groupCountZ)
       return;
+   set_base_group(cmd->replay, baseGroupX, baseGroupY, baseGroupZ);
    WGPUComputePassEncoder compute = flush_dispatch(cmd);
    if (compute)
       wgpuComputePassEncoderDispatchWorkgroups(compute, groupCountX, groupCountY, groupCountZ);
@@ -1983,6 +1995,7 @@ wvk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDevice
    struct wvk_bound_buffer b = bound_buffer(cmd, buffer, offset, sizeof(VkDispatchIndirectCommand));
    if (!b.buffer)
       return;
+   set_base_group(cmd->replay, 0, 0, 0);
    WGPUComputePassEncoder compute = flush_dispatch(cmd);
    if (!compute)
       return;
