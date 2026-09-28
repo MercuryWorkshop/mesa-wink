@@ -34,6 +34,10 @@ buffer_offset(const struct wvk_buffer *buffer, uint64_t offset)
    return buffer->offset + offset;
 }
 
+static void repack(struct wvk_device *dev, struct wvk_replay *replay, WGPUBuffer src, uint64_t src_offset,
+                   uint32_t src_pitch, uint32_t src_image, WGPUBuffer dst, uint64_t dst_offset, uint32_t dst_pitch,
+                   uint32_t dst_image, uint32_t row_bytes, uint32_t rows, uint32_t images);
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *pCopyBufferInfo)
 {
@@ -49,13 +53,14 @@ wvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *pCopy
       wvk_replay_read(replay, src->mem, so, r->size);
       wvk_replay_write(replay, dst->mem, dof, r->size);
       if ((so | dof | r->size) & 3) {
-         /* WebGPU copies whole words. */
-         mesa_logw("wvk: vkCmdCopyBuffer of %" PRIu64 " bytes at %" PRIu64 " -> %" PRIu64
-                   " is not word-aligned; copying the aligned part", r->size, so, dof);
-         const uint64_t size = r->size & ~3ull;
-         if (!size || ((so | dof) & 3))
-            continue;
-         wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, buffer_wgpu(src), so, buffer_wgpu(dst), dof, size);
+         /* WebGPU copies whole words: the rest is a shader's, byte by
+          * byte, in rows of what a dispatch reaches. */
+         const uint32_t row = 65535 * 64;
+         for (uint64_t at = 0; at < r->size; at += row) {
+            const uint32_t n = (uint32_t)MIN2(row, r->size - at);
+            repack(wvk_cmd_buffer_device(cmd), replay, buffer_wgpu(src), so + at, n, n, buffer_wgpu(dst), dof + at,
+                   n, n, n, 1, 1);
+         }
          continue;
       }
       wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, buffer_wgpu(src), so, buffer_wgpu(dst), dof, r->size);

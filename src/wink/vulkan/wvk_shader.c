@@ -36,6 +36,7 @@
 #include "compiler/nir/nir_deref.h"
 #include "compiler/spirv/nir_spirv.h"
 #include "util/blob.h"
+#include "util/format/u_format.h"
 #include "util/u_dynarray.h"
 #include "util/u_atomic.h"
 #include "util/mesa-blake3.h"
@@ -575,6 +576,46 @@ cube_image_as_array(nir_builder *b, nir_intrinsic_instr *intr)
                            : nir_trim_vector(b, &intr->def, 2);
    nir_def_rewrite_uses(placeholder, nir_trim_vector(b, size, n));
    nir_instr_remove(nir_def_instr(placeholder));
+}
+
+/* Image loads and stores typed as the image is: SignExtend and ZeroExtend
+ * let the value's signedness differ, and WGSL does not. The bits are the
+ * same. */
+static bool
+match_image_type_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_image_deref_load && intr->intrinsic != nir_intrinsic_image_deref_store)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   enum glsl_base_type base = glsl_get_sampler_result_type(glsl_without_array(deref->type));
+   /* A storage texture's channels are its format's: the variable too. */
+   if (var && var->data.image.format != PIPE_FORMAT_NONE) {
+      const enum pipe_format f = var->data.image.format;
+      const enum glsl_base_type fbase = util_format_is_pure_sint(f)   ? GLSL_TYPE_INT
+                                        : util_format_is_pure_uint(f) ? GLSL_TYPE_UINT
+                                                                      : GLSL_TYPE_FLOAT;
+      const struct glsl_type *bare = glsl_without_array(var->type);
+      if (fbase != glsl_get_sampler_result_type(bare)) {
+         var->type = glsl_type_wrap_in_arrays(
+            glsl_image_type(glsl_get_sampler_dim(bare), glsl_sampler_type_is_array(bare), fbase), var->type);
+         *(bool *)data = true;
+      }
+      base = fbase;
+   }
+   nir_alu_type want = base == GLSL_TYPE_INT ? nir_type_int : base == GLSL_TYPE_UINT ? nir_type_uint : nir_type_float;
+   if (intr->intrinsic == nir_intrinsic_image_deref_load) {
+      const nir_alu_type have = nir_intrinsic_dest_type(intr);
+      if (nir_alu_type_get_base_type(have) == want || want == nir_type_float)
+         return false;
+      nir_intrinsic_set_dest_type(intr, want | nir_alu_type_get_type_size(have));
+   } else {
+      const nir_alu_type have = nir_intrinsic_src_type(intr);
+      if (nir_alu_type_get_base_type(have) == want || want == nir_type_float)
+         return false;
+      nir_intrinsic_set_src_type(intr, want | nir_alu_type_get_type_size(have));
+   }
+   return true;
 }
 
 /* Queries of an integer cube, which is the 2D array of its faces
@@ -2003,7 +2044,10 @@ reflect_bindings(nir_shader *nir, const struct vk_shader_compile_info *info,
                        ? WVK_BINDING_SAMPLER_COMPARE : WVK_BINDING_SAMPLER;
       } else if (glsl_type_is_image(type) &&
                  ((var->data.access & ACCESS_NON_WRITEABLE) || !_mesa_set_search(u.written, k))) {
+         /* Read-only, even if not read either: Tint takes no image that
+          * is neither. */
          var->data.access |= ACCESS_NON_WRITEABLE;
+         var->data.access &= ~ACCESS_NON_READABLE;
          /* Tint makes a read-only storage image a texture it loads from. */
          sb->kind = WVK_BINDING_TEXTURE;
          sb->view_dimension = view_dimension(type);
@@ -2136,6 +2180,10 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    /* Writes by a dynamic index are ladders of ifs. */
    NIR_PASS(_, nir, nir_shader_instructions_pass, rewrite_resource_instr, nir_metadata_none, &state);
    NIR_PASS(_, nir, nir_shader_instructions_pass, integer_cube_query_instr, nir_metadata_control_flow, NULL);
+   bool retyped = false;
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, match_image_type_instr, nir_metadata_all, &retyped);
+   if (retyped)
+      nir_fixup_deref_types(nir);
    /* Swizzles first: a gather's is a gather of another component, which
     * then samples as its own; and the border replaces a texel before the
     * swizzle takes it apart. */

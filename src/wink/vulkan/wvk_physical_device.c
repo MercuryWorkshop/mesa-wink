@@ -749,9 +749,8 @@ optimal_features(const struct wvk_physical_device *pdev, VkFormat format)
       f |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
    if (caps & WVK_CAP_STORAGE) {
       f |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
-      if (caps & WVK_CAP_STORAGE_RW)
-         f |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
-              VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      /* Not without a format: WGSL's storage textures have theirs in the
+       * shader, which is made before any view is bound. */
       /* Through the image's buffer of its texels (wvk_image.h). */
       if (wvk_format_has_atomics(format))
          f |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
