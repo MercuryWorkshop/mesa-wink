@@ -728,6 +728,52 @@ zero_descriptors_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* The index operand of loads from one of the driver's buffers. */
+static nir_def *
+driver_buffer(nir_builder *b, uint32_t binding)
+{
+   nir_def *index = nir_vulkan_resource_index(b, 2, 32, nir_imm_int(b, 0), .desc_set = WVK_DRIVER_GROUP,
+                                              .binding = binding,
+                                              .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+   nir_def *desc = nir_load_vulkan_descriptor(b, 2, 32, index, .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+   return nir_channel(b, desc, 0);
+}
+
+/* BaseVertex, BaseInstance and DrawIndex. The driver's data says which
+ * words of the draw binding the first two are -- a direct draw's own
+ * values in the push buffer, or the fields of an indirect draw's command
+ * where it is -- and says DrawIndex itself. See set_draw_parameters. */
+static bool
+lower_draw_parameters_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   unsigned c;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_first_vertex:
+   case nir_intrinsic_load_base_vertex:
+      c = 0;
+      break;
+   case nir_intrinsic_load_base_instance:
+      c = 1;
+      break;
+   case nir_intrinsic_load_draw_id:
+      c = 2;
+      break;
+   default:
+      return false;
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *where = nir_load_ssbo(b, 4, 32, driver_buffer(b, WVK_DRIVER_SLOT_PUSH),
+                                  nir_imm_int(b, WVK_DRIVER_DRAW_OFFSET), .align_mul = 16,
+                                  .access = ACCESS_NON_WRITEABLE);
+   nir_def *value = nir_channel(b, where, c);
+   if (c < 2) {
+      value = nir_load_ssbo(b, 1, 32, driver_buffer(b, WVK_DRIVER_SLOT_DRAW), nir_ishl_imm(b, value, 2),
+                            .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+   }
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
 /* The viewport transform from the driver's data: a vertex shader's
  * position is scaled and moved to where Vulkan's viewport would have put
  * it, WebGPU's being kept inside the attachments. See set_viewport_scissor. */
@@ -750,13 +796,7 @@ lower_viewport_transform(nir_shader *nir)
             if (!var || var->data.mode != nir_var_shader_out || var->data.location != VARYING_SLOT_POS)
                continue;
             b.cursor = nir_before_instr(instr);
-            nir_def *index = nir_vulkan_resource_index(&b, 2, 32, nir_imm_int(&b, 0),
-                                                       .desc_set = WVK_DRIVER_GROUP,
-                                                       .binding = WVK_DRIVER_SLOT_PUSH,
-                                                       .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-            nir_def *desc = nir_load_vulkan_descriptor(&b, 2, 32, index,
-                                                       .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
-            nir_def *t = nir_load_ssbo(&b, 4, 32, nir_channel(&b, desc, 0),
+            nir_def *t = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
                                        nir_imm_int(&b, WVK_DRIVER_DATA_OFFSET), .align_mul = 16,
                                        .access = ACCESS_NON_WRITEABLE);
             nir_def *pos = intr->src[1].ssa;
@@ -792,6 +832,10 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo | nir_var_mem_ssbo,
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, lower_viewport_transform);
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_draw_parameters_instr, nir_metadata_control_flow,
+               NULL);
+   }
    const nir_lower_mem_access_bit_sizes_options sizes = {
       .callback = word_access,
       .modes = nir_var_mem_ubo | nir_var_mem_ssbo,
@@ -1154,6 +1198,7 @@ reflect_bindings(nir_shader *nir, const struct vk_shader_compile_info *info,
          if (var->data.descriptor_set == WVK_DRIVER_GROUP && var->data.binding >= WVK_DRIVER_SLOT_BASE) {
             sb->dynamic = true;
             shader->uses_push_constants |= var->data.binding == WVK_DRIVER_SLOT_PUSH;
+            shader->uses_draw_parameters |= var->data.binding == WVK_DRIVER_SLOT_DRAW;
          } else {
             /* The set layout's binding this slot came from. */
             const struct wvk_descriptor_set_layout *layout =
@@ -1421,6 +1466,7 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint32(blob, shader->io_mask);
    blob_write_uint8(blob, shader->writes_depth);
    blob_write_uint8(blob, shader->uses_push_constants);
+   blob_write_uint8(blob, shader->uses_draw_parameters);
    blob_write_bytes(blob, shader->workgroup_size, sizeof(shader->workgroup_size));
    return !blob->out_of_memory;
 }
@@ -1442,6 +1488,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const uint32_t io_mask = blob_read_uint32(blob);
    const bool writes_depth = blob_read_uint8(blob);
    const bool uses_push_constants = blob_read_uint8(blob);
+   const bool uses_draw_parameters = blob_read_uint8(blob);
    uint16_t workgroup_size[3];
    blob_copy_bytes(blob, workgroup_size, sizeof(workgroup_size));
    if (blob->overrun || !wgsl[0]) {
@@ -1469,6 +1516,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->io_mask = io_mask;
    shader->writes_depth = writes_depth;
    shader->uses_push_constants = uses_push_constants;
+   shader->uses_draw_parameters = uses_draw_parameters;
    memcpy(shader->workgroup_size, workgroup_size, sizeof(workgroup_size));
    VkResult result = shader->bindings ? VK_SUCCESS : vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    for (uint32_t i = 0; result == VK_SUCCESS && i < WVK_SHADER_VARIANTS; ++i) {

@@ -623,6 +623,18 @@ struct wvk_bound_buffer {
    uint64_t size;
 };
 
+struct wvk_draw_binding {
+   WGPUBuffer buffer;
+   /* The memory's serial, or 0 for the push buffer. */
+   uint64_t serial;
+   uint32_t offset;
+};
+
+/* An indirect draw's binding: from its command rounded down to 256 bytes,
+ * as dynamic offsets are, to the end of the command. The memory's padding
+ * covers what that reaches past the buffer. */
+#define WVK_DRAW_WINDOW (256 - 4 + sizeof(VkDrawIndexedIndirectCommand))
+
 struct wvk_bound_state {
    struct wvk_shader *vs, *fs, *cs;
    struct wvk_bound_set sets[WVK_BIND_POINTS][WVK_MAX_GROUPS];
@@ -636,6 +648,11 @@ struct wvk_bound_state {
    /* Where push[] is in the submit's push data, or UINT32_MAX if it
     * changed since. */
    uint32_t push_offset;
+   /* What the draw binding is: the push buffer, or (buffer set) an
+    * indirect buffer from a 256-byte boundary. See set_draw_parameters. */
+   struct wvk_draw_binding draw;
+   /* The last draw's pipeline layout. */
+   struct wvk_layout *graphics_layout;
 
    /* Of the current pass: what is set on it. */
    uint32_t pass_serial;
@@ -915,7 +932,7 @@ note_buffer(struct wvk_replay *replay, const struct wvk_descriptor *d, bool writ
 
 static WGPUBindGroup
 make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct wvk_descriptor_set *set,
-                uint32_t group)
+                uint32_t group, const struct wvk_draw_binding *draw)
 {
    const struct wvk_physical_device *pdev = wvk_device_physical(dev);
    WGPUBindGroupEntry *entries = calloc(MAX2(bgl->count, 1), sizeof(*entries));
@@ -927,9 +944,14 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       *e = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       e->binding = b->binding;
       if (group == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
-         e->buffer = dev->push_buffer;
          e->offset = 0;
-         e->size = WVK_PUSH_DATA_SIZE;
+         if (b->binding == WVK_DRIVER_SLOT_DRAW && draw->buffer) {
+            e->buffer = draw->buffer;
+            e->size = WVK_DRAW_WINDOW;
+         } else {
+            e->buffer = dev->push_buffer;
+            e->size = WVK_PUSH_DATA_SIZE;
+         }
          continue;
       }
       bool sampler = false;
@@ -983,21 +1005,34 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
    return bg;
 }
 
+static bool
+bgl_has_binding(const struct wvk_bgl *bgl, uint32_t binding)
+{
+   for (uint32_t i = 0; i < bgl->count; ++i) {
+      if (bgl->entries[i].b.binding == binding)
+         return true;
+   }
+   return false;
+}
+
 /* A set's bind group for this layout: kept in the set until it changes. */
 static WGPUBindGroup
-get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descriptor_set *set, uint32_t group)
+get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descriptor_set *set, uint32_t group,
+               const struct wvk_draw_binding *draw)
 {
-   const uint64_t extra = group == WVK_DRIVER_GROUP ? dev->push_generation : 0;
+   const bool driver = group == WVK_DRIVER_GROUP;
+   const uint64_t extra = driver ? dev->push_generation : 0;
+   const uint64_t draw_serial = driver && bgl_has_binding(bgl, WVK_DRIVER_SLOT_DRAW) ? draw->serial : 0;
    if (!set) {
       /* Only the driver's bindings, or nothing: kept on the device. */
       if (bgl == dev->empty_bgl)
          return dev->empty_bind_group;
       for (uint32_t i = 0; i < ARRAY_SIZE(dev->driver_groups); ++i) {
          if (dev->driver_groups[i].bgl == bgl && dev->driver_groups[i].extra == extra &&
-             dev->driver_groups[i].group)
+             dev->driver_groups[i].draw == draw_serial && dev->driver_groups[i].group)
             return dev->driver_groups[i].group;
       }
-      WGPUBindGroup bg = make_bind_group(dev, bgl, NULL, group);
+      WGPUBindGroup bg = make_bind_group(dev, bgl, NULL, group, draw);
       if (!bg)
          return NULL;
       const uint32_t i = dev->driver_group_next;
@@ -1006,15 +1041,17 @@ get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descripto
          wgpuBindGroupRelease(dev->driver_groups[i].group);
       dev->driver_groups[i].bgl = bgl;
       dev->driver_groups[i].extra = extra;
+      dev->driver_groups[i].draw = draw_serial;
       dev->driver_groups[i].group = bg;
       return bg;
    }
    for (uint32_t i = 0; i < WVK_SET_BIND_GROUPS; ++i) {
       struct wvk_set_bind_group *c = &set->bind_groups[i];
-      if (c->group && c->layout == bgl->layout && c->generation == set->generation && c->extra == extra)
+      if (c->group && c->layout == bgl->layout && c->generation == set->generation && c->extra == extra &&
+          c->draw == draw_serial)
          return c->group;
    }
-   WGPUBindGroup bg = make_bind_group(dev, bgl, set, group);
+   WGPUBindGroup bg = make_bind_group(dev, bgl, set, group, draw);
    if (!bg)
       return NULL;
    struct wvk_set_bind_group *c = &set->bind_groups[set->bind_group_next];
@@ -1022,7 +1059,7 @@ get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descripto
    if (c->group)
       wgpuBindGroupRelease(c->group);
    *c = (struct wvk_set_bind_group){
-      .layout = bgl->layout, .generation = set->generation, .extra = extra, .group = bg,
+      .layout = bgl->layout, .generation = set->generation, .extra = extra, .draw = draw_serial, .group = bg,
    };
    return bg;
 }
@@ -1044,11 +1081,12 @@ push_offset(struct wvk_device *dev, struct wvk_replay *replay)
    return offset;
 }
 
-/* Bind every group of the layout. Returns false if one could not be made,
- * and the draw is to be skipped. */
+/* Bind every group of the layout, or only the driver's. Returns false if
+ * one could not be made, and the draw is to be skipped. */
 static bool
 bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout *layout,
-            uint32_t bind_point, WGPURenderPassEncoder pass, WGPUComputePassEncoder compute)
+            uint32_t bind_point, WGPURenderPassEncoder pass, WGPUComputePassEncoder compute,
+            bool driver_only)
 {
    struct wvk_bound_state *st = replay->state;
    /* The push buffer has to exist and hold this submit's data before any
@@ -1066,10 +1104,10 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
          return false;
    }
 
-   for (uint32_t g = 0; g < layout->group_count; ++g) {
+   for (uint32_t g = driver_only ? WVK_DRIVER_GROUP : 0; g < layout->group_count; ++g) {
       struct wvk_bgl *bgl = layout->groups[g];
       struct wvk_bound_set *bound = &st->sets[bind_point][g];
-      WGPUBindGroup bg = get_bind_group(dev, bgl, bgl->count ? bound->set : NULL, g);
+      WGPUBindGroup bg = get_bind_group(dev, bgl, bgl->count ? bound->set : NULL, g, &st->draw);
       if (!bg)
          return false;
 
@@ -1080,8 +1118,10 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
       for (uint32_t i = 0; i < bgl->count; ++i) {
          const struct wvk_shader_binding *b = &bgl->entries[i].b;
          if (g == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
-            if (b->dynamic && offset_count < WVK_MAX_DYNAMIC)
-               offsets[offset_count++] = push_at;
+            if (b->dynamic && offset_count < WVK_MAX_DYNAMIC) {
+               offsets[offset_count++] = b->binding == WVK_DRIVER_SLOT_DRAW && st->draw.buffer
+                                            ? st->draw.offset : push_at;
+            }
             continue;
          }
          if (b->kind != WVK_BINDING_UNIFORM && b->kind != WVK_BINDING_STORAGE &&
@@ -1357,7 +1397,8 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    /* Before the bind groups: it writes the driver's data among the push
     * constants. */
    set_viewport_scissor(cmd, pass);
-   if (!bind_groups(dev, replay, p->layout, WVK_BIND_GRAPHICS, pass, NULL))
+   st->graphics_layout = p->layout;
+   if (!bind_groups(dev, replay, p->layout, WVK_BIND_GRAPHICS, pass, NULL, false))
       return false;
 
    for (uint32_t slot = 0; slot < p->key.vb_count; ++slot) {
@@ -1386,12 +1427,49 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    return true;
 }
 
+/* Where the vertex shader finds BaseVertex and BaseInstance, and what
+ * DrawIndex is. A direct draw's values are among the driver's data. An
+ * indirect draw's are in its command, `at` in the buffer, which becomes
+ * the draw binding. Only for shaders that read them, since the push data
+ * changes with every draw. */
+static void
+set_draw_parameters(struct wvk_bound_state *st, const struct wvk_bound_buffer *indirect, uint64_t at,
+                    bool indexed, int32_t base_vertex, uint32_t base_instance, uint32_t draw_id)
+{
+   if (!st->vs || !st->vs->uses_draw_parameters)
+      return;
+   uint32_t words[8] = { 0 };
+   if (indirect) {
+      const uint64_t start = at & ~(uint64_t)255;
+      const uint32_t first = (uint32_t)(at - start) / 4;
+      /* vertexOffset and firstInstance of a VkDrawIndexedIndirectCommand,
+       * firstVertex and firstInstance of a VkDrawIndirectCommand. */
+      words[0] = first + (indexed ? 3 : 2);
+      words[1] = first + (indexed ? 4 : 3);
+      st->draw = (struct wvk_draw_binding){ indirect->buffer, indirect->mem->serial, (uint32_t)start };
+   } else {
+      words[0] = WVK_DRIVER_DRAW_VALUES / 4;
+      words[1] = WVK_DRIVER_DRAW_VALUES / 4 + 1;
+      words[4] = (uint32_t)base_vertex;
+      words[5] = base_instance;
+      st->draw = (struct wvk_draw_binding){ 0 };
+   }
+   words[2] = draw_id;
+   if (memcmp(st->push + WVK_DRIVER_DRAW_OFFSET, words, sizeof(words))) {
+      memcpy(st->push + WVK_DRIVER_DRAW_OFFSET, words, sizeof(words));
+      st->push_offset = UINT32_MAX;
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
             uint32_t firstVertex, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
-   if (!vertexCount || !instanceCount || !flush_draw(cmd, false))
+   if (!vertexCount || !instanceCount)
+      return;
+   set_draw_parameters(cmd->replay->state, NULL, 0, false, (int32_t)firstVertex, firstInstance, 0);
+   if (!flush_draw(cmd, false))
       return;
    wgpuRenderPassEncoderDraw(cmd->replay->pass, vertexCount, instanceCount, firstVertex, firstInstance);
 }
@@ -1401,7 +1479,10 @@ wvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t 
                    uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
-   if (!indexCount || !instanceCount || !flush_draw(cmd, true))
+   if (!indexCount || !instanceCount)
+      return;
+   set_draw_parameters(cmd->replay->state, NULL, 0, true, vertexOffset, firstInstance, 0);
+   if (!flush_draw(cmd, true))
       return;
    wgpuRenderPassEncoderDrawIndexed(cmd->replay->pass, indexCount, instanceCount, firstIndex,
                                     vertexOffset, firstInstance);
@@ -1411,16 +1492,30 @@ static void
 draw_indirect(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer _buffer, VkDeviceSize offset,
               uint32_t drawCount, uint32_t stride)
 {
-   if (!drawCount || !flush_draw(cmd, indexed))
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   if (!drawCount)
       return;
    const uint32_t size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
    struct wvk_bound_buffer b = bound_buffer(cmd, _buffer, offset,
                                             (uint64_t)(drawCount - 1) * stride + size);
    if (!b.buffer)
       return;
-   wvk_replay_read(cmd->replay, b.mem, b.offset, b.size);
+   set_draw_parameters(st, &b, b.offset, indexed, 0, 0, 0);
+   if (!flush_draw(cmd, indexed))
+      return;
+   wvk_replay_read(replay, b.mem, b.offset, b.size);
+   /* WebGPU draws one command at a time; where a shader reads the draw's
+    * parameters, every one moves the driver's group to its own. */
+   const bool per_draw = st->vs->uses_draw_parameters;
    for (uint32_t i = 0; i < drawCount; ++i) {
       const uint64_t at = b.offset + (uint64_t)i * stride;
+      if (per_draw && i) {
+         set_draw_parameters(st, &b, at, indexed, 0, 0, i);
+         if (!bind_groups(wvk_cmd_buffer_device(cmd), replay, st->graphics_layout, WVK_BIND_GRAPHICS,
+                          replay->pass, NULL, true))
+            return;
+      }
       if (indexed)
          wgpuRenderPassEncoderDrawIndexedIndirect(cmd->replay->pass, b.buffer, at);
       else
@@ -1503,7 +1598,7 @@ flush_dispatch(struct wvk_cmd_buffer *cmd)
       replay->compute = wgpuCommandEncoderBeginComputePass(replay->encoder, &desc);
    }
    wgpuComputePassEncoderSetPipeline(replay->compute, p->pipeline);
-   if (!bind_groups(dev, replay, p->layout, WVK_BIND_COMPUTE, NULL, replay->compute))
+   if (!bind_groups(dev, replay, p->layout, WVK_BIND_COMPUTE, NULL, replay->compute, false))
       return NULL;
    return replay->compute;
 }

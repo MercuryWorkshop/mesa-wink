@@ -107,7 +107,6 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Layered rendering: a pass is one layer. This affects blits of several
   layers and 3D blits, and multiview.
 - Copies into a depth32 or depth24 aspect.
-- `shaderDrawParameters`.
 - Precise occlusion queries, and timestamps.
 - Subgroups.
 - Sampler LOD bias, border colours, and component swizzles.

@@ -9,6 +9,7 @@
 #include "wvk_physical_device.h"
 
 #include "util/os_memory.h"
+#include "util/u_atomic.h"
 
 /* Every usage a buffer's range may be put to, since the memory does not
  * know which buffers will live in it. Map usages cannot be combined with
@@ -88,6 +89,7 @@ wvk_device_memory_get_buffer(struct wvk_device *dev, struct wvk_device_memory *m
       if (!mem->buffer)
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       mem->buffer_size = size;
+      mem->serial = p_atomic_inc_return(&dev->next_memory_serial);
    }
    *out = mem->buffer;
    return VK_SUCCESS;

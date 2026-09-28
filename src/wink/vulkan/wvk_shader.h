@@ -39,7 +39,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 2
+#define WVK_SHADER_BINARY_VERSION 3
 
 enum wvk_shader_variant {
    /* Vulkan's y points down, WebGPU's up: gl_Position.y negated. */
@@ -72,6 +72,9 @@ struct wvk_shader {
    /* The push constants read, as a storage buffer at the driver's
     * binding. */
    bool uses_push_constants;
+   /* Vertex: BaseVertex, BaseInstance or DrawIndex read, which the draw
+    * has to say. */
+   bool uses_draw_parameters;
    /* Compute. */
    uint16_t workgroup_size[3];
 };

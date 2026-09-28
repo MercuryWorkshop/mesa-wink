@@ -25,6 +25,8 @@ struct wvk_device_memory {
 
    WGPUBuffer buffer;
    uint64_t buffer_size;
+   /* Unique on the device, for caches that name the buffer. */
+   uint64_t serial;
 
    void *host;
 };

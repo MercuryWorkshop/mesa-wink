@@ -58,13 +58,23 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 #define WVK_DRIVER_GROUP 3
 #define WVK_DRIVER_SLOT_BASE 992
 #define WVK_DRIVER_SLOT_PUSH (WVK_DRIVER_SLOT_BASE + 0)
+/* The draw's parameters (BaseVertex, BaseInstance): the push buffer again
+ * for a direct draw, the indirect buffer for an indirect one. */
+#define WVK_DRIVER_SLOT_DRAW (WVK_DRIVER_SLOT_BASE + 1)
 #define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
 
 /* The push binding: the application's push constants, then the driver's
- * own data for the draw -- the vertex shader's viewport transform. */
+ * own data for the draw:
+ *   - the vertex shader's viewport transform, 4 floats;
+ *   - the words of the draw binding BaseVertex and BaseInstance are, and
+ *     DrawIndex, 4 uints;
+ *   - a direct draw's BaseVertex and BaseInstance, which those words name
+ *     then, 4 uints. */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
-#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 16)
+#define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
+#define WVK_DRIVER_DRAW_VALUES (WVK_DRIVER_DATA_OFFSET + 32)
+#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 48)
 
 static inline bool
 wvk_descriptor_type_is_dynamic(VkDescriptorType type)

@@ -44,6 +44,7 @@ struct wvk_device {
    struct hash_table *render_pipelines;     /* struct wvk_render_pipeline */
    struct hash_table *compute_pipelines;    /* struct wvk_compute_pipeline */
    uint64_t next_shader_id;
+   uint64_t next_memory_serial;
 
    /* An empty group, for the gaps before the driver's. */
    struct wvk_bgl *empty_bgl;
@@ -59,8 +60,9 @@ struct wvk_device {
    struct {
       struct wvk_bgl *bgl;
       uint64_t extra;
+      uint64_t draw;
       WGPUBindGroup group;
-   } driver_groups[4];
+   } driver_groups[8];
    uint32_t driver_group_next;
    /* The shaders of copies WebGPU does not do: query results, bytes
     * between buffer layouts, and depth out of a texture. */

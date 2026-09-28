@@ -101,7 +101,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_relaxed_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = false,
       .KHR_separate_depth_stencil_layouts = true,
-      .KHR_shader_draw_parameters = false, /* TODO: BaseVertex and friends from a driver buffer */
+      .KHR_shader_draw_parameters = true,
       .KHR_shader_float_controls = true,
       .KHR_shader_non_semantic_info = true,
       .KHR_spirv_1_4 = true,
@@ -151,7 +151,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .shaderStorageBufferArrayDynamicIndexing = false,
 
       /* Vulkan 1.1 */
-      .shaderDrawParameters = false,
+      .shaderDrawParameters = true,
 
       /* Vulkan 1.2 */
       .shaderFloat16 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_ShaderF16),
