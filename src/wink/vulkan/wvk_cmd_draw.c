@@ -638,6 +638,27 @@ wvk_replay_reset_state(struct wvk_replay *replay)
       replay->state->push_offset = UINT32_MAX;
 }
 
+void *
+wvk_replay_save_state(struct wvk_replay *replay)
+{
+   struct wvk_bound_state *copy = malloc(sizeof(*copy));
+   if (copy)
+      *copy = *replay->state;
+   return copy;
+}
+
+void
+wvk_replay_restore_state(struct wvk_replay *replay, void *saved)
+{
+   struct wvk_bound_state *st = replay->state;
+   if (saved) {
+      *st = *(struct wvk_bound_state *)saved;
+      free(saved);
+   }
+   /* The pass saw other pipelines meanwhile. */
+   st->pipeline = NULL;
+}
+
 void
 wvk_replay_finish_state(struct wvk_device *dev, struct wvk_replay *replay)
 {

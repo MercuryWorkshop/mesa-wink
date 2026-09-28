@@ -62,6 +62,8 @@ struct wvk_replay {
    struct util_dynarray push_buffers;   /* struct wvk_push_buffer */
    /* Descriptor sets made by vkCmdPushDescriptorSet, destroyed after. */
    struct util_dynarray push_sets;
+   /* Memory for vk_meta's vertices, freed after. */
+   struct util_dynarray meta_memory;   /* VkDeviceMemory */
 };
 
 struct wvk_push_buffer {
@@ -75,6 +77,11 @@ struct wvk_bound_state;
  * across command buffers. */
 void wvk_replay_reset_state(struct wvk_replay *replay);
 void wvk_replay_finish_state(struct wvk_device *dev, struct wvk_replay *replay);
+
+/* What is bound, kept around a vk_meta operation. */
+void *wvk_replay_save_state(struct wvk_replay *replay);
+void wvk_replay_restore_state(struct wvk_replay *replay, void *saved);
+void wvk_replay_free_meta_memory(struct wvk_device *dev, struct wvk_replay *replay);
 
 /* The submit's push constants into the push buffer: right before it. */
 void wvk_replay_upload_push_constants(struct wvk_device *dev, struct wvk_replay *replay);

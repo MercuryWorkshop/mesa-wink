@@ -365,6 +365,43 @@ lower_push_constants(nir_shader *nir)
    return progress;
 }
 
+/* gl_Layer and gl_ViewportIndex from a vertex shader: WebGPU renders one
+ * layer and one viewport, and so does everything here, one pass at a time
+ * -- vk_meta's shaders write the layer anyway. */
+static bool
+drop_layer_outputs(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_VERTEX)
+      return false;
+   bool progress = false;
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location == VARYING_SLOT_LAYER || var->data.location == VARYING_SLOT_VIEWPORT) {
+         var->data.mode = nir_var_shader_temp;
+         progress = true;
+      }
+   }
+   if (progress) {
+      nir_fixup_deref_modes(nir);
+      NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp | nir_var_shader_temp, NULL);
+   }
+   return progress;
+}
+
+/* gl_Layer in a fragment shader, and the view index: always the first,
+ * as a pass is one layer. TODO: a pass per layer for layered blits. */
+static bool
+lower_layer_id_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_layer_id && intr->intrinsic != nir_intrinsic_load_view_index)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components, intr->def.bit_size));
+   return true;
+}
+
 /* The (set, binding) a buffer deref chain starts from: a variable, or
  * vtn's cast of a loaded descriptor. */
 static bool
@@ -649,6 +686,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       .split = _mesa_pointer_hash_table_create(mem_ctx),
    };
    NIR_PASS(_, nir, lower_push_constants);
+   NIR_PASS(_, nir, drop_layer_outputs);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_layer_id_instr, nir_metadata_control_flow, NULL);
    split_resource_vars(nir, &state);
    split_buffer_vars(nir, &state);
    NIR_PASS(_, nir, nir_shader_instructions_pass, rewrite_resource_instr, nir_metadata_control_flow,

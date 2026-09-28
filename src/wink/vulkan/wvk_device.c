@@ -114,18 +114,24 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
       goto fail_pool;
    dev->replay_cmd = container_of(replay, struct wvk_cmd_buffer, vk);
 
+   result = wvk_device_init_meta(dev);
+   if (result != VK_SUCCESS)
+      goto fail_replay;
+
    /* One queue family, with one queue. */
    for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; ++i) {
       const VkDeviceQueueCreateInfo *qci = &pCreateInfo->pQueueCreateInfos[i];
       assert(qci->queueFamilyIndex == 0 && qci->queueCount == 1);
       result = wvk_queue_init(dev, &dev->queue, qci, 0);
       if (result != VK_SUCCESS)
-         goto fail_replay;
+         goto fail_meta;
    }
 
    *pDevice = wvk_device_to_handle(dev);
    return VK_SUCCESS;
 
+fail_meta:
+   wvk_device_finish_meta(dev);
 fail_replay:
    wvk_cmd_buffer_ops.destroy(&dev->replay_cmd->vk);
 fail_pool:
@@ -149,6 +155,7 @@ wvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    if (dev->queue.vk.base.device)
       wvk_queue_finish(dev, &dev->queue);
+   wvk_device_finish_meta(dev);
    wvk_cmd_buffer_ops.destroy(&dev->replay_cmd->vk);
    vk_command_pool_finish(&dev->replay_pool);
    wvk_device_finish_pipeline_caches(dev);

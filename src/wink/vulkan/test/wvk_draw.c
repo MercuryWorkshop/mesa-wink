@@ -10,6 +10,7 @@
  *   - push constants that change between two draws of one pass
  *   - a negative viewport height (VK_KHR_maintenance1) flipping it back
  *   - a textured quad: a uniform buffer and a combined image sampler
+ *   - vkCmdClearAttachments inside a pass, and vkCmdBlitImage scaling up
  *
  * Build: src/wink/vulkan/test/build.sh OUT
  */
@@ -339,6 +340,74 @@ test_texture(VkBuffer vertices)
    printf("texture: done\n");
 }
 
+static void
+test_clear_attachments(void)
+{
+   struct image target = make_image(W, H, VK_FORMAT_R8G8B8A8_UNORM,
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+   struct buffer out = make_buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST);
+   VkCommandBuffer cmd = begin();
+   begin_pass(cmd, &target, false);
+   vkCmdClearAttachments(cmd, 1, &(VkClearAttachment){
+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0,
+      .clearValue.color.float32 = { 0, 1, 0, 1 },
+   }, 1, &(VkClearRect){ .rect = { { 16, 8 }, { 32, 16 } }, .baseArrayLayer = 0, .layerCount = 1 });
+   end_pass_and_read(cmd, &target, &out);
+   submit_and_wait(cmd);
+   const uint8_t *in = pixel(&out, 20, 10), *outside = pixel(&out, 20, 30), *corner = pixel(&out, 0, 0);
+   CHECK(is(in, 0, 255, 0), "cleared rect: %u %u %u %u", in[0], in[1], in[2], in[3]);
+   CHECK(outside[1] == 0 && corner[1] == 0, "cleared outside the rect: %u %u", outside[1], corner[1]);
+   free_buffer(&out);
+   free_image(&target);
+   printf("clear attachments: done\n");
+}
+
+static void
+test_blit(void)
+{
+   /* 2x2 up to W x H, nearest: four quadrants. */
+   struct image src = make_image(2, 2, VK_FORMAT_R8G8B8A8_UNORM,
+                                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+   struct image dst = make_image(W, H, VK_FORMAT_R8G8B8A8_UNORM,
+                                 VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+   struct buffer staging = make_buffer(16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST);
+   const uint8_t texels[16] = { 255, 0, 0, 255,   0, 255, 0, 255,
+                                0, 0, 255, 255,   255, 255, 255, 255 };
+   memcpy(staging.map, texels, sizeof(texels));
+   struct buffer out = make_buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST);
+
+   VkCommandBuffer cmd = begin();
+   vkCmdCopyBufferToImage(cmd, staging.buffer, src.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                          &(VkBufferImageCopy){
+      .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 2, 2, 1 },
+   });
+   vkCmdBlitImage(cmd, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image,
+                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &(VkImageBlit){
+      .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+      .srcOffsets = { { 0, 0, 0 }, { 2, 2, 1 } },
+      .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+      .dstOffsets = { { 0, 0, 0 }, { W, H, 1 } },
+   }, VK_FILTER_NEAREST);
+   vkCmdCopyImageToBuffer(cmd, dst.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.buffer, 1,
+                          &(VkBufferImageCopy){
+      .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 },
+   });
+   submit_and_wait(cmd);
+   const uint8_t *tl = pixel(&out, 1, 1), *tr = pixel(&out, W - 2, 1);
+   const uint8_t *bl = pixel(&out, 1, H - 2), *br = pixel(&out, W - 2, H - 2);
+   CHECK(is(tl, 255, 0, 0), "blit top left: %u %u %u %u", tl[0], tl[1], tl[2], tl[3]);
+   CHECK(is(tr, 0, 255, 0), "blit top right: %u %u %u %u", tr[0], tr[1], tr[2], tr[3]);
+   CHECK(is(bl, 0, 0, 255), "blit bottom left: %u %u %u %u", bl[0], bl[1], bl[2], bl[3]);
+   CHECK(is(br, 255, 255, 255), "blit bottom right: %u %u %u %u", br[0], br[1], br[2], br[3]);
+   free_buffer(&out);
+   free_buffer(&staging);
+   free_image(&dst);
+   free_image(&src);
+   printf("blit: done\n");
+}
+
 int
 main(void)
 {
@@ -354,6 +423,8 @@ main(void)
 
    test_colors(vertices.buffer);
    test_texture(vertices.buffer);
+   test_clear_attachments();
+   test_blit();
 
    free_buffer(&vertices);
    return test_finish();

@@ -10,6 +10,7 @@
 
 #include "vk_command_pool.h"
 #include "vk_device.h"
+#include "vk_meta.h"
 
 #include "util/hash_table.h"
 #include "util/simple_mtx.h"
@@ -32,6 +33,9 @@ struct wvk_device {
    /* What submits replay into; submits to the one queue are serialized. */
    struct vk_command_pool replay_pool;
    struct wvk_cmd_buffer *replay_cmd;
+
+   /* Blits and vkCmdClearAttachments. */
+   struct vk_meta_device meta;
 
    /* WebGPU pipelines and layouts, made at draws and kept. */
    simple_mtx_t cache_lock;
@@ -66,6 +70,8 @@ struct wvk_device {
 /* The caches: made with the device, gone with it. */
 VkResult wvk_device_init_pipeline_caches(struct wvk_device *dev);
 void wvk_device_finish_pipeline_caches(struct wvk_device *dev);
+VkResult wvk_device_init_meta(struct wvk_device *dev);
+void wvk_device_finish_meta(struct wvk_device *dev);
 
 VK_DEFINE_HANDLE_CASTS(wvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 

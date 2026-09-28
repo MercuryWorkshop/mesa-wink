@@ -205,6 +205,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_init(&replay.push_data, NULL);
    util_dynarray_init(&replay.push_buffers, NULL);
    util_dynarray_init(&replay.push_sets, NULL);
+   util_dynarray_init(&replay.meta_memory, NULL);
 
    WGPUCommandEncoderDescriptor edesc = WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
    replay.encoder = wgpuDeviceCreateCommandEncoder(dev->wgpu, &edesc);
@@ -276,6 +277,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_fini(&replay.releases);
    util_dynarray_fini(&replay.views);
    wvk_replay_finish_state(dev, &replay);
+   wvk_replay_free_meta_memory(dev, &replay);
    return VK_SUCCESS;
 }
 

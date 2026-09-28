@@ -60,6 +60,7 @@ wvk_files = files(
   'wvk_cmd_buffer.c',
   'wvk_cmd_copy.c',
   'wvk_cmd_draw.c',
+  'wvk_cmd_meta.c',
   'wvk_cmd_render.c',
   'wvk_device.c',
   'wvk_descriptor_set.c',
