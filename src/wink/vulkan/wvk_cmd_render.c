@@ -63,6 +63,17 @@ load_op(VkAttachmentLoadOp op, bool resuming)
    }
 }
 
+/* WebGPU loads, clears or drops the whole of an attachment, Vulkan only
+ * its render area. Where the area is less, the attachment is loaded, and
+ * a clear is a draw over the area once the pass has begun. */
+static bool
+area_covers(const VkRect2D *area, const struct wvk_image_view *view)
+{
+   return area->offset.x <= 0 && area->offset.y <= 0 &&
+          (int64_t)area->offset.x + area->extent.width >= view->vk.extent.width &&
+          (int64_t)area->offset.y + area->extent.height >= view->vk.extent.height;
+}
+
 static WGPUStoreOp
 store_op(VkAttachmentStoreOp op, bool suspending)
 {
@@ -107,6 +118,9 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
 
    const struct wvk_physical_device *pdev = wvk_device_physical(wvk_cmd_buffer_device(cmd));
    WGPURenderPassColorAttachment colors[8];
+   /* Clears of attachments the render area does not cover. */
+   VkClearAttachment clears[9];
+   uint32_t clear_count = 0;
    const uint32_t color_count = MIN2(info->colorAttachmentCount, ARRAY_SIZE(colors));
    replay->rendering.color_count = color_count;
    /* Nothing to resolve by shader, until an attachment says otherwise. */
@@ -134,6 +148,11 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       if (wvk_image_view_image(view)->dimension == WGPUTextureDimension_3D)
          colors[i].depthSlice = view->vk.base_array_layer;
       colors[i].loadOp = load_op(att->loadOp, resuming);
+      if (!resuming && !area_covers(&info->renderArea, view)) {
+         colors[i].loadOp = WGPULoadOp_Load;
+         if (att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
+            clears[clear_count++] = (VkClearAttachment){ VK_IMAGE_ASPECT_COLOR_BIT, i, att->clearValue };
+      }
       colors[i].storeOp = store_op(att->storeOp, suspending);
       colors[i].clearValue = wvk_clear_color(view->vk.format, &att->clearValue.color);
       if (att->resolveMode != VK_RESOLVE_MODE_NONE && att->resolveImageView) {
@@ -169,6 +188,8 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       replay->rendering.depth_format = wvk_image_view_image(view)->format;
       ds.view = attachment_view(replay, view, WGPUTextureAspect_All);
       const VkFormat format = wvk_image_view_image(view)->vk.format;
+      const bool whole = resuming || area_covers(&info->renderArea, view);
+      VkClearAttachment ds_clear = { 0 };
       if (depth && depth->resolveMode != VK_RESOLVE_MODE_NONE && depth->resolveImageView) {
          replay->rendering.resolve.depth = *depth;
          replay->rendering.resolve.depth.pNext = NULL;
@@ -181,7 +202,11 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       }
       if (vk_format_has_depth(format)) {
          if (depth) {
-            ds.depthLoadOp = load_op(depth->loadOp, resuming);
+            ds.depthLoadOp = whole ? load_op(depth->loadOp, resuming) : WGPULoadOp_Load;
+            if (!whole && depth->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+               ds_clear.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
+               ds_clear.clearValue.depthStencil.depth = depth->clearValue.depthStencil.depth;
+            }
             ds.depthStoreOp = replay->rendering.resolve.depth.resolveMode ? WGPUStoreOp_Store
                               : store_op(depth->storeOp, suspending);
             ds.depthClearValue = CLAMP(clear_finite(depth->clearValue.depthStencil.depth), 0.0, 1.0);
@@ -192,7 +217,11 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       }
       if (vk_format_has_stencil(format)) {
          if (stencil) {
-            ds.stencilLoadOp = load_op(stencil->loadOp, resuming);
+            ds.stencilLoadOp = whole ? load_op(stencil->loadOp, resuming) : WGPULoadOp_Load;
+            if (!whole && stencil->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+               ds_clear.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+               ds_clear.clearValue.depthStencil.stencil = stencil->clearValue.depthStencil.stencil;
+            }
             ds.stencilStoreOp = replay->rendering.resolve.stencil.resolveMode ? WGPUStoreOp_Store
                                 : store_op(stencil->storeOp, suspending);
             ds.stencilClearValue = stencil->clearValue.depthStencil.stencil;
@@ -200,6 +229,8 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
             ds.stencilReadOnly = true;
          }
       }
+      if (ds_clear.aspectMask)
+         clears[clear_count++] = ds_clear;
    }
 
    /* WebGPU wants an attachment; Vulkan renders without any, for what the
@@ -237,6 +268,10 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    desc.depthStencilAttachment = (depth || stencil) ? &ds : NULL;
    desc.occlusionQuerySet = wvk_replay_query_set(wvk_cmd_buffer_device(cmd), replay);
    replay->pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &desc);
+   if (clear_count) {
+      const VkClearRect rect = { info->renderArea, 0, MAX2(info->layerCount, 1) };
+      wvk_CmdClearAttachments(commandBuffer, clear_count, clears, 1, &rect);
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
