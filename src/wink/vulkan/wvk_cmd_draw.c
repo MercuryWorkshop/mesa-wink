@@ -1230,6 +1230,12 @@ get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descripto
       dev->driver_groups[i].group = bg;
       return bg;
    }
+   /* Its inline uniform blocks as the set has them now: written before
+    * the submit, in the queue's order, after what used them before. */
+   if (set->inline_buffer && set->inline_uploaded != set->generation) {
+      wgpuQueueWriteBuffer(dev->queue.wgpu, set->inline_buffer, 0, set->inline_data, set->inline_size);
+      set->inline_uploaded = set->generation;
+   }
    for (uint32_t i = 0; i < WVK_SET_BIND_GROUPS; ++i) {
       struct wvk_set_bind_group *c = &set->bind_groups[i];
       if (c->group && c->layout == bgl->layout && c->generation == set->generation &&
@@ -1573,13 +1579,15 @@ set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
  * offsets are, as far as a binding can reach. The driver's data says
  * where in that the bound range starts. */
 static void
-set_pulled_buffers(struct wvk_device *dev, struct wvk_replay *replay)
+set_pulled_buffers(struct wvk_device *dev, struct wvk_cmd_buffer *cmd, struct wvk_replay *replay)
 {
    const struct wvk_physical_device *pdev = wvk_device_physical(dev);
    struct wvk_bound_state *st = replay->state;
-   uint32_t starts[WVK_MAX_PULLED_BINDINGS] = { 0 };
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   uint32_t starts[WVK_MAX_PULLED_BINDINGS] = { 0 }, strides[WVK_MAX_PULLED_BINDINGS] = { 0 };
    for (uint32_t i = 0; i < st->vs->pulled_count; ++i) {
       const struct wvk_bound_buffer *vb = &st->vb[st->vs->pulled_bindings[i]];
+      strides[i] = dyn->vi_binding_strides[st->vs->pulled_bindings[i]];
       struct wvk_driver_buffer *d = &st->pulled[i];
       if (!vb->buffer || !vb->mem) {
          *d = (struct wvk_driver_buffer){ 0 };
@@ -1594,8 +1602,10 @@ set_pulled_buffers(struct wvk_device *dev, struct wvk_replay *replay)
       starts[i] = (uint32_t)(vb->offset - offset);
       wvk_replay_read(replay, vb->mem, vb->offset, vb->size);
    }
-   if (memcmp(st->push + WVK_DRIVER_PULL_OFFSET, starts, sizeof(starts))) {
+   if (memcmp(st->push + WVK_DRIVER_PULL_OFFSET, starts, sizeof(starts)) ||
+       memcmp(st->push + WVK_DRIVER_PULL_STRIDES, strides, sizeof(strides))) {
       memcpy(st->push + WVK_DRIVER_PULL_OFFSET, starts, sizeof(starts));
+      memcpy(st->push + WVK_DRIVER_PULL_STRIDES, strides, sizeof(strides));
       st->push_offset = UINT32_MAX;
    }
 }
@@ -1684,7 +1694,7 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    set_viewport_scissor(cmd, pass);
    st->graphics_layout = p->layout;
    if (st->vs->pulled_count)
-      set_pulled_buffers(dev, replay);
+      set_pulled_buffers(dev, cmd, replay);
    if (!bind_groups(dev, replay, p->layout, WVK_BIND_GRAPHICS, pass, NULL, false))
       return false;
 

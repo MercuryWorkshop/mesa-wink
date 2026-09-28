@@ -71,8 +71,8 @@ api_version(void)
    if (override)
       return override;
    const char *v = getenv("WINK_VK_API_VERSION");
-   if (v && strcmp(v, "1.3") == 0)
-      return VK_MAKE_API_VERSION(0, 1, 3, VK_HEADER_VERSION);
+   if (v && strcmp(v, "1.2") == 0)
+      return VK_MAKE_API_VERSION(0, 1, 2, VK_HEADER_VERSION);
    return WVK_API_VERSION;
 }
 
@@ -97,6 +97,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
+      .KHR_maintenance4 = true,
       .KHR_multiview = true,
       .KHR_portability_subset = true,
       .KHR_push_descriptor = true,
@@ -105,6 +106,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_separate_depth_stencil_layouts = true,
       .KHR_shader_draw_parameters = true,
       .KHR_shader_float_controls = true,
+      .KHR_shader_integer_dot_product = true,
       .KHR_shader_non_semantic_info = true,
       .KHR_shader_terminate_invocation = true,
       .KHR_shader_subgroup_extended_types = true,
@@ -115,13 +117,23 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_synchronization2 = true,
       .KHR_timeline_semaphore = true,
       .KHR_uniform_buffer_standard_layout = true,
+      .KHR_vulkan_memory_model = true,
+      .KHR_zero_initialize_workgroup_memory = true,
       .EXT_border_color_swizzle = true,
-      .EXT_descriptor_indexing = true,
       .EXT_custom_border_color = true,
+      .EXT_extended_dynamic_state = true,
+      .EXT_extended_dynamic_state2 = true,
       .EXT_host_query_reset = true,
+      .EXT_image_robustness = true,
+      .EXT_inline_uniform_block = true,
+      .EXT_pipeline_creation_cache_control = true,
+      .EXT_pipeline_creation_feedback = true,
+      .EXT_private_data = true,
       .EXT_separate_stencil_usage = true,
       .EXT_shader_demote_to_helper_invocation = true,
       .EXT_subgroup_size_control = true,
+      .EXT_texel_buffer_alignment = true,
+      .EXT_tooling_info = true,
       /* WebGPU steps instances one at a time: other divisors are read by
        * the shader (wvk_shader.c, pull_divided_attributes). */
       .EXT_vertex_attribute_divisor = true,
@@ -176,7 +188,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Descriptor indexing: bind groups are made when the submit is
        * replayed, so updates after binding are what it sees; a binding
        * never written shows a placeholder. */
-      .descriptorIndexing = true,
+      /* Each feature of descriptor indexing, but not the extension's set
+       * of them: that also asks for 500000 descriptors a stage, and
+       * WebGPU has a few dozen bindings. */
+      .descriptorIndexing = false,
       .shaderInputAttachmentArrayDynamicIndexing = true,
       .shaderUniformTexelBufferArrayDynamicIndexing = true,
       .shaderStorageTexelBufferArrayDynamicIndexing = true,
@@ -193,6 +208,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .descriptorBindingStorageBufferUpdateAfterBind = true,
       .descriptorBindingUniformTexelBufferUpdateAfterBind = true,
       .descriptorBindingStorageTexelBufferUpdateAfterBind = true,
+      /* Inline uniform blocks: a uniform buffer of the set's, written
+       * from the host's copy when the set's bind group is made. */
+      .inlineUniformBlock = true,
+      .descriptorBindingInlineUniformBlockUpdateAfterBind = true,
       .descriptorBindingUpdateUnusedWhilePending = true,
       .descriptorBindingPartiallyBound = true,
       .descriptorBindingVariableDescriptorCount = true,
@@ -221,7 +240,23 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .computeFullSubgroups = true,
       .shaderSubgroupRotate = true,
       .shaderSubgroupRotateClustered = true,
-      .maintenance4 = false,
+      .maintenance4 = true,
+      /* Dot products of integers are multiplies and adds. */
+      .shaderIntegerDotProduct = true,
+      /* WGSL's atomics and barriers, which are what the memory model
+       * asks for within a workgroup; wider scopes are the workgroup's. */
+      .vulkanMemoryModel = true,
+      .vulkanMemoryModelDeviceScope = true,
+      .texelBufferAlignment = true,
+
+      /* Pipelines are made at the draw from the dynamic state
+       * (wvk_cmd_draw.c): any of it can be dynamic. WebGPU has no logic
+       * operations or tessellation. */
+      .extendedDynamicState = true,
+      .extendedDynamicState2 = true,
+      /* Not the vertex input: attributes with divisors are read by the
+       * vertex shader, as the pipeline's state says. */
+      .vertexInputDynamicState = false,
 
       /* Samplers' records do what WebGPU's samplers cannot
        * (wvk_nir_descriptors.c); a view's swizzle applies to the border. */
@@ -393,15 +428,16 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .subPixelInterpolationOffsetBits = 4,
       .maxFramebufferWidth = max_2d,
       .maxFramebufferHeight = max_2d,
-      /* A WebGPU attachment is one layer. */
-      .maxFramebufferLayers = 1,
+      /* A pass of several layers is one for each (wvk_cmd_buffer.c). */
+      .maxFramebufferLayers = l->maxTextureArrayLayers,
       .framebufferColorSampleCounts = WVK_SAMPLE_COUNTS,
       .framebufferDepthSampleCounts = WVK_SAMPLE_COUNTS,
       .framebufferStencilSampleCounts = WVK_SAMPLE_COUNTS,
       .framebufferNoAttachmentsSampleCounts = WVK_SAMPLE_COUNTS,
       .maxColorAttachments = l->maxColorAttachments,
       .sampledImageColorSampleCounts = WVK_SAMPLE_COUNTS,
-      .sampledImageIntegerSampleCounts = WVK_SAMPLE_COUNTS,
+      /* WebGPU multisamples few integer formats. */
+      .sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .sampledImageDepthSampleCounts = WVK_SAMPLE_COUNTS,
       .sampledImageStencilSampleCounts = WVK_SAMPLE_COUNTS,
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
@@ -458,12 +494,24 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
       .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
 
-      /* Vulkan 1.3 */
+      /* Vulkan 1.3. Inline uniform blocks are uniform buffers, of those
+       * WebGPU has for each stage. */
+      .maxInlineUniformBlockSize = 4096,
+      .maxPerStageDescriptorInlineUniformBlocks = 4,
+      .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 4,
+      .maxDescriptorSetInlineUniformBlocks = 4,
+      .maxDescriptorSetUpdateAfterBindInlineUniformBlocks = 4,
+      .maxInlineUniformTotalSize = 4 * 4096,
       .minSubgroupSize = 1,
       .maxSubgroupSize = 1,
       .maxComputeWorkgroupSubgroups = l->maxComputeInvocationsPerWorkgroup,
       .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
       .maxBufferSize = l->maxBufferSize,
+      /* A texel buffer starts anywhere: its record says where. */
+      .storageTexelBufferOffsetAlignmentBytes = 16,
+      .storageTexelBufferOffsetSingleTexelAlignment = true,
+      .uniformTexelBufferOffsetAlignmentBytes = 16,
+      .uniformTexelBufferOffsetSingleTexelAlignment = true,
 
       /* VK_KHR_push_descriptor */
       .maxPushDescriptors = 32,
@@ -804,6 +852,10 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
 
    if ((usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) &&
        !(caps & WVK_CAP_SAMPLE))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   /* An input attachment is an attachment too. */
+   if ((usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
+       !(caps & (WVK_CAP_RENDER | WVK_CAP_DEPTH | WVK_CAP_STENCIL)))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(caps & WVK_CAP_STORAGE))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;

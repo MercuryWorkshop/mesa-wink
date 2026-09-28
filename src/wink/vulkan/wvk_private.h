@@ -32,7 +32,8 @@
 /* What Vulkan version this driver reports; WINK_VK_API_VERSION=1.3 raises
  * it for applications that check, with 1.3's extra features reported as
  * absent. See wvk_physical_device.c. */
-#define WVK_API_VERSION VK_MAKE_API_VERSION(0, 1, 2, VK_HEADER_VERSION)
+/* Vulkan 1.3, but for bufferDeviceAddress: WebGPU has no pointers. */
+#define WVK_API_VERSION VK_MAKE_API_VERSION(0, 1, 3, VK_HEADER_VERSION)
 
 #define WVK_MAX_QUEUE_FAMILIES 1
 #define WVK_MAX_MEMORY_TYPES 4

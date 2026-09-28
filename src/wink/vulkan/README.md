@@ -126,6 +126,16 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - WebGPU has 10 storage buffers a stage in browsers, and texel buffers are
   storage buffers, beyond what Vulkan counts as such. Image atomics, which
   WGSL does not have.
+- Vulkan 1.3 is reported, but for `bufferDeviceAddress`: WebGPU has no
+  pointers.
+- Descriptor indexing's features, each of them, but not
+  `VK_EXT_descriptor_indexing`: that asks for 500000 descriptors a stage,
+  where WebGPU has a few dozen bindings.
+- Device-scope memory ordering between workgroups: WGSL's barriers are
+  the workgroup's, and none can be in non-uniform control flow, so a
+  memory barrier there is dropped.
+- An attribute larger than its binding's dynamic stride, which WebGPU
+  cannot describe.
 - Precise occlusion queries, and timestamps.
 - Subgroups are one invocation each: Tint reads no subgroup operations from
   SPIR-V. Every operation but the quad ones is there, trivially.

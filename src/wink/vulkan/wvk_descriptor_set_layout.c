@@ -78,7 +78,7 @@ wvk_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCreat
    layout->slots = slots;
 
    /* In binding order, which is also the order of dynamic offsets. */
-   uint32_t descriptor = 0, dynamic = 0, slot = 0;
+   uint32_t descriptor = 0, dynamic = 0, slot = 0, inline_end = 0;
    struct wvk_sampler **next_sampler = samplers;
    for (uint32_t b = 0; b < binding_count; ++b) {
       const VkDescriptorSetLayoutBinding *info = find_binding(pCreateInfo, b);
@@ -92,8 +92,12 @@ wvk_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCreat
       bl->descriptor_index = descriptor;
       bl->slot = slot;
       if (info->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
-         /* descriptorCount is its size in bytes: one uniform buffer. */
+         /* descriptorCount is its size in bytes: one uniform buffer, a
+          * range of the set's buffer for them. */
          bl->count = 1;
+         bl->inline_offset = align(inline_end, 256);
+         bl->inline_size = info->descriptorCount;
+         inline_end = bl->inline_offset + align(info->descriptorCount, 16);
       } else {
          bl->count = info->descriptorCount;
       }
@@ -121,6 +125,7 @@ wvk_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCreat
    }
    layout->descriptor_count = descriptor;
    layout->dynamic_count = dynamic;
+   layout->inline_size = inline_end ? inline_end + 256 : 0;
    layout->vk.dynamic_descriptor_count = dynamic;
 
    /* What the runtime's pipeline cache keys shaders on: everything a
@@ -157,15 +162,25 @@ wvk_GetDescriptorSetLayoutSupport(VkDevice _device, const VkDescriptorSetLayoutC
           * leave room for. */
          VkDescriptorSetVariableDescriptorCountLayoutSupport *vs = ext;
          vs->maxVariableDescriptorCount = 0;
+         const VkDescriptorSetLayoutBindingFlagsCreateInfo *flags =
+            vk_find_struct_const(pCreateInfo->pNext, DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
          const VkDescriptorSetLayoutBinding *last = NULL;
+         uint32_t last_index = 0;
          for (uint32_t i = 0; i < pCreateInfo->bindingCount; ++i) {
-            if (!last || pCreateInfo->pBindings[i].binding > last->binding)
+            if (!last || pCreateInfo->pBindings[i].binding > last->binding) {
                last = &pCreateInfo->pBindings[i];
+               last_index = i;
+            }
          }
-         if (last && pSupport->supported) {
+         /* Only a binding of variable count has a maximum. */
+         const bool variable = last && flags && last_index < flags->bindingCount &&
+                               (flags->pBindingFlags[last_index] &
+                                VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT);
+         if (variable && pSupport->supported) {
             const uint32_t per = last->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK
                                     ? 0 : wvk_descriptor_type_slots(last->descriptorType);
             const uint32_t others = slot_count - (per ? last->descriptorCount * per : 1);
+            /* An inline uniform block's count is its size in bytes. */
             vs->maxVariableDescriptorCount = per ? (WVK_MAX_SET_SLOTS - others) / per : 4096;
          }
          break;

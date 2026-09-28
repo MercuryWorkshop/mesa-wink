@@ -104,6 +104,34 @@ wvk_descriptor_set_create(struct wvk_device *dev, struct wvk_descriptor_set_layo
    set->layout = layout;
    list_inithead(&set->link);
 
+   /* Inline uniform blocks: bytes on the host, uploaded to their buffer
+    * when a bind group is made after a write (wvk_cmd_draw.c). */
+   if (layout->inline_size) {
+      set->inline_size = layout->inline_size;
+      set->inline_data = calloc(1, set->inline_size);
+      WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
+      bd.label = wvk_sv("wvk inline uniform blocks");
+      bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+      bd.size = set->inline_size;
+      set->inline_buffer = wgpuDeviceCreateBuffer(dev->wgpu, &bd);
+      if (!set->inline_data || !set->inline_buffer) {
+         wvk_descriptor_set_destroy(dev, set);
+         return NULL;
+      }
+      /* Zeroes, as the buffer starts. */
+      set->inline_uploaded = set->generation;
+      for (uint32_t b = 0; b < layout->binding_count; ++b) {
+         const struct wvk_descriptor_set_binding_layout *bl = &layout->bindings[b];
+         if (bl->type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
+            continue;
+         struct wvk_descriptor *d = &set->descriptors[bl->descriptor_index];
+         d->buffer = set->inline_buffer;
+         wgpuBufferAddRef(d->buffer);
+         d->offset = bl->inline_offset;
+         d->size = set->inline_size - bl->inline_offset;
+      }
+   }
+
    /* Immutable samplers are there from the start. */
    for (uint32_t b = 0; b < layout->binding_count; ++b) {
       const struct wvk_descriptor_set_binding_layout *bl = &layout->bindings[b];
@@ -123,6 +151,7 @@ wvk_descriptor_set_destroy(struct wvk_device *dev, struct wvk_descriptor_set *se
       clear_descriptor(&set->descriptors[i], false);
    if (set->inline_buffer)
       wgpuBufferRelease(set->inline_buffer);
+   free(set->inline_data);
    list_del(&set->link);
    vk_descriptor_set_layout_unref(&dev->vk, &set->layout->vk);
    vk_object_free(&dev->vk, NULL, set);
@@ -245,10 +274,44 @@ next_element(const struct wvk_descriptor_set_layout *layout, uint32_t *binding, 
    }
 }
 
+/* Bytes of inline uniform blocks from `offset` in `binding`, running on
+ * into the following blocks as a write of more than one does; to the set
+ * if `to`, else from it. */
+static void
+inline_bytes(struct wvk_descriptor_set *set, uint32_t binding, uint32_t offset, void *data, uint32_t size,
+             bool to)
+{
+   const struct wvk_descriptor_set_layout *layout = set->layout;
+   uint8_t *bytes = data;
+   for (; size && binding < layout->binding_count; ++binding, offset = 0) {
+      const struct wvk_descriptor_set_binding_layout *bl = &layout->bindings[binding];
+      if (bl->type != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK || offset >= bl->inline_size)
+         continue;
+      const uint32_t n = MIN2(size, bl->inline_size - offset);
+      uint8_t *at = set->inline_data + bl->inline_offset + offset;
+      if (to)
+         memcpy(at, bytes, n);
+      else
+         memcpy(bytes, at, n);
+      bytes += n;
+      size -= n;
+   }
+}
+
 void
 wvk_descriptor_set_write(struct wvk_device *dev, struct wvk_descriptor_set *set,
                          const VkWriteDescriptorSet *write)
 {
+   if (write->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+      /* dstArrayElement and descriptorCount are bytes. */
+      const VkWriteDescriptorSetInlineUniformBlock *block =
+         vk_find_struct_const(write->pNext, WRITE_DESCRIPTOR_SET_INLINE_UNIFORM_BLOCK);
+      if (block && set->inline_data)
+         inline_bytes(set, write->dstBinding, write->dstArrayElement, (void *)block->pData,
+                      MIN2(block->dataSize, write->descriptorCount), true);
+      wvk_descriptor_set_invalidate(set);
+      return;
+   }
    uint32_t binding = write->dstBinding, element = write->dstArrayElement;
    for (uint32_t i = 0; i < write->descriptorCount && binding < set->layout->binding_count; ++i) {
       write_one(dev, set, binding, element,
@@ -267,6 +330,12 @@ wvk_descriptor_set_write_template(struct wvk_device *dev, struct wvk_descriptor_
 {
    for (uint32_t i = 0; i < template->entry_count; ++i) {
       const struct vk_descriptor_template_entry *entry = &template->entries[i];
+      if (entry->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+         if (set->inline_data)
+            inline_bytes(set, entry->binding, entry->array_element, (uint8_t *)data + entry->offset,
+                         entry->array_count, true);
+         continue;
+      }
       uint32_t binding = entry->binding, element = entry->array_element;
       for (uint32_t j = 0; j < entry->array_count && binding < set->layout->binding_count; ++j) {
          const void *src = (const uint8_t *)data + entry->offset + j * entry->stride;
@@ -335,6 +404,18 @@ wvk_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
       VK_FROM_HANDLE(wvk_descriptor_set, dst, copy->dstSet);
       uint32_t sb = copy->srcBinding, se = copy->srcArrayElement;
       uint32_t db = copy->dstBinding, de = copy->dstArrayElement;
+      if (sb < src->layout->binding_count &&
+          src->layout->bindings[sb].type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
+         /* Bytes, through a copy: the two may be one set. */
+         void *bytes = malloc(copy->descriptorCount);
+         if (bytes && src->inline_data && dst->inline_data) {
+            inline_bytes(src, sb, se, bytes, copy->descriptorCount, false);
+            inline_bytes(dst, db, de, bytes, copy->descriptorCount, true);
+         }
+         free(bytes);
+         wvk_descriptor_set_invalidate(dst);
+         continue;
+      }
       for (uint32_t j = 0; j < copy->descriptorCount; ++j) {
          if (sb >= src->layout->binding_count || db >= dst->layout->binding_count)
             break;

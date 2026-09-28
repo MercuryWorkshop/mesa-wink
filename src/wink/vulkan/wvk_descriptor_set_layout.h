@@ -28,6 +28,10 @@ struct wvk_descriptor_set_binding_layout {
    uint32_t slot;
    /* count of them, or NULL. */
    struct wvk_sampler **immutable_samplers;
+   /* An inline uniform block: its bytes, and where they are in the set's
+    * buffer of them. */
+   uint32_t inline_offset;
+   uint32_t inline_size;
 };
 
 /* What a WebGPU binding of the set is: element `element` of Vulkan
@@ -46,6 +50,10 @@ struct wvk_descriptor_set_layout {
    uint32_t dynamic_count;
    uint32_t slot_count;
    struct wvk_descriptor_slot *slots;
+   /* The bytes of the set's inline uniform blocks, each where a uniform
+    * binding can start, and room after the last for WebGPU's minimum
+    * binding size. */
+   uint32_t inline_size;
 
    struct wvk_descriptor_set_binding_layout bindings[];
 };
@@ -131,7 +139,8 @@ enum wvk_texel_type {
  *     in bytes, 4 uints;
  *   - the viewport transform's depth part, 2 floats; and the layer and
  *     view a pass renders, 2 uints (a pass per layer or view, see
- *     wvk_cmd_buffer.c). */
+ *     wvk_cmd_buffer.c);
+ *   - each pulled vertex buffer's stride, which may be dynamic, 4 uints. */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
@@ -139,7 +148,8 @@ enum wvk_texel_type {
 #define WVK_DRIVER_PULL_OFFSET (WVK_DRIVER_DATA_OFFSET + 48)
 #define WVK_DRIVER_DEPTH_OFFSET (WVK_DRIVER_DATA_OFFSET + 64)
 #define WVK_DRIVER_LAYER_OFFSET (WVK_DRIVER_DEPTH_OFFSET + 8)
-#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 80)
+#define WVK_DRIVER_PULL_STRIDES (WVK_DRIVER_DATA_OFFSET + 80)
+#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 96)
 #define WVK_META_OFFSET WVK_PUSH_DATA_SIZE
 /* How much of the push buffer the push binding shows: its data, and as
  * many records as that leaves room for. */

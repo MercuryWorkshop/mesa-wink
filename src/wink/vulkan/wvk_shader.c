@@ -33,6 +33,7 @@
 
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_deref.h"
 #include "compiler/spirv/nir_spirv.h"
 #include "util/blob.h"
 #include "util/u_dynarray.h"
@@ -59,6 +60,11 @@ wvk_init_nir_options(nir_shader_compiler_options *options)
     * integers, which WGSL does not have. */
    options->lower_pack_half_2x16 = false;
    options->lower_unpack_half_2x16 = false;
+   /* Saturating arithmetic, which integer dot products have: SPIR-V's is
+    * Intel's alone. */
+   options->lower_uadd_sat = true;
+   options->lower_usub_sat = true;
+   options->lower_iadd_sat = true;
 }
 
 static const nir_shader_compiler_options *
@@ -104,6 +110,34 @@ optimize(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_if, 0);
       NIR_PASS(progress, nir, nir_opt_undef);
    } while (progress);
+}
+
+/* OpQuantizeToF16, through WGSL's pack2x16float, which leaves what
+ * f16 cannot hold undefined: those, and denormals, which flush, by hand. */
+static bool
+lower_quantize_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_fquantize2f16)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *a = nir_ssa_for_alu_src(b, alu, 0);
+   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < a->num_components; ++i) {
+      nir_def *x = nir_channel(b, a, i);
+      nir_def *mag = nir_fabs(b, x);
+      nir_def *sign = nir_iand_imm(b, x, 0x80000000u);
+      nir_def *half = nir_channel(b, nir_unpack_half_2x16(b, nir_pack_half_2x16(b, nir_vec2(b, x, nir_imm_float(b, 0)))), 0);
+      /* What rounds past the largest half, 65504, is infinite. */
+      nir_def *inf = nir_ior_imm(b, sign, 0x7f800000u);
+      nir_def *v = nir_bcsel(b, nir_fge_imm(b, mag, 65520.0f), inf, half);
+      v = nir_bcsel(b, nir_flt_imm(b, mag, 6.103515625e-05f /* 2^-14 */), sign, v);
+      comps[i] = nir_bcsel(b, nir_fneu(b, x, x), x, v);
+   }
+   nir_def_replace(&alu->def, nir_vec(b, comps, a->num_components));
+   return true;
 }
 
 /* Helper invocations, which WGSL has no builtin for: those outside the
@@ -175,6 +209,9 @@ wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, wvk_nir_lower_subgroups);
+   /* ALU the SPIR-V emitter has no instruction for. */
+   NIR_PASS(_, nir, nir_lower_frexp);
+   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_quantize_instr, nir_metadata_control_flow, NULL);
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, lower_helper_invocations);
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
@@ -216,7 +253,7 @@ wvk_hash_state(struct vk_physical_device *device, const struct vk_graphics_pipel
             continue;
          const struct vk_vertex_attribute_state *a = &vi->attributes[location];
          const struct vk_vertex_binding_state *vb = &vi->bindings[a->binding];
-         const uint32_t words[] = { location, a->binding, a->format, a->offset, vb->stride, vb->divisor };
+         const uint32_t words[] = { location, a->binding, a->format, a->offset, vb->divisor };
          _mesa_blake3_update(&ctx, words, sizeof(words));
       }
    }
@@ -1095,8 +1132,12 @@ fetch_attribute(nir_builder *b, const struct vk_vertex_input_state *vi, int loca
    nir_def *starts = nir_load_ssbo(b, 4, 32, driver_buffer(b, WVK_DRIVER_SLOT_PUSH),
                                    nir_imm_int(b, WVK_DRIVER_PULL_OFFSET), .align_mul = 16,
                                    .access = ACCESS_NON_WRITEABLE);
+   /* The stride as the draw has it: it may be dynamic. */
+   nir_def *strides = nir_load_ssbo(b, 4, 32, driver_buffer(b, WVK_DRIVER_SLOT_PUSH),
+                                    nir_imm_int(b, WVK_DRIVER_PULL_STRIDES), .align_mul = 16,
+                                    .access = ACCESS_NON_WRITEABLE);
    nir_def *address = nir_iadd(b, nir_channel(b, starts, slot),
-                               nir_iadd_imm(b, nir_imul_imm(b, element, vb->stride), a->offset));
+                               nir_iadd_imm(b, nir_imul(b, element, nir_channel(b, strides, slot)), a->offset));
 
    const struct util_format_description *desc = vk_format_description(a->format);
    nir_def *channels[4];
@@ -1263,7 +1304,7 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
    /* vtn's variables go; the words take their place. */
    nir_foreach_variable_with_modes_safe(var, nir, nir_var_mem_ubo | nir_var_mem_ssbo)
       exec_node_remove(&var->node);
-   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_to_words_instr, nir_metadata_control_flow, &wb);
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_to_words_instr, nir_metadata_none, &wb);
    /* Every access has its binding now; what is left of the descriptors is
     * their offset part, which is zero. */
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, zero_descriptors_instr, nir_metadata_control_flow, NULL);
@@ -1376,58 +1417,254 @@ demote_to_terminate_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
-/* A fragment output of fewer components than its attachment has, which
- * Vulkan leaves undefined and WebGPU refuses: every colour output is a
- * vec4, the rest zero. */
-static bool
-pad_fragment_outputs(nir_shader *nir)
+/* Structs among a stage's varyings -- GLSL's interface blocks, and arrays
+ * of them -- as a variable for each member of each element: WGSL has no
+ * structs there, and the SPIR-V emitter gives them offsets Tint refuses.
+ * Each leaf takes the location and interpolation its member has. */
+struct io_leaf {
+   nir_variable *var;
+   /* Which element of each array, and which member of each struct, from
+    * the variable down to the leaf. */
+   uint8_t path[8];
+   uint8_t depth;
+};
+
+struct io_split {
+   nir_variable *var;
+   struct util_dynarray leaves;
+   /* Indexed by a variable somewhere, and so left whole. */
+   bool failed;
+};
+
+/* The leaves of `type`, at `location`: `offset` is how many locations
+ * the arrays around it have moved it, for the members of the variable's
+ * own struct, whose locations vtn resolved (nir_variable::members). */
+static void
+flatten_io_type(nir_shader *nir, struct io_split *split, const struct glsl_type *type, int location,
+                unsigned offset, const struct nir_variable_data *data, bool top, uint8_t *path, uint8_t depth)
 {
-   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+   const bool struct_below = glsl_type_is_struct_or_ifc(glsl_without_array(type));
+   if (!struct_below || depth == ARRAY_SIZE(((struct io_leaf *)0)->path)) {
+      nir_variable *var = nir_variable_clone(split->var, nir);
+      var->type = type;
+      var->members = NULL;
+      var->num_members = 0;
+      var->data.location = location;
+      var->data.location_frac = 0;
+      if (data) {
+         var->data.location_frac = data->location_frac;
+         var->data.interpolation = data->interpolation;
+         var->data.centroid = data->centroid;
+         var->data.sample = data->sample;
+      }
+      var->name = ralloc_asprintf(nir, "%s_%u", split->var->name ? split->var->name : "io",
+                                  (unsigned)util_dynarray_num_elements(&split->leaves, struct io_leaf));
+      nir_shader_add_variable(nir, var);
+      struct io_leaf leaf = { .var = var, .depth = depth };
+      memcpy(leaf.path, path, depth);
+      util_dynarray_append(&split->leaves, leaf);
+      return;
+   }
+   if (glsl_type_is_array(type)) {
+      const struct glsl_type *elem = glsl_get_array_element(type);
+      const unsigned slots = glsl_count_vec4_slots(elem, false, false);
+      for (unsigned e = 0; e < glsl_get_length(type); ++e) {
+         path[depth] = e;
+         flatten_io_type(nir, split, elem, location + e * slots, offset + e * slots, data, top, path, depth + 1);
+      }
+      return;
+   }
+   int at = location;
+   for (unsigned m = 0; m < glsl_get_length(type); ++m) {
+      const struct glsl_type *member = glsl_get_struct_field(type, m);
+      const struct nir_variable_data *member_data = data;
+      if (top && split->var->members) {
+         /* A member of the block is where vtn says, in each element. */
+         member_data = &split->var->members[m];
+         at = split->var->members[m].location + offset;
+      }
+      path[depth] = m;
+      flatten_io_type(nir, split, member, at, offset, member_data, false, path, depth + 1);
+      at += glsl_count_vec4_slots(member, false, false);
+   }
+}
+
+static bool
+split_io_structs(nir_shader *nir)
+{
+   nir_variable_mode mode;
+   if (nir->info.stage == MESA_SHADER_VERTEX)
+      mode = nir_var_shader_out;
+   else if (nir->info.stage == MESA_SHADER_FRAGMENT)
+      mode = nir_var_shader_in;
+   else
       return false;
-   bool progress = false;
-   nir_foreach_shader_out_variable(var, nir) {
-      if (var->data.location < FRAG_RESULT_DATA0)
+
+   struct util_dynarray splits = UTIL_DYNARRAY_INIT;
+   nir_foreach_variable_with_modes(var, nir, mode) {
+      if (!glsl_type_is_struct_or_ifc(glsl_without_array(var->type)))
          continue;
-      /* An array is an output per element. */
-      const struct glsl_type *old = glsl_without_array(var->type);
-      if (!glsl_type_is_vector_or_scalar(old) || glsl_get_vector_elements(old) == 4)
+      const int location = var->members ? var->members[0].location : var->data.location;
+      if (location < VARYING_SLOT_VAR0)
          continue;
-      const struct glsl_type *vec4 = glsl_vector_type(glsl_get_base_type(old), 4);
-      var->type = glsl_type_is_array(var->type) ? glsl_array_type(vec4, glsl_get_length(var->type), 0) : vec4;
-      nir_foreach_function_impl(impl, nir) {
-         nir_builder b = nir_builder_create(impl);
-         nir_foreach_block(block, impl) {
-            nir_foreach_instr_safe(instr, block) {
-               if (instr->type != nir_instr_type_intrinsic)
-                  continue;
-               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-               if ((intr->intrinsic != nir_intrinsic_store_deref && intr->intrinsic != nir_intrinsic_load_deref) ||
-                   nir_intrinsic_get_var(intr, 0) != var ||
-                   !glsl_type_is_vector_or_scalar(nir_src_as_deref(intr->src[0])->type))
-                  continue;
-               if (intr->intrinsic == nir_intrinsic_load_deref) {
-                  /* Reading the output back: the components it had. */
-                  const unsigned n = intr->def.num_components;
-                  b.cursor = nir_after_instr(instr);
-                  intr->num_components = 4;
-                  intr->def.num_components = 4;
-                  nir_def *trimmed = nir_trim_vector(&b, &intr->def, n);
-                  nir_def_rewrite_uses_after(&intr->def, trimmed);
-                  continue;
-               }
-               b.cursor = nir_before_instr(instr);
-               nir_def *value = intr->src[1].ssa;
-               nir_def *comps[4];
-               for (unsigned c = 0; c < 4; ++c)
-                  comps[c] = c < value->num_components ? nir_channel(&b, value, c)
-                                                       : nir_imm_zero(&b, 1, value->bit_size);
-               nir_src_rewrite(&intr->src[1], nir_vec(&b, comps, 4));
-               intr->num_components = 4;
-               nir_intrinsic_set_write_mask(intr, 0xf);
+      struct io_split split = { .var = var, .leaves = UTIL_DYNARRAY_INIT };
+      util_dynarray_append(&splits, split);
+   }
+   if (!splits.size)
+      return false;
+   util_dynarray_foreach(&splits, struct io_split, split) {
+      uint8_t path[8];
+      flatten_io_type(nir, split, split->var->type, split->var->data.location, 0, &split->var->data, true, path, 0);
+   }
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (!nir_intrinsic_infos[intr->intrinsic].num_srcs || !nir_src_as_deref(intr->src[0]))
+               continue;
+            nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+            nir_variable *root = nir_deref_instr_get_variable(deref);
+            struct io_split *split = NULL;
+            util_dynarray_foreach(&splits, struct io_split, s) {
+               if (s->var == root)
+                  split = s;
             }
+            if (!split)
+               continue;
+            nir_deref_path p;
+            nir_deref_path_init(&p, deref, NULL);
+            /* The leaf: struct members and array elements down to it, which
+             * have to be constant. */
+            uint8_t path[8];
+            unsigned depth = 0, i = 1;
+            for (; p.path[i]; ++i) {
+               const struct glsl_type *parent = p.path[i - 1]->type;
+               if (!glsl_type_is_struct_or_ifc(glsl_without_array(parent)) || depth == ARRAY_SIZE(path))
+                  break;
+               nir_deref_instr *d = p.path[i];
+               if (d->deref_type == nir_deref_type_struct) {
+                  path[depth++] = d->strct.index;
+               } else if (d->deref_type == nir_deref_type_array && nir_src_is_const(d->arr.index)) {
+                  path[depth++] = nir_src_as_uint(d->arr.index);
+               } else {
+                  split->failed = true;
+                  break;
+               }
+            }
+            struct io_leaf *leaf = NULL;
+            util_dynarray_foreach(&split->leaves, struct io_leaf, l) {
+               if (l->depth == depth && !memcmp(l->path, path, depth))
+                  leaf = l;
+            }
+            if (!leaf) {
+               nir_deref_path_finish(&p);
+               split->failed = true;
+               continue;
+            }
+            /* The rest of the chain, on the leaf. */
+            b.cursor = nir_before_instr(instr);
+            nir_deref_instr *d = nir_build_deref_var(&b, leaf->var);
+            for (; p.path[i]; ++i)
+               d = nir_build_deref_follower(&b, d, p.path[i]);
+            nir_deref_path_finish(&p);
+            nir_src_rewrite(&intr->src[0], &d->def);
          }
       }
-      progress = true;
+      nir_progress(true, impl, nir_metadata_control_flow);
+   }
+   util_dynarray_foreach(&splits, struct io_split, split) {
+      if (split->failed)
+         mesa_logw_once("wvk: a varying struct indexed by a variable");
+      else
+         exec_node_remove(&split->var->node);
+      util_dynarray_fini(&split->leaves);
+   }
+   util_dynarray_fini(&splits);
+   NIR_PASS(_, nir, nir_opt_dce);
+   return true;
+}
+
+/* Vectors of fewer than four components among a stage's outputs or
+ * inputs, as vec4s. A fragment output of fewer than its attachment has,
+ * which Vulkan leaves undefined, WebGPU refuses; and so does a vertex
+ * output of more components than the fragment input at its location,
+ * which Vulkan allows: every user varying is a vec4 on either side. A
+ * location shared among components of several variables stays. */
+static bool
+pad_io_var(nir_shader *nir, nir_variable *var)
+{
+   const struct glsl_type *old = glsl_without_array(var->type);
+   if (!glsl_type_is_vector_or_scalar(old) || glsl_get_vector_elements(old) == 4 ||
+       glsl_get_bit_size(old) != 32 || var->data.location_frac)
+      return false;
+   nir_foreach_variable_with_modes(other, nir, var->data.mode) {
+      if (other != var && other->data.location == var->data.location)
+         return false;
+   }
+   const struct glsl_type *vec4 = glsl_vector_type(glsl_get_base_type(old), 4);
+   var->type = glsl_type_is_array(var->type) ? glsl_array_type(vec4, glsl_get_length(var->type), 0) : vec4;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            const bool load = intr->intrinsic == nir_intrinsic_load_deref ||
+                              intr->intrinsic == nir_intrinsic_interp_deref_at_centroid ||
+                              intr->intrinsic == nir_intrinsic_interp_deref_at_sample ||
+                              intr->intrinsic == nir_intrinsic_interp_deref_at_offset;
+            if ((intr->intrinsic != nir_intrinsic_store_deref && !load) ||
+                nir_intrinsic_get_var(intr, 0) != var ||
+                !glsl_type_is_vector_or_scalar(nir_src_as_deref(intr->src[0])->type))
+               continue;
+            if (load) {
+               /* What was read: the components it had. */
+               const unsigned n = intr->def.num_components;
+               b.cursor = nir_after_instr(instr);
+               intr->num_components = 4;
+               intr->def.num_components = 4;
+               nir_def *trimmed = nir_trim_vector(&b, &intr->def, n);
+               nir_def_rewrite_uses_after(&intr->def, trimmed);
+               continue;
+            }
+            /* What is written: the components it wrote, the rest zero. */
+            b.cursor = nir_before_instr(instr);
+            nir_def *value = intr->src[1].ssa;
+            nir_def *comps[4];
+            for (unsigned c = 0; c < 4; ++c)
+               comps[c] = c < value->num_components ? nir_channel(&b, value, c)
+                                                    : nir_imm_zero(&b, 1, value->bit_size);
+            nir_src_rewrite(&intr->src[1], nir_vec(&b, comps, 4));
+            intr->num_components = 4;
+            nir_intrinsic_set_write_mask(intr, nir_intrinsic_write_mask(intr) |
+                                                  (0xf & ~BITFIELD_MASK(value->num_components)));
+         }
+      }
+   }
+   return true;
+}
+
+static bool
+pad_io_vectors(nir_shader *nir)
+{
+   bool progress = false;
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      nir_foreach_shader_out_variable(var, nir) {
+         if (var->data.location >= FRAG_RESULT_DATA0)
+            progress |= pad_io_var(nir, var);
+      }
+   }
+   if (nir->info.stage == MESA_SHADER_VERTEX || nir->info.stage == MESA_SHADER_FRAGMENT) {
+      const nir_variable_mode mode = nir->info.stage == MESA_SHADER_VERTEX ? nir_var_shader_out : nir_var_shader_in;
+      nir_foreach_variable_with_modes(var, nir, mode) {
+         if (var->data.location >= VARYING_SLOT_VAR0 && var->data.location <= VARYING_SLOT_VAR31)
+            progress |= pad_io_var(nir, var);
+      }
    }
    if (progress)
       nir_fixup_deref_types(nir);
@@ -1772,12 +2009,17 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       mesa_logw_once("wvk: a pipeline layout of more descriptors than their records have room for");
 
    NIR_PASS(_, nir, lower_push_constants);
+   /* Varyings WGSL can have: no structs, and a location each. */
+   NIR_PASS(_, nir, split_io_structs);
+   NIR_PASS(_, nir, nir_opt_vectorize_io_vars,
+            nir->info.stage == MESA_SHADER_VERTEX ? nir_var_shader_out
+            : nir->info.stage == MESA_SHADER_FRAGMENT ? nir_var_shader_in : 0);
    NIR_PASS(_, nir, lower_layer_outputs, shader);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_layer_id_instr, nir_metadata_control_flow, NULL);
    split_resource_vars(nir, &state);
    split_buffer_vars(nir, &state);
-   NIR_PASS(_, nir, nir_shader_instructions_pass, rewrite_resource_instr, nir_metadata_control_flow,
-            &state);
+   /* Writes by a dynamic index are ladders of ifs. */
+   NIR_PASS(_, nir, nir_shader_instructions_pass, rewrite_resource_instr, nir_metadata_none, &state);
    /* Swizzles first: a gather's is a gather of another component, which
     * then samples as its own; and the border replaces a texel before the
     * swizzle takes it apart. */
@@ -1785,7 +2027,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    NIR_PASS(_, nir, wvk_nir_lower_samplers, shader->meta_base);
    NIR_PASS(_, nir, lower_1d_images);
    NIR_PASS(_, nir, lower_ms_arrays);
-   NIR_PASS(_, nir, pad_fragment_outputs);
+   NIR_PASS(_, nir, pad_io_vectors);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, demote_to_terminate_instr, nir_metadata_all, NULL);
    NIR_PASS(_, nir, wvk_nir_lower_texel_buffers, shader->meta_base);
    lower_buffers_to_words(nir, info, pipeline_state, shader, mem_ctx);

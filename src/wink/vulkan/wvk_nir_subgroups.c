@@ -150,6 +150,15 @@ lower_subgroup_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          nir_instr_remove(&intr->instr);
          return true;
       }
+      /* An execution barrier with no memory is WGSL's workgroupBarrier()
+       * still: Tint makes nothing of a control barrier without memory
+       * semantics, and SPIR-V has no scope for none. */
+      if (nir_intrinsic_execution_scope(intr) != SCOPE_NONE && nir_intrinsic_memory_scope(intr) == SCOPE_NONE) {
+         nir_intrinsic_set_memory_scope(intr, SCOPE_WORKGROUP);
+         nir_intrinsic_set_memory_semantics(intr, NIR_MEMORY_ACQ_REL);
+         nir_intrinsic_set_memory_modes(intr, nir_var_mem_shared);
+         changed = true;
+      }
       return changed;
    }
    default:
