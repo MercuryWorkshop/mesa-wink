@@ -68,6 +68,9 @@ struct wvk_device {
     * between buffer layouts, and depth out of a texture. */
    WGPUComputePipeline copy_query_pipeline;
    WGPUComputePipeline repack_pipeline;
+   /* 16-bit packed texels into and out of RGBA8 textures: 2D arrays and
+    * 3D, each way (wvk_cmd_copy.c). */
+   WGPUComputePipeline packed16_pipelines[4];
    WGPUComputePipeline depth_out_pipeline;
    /* And into depth: a pass writing frag_depth, for each depth format. */
    struct {

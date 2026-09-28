@@ -43,8 +43,11 @@ wvk_clear_color(VkFormat format, const VkClearColorValue *value)
       return (WGPUColor){ value->uint32[0], value->uint32[1], value->uint32[2], value->uint32[3] };
    if (vk_format_is_sint(format))
       return (WGPUColor){ value->int32[0], value->int32[1], value->int32[2], value->int32[3] };
+   /* Alpha is one in a format without it, and a packed format's RGBA8
+    * texture keeps it so. */
+   const double alpha = util_format_has_alpha(vk_format_to_pipe_format(format)) ? clear_finite(value->float32[3]) : 1.0;
    return (WGPUColor){ clear_finite(value->float32[0]), clear_finite(value->float32[1]), clear_finite(value->float32[2]),
-                       clear_finite(value->float32[3]) };
+                       alpha };
 }
 
 static WGPULoadOp

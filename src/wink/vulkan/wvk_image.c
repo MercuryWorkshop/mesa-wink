@@ -106,6 +106,9 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && (caps & WVK_CAP_STORAGE) &&
        pCreateInfo->samples == VK_SAMPLE_COUNT_1_BIT)
       wusage |= WGPUTextureUsage_StorageBinding;
+   /* Copies into a packed format's texture are a shader's stores. */
+   if ((caps & WVK_CAP_PACKED16) && pCreateInfo->samples == VK_SAMPLE_COUNT_1_BIT)
+      wusage |= WGPUTextureUsage_StorageBinding;
    image->usage = wusage;
 
    WGPUTextureFormat view_formats[1];
@@ -378,7 +381,18 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    const struct wvk_format *format = wvk_format_get(view->vk.format);
    view->format = format ? format->texture : image->format;
    view->aspect = wvk_aspect(view->vk.aspects);
-   const VkComponentMapping *m = &view->vk.swizzle;
+   VkComponentMapping mapping = view->vk.swizzle;
+   /* A packed format without alpha in an RGBA8 texture: whatever alpha it
+    * was rendered with, the format's is one. */
+   if (format && (format->caps & WVK_CAP_PACKED16) &&
+       !util_format_has_alpha(vk_format_to_pipe_format(view->vk.view_format))) {
+      VkComponentSwizzle *c[4] = { &mapping.r, &mapping.g, &mapping.b, &mapping.a };
+      for (unsigned i = 0; i < 4; ++i) {
+         if (*c[i] == VK_COMPONENT_SWIZZLE_A)
+            *c[i] = VK_COMPONENT_SWIZZLE_ONE;
+      }
+   }
+   const VkComponentMapping *m = &mapping;
    if (m->r != VK_COMPONENT_SWIZZLE_R || m->g != VK_COMPONENT_SWIZZLE_G || m->b != VK_COMPONENT_SWIZZLE_B ||
        m->a != VK_COMPONENT_SWIZZLE_A)
       view->swizzle = (uint32_t)m->r | (uint32_t)m->g << 3 | (uint32_t)m->b << 6 | (uint32_t)m->a << 9;

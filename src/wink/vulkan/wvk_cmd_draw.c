@@ -449,6 +449,10 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuComputePipelineRelease(dev->copy_query_pipeline);
    if (dev->repack_pipeline)
       wgpuComputePipelineRelease(dev->repack_pipeline);
+   for (uint32_t i = 0; i < ARRAY_SIZE(dev->packed16_pipelines); ++i) {
+      if (dev->packed16_pipelines[i])
+         wgpuComputePipelineRelease(dev->packed16_pipelines[i]);
+   }
    if (dev->depth_out_pipeline)
       wgpuComputePipelineRelease(dev->depth_out_pipeline);
    for (uint32_t i = 0; i < ARRAY_SIZE(dev->depth_in_pipelines); ++i) {
@@ -1469,6 +1473,15 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
       const bool written = st->fs && (st->fs->io_mask & BITFIELD_BIT(i)) &&
                            (dyn->cb.color_write_enables & BITFIELD_BIT(i));
       k->color[i].write_mask = written ? a->write_mask : 0;
+      /* A packed format without alpha keeps its RGBA8 texture's at one,
+       * which is what blending reads as its alpha. */
+      const struct wvk_image_view *view = i < replay->rendering.color_count ? replay->rendering.color[i] : NULL;
+      if (view) {
+         const struct wvk_format *f = wvk_format_get(view->vk.view_format);
+         if (f && (f->caps & WVK_CAP_PACKED16) &&
+             !util_format_has_alpha(vk_format_to_pipe_format(view->vk.view_format)))
+            k->color[i].write_mask &= ~VK_COLOR_COMPONENT_A_BIT;
+      }
       k->color[i].blend = a->blend_enable && written;
       if (k->color[i].blend) {
          k->color[i].src_c = blend_factor(a->src_color_blend_factor);

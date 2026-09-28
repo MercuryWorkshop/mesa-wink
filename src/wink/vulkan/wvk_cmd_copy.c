@@ -15,6 +15,7 @@
 #include "wvk_device.h"
 #include "wvk_device_memory.h"
 #include "wvk_entrypoints.h"
+#include "wvk_format.h"
 #include "wvk_image.h"
 
 #include "vk_format.h"
@@ -420,6 +421,142 @@ repack(struct wvk_device *dev, struct wvk_replay *replay, WGPUBuffer src, uint64
    dispatch(dev, replay, pipeline, entries, 2, params, sizeof(params), DIV_ROUND_UP(row_bytes, 64), rows, images);
 }
 
+/* ---------------------------------------------------------------------- */
+/* 16-bit packed formats (WVK_CAP_PACKED16)
+ *
+ * RGBA8 textures, whose texels a shader unpacks out of buffers and packs
+ * into them. Each channel of the texture is `size` bits of the texel from
+ * bit `shift`, 8 bits of P's sizes and shifts each; a channel of none is
+ * 0, and alpha 1. */
+
+#define PACKED16_COMMON                                                                      \
+   "struct P { byte: u32, pitch: u32, image: u32, width: u32, height: u32,\n"                  \
+   "           origin_x: u32, origin_y: u32, origin_z: u32, sizes: u32, shifts: u32 }\n"       \
+   "fn field(p: P, i: u32) -> vec2u {\n"                                                      \
+   "  return vec2u((p.sizes >> (8u * i)) & 255u, (p.shifts >> (8u * i)) & 255u);\n"            \
+   "}\n"
+
+#define UNPACK16(texture, store)                                                             \
+   PACKED16_COMMON                                                                           \
+   "@group(0) @binding(0) var<storage, read> src: array<u32>;\n"                              \
+   "@group(0) @binding(1) var dst: " texture ";\n"                                            \
+   "@group(0) @binding(2) var<uniform> p: P;\n"                                               \
+   "@compute @workgroup_size(8, 8, 1)\n"                                                      \
+   "fn main(@builtin(global_invocation_id) id: vec3u) {\n"                                    \
+   "  if (id.x >= p.width || id.y >= p.height) { return; }\n"                                 \
+   "  let byte = p.byte + id.z * p.image + id.y * p.pitch + id.x * 2u;\n"                     \
+   "  let v = (src[byte >> 2u] >> ((byte & 2u) * 8u)) & 0xffffu;\n"                            \
+   "  var c = vec4f(0.0, 0.0, 0.0, 1.0);\n"                                                   \
+   "  for (var i = 0u; i < 4u; i++) {\n"                                                      \
+   "    let f = field(p, i);\n"                                                               \
+   "    if (f.x != 0u) {\n"                                                                   \
+   "      let m = (1u << f.x) - 1u;\n"                                                        \
+   "      c[i] = f32((v >> f.y) & m) / f32(m);\n"                                             \
+   "    }\n"                                                                                  \
+   "  }\n"                                                                                    \
+   "  " store "\n"                                                                            \
+   "}\n"
+
+#define PACK16(texture, load)                                                                \
+   PACKED16_COMMON                                                                           \
+   "@group(0) @binding(0) var src: " texture ";\n"                                            \
+   "@group(0) @binding(1) var<storage, read_write> dst: array<atomic<u32>>;\n"                \
+   "@group(0) @binding(2) var<uniform> p: P;\n"                                               \
+   "@compute @workgroup_size(8, 8, 1)\n"                                                      \
+   "fn main(@builtin(global_invocation_id) id: vec3u) {\n"                                    \
+   "  if (id.x >= p.width || id.y >= p.height) { return; }\n"                                 \
+   "  let c = " load ";\n"                                                                    \
+   "  var v = 0u;\n"                                                                          \
+   "  for (var i = 0u; i < 4u; i++) {\n"                                                      \
+   "    let f = field(p, i);\n"                                                               \
+   "    if (f.x != 0u) {\n"                                                                   \
+   "      let m = (1u << f.x) - 1u;\n"                                                        \
+   "      v |= (u32(round(clamp(c[i], 0.0, 1.0) * f32(m))) & m) << f.y;\n"                     \
+   "    }\n"                                                                                  \
+   "  }\n"                                                                                    \
+   "  let byte = p.byte + id.z * p.image + id.y * p.pitch + id.x * 2u;\n"                     \
+   "  let half = (byte & 2u) * 8u;\n"                                                         \
+   "  atomicAnd(&dst[byte >> 2u], ~(0xffffu << half));\n"                                     \
+   "  atomicOr(&dst[byte >> 2u], v << half);\n"                                               \
+   "}\n"
+
+static const char *const packed16_wgsl[4] = {
+   UNPACK16("texture_storage_2d_array<rgba8unorm, write>",
+            "textureStore(dst, vec2u(p.origin_x + id.x, p.origin_y + id.y), p.origin_z + id.z, c);"),
+   UNPACK16("texture_storage_3d<rgba8unorm, write>",
+            "textureStore(dst, vec3u(p.origin_x + id.x, p.origin_y + id.y, p.origin_z + id.z), c);"),
+   PACK16("texture_2d_array<f32>",
+          "textureLoad(src, vec2u(p.origin_x + id.x, p.origin_y + id.y), p.origin_z + id.z, 0)"),
+   PACK16("texture_3d<f32>", "textureLoad(src, vec3u(p.origin_x + id.x, p.origin_y + id.y, p.origin_z + id.z), 0)"),
+};
+
+static bool
+is_packed16(const struct wvk_image *image)
+{
+   const struct wvk_format *f = wvk_format_get(image->vk.format);
+   return f && (f->caps & WVK_CAP_PACKED16);
+}
+
+/* A region of a packed image, as image_region has it, to or from a
+ * buffer laid out as `l` says. */
+static void
+convert_packed16(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image,
+                 bool to_texture, WGPUBuffer buffer, uint64_t offset, const struct copy_layout *l,
+                 const WGPUTexelCopyTextureInfo *tex, WGPUExtent3D size)
+{
+   const bool is_3d = image->dimension == WGPUTextureDimension_3D;
+   const unsigned which = (to_texture ? 0 : 2) + (is_3d ? 1 : 0);
+   WGPUComputePipeline pipeline =
+      copy_pipeline(dev, &dev->packed16_pipelines[which], packed16_wgsl[which], "wvk packed16");
+   if (!pipeline || !size.width || !size.height || !size.depthOrArrayLayers)
+      return;
+   /* The texture's channels, where the format has them. */
+   const struct util_format_description *desc = vk_format_description(image->vk.format);
+   uint32_t sizes = 0, shifts = 0;
+   for (unsigned c = 0; c < 4; ++c) {
+      const unsigned sw = desc->swizzle[c];
+      if (sw > PIPE_SWIZZLE_W)
+         continue;
+      sizes |= (uint32_t)desc->channel[sw].size << (8 * c);
+      shifts |= (uint32_t)desc->channel[sw].shift << (8 * c);
+   }
+   /* The level: every layer of it, or its depth. */
+   WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   vd.dimension = is_3d ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2DArray;
+   vd.baseMipLevel = tex->mipLevel;
+   vd.mipLevelCount = 1;
+   vd.arrayLayerCount = is_3d ? 1 : image->vk.array_layers;
+   WGPUTextureView view = wgpuTextureCreateView(image->texture, &vd);
+   if (!view)
+      return;
+   util_dynarray_append(&replay->views, view);
+   uint32_t byte;
+   const WGPUBindGroupEntry range = storage_range(to_texture ? 0 : 1, buffer, offset, region_bytes(l, size), &byte);
+   WGPUBindGroupEntry texture = WGPU_BIND_GROUP_ENTRY_INIT;
+   texture.binding = to_texture ? 1 : 0;
+   texture.textureView = view;
+   const WGPUBindGroupEntry entries[2] = { to_texture ? range : texture, to_texture ? texture : range };
+   const uint32_t params[12] = {
+      byte, l->row_bytes, l->rows_per_image * l->row_bytes, size.width, size.height,
+      tex->origin.x, tex->origin.y, tex->origin.z, sizes, shifts,
+   };
+   dispatch(dev, replay, pipeline, entries, 2, params, sizeof(params), DIV_ROUND_UP(size.width, 8),
+            DIV_ROUND_UP(size.height, 8), size.depthOrArrayLayers);
+}
+
+/* A buffer-texture copy of a colour image: WebGPU's, or a shader's for a
+ * packed format. */
+static void
+copy_color(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image, bool to_texture,
+           WGPUBuffer buffer, uint64_t offset, const struct copy_layout *l, const WGPUTexelCopyTextureInfo *tex,
+           WGPUExtent3D size)
+{
+   if (is_packed16(image))
+      convert_packed16(dev, replay, image, to_texture, buffer, offset, l, tex, size);
+   else
+      copy_buffer_texture(replay, to_texture, buffer, offset, l, tex, size);
+}
+
 /* Where texel (x, y) of a linear image is in its memory. */
 static uint64_t
 linear_offset(const struct wvk_image *image, VkOffset3D o)
@@ -663,7 +800,7 @@ wvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIma
          copy_buffer_to_ds(wvk_cmd_buffer_device(cmd), replay, dst, r->imageSubresource.aspectMask, &tex,
                            size, buffer_wgpu(src), off, &l);
       else
-         copy_buffer_texture(replay, true, buffer_wgpu(src), off, &l, &tex, size);
+         copy_color(wvk_cmd_buffer_device(cmd), replay, dst, true, buffer_wgpu(src), off, &l, &tex, size);
    }
 }
 
@@ -700,7 +837,7 @@ wvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBuff
          copy_ds_to_buffer(wvk_cmd_buffer_device(cmd), replay, src, r->imageSubresource.aspectMask, &tex,
                            size, buffer_wgpu(dst), off, &l);
       else
-         copy_buffer_texture(replay, false, buffer_wgpu(dst), off, &l, &tex, size);
+         copy_color(wvk_cmd_buffer_device(cmd), replay, src, false, buffer_wgpu(dst), off, &l, &tex, size);
    }
 }
 
@@ -732,6 +869,15 @@ copy_image_linear(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_
    buf.layout.offset = linear_offset(linear, at);
    buf.layout.bytesPerRow = linear->pitch;
    buf.layout.rowsPerImage = size.height;
+   if (is_packed16(tiled)) {
+      const struct copy_layout l = { 1, 1, 2, linear->pitch, size.height };
+      if (src->linear)
+         wvk_replay_read(replay, linear->mem, buf.layout.offset, linear_bytes(linear, r->extent));
+      convert_packed16(dev, replay, tiled, src->linear, linear->mem->buffer, buf.layout.offset, &l, &tex, size);
+      if (!src->linear)
+         wvk_replay_write(replay, linear->mem, buf.layout.offset, linear_bytes(linear, r->extent));
+      return;
+   }
    if (src->linear) {
       wvk_replay_read(replay, linear->mem, buf.layout.offset, linear_bytes(linear, r->extent));
       wgpuCommandEncoderCopyBufferToTexture(replay->encoder, &buf, &tex, &size);
@@ -771,9 +917,11 @@ wvk_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyIm
    wvk_replay_end_passes(replay);
    /* WebGPU copies between textures of one format, give or take sRGB;
     * Vulkan between any of one size, which goes through a buffer. */
-   const bool same = src->format == dst->format ||
-                     util_format_linear(vk_format_to_pipe_format(src->vk.format)) ==
-                        util_format_linear(vk_format_to_pipe_format(dst->vk.format));
+   const bool same = (src->format == dst->format ||
+                      util_format_linear(vk_format_to_pipe_format(src->vk.format)) ==
+                         util_format_linear(vk_format_to_pipe_format(dst->vk.format))) &&
+                     /* Packed formats' textures are RGBA8 whatever their bits. */
+                     ((!is_packed16(src) && !is_packed16(dst)) || src->vk.format == dst->vk.format);
    for (uint32_t i = 0; i < pCopyImageInfo->regionCount; ++i) {
       const VkImageCopy2 *r = &pCopyImageInfo->pRegions[i];
       if (src->linear || dst->linear) {
@@ -817,12 +965,13 @@ wvk_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyIm
       l.row_bytes = align(l.row_bytes, 256);
       const uint64_t bytes = (uint64_t)size.depthOrArrayLayers * l.rows_per_image * l.row_bytes;
       WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay, bytes,
-                                               WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst, NULL);
-      copy_buffer_texture(replay, false, temp, 0, &l, &s, size);
+                                               WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst |
+                                               WGPUBufferUsage_Storage, NULL);
+      copy_color(dev, replay, src, false, temp, 0, &l, &s, size);
       struct copy_layout dl = l;
       dl.block_w = util_format_get_blockwidth(df);
       dl.block_h = util_format_get_blockheight(df);
-      copy_buffer_texture(replay, true, temp, 0, &dl, &d, dsize);
+      copy_color(dev, replay, dst, true, temp, 0, &dl, &d, dsize);
    }
 }
 

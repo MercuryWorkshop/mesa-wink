@@ -47,6 +47,10 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   texture, and a shader that does atomics on it uses it for everything.
   Between barriers one or the other is the image: the texture is copied to
   the buffer before such a shader runs, and back at the next barrier.
+- **16-bit packed formats** (565, 4444, 5551, 1555), which WebGPU does not
+  have, are RGBA8 textures. Copies to and from buffers are a shader's,
+  which packs and unpacks the texels; a format without alpha keeps its
+  texture's at one. Blending is at 8 bits, not the format's.
 - **Arrays of descriptors** are bindings of their own. A dynamic or
   non-uniform index chooses among them in the shader: reads from each,
   selected; writes only where the index is.

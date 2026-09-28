@@ -26,6 +26,9 @@ enum wvk_format_cap {
    WVK_CAP_COPY_DST     = 1u << 11, /* buffer or texture to texture */
    WVK_CAP_COMPRESSED   = 1u << 12,
    WVK_CAP_INT          = 1u << 13, /* uint or sint sample type */
+   /* A 16-bit packed format WebGPU does not have: an RGBA8 texture, whose
+    * copies to and from buffers convert (wvk_cmd_copy.c). */
+   WVK_CAP_PACKED16     = 1u << 14,
 };
 
 struct wvk_format {
