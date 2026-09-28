@@ -596,7 +596,7 @@ surface_create_here(const wink_surface_attribs *a, int *status)
    s->offscreen = a->offscreen;
    s->manage_canvas_size = a->manage_canvas_size;
    s->opaque = a->alpha_bits == 0;
-   s->swap_interval = 1;
+   s->swap_interval = wink.remote ? 1 : WINK_SWAP_UNPACED;
    util_queue_fence_init(&s->swap_fence[0]);
    util_queue_fence_init(&s->swap_fence[1]);
 
@@ -783,10 +783,16 @@ wink_swap_interval(wink_surface *s, int interval)
 {
    if (!s)
       return WINK_ERROR_BAD_SURFACE;
-   if (interval < 0)
+   if (interval < WINK_SWAP_UNPACED)
       return WINK_ERROR_BAD_ATTRIBUTE;
    s->swap_interval = interval;
    return WINK_OK;
+}
+
+void
+wink_yield_frames(int frames)
+{
+   wink_js_yield_frame(frames > 0 ? frames : 0);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1143,7 +1149,7 @@ swap_glthread(struct gl_context *ctx, void *p)
    (void)ctx;
    wink_surface *s = p;
    swap_here(s);
-   wink_js_yield_frame(s->swap_interval);
+   wink_js_yield_frame(s->swap_interval > 0 ? s->swap_interval : 0);
 }
 #endif
 
@@ -1170,5 +1176,9 @@ wink_swap_buffers(wink_surface *s)
    }
 #endif
    wink_rpc(swap_rpc, s);
+   /* Remote without a current context: nothing to pace, and this thread
+    * need not be one that can suspend. */
+   if (!wink.remote && s->swap_interval != WINK_SWAP_UNPACED)
+      wink_js_yield_frame(s->swap_interval);
    return WINK_OK;
 }

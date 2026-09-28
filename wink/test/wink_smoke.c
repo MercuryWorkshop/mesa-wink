@@ -300,8 +300,11 @@ exercise(const char *label, int api, wink_surface *surface)
    read_center(px, W, H);
    CHECK(near(px, 255, 128, 0), "%s: draw read %u,%u,%u,%u", label, px[0], px[1], px[2], px[3]);
 
+   /* One paced swap each way: a turn of the event loop, then a frame. */
+   wink_swap_interval(surface, 0);
    status = wink_swap_buffers(surface);
    CHECK(status == WINK_OK, "%s: swap: %s", label, wink_status_string(status));
+   wink_swap_interval(surface, 1);
 
    /* Resize: the default framebuffer is rebuilt at the new size. */
    wink_surface_resize(surface, W / 2, H / 2);
@@ -313,6 +316,7 @@ exercise(const char *label, int api, wink_surface *surface)
    CHECK(near(px, 0, 255, 0), "%s: resized read %u,%u,%u,%u", label, px[0], px[1], px[2], px[3]);
    p_glGetIntegerv(GL_VIEWPORT, vp);
    wink_swap_buffers(surface);
+   wink_swap_interval(surface, (init_flags & WINK_INIT_GL_ON_MAIN_THREAD) ? 1 : WINK_SWAP_UNPACED);
    wink_surface_resize(surface, W, H);
 
    GLenum err = p_glGetError();
@@ -377,6 +381,14 @@ run_pass(const char *label)
    CHECK(surface, "surface: %s", wink_status_string(status));
    if (!surface)
       return 1;
+
+   /* Pacing: unpaced by default in the ordinary mode; a paced swap and a
+    * bare yield both suspend on this thread and come back. */
+   if (!(init_flags & WINK_INIT_GL_ON_MAIN_THREAD)) {
+      wink_yield_frames(0);
+      wink_yield_frames(1);
+   }
+   CHECK(wink_swap_interval(surface, -2) == WINK_ERROR_BAD_ATTRIBUTE, "swap interval -2 accepted");
 
    exercise("es", WINK_API_OPENGL_ES, surface);
    exercise("core", WINK_API_OPENGL_CORE, surface);

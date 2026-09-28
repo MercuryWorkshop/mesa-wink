@@ -160,15 +160,30 @@ WINK_EXPORT wink_surface *wink_get_current_surface(void);
 WINK_EXPORT void *wink_get_proc_address(const char *name);
 
 /* Flush the current context and copy the surface's back buffer onto its
- * canvas. Here it never suspends and pacing is the caller's
- * (requestAnimationFrame). With WINK_INIT_GL_ON_MAIN_THREAD the swap is queued
- * behind the frame and paced on the main thread by wink_swap_interval, and
- * this waits for the frame before it: at most two in flight. */
+ * canvas, which shows it once the owning thread next yields to its event
+ * loop. Then wait as wink_swap_interval says: by default not at all, so
+ * this never suspends and pacing is the caller's (requestAnimationFrame).
+ * With WINK_INIT_GL_ON_MAIN_THREAD the swap is queued behind the frame and
+ * paced on the main thread instead, and this waits for the frame before it:
+ * at most two in flight. */
 WINK_EXPORT int wink_swap_buffers(wink_surface *surface);
 
-/* Animation frames each swap waits for on the main thread (0: none, just a
- * turn of the event loop). Only WINK_INIT_GL_ON_MAIN_THREAD paces; default 1. */
+/* How each swap of this surface waits: for `interval` animation frames, or
+ * with 0 for one turn of the event loop -- enough for the frame to be shown,
+ * and what a loop that never returns to the browser needs. On the owning
+ * thread that suspends through JSPI, like a readback. WINK_SWAP_UNPACED
+ * never waits; it is the default, except with WINK_INIT_GL_ON_MAIN_THREAD,
+ * where the main thread paces with a default of 1 and UNPACED means 0. */
+#define WINK_SWAP_UNPACED (-1)
 WINK_EXPORT int wink_swap_interval(wink_surface *surface, int interval);
+
+/* Let `frames` animation frames pass on the calling thread, or with 0 one
+ * turn of its event loop, suspending through JSPI: the export that led here
+ * must have been entered through WebAssembly.promising. requestAnimationFrame
+ * never fires in a hidden tab, so no wait lasts longer than a second. Needs
+ * no wink_init; it is for callers that pace or yield themselves, such as a
+ * windowing layer whose WebGL fallback shares the loop. */
+WINK_EXPORT void wink_yield_frames(int frames);
 
 /* Non-zero once the WebGPU device is lost; every later call fails. */
 WINK_EXPORT int wink_device_lost(void);

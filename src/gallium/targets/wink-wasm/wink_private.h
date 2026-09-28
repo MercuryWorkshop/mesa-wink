@@ -20,9 +20,9 @@ void *wink_js_create_surface(const char *selector); /* WGPUSurface, or NULL */
 int wink_js_get_env(char *buf, int len);
 /* Have the main thread run `queue` (util_queue_run_external), from any thread. */
 void wink_js_kick(struct util_queue *queue);
-/* On the main thread's runner: let `frames` animation frames pass, or with 0
- * just give the event loop a turn -- which is when a canvas is presented.
- * Suspends. */
+/* Let `frames` animation frames pass, or with 0 just give the event loop a
+ * turn -- which is when a canvas is presented. Suspends: on the main thread's
+ * runner, or on a thread entered through WebAssembly.promising. */
 void wink_js_yield_frame(int frames);
 
 /* wink.c, called by library_wink.js: the main thread's runner, and the

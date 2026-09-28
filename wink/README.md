@@ -170,7 +170,15 @@ wink_swap_buffers(surface);                        /* never suspends */
   fna-wasm-build's runtime fork does (`WasmEnableJSPI`). Without JSPI,
   `wink_init` returns `WINK_ERROR_NO_JSPI` rather than hanging later.
 * **Frames.** A frame reaches the canvas when the owning thread returns to its
-  event loop. Pacing (requestAnimationFrame) is the caller's job.
+  event loop. By default pacing is the caller's job (requestAnimationFrame),
+  and `wink_swap_buffers` never suspends.
+  * A loop that never returns to the browser should call
+    `wink_swap_interval(surface, n)`. Each swap then suspends for `n`
+    animation frames, or for one turn of the event loop when `n` is 0.
+  * `wink_yield_frames(n)` is the same wait without a swap, for a windowing
+    layer's other paths.
+  * Neither waits more than a second, because a hidden tab never runs
+    requestAnimationFrame.
 
 #### The canvas on a worker
 

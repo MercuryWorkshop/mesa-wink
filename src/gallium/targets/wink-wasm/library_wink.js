@@ -308,8 +308,10 @@ var LibraryWink = {
   },
 
   // A presented frame needs the event loop; pacing is waiting for more of it.
-  // The setTimeout fallback is for hidden tabs, where requestAnimationFrame
-  // never fires and a job waiting on it would park the runner for good.
+  // One turn prefers scheduler.yield, which a worker's nested setTimeouts
+  // would otherwise clamp to 4 ms each. The one-second fallback is for hidden
+  // tabs, where requestAnimationFrame never fires and a stack waiting on it
+  // would be parked for good.
   wink_js_yield_frame__deps: ['$WINK'],
   wink_js_yield_frame: function (frames) {
     return WINK.suspend(new Promise(function (resolve) {
@@ -318,6 +320,7 @@ var LibraryWink = {
       var done = function () { if (!settled) { settled = true; resolve(); } };
       var tick = function () { if (--left <= 0) done(); else requestAnimationFrame(tick); };
       if (left > 0 && typeof requestAnimationFrame == 'function') requestAnimationFrame(tick);
+      else if (typeof scheduler != 'undefined' && scheduler['yield']) scheduler['yield']().then(done, done);
       else setTimeout(done, 0);
       setTimeout(done, 1000);
     }));
