@@ -114,6 +114,12 @@ wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_lower_system_values);
+   /* Input attachments are textures, fetched at the fragment: the
+    * runtime's subpasses are passes of their own. */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      const nir_input_attachment_options ia = { 0 };
+      NIR_PASS(_, nir, nir_lower_input_attachments, &ia);
+   }
    optimize(nir);
 }
 
@@ -211,6 +217,14 @@ split_resource_vars(nir_shader *nir, struct lower_state *state)
                                     glsl_sampler_type_is_shadow(bare) ? glsl_bare_shadow_sampler_type()
                                                                       : glsl_bare_sampler_type(),
                                     var, bl->slot + bl->count + e, "_smp", e);
+         } else if (glsl_type_is_image(bare) && (glsl_get_sampler_dim(bare) == GLSL_SAMPLER_DIM_SUBPASS ||
+                                                 glsl_get_sampler_dim(bare) == GLSL_SAMPLER_DIM_SUBPASS_MS)) {
+            /* An input attachment: fetched, as a texture. */
+            const bool ms = glsl_get_sampler_dim(bare) == GLSL_SAMPLER_DIM_SUBPASS_MS;
+            const struct glsl_type *texture =
+               glsl_texture_type(ms ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D, false,
+                                 glsl_get_sampler_result_type(bare));
+            s->texture[e] = new_var(nir, nir_var_uniform, texture, var, bl->slot + e, "_ia", e);
          } else {
             s->texture[e] = new_var(nir, var->data.mode, bare, var, bl->slot + e, "_", e);
          }

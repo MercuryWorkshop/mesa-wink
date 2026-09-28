@@ -208,9 +208,9 @@ get_device_properties(const struct wvk_physical_device *pdev,
    default: type = VK_PHYSICAL_DEVICE_TYPE_OTHER; break;
    }
 
-   /* The driver keeps one uniform buffer and one storage buffer per stage
-    * for itself: push constants and draw parameters. */
-   const uint32_t ubos = l->maxUniformBuffersPerShaderStage - 1;
+   /* The driver keeps one storage buffer per stage for itself: the push
+    * constants. */
+   const uint32_t ubos = l->maxUniformBuffersPerShaderStage;
    const uint32_t ssbos = l->maxStorageBuffersPerShaderStage - 1;
 
    *p = (struct vk_properties){
@@ -255,7 +255,9 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxDescriptorSetStorageImages = 6 * l->maxStorageTexturesPerShaderStage,
       .maxDescriptorSetInputAttachments = MIN2(l->maxSampledTexturesPerShaderStage, 8),
       .maxVertexInputAttributes = l->maxVertexAttributes,
-      .maxVertexInputBindings = l->maxVertexBuffers,
+      /* Binding numbers up to Vulkan's minimum, onto WebGPU's slots: a
+       * pipeline can use as many bindings as WebGPU has buffers. */
+      .maxVertexInputBindings = MAX2(l->maxVertexBuffers, 16),
       .maxVertexInputAttributeOffset = l->maxVertexBufferArrayStride - 1,
       .maxVertexInputBindingStride = l->maxVertexBufferArrayStride,
       .maxVertexOutputComponents = l->maxInterStageShaderVariables * 4,
@@ -278,7 +280,8 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxDrawIndexedIndexValue = UINT32_MAX,
       .maxDrawIndirectCount = UINT32_MAX,
       /* WebGPU samplers have no LOD bias. */
-      .maxSamplerLodBias = 0.0f,
+      /* Vulkan's minimum. WebGPU samplers have no bias: it is ignored. */
+      .maxSamplerLodBias = 2.0f,
       .maxSamplerAnisotropy = 16.0f,
       .maxViewports = 1,
       .maxViewportDimensions = { max_2d, max_2d },
@@ -308,7 +311,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .sampledImageColorSampleCounts = WVK_SAMPLE_COUNTS,
       .sampledImageIntegerSampleCounts = WVK_SAMPLE_COUNTS,
       .sampledImageDepthSampleCounts = WVK_SAMPLE_COUNTS,
-      .sampledImageStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT,
+      .sampledImageStencilSampleCounts = WVK_SAMPLE_COUNTS,
       .storageImageSampleCounts = VK_SAMPLE_COUNT_1_BIT,
       .maxSampleMaskWords = 1,
       /* Timestamps exist only at pass boundaries in WebGPU. */
@@ -419,10 +422,12 @@ init_memory(struct wvk_physical_device *pdev)
    };
    pdev->memory_types[WVK_MEMORY_UPLOAD] = (VkMemoryType){
       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+      .heapIndex = 1,
    };
    pdev->memory_types[WVK_MEMORY_READBACK] = (VkMemoryType){
       .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+      .heapIndex = 1,
    };
    pdev->memory_types[WVK_MEMORY_DEVICE_UPLOAD] = (VkMemoryType){
       .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -533,10 +538,15 @@ wvk_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
    VK_FROM_HANDLE(wvk_physical_device, pdev, physicalDevice);
    VkPhysicalDeviceMemoryProperties *props = &pMemoryProperties->memoryProperties;
 
-   props->memoryHeapCount = 1;
+   /* Device-local types in a device-local heap, as Vulkan insists; the
+    * host-visible ones that are not, in a heap of their own. */
+   props->memoryHeapCount = 2;
    props->memoryHeaps[0] = (VkMemoryHeap){
       .size = pdev->heap_size,
       .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
+   };
+   props->memoryHeaps[1] = (VkMemoryHeap){
+      .size = pdev->heap_size / 2,
    };
    props->memoryTypeCount = WVK_MEMORY_TYPE_COUNT;
    for (uint32_t i = 0; i < WVK_MEMORY_TYPE_COUNT; ++i)

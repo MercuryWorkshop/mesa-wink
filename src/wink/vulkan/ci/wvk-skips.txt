@@ -1,0 +1,2 @@
+# Tests not run on the wink Vulkan driver: they hang, or take far longer
+# than they tell anything.

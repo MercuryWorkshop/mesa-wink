@@ -75,6 +75,8 @@ wvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
    if (info->anisotropyEnable && desc.magFilter == WGPUFilterMode_Linear &&
        desc.minFilter == WGPUFilterMode_Linear && desc.mipmapFilter == WGPUMipmapFilterMode_Linear)
       desc.maxAnisotropy = (uint16_t)CLAMP(info->maxAnisotropy, 1.0f, 16.0f);
+   if (info->mipLodBias != 0.0f)
+      mesa_logw_once("wvk: a sampler's LOD bias is ignored: WebGPU samplers have none");
    sampler->wgpu = wgpuDeviceCreateSampler(dev->wgpu, &desc);
    if (!sampler->wgpu) {
       vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);

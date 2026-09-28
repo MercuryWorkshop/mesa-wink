@@ -99,6 +99,8 @@ wvk_replay_end_passes(struct wvk_replay *replay)
       wgpuRenderPassEncoderEnd(replay->pass);
       wgpuRenderPassEncoderRelease(replay->pass);
       replay->pass = NULL;
+      if (replay->query_set)
+         wvk_replay_resolve_queries(replay);
    }
    if (replay->compute) {
       wgpuComputePassEncoderEnd(replay->compute);
@@ -206,6 +208,8 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_init(&replay.push_buffers, NULL);
    util_dynarray_init(&replay.push_sets, NULL);
    util_dynarray_init(&replay.meta_memory, NULL);
+   util_dynarray_init(&replay.pass_queries, NULL);
+   replay.serial = serial;
 
    WGPUCommandEncoderDescriptor edesc = WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
    replay.encoder = wgpuDeviceCreateCommandEncoder(dev->wgpu, &edesc);
@@ -220,6 +224,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
       vk_command_buffer_reset(&rcmd->vk);
       vk_command_buffer_begin(&rcmd->vk, &begin);
       wvk_replay_reset_state(&replay);
+      replay.uses_queries = wvk_cmd_queue_has_occlusion_queries(&cmds[i]->cmd_queue);
       vk_cmd_queue_execute(&cmds[i]->cmd_queue, wvk_cmd_buffer_to_handle(rcmd), &dev->vk.dispatch_table);
    }
    wvk_replay_end_passes(&replay);
@@ -278,6 +283,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_fini(&replay.views);
    wvk_replay_finish_state(dev, &replay);
    wvk_replay_free_meta_memory(dev, &replay);
+   wvk_replay_finish_queries(&replay);
    return VK_SUCCESS;
 }
 
@@ -286,16 +292,6 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
 
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDependencyInfo *pDependencyInfo)
-{
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wvk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent event, const VkDependencyInfo *pDependencyInfo)
-{
-}
-
-VKAPI_ATTR void VKAPI_CALL
-wvk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags2 stageMask)
 {
 }
 

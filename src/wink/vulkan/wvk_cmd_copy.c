@@ -6,7 +6,8 @@
  *
  * WebGPU's buffer-texture copies want rows of a multiple of 256 bytes;
  * Vulkan takes any. An aligned copy is one WebGPU copy, and any other
- * goes a row at a time, for which WebGPU needs no row pitch at all.
+ * goes a row at a time, for which WebGPU needs no row pitch at all --
+ * except for depth and stencil, which are below.
  */
 #include "wvk_cmd_buffer.h"
 
@@ -209,6 +210,276 @@ region_bytes(const struct copy_layout *l, WGPUExtent3D size)
           (uint64_t)(block_rows - 1) * l->row_bytes + last_row;
 }
 
+/* ---------------------------------------------------------------------- */
+/* Depth and stencil
+ *
+ * WebGPU copies only whole subresources of these, stencil both ways and
+ * depth16 both ways, depth32float only out, and depth24plus not at all.
+ * What it does copy goes through a buffer of the whole subresource, which
+ * a byte-wise shader repacks into or out of the application's layout; the
+ * depth aspect is read out by a shader, whatever its format. */
+
+static const char repack_wgsl[] =
+   "struct P { src_byte: u32, src_pitch: u32, src_image: u32, dst_byte: u32,\n"
+   "           dst_pitch: u32, dst_image: u32, row_bytes: u32, rows: u32 }\n"
+   "@group(0) @binding(0) var<storage, read> src: array<u32>;\n"
+   "@group(0) @binding(1) var<storage, read_write> dst: array<atomic<u32>>;\n"
+   "@group(0) @binding(2) var<uniform> p: P;\n"
+   "@compute @workgroup_size(64)\n"
+   "fn main(@builtin(global_invocation_id) id: vec3u) {\n"
+   "  if (id.x >= p.row_bytes || id.y >= p.rows) { return; }\n"
+   "  let s = p.src_byte + id.z * p.src_image + id.y * p.src_pitch + id.x;\n"
+   "  let d = p.dst_byte + id.z * p.dst_image + id.y * p.dst_pitch + id.x;\n"
+   "  let v = (src[s / 4u] >> ((s % 4u) * 8u)) & 0xffu;\n"
+   "  let shift = (d % 4u) * 8u;\n"
+   "  atomicAnd(&dst[d / 4u], ~(0xffu << shift));\n"
+   "  atomicOr(&dst[d / 4u], v << shift);\n"
+   "}\n";
+
+static const char depth_out_wgsl[] =
+   "struct P { ox: u32, oy: u32, layer: u32, level: u32, width: u32, height: u32,\n"
+   "           dst_byte: u32, dst_pitch: u32, dst_image: u32, kind: u32 }\n"
+   "@group(0) @binding(0) var src: texture_depth_2d_array;\n"
+   "@group(0) @binding(1) var<storage, read_write> dst: array<atomic<u32>>;\n"
+   "@group(0) @binding(2) var<uniform> p: P;\n"
+   "@compute @workgroup_size(8, 8, 1)\n"
+   "fn main(@builtin(global_invocation_id) id: vec3u) {\n"
+   "  if (id.x >= p.width || id.y >= p.height) { return; }\n"
+   "  let d = textureLoad(src, vec2i(i32(p.ox + id.x), i32(p.oy + id.y)), i32(p.layer + id.z), i32(p.level));\n"
+   "  let at = p.dst_byte + id.z * p.dst_image + id.y * p.dst_pitch;\n"
+   "  if (p.kind == 2u) {\n"
+   "    let v = u32(round(clamp(d, 0.0, 1.0) * 65535.0));\n"
+   "    let b = at + id.x * 2u;\n"
+   "    let shift = (b % 4u) * 8u;\n"
+   "    atomicAnd(&dst[b / 4u], ~(0xffffu << shift));\n"
+   "    atomicOr(&dst[b / 4u], v << shift);\n"
+   "  } else {\n"
+   "    let v = select(bitcast<u32>(d), u32(round(clamp(d, 0.0, 1.0) * 16777215.0)), p.kind == 1u);\n"
+   "    atomicStore(&dst[(at + id.x * 4u) / 4u], v);\n"
+   "  }\n"
+   "}\n";
+
+static WGPUComputePipeline
+copy_pipeline(struct wvk_device *dev, WGPUComputePipeline *slot, const char *wgsl, const char *label)
+{
+   simple_mtx_lock(&dev->cache_lock);
+   if (!*slot) {
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(wgsl);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      sm.label = wvk_sv(label);
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+      desc.label = wvk_sv(label);
+      desc.compute.module = module;
+      desc.compute.entryPoint = wvk_sv("main");
+      *slot = wgpuDeviceCreateComputePipeline(dev->wgpu, &desc);
+      wgpuShaderModuleRelease(module);
+   }
+   simple_mtx_unlock(&dev->cache_lock);
+   return *slot;
+}
+
+/* One compute dispatch, with its bind group and parameters, between
+ * passes. */
+static void
+dispatch(struct wvk_device *dev, struct wvk_replay *replay, WGPUComputePipeline pipeline,
+         const WGPUBindGroupEntry *entries, uint32_t entry_count, const void *params, size_t params_size,
+         uint32_t x, uint32_t y, uint32_t z)
+{
+   WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, params_size, WGPUBufferUsage_Uniform, params);
+   if (!params_buffer)
+      return;
+   WGPUBindGroupEntry all[4];
+   memcpy(all, entries, entry_count * sizeof(*entries));
+   all[entry_count] = (WGPUBindGroupEntry){
+      .binding = entry_count, .buffer = params_buffer, .offset = 0, .size = align64(params_size, 16),
+   };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
+   bg.entryCount = entry_count + 1;
+   bg.entries = all;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bg.layout);
+
+   wvk_replay_end_passes(replay);
+   WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
+   wgpuComputePassEncoderSetPipeline(pass, pipeline);
+   wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuComputePassEncoderDispatchWorkgroups(pass, x, y, z);
+   wgpuComputePassEncoderEnd(pass);
+   wgpuComputePassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+}
+
+/* A storage binding of [offset, offset + size) of a buffer: from the 256
+ * bytes below, which is where bindings can start, and where in it that is. */
+static WGPUBindGroupEntry
+storage_range(uint32_t binding, WGPUBuffer buffer, uint64_t offset, uint64_t size, uint32_t *byte_out)
+{
+   const uint64_t base = offset & ~255ull;
+   *byte_out = (uint32_t)(offset - base);
+   return (WGPUBindGroupEntry){
+      .binding = binding, .buffer = buffer, .offset = base, .size = align64(offset + size - base, 4),
+   };
+}
+
+/* rows of row_bytes from one buffer layout to another, byte for byte. */
+static void
+repack(struct wvk_device *dev, struct wvk_replay *replay, WGPUBuffer src, uint64_t src_offset,
+       uint32_t src_pitch, uint32_t src_image, WGPUBuffer dst, uint64_t dst_offset, uint32_t dst_pitch,
+       uint32_t dst_image, uint32_t row_bytes, uint32_t rows, uint32_t images)
+{
+   WGPUComputePipeline pipeline = copy_pipeline(dev, &dev->repack_pipeline, repack_wgsl, "wvk repack");
+   if (!pipeline || !row_bytes || !rows || !images)
+      return;
+   const uint64_t src_size = (uint64_t)(images - 1) * src_image + (uint64_t)(rows - 1) * src_pitch + row_bytes;
+   const uint64_t dst_size = (uint64_t)(images - 1) * dst_image + (uint64_t)(rows - 1) * dst_pitch + row_bytes;
+   uint32_t src_byte, dst_byte;
+   const WGPUBindGroupEntry entries[] = {
+      storage_range(0, src, src_offset, src_size, &src_byte),
+      storage_range(1, dst, dst_offset, dst_size, &dst_byte),
+   };
+   const uint32_t params[8] = { src_byte, src_pitch, src_image, dst_byte, dst_pitch, dst_image, row_bytes, rows };
+   dispatch(dev, replay, pipeline, entries, 2, params, sizeof(params), DIV_ROUND_UP(row_bytes, 64), rows, images);
+}
+
+static bool
+is_ds_aspect(VkImageAspectFlags aspect)
+{
+   return aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+}
+
+/* The whole of the subresources a region is in: what WebGPU copies. */
+static void
+whole_subresource(const struct wvk_image *image, const WGPUTexelCopyTextureInfo *tex, WGPUExtent3D size,
+                  WGPUTexelCopyTextureInfo *whole, WGPUExtent3D *whole_size)
+{
+   *whole = *tex;
+   whole->origin.x = 0;
+   whole->origin.y = 0;
+   *whole_size = (WGPUExtent3D){
+      u_minify(image->vk.extent.width, tex->mipLevel),
+      image->vk.image_type == VK_IMAGE_TYPE_1D ? 1 : u_minify(image->vk.extent.height, tex->mipLevel),
+      size.depthOrArrayLayers,
+   };
+}
+
+/* The stencil aspect, or depth16's, into a buffer of the whole
+ * subresource, 256-byte rows: the temporary, and its pitch. */
+static WGPUBuffer
+stage_out(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image,
+          const WGPUTexelCopyTextureInfo *tex, WGPUExtent3D size, uint32_t bytes, uint32_t *pitch)
+{
+   WGPUTexelCopyTextureInfo whole;
+   WGPUExtent3D whole_size;
+   whole_subresource(image, tex, size, &whole, &whole_size);
+   *pitch = align(whole_size.width * bytes, 256);
+   WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay,
+                                            (uint64_t)*pitch * whole_size.height * whole_size.depthOrArrayLayers,
+                                            WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst |
+                                            WGPUBufferUsage_Storage, NULL);
+   if (!temp)
+      return NULL;
+   WGPUTexelCopyBufferInfo buf = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+   buf.buffer = temp;
+   buf.layout.bytesPerRow = *pitch;
+   buf.layout.rowsPerImage = whole_size.height;
+   wvk_replay_end_passes(replay);
+   wgpuCommandEncoderCopyTextureToBuffer(replay->encoder, &whole, &buf, &whole_size);
+   return temp;
+}
+
+static void
+depth_out(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+          const WGPUTexelCopyTextureInfo *tex, WGPUExtent3D size, WGPUBuffer dst, uint64_t dst_offset,
+          const struct copy_layout *l)
+{
+   WGPUComputePipeline pipeline = copy_pipeline(dev, &dev->depth_out_pipeline, depth_out_wgsl, "wvk depth out");
+   if (!pipeline)
+      return;
+   WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   vd.dimension = WGPUTextureViewDimension_2DArray;
+   vd.aspect = WGPUTextureAspect_DepthOnly;
+   vd.baseMipLevel = tex->mipLevel;
+   vd.mipLevelCount = 1;
+   vd.baseArrayLayer = tex->origin.z;
+   vd.arrayLayerCount = size.depthOrArrayLayers;
+   WGPUTextureView view = wgpuTextureCreateView(image->texture, &vd);
+   util_dynarray_append(&replay->views, view);
+
+   const enum pipe_format depth = vk_format_to_pipe_format(vk_format_depth_only(image->vk.format));
+   const uint32_t kind = depth == PIPE_FORMAT_Z16_UNORM ? 2 : depth == PIPE_FORMAT_Z32_FLOAT ? 0 : 1;
+   const uint64_t bytes = (uint64_t)(size.depthOrArrayLayers - 1) * l->rows_per_image * l->row_bytes +
+                          (uint64_t)(size.height - 1) * l->row_bytes + size.width * l->block_bytes;
+   uint32_t dst_byte;
+   const WGPUBindGroupEntry entries[] = {
+      { .binding = 0, .textureView = view },
+      storage_range(1, dst, dst_offset, bytes, &dst_byte),
+   };
+   const uint32_t params[12] = {
+      tex->origin.x, tex->origin.y, 0, 0, size.width, size.height,
+      dst_byte, l->row_bytes, l->rows_per_image * l->row_bytes, kind,
+   };
+   dispatch(dev, replay, pipeline, entries, 2, params, sizeof(params), DIV_ROUND_UP(size.width, 8),
+            DIV_ROUND_UP(size.height, 8), size.depthOrArrayLayers);
+}
+
+/* A depth or stencil aspect to a buffer. */
+static void
+copy_ds_to_buffer(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+                  VkImageAspectFlags aspect, const WGPUTexelCopyTextureInfo *tex, WGPUExtent3D size,
+                  WGPUBuffer dst, uint64_t dst_offset, const struct copy_layout *l)
+{
+   if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) {
+      depth_out(dev, replay, image, tex, size, dst, dst_offset, l);
+      return;
+   }
+   uint32_t pitch;
+   WGPUBuffer temp = stage_out(dev, replay, image, tex, size, 1, &pitch);
+   if (!temp)
+      return;
+   const uint32_t height = image->vk.image_type == VK_IMAGE_TYPE_1D ? 1
+                           : u_minify(image->vk.extent.height, tex->mipLevel);
+   repack(dev, replay, temp, (uint64_t)tex->origin.y * pitch + tex->origin.x, pitch, pitch * height, dst,
+          dst_offset, l->row_bytes, l->rows_per_image * l->row_bytes, size.width, size.height,
+          size.depthOrArrayLayers);
+}
+
+/* A buffer to a depth or stencil aspect: the whole subresource out, the
+ * region patched in, and the whole back. */
+static void
+copy_buffer_to_ds(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+                  VkImageAspectFlags aspect, const WGPUTexelCopyTextureInfo *tex, WGPUExtent3D size,
+                  WGPUBuffer src, uint64_t src_offset, const struct copy_layout *l)
+{
+   const enum pipe_format depth = vk_format_to_pipe_format(vk_format_depth_only(image->vk.format));
+   if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT && depth != PIPE_FORMAT_Z16_UNORM) {
+      /* TODO: a pass writing frag_depth. */
+      mesa_logw_once("wvk: copies into a %s depth aspect are not supported yet",
+                     util_format_short_name(depth));
+      return;
+   }
+   const uint32_t bytes = aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? 2 : 1;
+   uint32_t pitch;
+   WGPUBuffer temp = stage_out(dev, replay, image, tex, size, bytes, &pitch);
+   if (!temp)
+      return;
+   WGPUTexelCopyTextureInfo whole;
+   WGPUExtent3D whole_size;
+   whole_subresource(image, tex, size, &whole, &whole_size);
+   repack(dev, replay, src, src_offset, l->row_bytes, l->rows_per_image * l->row_bytes, temp,
+          (uint64_t)tex->origin.y * pitch + (uint64_t)tex->origin.x * bytes, pitch, pitch * whole_size.height,
+          size.width * bytes, size.height, size.depthOrArrayLayers);
+   WGPUTexelCopyBufferInfo buf = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+   buf.buffer = temp;
+   buf.layout.bytesPerRow = pitch;
+   buf.layout.rowsPerImage = whole_size.height;
+   wgpuCommandEncoderCopyBufferToTexture(replay->encoder, &buf, &whole, &whole_size);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToImageInfo2 *pCopyBufferToImageInfo)
 {
@@ -227,7 +498,11 @@ wvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIma
                                                  r->bufferRowLength, r->bufferImageHeight, r->imageExtent);
       const uint64_t off = buffer_offset(src, r->bufferOffset);
       wvk_replay_read(replay, src->mem, off, region_bytes(&l, size));
-      copy_buffer_texture(replay, true, buffer_wgpu(src), off, &l, &tex, size);
+      if (is_ds_aspect(r->imageSubresource.aspectMask))
+         copy_buffer_to_ds(wvk_cmd_buffer_device(cmd), replay, dst, r->imageSubresource.aspectMask, &tex,
+                           size, buffer_wgpu(src), off, &l);
+      else
+         copy_buffer_texture(replay, true, buffer_wgpu(src), off, &l, &tex, size);
    }
 }
 
@@ -249,7 +524,11 @@ wvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBuff
                                                  r->bufferRowLength, r->bufferImageHeight, r->imageExtent);
       const uint64_t off = buffer_offset(dst, r->bufferOffset);
       wvk_replay_write(replay, dst->mem, off, region_bytes(&l, size));
-      copy_buffer_texture(replay, false, buffer_wgpu(dst), off, &l, &tex, size);
+      if (is_ds_aspect(r->imageSubresource.aspectMask))
+         copy_ds_to_buffer(wvk_cmd_buffer_device(cmd), replay, src, r->imageSubresource.aspectMask, &tex,
+                           size, buffer_wgpu(dst), off, &l);
+      else
+         copy_buffer_texture(replay, false, buffer_wgpu(dst), off, &l, &tex, size);
    }
 }
 

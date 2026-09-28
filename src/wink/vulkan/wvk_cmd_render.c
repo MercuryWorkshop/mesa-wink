@@ -157,6 +157,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    desc.colorAttachmentCount = color_count;
    desc.colorAttachments = colors;
    desc.depthStencilAttachment = (depth || stencil) ? &ds : NULL;
+   desc.occlusionQuerySet = wvk_replay_query_set(wvk_cmd_buffer_device(cmd), replay);
    replay->pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &desc);
 }
 

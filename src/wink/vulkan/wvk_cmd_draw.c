@@ -271,6 +271,8 @@ struct wvk_render_key {
    uint8_t attr_bindings[16];
    uint16_t vb_strides[8];
    uint8_t vb_steps[8];
+   /* The Vulkan binding of each WebGPU slot. */
+   uint8_t vb_bindings[8];
    uint8_t attr_count, vb_count;
    uint8_t variant;
    uint8_t topology, strip_index_format, front_face, cull_mode, unclipped_depth;
@@ -411,6 +413,12 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       if (dev->driver_groups[i].group)
          wgpuBindGroupRelease(dev->driver_groups[i].group);
    }
+   if (dev->copy_query_pipeline)
+      wgpuComputePipelineRelease(dev->copy_query_pipeline);
+   if (dev->repack_pipeline)
+      wgpuComputePipelineRelease(dev->repack_pipeline);
+   if (dev->depth_out_pipeline)
+      wgpuComputePipelineRelease(dev->depth_out_pipeline);
    if (dev->null_buffer)
       wgpuBufferRelease(dev->null_buffer);
    if (dev->null_sampler)
@@ -1109,19 +1117,30 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
          break;
       const struct vk_vertex_attribute_state *a = &vi->attributes[loc];
       const struct wvk_format *f = wvk_format_get(a->format);
-      if (!f || !f->vertex || a->binding >= ARRAY_SIZE(k->vb_strides))
+      if (!f || !f->vertex || a->binding >= MESA_VK_MAX_VERTEX_BINDINGS)
          continue;
+      /* Bindings take slots in the order attributes name them. */
+      uint32_t slot = 0;
+      while (slot < k->vb_count && k->vb_bindings[slot] != a->binding)
+         ++slot;
+      if (slot == k->vb_count) {
+         if (slot == ARRAY_SIZE(k->vb_bindings)) {
+            mesa_logw_once("wvk: a pipeline reads more vertex buffers than WebGPU has");
+            continue;
+         }
+         k->vb_bindings[k->vb_count++] = a->binding;
+      }
       const uint32_t i = k->attr_count++;
       k->attr_formats[i] = f->vertex;
       k->attr_offsets[i] = a->offset;
       k->attr_locations[i] = loc;
-      k->attr_bindings[i] = a->binding;
-      k->vb_count = MAX2(k->vb_count, a->binding + 1);
+      k->attr_bindings[i] = slot;
    }
-   for (uint32_t b = 0; b < k->vb_count; ++b) {
-      k->vb_strides[b] = dyn->vi_binding_strides[b];
-      k->vb_steps[b] = vi->bindings[b].input_rate == VK_VERTEX_INPUT_RATE_INSTANCE
-                          ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
+   for (uint32_t slot = 0; slot < k->vb_count; ++slot) {
+      const uint32_t b = k->vb_bindings[slot];
+      k->vb_strides[slot] = dyn->vi_binding_strides[b];
+      k->vb_steps[slot] = vi->bindings[b].input_rate == VK_VERTEX_INPUT_RATE_INSTANCE
+                             ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
    }
 
    k->topology = topology(dyn->ia.primitive_topology);
@@ -1297,13 +1316,13 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    if (!bind_groups(dev, replay, p->layout, WVK_BIND_GRAPHICS, pass, NULL))
       return false;
 
-   for (uint32_t b = 0; b < p->key.vb_count; ++b) {
-      const struct wvk_bound_buffer *vb = &st->vb[b];
+   for (uint32_t slot = 0; slot < p->key.vb_count; ++slot) {
+      const struct wvk_bound_buffer *vb = &st->vb[p->key.vb_bindings[slot]];
       if (!vb->buffer) {
-         wgpuRenderPassEncoderSetVertexBuffer(pass, b, dev->null_buffer, 0, WGPU_WHOLE_SIZE);
+         wgpuRenderPassEncoderSetVertexBuffer(pass, slot, dev->null_buffer, 0, WGPU_WHOLE_SIZE);
          continue;
       }
-      wgpuRenderPassEncoderSetVertexBuffer(pass, b, vb->buffer, vb->offset, vb->size);
+      wgpuRenderPassEncoderSetVertexBuffer(pass, slot, vb->buffer, vb->offset, vb->size);
       wvk_replay_read(replay, vb->mem, vb->offset, vb->size);
    }
    if (indexed) {

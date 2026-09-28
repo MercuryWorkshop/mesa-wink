@@ -70,6 +70,7 @@ wvk_files = files(
   'wvk_image.c',
   'wvk_instance.c',
   'wvk_physical_device.c',
+  'wvk_query.c',
   'wvk_queue.c',
   'wvk_sampler.c',
   'wvk_shader.c',

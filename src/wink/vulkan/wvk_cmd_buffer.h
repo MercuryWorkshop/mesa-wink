@@ -12,6 +12,8 @@
 
 #include "util/u_dynarray.h"
 
+#include "wvk_query.h"
+
 struct wvk_device;
 struct wvk_device_memory;
 struct wvk_image;
@@ -64,6 +66,19 @@ struct wvk_replay {
    struct util_dynarray push_sets;
    /* Memory for vk_meta's vertices, freed after. */
    struct util_dynarray meta_memory;   /* VkDeviceMemory */
+
+   /* The serial this submit finishes at. */
+   uint64_t serial;
+
+   /* Occlusion queries: the submit's query set, which passes of command
+    * buffers that have queries count in, and where the results go. */
+   bool uses_queries;
+   WGPUQuerySet query_set;
+   WGPUBuffer query_resolve;
+   uint32_t query_next;
+   uint32_t pass_query_first;
+   struct util_dynarray pass_queries;   /* struct wvk_pass_query */
+   struct wvk_pass_query active_query;
 };
 
 struct wvk_push_buffer {

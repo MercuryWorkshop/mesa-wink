@@ -275,7 +275,9 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
     * -- are made when used. */
    if (image->texture && (image->usage & WGPUTextureUsage_TextureBinding)) {
       WGPUTextureViewDescriptor desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
-      desc.format = view->format;
+      /* One aspect of a depth-stencil texture is viewed as that aspect's
+       * own format, which WebGPU works out itself. */
+      desc.format = view->aspect == WGPUTextureAspect_All ? view->format : WGPUTextureFormat_Undefined;
       desc.dimension = view_dimension(view->vk.view_type);
       desc.baseMipLevel = view->vk.base_mip_level;
       desc.mipLevelCount = view->vk.level_count;
@@ -306,7 +308,7 @@ wvk_image_attachment_view(struct wvk_image *image, WGPUTextureFormat format, WGP
                           uint32_t level, uint32_t layer)
 {
    WGPUTextureViewDescriptor desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
-   desc.format = format;
+   desc.format = aspect == WGPUTextureAspect_All ? format : WGPUTextureFormat_Undefined;
    desc.dimension = image->dimension == WGPUTextureDimension_3D ? WGPUTextureViewDimension_3D
                                                                  : WGPUTextureViewDimension_2D;
    desc.baseMipLevel = level;

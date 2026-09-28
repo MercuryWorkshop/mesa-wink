@@ -62,6 +62,11 @@ struct wvk_device {
       WGPUBindGroup group;
    } driver_groups[4];
    uint32_t driver_group_next;
+   /* The shaders of copies WebGPU does not do: query results, bytes
+    * between buffer layouts, and depth out of a texture. */
+   WGPUComputePipeline copy_query_pipeline;
+   WGPUComputePipeline repack_pipeline;
+   WGPUComputePipeline depth_out_pipeline;
    /* Bound where a descriptor was never written. */
    WGPUBuffer null_buffer;
    WGPUSampler null_sampler;
