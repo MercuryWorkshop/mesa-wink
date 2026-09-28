@@ -43,7 +43,6 @@
 
 #include <stdlib.h>
 
-#define WVK_SHADER_BLOB_VERSION 1
 
 void
 wvk_init_nir_options(nir_shader_compiler_options *options)
@@ -763,6 +762,71 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
    return true;
 }
 
+/* 1D images are 2D textures one texel high, as 1D images are here: the
+ * variable, the intrinsics' dimension, a y of 0 in coordinates, and sizes
+ * without the height again. */
+static bool
+lower_1d_image_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_image_deref_size:
+   case nir_intrinsic_image_deref_samples:
+   case nir_intrinsic_image_deref_levels:
+      break;
+   default:
+      return false;
+   }
+   if (nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_1D)
+      return false;
+   const bool array = nir_intrinsic_image_array(intr);
+   nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_2D);
+
+   if (intr->intrinsic == nir_intrinsic_image_deref_size) {
+      b->cursor = nir_after_instr(&intr->instr);
+      intr->def.num_components = array ? 3 : 2;
+      intr->num_components = intr->def.num_components;
+      nir_def *size = array ? nir_vec2(b, nir_channel(b, &intr->def, 0), nir_channel(b, &intr->def, 2))
+                            : nir_channel(b, &intr->def, 0);
+      nir_def_rewrite_uses_after(&intr->def, size);
+      return true;
+   }
+   if (intr->intrinsic == nir_intrinsic_image_deref_samples ||
+       intr->intrinsic == nir_intrinsic_image_deref_levels)
+      return true;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *coord = intr->src[1].ssa;
+   nir_def *zero = nir_imm_zero(b, 1, coord->bit_size);
+   nir_def *xy[4] = {
+      nir_channel(b, coord, 0), zero, array ? nir_channel(b, coord, 1) : zero, zero,
+   };
+   nir_src_rewrite(&intr->src[1], nir_vec(b, xy, coord->num_components));
+   return true;
+}
+
+static bool
+lower_1d_images(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_variable_with_modes(var, nir, nir_var_image | nir_var_uniform) {
+      const struct glsl_type *bare = glsl_without_array(var->type);
+      if (!glsl_type_is_image(bare) || glsl_get_sampler_dim(bare) != GLSL_SAMPLER_DIM_1D)
+         continue;
+      var->type = glsl_type_wrap_in_arrays(
+         glsl_image_type(GLSL_SAMPLER_DIM_2D, glsl_sampler_type_is_array(bare),
+                         glsl_get_sampler_result_type(bare)), var->type);
+      progress = true;
+   }
+   if (!progress)
+      return false;
+   nir_fixup_deref_types(nir);
+   return nir_shader_intrinsics_pass(nir, lower_1d_image_instr, nir_metadata_control_flow, NULL);
+}
+
 /* The (set, binding) a buffer deref chain starts from: a variable, or
  * vtn's cast of a loaded descriptor. */
 static bool
@@ -928,6 +992,7 @@ reflect_bindings(nir_shader *nir, const struct vk_shader_compile_info *info,
          }
          if (var->data.mode == nir_var_mem_ubo) {
             sb->kind = WVK_BINDING_UNIFORM;
+            sb->min_size = glsl_get_explicit_size(type, false);
          } else if (_mesa_set_search(u.written, k)) {
             sb->kind = WVK_BINDING_STORAGE;
          } else {
@@ -953,6 +1018,16 @@ reflect_bindings(nir_shader *nir, const struct vk_shader_compile_info *info,
       } else if (glsl_type_is_bare_sampler(type)) {
          sb->kind = glsl_sampler_type_is_shadow(type) || _mesa_set_search(u.compared, k)
                        ? WVK_BINDING_SAMPLER_COMPARE : WVK_BINDING_SAMPLER;
+      } else if (glsl_type_is_image(type) && (var->data.access & ACCESS_NON_WRITEABLE)) {
+         /* Tint makes a read-only storage image a texture it loads from. */
+         sb->kind = WVK_BINDING_TEXTURE;
+         sb->view_dimension = view_dimension(type);
+         sb->multisampled = glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_MS;
+         switch (glsl_get_sampler_result_type(type)) {
+         case GLSL_TYPE_INT: sb->sample_type = WGPUTextureSampleType_Sint; break;
+         case GLSL_TYPE_UINT: sb->sample_type = WGPUTextureSampleType_Uint; break;
+         default: sb->sample_type = WGPUTextureSampleType_UnfilterableFloat; break;
+         }
       } else if (glsl_type_is_image(type)) {
          sb->kind = WVK_BINDING_STORAGE_TEXTURE;
          sb->view_dimension = view_dimension(type);
@@ -1055,6 +1130,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
             &state);
    NIR_PASS(_, nir, nir_shader_instructions_pass, lower_integer_sample_instr, nir_metadata_control_flow,
             NULL);
+   NIR_PASS(_, nir, lower_1d_images);
    lower_buffers_to_words(nir, info, mem_ctx);
    optimize(nir);
    /* The combined and arrayed originals, now without a use. */
@@ -1200,7 +1276,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
                        const VkAllocationCallbacks *pAllocator, struct vk_shader **shader_out)
 {
    struct wvk_device *dev = container_of(vk_dev, struct wvk_device, vk);
-   if (binary_version != WVK_SHADER_BLOB_VERSION)
+   if (binary_version != WVK_SHADER_BINARY_VERSION)
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    /* The stage is not in the blob: the first WGSL says it. */

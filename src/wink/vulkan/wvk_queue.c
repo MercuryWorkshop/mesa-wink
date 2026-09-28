@@ -85,16 +85,24 @@ retire_oldest(struct wvk_queue *queue)
    return true;
 }
 
+/* How long one waiter holds the queue: others waiting with a shorter
+ * timeout get their turn in between. */
+#define WVK_WAIT_SLICE_NS (2ull * 1000 * 1000)
+
 VkResult
 wvk_queue_wait_progress(struct wvk_queue *queue, uint64_t abs_timeout_ns)
 {
+   simple_mtx_lock(&queue->lock);
    if (retire_oldest(queue)) {
       while (retire_oldest(queue))
          ;
+      simple_mtx_unlock(&queue->lock);
       return VK_SUCCESS;
    }
-   if (!queue->pending_count)
+   if (!queue->pending_count) {
+      simple_mtx_unlock(&queue->lock);
       return VK_NOT_READY;
+   }
 
    /* Wait for whatever the oldest submit is still waiting for. */
    struct wvk_pending_submit *p = pending_at(queue, 0);
@@ -110,13 +118,15 @@ wvk_queue_wait_progress(struct wvk_queue *queue, uint64_t abs_timeout_ns)
    const uint64_t now = os_time_get_nano();
    const uint64_t timeout = abs_timeout_ns == OS_TIMEOUT_INFINITE ? UINT64_MAX
                             : abs_timeout_ns > now ? abs_timeout_ns - now : 0;
-   const WGPUWaitStatus status = wgpuInstanceWaitAny(queue_instance(queue)->wgpu, count, waits, timeout);
-   if (status == WGPUWaitStatus_Error)
-      return vk_device_set_lost(&wvk_queue_device(queue)->vk, "waiting for WebGPU failed");
+   const WGPUWaitStatus status = wgpuInstanceWaitAny(queue_instance(queue)->wgpu, count, waits,
+                                                     MIN2(timeout, WVK_WAIT_SLICE_NS));
 
    bool progressed = false;
    while (retire_oldest(queue))
       progressed = true;
+   simple_mtx_unlock(&queue->lock);
+   if (status == WGPUWaitStatus_Error)
+      return vk_device_set_lost(&wvk_queue_device(queue)->vk, "waiting for WebGPU failed");
    if (vk_device_is_lost(&wvk_queue_device(queue)->vk))
       return VK_ERROR_DEVICE_LOST;
    /* A readback mapping is progress too, if not yet a finished submit. */
@@ -127,23 +137,28 @@ bool
 wvk_queue_range_pending(struct wvk_queue *queue, struct wvk_device_memory *mem,
                         uint64_t offset, uint64_t size)
 {
-   for (uint32_t i = 0; i < queue->pending_count; ++i) {
+   simple_mtx_lock(&queue->lock);
+   bool pending = false;
+   for (uint32_t i = 0; i < queue->pending_count && !pending; ++i) {
       const struct wvk_pending_submit *p = pending_at(queue, i);
       for (uint32_t j = 0; j < p->readback_count; ++j) {
          const struct wvk_readback *rb = &p->readbacks[j];
          if (rb->mem == mem && rb->offset < offset + size && offset < rb->offset + rb->size)
-            return true;
+            pending = true;
       }
    }
-   return false;
+   simple_mtx_unlock(&queue->lock);
+   return pending;
 }
 
 VkResult
 wvk_queue_reserve(struct wvk_queue *queue, uint64_t *serial)
 {
+   simple_mtx_lock(&queue->lock);
    while (retire_oldest(queue))
       ;
-   while (queue->pending_count == WVK_MAX_PENDING_SUBMITS) {
+   simple_mtx_unlock(&queue->lock);
+   while (p_atomic_read(&queue->pending_count) == WVK_MAX_PENDING_SUBMITS) {
       VkResult result = wvk_queue_wait_progress(queue, OS_TIMEOUT_INFINITE);
       if (result == VK_ERROR_DEVICE_LOST)
          return result;
@@ -156,6 +171,7 @@ void
 wvk_queue_commit(struct wvk_queue *queue, uint64_t serial,
                  struct wvk_readback *readbacks, uint32_t readback_count)
 {
+   simple_mtx_lock(&queue->lock);
    assert(serial == queue->submitted + 1);
    queue->submitted = serial;
    struct wvk_pending_submit *p = pending_at(queue, queue->pending_count);
@@ -181,6 +197,7 @@ wvk_queue_commit(struct wvk_queue *queue, uint64_t serial,
       readbacks[i].future = wgpuBufferMapAsync(readbacks[i].staging, WGPUMapMode_Read, 0,
                                                readbacks[i].size, map);
    }
+   simple_mtx_unlock(&queue->lock);
 }
 
 static VkResult
@@ -225,6 +242,7 @@ wvk_queue_init(struct wvk_device *dev, struct wvk_queue *queue,
    if (result != VK_SUCCESS)
       return result;
 
+   simple_mtx_init(&queue->lock, mtx_plain);
    queue->wgpu = wgpuDeviceGetQueue(dev->wgpu);
    queue->vk.driver_submit = wvk_queue_submit;
    return VK_SUCCESS;
@@ -239,5 +257,6 @@ wvk_queue_finish(struct wvk_device *dev, struct wvk_queue *queue)
       ;
    if (queue->wgpu)
       wgpuQueueRelease(queue->wgpu);
+   simple_mtx_destroy(&queue->lock);
    vk_queue_finish(&queue->vk);
 }

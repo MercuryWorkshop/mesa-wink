@@ -394,7 +394,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
    memcpy(p->driverUUID, instance->driver_uuid, VK_UUID_SIZE);
    /* Shaders are cached as WGSL, which is this build's. */
    memcpy(p->shaderBinaryUUID, instance->driver_uuid, VK_UUID_SIZE);
-   p->shaderBinaryVersion = 1;
+   p->shaderBinaryVersion = WVK_SHADER_BINARY_VERSION;
    /* The device: the adapter's IDs, and which backend it is reached by. */
    uint32_t uuid[4] = { pdev->info.vendorID, pdev->info.deviceID, (uint32_t)pdev->info.backendType,
                         0x77696e6b /* "wink" */ };

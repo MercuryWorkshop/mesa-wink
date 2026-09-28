@@ -109,9 +109,9 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
     * Vulkan takes any size. The texture is the next size up, and edge
     * copies go to its blocks. TODO: sampling sees the padded size. */
    const enum pipe_format pformat = vk_format_to_pipe_format(pCreateInfo->format);
-   desc.size.width = align(image->vk.extent.width, util_format_get_blockwidth(pformat));
+   desc.size.width = util_align_npot(image->vk.extent.width, util_format_get_blockwidth(pformat));
    desc.size.height = image->vk.image_type == VK_IMAGE_TYPE_1D
-                         ? 1 : align(image->vk.extent.height, util_format_get_blockheight(pformat));
+                         ? 1 : util_align_npot(image->vk.extent.height, util_format_get_blockheight(pformat));
    desc.size.depthOrArrayLayers = image->vk.image_type == VK_IMAGE_TYPE_3D
                                      ? image->vk.extent.depth : image->vk.array_layers;
    desc.format = format->texture;

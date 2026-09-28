@@ -211,6 +211,7 @@ get_layout(struct wvk_device *dev, struct wvk_shader *const *shaders, uint32_t s
             /* One stage writes what another reads: storage for both. */
             if (found->b.kind == WVK_BINDING_STORAGE_READ && b->kind == WVK_BINDING_STORAGE)
                found->b.kind = WVK_BINDING_STORAGE;
+            found->b.min_size = MAX2(found->b.min_size, b->min_size);
             /* Fetched in one, sampled in the other: sampled. */
             if (found->b.kind == WVK_BINDING_TEXTURE &&
                 found->b.sample_type == WGPUTextureSampleType_UnfilterableFloat &&
@@ -945,8 +946,8 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
           * of the buffer as there is: WebGPU wants all of the shader's
           * block bound, where Vulkan wants only what is read. */
          uint64_t size = d->size;
-         if (b->kind == WVK_BINDING_UNIFORM && !b->dynamic && d->mem)
-            size = MAX2(size, d->mem->buffer_size - d->offset);
+         if (b->kind == WVK_BINDING_UNIFORM && d->mem)
+            size = MIN2(MAX2(size, b->min_size), d->mem->buffer_size - d->offset);
          e->size = MIN2(size, max) & ~3ull;
          break;
       }

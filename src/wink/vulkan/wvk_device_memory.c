@@ -42,12 +42,13 @@ wvk_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
    if (is_host_visible(pdev, mem->vk.memory_type_index)) {
       /* Zeroed: an application may map and read before writing, and what
        * is uploaded should not be whatever the heap held. */
-      mem->host = os_malloc_aligned(MAX2(mem->vk.size, 1), 64);
+      const uint64_t host_size = wvk_memory_buffer_size(mem->vk.size);
+      mem->host = os_malloc_aligned(host_size, 64);
       if (!mem->host) {
          vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
          return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
       }
-      memset(mem->host, 0, mem->vk.size);
+      memset(mem->host, 0, host_size);
    }
 
    *pMem = wvk_device_memory_to_handle(mem);
@@ -74,8 +75,7 @@ wvk_device_memory_get_buffer(struct wvk_device *dev, struct wvk_device_memory *m
 {
    if (!mem->buffer) {
       const struct wvk_physical_device *pdev = wvk_device_physical(dev);
-      /* WebGPU sizes are multiples of four. */
-      const uint64_t size = align64(MAX2(mem->vk.size, 4), 4);
+      const uint64_t size = wvk_memory_buffer_size(mem->vk.size);
       if (size > pdev->limits.maxBufferSize)
          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "%" PRIu64 " bytes of buffer memory is more than WebGPU's %" PRIu64,

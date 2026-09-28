@@ -9,6 +9,7 @@
 
 #include "vk_queue.h"
 
+#include "util/simple_mtx.h"
 #include "util/u_atomic.h"
 
 struct wvk_device;
@@ -43,6 +44,10 @@ struct wvk_pending_submit {
 struct wvk_queue {
    struct vk_queue vk;
    WGPUQueue wgpu;
+
+   /* Submits are the application's to serialize, but waits are not: any
+    * thread may wait on a fence or a semaphore, and waiting retires. */
+   simple_mtx_t lock;
 
    uint64_t submitted;
    uint64_t completed;

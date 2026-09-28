@@ -32,9 +32,14 @@ struct wvk_shader_binding {
    uint8_t multisampled;
    uint8_t access;           /* WGPUStorageTextureAccess */
    uint32_t format;          /* WGPUTextureFormat, of a storage texture */
-   /* Buffers: the set layout said dynamic. */
+   /* Buffers: the set layout said dynamic; and how much of a uniform
+    * buffer the shader declares, which a binding has to hold. */
    bool dynamic;
+   uint32_t min_size;
 };
+
+/* Of the serialized shaders, for the pipeline cache. */
+#define WVK_SHADER_BINARY_VERSION 2
 
 enum wvk_shader_variant {
    /* Vulkan's y points down, WebGPU's up: gl_Position.y negated. */

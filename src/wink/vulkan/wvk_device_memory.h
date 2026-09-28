@@ -32,6 +32,16 @@ struct wvk_device_memory {
 VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_device_memory, vk.base, VkDeviceMemory,
                                VK_OBJECT_TYPE_DEVICE_MEMORY)
 
+/* What the WGPUBuffer, and the host copy, of memory of `size` bytes are:
+ * whole words, and 256 bytes more. WebGPU wants a uniform binding to hold
+ * all of the shader's block, where Vulkan lets a buffer be only as big as
+ * what is read of it; the padding lets a binding reach past the end. */
+static inline uint64_t
+wvk_memory_buffer_size(uint64_t size)
+{
+   return align64(MAX2(size, 4), 4) + 256;
+}
+
 /* The WGPUBuffer behind buffer memory, made on first use. */
 VkResult wvk_device_memory_get_buffer(struct wvk_device *dev, struct wvk_device_memory *mem,
                                       WGPUBuffer *out);
