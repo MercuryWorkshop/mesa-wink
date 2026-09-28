@@ -21,4 +21,10 @@ bool wvk_nir_lower_texel_buffers(nir_shader *nir);
 /* Views' swizzles, as their records say. */
 bool wvk_nir_lower_view_swizzles(nir_shader *nir);
 
+/* What WebGPU's samplers cannot do, as samplers' records say: border
+ * colours, mirroring once, LOD bias, unnormalized coordinates, and
+ * sampling integer textures at all. */
+bool wvk_nir_lower_samplers(nir_shader *nir);
+
+
 #endif

@@ -13,6 +13,7 @@
 #include "wvk_physical_device.h"
 
 #include "wvk_entrypoints.h"
+#include "wvk_descriptor_set_layout.h"
 #include "wvk_format.h"
 #include "wvk_image.h"
 #include "wvk_shader.h"
@@ -99,7 +100,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_portability_subset = true,
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
-      .KHR_sampler_mirror_clamp_to_edge = false,
+      .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_separate_depth_stencil_layouts = true,
       .KHR_shader_draw_parameters = true,
       .KHR_shader_float_controls = true,
@@ -110,6 +111,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_synchronization2 = true,
       .KHR_timeline_semaphore = true,
       .KHR_uniform_buffer_standard_layout = true,
+      .EXT_border_color_swizzle = true,
+      .EXT_custom_border_color = true,
       .EXT_host_query_reset = true,
       .EXT_separate_stencil_usage = true,
       /* WebGPU steps instances one at a time: other divisors are read by
@@ -154,6 +157,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .shaderDrawParameters = true,
 
       /* Vulkan 1.2 */
+      .samplerMirrorClampToEdge = true,
       .shaderFloat16 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_ShaderF16),
       .imagelessFramebuffer = true,
       .uniformBufferStandardLayout = true,
@@ -171,6 +175,13 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .privateData = true,
       .maintenance4 = false,
 
+      /* Samplers' records do what WebGPU's samplers cannot
+       * (wvk_nir_descriptors.c); a view's swizzle applies to the border. */
+      .customBorderColors = true,
+      .customBorderColorWithoutFormat = true,
+      .borderColorSwizzle = true,
+      .borderColorSwizzleFromImage = true,
+
       /* VK_KHR_vertex_attribute_divisor */
       .vertexAttributeInstanceRateDivisor = true,
       .vertexAttributeInstanceRateZeroDivisor = true,
@@ -184,7 +195,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .multisampleArrayImage = false,
       .mutableComparisonSamplers = true,
       .pointPolygons = false,
-      .samplerMipLodBias = false,
+      .samplerMipLodBias = true,
       .separateStencilMaskRef = false,
       .shaderSampleRateInterpolationFunctions = false,
       .tessellationIsolines = false,
@@ -284,7 +295,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxDrawIndirectCount = UINT32_MAX,
       /* WebGPU samplers have no LOD bias. */
       /* Vulkan's minimum. WebGPU samplers have no bias: it is ignored. */
-      .maxSamplerLodBias = 2.0f,
+      .maxSamplerLodBias = WVK_MAX_SAMPLER_LOD_BIAS,
       .maxSamplerAnisotropy = 16.0f,
       .maxViewports = 1,
       .maxViewportDimensions = { max_2d, max_2d },
@@ -368,6 +379,9 @@ get_device_properties(const struct wvk_physical_device *pdev,
 
       /* VK_KHR_push_descriptor */
       .maxPushDescriptors = 32,
+
+      /* VK_EXT_custom_border_color */
+      .maxCustomBorderColorSamplers = 4000,
 
       /* VK_KHR_vertex_attribute_divisor */
       .maxVertexAttribDivisor = UINT32_MAX,

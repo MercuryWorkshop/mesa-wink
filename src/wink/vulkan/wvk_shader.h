@@ -22,6 +22,9 @@ enum wvk_binding_kind {
    WVK_BINDING_STORAGE_TEXTURE,
    WVK_BINDING_SAMPLER,
    WVK_BINDING_SAMPLER_COMPARE,
+   /* Only in bind group layouts: a sampler whose descriptor does not
+    * filter (see binding_variant in wvk_cmd_draw.c). */
+   WVK_BINDING_SAMPLER_NONFILTERING,
 };
 
 struct wvk_shader_binding {

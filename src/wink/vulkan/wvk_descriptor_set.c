@@ -217,13 +217,17 @@ wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words)
       case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
          if (slot->sampler && d->sampler)
             memcpy(record, d->sampler->meta, sizeof(d->sampler->meta));
-         else if (!slot->sampler && d->view)
+         else if (!slot->sampler && d->view) {
             record[WVK_META_TEX_SWIZZLE] = d->view->swizzle;
+            record[WVK_META_TEX_CHANNELS] = d->view->channels;
+         }
          break;
       case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
       case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-         if (d->view)
+         if (d->view) {
             record[WVK_META_TEX_SWIZZLE] = d->view->swizzle;
+            record[WVK_META_TEX_CHANNELS] = d->view->channels;
+         }
          break;
       case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
       case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:

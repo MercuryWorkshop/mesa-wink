@@ -121,8 +121,20 @@ bgl_entry(const struct wvk_bgl_entry *e)
    case WVK_BINDING_SAMPLER_COMPARE:
       out.sampler.type = WGPUSamplerBindingType_Comparison;
       break;
+   case WVK_BINDING_SAMPLER_NONFILTERING:
+      out.sampler.type = WGPUSamplerBindingType_NonFiltering;
+      break;
    }
    return out;
+}
+
+/* Whether a shader binding is one the bound descriptors can change the
+ * WebGPU type of: a sampled texture, and a sampler. */
+static bool
+is_variant_binding(const struct wvk_shader_binding *b)
+{
+   return (b->kind == WVK_BINDING_TEXTURE && b->sample_type == WGPUTextureSampleType_Float) ||
+          b->kind == WVK_BINDING_SAMPLER;
 }
 
 /* Equal entries are one object: that is what lets a set's bind group be
@@ -177,9 +189,11 @@ stage_bit(mesa_shader_stage stage)
 }
 
 /* The pipeline layout of these shaders: every binding any of them uses,
- * visible to the stages that use it. */
+ * visible to the stages that use it; with the bindings that `variant` has
+ * a bit for, in the shaders' order, not filtering. */
 static struct wvk_layout *
-get_layout(struct wvk_device *dev, struct wvk_shader *const *shaders, uint32_t shader_count)
+get_layout(struct wvk_device *dev, struct wvk_shader *const *shaders, uint32_t shader_count,
+           uint64_t variant)
 {
    uint32_t total = 0;
    for (uint32_t s = 0; s < shader_count; ++s)
@@ -190,13 +204,23 @@ get_layout(struct wvk_device *dev, struct wvk_shader *const *shaders, uint32_t s
       entries[g] = calloc(MAX2(total, 1), sizeof(struct wvk_bgl_entry));
 
    uint32_t group_count = 0;
+   unsigned variant_bit = 0;
    for (uint32_t s = 0; s < shader_count; ++s) {
       const struct wvk_shader *shader = shaders[s];
       if (!shader)
          continue;
       const WGPUShaderStage visibility = stage_bit(shader->vk.stage);
       for (uint32_t i = 0; i < shader->binding_count; ++i) {
+         struct wvk_shader_binding unfiltered;
          const struct wvk_shader_binding *b = &shader->bindings[i];
+         if (is_variant_binding(b) && variant_bit < 64 && (variant >> variant_bit++ & 1)) {
+            unfiltered = *b;
+            if (b->kind == WVK_BINDING_TEXTURE)
+               unfiltered.sample_type = WGPUTextureSampleType_UnfilterableFloat;
+            else
+               unfiltered.kind = WVK_BINDING_SAMPLER_NONFILTERING;
+            b = &unfiltered;
+         }
          if (b->group >= WVK_MAX_GROUPS || !entries[b->group])
             continue;
          group_count = MAX2(group_count, b->group + 1u);
@@ -293,6 +317,8 @@ struct wvk_render_key {
    uint8_t stencil_read_mask, stencil_write_mask;
    int32_t depth_bias;
    float depth_bias_slope, depth_bias_clamp;
+   /* binding_variant of the shaders. */
+   uint64_t bindings;
 };
 
 struct wvk_render_pipeline {
@@ -303,7 +329,9 @@ struct wvk_render_pipeline {
 };
 
 struct wvk_compute_pipeline {
+   /* The key: the shader, and binding_variant of it. */
    uint64_t cs;
+   uint64_t bindings;
    WGPUComputePipeline pipeline;
    struct wvk_layout *layout;
 };
@@ -324,13 +352,13 @@ render_equal(const void *a, const void *b)
 static uint32_t
 compute_hash(const void *key)
 {
-   return _mesa_hash_data(key, sizeof(uint64_t));
+   return _mesa_hash_data(key, 2 * sizeof(uint64_t));
 }
 
 static bool
 compute_equal(const void *a, const void *b)
 {
-   return *(const uint64_t *)a == *(const uint64_t *)b;
+   return !memcmp(a, b, 2 * sizeof(uint64_t));
 }
 
 VkResult
@@ -933,6 +961,44 @@ slot_descriptor(const struct wvk_descriptor_set *set, uint32_t slot, bool *sampl
    return &set->descriptors[bl->descriptor_index + s->element];
 }
 
+/* What the bound descriptors say of their bindings that shaders cannot
+ * know, and WebGPU's bind group layouts must: a texture whose view's
+ * format does not filter (depth, 32-bit float where WebGPU will not) is
+ * unfilterable-float, and a sampler that does not filter is
+ * non-filtering. A bit for each binding is_variant_binding, in the
+ * shaders' order. */
+static uint64_t
+binding_variant(struct wvk_device *dev, const struct wvk_bound_state *st, uint32_t bind_point,
+                struct wvk_shader *const *shaders, uint32_t shader_count)
+{
+   const struct wvk_physical_device *pdev = wvk_device_physical(dev);
+   uint64_t variant = 0;
+   unsigned bit = 0;
+   for (uint32_t s = 0; s < shader_count; ++s) {
+      const struct wvk_shader *shader = shaders[s];
+      for (uint32_t i = 0; shader && i < shader->binding_count && bit < 64; ++i) {
+         const struct wvk_shader_binding *b = &shader->bindings[i];
+         if (!is_variant_binding(b))
+            continue;
+         const unsigned this_bit = bit++;
+         if (b->group >= WVK_MAX_GROUPS)
+            continue;
+         bool sampler;
+         uint32_t dynamic_index;
+         const struct wvk_descriptor *d = slot_descriptor(st->sets[bind_point][b->group].set, b->binding,
+                                                          &sampler, &dynamic_index);
+         bool unfiltered = false;
+         if (b->kind == WVK_BINDING_TEXTURE)
+            unfiltered = d && d->view && !(wvk_format_caps(pdev, d->view->vk.view_format) & WVK_CAP_FILTER);
+         else
+            unfiltered = d && d->sampler && d->sampler->binding_type == WGPUSamplerBindingType_NonFiltering;
+         if (unfiltered)
+            variant |= 1ull << this_bit;
+      }
+   }
+   return variant;
+}
+
 static void
 note_buffer(struct wvk_replay *replay, const struct wvk_descriptor *d, bool written)
 {
@@ -1026,6 +1092,7 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       }
       case WVK_BINDING_SAMPLER:
       case WVK_BINDING_SAMPLER_COMPARE:
+      case WVK_BINDING_SAMPLER_NONFILTERING:
          e->sampler = d && d->sampler ? d->sampler->wgpu : dev->null_sampler;
          break;
       case WVK_BINDING_TEXTURE:
@@ -1410,6 +1477,8 @@ get_render_pipeline(struct wvk_device *dev, struct wvk_cmd_buffer *cmd, bool ind
    if (!key)
       return NULL;
    build_render_key(cmd, indexed, &key->key);
+   struct wvk_shader *const stages[] = { st->vs, st->fs };
+   key->key.bindings = binding_variant(dev, st, WVK_BIND_GRAPHICS, stages, 2);
    key->hash = _mesa_hash_data(&key->key, sizeof(key->key));
 
    simple_mtx_lock(&dev->cache_lock);
@@ -1420,7 +1489,7 @@ get_render_pipeline(struct wvk_device *dev, struct wvk_cmd_buffer *cmd, bool ind
       return (struct wvk_render_pipeline *)he->key;
    }
    struct wvk_shader *const shaders[] = { st->vs, st->fs };
-   key->layout = get_layout(dev, shaders, 2);
+   key->layout = get_layout(dev, shaders, 2, key->key.bindings);
    if (key->layout)
       key->pipeline = create_render_pipeline(dev, &key->key, st->vs, st->fs, key->layout);
    if (!key->pipeline) {
@@ -1747,10 +1816,11 @@ wvk_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDev
 /* Dispatches */
 
 static struct wvk_compute_pipeline *
-get_compute_pipeline(struct wvk_device *dev, struct wvk_shader *cs)
+get_compute_pipeline(struct wvk_device *dev, const struct wvk_bound_state *st, struct wvk_shader *cs)
 {
+   const uint64_t key[2] = { cs->id, binding_variant(dev, st, WVK_BIND_COMPUTE, &cs, 1) };
    simple_mtx_lock(&dev->cache_lock);
-   struct hash_entry *he = _mesa_hash_table_search(dev->compute_pipelines, &cs->id);
+   struct hash_entry *he = _mesa_hash_table_search(dev->compute_pipelines, key);
    if (he) {
       simple_mtx_unlock(&dev->cache_lock);
       return (struct wvk_compute_pipeline *)he->key;
@@ -1760,8 +1830,9 @@ get_compute_pipeline(struct wvk_device *dev, struct wvk_shader *cs)
       simple_mtx_unlock(&dev->cache_lock);
       return NULL;
    }
-   p->cs = cs->id;
-   p->layout = get_layout(dev, &cs, 1);
+   p->cs = key[0];
+   p->bindings = key[1];
+   p->layout = get_layout(dev, &cs, 1, p->bindings);
    if (p->layout) {
       WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
       desc.label = wvk_sv("wvk compute pipeline");
@@ -1794,7 +1865,7 @@ flush_dispatch(struct wvk_cmd_buffer *cmd)
       mesa_logw_once("wvk: a dispatch inside a render pass");
       return NULL;
    }
-   struct wvk_compute_pipeline *p = get_compute_pipeline(dev, st->cs);
+   struct wvk_compute_pipeline *p = get_compute_pipeline(dev, st, st->cs);
    if (!p)
       return NULL;
    if (!replay->compute) {

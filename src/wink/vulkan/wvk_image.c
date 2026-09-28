@@ -339,6 +339,17 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    if (m->r != VK_COMPONENT_SWIZZLE_R || m->g != VK_COMPONENT_SWIZZLE_G || m->b != VK_COMPONENT_SWIZZLE_B ||
        m->a != VK_COMPONENT_SWIZZLE_A)
       view->swizzle = (uint32_t)m->r | (uint32_t)m->g << 3 | (uint32_t)m->b << 6 | (uint32_t)m->a << 9;
+   /* A depth or stencil aspect is red; else what the format has. */
+   if (view->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+      view->channels = 1;
+   } else {
+      const struct util_format_description *desc =
+         util_format_description(vk_format_to_pipe_format(view->vk.view_format));
+      for (unsigned i = 0; desc && i < 4; ++i) {
+         if (desc->swizzle[i] <= PIPE_SWIZZLE_W)
+            view->channels |= 1u << i;
+      }
+   }
 
    /* Views of an image without a texture -- a swapchain's, until acquired
     * -- are made when used. */

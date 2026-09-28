@@ -459,71 +459,6 @@ lower_layer_id_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
  * samples integer formats nearest, so the fetch is of the texel the
  * coordinate falls in, clamped to the edge -- which is what vk_meta's and
  * nearly every application's samplers for these do. */
-static bool
-lower_integer_sample_instr(nir_builder *b, nir_instr *instr, void *data)
-{
-   if (instr->type != nir_instr_type_tex)
-      return false;
-   nir_tex_instr *tex = nir_instr_as_tex(instr);
-   if (nir_alu_type_get_base_type(tex->dest_type) == nir_type_float || tex->is_shadow)
-      return false;
-   if (tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl &&
-       tex->op != nir_texop_txd)
-      return false;
-   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
-      return false;
-
-   b->cursor = nir_before_instr(instr);
-   const int texture_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
-   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-   const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
-   const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
-   if (texture_idx < 0 || coord_idx < 0)
-      return false;
-   nir_def *texture = tex->src[texture_idx].src.ssa;
-   nir_def *coord = tex->src[coord_idx].src.ssa;
-   nir_def *lod = tex->op == nir_texop_txl && lod_idx >= 0
-                     ? nir_f2i32(b, nir_fround_even(b, tex->src[lod_idx].src.ssa))
-                     : nir_imm_int(b, 0);
-
-   nir_tex_instr *txs = nir_tex_instr_create(b->shader, 2);
-   txs->op = nir_texop_txs;
-   txs->sampler_dim = tex->sampler_dim;
-   txs->is_array = tex->is_array;
-   txs->dest_type = nir_type_int32;
-   txs->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture);
-   txs->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, lod);
-   nir_def_init(&txs->instr, &txs->def, nir_tex_instr_dest_size(txs), 32);
-   nir_builder_instr_insert(b, &txs->instr);
-   nir_def *size = &txs->def;
-
-   const unsigned n = tex->coord_components;
-   const unsigned spatial = n - (tex->is_array ? 1 : 0);
-   nir_def *comps[4];
-   for (unsigned i = 0; i < n; ++i) {
-      nir_def *c = nir_channel(b, coord, i);
-      nir_def *extent = nir_channel(b, size, i);
-      nir_def *texel = i < spatial ? nir_f2i32(b, nir_ffloor(b, nir_fmul(b, c, nir_i2f32(b, extent))))
-                                   : nir_f2i32(b, nir_fround_even(b, c));
-      if (offset_idx >= 0 && i < spatial)
-         texel = nir_iadd(b, texel, nir_channel(b, tex->src[offset_idx].src.ssa, i));
-      comps[i] = nir_imax(b, nir_imin(b, texel, nir_iadd_imm(b, extent, -1)), nir_imm_int(b, 0));
-   }
-
-   nir_tex_instr *txf = nir_tex_instr_create(b->shader, 3);
-   txf->op = nir_texop_txf;
-   txf->sampler_dim = tex->sampler_dim;
-   txf->is_array = tex->is_array;
-   txf->dest_type = tex->dest_type;
-   txf->coord_components = n;
-   txf->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture);
-   txf->src[1] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_vec(b, comps, n));
-   txf->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, lod);
-   nir_def_init(&txf->instr, &txf->def, tex->def.num_components, tex->def.bit_size);
-   nir_builder_instr_insert(b, &txf->instr);
-   nir_def_replace(&tex->def, &txf->def);
-   return true;
-}
 
 /*
  * Buffers as arrays of words. WGSL has layout rules of its own, which
@@ -1516,14 +1451,16 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    split_buffer_vars(nir, &state);
    NIR_PASS(_, nir, nir_shader_instructions_pass, rewrite_resource_instr, nir_metadata_control_flow,
             &state);
-   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_integer_sample_instr, nir_metadata_control_flow,
-            NULL);
+   /* Swizzles first: a gather's is a gather of another component, which
+    * then samples as its own; and the border replaces a texel before the
+    * swizzle takes it apart. */
+   NIR_PASS(_, nir, wvk_nir_lower_view_swizzles);
+   NIR_PASS(_, nir, wvk_nir_lower_samplers);
    NIR_PASS(_, nir, lower_1d_images);
    NIR_PASS(_, nir, lower_ms_arrays);
    NIR_PASS(_, nir, pad_fragment_outputs);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, demote_to_terminate_instr, nir_metadata_all, NULL);
    NIR_PASS(_, nir, wvk_nir_lower_texel_buffers);
-   NIR_PASS(_, nir, wvk_nir_lower_view_swizzles);
    lower_buffers_to_words(nir, info, pipeline_state, shader, mem_ctx);
    optimize(nir);
    /* The combined and arrayed originals, now without a use. */

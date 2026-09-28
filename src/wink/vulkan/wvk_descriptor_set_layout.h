@@ -76,8 +76,10 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 #define WVK_META_WORDS 8
 
 /* A texture's record: its view's swizzle, 0 for none, else 3 bits a
- * component of VkComponentSwizzle (ZERO to A). */
+ * component of VkComponentSwizzle (ZERO to A); and which of R, G, B and A
+ * its format has, a bit each, which a border colour is made into. */
 #define WVK_META_TEX_SWIZZLE 0
+#define WVK_META_TEX_CHANNELS 1
 
 /* A sampler's record. */
 #define WVK_META_SAMPLER_FLAGS 0
@@ -96,6 +98,8 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* What a shader does itself when sampling a float texture: an axis
  * clamps to the border or mirrors once, or coordinates are texels. */
 #define WVK_SAMPLER_EMULATE (1u << 17)
+/* The largest LOD bias a sampler has, which maxSamplerLodBias reports. */
+#define WVK_MAX_SAMPLER_LOD_BIAS 15.0f
 
 /* A texel buffer's record. */
 #define WVK_META_TEXEL_FORMAT 0    /* enum wvk_texel_type, and bytes a texel << 8 */
