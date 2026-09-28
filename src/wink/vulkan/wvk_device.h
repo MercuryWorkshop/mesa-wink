@@ -8,8 +8,10 @@
 #include "wvk_private.h"
 #include "wvk_queue.h"
 
+#include "vk_command_pool.h"
 #include "vk_device.h"
 
+struct wvk_cmd_buffer;
 struct wvk_physical_device;
 
 struct wvk_device {
@@ -22,6 +24,10 @@ struct wvk_device {
 
    WGPUDevice wgpu;
    struct wvk_queue queue;
+
+   /* What submits replay into; submits to the one queue are serialized. */
+   struct vk_command_pool replay_pool;
+   struct wvk_cmd_buffer *replay_cmd;
 };
 
 VK_DEFINE_HANDLE_CASTS(wvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)

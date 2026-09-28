@@ -94,18 +94,36 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
       goto fail_init;
    }
 
+   const VkCommandPoolCreateInfo pool_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+      .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+      .queueFamilyIndex = 0,
+   };
+   result = vk_command_pool_init(&dev->vk, &dev->replay_pool, &pool_info, NULL);
+   if (result != VK_SUCCESS)
+      goto fail_device;
+   struct vk_command_buffer *replay;
+   result = wvk_cmd_buffer_ops.create(&dev->replay_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, &replay);
+   if (result != VK_SUCCESS)
+      goto fail_pool;
+   dev->replay_cmd = container_of(replay, struct wvk_cmd_buffer, vk);
+
    /* One queue family, with one queue. */
    for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; ++i) {
       const VkDeviceQueueCreateInfo *qci = &pCreateInfo->pQueueCreateInfos[i];
       assert(qci->queueFamilyIndex == 0 && qci->queueCount == 1);
       result = wvk_queue_init(dev, &dev->queue, qci, 0);
       if (result != VK_SUCCESS)
-         goto fail_device;
+         goto fail_replay;
    }
 
    *pDevice = wvk_device_to_handle(dev);
    return VK_SUCCESS;
 
+fail_replay:
+   wvk_cmd_buffer_ops.destroy(&dev->replay_cmd->vk);
+fail_pool:
+   vk_command_pool_finish(&dev->replay_pool);
 fail_device:
    wgpuDeviceRelease(dev->wgpu);
 fail_init:
@@ -123,6 +141,8 @@ wvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    if (dev->queue.vk.base.device)
       wvk_queue_finish(dev, &dev->queue);
+   wvk_cmd_buffer_ops.destroy(&dev->replay_cmd->vk);
+   vk_command_pool_finish(&dev->replay_pool);
    wgpuDeviceDestroy(dev->wgpu);
    wgpuDeviceRelease(dev->wgpu);
    vk_device_finish(&dev->vk);

@@ -1,14 +1,29 @@
 /*
  * Copyright 2026 wink contributors
  * SPDX-License-Identifier: MIT
+ *
+ * Recording and replay. An application's command buffer records every
+ * vkCmd* into its vk_cmd_queue. A submit replays all of its command
+ * buffers, through the driver's own entrypoints, into the device's replay
+ * command buffer, whose vkCmd* implementations encode into one
+ * WGPUCommandEncoder.
+ *
+ * Host-visible memory is a host copy the GPU never sees on its own: the
+ * ranges a submit reads are uploaded with wgpuQueueWriteBuffer before it,
+ * and the ranges it writes are copied into mappable buffers at its end and
+ * copied back once it ran, before the submit counts as finished.
  */
 #include "wvk_cmd_buffer.h"
 
 #include "wvk_device.h"
+#include "wvk_device_memory.h"
 #include "wvk_entrypoints.h"
 #include "wvk_queue.h"
 
+#include "vk_cmd_queue.h"
 #include "vk_command_pool.h"
+
+#include <stdlib.h>
 
 static VkResult
 wvk_cmd_buffer_create(struct vk_command_pool *pool, VkCommandBufferLevel level,
@@ -72,12 +87,208 @@ wvk_EndCommandBuffer(VkCommandBuffer commandBuffer)
    return vk_command_buffer_end(&cmd->vk);
 }
 
+/* ---------------------------------------------------------------------- */
+/* The replay state */
+
+void
+wvk_replay_end_passes(struct wvk_replay *replay)
+{
+   if (replay->pass) {
+      wgpuRenderPassEncoderEnd(replay->pass);
+      wgpuRenderPassEncoderRelease(replay->pass);
+      replay->pass = NULL;
+   }
+   if (replay->compute) {
+      wgpuComputePassEncoderEnd(replay->compute);
+      wgpuComputePassEncoderRelease(replay->compute);
+      replay->compute = NULL;
+   }
+}
+
+static void
+add_range(struct util_dynarray *ranges, struct wvk_device_memory *mem, uint64_t offset, uint64_t size)
+{
+   if (!mem || !mem->host || !size)
+      return;
+   /* WebGPU copies whole words. */
+   const uint64_t start = offset & ~3ull;
+   const uint64_t end = MIN2(align64(offset + size, 4), mem->buffer_size);
+   if (end <= start)
+      return;
+   util_dynarray_append(ranges, ((struct wvk_mem_range){ mem, start, end - start }));
+}
+
+void
+wvk_replay_read(struct wvk_replay *replay, struct wvk_device_memory *mem, uint64_t offset, uint64_t size)
+{
+   add_range(&replay->reads, mem, offset, size);
+}
+
+void
+wvk_replay_write(struct wvk_replay *replay, struct wvk_device_memory *mem, uint64_t offset, uint64_t size)
+{
+   add_range(&replay->writes, mem, offset, size);
+}
+
+WGPUBuffer
+wvk_replay_temp_buffer(struct wvk_device *dev, struct wvk_replay *replay, uint64_t size,
+                       WGPUBufferUsage usage, const void *data)
+{
+   WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+   desc.label = wvk_sv("wvk temporary");
+   desc.usage = usage;
+   desc.size = align64(MAX2(size, 4), 4);
+   desc.mappedAtCreation = data != NULL;
+   WGPUBuffer buffer = wgpuDeviceCreateBuffer(dev->wgpu, &desc);
+   if (!buffer)
+      return NULL;
+   if (data) {
+      void *p = wgpuBufferGetMappedRange(buffer, 0, desc.size);
+      if (p) {
+         memcpy(p, data, size);
+         if (desc.size > size)
+            memset((uint8_t *)p + size, 0, desc.size - size);
+      }
+      wgpuBufferUnmap(buffer);
+   }
+   util_dynarray_append(&replay->releases, buffer);
+   return buffer;
+}
+
+static int
+compare_ranges(const void *a, const void *b)
+{
+   const struct wvk_mem_range *x = a, *y = b;
+   if (x->mem != y->mem)
+      return (uintptr_t)x->mem < (uintptr_t)y->mem ? -1 : 1;
+   return x->offset < y->offset ? -1 : x->offset > y->offset ? 1 : 0;
+}
+
+/* Sorted by memory and offset, with overlapping and touching ranges made
+ * one. Returns the count. */
+static uint32_t
+coalesce(struct util_dynarray *ranges)
+{
+   const uint32_t count = util_dynarray_num_elements(ranges, struct wvk_mem_range);
+   struct wvk_mem_range *r = util_dynarray_begin(ranges);
+   if (count < 2)
+      return count;
+   qsort(r, count, sizeof(*r), compare_ranges);
+   uint32_t out = 0;
+   for (uint32_t i = 1; i < count; ++i) {
+      if (r[i].mem == r[out].mem && r[i].offset <= r[out].offset + r[out].size) {
+         const uint64_t end = MAX2(r[out].offset + r[out].size, r[i].offset + r[i].size);
+         r[out].size = end - r[out].offset;
+      } else {
+         r[++out] = r[i];
+      }
+   }
+   return out + 1;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Submit */
+
 VkResult
 wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
-                       struct vk_command_buffer *const *cmds, uint32_t count)
+                       struct vk_command_buffer *const *cmds, uint32_t count, uint64_t serial)
 {
-   /* M0: recording works, replay comes with memory and encoding. */
-   if (count)
-      return vk_errorf(dev, VK_ERROR_FEATURE_NOT_PRESENT, "command replay is not implemented yet");
+   struct wvk_cmd_buffer *rcmd = dev->replay_cmd;
+   struct wvk_replay replay;
+   memset(&replay, 0, sizeof(replay));
+   util_dynarray_init(&replay.reads, NULL);
+   util_dynarray_init(&replay.writes, NULL);
+   util_dynarray_init(&replay.releases, NULL);
+   util_dynarray_init(&replay.views, NULL);
+
+   WGPUCommandEncoderDescriptor edesc = WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
+   replay.encoder = wgpuDeviceCreateCommandEncoder(dev->wgpu, &edesc);
+
+   vk_command_buffer_reset(&rcmd->vk);
+   const VkCommandBufferBeginInfo begin = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+   };
+   vk_command_buffer_begin(&rcmd->vk, &begin);
+   rcmd->replay = &replay;
+   for (uint32_t i = 0; i < count; ++i)
+      vk_cmd_queue_execute(&cmds[i]->cmd_queue, wvk_cmd_buffer_to_handle(rcmd), &dev->vk.dispatch_table);
+   wvk_replay_end_passes(&replay);
+   rcmd->replay = NULL;
+   /* What the replay itself recorded is of no further use. */
+   vk_command_buffer_reset(&rcmd->vk);
+
+   /* What the submit wrote to host-visible memory goes to mappable
+    * buffers, at its very end. */
+   const uint32_t write_count = coalesce(&replay.writes);
+   struct wvk_readback *readbacks = write_count ? calloc(write_count, sizeof(*readbacks)) : NULL;
+   uint32_t readback_count = 0;
+   for (uint32_t i = 0; i < write_count; ++i) {
+      const struct wvk_mem_range *w = util_dynarray_element(&replay.writes, struct wvk_mem_range, i);
+      WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk readback");
+      desc.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+      desc.size = w->size;
+      WGPUBuffer staging = wgpuDeviceCreateBuffer(dev->wgpu, &desc);
+      if (!staging || !readbacks)
+         continue;
+      wgpuCommandEncoderCopyBufferToBuffer(replay.encoder, w->mem->buffer, w->offset, staging, 0, w->size);
+      readbacks[readback_count++] = (struct wvk_readback){
+         .mem = w->mem, .offset = w->offset, .size = w->size, .staging = staging,
+      };
+   }
+
+   WGPUCommandBufferDescriptor cdesc = WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT;
+   WGPUCommandBuffer commands = wgpuCommandEncoderFinish(replay.encoder, &cdesc);
+   wgpuCommandEncoderRelease(replay.encoder);
+
+   /* What it reads of host-visible memory goes up first -- except where an
+    * earlier submit is still to write the range back, since until then the
+    * GPU's copy is the one that counts. */
+   const uint32_t read_count = coalesce(&replay.reads);
+   for (uint32_t i = 0; i < read_count; ++i) {
+      const struct wvk_mem_range *r = util_dynarray_element(&replay.reads, struct wvk_mem_range, i);
+      if (wvk_queue_range_pending(queue, r->mem, r->offset, r->size))
+         continue;
+      wgpuQueueWriteBuffer(queue->wgpu, r->mem->buffer, r->offset,
+                           (const uint8_t *)r->mem->host + r->offset, r->size);
+   }
+
+   wgpuQueueSubmit(queue->wgpu, 1, &commands);
+   wgpuCommandBufferRelease(commands);
+   wvk_queue_commit(queue, serial, readbacks, readback_count);
+
+   util_dynarray_foreach(&replay.releases, WGPUBuffer, b)
+      wgpuBufferRelease(*b);
+   util_dynarray_foreach(&replay.views, WGPUTextureView, v)
+      wgpuTextureViewRelease(*v);
+   util_dynarray_fini(&replay.reads);
+   util_dynarray_fini(&replay.writes);
+   util_dynarray_fini(&replay.releases);
+   util_dynarray_fini(&replay.views);
    return VK_SUCCESS;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Synchronization: one in-order queue has nothing to wait for. */
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDependencyInfo *pDependencyInfo)
+{
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdSetEvent2(VkCommandBuffer commandBuffer, VkEvent event, const VkDependencyInfo *pDependencyInfo)
+{
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdResetEvent2(VkCommandBuffer commandBuffer, VkEvent event, VkPipelineStageFlags2 stageMask)
+{
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount, const VkEvent *pEvents,
+                   const VkDependencyInfo *pDependencyInfos)
+{
 }

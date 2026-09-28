@@ -48,6 +48,8 @@ wvk_entrypoints = custom_target(
 wvk_files = files(
   'wvk_buffer.c',
   'wvk_cmd_buffer.c',
+  'wvk_cmd_copy.c',
+  'wvk_cmd_render.c',
   'wvk_device.c',
   'wvk_device_memory.c',
   'wvk_format.c',

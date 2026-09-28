@@ -6,6 +6,7 @@
 
 #include "wvk_cmd_buffer.h"
 #include "wvk_device.h"
+#include "wvk_device_memory.h"
 #include "wvk_instance.h"
 #include "wvk_physical_device.h"
 #include "wvk_platform.h"
@@ -13,66 +14,173 @@
 
 #include "util/os_time.h"
 
+#include <stdlib.h>
+
 static struct wvk_instance *
 queue_instance(struct wvk_queue *queue)
 {
    return (struct wvk_instance *)wvk_queue_device(queue)->vk.physical->instance;
 }
 
+static struct wvk_pending_submit *
+pending_at(struct wvk_queue *queue, uint32_t i)
+{
+   return &queue->pending[(queue->pending_first + i) % WVK_MAX_PENDING_SUBMITS];
+}
+
 static void
 on_work_done(WGPUQueueWorkDoneStatus status, void *userdata1, void *userdata2)
 {
    struct wvk_queue *queue = userdata1;
-   const uint64_t serial = (uint64_t)(uintptr_t)userdata2;
+   struct wvk_pending_submit *p = userdata2;
    if (status != WGPUQueueWorkDoneStatus_Success)
       vk_device_set_lost(&wvk_queue_device(queue)->vk, "queue work failed");
-   /* In order, so this is a high-water mark. */
-   if (serial > p_atomic_read(&queue->completed))
-      p_atomic_set(&queue->completed, serial);
+   p->done = true;
 }
 
 static void
-retire_completed(struct wvk_queue *queue)
+on_mapped(WGPUMapAsyncStatus status, WGPUStringView message, void *userdata1, void *userdata2)
 {
-   const uint64_t completed = wvk_queue_completed(queue);
-   while (queue->pending_count &&
-          queue->pending[queue->pending_first].serial <= completed) {
-      queue->pending_first = (queue->pending_first + 1) % WVK_MAX_PENDING_SUBMITS;
-      --queue->pending_count;
+   struct wvk_readback *rb = userdata1;
+   (void)userdata2;
+   rb->mapped = true;
+   if (status != WGPUMapAsyncStatus_Success) {
+      rb->failed = true;
+      mesa_loge("wvk: reading host-visible memory back failed: %.*s", wvk_sv_len(message), message.data);
    }
+}
+
+/* The oldest submit is done if its work is, and every readback mapped:
+ * then its memory goes back to the host copies, in order. */
+static bool
+retire_oldest(struct wvk_queue *queue)
+{
+   if (!queue->pending_count)
+      return false;
+   struct wvk_pending_submit *p = pending_at(queue, 0);
+   if (!p->done)
+      return false;
+   for (uint32_t i = 0; i < p->readback_count; ++i) {
+      if (!p->readbacks[i].mapped)
+         return false;
+   }
+   for (uint32_t i = 0; i < p->readback_count; ++i) {
+      struct wvk_readback *rb = &p->readbacks[i];
+      if (!rb->failed) {
+         const void *data = wgpuBufferGetConstMappedRange(rb->staging, 0, rb->size);
+         if (data)
+            memcpy((uint8_t *)rb->mem->host + rb->offset, data, rb->size);
+      }
+      wgpuBufferUnmap(rb->staging);
+      wgpuBufferDestroy(rb->staging);
+      wgpuBufferRelease(rb->staging);
+   }
+   free(p->readbacks);
+   p->readbacks = NULL;
+   p->readback_count = 0;
+   /* In order, so this is a high-water mark. */
+   p_atomic_set(&queue->completed, p->serial);
+   queue->pending_first = (queue->pending_first + 1) % WVK_MAX_PENDING_SUBMITS;
+   --queue->pending_count;
+   return true;
 }
 
 VkResult
 wvk_queue_wait_progress(struct wvk_queue *queue, uint64_t abs_timeout_ns)
 {
-   retire_completed(queue);
+   if (retire_oldest(queue)) {
+      while (retire_oldest(queue))
+         ;
+      return VK_SUCCESS;
+   }
    if (!queue->pending_count)
       return VK_NOT_READY;
+
+   /* Wait for whatever the oldest submit is still waiting for. */
+   struct wvk_pending_submit *p = pending_at(queue, 0);
+   WGPUFutureWaitInfo waits[64];
+   uint32_t count = 0;
+   if (!p->done)
+      waits[count++] = (WGPUFutureWaitInfo){ .future = p->work_done };
+   for (uint32_t i = 0; i < p->readback_count && count < ARRAY_SIZE(waits); ++i) {
+      if (!p->readbacks[i].mapped)
+         waits[count++] = (WGPUFutureWaitInfo){ .future = p->readbacks[i].future };
+   }
 
    const uint64_t now = os_time_get_nano();
    const uint64_t timeout = abs_timeout_ns == OS_TIMEOUT_INFINITE ? UINT64_MAX
                             : abs_timeout_ns > now ? abs_timeout_ns - now : 0;
-   const uint64_t before = wvk_queue_completed(queue);
-   wvk_platform_wait(queue_instance(queue)->wgpu,
-                     queue->pending[queue->pending_first].future, timeout);
-   retire_completed(queue);
+   const WGPUWaitStatus status = wgpuInstanceWaitAny(queue_instance(queue)->wgpu, count, waits, timeout);
+   if (status == WGPUWaitStatus_Error)
+      return vk_device_set_lost(&wvk_queue_device(queue)->vk, "waiting for WebGPU failed");
+
+   bool progressed = false;
+   while (retire_oldest(queue))
+      progressed = true;
    if (vk_device_is_lost(&wvk_queue_device(queue)->vk))
       return VK_ERROR_DEVICE_LOST;
-   return wvk_queue_completed(queue) > before ? VK_SUCCESS : VK_TIMEOUT;
+   /* A readback mapping is progress too, if not yet a finished submit. */
+   return progressed || status == WGPUWaitStatus_Success ? VK_SUCCESS : VK_TIMEOUT;
 }
 
-/* Reserve a pending slot: the ring only fills when WebGPU is far behind,
- * so wait for the oldest submit then. */
-static VkResult
-reserve_pending(struct wvk_queue *queue)
+bool
+wvk_queue_range_pending(struct wvk_queue *queue, struct wvk_device_memory *mem,
+                        uint64_t offset, uint64_t size)
 {
-   retire_completed(queue);
+   for (uint32_t i = 0; i < queue->pending_count; ++i) {
+      const struct wvk_pending_submit *p = pending_at(queue, i);
+      for (uint32_t j = 0; j < p->readback_count; ++j) {
+         const struct wvk_readback *rb = &p->readbacks[j];
+         if (rb->mem == mem && rb->offset < offset + size && offset < rb->offset + rb->size)
+            return true;
+      }
+   }
+   return false;
+}
+
+VkResult
+wvk_queue_reserve(struct wvk_queue *queue, uint64_t *serial)
+{
+   while (retire_oldest(queue))
+      ;
    while (queue->pending_count == WVK_MAX_PENDING_SUBMITS) {
       VkResult result = wvk_queue_wait_progress(queue, OS_TIMEOUT_INFINITE);
       if (result == VK_ERROR_DEVICE_LOST)
          return result;
    }
+   *serial = queue->submitted + 1;
    return VK_SUCCESS;
+}
+
+void
+wvk_queue_commit(struct wvk_queue *queue, uint64_t serial,
+                 struct wvk_readback *readbacks, uint32_t readback_count)
+{
+   assert(serial == queue->submitted + 1);
+   queue->submitted = serial;
+   struct wvk_pending_submit *p = pending_at(queue, queue->pending_count);
+   *p = (struct wvk_pending_submit){
+      .serial = serial,
+      .readbacks = readbacks,
+      .readback_count = readback_count,
+   };
+   ++queue->pending_count;
+
+   WGPUQueueWorkDoneCallbackInfo cb = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
+   cb.mode = WGPUCallbackMode_WaitAnyOnly;
+   cb.callback = on_work_done;
+   cb.userdata1 = queue;
+   cb.userdata2 = p;
+   p->work_done = wgpuQueueOnSubmittedWorkDone(queue->wgpu, cb);
+
+   for (uint32_t i = 0; i < readback_count; ++i) {
+      WGPUBufferMapCallbackInfo map = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+      map.mode = WGPUCallbackMode_WaitAnyOnly;
+      map.callback = on_mapped;
+      map.userdata1 = &readbacks[i];
+      readbacks[i].future = wgpuBufferMapAsync(readbacks[i].staging, WGPUMapMode_Read, 0,
+                                               readbacks[i].size, map);
+   }
 }
 
 static VkResult
@@ -87,26 +195,14 @@ wvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    /* Waits need nothing: submits are deferred until what they wait for is
     * pending, and pending means earlier on this in-order queue. */
 
-   VkResult result = wvk_cmd_buffers_submit(dev, queue, submit->command_buffers,
-                                            submit->command_buffer_count);
+   uint64_t serial;
+   VkResult result = wvk_queue_reserve(queue, &serial);
    if (result != VK_SUCCESS)
       return result;
-
-   result = reserve_pending(queue);
+   result = wvk_cmd_buffers_submit(dev, queue, submit->command_buffers,
+                                   submit->command_buffer_count, serial);
    if (result != VK_SUCCESS)
       return result;
-
-   const uint64_t serial = ++queue->submitted;
-   WGPUQueueWorkDoneCallbackInfo cb = WGPU_QUEUE_WORK_DONE_CALLBACK_INFO_INIT;
-   cb.mode = WGPUCallbackMode_WaitAnyOnly;
-   cb.callback = on_work_done;
-   cb.userdata1 = queue;
-   cb.userdata2 = (void *)(uintptr_t)serial;
-   const WGPUFuture future = wgpuQueueOnSubmittedWorkDone(queue->wgpu, cb);
-   const uint32_t slot = (queue->pending_first + queue->pending_count) % WVK_MAX_PENDING_SUBMITS;
-   queue->pending[slot].serial = serial;
-   queue->pending[slot].future = future;
-   ++queue->pending_count;
 
    for (uint32_t i = 0; i < submit->signal_count; ++i) {
       struct vk_sync *sync = submit->signals[i].sync;
@@ -139,7 +235,7 @@ wvk_queue_finish(struct wvk_device *dev, struct wvk_queue *queue)
 {
    /* Let what was submitted finish before the device goes. */
    while (queue->pending_count &&
-          wvk_queue_wait_progress(queue, OS_TIMEOUT_INFINITE) == VK_SUCCESS)
+          wvk_queue_wait_progress(queue, OS_TIMEOUT_INFINITE) != VK_ERROR_DEVICE_LOST)
       ;
    if (queue->wgpu)
       wgpuQueueRelease(queue->wgpu);
