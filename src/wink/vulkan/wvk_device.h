@@ -88,6 +88,16 @@ struct wvk_device {
    /* Compressed texels into a shadow (wvk_image.h): for each format of
     * shadow, from a 2D array and from a 3D texture. */
    WGPURenderPipeline shadow_pipelines[3][2];
+   /* Copies of multisampled colour textures, a pass writing each sample:
+    * by format and sample count. */
+   struct {
+      WGPUTextureFormat format;
+      uint32_t samples;
+      WGPURenderPipeline pipeline;
+   } ms_copy_pipelines[8];
+   /* Depth into R32Float and stencil into R8Uint, for copies of them a
+    * pass reads. */
+   WGPURenderPipeline ds_copy_pipelines[2];
    /* What a binding with no descriptor written shows: 1x1 textures of
     * each kind a bind group layout can want (descriptorBindingPartiallyBound). */
    struct {

@@ -77,13 +77,6 @@ area_covers(const VkRect2D *area, const struct wvk_image_view *view)
           (int64_t)area->offset.y + area->extent.height >= view->vk.extent.height;
 }
 
-static WGPUStoreOp
-store_op(VkAttachmentStoreOp op, bool suspending)
-{
-   if (suspending)
-      return WGPUStoreOp_Store;
-   return op == VK_ATTACHMENT_STORE_OP_DONT_CARE ? WGPUStoreOp_Discard : WGPUStoreOp_Store;
-}
 
 static WGPUTextureView
 attachment_view(struct wvk_replay *replay, struct wvk_image_view *view, WGPUTextureAspect aspect)
@@ -192,7 +185,10 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
          if (att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
             clears[clear_count++] = (VkClearAttachment){ VK_IMAGE_ASPECT_COLOR_BIT, i, att->clearValue };
       }
-      colors[i].storeOp = store_op(att->storeOp, suspending);
+      /* Kept, whatever the store op: the pass may be ended and begun again
+       * before Vulkan's is over (wvk_replay_restart_pass), and the rest of
+       * it draws over what is there; DONT_CARE may leave anything. */
+      colors[i].storeOp = WGPUStoreOp_Store;
       colors[i].clearValue = wvk_clear_color(view->vk.format, &att->clearValue.color);
       if (att->resolveMode != VK_RESOLVE_MODE_NONE && att->resolveImageView) {
          VK_FROM_HANDLE(wvk_image_view, resolve, att->resolveImageView);
@@ -204,8 +200,6 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
             replay->rendering.resolve.colors[i] = *att;
             replay->rendering.resolve.colors[i].pNext = NULL;
             replay->rendering.resolve.pending = true;
-            /* What the shader resolves from has to outlive the pass. */
-            colors[i].storeOp = WGPUStoreOp_Store;
          }
       }
    }
@@ -256,8 +250,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
                ds_clear.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
                ds_clear.clearValue.depthStencil.depth = depth->clearValue.depthStencil.depth;
             }
-            ds.depthStoreOp = replay->rendering.resolve.depth.resolveMode ? WGPUStoreOp_Store
-                              : store_op(depth->storeOp, suspending);
+            ds.depthStoreOp = WGPUStoreOp_Store;
             ds.depthClearValue = CLAMP(clear_finite(depth->clearValue.depthStencil.depth), 0.0, 1.0);
          } else if (!depth) {
             /* Not attached in this pass: kept as it is. */
@@ -280,8 +273,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
                ds_clear.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
                ds_clear.clearValue.depthStencil.stencil = stencil->clearValue.depthStencil.stencil;
             }
-            ds.stencilStoreOp = replay->rendering.resolve.stencil.resolveMode ? WGPUStoreOp_Store
-                                : store_op(stencil->storeOp, suspending);
+            ds.stencilStoreOp = WGPUStoreOp_Store;
             ds.stencilClearValue = stencil->clearValue.depthStencil.stencil;
          } else {
             /* Nor is this, and pipelines then write none of it; and test

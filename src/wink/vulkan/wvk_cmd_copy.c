@@ -839,6 +839,240 @@ wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struc
    wgpuBindGroupRelease(group);
 }
 
+/* Each sample of a multisampled colour texture into another. */
+static const char ms_copy_wgsl[] =
+   "@group(0) @binding(0) var src: texture_multisampled_2d<T>;\n"
+   "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n"
+   "  let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n"
+   "  return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);\n"
+   "}\n"
+   "@fragment fn fs(@builtin(position) pos: vec4f, @builtin(sample_index) s: u32) -> @location(0) vec4<T> {\n"
+   "  return textureLoad(src, vec2i(pos.xy), i32(s));\n"
+   "}\n";
+
+static WGPURenderPipeline
+ms_copy_pipeline(struct wvk_device *dev, WGPUTextureFormat format, VkFormat vk_format, uint32_t samples)
+{
+   WGPURenderPipeline pipeline = NULL;
+   simple_mtx_lock(&dev->cache_lock);
+   uint32_t i = 0;
+   while (i < ARRAY_SIZE(dev->ms_copy_pipelines) && dev->ms_copy_pipelines[i].pipeline &&
+          (dev->ms_copy_pipelines[i].format != format || dev->ms_copy_pipelines[i].samples != samples))
+      ++i;
+   if (i < ARRAY_SIZE(dev->ms_copy_pipelines) && !dev->ms_copy_pipelines[i].pipeline) {
+      const char *type = vk_format_is_sint(vk_format) ? "i32" : vk_format_is_int(vk_format) ? "u32" : "f32";
+      char *code = ralloc_strdup(NULL, "");
+      for (const char *c = ms_copy_wgsl; *c; ++c) {
+         if (*c == 'T' && c[1] == '>')
+            ralloc_strcat(&code, type);
+         else
+            ralloc_strncat(&code, c, 1);
+      }
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(code);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      sm.label = wvk_sv("wvk ms copy");
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      ralloc_free(code);
+      WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+      target.format = format;
+      WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+      fragment.module = module;
+      fragment.entryPoint = wvk_sv("fs");
+      fragment.targetCount = 1;
+      fragment.targets = &target;
+      WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk ms copy");
+      desc.vertex.module = module;
+      desc.vertex.entryPoint = wvk_sv("vs");
+      desc.fragment = &fragment;
+      desc.multisample.count = samples;
+      dev->ms_copy_pipelines[i].format = format;
+      dev->ms_copy_pipelines[i].samples = samples;
+      dev->ms_copy_pipelines[i].pipeline = wgpuDeviceCreateRenderPipeline(dev->wgpu, &desc);
+      wgpuShaderModuleRelease(module);
+   }
+   if (i < ARRAY_SIZE(dev->ms_copy_pipelines))
+      pipeline = dev->ms_copy_pipelines[i].pipeline;
+   simple_mtx_unlock(&dev->cache_lock);
+   return pipeline;
+}
+
+WGPUTexture
+wvk_image_snapshot_ms(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image)
+{
+   if (!image->texture || (image->vk.aspects & ~VK_IMAGE_ASPECT_COLOR_BIT))
+      return NULL;
+   WGPURenderPipeline pipeline = ms_copy_pipeline(dev, image->format, image->vk.format, image->vk.samples);
+   if (!pipeline)
+      return NULL;
+   WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+   desc.label = wvk_sv("VkImage copy");
+   desc.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_RenderAttachment;
+   desc.size = (WGPUExtent3D){ wgpuTextureGetWidth(image->texture), wgpuTextureGetHeight(image->texture), 1 };
+   desc.format = image->format;
+   desc.sampleCount = image->vk.samples;
+   WGPUTexture copy = wgpuDeviceCreateTexture(dev->wgpu, &desc);
+   if (!copy)
+      return NULL;
+
+   WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   vd.dimension = WGPUTextureViewDimension_2D;
+   vd.baseArrayLayer = 0;
+   vd.arrayLayerCount = 1;
+   WGPUTextureView src = wgpuTextureCreateView(image->texture, &vd);
+   util_dynarray_append(&replay->views, src);
+   WGPUTextureView dst = wgpuTextureCreateView(copy, &vd);
+   util_dynarray_append(&replay->views, dst);
+   WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+   const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = bgl;
+   bg.entryCount = 1;
+   bg.entries = &entry;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bgl);
+
+   wvk_replay_end_passes(replay);
+   WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+   color.view = dst;
+   color.loadOp = WGPULoadOp_Clear;
+   color.storeOp = WGPUStoreOp_Store;
+   WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+   pd.label = wvk_sv("wvk ms copy");
+   pd.colorAttachmentCount = 1;
+   pd.colorAttachments = &color;
+   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &pd);
+   wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+   wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+   wgpuRenderPassEncoderEnd(pass);
+   wgpuRenderPassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+   return copy;
+}
+
+/* Depth into R32Float, or stencil into R8Uint: a pass a level and layer,
+ * loading it. Only depth16 and depth32 copy out of a texture, and none
+ * into one; stencil does, but not reliably out of combined formats. */
+static const char ds_copy_wgsl[] =
+   "struct V { @builtin(position) pos: vec4f, @location(0) @interpolate(flat) z: u32 }\n"
+   "@vertex fn vs(@builtin(vertex_index) i: u32, @builtin(instance_index) z: u32) -> V {\n"
+   "  let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n"
+   "  return V(vec4f(uv * 2.0 - 1.0, 0.0, 1.0), z);\n"
+   "}\n";
+
+static WGPURenderPipeline
+ds_copy_pipeline(struct wvk_device *dev, bool stencil)
+{
+   simple_mtx_lock(&dev->cache_lock);
+   WGPURenderPipeline *slot = &dev->ds_copy_pipelines[stencil];
+   if (!*slot) {
+      const char *fs = stencil
+         ? "@group(0) @binding(0) var src: texture_2d_array<u32>;\n"
+           "@fragment fn fs(v: V) -> @location(0) vec4u {\n"
+           "  return textureLoad(src, vec2i(v.pos.xy), i32(v.z), 0);\n"
+           "}\n"
+         : "@group(0) @binding(0) var src: texture_depth_2d_array;\n"
+           "@fragment fn fs(v: V) -> @location(0) vec4f {\n"
+           "  return vec4f(textureLoad(src, vec2i(v.pos.xy), i32(v.z), 0), 0.0, 0.0, 1.0);\n"
+           "}\n";
+      char *code = ralloc_asprintf(NULL, "%s%s", ds_copy_wgsl, fs);
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(code);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      sm.label = wvk_sv("wvk depth-stencil copy");
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      ralloc_free(code);
+      WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+      target.format = stencil ? WGPUTextureFormat_R8Uint : WGPUTextureFormat_R32Float;
+      WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+      fragment.module = module;
+      fragment.entryPoint = wvk_sv("fs");
+      fragment.targetCount = 1;
+      fragment.targets = &target;
+      WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+      pd.label = wvk_sv("wvk depth-stencil copy");
+      pd.vertex.module = module;
+      pd.vertex.entryPoint = wvk_sv("vs");
+      pd.fragment = &fragment;
+      *slot = wgpuDeviceCreateRenderPipeline(dev->wgpu, &pd);
+      wgpuShaderModuleRelease(module);
+   }
+   WGPURenderPipeline pipeline = *slot;
+   simple_mtx_unlock(&dev->cache_lock);
+   return pipeline;
+}
+
+WGPUTexture
+wvk_image_snapshot_ds(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image, bool stencil)
+{
+   if (!image->texture || image->vk.samples > 1 || image->dimension == WGPUTextureDimension_3D)
+      return NULL;
+   WGPURenderPipeline pipeline = ds_copy_pipeline(dev, stencil);
+   if (!pipeline)
+      return NULL;
+   const uint32_t layers = image->vk.array_layers, levels = image->vk.mip_levels;
+   WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+   desc.label = wvk_sv("VkImage copy");
+   desc.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_RenderAttachment;
+   desc.size = (WGPUExtent3D){ wgpuTextureGetWidth(image->texture), wgpuTextureGetHeight(image->texture), layers };
+   desc.format = stencil ? WGPUTextureFormat_R8Uint : WGPUTextureFormat_R32Float;
+   desc.mipLevelCount = levels;
+   WGPUTexture copy = wgpuDeviceCreateTexture(dev->wgpu, &desc);
+   if (!copy)
+      return NULL;
+   wvk_replay_end_passes(replay);
+
+   WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+   for (uint32_t l = 0; l < levels; ++l) {
+      WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+      vd.dimension = WGPUTextureViewDimension_2DArray;
+      vd.baseMipLevel = l;
+      vd.mipLevelCount = 1;
+      vd.baseArrayLayer = 0;
+      vd.arrayLayerCount = layers;
+      vd.aspect = stencil ? WGPUTextureAspect_StencilOnly : WGPUTextureAspect_DepthOnly;
+      WGPUTextureView src = wgpuTextureCreateView(image->texture, &vd);
+      util_dynarray_append(&replay->views, src);
+      const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src };
+      WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+      bg.layout = bgl;
+      bg.entryCount = 1;
+      bg.entries = &entry;
+      WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+      for (uint32_t z = 0; z < layers; ++z) {
+         WGPUTextureViewDescriptor ad = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+         ad.dimension = WGPUTextureViewDimension_2D;
+         ad.baseMipLevel = l;
+         ad.mipLevelCount = 1;
+         ad.baseArrayLayer = z;
+         ad.arrayLayerCount = 1;
+         WGPUTextureView view = wgpuTextureCreateView(copy, &ad);
+         util_dynarray_append(&replay->views, view);
+         WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+         color.view = view;
+         color.loadOp = WGPULoadOp_Clear;
+         color.storeOp = WGPUStoreOp_Store;
+         WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+         pd.label = wvk_sv("wvk depth-stencil copy");
+         pd.colorAttachmentCount = 1;
+         pd.colorAttachments = &color;
+         WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &pd);
+         wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+         wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+         wgpuRenderPassEncoderDraw(pass, 3, 1, 0, z);
+         wgpuRenderPassEncoderEnd(pass);
+         wgpuRenderPassEncoderRelease(pass);
+      }
+      wgpuBindGroupRelease(group);
+   }
+   wgpuBindGroupLayoutRelease(bgl);
+   return copy;
+}
+
 /* A depth or stencil aspect to a buffer. */
 static void
 copy_ds_to_buffer(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,

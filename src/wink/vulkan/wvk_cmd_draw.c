@@ -466,6 +466,14 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       if (dev->depth_in_pipelines[i].pipeline)
          wgpuRenderPipelineRelease(dev->depth_in_pipelines[i].pipeline);
    }
+   for (uint32_t i = 0; i < ARRAY_SIZE(dev->ds_copy_pipelines); ++i) {
+      if (dev->ds_copy_pipelines[i])
+         wgpuRenderPipelineRelease(dev->ds_copy_pipelines[i]);
+   }
+   for (uint32_t i = 0; i < ARRAY_SIZE(dev->ms_copy_pipelines); ++i) {
+      if (dev->ms_copy_pipelines[i].pipeline)
+         wgpuRenderPipelineRelease(dev->ms_copy_pipelines[i].pipeline);
+   }
    for (uint32_t i = 0; i < ARRAY_SIZE(dev->shadow_pipelines); ++i) {
       for (uint32_t j = 0; j < 2; ++j) {
          if (dev->shadow_pipelines[i][j])
@@ -1125,6 +1133,33 @@ placeholder_view_locked(struct wvk_device *dev, const struct wvk_shader_binding 
 static const struct vk_stencil_test_face_state *draw_stencil_face(const struct wvk_replay *replay,
                                                                    const struct vk_dynamic_graphics_state *dyn);
 
+/* The aspect a shader reads of a descriptor's view: of a view of both
+ * depth and stencil, an input attachment's, the one its type says. */
+static WGPUTextureAspect
+descriptor_aspect(const struct wvk_descriptor *d, const struct wvk_shader_binding *b)
+{
+   if (d->view_desc.aspect != WGPUTextureAspect_All || !d->view_image ||
+       d->view_image->vk.aspects != (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+      return d->view_desc.aspect;
+   return b->sample_type == WGPUTextureSampleType_Uint || b->sample_type == WGPUTextureSampleType_Sint
+             ? WGPUTextureAspect_StencilOnly : WGPUTextureAspect_DepthOnly;
+}
+
+/* What a snapshot of what the descriptor reads is of: the view's texture,
+ * or of a depth-stencil image the aspect read. */
+#define WVK_SNAPSHOT_DEPTH 29
+#define WVK_SNAPSHOT_STENCIL 30
+
+static uint32_t
+snapshot_key(const struct wvk_descriptor *d, const struct wvk_shader_binding *b)
+{
+   if (!(d->view_image->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)))
+      return d->view_texture;
+   return descriptor_aspect(d, b) == WGPUTextureAspect_StencilOnly ||
+                (d->view_image->vk.aspects == VK_IMAGE_ASPECT_STENCIL_BIT)
+             ? WVK_SNAPSHOT_STENCIL : WVK_SNAPSHOT_DEPTH;
+}
+
 /* The copy of an image's texture the pass renders to, if it has one. */
 static WGPUTexture
 find_snapshot(const struct wvk_replay *replay, const struct wvk_image *image, uint32_t t)
@@ -1146,6 +1181,9 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
    WGPUBindGroupEntry *entries = calloc(MAX2(bgl->count, 1), sizeof(*entries));
    if (!entries)
       return NULL;
+   /* Views made for it, which it keeps. */
+   struct util_dynarray own_views;
+   util_dynarray_init(&own_views, NULL);
    for (uint32_t i = 0; i < bgl->count; ++i) {
       const struct wvk_shader_binding *b = &bgl->entries[i].b;
       WGPUBindGroupEntry *e = &entries[i];
@@ -1201,26 +1239,52 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       case WVK_BINDING_STORAGE_TEXTURE:
          e->textureView = d && d->view ? d->view : placeholder_view(dev, b);
          if (replay && d && d->view_image && b->kind == WVK_BINDING_TEXTURE) {
-            WGPUTexture copy = find_snapshot(replay, d->view_image, d->view_texture);
-            WGPUTextureView v = copy ? wgpuTextureCreateView(copy, &d->view_desc) : NULL;
+            const uint32_t key = snapshot_key(d, b);
+            WGPUTexture copy = find_snapshot(replay, d->view_image, key);
+            /* A copy of depth or stencil is of that alone, as a colour. */
+            WGPUTextureViewDescriptor vd = d->view_desc;
+            if (key == WVK_SNAPSHOT_DEPTH || key == WVK_SNAPSHOT_STENCIL) {
+               vd.format = WGPUTextureFormat_Undefined;
+               vd.aspect = WGPUTextureAspect_All;
+            }
+            WGPUTextureView v = copy ? wgpuTextureCreateView(copy, &vd) : NULL;
             if (v) {
                util_dynarray_append(&replay->views, v);
                e->textureView = v;
             }
          }
-         if (!e->textureView) {
-            free(entries);
-            return NULL;
+         if (d && d->view && d->view_image && descriptor_aspect(d, b) != d->view_desc.aspect &&
+             e->textureView == d->view) {
+            WGPUTextureViewDescriptor vd = d->view_desc;
+            vd.aspect = descriptor_aspect(d, b);
+            vd.format = WGPUTextureFormat_Undefined;
+            uint32_t first_level;
+            WGPUTextureView v = wgpuTextureCreateView(wvk_image_texture(d->view_image, d->view_texture, &first_level),
+                                                      &vd);
+            if (v) {
+               util_dynarray_append(&own_views, v);
+               e->textureView = v;
+            }
          }
          break;
       }
+   }
+   WGPUBindGroup bg = NULL;
+   for (uint32_t i = 0; i < bgl->count; ++i) {
+      const uint8_t kind = bgl->entries[i].b.kind;
+      if ((kind == WVK_BINDING_TEXTURE || kind == WVK_BINDING_STORAGE_TEXTURE) && !entries[i].textureView)
+         goto out;
    }
    WGPUBindGroupDescriptor desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
    desc.label = wvk_sv("wvk bind group");
    desc.layout = bgl->layout;
    desc.entryCount = bgl->count;
    desc.entries = entries;
-   WGPUBindGroup bg = wgpuDeviceCreateBindGroup(dev->wgpu, &desc);
+   bg = wgpuDeviceCreateBindGroup(dev->wgpu, &desc);
+out:
+   util_dynarray_foreach(&own_views, WGPUTextureView, v)
+      wgpuTextureViewRelease(*v);
+   util_dynarray_fini(&own_views);
    free(entries);
    return bg;
 }
@@ -1342,7 +1406,7 @@ reads_snapshot(const struct wvk_replay *replay, const struct wvk_bgl *bgl, const
       bool sampler;
       uint32_t dynamic_index;
       const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
-      if (d && d->view_image && find_snapshot(replay, d->view_image, d->view_texture))
+      if (d && d->view_image && find_snapshot(replay, d->view_image, snapshot_key(d, b)))
          return true;
    }
    return false;
@@ -1353,7 +1417,7 @@ reads_snapshot(const struct wvk_replay *replay, const struct wvk_bgl *bgl, const
  * may, read-only. Of another texture of the image's, what it reads is a
  * copy already (sync_image_textures). */
 static bool
-is_rendered_to(const struct wvk_replay *replay, const struct wvk_descriptor *d)
+is_rendered_to(const struct wvk_replay *replay, const struct wvk_descriptor *d, WGPUTextureAspect aspect)
 {
    for (uint32_t i = 0; i < replay->rendering.color_count; ++i) {
       const struct wvk_image_view *color = replay->rendering.color[i];
@@ -1363,7 +1427,7 @@ is_rendered_to(const struct wvk_replay *replay, const struct wvk_descriptor *d)
    const struct wvk_image_view *ds = replay->rendering.depth_stencil;
    if (!ds || wvk_image_view_image(ds) != d->view_image)
       return false;
-   switch (d->view_desc.aspect) {
+   switch (aspect) {
    case WGPUTextureAspect_DepthOnly:
       return !replay->rendering.depth_read_only;
    case WGPUTextureAspect_StencilOnly:
@@ -1393,19 +1457,27 @@ snapshot_feedback(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout)
          bool sampler;
          uint32_t dynamic_index;
          const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
-         if (!d || !d->view_image || !is_rendered_to(replay, d) ||
-             find_snapshot(replay, d->view_image, d->view_texture))
+         if (!d || !d->view_image || !is_rendered_to(replay, d, descriptor_aspect(d, b)))
+            continue;
+         const uint32_t key = snapshot_key(d, b);
+         if (find_snapshot(replay, d->view_image, key))
             continue;
          if (!ended) {
             wvk_replay_end_passes(replay);
             ended = true;
          }
-         WGPUTexture copy = wvk_image_snapshot(dev->wgpu, d->view_image, d->view_texture, replay->encoder);
+         WGPUTexture copy;
+         if (key == WVK_SNAPSHOT_DEPTH || key == WVK_SNAPSHOT_STENCIL)
+            copy = wvk_image_snapshot_ds(dev, replay, d->view_image, key == WVK_SNAPSHOT_STENCIL);
+         else if (d->view_image->vk.samples > 1)
+            copy = wvk_image_snapshot_ms(dev, replay, d->view_image);
+         else
+            copy = wvk_image_snapshot(dev->wgpu, d->view_image, d->view_texture, replay->encoder);
          if (!copy) {
-            mesa_logw_once("wvk: a pass reads a multisampled or depth image it renders to");
+            mesa_logw_once("wvk: a pass reads a multisampled depth image it renders to");
             continue;
          }
-         const struct wvk_snapshot snapshot = { d->view_image, d->view_texture, copy };
+         const struct wvk_snapshot snapshot = { d->view_image, key, copy };
          util_dynarray_append(&replay->snapshots, snapshot);
       }
    }

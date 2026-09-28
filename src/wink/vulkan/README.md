@@ -54,9 +54,13 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **A pass that reads what it renders to** -- an input attachment of its own
   subpass, a feedback loop -- reads a copy, which WebGPU wants: a texture is
   an attachment or bound in a pass, not both. The copy is made before the
-  draw, with the pass begun again after, and kept until a barrier. Depth
-  and stencil in read-only layouts are read-only to WebGPU, which lets
-  shaders read them as they are.
+  draw, with the pass begun again after, and kept until a barrier: a
+  texture copy, or where WebGPU copies none a pass loading each texel --
+  each sample of a multisampled image, depth into R32Float and stencil
+  into R8Uint. Depth and stencil in read-only layouts are read-only to
+  WebGPU, which lets shaders read them as they are. Passes store what
+  they render even where Vulkan does not care, since one may be ended
+  and begun again before Vulkan's is over.
 - **Views in other formats.** WebGPU views a texture only as its format
   or its sRGB twin. A view of another format of the same texel size, or an
   uncompressed view of a compressed image (a texel a block), is of another
@@ -197,8 +201,7 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Multisampled array images are a texture for each layer, since WebGPU
   has no multisampled arrays: attachments, clears and resolves are right,
   but a shader sampling one sees its first layer.
-- Feedback loops on multisampled images, and on depth or stencil that is
-  written: WebGPU copies neither.
+- Feedback loops on multisampled depth or stencil that is written.
 - Formats WebGPU does not multisample (RG32 and RGBA32 among them) have
   one sample, though Vulkan wants every colour attachment format to have
   framebufferColorSampleCounts.

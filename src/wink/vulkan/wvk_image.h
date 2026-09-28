@@ -161,6 +161,15 @@ wvk_image_layer_texture(const struct wvk_image *image, uint32_t layer, uint32_t 
 WGPUTexture wvk_image_snapshot(WGPUDevice device, const struct wvk_image *image, uint32_t t,
                                WGPUCommandEncoder encoder);
 
+/* The same of a multisampled colour image's first layer, which is what
+ * shaders see of it: a pass copying each sample (wvk_cmd_copy.c). */
+WGPUTexture wvk_image_snapshot_ms(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image);
+
+/* The same of a depth-stencil image's depth, as R32Float, or its stencil,
+ * as R8Uint; one sample only (wvk_cmd_copy.c). */
+WGPUTexture wvk_image_snapshot_ds(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image,
+                                  bool stencil);
+
 /* Copy an atomic image's texels from its texture to its buffer, or back,
  * outside any pass. */
 void wvk_image_copy_atomic(struct wvk_image *image, WGPUCommandEncoder encoder, bool to_buffer);
