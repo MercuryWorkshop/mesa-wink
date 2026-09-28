@@ -9,6 +9,9 @@
 
 #include "vk_image.h"
 
+struct wvk_device_memory;
+struct wvk_physical_device;
+
 /* A WGPUTexture of its own; its memory is accounting only. A 1D image is
  * a 2D texture one texel high, so that it can have mips and be rendered
  * to, which WebGPU's 1D textures cannot. */
@@ -18,7 +21,20 @@ struct wvk_image {
    WGPUTextureFormat format;
    WGPUTextureDimension dimension;
    WGPUTextureUsage usage;
+
+   /* A linear image has no texture: it is its memory, rows `pitch` bytes
+    * apart -- 256-aligned, so copies to and from textures are one WebGPU
+    * copy each. Only transfers use one. */
+   bool linear;
+   uint32_t pitch;
+   struct wvk_device_memory *mem;
+   uint64_t offset;
 };
+
+/* Whether an image of this format, type and so on can be linear. */
+bool wvk_image_linear_supported(const struct wvk_physical_device *pdev, VkFormat format, VkImageType type,
+                                VkImageUsageFlags usage);
+uint32_t wvk_image_linear_pitch(VkFormat format, uint32_t width);
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE)
 

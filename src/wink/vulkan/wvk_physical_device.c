@@ -14,6 +14,7 @@
 
 #include "wvk_entrypoints.h"
 #include "wvk_format.h"
+#include "wvk_image.h"
 #include "wvk_shader.h"
 #include "wvk_instance.h"
 #include "wvk_platform.h"
@@ -111,8 +112,10 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_uniform_buffer_standard_layout = true,
       .EXT_host_query_reset = true,
       .EXT_separate_stencil_usage = true,
-      .EXT_vertex_attribute_divisor = true,
-      .KHR_vertex_attribute_divisor = true,
+      /* WebGPU steps instances one at a time. TODO: divisors by pulling
+       * vertices in the shader. */
+      .EXT_vertex_attribute_divisor = false,
+      .KHR_vertex_attribute_divisor = false,
    };
    (void)pdev;
 }
@@ -169,8 +172,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .maintenance4 = false,
 
       /* VK_KHR_vertex_attribute_divisor */
-      .vertexAttributeInstanceRateDivisor = true,
-      .vertexAttributeInstanceRateZeroDivisor = true,
+      .vertexAttributeInstanceRateDivisor = false,
+      .vertexAttributeInstanceRateZeroDivisor = false,
 
       /* VK_KHR_portability_subset: what WebGPU leaves out */
       .constantAlphaColorBlendFactors = true,
@@ -367,7 +370,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxPushDescriptors = 32,
 
       /* VK_KHR_vertex_attribute_divisor */
-      .maxVertexAttribDivisor = UINT32_MAX,
+      .maxVertexAttribDivisor = 1,
       .supportsNonZeroFirstInstance = true,
 
       /* VK_KHR_portability_subset */
@@ -612,10 +615,14 @@ wvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat
 
    const VkFormatFeatureFlags2 optimal = optimal_features(pdev, format);
    const VkFormatFeatureFlags2 buffer = buffer_features(pdev, format);
+   /* WebGPU has no linear textures: a linear image is memory, and only
+    * copied to and from. */
+   const VkFormatFeatureFlags2 linear =
+      wvk_image_linear_supported(pdev, format, VK_IMAGE_TYPE_2D, 0)
+         ? VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT : 0;
 
    pFormatProperties->formatProperties = (VkFormatProperties){
-      /* WebGPU has no linear textures. */
-      .linearTilingFeatures = 0,
+      .linearTilingFeatures = vk_format_features2_to_features(linear),
       .optimalTilingFeatures = vk_format_features2_to_features(optimal),
       .bufferFeatures = vk_format_features2_to_features(buffer),
    };
@@ -624,7 +631,7 @@ wvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat
       switch (stype) {
       case VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3: {
          VkFormatProperties3 *p = ext;
-         p->linearTilingFeatures = 0;
+         p->linearTilingFeatures = linear;
          p->optimalTilingFeatures = optimal;
          p->bufferFeatures = buffer;
          break;
@@ -647,7 +654,21 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){ 0 };
 
    const uint32_t caps = wvk_format_caps(pdev, info->format);
-   if (!caps || info->tiling != VK_IMAGE_TILING_OPTIMAL)
+   if (!caps)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if (info->tiling == VK_IMAGE_TILING_LINEAR) {
+      if (!wvk_image_linear_supported(pdev, info->format, info->type, info->usage) || info->flags)
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
+         .maxExtent = { l->maxTextureDimension2D, l->maxTextureDimension2D, 1 },
+         .maxMipLevels = 1,
+         .maxArrayLayers = 1,
+         .sampleCounts = VK_SAMPLE_COUNT_1_BIT,
+         .maxResourceSize = 1ull << 31,
+      };
+      return VK_SUCCESS;
+   }
+   if (info->tiling != VK_IMAGE_TILING_OPTIMAL)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    VkImageUsageFlags usage = info->usage;

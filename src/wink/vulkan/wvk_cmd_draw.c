@@ -35,7 +35,6 @@
 #include <stdlib.h>
 
 #define WVK_PUSH_STRIDE 256
-#define WVK_PUSH_SIZE 128
 #define WVK_MAX_GROUPS 4
 #define WVK_MAX_DYNAMIC 32
 
@@ -632,7 +631,8 @@ struct wvk_bound_state {
    struct wvk_bound_buffer ib;
    VkIndexType index_type;
 
-   uint8_t push[WVK_PUSH_SIZE];
+   /* The push constants, and the driver's data after them. */
+   uint8_t push[WVK_PUSH_DATA_SIZE];
    /* Where push[] is in the submit's push data, or UINT32_MAX if it
     * changed since. */
    uint32_t push_offset;
@@ -640,6 +640,7 @@ struct wvk_bound_state {
    /* Of the current pass: what is set on it. */
    uint32_t pass_serial;
    WGPURenderPipeline pipeline;
+   bool pipeline_flipped;
 };
 
 void
@@ -649,8 +650,11 @@ wvk_replay_reset_state(struct wvk_replay *replay)
       replay->state = calloc(1, sizeof(*replay->state));
    else
       memset(replay->state, 0, sizeof(*replay->state));
-   if (replay->state)
+   if (replay->state) {
       replay->state->push_offset = UINT32_MAX;
+      const float identity[4] = { 1, 0, 1, 0 };
+      memcpy(replay->state->push + WVK_DRIVER_DATA_OFFSET, identity, sizeof(identity));
+   }
 }
 
 void *
@@ -925,7 +929,7 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       if (group == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
          e->buffer = dev->push_buffer;
          e->offset = 0;
-         e->size = WVK_PUSH_SIZE;
+         e->size = WVK_PUSH_DATA_SIZE;
          continue;
       }
       bool sampler = false;
@@ -1034,8 +1038,8 @@ push_offset(struct wvk_device *dev, struct wvk_replay *replay)
    uint8_t *slot = util_dynarray_grow_bytes(&replay->push_data, 1, WVK_PUSH_STRIDE);
    if (!slot)
       return 0;
-   memcpy(slot, st->push, WVK_PUSH_SIZE);
-   memset(slot + WVK_PUSH_SIZE, 0, WVK_PUSH_STRIDE - WVK_PUSH_SIZE);
+   memcpy(slot, st->push, WVK_PUSH_DATA_SIZE);
+   memset(slot + WVK_PUSH_DATA_SIZE, 0, WVK_PUSH_STRIDE - WVK_PUSH_DATA_SIZE);
    st->push_offset = offset;
    return offset;
 }
@@ -1268,6 +1272,7 @@ get_render_pipeline(struct wvk_device *dev, struct wvk_cmd_buffer *cmd, bool ind
 static void
 set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
 {
+   struct wvk_bound_state *st = cmd->replay->state;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    const VkExtent2D extent = cmd->replay->rendering.extent;
    if (dyn->vp.viewport_count) {
@@ -1279,8 +1284,23 @@ set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
       float x0 = CLAMP(v.x, 0.0f, (float)extent.width), y0 = CLAMP(v.y, 0.0f, (float)extent.height);
       float x1 = CLAMP(v.x + v.width, 0.0f, (float)extent.width);
       float y1 = CLAMP(v.y + v.height, 0.0f, (float)extent.height);
-      if (x0 != v.x || y0 != v.y || x1 != v.x + v.width || y1 != v.y + v.height)
-         mesa_logw_once("wvk: a viewport outside the attachments is clamped to them");
+      /* WebGPU's viewport stays inside the attachments, and Vulkan's need
+       * not: the vertex shader scales and moves the position to where the
+       * clamped one puts it, in WebGPU's y-up space. */
+      float transform[4] = { 1, 0, 1, 0 };
+      if (x1 > x0 && y1 > y0 && (x0 != v.x || y0 != v.y || x1 != v.x + v.width || y1 != v.y + v.height)) {
+         const float cw = x1 - x0, ch = y1 - y0;
+         transform[0] = v.width / cw;
+         transform[1] = (2 * (v.x - x0) + v.width - cw) / cw;
+         transform[2] = v.height / ch;
+         const float by = (ch - 2 * (v.y - y0) - v.height) / ch;
+         /* The flipped shader negates y after the transform. */
+         transform[3] = st->pipeline_flipped ? -by : by;
+      }
+      if (memcmp(st->push + WVK_DRIVER_DATA_OFFSET, transform, sizeof(transform))) {
+         memcpy(st->push + WVK_DRIVER_DATA_OFFSET, transform, sizeof(transform));
+         st->push_offset = UINT32_MAX;
+      }
       const float min_depth = CLAMP(MIN2(v.minDepth, v.maxDepth), 0.0f, 1.0f);
       const float max_depth = CLAMP(MAX2(v.minDepth, v.maxDepth), 0.0f, 1.0f);
       wgpuRenderPassEncoderSetViewport(pass, x0, y0, x1 - x0, y1 - y0, min_depth, max_depth);
@@ -1333,6 +1353,10 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
       wgpuRenderPassEncoderSetPipeline(pass, p->pipeline);
       st->pipeline = p->pipeline;
    }
+   st->pipeline_flipped = p->key.variant == WVK_SHADER_FLIPPED;
+   /* Before the bind groups: it writes the driver's data among the push
+    * constants. */
+   set_viewport_scissor(cmd, pass);
    if (!bind_groups(dev, replay, p->layout, WVK_BIND_GRAPHICS, pass, NULL))
       return false;
 
@@ -1355,7 +1379,6 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
       wvk_replay_read(replay, ib->mem, ib->offset, ib->size);
    }
 
-   set_viewport_scissor(cmd, pass);
    const float *bc = dyn->cb.blend_constants;
    const WGPUColor blend = { bc[0], bc[1], bc[2], bc[3] };
    wgpuRenderPassEncoderSetBlendConstant(pass, &blend);

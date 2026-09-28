@@ -68,12 +68,27 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
 
    const struct wvk_format *format = wvk_format_get(pCreateInfo->format);
    const uint32_t caps = wvk_format_caps(pdev, pCreateInfo->format);
-   if (!format || !caps || pCreateInfo->tiling != VK_IMAGE_TILING_OPTIMAL)
+   const bool linear = pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR;
+   if (!format || !caps || (pCreateInfo->tiling != VK_IMAGE_TILING_OPTIMAL && !linear))
+      return vk_error(dev, VK_ERROR_FORMAT_NOT_SUPPORTED);
+   if (linear && (!wvk_image_linear_supported(pdev, pCreateInfo->format, pCreateInfo->imageType,
+                                              pCreateInfo->usage) ||
+                  pCreateInfo->mipLevels != 1 || pCreateInfo->arrayLayers != 1 ||
+                  pCreateInfo->samples != VK_SAMPLE_COUNT_1_BIT))
       return vk_error(dev, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
    struct wvk_image *image = vk_image_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*image));
    if (!image)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   image->format = format->texture;
+   if (linear) {
+      image->linear = true;
+      image->pitch = wvk_image_linear_pitch(pCreateInfo->format, pCreateInfo->extent.width);
+      image->dimension = WGPUTextureDimension_2D;
+      *pImage = wvk_image_to_handle(image);
+      return VK_SUCCESS;
+   }
 
    image->format = format->texture;
    image->dimension = pCreateInfo->imageType == VK_IMAGE_TYPE_3D ? WGPUTextureDimension_3D
@@ -163,16 +178,36 @@ image_size(VkFormat vk_format, VkImageType type, VkExtent3D extent, uint32_t lev
    return size * layers * samples;
 }
 
+bool
+wvk_image_linear_supported(const struct wvk_physical_device *pdev, VkFormat format, VkImageType type,
+                           VkImageUsageFlags usage)
+{
+   const uint32_t caps = wvk_format_caps(pdev, format);
+   return type == VK_IMAGE_TYPE_2D && caps &&
+          !(caps & (WVK_CAP_COMPRESSED | WVK_CAP_DEPTH | WVK_CAP_STENCIL)) &&
+          !(usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT));
+}
+
+uint32_t
+wvk_image_linear_pitch(VkFormat format, uint32_t width)
+{
+   return align(width * util_format_get_blocksize(vk_format_to_pipe_format(format)), 256);
+}
+
 static void
-get_image_requirements(VkFormat format, VkImageType type, VkExtent3D extent, uint32_t levels,
-                       uint32_t layers, VkSampleCountFlagBits samples,
+get_image_requirements(VkFormat format, VkImageType type, VkImageTiling tiling, VkExtent3D extent,
+                       uint32_t levels, uint32_t layers, VkSampleCountFlagBits samples,
                        VkMemoryRequirements2 *pMemoryRequirements)
 {
+   const bool linear = tiling == VK_IMAGE_TILING_LINEAR;
+   const uint64_t size = linear ? (uint64_t)wvk_image_linear_pitch(format, extent.width) * extent.height
+                                : image_size(format, type, extent, levels, layers, samples);
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){
-      .size = align64(MAX2(image_size(format, type, extent, levels, layers, samples), 1), 256),
+      .size = align64(MAX2(size, 1), 256),
       .alignment = 256,
-      /* There are no linear images to map. */
-      .memoryTypeBits = BITFIELD_BIT(WVK_MEMORY_DEVICE),
+      /* Linear images are memory, and may be mapped; the rest are
+       * textures of their own. */
+      .memoryTypeBits = linear ? BITFIELD_MASK(WVK_MEMORY_TYPE_COUNT) : BITFIELD_BIT(WVK_MEMORY_DEVICE),
    };
    vk_foreach_struct(stype, ext, pMemoryRequirements->pNext) {
       switch (stype) {
@@ -194,7 +229,7 @@ wvk_GetImageMemoryRequirements2(VkDevice _device, const VkImageMemoryRequirement
                                 VkMemoryRequirements2 *pMemoryRequirements)
 {
    VK_FROM_HANDLE(wvk_image, image, pInfo->image);
-   get_image_requirements(image->vk.format, image->vk.image_type, image->vk.extent,
+   get_image_requirements(image->vk.format, image->vk.image_type, image->vk.tiling, image->vk.extent,
                           image->vk.mip_levels, image->vk.array_layers, image->vk.samples,
                           pMemoryRequirements);
 }
@@ -204,8 +239,8 @@ wvk_GetDeviceImageMemoryRequirements(VkDevice _device, const VkDeviceImageMemory
                                      VkMemoryRequirements2 *pMemoryRequirements)
 {
    const VkImageCreateInfo *ci = pInfo->pCreateInfo;
-   get_image_requirements(ci->format, ci->imageType, ci->extent, ci->mipLevels, ci->arrayLayers,
-                          ci->samples, pMemoryRequirements);
+   get_image_requirements(ci->format, ci->imageType, ci->tiling, ci->extent, ci->mipLevels,
+                          ci->arrayLayers, ci->samples, pMemoryRequirements);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -227,20 +262,45 @@ wvk_GetDeviceImageSparseMemoryRequirements(VkDevice device, const VkDeviceImageM
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindImageMemoryInfo *pBindInfos)
 {
+   VK_FROM_HANDLE(wvk_device, dev, _device);
+   VkResult result = VK_SUCCESS;
    for (uint32_t i = 0; i < bindInfoCount; ++i) {
+      VK_FROM_HANDLE(wvk_image, image, pBindInfos[i].image);
+      VK_FROM_HANDLE(wvk_device_memory, mem, pBindInfos[i].memory);
+      VkResult r = VK_SUCCESS;
+      image->mem = mem;
+      image->offset = pBindInfos[i].memoryOffset;
+      /* A linear image is its memory's buffer. */
+      if (image->linear && mem) {
+         WGPUBuffer buffer;
+         r = wvk_device_memory_get_buffer(dev, mem, &buffer);
+      }
       const VkBindMemoryStatusKHR *status = vk_find_struct_const(pBindInfos[i].pNext, BIND_MEMORY_STATUS_KHR);
       if (status && status->pResult)
-         *status->pResult = VK_SUCCESS;
+         *status->pResult = r;
+      if (r != VK_SUCCESS)
+         result = r;
    }
-   return VK_SUCCESS;
+   return result;
 }
 
-/* Only linear images have a layout to report, and there are none. */
+/* Only linear images have a layout to report. */
 VKAPI_ATTR void VKAPI_CALL
-wvk_GetImageSubresourceLayout2KHR(VkDevice device, VkImage image, const VkImageSubresource2KHR *pSubresource,
+wvk_GetImageSubresourceLayout2KHR(VkDevice device, VkImage _image, const VkImageSubresource2KHR *pSubresource,
                                   VkSubresourceLayout2KHR *pLayout)
 {
+   VK_FROM_HANDLE(wvk_image, image, _image);
    pLayout->subresourceLayout = (VkSubresourceLayout){ 0 };
+   if (!image->linear)
+      return;
+   const uint64_t size = (uint64_t)image->pitch * image->vk.extent.height;
+   pLayout->subresourceLayout = (VkSubresourceLayout){
+      .offset = 0,
+      .size = size,
+      .rowPitch = image->pitch,
+      .arrayPitch = size,
+      .depthPitch = size,
+   };
 }
 
 /* ---------------------------------------------------------------------- */

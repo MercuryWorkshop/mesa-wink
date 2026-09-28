@@ -351,6 +351,21 @@ repack(struct wvk_device *dev, struct wvk_replay *replay, WGPUBuffer src, uint64
    dispatch(dev, replay, pipeline, entries, 2, params, sizeof(params), DIV_ROUND_UP(row_bytes, 64), rows, images);
 }
 
+/* Where texel (x, y) of a linear image is in its memory. */
+static uint64_t
+linear_offset(const struct wvk_image *image, VkOffset3D o)
+{
+   const uint32_t bpp = util_format_get_blocksize(vk_format_to_pipe_format(image->vk.format));
+   return image->offset + (uint64_t)o.y * image->pitch + (uint64_t)o.x * bpp;
+}
+
+static uint64_t
+linear_bytes(const struct wvk_image *image, VkExtent3D e)
+{
+   const uint32_t bpp = util_format_get_blocksize(vk_format_to_pipe_format(image->vk.format));
+   return (uint64_t)(e.height - 1) * image->pitch + (uint64_t)e.width * bpp;
+}
+
 static bool
 is_ds_aspect(VkImageAspectFlags aspect)
 {
@@ -503,7 +518,14 @@ wvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIma
                                                  r->bufferRowLength, r->bufferImageHeight, r->imageExtent);
       const uint64_t off = buffer_offset(src, r->bufferOffset);
       wvk_replay_read(replay, src->mem, off, region_bytes(&l, size));
-      if (is_ds_aspect(r->imageSubresource.aspectMask))
+      if (dst->linear) {
+         const uint32_t bpp = util_format_get_blocksize(vk_format_to_pipe_format(dst->vk.format));
+         const uint64_t at = linear_offset(dst, r->imageOffset);
+         repack(wvk_cmd_buffer_device(cmd), replay, buffer_wgpu(src), off, l.row_bytes,
+                l.rows_per_image * l.row_bytes, dst->mem->buffer, at, dst->pitch, 0,
+                r->imageExtent.width * bpp, r->imageExtent.height, 1);
+         wvk_replay_write(replay, dst->mem, at, linear_bytes(dst, r->imageExtent));
+      } else if (is_ds_aspect(r->imageSubresource.aspectMask))
          copy_buffer_to_ds(wvk_cmd_buffer_device(cmd), replay, dst, r->imageSubresource.aspectMask, &tex,
                            size, buffer_wgpu(src), off, &l);
       else
@@ -529,11 +551,55 @@ wvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBuff
                                                  r->bufferRowLength, r->bufferImageHeight, r->imageExtent);
       const uint64_t off = buffer_offset(dst, r->bufferOffset);
       wvk_replay_write(replay, dst->mem, off, region_bytes(&l, size));
-      if (is_ds_aspect(r->imageSubresource.aspectMask))
+      if (src->linear) {
+         const uint32_t bpp = util_format_get_blocksize(vk_format_to_pipe_format(src->vk.format));
+         const uint64_t at = linear_offset(src, r->imageOffset);
+         wvk_replay_read(replay, src->mem, at, linear_bytes(src, r->imageExtent));
+         repack(wvk_cmd_buffer_device(cmd), replay, src->mem->buffer, at, src->pitch, 0, buffer_wgpu(dst),
+                off, l.row_bytes, l.rows_per_image * l.row_bytes, r->imageExtent.width * bpp,
+                r->imageExtent.height, 1);
+      } else if (is_ds_aspect(r->imageSubresource.aspectMask))
          copy_ds_to_buffer(wvk_cmd_buffer_device(cmd), replay, src, r->imageSubresource.aspectMask, &tex,
                            size, buffer_wgpu(dst), off, &l);
       else
          copy_buffer_texture(replay, false, buffer_wgpu(dst), off, &l, &tex, size);
+   }
+}
+
+/* A copy with a linear image on one side or both: a texture-buffer copy
+ * with the linear image's pitch, which is aligned for it, or a repack
+ * between two of them. */
+static void
+copy_image_linear(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *src,
+                  struct wvk_image *dst, const VkImageCopy2 *r)
+{
+   const uint32_t bpp = util_format_get_blocksize(vk_format_to_pipe_format(src->vk.format));
+   if (src->linear && dst->linear) {
+      const uint64_t from = linear_offset(src, r->srcOffset), to = linear_offset(dst, r->dstOffset);
+      wvk_replay_read(replay, src->mem, from, linear_bytes(src, r->extent));
+      repack(dev, replay, src->mem->buffer, from, src->pitch, 0, dst->mem->buffer, to, dst->pitch, 0,
+             r->extent.width * bpp, r->extent.height, 1);
+      wvk_replay_write(replay, dst->mem, to, linear_bytes(dst, r->extent));
+      return;
+   }
+   struct wvk_image *linear = src->linear ? src : dst;
+   struct wvk_image *tiled = src->linear ? dst : src;
+   WGPUTexelCopyTextureInfo tex;
+   WGPUExtent3D size;
+   image_region(tiled, src->linear ? &r->dstSubresource : &r->srcSubresource,
+                src->linear ? r->dstOffset : r->srcOffset, r->extent, &tex, &size);
+   const VkOffset3D at = src->linear ? r->srcOffset : r->dstOffset;
+   WGPUTexelCopyBufferInfo buf = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+   buf.buffer = linear->mem->buffer;
+   buf.layout.offset = linear_offset(linear, at);
+   buf.layout.bytesPerRow = linear->pitch;
+   buf.layout.rowsPerImage = size.height;
+   if (src->linear) {
+      wvk_replay_read(replay, linear->mem, buf.layout.offset, linear_bytes(linear, r->extent));
+      wgpuCommandEncoderCopyBufferToTexture(replay->encoder, &buf, &tex, &size);
+   } else {
+      wgpuCommandEncoderCopyTextureToBuffer(replay->encoder, &tex, &buf, &size);
+      wvk_replay_write(replay, linear->mem, buf.layout.offset, linear_bytes(linear, r->extent));
    }
 }
 
@@ -554,6 +620,10 @@ wvk_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyIm
                         util_format_linear(vk_format_to_pipe_format(dst->vk.format));
    for (uint32_t i = 0; i < pCopyImageInfo->regionCount; ++i) {
       const VkImageCopy2 *r = &pCopyImageInfo->pRegions[i];
+      if (src->linear || dst->linear) {
+         copy_image_linear(dev, replay, src, dst, r);
+         continue;
+      }
       WGPUTexelCopyTextureInfo s, d;
       WGPUExtent3D size, dsize;
       image_region(src, &r->srcSubresource, r->srcOffset, r->extent, &s, &size);

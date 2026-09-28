@@ -728,6 +728,52 @@ zero_descriptors_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* The viewport transform from the driver's data: a vertex shader's
+ * position is scaled and moved to where Vulkan's viewport would have put
+ * it, WebGPU's being kept inside the attachments. See set_viewport_scissor. */
+static bool
+lower_viewport_transform(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_VERTEX)
+      return false;
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_store_deref)
+               continue;
+            nir_variable *var = nir_intrinsic_get_var(intr, 0);
+            if (!var || var->data.mode != nir_var_shader_out || var->data.location != VARYING_SLOT_POS)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_def *index = nir_vulkan_resource_index(&b, 2, 32, nir_imm_int(&b, 0),
+                                                       .desc_set = WVK_DRIVER_GROUP,
+                                                       .binding = WVK_DRIVER_SLOT_PUSH,
+                                                       .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            nir_def *desc = nir_load_vulkan_descriptor(&b, 2, 32, index,
+                                                       .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            nir_def *t = nir_load_ssbo(&b, 4, 32, nir_channel(&b, desc, 0),
+                                       nir_imm_int(&b, WVK_DRIVER_DATA_OFFSET), .align_mul = 16,
+                                       .access = ACCESS_NON_WRITEABLE);
+            nir_def *pos = intr->src[1].ssa;
+            nir_def *w = nir_channel(&b, pos, 3);
+            nir_def *x = nir_ffma(&b, nir_channel(&b, pos, 0), nir_channel(&b, t, 0),
+                                  nir_fmul(&b, w, nir_channel(&b, t, 1)));
+            nir_def *y = nir_ffma(&b, nir_channel(&b, pos, 1), nir_channel(&b, t, 2),
+                                  nir_fmul(&b, w, nir_channel(&b, t, 3)));
+            nir_src_rewrite(&intr->src[1], nir_vec4(&b, x, y, nir_channel(&b, pos, 2), w));
+            progress = true;
+         }
+      }
+      nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 static bool
 lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *info, void *mem_ctx)
 {
@@ -745,6 +791,7 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
    }
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo | nir_var_mem_ssbo,
             nir_address_format_32bit_index_offset);
+   NIR_PASS(_, nir, lower_viewport_transform);
    const nir_lower_mem_access_bit_sizes_options sizes = {
       .callback = word_access,
       .modes = nir_var_mem_ubo | nir_var_mem_ssbo,
@@ -865,6 +912,51 @@ demote_to_terminate_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    else
       return false;
    return true;
+}
+
+/* A fragment output of fewer components than its attachment has, which
+ * Vulkan leaves undefined and WebGPU refuses: every colour output is a
+ * vec4, the rest zero. */
+static bool
+pad_fragment_outputs(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+   bool progress = false;
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location < FRAG_RESULT_DATA0 || glsl_type_is_array(var->type))
+         continue;
+      const unsigned n = glsl_get_vector_elements(var->type);
+      if (n == 4 || !glsl_type_is_vector_or_scalar(var->type))
+         continue;
+      const struct glsl_type *old = var->type;
+      var->type = glsl_vector_type(glsl_get_base_type(old), 4);
+      nir_foreach_function_impl(impl, nir) {
+         nir_builder b = nir_builder_create(impl);
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr_safe(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_store_deref ||
+                   nir_intrinsic_get_var(intr, 0) != var)
+                  continue;
+               b.cursor = nir_before_instr(instr);
+               nir_def *value = intr->src[1].ssa;
+               nir_def *comps[4];
+               for (unsigned c = 0; c < 4; ++c)
+                  comps[c] = c < value->num_components ? nir_channel(&b, value, c)
+                                                       : nir_imm_zero(&b, 1, value->bit_size);
+               nir_src_rewrite(&intr->src[1], nir_vec(&b, comps, 4));
+               nir_intrinsic_set_write_mask(intr, 0xf);
+            }
+         }
+      }
+      progress = true;
+   }
+   if (progress)
+      nir_fixup_deref_types(nir);
+   return progress;
 }
 
 static bool
@@ -1191,6 +1283,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
             NULL);
    NIR_PASS(_, nir, lower_1d_images);
    NIR_PASS(_, nir, lower_ms_arrays);
+   NIR_PASS(_, nir, pad_fragment_outputs);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, demote_to_terminate_instr, nir_metadata_all, NULL);
    lower_buffers_to_words(nir, info, mem_ctx);
    optimize(nir);
