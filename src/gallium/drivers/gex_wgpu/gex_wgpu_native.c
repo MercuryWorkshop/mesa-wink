@@ -211,6 +211,12 @@ create_device(void)
     * fails the whole device. */
    static const WGPUFeatureName optional[] = {
       WGPUFeatureName_TextureCompressionBC,
+      /* GL ES 3.2's compression. Every browser adapter measured has all
+       * three, and without them st/mesa decodes ASTC and ETC2 on the CPU --
+       * correct, but a different path from the one the browser takes. */
+      WGPUFeatureName_TextureCompressionASTC,
+      WGPUFeatureName_TextureCompressionASTCSliced3D,
+      WGPUFeatureName_TextureCompressionETC2,
       WGPUFeatureName_Depth32FloatStencil8,
       WGPUFeatureName_RG11B10UfloatRenderable,
       WGPUFeatureName_DepthClipControl,

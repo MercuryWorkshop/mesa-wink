@@ -1510,6 +1510,14 @@ struct gex_wgpu_screen {
    WGPURenderPipeline msaa_depth[5];
    WGPUBindGroupLayout msaa_depth_layout;
    bool texture_compression_bc;
+   /* ASTC LDR and ETC2/EAC, which is what GL ES 3.2 names for texture
+    * compression. st/mesa can decode either on the CPU, and without these it
+    * does; with them the blocks go to the GPU as they are, a quarter to an
+    * eighth of the memory and none of the decode. ASTC is taken only with its
+    * sliced-3D companion: st/mesa's fallback is all-or-nothing, so a 3D ASTC
+    * texture this driver refused would have no format at all. */
+   bool texture_compression_astc;
+   bool texture_compression_etc2;
    /* WebGPU's `dual-source-blending`. It gates ARB_blend_func_extended, which
     * is one of the two things standing between this driver and GL 3.3, and
     * without it the SRC1 blend factors have no meaning and a fragment shader
@@ -18917,6 +18925,27 @@ gex_wgpu_texture_format(enum pipe_format format)
    case PIPE_FORMAT_BPTC_RGB_UFLOAT: return WGPUTextureFormat_BC6HRGBUfloat;
    case PIPE_FORMAT_BPTC_RGBA_UNORM: return WGPUTextureFormat_BC7RGBAUnorm;
    case PIPE_FORMAT_BPTC_SRGBA: return WGPUTextureFormat_BC7RGBAUnormSrgb;
+   /* ETC1 is a subset of ETC2 RGB8, bit for bit. */
+   case PIPE_FORMAT_ETC1_RGB8:
+   case PIPE_FORMAT_ETC2_RGB8: return WGPUTextureFormat_ETC2RGB8Unorm;
+   case PIPE_FORMAT_ETC2_SRGB8: return WGPUTextureFormat_ETC2RGB8UnormSrgb;
+   case PIPE_FORMAT_ETC2_RGB8A1: return WGPUTextureFormat_ETC2RGB8A1Unorm;
+   case PIPE_FORMAT_ETC2_SRGB8A1: return WGPUTextureFormat_ETC2RGB8A1UnormSrgb;
+   case PIPE_FORMAT_ETC2_RGBA8: return WGPUTextureFormat_ETC2RGBA8Unorm;
+   case PIPE_FORMAT_ETC2_SRGBA8: return WGPUTextureFormat_ETC2RGBA8UnormSrgb;
+   case PIPE_FORMAT_ETC2_R11_UNORM: return WGPUTextureFormat_EACR11Unorm;
+   case PIPE_FORMAT_ETC2_R11_SNORM: return WGPUTextureFormat_EACR11Snorm;
+   case PIPE_FORMAT_ETC2_RG11_UNORM: return WGPUTextureFormat_EACRG11Unorm;
+   case PIPE_FORMAT_ETC2_RG11_SNORM: return WGPUTextureFormat_EACRG11Snorm;
+   /* ASTC LDR, 2D blocks. The HDR (_FLOAT) and 3D-block formats have no
+    * WebGPU equivalent. */
+#define GEX_ASTC(w, h)                                                        \
+   case PIPE_FORMAT_ASTC_##w##x##h: return WGPUTextureFormat_ASTC##w##x##h##Unorm; \
+   case PIPE_FORMAT_ASTC_##w##x##h##_SRGB: return WGPUTextureFormat_ASTC##w##x##h##UnormSrgb;
+   GEX_ASTC(4, 4) GEX_ASTC(5, 4) GEX_ASTC(5, 5) GEX_ASTC(6, 5) GEX_ASTC(6, 6)
+   GEX_ASTC(8, 5) GEX_ASTC(8, 6) GEX_ASTC(8, 8) GEX_ASTC(10, 5) GEX_ASTC(10, 6)
+   GEX_ASTC(10, 8) GEX_ASTC(10, 10) GEX_ASTC(12, 10) GEX_ASTC(12, 12)
+#undef GEX_ASTC
    case PIPE_FORMAT_Z32_FLOAT: return WGPUTextureFormat_Depth32Float;
    /* Z16_UNORM was absent twice, both times because a depth-only framebuffer
     * had no render pass to draw into -- "draw refused (no colour target)" --
@@ -19015,6 +19044,35 @@ gex_wgpu_is_bc_format(enum pipe_format format)
           format == PIPE_FORMAT_BPTC_RGB_UFLOAT ||
           format == PIPE_FORMAT_BPTC_RGBA_UNORM ||
           format == PIPE_FORMAT_BPTC_SRGBA;
+}
+
+/* The ASTC formats WebGPU has: LDR with 2D blocks. Asked of the mapping
+ * rather than of the format description, which cannot tell HDR from LDR --
+ * both are one opaque 128-bit channel there. */
+static bool
+gex_wgpu_is_astc_format(enum pipe_format format)
+{
+   const struct util_format_description *d = util_format_description(format);
+   return d && d->layout == UTIL_FORMAT_LAYOUT_ASTC &&
+          gex_wgpu_texture_format(format) != WGPUTextureFormat_Undefined;
+}
+
+/* ETC1 and every ETC2/EAC format; WebGPU has them all. */
+static bool
+gex_wgpu_is_etc_format(enum pipe_format format)
+{
+   const struct util_format_description *d = util_format_description(format);
+   return d && d->layout == UTIL_FORMAT_LAYOUT_ETC;
+}
+
+/* Stored as blocks, and sized, copied and read back in them. Every path that
+ * asked "is this BC?" for that reason asks this instead; only the support
+ * query needs to know which family, for the feature that gates it. */
+static bool
+gex_wgpu_is_compressed_format(enum pipe_format format)
+{
+   return gex_wgpu_is_bc_format(format) || gex_wgpu_is_astc_format(format) ||
+          gex_wgpu_is_etc_format(format);
 }
 
 /* Bytes per pixel, from Mesa's own format table rather than a list here.
@@ -19332,6 +19390,21 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
              MAX2(1, sample_count) == 1 &&
              MAX2(1, storage_sample_count) == 1;
    }
+   /* Every block size or none -- st/mesa enables the extension, and stops
+    * decoding on the CPU, on the strength of one of them -- and 3D as well as
+    * 2D, since the sliced-3D feature came with it. ETC2 has no 3D form. */
+   if (gex_wgpu_is_astc_format(format) || gex_wgpu_is_etc_format(format)) {
+      const bool astc = gex_wgpu_is_astc_format(format);
+      const bool target_supported =
+         target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_2D_ARRAY ||
+         target == PIPE_TEXTURE_CUBE || target == PIPE_TEXTURE_CUBE_ARRAY ||
+         (astc && target == PIPE_TEXTURE_3D);
+      return (astc ? gex_screen(screen)->texture_compression_astc
+                   : gex_screen(screen)->texture_compression_etc2) &&
+             target_supported && bind == PIPE_BIND_SAMPLER_VIEW &&
+             MAX2(1, sample_count) == 1 &&
+             MAX2(1, storage_sample_count) == 1;
+   }
    /* Stencil as data. The two padded spellings are *view* formats -- st/mesa
     * never allocates one, it asks for a stencil-aspect view of a combined
     * texture it already has -- so they take the sampler bind only, while
@@ -19629,7 +19702,7 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
        gex_wgpu_storage_texture_format(templ->format) ==
           WGPUTextureFormat_Undefined &&
        !util_format_is_depth_or_stencil(templ->format) &&
-       !gex_wgpu_is_bc_format(templ->format)) {
+       !gex_wgpu_is_compressed_format(templ->format)) {
       static unsigned told;
       if (told < 40) {
          ++told;
@@ -19787,7 +19860,7 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
    const unsigned requested_samples = MAX2(1, templ->nr_samples);
    const struct gex_wgpu_screen *screen_limits = gex_screen(screen);
    if ((gex_wgpu_texture_format(templ->format) == WGPUTextureFormat_Undefined &&
-        !gex_wgpu_is_bc_format(templ->format)) ||
+        !gex_wgpu_is_compressed_format(templ->format)) ||
        (requested_samples != 1 &&
         !gex_wgpu_is_format_supported(screen, templ->format, templ->target,
                                       templ->nr_samples,
@@ -19857,7 +19930,7 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
     * !stObj->pt) return GL_FALSE` in fbobject.c, which is indistinguishable
     * from a format refusal at the GL level. Say which format, once each. */
    if (gex_wgpu_texture_format(templ->format) == WGPUTextureFormat_Undefined &&
-       !gex_wgpu_is_bc_format(templ->format)) {
+       !gex_wgpu_is_compressed_format(templ->format)) {
       static uint64_t said[(PIPE_FORMAT_COUNT + 63) / 64];
       const unsigned word = (unsigned)templ->format / 64;
       const uint64_t bit = 1ull << ((unsigned)templ->format % 64);
@@ -20001,8 +20074,10 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
     * sampled slightly wrong until the shader compensates. */
    const unsigned block_w = util_format_get_blockwidth(templ->format);
    const unsigned block_h = util_format_get_blockheight(templ->format);
-   desc.size.width = block_w > 1 ? align(templ->width0, block_w) : templ->width0;
-   desc.size.height = block_h > 1 ? align(templ->height0, block_h)
+   /* util_align_npot, not align: ASTC blocks come 5, 6, 10 and 12 wide. */
+   desc.size.width = block_w > 1 ? util_align_npot(templ->width0, block_w)
+                                 : templ->width0;
+   desc.size.height = block_h > 1 ? util_align_npot(templ->height0, block_h)
                                   : templ->height0;
    desc.size.depthOrArrayLayers = templ->target == PIPE_TEXTURE_3D
       ? templ->depth0 : templ->array_size;
@@ -20460,7 +20535,7 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
    const int layer_count = !one_d_array ? (box ? box->depth : 0)
       : layers_in_z ? box->depth : box->height;
    const bool compressed = resource &&
-      gex_wgpu_is_bc_format(resource->format);
+      gex_wgpu_is_compressed_format(resource->format);
    const unsigned bytes_per_pixel = resource
       ? gex_wgpu_format_bytes(resource->format) : 0;
    const unsigned block_width = compressed
@@ -20655,11 +20730,11 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
    layout.bytesPerRow = upload_stride;
    layout.rowsPerImage = one_d_array ? 1 : upload_layer / upload_stride;
    WGPUExtent3D extent = {
-      compressed ? ALIGN_POT((uint32_t)box->width, block_width)
+      compressed ? (uint32_t)util_align_npot(box->width, block_width)
                  : (uint32_t)box->width,
       one_d_array ? 1u
                   : compressed
-                  ? ALIGN_POT((uint32_t)box->height, block_height)
+                  ? (uint32_t)util_align_npot(box->height, block_height)
                   : (uint32_t)box->height,
       (uint32_t)layer_count,
    };
@@ -20730,7 +20805,7 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
         texture->target != PIPE_TEXTURE_CUBE &&
         texture->target != PIPE_TEXTURE_CUBE_ARRAY) ||
        (gex_wgpu_format_bytes(texture->format) == 0 &&
-        !gex_wgpu_is_bc_format(texture->format) &&
+        !gex_wgpu_is_compressed_format(texture->format) &&
         texture->format != PIPE_FORMAT_Z32_FLOAT &&
         texture->format != PIPE_FORMAT_Z24_UNORM_S8_UINT) ||
        !gex_wgpu_view_target_ok(templ->target, texture->target) ||
@@ -22515,7 +22590,7 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
     * ordinary memory and handed to the same upload path on unmap, so every
     * level, layer and block format texture_subdata handles works here too. */
    if (writing && !reading) {
-      const bool compressed = gex_wgpu_is_bc_format(resource->format);
+      const bool compressed = gex_wgpu_is_compressed_format(resource->format);
       const unsigned block_width = compressed
          ? util_format_get_blockwidth(resource->format) : 1;
       const unsigned block_height = compressed
@@ -22574,7 +22649,7 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
     * made it "Error during glGetTexImage" 172 times in packed_pixels.rectangle
     * alone. WebGPU copies a compressed texture to a buffer the same way it
     * copies any other, in whole blocks. */
-   const bool read_compressed = gex_wgpu_is_bc_format(resource->format);
+   const bool read_compressed = gex_wgpu_is_compressed_format(resource->format);
    const unsigned read_block_w = util_format_get_blockwidth(resource->format);
    const unsigned read_block_h = util_format_get_blockheight(resource->format);
    const unsigned read_block_bytes =
@@ -48327,6 +48402,9 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * grants applications the core spelling of what they could already ask for
     * by name. */
    caps->glsl_feature_level = 460;
+   /* st/mesa reads ES gates from the desktop level too, so this only decides
+    * the ES-only fallbacks -- but it is the claim, and it should be made. */
+   caps->essl_feature_level = 320;
    caps->glsl_feature_level_compatibility = 460;
 
    /* ARB_texture_gather, exposed below its GL 4.0 core version.
@@ -49455,6 +49533,13 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->texture_compression_bc =
       wgpuDeviceHasFeature(device, WGPUFeatureName_TextureCompressionBC) &&
       !getenv("GEX_WGPU_NO_BC");
+   screen->texture_compression_astc =
+      wgpuDeviceHasFeature(device, WGPUFeatureName_TextureCompressionASTC) &&
+      wgpuDeviceHasFeature(device, WGPUFeatureName_TextureCompressionASTCSliced3D) &&
+      !getenv("GEX_WGPU_NO_ASTC");
+   screen->texture_compression_etc2 =
+      wgpuDeviceHasFeature(device, WGPUFeatureName_TextureCompressionETC2) &&
+      !getenv("GEX_WGPU_NO_ETC2");
    screen->max_colour_bytes_per_sample =
       got_limits && limits.maxColorAttachmentBytesPerSample
          ? limits.maxColorAttachmentBytesPerSample : 32u;
@@ -49486,9 +49571,12 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->timestamp_query =
       wgpuDeviceHasFeature(device, WGPUFeatureName_TimestampQuery);
    fprintf(stderr,
-           "gex-wgpu: optional features bc=%d depth32s8=%d depthclip=%d "
-           "rg11b10=%d f32filter=%d f32blend=%d dualsrc=%d timestamp=%d\n",
-           (int)screen->texture_compression_bc, (int)screen->depth32_stencil8,
+           "gex-wgpu: optional features bc=%d astc=%d etc2=%d depth32s8=%d "
+           "depthclip=%d rg11b10=%d f32filter=%d f32blend=%d dualsrc=%d "
+           "timestamp=%d\n",
+           (int)screen->texture_compression_bc,
+           (int)screen->texture_compression_astc,
+           (int)screen->texture_compression_etc2, (int)screen->depth32_stencil8,
            (int)screen->depth_clip_control, (int)screen->rg11b10_renderable,
            (int)screen->float32_filterable, (int)screen->float32_blendable,
            (int)screen->dual_source_blending, (int)screen->timestamp_query);

@@ -68,7 +68,12 @@ note(const char *fmt, ...)
    X(void, GenVertexArrays, (GLsizei, GLuint *))                                 \
    X(void, BindVertexArray, (GLuint))                                            \
    X(void, DeleteVertexArrays, (GLsizei, const GLuint *))                        \
-   X(void, DrawArrays, (GLenum, GLint, GLsizei))
+   X(void, DrawArrays, (GLenum, GLint, GLsizei))                                 \
+   X(void, GenTextures, (GLsizei, GLuint *))                                     \
+   X(void, BindTexture, (GLenum, GLuint))                                        \
+   X(void, TexParameteri, (GLenum, GLenum, GLint))                               \
+   X(void, CompressedTexImage2D, (GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *)) \
+   X(void, DeleteTextures, (GLsizei, const GLuint *))
 
 #define DECLARE(ret, name, args) static ret (*p_gl##name) args;
 GL_FUNCS(DECLARE)
@@ -114,6 +119,119 @@ static int
 near(const uint8_t px[4], int r, int g, int b)
 {
    return abs(px[0] - r) <= 2 && abs(px[1] - g) <= 2 && abs(px[2] - b) <= 2;
+}
+
+static GLuint
+link_program(const char *vs_src, const char *fs_src, const char *label)
+{
+   GLuint v = compile(GL_VERTEX_SHADER, vs_src), f = compile(GL_FRAGMENT_SHADER, fs_src);
+   GLuint prog = p_glCreateProgram();
+   p_glAttachShader(prog, v);
+   p_glAttachShader(prog, f);
+   p_glLinkProgram(prog);
+   p_glDeleteShader(v);
+   p_glDeleteShader(f);
+   GLint linked = 0;
+   p_glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+   if (!linked) {
+      char log[1024] = "";
+      p_glGetProgramInfoLog(prog, sizeof(log), NULL, log);
+      note("FAIL %s: link: %s", label, log);
+      ++failures;
+   }
+   return prog;
+}
+
+/* One compressed block, uploaded and sampled by a full-screen draw. The
+ * expected colour is what the block decodes to, so this checks the format
+ * reached the GPU (or st/mesa's CPU decode) intact, not merely that the
+ * upload was accepted. */
+static void
+sample_block(const char *label, GLenum internal_format, GLsizei width, GLsizei height,
+             const void *data, GLsizei size, int r, int g, int b)
+{
+   static const char *vs =
+      "#version 300 es\n"
+      "void main() {\n"
+      "  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+      "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+      "}\n";
+   static const char *fs =
+      "#version 300 es\n"
+      "precision highp float;\n"
+      "uniform highp sampler2D tex;\n"
+      "out vec4 color;\n"
+      "void main() { color = texture(tex, vec2(0.5)); }\n";
+   GLuint tex = 0;
+   p_glGenTextures(1, &tex);
+   p_glBindTexture(GL_TEXTURE_2D, tex);
+   p_glCompressedTexImage2D(GL_TEXTURE_2D, 0, internal_format, width, height, 0, size, data);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+   GLenum err = p_glGetError();
+   CHECK(err == GL_NO_ERROR, "%s: upload error 0x%x", label, err);
+
+   GLuint prog = link_program(vs, fs, label);
+   GLuint vao = 0;
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glUseProgram(prog);
+   p_glViewport(0, 0, W, H);
+   p_glClearColor(0, 0, 0, 1);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glDrawArrays(GL_TRIANGLES, 0, 3);
+   uint8_t px[4];
+   read_center(px, W, H);
+   CHECK(near(px, r, g, b), "%s: sampled %u,%u,%u,%u, want %d,%d,%d", label,
+         px[0], px[1], px[2], px[3], r, g, b);
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+   p_glDeleteTextures(1, &tex);
+}
+
+static void
+compressed(const char *label, wink_surface *surface)
+{
+   wink_context_attribs ca;
+   wink_context_attribs_default(&ca);
+   ca.api = WINK_API_OPENGL_ES;
+   ca.major = 3;
+   ca.minor = 2;
+   int status = 0;
+   wink_context *ctx = wink_context_create(&ca, &status);
+   CHECK(ctx, "%s: ES 3.2 context: %s", label, wink_status_string(status));
+   if (!ctx)
+      return;
+   wink_make_current(ctx, surface, surface);
+
+   /* ASTC 4x4 void-extent block: one constant colour, as UNORM16 RGBA. */
+   static const uint8_t astc[16] = {
+      0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+      0xff, 0xff, 0x80, 0x80, 0x00, 0x00, 0xff, 0xff,
+   };
+   char name[64];
+   snprintf(name, sizeof(name), "%s astc", label);
+   sample_block(name, GL_COMPRESSED_RGBA_ASTC_4x4_KHR, 4, 4, astc, sizeof(astc), 255, 128, 0);
+
+   /* A block size that is not a power of two, on a texture that is not a
+    * multiple of it: 7x5 in 6x6 blocks is 2x1 blocks, stored as 12x6. A
+    * void-extent block reads the same whatever the block size. */
+   uint8_t astc6[32];
+   memcpy(astc6, astc, 16);
+   memcpy(astc6 + 16, astc, 16);
+   snprintf(name, sizeof(name), "%s astc 6x6 on 7x5", label);
+   sample_block(name, GL_COMPRESSED_RGBA_ASTC_6x6_KHR, 7, 5, astc6, sizeof(astc6), 255, 128, 0);
+
+   /* ETC2 RGB8 in individual mode: both halves 4-bit (F,8,0), table 0, every
+    * pixel index 0 -- which adds 2 to each channel. */
+   static const uint8_t etc2[8] = { 0xff, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+   snprintf(name, sizeof(name), "%s etc2", label);
+   sample_block(name, GL_COMPRESSED_RGB8_ETC2, 4, 4, etc2, sizeof(etc2), 255, 138, 2);
+
+   wink_make_current(NULL, NULL, NULL);
+   wink_context_destroy(ctx);
 }
 
 static void
@@ -224,15 +342,15 @@ __wrap_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void *)
 /* library_wink_test.js: linking this in is what publishes the raw export. */
 void wink_test_publish(void);
 
-EMSCRIPTEN_KEEPALIVE int
-wink_smoke_main(void)
+static int
+run_pass(const char *label)
 {
-   wink_test_publish();
    int status = wink_init(NULL);
    if (status != WINK_OK) {
-      note("FAIL init: %s", wink_status_string(status));
+      note("FAIL %s: init: %s", label, wink_status_string(status));
       return 1;
    }
+   note("-- %s", label);
    CHECK(load_gl() == 0, "GL lookup");
    CHECK(wink_get_proc_address("glPolygonOffsetClampEXT"), "no glPolygonOffsetClampEXT");
    CHECK(wink_get_proc_address("glBlendBarrierKHR"), "no glBlendBarrierKHR");
@@ -241,7 +359,7 @@ wink_smoke_main(void)
    int core = 0, compat = 0, es = 0;
    wink_query_versions(&core, &compat, &es);
    note("versions: core %d, compat %d, es %d", core, compat, es);
-   CHECK(core >= 33 && es >= 30, "versions too low");
+   CHECK(core >= 33 && es >= 32, "versions too low");
 
    wink_surface_attribs sa;
    wink_surface_attribs_default(&sa);
@@ -257,6 +375,7 @@ wink_smoke_main(void)
    exercise("es", WINK_API_OPENGL_ES, surface);
    exercise("core", WINK_API_OPENGL_CORE, surface);
    exercise("compat", WINK_API_OPENGL_COMPAT, surface);
+   compressed(label, surface);
 
    /* A version that does not exist is refused, not quietly lowered. */
    wink_context_attribs ca;
@@ -268,6 +387,19 @@ wink_smoke_main(void)
 
    wink_surface_destroy(surface);
    wink_shutdown();
+   return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE int
+wink_smoke_main(void)
+{
+   wink_test_publish();
+   run_pass("native compression");
+   /* And again from a fresh device with ASTC and ETC2 hidden from the
+    * driver: st/mesa must still expose GL ES 3.2, decoding on the CPU. */
+   wink_setenv("GEX_WGPU_NO_ASTC", "1");
+   wink_setenv("GEX_WGPU_NO_ETC2", "1");
+   run_pass("cpu-decoded compression");
    note(failures ? "FAILED %d" : "PASS", failures);
    return failures;
 }
