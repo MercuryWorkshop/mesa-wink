@@ -1,0 +1,26 @@
+<!--
+  The .NET 10 half of wink's tests: link a packaged variant into a
+  browser-wasm app through the wink.targets it ships, the way a consumer
+  would, and check from managed code that the native side is there.
+
+    dotnet publish -c Release -p:WinkPackage=<build/wink/out/st or mt>
+
+  Only calls that never suspend are made here. Anything that can wait for the
+  GPU (wink_init, readbacks) needs its export wrapped in WebAssembly.promising,
+  which stock .NET does not do; fna-wasm-build's runtime fork does
+  (WasmEnableJSPI).
+-->
+<Project Sdk="Microsoft.NET.Sdk.WebAssembly">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <WinkPackage Condition="'$(WinkPackage)' == ''">$(MSBuildThisFileDirectory)../../../build/wink/out/st</WinkPackage>
+  </PropertyGroup>
+  <!-- Read before wink.targets so its variant check sees it. -->
+  <PropertyGroup Condition="Exists('$(WinkPackage)/lib') and $([System.IO.File]::ReadAllText('$(WinkPackage)/manifest.json').Contains('&quot;variant&quot;: &quot;mt&quot;'))">
+    <WasmEnableThreads>true</WasmEnableThreads>
+  </PropertyGroup>
+  <Import Project="$(WinkPackage)/wink.targets" />
+</Project>

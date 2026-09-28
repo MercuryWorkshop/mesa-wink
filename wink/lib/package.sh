@@ -46,12 +46,25 @@ package_variant() {  # <variant>
   cp "$src/wink.h" "$src/wink_emscripten_compat.h" "$tmp/include/"
   cp "$WINK_EMDAWN/webgpu/include/webgpu/webgpu.h" "$tmp/include/webgpu/"
 
-  local libc="" em_cache
-  em_cache=$("$WINK_EMBIN/emcc" --cflags 2>/dev/null | tr ' ' '\n' | sed -n 's|^--sysroot=\(.*\)/sysroot$|\1|p' | head -1)
-  [ -n "$em_cache" ] && libc="$em_cache/sysroot/lib/wasm32-emscripten/libc.a"
+  # The sysroot's libc, for the st pthread check. EM_CACHE when set (it always
+  # is for .NET's pack, whose emcc cannot answer --cflags: that compiles a
+  # test file the pack does not ship); otherwise ask emcc.
+  local libc="" em_cache=${EM_CACHE:-}
+  if [ -z "$em_cache" ]; then
+    em_cache=$("$WINK_EMBIN/emcc" --cflags 2>/dev/null | tr ' ' '\n' \
+                 | sed -n 's|^--sysroot=\(.*\)/sysroot$|\1|p' | head -1) || em_cache=
+  fi
+  local rt="" mt_suffix=""
+  [ "$v" = mt ] && mt_suffix=-mt
+  if [ -n "$em_cache" ]; then
+    libc="$em_cache/sysroot/lib/wasm32-emscripten/libc.a"
+    rt="$em_cache/sysroot/lib/wasm32-emscripten/libcompiler_rt-wasm-sjlj$mt_suffix.a"
+  fi
   run "$WINK_PY" "$WINK_DIR/tools/wink-symbols.py" --emnm "$WINK_EMBIN/emnm" --variant "$v" \
     --object "$target/wink.o" --tint "$tmp/lib/libwink_tint.a" --webgpu "$tmp/lib/libwink_webgpu.a" \
-    ${libc:+--libc "$libc"} --check-against "$WINK_CHECK_AGAINST" --out "$tmp/symbols"
+    ${libc:+--libc "$libc"} ${rt:+--compiler-rt "$rt"} --check-against "$WINK_CHECK_AGAINST" \
+    --collisions-out "$tmp/symbols/collisions.txt" --out "$tmp/symbols"
+
 
   WINK_V=$v WINK_TMP=$tmp WINK_JS_ORDER=$WINK_JS_ORDER \
   WINK_EMCC_VERSION_LINE=$WINK_EMCC_VERSION_LINE WINK_CLANG_VERSION_LINE=$WINK_CLANG_VERSION_LINE \
@@ -98,8 +111,13 @@ manifest = {
 json.dump(manifest, open(os.path.join(tmp, 'manifest.json'), 'w'), indent=2, sort_keys=True)
 flags = required + [f for f in recommended if '>=' not in f] + ['--js-library=%s' % os.path.join(tmp.rsplit('.tmp', 1)[0], 'js', j) for j in js]
 open(os.path.join(tmp, 'wink.rsp'), 'w').write('\n'.join(flags) + '\n')
-msb = ' '.join(required + ['--js-library=&quot;$(WinkRoot)js/%s&quot;' % j for j in js])
-t = open(e['WINK_TARGETS_IN']).read().replace('@VARIANT@', v).replace('@LINK_FLAGS@', msb)
+def jsflag(j):
+    return '--js-library=&quot;$(WinkRoot)js/%s&quot;' % j
+t = (open(e['WINK_TARGETS_IN']).read()
+     .replace('@VARIANT@', v)
+     .replace('@REQUIRED_FLAGS@', ' '.join(required))
+     .replace('@WEBGPU_JS@', ' '.join(jsflag(j) for j in js if j != 'library_wink.js'))
+     .replace('@WINK_JS@', jsflag('library_wink.js')))
 open(os.path.join(tmp, 'wink.targets'), 'w').write(t)
 EOF
   rm -rf "$out" && mv "$tmp" "$out"

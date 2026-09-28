@@ -70,7 +70,9 @@ def main():
     ap.add_argument('--tint', required=True)
     ap.add_argument('--webgpu', required=True)
     ap.add_argument('--libc', help="the variant's emscripten libc.a, for the st pthread check")
+    ap.add_argument('--compiler-rt', help="the variant's libcompiler_rt-wasm-sjlj*.a, for the setjmp ABI check")
     ap.add_argument('--check-against', default='')
+    ap.add_argument('--collisions-out', help='write the colliding symbol names here, one per line')
     ap.add_argument('--out', required=True)
     a = ap.parse_args()
 
@@ -89,6 +91,18 @@ def main():
         fails.append('JS exception/setjmp shims referenced (missing -fwasm-exceptions?): ' + ' '.join(shims[:30]))
     if any(h in w_undef for h in SJLJ_HELPERS) and '__wasm_longjmp' not in w_undef:
         fails.append('setjmp is used but not in wasm mode: no __wasm_longjmp reference')
+    # The setjmp helpers are the compiler's ABI with compiler-rt, and they were
+    # renamed (saveSetjmp -> __wasm_setjmp) between LLVM builds that both call
+    # themselves 19 and ship as Emscripten 3.1.56. .NET's workload pack pairs a
+    # clang that emits the new names with a compiler-rt that has the old ones.
+    if a.compiler_rt and os.path.exists(a.compiler_rt):
+        rt_strong, rt_weak, _ = nm(a.emnm, a.compiler_rt)
+        wanted = sorted(s for s in w_undef
+                        if s in SJLJ_HELPERS + ('__wasm_setjmp', '__wasm_setjmp_test', '__wasm_longjmp'))
+        missing = [s for s in wanted if s not in rt_strong | rt_weak]
+        if missing:
+            fails.append('setjmp helpers %s are not in %s: the compiler that built wink and this '
+                         "emsdk's compiler-rt disagree" % (' '.join(missing), os.path.basename(a.compiler_rt)))
     webgl = sorted(s for s in w_undef if WEBGL_RE.match(s))
     if webgl:
         fails.append('WebGL referenced: ' + ' '.join(webgl))
@@ -112,11 +126,16 @@ def main():
     resolved = t_strong | t_weak | g_strong | g_weak
     unresolved = sorted(s for s in w_undef if s not in resolved and not JS_RE.match(s))
 
+    collisions = set()
     for arch in filter(None, a.check_against.split(':')):
         a_strong, _, _ = nm(a.emnm, arch)
         clash = sorted(w_strong & a_strong)
         if clash:
             warns.append('%d collisions with %s: %s' % (len(clash), arch, ' '.join(clash[:40])))
+            collisions.update(clash)
+    if a.collisions_out:
+        with open(a.collisions_out, 'w') as f:
+            f.write(''.join(n + '\n' for n in sorted(collisions)))
 
     with open(os.path.join(a.out, 'defined.txt'), 'w') as f:
         f.write('\n'.join(sorted(w_strong | w_weak)) + '\n')

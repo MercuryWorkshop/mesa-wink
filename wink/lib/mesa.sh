@@ -65,7 +65,9 @@ mesa_build() {  # <variant>
 $(mesa_options "$variant")
 EOF
   local key
-  key=$(hash_str "$(cat "$cross") ${opts[*]}")
+  # The compiler is part of the configuration: the wrappers keep their path
+  # whichever emsdk they front, so meson would not notice a different one.
+  key=$(hash_str "$(cat "$cross") ${opts[*]} $WINK_EMSDK_ROOT $WINK_EMCC_VERSION_LINE")
   local keyfile="$WINK_BUILD_ROOT/$variant.config"
 
   if [ ! -f "$build/build.ninja" ]; then
