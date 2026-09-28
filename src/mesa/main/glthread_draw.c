@@ -396,6 +396,7 @@ draw_arrays(GLuint drawid, GLenum mode, GLint first, GLsizei count,
       return;
 
    if (unlikely(compiled_into_dlist && ctx->GLThread.ListMode)) {
+      GLTHREAD_REMOTE_CALL(ctx, DrawArrays, mode, first, count);
       _mesa_glthread_finish_before(ctx, "DrawArrays");
       /* Use the function that's compiled into a display list. */
       CALL_DrawArrays(ctx->Dispatch.Current, (mode, first, count));
@@ -410,7 +411,7 @@ draw_arrays(GLuint drawid, GLenum mode, GLint first, GLsizei count,
     * This is also an error path. Zero counts should still call the driver
     * for possible GL errors.
     */
-   if (!user_buffer_mask ||
+   if (!user_buffer_mask || GLTHREAD_IS_REMOTE(ctx) ||
        (!no_error &&
         (count <= 0 || instance_count <= 0 ||   /* GL_INVALID_VALUE / no-op */
          ctx->GLThread.inside_begin_end ||      /* GL_INVALID_OPERATION */
@@ -437,6 +438,13 @@ draw_arrays(GLuint drawid, GLenum mode, GLint first, GLsizei count,
          cmd->baseinstance = baseinstance;
          cmd->drawid = drawid;
       }
+#if MESA_GLTHREAD_REMOTE
+      /* A remote context uploads nothing: its driver reads the client arrays
+       * itself, in this same address space, and they may change the moment
+       * this returns. */
+      if (user_buffer_mask && GLTHREAD_IS_REMOTE(ctx))
+         _mesa_glthread_finish(ctx);
+#endif
       return;
    }
 
@@ -525,6 +533,7 @@ _mesa_marshal_MultiDrawArrays(GLenum mode, const GLint *first,
    GET_CURRENT_CONTEXT(ctx);
 
    if (unlikely(ctx->GLThread.ListMode)) {
+      GLTHREAD_REMOTE_CALL(ctx, MultiDrawArrays, mode, first, count, draw_count);
       _mesa_glthread_finish_before(ctx, "MultiDrawArrays");
       CALL_MultiDrawArrays(ctx->Dispatch.Current,
                            (mode, first, count, draw_count));
@@ -537,6 +546,15 @@ _mesa_marshal_MultiDrawArrays(GLenum mode, const GLint *first,
       _mesa_is_desktop_gl_core(ctx) || draw_count <= 0 ||
       ctx->Dispatch.Current == ctx->Dispatch.ContextLost ||
       ctx->GLThread.inside_begin_end ? 0 : get_user_buffer_mask(ctx);
+
+#if MESA_GLTHREAD_REMOTE
+   /* Nothing is uploaded for a remote context: its driver reads the client
+    * arrays, and this thread waits until it has. */
+   if (user_buffer_mask && GLTHREAD_IS_REMOTE(ctx)) {
+      _mesa_glthread_call_MultiDrawArrays(ctx, mode, first, count, draw_count);
+      return;
+   }
+#endif
 
    if (user_buffer_mask) {
       unsigned min_index = ~0;
@@ -608,6 +626,7 @@ _mesa_marshal_MultiDrawArrays(GLenum mode, const GLint *first,
       }
    } else {
       /* The call is too large, so sync and execute the unmarshal code here. */
+      GLTHREAD_REMOTE_CALL(ctx, MultiDrawArrays, mode, first, count, draw_count);
       _mesa_glthread_finish_before(ctx, "MultiDrawArrays");
 
       if (user_buffer_mask) {
@@ -779,6 +798,19 @@ draw_elements(GLuint drawid, GLenum mode, GLsizei count, GLenum type,
       return;
 
    if (unlikely(compiled_into_dlist && ctx->GLThread.ListMode)) {
+#if MESA_GLTHREAD_REMOTE
+      if (GLTHREAD_IS_REMOTE(ctx)) {
+         if (basevertex)
+            _mesa_glthread_call_DrawElementsBaseVertex(ctx, mode, count, type,
+                                                       indices, basevertex);
+         else if (index_bounds_valid)
+            _mesa_glthread_call_DrawRangeElements(ctx, mode, min_index, max_index,
+                                                  count, type, indices);
+         else
+            _mesa_glthread_call_DrawElements(ctx, mode, count, type, indices);
+         return;
+      }
+#endif
       _mesa_glthread_finish_before(ctx, "DrawElements");
 
       /* Only use the ones that are compiled into display lists. */
@@ -809,7 +841,7 @@ draw_elements(GLuint drawid, GLenum mode, GLsizei count, GLenum type,
     * This is also an error path. Zero counts should still call the driver
     * for possible GL errors.
     */
-   if ((!user_buffer_mask && !has_user_indices) ||
+   if ((!user_buffer_mask && !has_user_indices) || GLTHREAD_IS_REMOTE(ctx) ||
        (!no_error &&
         /* zeros are discarded for no_error at the beginning */
         (count <= 0 || instance_count <= 0 ||   /* GL_INVALID_VALUE / no-op */
@@ -881,6 +913,12 @@ draw_elements(GLuint drawid, GLenum mode, GLsizei count, GLenum type,
          cmd->drawid = drawid;
          cmd->indices = indices;
       }
+#if MESA_GLTHREAD_REMOTE
+      /* As for draw_arrays: the driver reads the client arrays and indices
+       * itself, and this thread waits for it. */
+      if ((user_buffer_mask || has_user_indices) && GLTHREAD_IS_REMOTE(ctx))
+         _mesa_glthread_finish(ctx);
+#endif
       return;
    }
 
@@ -1109,6 +1147,18 @@ multi_draw_elements_async(struct gl_context *ctx, GLenum mode,
          memcpy(variable_data, buffers, buffers_size);
    } else {
       /* The call is too large, so sync and execute the unmarshal code here. */
+#if MESA_GLTHREAD_REMOTE
+      if (GLTHREAD_IS_REMOTE(ctx)) {
+         if (basevertex)
+            _mesa_glthread_call_MultiDrawElementsBaseVertex(ctx, mode, count, type,
+                                                            indices, draw_count,
+                                                            basevertex);
+         else
+            _mesa_glthread_call_MultiDrawElements(ctx, mode, count, type, indices,
+                                                  draw_count);
+         return;
+      }
+#endif
       _mesa_glthread_finish_before(ctx, "DrawElements");
 
       /* Bind uploaded buffers if needed. */
@@ -1135,6 +1185,18 @@ _mesa_marshal_MultiDrawElementsBaseVertex(GLenum mode, const GLsizei *count,
    GET_CURRENT_CONTEXT(ctx);
 
    if (unlikely(ctx->GLThread.ListMode)) {
+#if MESA_GLTHREAD_REMOTE
+      if (GLTHREAD_IS_REMOTE(ctx)) {
+         if (basevertex)
+            _mesa_glthread_call_MultiDrawElementsBaseVertex(ctx, mode, count, type,
+                                                            indices, draw_count,
+                                                            basevertex);
+         else
+            _mesa_glthread_call_MultiDrawElements(ctx, mode, count, type, indices,
+                                                  draw_count);
+         return;
+      }
+#endif
       _mesa_glthread_finish_before(ctx, "MultiDrawElements");
 
       if (basevertex) {
@@ -1170,6 +1232,20 @@ _mesa_marshal_MultiDrawElementsBaseVertex(GLenum mode, const GLsizei *count,
                                 draw_count, basevertex, NULL, 0, NULL, NULL);
       return;
    }
+
+   /* A remote context uploads nothing; its driver reads the client memory. */
+#if MESA_GLTHREAD_REMOTE
+   if (GLTHREAD_IS_REMOTE(ctx)) {
+      if (basevertex)
+         _mesa_glthread_call_MultiDrawElementsBaseVertex(ctx, mode, count, type,
+                                                         indices, draw_count,
+                                                         basevertex);
+      else
+         _mesa_glthread_call_MultiDrawElements(ctx, mode, count, type, indices,
+                                               draw_count);
+      return;
+   }
+#endif
 
    bool need_index_bounds = user_buffer_mask & ~vao->NonZeroDivisorMask;
    unsigned index_size = get_index_size(type);
@@ -1439,6 +1515,7 @@ _mesa_marshal_DrawArraysIndirect(GLenum mode, const GLvoid *indirect)
       return;
    }
 
+   GLTHREAD_REMOTE_CALL(ctx, DrawArraysIndirect, mode, indirect);
    _mesa_glthread_finish_before(ctx, "DrawArraysIndirect");
    lower_draw_arrays_indirect(ctx, mode, (GLintptr)indirect, 0, 1);
 }
@@ -1475,6 +1552,7 @@ _mesa_marshal_DrawElementsIndirect(GLenum mode, GLenum type, const GLvoid *indir
       return;
    }
 
+   GLTHREAD_REMOTE_CALL(ctx, DrawElementsIndirect, mode, type, indirect);
    _mesa_glthread_finish_before(ctx, "DrawElementsIndirect");
    lower_draw_elements_indirect(ctx, mode, type, (GLintptr)indirect, 0, 1);
 }
@@ -1517,6 +1595,7 @@ _mesa_marshal_MultiDrawArraysIndirect(GLenum mode, const GLvoid *indirect,
    }
 
    /* Lower the draw to direct due to non-VBO vertex arrays. */
+   GLTHREAD_REMOTE_CALL(ctx, MultiDrawArraysIndirect, mode, indirect, primcount, stride);
    _mesa_glthread_finish_before(ctx, "MultiDrawArraysIndirect");
    lower_draw_arrays_indirect(ctx, mode, (GLintptr)indirect, stride, primcount);
 }
@@ -1563,6 +1642,7 @@ _mesa_marshal_MultiDrawElementsIndirect(GLenum mode, GLenum type,
    }
 
    /* Lower the draw to direct due to non-VBO vertex arrays. */
+   GLTHREAD_REMOTE_CALL(ctx, MultiDrawElementsIndirect, mode, type, indirect, primcount, stride);
    _mesa_glthread_finish_before(ctx, "MultiDrawElementsIndirect");
    lower_draw_elements_indirect(ctx, mode, type, (GLintptr)indirect, stride,
                                 primcount);
@@ -1614,6 +1694,7 @@ _mesa_marshal_MultiDrawArraysIndirectCountARB(GLenum mode, GLintptr indirect,
    }
 
    /* Lower the draw to direct due to non-VBO vertex arrays. */
+   GLTHREAD_REMOTE_CALL(ctx, MultiDrawArraysIndirectCountARB, mode, indirect, drawcount, maxdrawcount, stride);
    _mesa_glthread_finish_before(ctx, "MultiDrawArraysIndirectCountARB");
    lower_draw_arrays_indirect(ctx, mode, indirect, stride,
                               read_draw_indirect_count(ctx, drawcount));
@@ -1666,6 +1747,7 @@ _mesa_marshal_MultiDrawElementsIndirectCountARB(GLenum mode, GLenum type,
    }
 
    /* Lower the draw to direct due to non-VBO vertex arrays. */
+   GLTHREAD_REMOTE_CALL(ctx, MultiDrawElementsIndirectCountARB, mode, type, indirect, drawcount, maxdrawcount, stride);
    _mesa_glthread_finish_before(ctx, "MultiDrawElementsIndirectCountARB");
    lower_draw_elements_indirect(ctx, mode, type, indirect, stride,
                                 read_draw_indirect_count(ctx, drawcount));

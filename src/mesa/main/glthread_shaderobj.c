@@ -59,6 +59,8 @@ _mesa_marshal_GetActiveUniform(GLuint program, GLuint index, GLsizei bufSize,
 
    /* This will generate GL_INVALID_OPERATION, as it should. */
    if (ctx->GLThread.inside_begin_end) {
+      GLTHREAD_REMOTE_CALL(ctx, GetActiveUniform, program, index, bufSize,
+                           length, size, type, name);
       _mesa_glthread_finish_before(ctx, "GetActiveUniform");
       CALL_GetActiveUniform(ctx->Dispatch.Current,
                             (program, index, bufSize, length, size, type,
@@ -94,6 +96,7 @@ _mesa_marshal_GetUniformLocation(GLuint program, const GLchar *name)
 
    /* This will generate GL_INVALID_OPERATION, as it should. */
    if (ctx->GLThread.inside_begin_end) {
+      GLTHREAD_REMOTE_CALL_RET(ctx, GetUniformLocation, program, name);
       _mesa_glthread_finish_before(ctx, "GetUniformLocation");
       return CALL_GetUniformLocation(ctx->Dispatch.Current, (program, name));
    }

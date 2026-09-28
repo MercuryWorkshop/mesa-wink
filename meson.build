@@ -1914,6 +1914,13 @@ if host_machine.system() == 'emscripten'
   endif
 endif
 
+# glthread whose driver thread is not its own: in a browser, the main thread,
+# which owns the WebGPU device (see _mesa_glthread_init_remote). Only where
+# there are threads for an application to call GL from.
+if host_machine.system() == 'emscripten' and with_wasm_threads
+  pre_args += '-DMESA_GLTHREAD_REMOTE=1'
+endif
+
 if host_machine.system() == 'windows'
   # For MSVC and MinGW we aren't using pthreads, and dependency('threads') will add linkage
   # to pthread for MinGW, so leave the dependency null_dep for Windows. For Windows linking to

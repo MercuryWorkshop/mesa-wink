@@ -82,6 +82,18 @@ class PrintCode(gl_XML.gl_print_base):
                 if func.marshal_no_error:
                     print('{0} GLAPIENTRY _mesa_marshal_{1}_no_error({2});'.format(func.return_type, func.name, func.get_parameter_string()))
 
+        # MESA_GLTHREAD_REMOTE: run a call on the context's glthread executor
+        # and wait for it (see _mesa_glthread_call in glthread.h).
+        print('#if MESA_GLTHREAD_REMOTE')
+        print('struct gl_context;')
+        for func in api.functionIterateAll():
+            if func.marshal_flavor() not in ('custom', 'async', 'sync'):
+                continue
+            params = func.get_parameter_string()
+            print('{0} _mesa_glthread_call_{1}(struct gl_context *ctx{2});'.format(
+                func.return_type, func.name, '' if params == 'void' else ', ' + params))
+        print('#endif')
+
 
 def show_usage():
     print('Usage: %s [-f input_file_name]' % sys.argv[0])

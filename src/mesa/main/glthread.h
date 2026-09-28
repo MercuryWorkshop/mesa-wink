@@ -208,6 +208,18 @@ struct glthread_state
    bool inside_begin_end;
    bool thread_sched_enabled;
 
+   /**
+    * MESA_GLTHREAD_REMOTE: the driver may only be called on this context's
+    * executor thread -- the queue has none of its own; see
+    * _mesa_glthread_init_remote -- so nothing glthread would normally do on
+    * the application thread may touch it. Where glthread would call the
+    * driver directly, it runs the call on the executor instead
+    * (_mesa_glthread_call); it never uploads; and a draw that reads client
+    * memory is waited for rather than copied.
+    */
+   bool remote;
+   thrd_t driver_thread;
+
    /** Display lists. */
    GLenum16 ListMode; /**< Zero if not inside display list, else list mode. */
    unsigned ListBase;
@@ -307,6 +319,51 @@ struct glthread_state
 
 void _mesa_glthread_init(struct gl_context *ctx);
 void _mesa_glthread_destroy(struct gl_context *ctx);
+
+#if MESA_GLTHREAD_REMOTE
+/* Enable glthread with the calling thread as the driver thread, for a platform
+ * whose driver can only run there: in a browser, the main thread, which owns
+ * the WebGPU device. Batches are handed to util_queue_run_external, which the
+ * embedder calls on this thread whenever `kick` asks it to. The application
+ * thread is whichever makes the context current next, by setting its own
+ * glapi context and dispatch (to ctx->MarshalExec). */
+bool _mesa_glthread_init_remote(struct gl_context *ctx,
+                                util_queue_kick_func kick, void *kick_data);
+
+/* Run fn(ctx, data) on the driver thread, after everything already submitted,
+ * with the context current and its execution dispatch installed, and wait for
+ * it. On the driver thread itself it runs at once. The generated
+ * _mesa_glthread_call_<Function> helpers are this with a GL call inside. */
+void _mesa_glthread_call(struct gl_context *ctx,
+                         void (*fn)(struct gl_context *ctx, void *data),
+                         void *data);
+
+/* The same without waiting: `fence` is signalled when fn has run, and `data`
+ * must live until then. */
+void _mesa_glthread_call_async(struct gl_context *ctx,
+                               void (*fn)(struct gl_context *ctx, void *data),
+                               void *data, struct util_queue_fence *fence);
+
+#define GLTHREAD_IS_REMOTE(ctx) unlikely((ctx)->GLThread.remote)
+/* Before a synchronous call glthread makes on the application thread: in a
+ * remote context, make the named GL call on the driver thread and return. */
+#define GLTHREAD_REMOTE_CALL(ctx, name, ...)                                  \
+   do {                                                                     \
+      if (GLTHREAD_IS_REMOTE(ctx)) {                                        \
+         _mesa_glthread_call_##name((ctx), __VA_ARGS__);                     \
+         return;                                                            \
+      }                                                                     \
+   } while (0)
+#define GLTHREAD_REMOTE_CALL_RET(ctx, name, ...)                              \
+   do {                                                                     \
+      if (GLTHREAD_IS_REMOTE(ctx))                                          \
+         return _mesa_glthread_call_##name((ctx), __VA_ARGS__);              \
+   } while (0)
+#else
+#define GLTHREAD_IS_REMOTE(ctx) false
+#define GLTHREAD_REMOTE_CALL(ctx, name, ...) do { } while (0)
+#define GLTHREAD_REMOTE_CALL_RET(ctx, name, ...) do { } while (0)
+#endif
 
 void _mesa_glthread_init_dispatch0(struct gl_context *ctx,
                                    struct _glapi_table *table);

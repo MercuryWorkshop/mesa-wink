@@ -11,6 +11,23 @@
  * come from the caller, one surface and context each at a time becomes any
  * number, and a context no longer carries a surface's visual (see
  * wink_context_create).
+ *
+ * Two ways to run it:
+ *
+ *  - Here: everything on the thread that called wink_init. On a worker, the
+ *    canvas must have been transferred to it (an OffscreenCanvas), and the
+ *    driver's readbacks suspend that worker's stack through JSPI.
+ *
+ *  - On the main thread (WINK_INIT_GL_ON_MAIN_THREAD, threaded builds): the
+ *    application calls GL from a worker, but the device, the canvas and the
+ *    whole driver live on the browser's main thread, where the canvas already
+ *    is. Contexts run Mesa's glthread with the main thread as its driver
+ *    thread (_mesa_glthread_init_remote): GL calls are marshalled on the
+ *    worker and executed on main, and a call that needs an answer waits for
+ *    it. Everything else wink does -- surfaces, contexts, make-current -- is
+ *    a call run there too (wink_rpc). The worker never touches WebGPU and
+ *    never needs JSPI; the main thread's runner in library_wink.js is entered
+ *    through WebAssembly.promising by wink itself, on a stack of its own.
  */
 #define WINK_BUILDING 1
 #include "wink.h"
@@ -20,13 +37,18 @@
 
 #include "frontend/api.h"
 #include "mesa/glapi/glapi/glapi.h"
+#include "mesa/main/glthread.h"
 #include "mesa/main/mtypes.h"
 #include "mesa/state_tracker/st_context.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
+#include "util/u_atomic.h"
 #include "util/u_inlines.h"
+#include "util/u_queue.h"
 #include "gex_wgpu_public.h"
 
+#include <emscripten/emscripten.h>
+#include <emscripten/threading.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +64,11 @@ struct wink_surface {
    bool opaque;
    WGPUSurface canvas;
    bool configured;
+   /* On the main thread: how many frames a swap waits for, and the two swaps
+    * that may be in flight. */
+   int swap_interval;
+   struct util_queue_fence swap_fence[2];
+   unsigned swap_index;
 };
 
 struct wink_context {
@@ -52,21 +79,33 @@ struct wink_context {
 
 static struct {
    bool initialized;
+   /* WINK_INIT_GL_ON_MAIN_THREAD. */
+   bool remote;
+   /* Here: the one thread that may call wink. Remote: the main thread. */
    pthread_t owner;
    WGPUDevice device;
    struct pipe_frontend_screen fscreen;
    struct st_config_options options;
    uint32_t next_drawable_id;
-   wink_context *current;
-   wink_surface *draw, *read;
+   int lost;
+   /* Remote: wink's own calls, run on the main thread. */
+   struct util_queue control;
 } wink;
+
+/* What is current is per thread, as GL's is. */
+static _Thread_local wink_context *tls_current;
+static _Thread_local wink_surface *tls_draw, *tls_read;
 
 /* ---------------------------------------------------------------------- */
 
 static bool
-on_owner_thread(void)
+calling_thread_ok(void)
 {
 #ifdef __EMSCRIPTEN_PTHREADS__
+   /* Remote: any application thread, but not main -- it would wait for
+    * itself. */
+   if (wink.remote)
+      return !emscripten_is_main_browser_thread();
    return pthread_equal(pthread_self(), wink.owner);
 #else
    return true;
@@ -79,9 +118,9 @@ check_ready(void)
 {
    if (!wink.initialized)
       return WINK_ERROR_NOT_INITIALIZED;
-   if (!on_owner_thread())
+   if (!calling_thread_ok())
       return WINK_ERROR_WRONG_THREAD;
-   if (wink_js_device_lost())
+   if (p_atomic_read(&wink.lost))
       return WINK_ERROR_DEVICE_LOST;
    return WINK_OK;
 }
@@ -108,6 +147,60 @@ take_attribs(void *dst, size_t dst_size, const void *src)
    memcpy((char *)dst + sizeof(uint32_t), (const char *)src + sizeof(uint32_t),
           (size < dst_size ? size : dst_size) - sizeof(uint32_t));
    return true;
+}
+
+/* ---------------------------------------------------------------------- */
+/* The main thread's side of remote mode */
+
+/* A job was queued for the main thread: have library_wink.js run it. */
+static void
+wink_kick(struct util_queue *queue)
+{
+   wink_js_kick(queue);
+}
+
+/* library_wink.js's runner, on the main thread, through
+ * WebAssembly.promising: the jobs may suspend (every readback does). */
+EMSCRIPTEN_KEEPALIVE void
+wink_main_run_queue(struct util_queue *queue)
+{
+   util_queue_run_external(queue);
+}
+
+/* library_wink.js, when the device is lost: a flag any thread can read,
+ * where a JS one would be visible only to the thread that set it. */
+EMSCRIPTEN_KEEPALIVE void
+wink_set_device_lost(void)
+{
+   p_atomic_set(&wink.lost, 1);
+}
+
+struct wink_rpc {
+   void (*fn)(void *arg);
+   void *arg;
+};
+
+static void
+wink_rpc_execute(void *job, void *gdata, int thread_index)
+{
+   struct wink_rpc *rpc = job;
+   rpc->fn(rpc->arg);
+}
+
+/* Run fn(arg) on the main thread and wait for it. */
+static void
+wink_rpc(void (*fn)(void *arg), void *arg)
+{
+   if (!wink.remote || emscripten_is_main_browser_thread()) {
+      fn(arg);
+      return;
+   }
+   struct wink_rpc rpc = { fn, arg };
+   struct util_queue_fence fence;
+   util_queue_fence_init(&fence);
+   util_queue_add_job(&wink.control, &rpc, &fence, wink_rpc_execute, NULL, 0);
+   util_queue_fence_wait(&fence);
+   util_queue_fence_destroy(&fence);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -146,7 +239,7 @@ wink_status_string(int status)
    case WINK_OK: return "ok";
    case WINK_ERROR_NO_WEBGPU: return "no WebGPU adapter or device";
    case WINK_ERROR_NO_JSPI: return "JSPI (WebAssembly.Suspending) is unavailable";
-   case WINK_ERROR_WRONG_THREAD: return "called from a thread other than wink_init's";
+   case WINK_ERROR_WRONG_THREAD: return "called from the wrong thread";
    case WINK_ERROR_NOT_INITIALIZED: return "wink_init has not succeeded";
    case WINK_ERROR_BAD_ATTRIBUTE: return "invalid attribute";
    case WINK_ERROR_BAD_VERSION: return "requested version unavailable";
@@ -170,6 +263,16 @@ get_frontend_param(struct pipe_frontend_screen *fscreen,
    (void)fscreen;
    (void)param;
    return 0;
+}
+
+/* glthread tells the frontend about its driver thread; DRI uses it to show the
+ * queue on the HUD, and there is no HUD here. */
+static void
+set_background_context(struct st_context *st,
+                       struct util_queue_monitoring *queue_info)
+{
+   (void)st;
+   (void)queue_info;
 }
 
 int
@@ -206,17 +309,9 @@ apply_js_env(void)
    free(buf);
 }
 
-int
-wink_init(const wink_init_attribs *attribs)
+static int
+init_here(const wink_init_attribs *a)
 {
-   if (wink.initialized)
-      return on_owner_thread() ? WINK_OK : WINK_ERROR_WRONG_THREAD;
-
-   wink_init_attribs a;
-   wink_init_attribs_default(&a);
-   if (!take_attribs(&a, sizeof(a), attribs))
-      return WINK_ERROR_BAD_ATTRIBUTE;
-
    /* Without JSPI the driver's waits would spin on a promise that can never
     * settle, so refuse here instead of hanging on the first readback. */
    if (!wink_js_has_jspi())
@@ -224,7 +319,7 @@ wink_init(const wink_init_attribs *attribs)
 
    apply_js_env();
 
-   WGPUDevice device = a.webgpu_device;
+   WGPUDevice device = a->webgpu_device;
    if (device)
       wgpuDeviceAddRef(device);
    else
@@ -243,24 +338,100 @@ wink_init(const wink_init_attribs *attribs)
       return WINK_ERROR_NO_WEBGPU;
    }
    wink.fscreen.get_param = get_frontend_param;
+   wink.fscreen.set_background_context = set_background_context;
    wink.device = device;
    wink.owner = pthread_self();
-   wink.initialized = true;
+   wink.lost = 0;
    return WINK_OK;
+}
+
+struct init_rpc {
+   const wink_init_attribs *attribs;
+   int status;
+};
+
+static void
+init_rpc(void *p)
+{
+   struct init_rpc *rpc = p;
+   rpc->status = init_here(rpc->attribs);
+}
+
+int
+wink_init(const wink_init_attribs *attribs)
+{
+   if (wink.initialized)
+      return calling_thread_ok() ? WINK_OK : WINK_ERROR_WRONG_THREAD;
+
+   wink_init_attribs a;
+   wink_init_attribs_default(&a);
+   if (!take_attribs(&a, sizeof(a), attribs))
+      return WINK_ERROR_BAD_ATTRIBUTE;
+
+   bool remote = a.flags & WINK_INIT_GL_ON_MAIN_THREAD;
+#ifdef __EMSCRIPTEN_PTHREADS__
+   /* Already on the main thread: there is nothing to hand over. */
+   if (remote && emscripten_is_main_browser_thread())
+      remote = false;
+#else
+   if (remote)
+      return WINK_ERROR_BAD_ATTRIBUTE;
+#endif
+
+   int status;
+   if (remote) {
+      if (!util_queue_init_external(&wink.control, "wink", 16, 0, NULL,
+                                    wink_kick, NULL))
+         return WINK_ERROR_OUT_OF_MEMORY;
+      wink.remote = true;
+      struct init_rpc rpc = { &a, WINK_OK };
+      wink_rpc(init_rpc, &rpc);
+      status = rpc.status;
+      if (status != WINK_OK) {
+         util_queue_destroy(&wink.control);
+         wink.remote = false;
+      }
+   } else {
+      status = init_here(&a);
+   }
+   wink.initialized = status == WINK_OK;
+   return status;
+}
+
+static void
+shutdown_rpc(void *p)
+{
+   (void)p;
+   st_api_make_current(NULL, NULL, NULL);
+   st_screen_destroy(&wink.fscreen);
+   wink.fscreen.screen->destroy(wink.fscreen.screen);
+   wgpuDeviceRelease(wink.device);
 }
 
 void
 wink_shutdown(void)
 {
-   if (!wink.initialized || !on_owner_thread())
+   if (!wink.initialized || !calling_thread_ok())
       return;
-   st_api_make_current(NULL, NULL, NULL);
-   wink.current = NULL;
-   wink.draw = wink.read = NULL;
-   st_screen_destroy(&wink.fscreen);
-   wink.fscreen.screen->destroy(wink.fscreen.screen);
-   wgpuDeviceRelease(wink.device);
+   if (tls_current)
+      wink_make_current(NULL, NULL, NULL);
+   wink_rpc(shutdown_rpc, NULL);
+   if (wink.remote)
+      util_queue_destroy(&wink.control);
    memset(&wink, 0, sizeof(wink));
+}
+
+struct versions_rpc {
+   int core, compat, es;
+};
+
+static void
+versions_rpc(void *p)
+{
+   struct versions_rpc *v = p;
+   int es1 = 0;
+   st_api_query_versions(&wink.fscreen, &wink.options, &v->core, &v->compat,
+                         &es1, &v->es);
 }
 
 int
@@ -269,18 +440,18 @@ wink_query_versions(int *core, int *compat, int *es)
    int status = check_ready();
    if (status != WINK_OK)
       return status;
-   int c = 0, p = 0, es1 = 0, es2 = 0;
-   st_api_query_versions(&wink.fscreen, &wink.options, &c, &p, &es1, &es2);
-   if (core) *core = c;
-   if (compat) *compat = p;
-   if (es) *es = es2;
+   struct versions_rpc v = { 0, 0, 0 };
+   wink_rpc(versions_rpc, &v);
+   if (core) *core = v.core;
+   if (compat) *compat = v.compat;
+   if (es) *es = v.es;
    return WINK_OK;
 }
 
 int
 wink_device_lost(void)
 {
-   return wink_js_device_lost();
+   return p_atomic_read(&wink.lost);
 }
 
 void *
@@ -412,6 +583,73 @@ choose_depth_stencil(unsigned depth, unsigned stencil)
    return PIPE_FORMAT_NONE;
 }
 
+static wink_surface *
+surface_create_here(const wink_surface_attribs *a, int *status)
+{
+   wink_surface *s = calloc(1, sizeof(*s));
+   if (!s) {
+      set_status(status, WINK_ERROR_OUT_OF_MEMORY);
+      return NULL;
+   }
+   s->width = a->width;
+   s->height = a->height;
+   s->offscreen = a->offscreen;
+   s->manage_canvas_size = a->manage_canvas_size;
+   s->opaque = a->alpha_bits == 0;
+   s->swap_interval = 1;
+   util_queue_fence_init(&s->swap_fence[0]);
+   util_queue_fence_init(&s->swap_fence[1]);
+
+   /* RGBA8 even without alpha: the canvas is configured RGBA8Unorm so the
+    * present is a plain copy (WebGPU will not copy between RGBA and BGRA),
+    * and an opaque composite mode is what hides the alpha channel. */
+   s->visual.buffer_mask = ST_ATTACHMENT_FRONT_LEFT_MASK | ST_ATTACHMENT_BACK_LEFT_MASK;
+   s->visual.color_format = a->srgb ? PIPE_FORMAT_R8G8B8A8_SRGB : PIPE_FORMAT_R8G8B8A8_UNORM;
+   s->visual.depth_stencil_format = choose_depth_stencil(a->depth_bits, a->stencil_bits);
+   if (s->visual.depth_stencil_format != PIPE_FORMAT_NONE)
+      s->visual.buffer_mask |= ST_ATTACHMENT_DEPTH_STENCIL_MASK;
+   else if (a->depth_bits || a->stencil_bits) {
+      free(s);
+      set_status(status, WINK_ERROR_BAD_ATTRIBUTE);
+      return NULL;
+   }
+   s->visual.accum_format = PIPE_FORMAT_NONE;
+   s->visual.samples = 0;
+
+   s->base.visual = &s->visual;
+   s->base.fscreen = &wink.fscreen;
+   /* st/mesa keys its framebuffer cache on this; any unique non-zero value. */
+   s->base.ID = ++wink.next_drawable_id;
+   s->base.stamp = 1;
+   s->base.flush_front = surface_flush_front;
+   s->base.validate = surface_validate;
+   s->base.flush_swapbuffers = surface_flush_swapbuffers;
+
+   if (!s->offscreen) {
+      s->canvas = wink_js_create_surface(a->canvas);
+      if (!s->canvas) {
+         free(s);
+         set_status(status, WINK_ERROR_NO_CANVAS);
+         return NULL;
+      }
+   }
+   set_status(status, WINK_OK);
+   return s;
+}
+
+struct surface_create_rpc {
+   const wink_surface_attribs *attribs;
+   int status;
+   wink_surface *result;
+};
+
+static void
+surface_create_rpc(void *p)
+{
+   struct surface_create_rpc *rpc = p;
+   rpc->result = surface_create_here(rpc->attribs, &rpc->status);
+}
+
 wink_surface *
 wink_surface_create(const wink_surface_attribs *attribs, int *status)
 {
@@ -431,53 +669,10 @@ wink_surface_create(const wink_surface_attribs *attribs, int *status)
       set_status(status, WINK_ERROR_BAD_ATTRIBUTE);
       return NULL;
    }
-
-   wink_surface *s = calloc(1, sizeof(*s));
-   if (!s) {
-      set_status(status, WINK_ERROR_OUT_OF_MEMORY);
-      return NULL;
-   }
-   s->width = a.width;
-   s->height = a.height;
-   s->offscreen = a.offscreen;
-   s->manage_canvas_size = a.manage_canvas_size;
-   s->opaque = a.alpha_bits == 0;
-
-   /* RGBA8 even without alpha: the canvas is configured RGBA8Unorm so the
-    * present is a plain copy (WebGPU will not copy between RGBA and BGRA),
-    * and an opaque composite mode is what hides the alpha channel. */
-   s->visual.buffer_mask = ST_ATTACHMENT_FRONT_LEFT_MASK | ST_ATTACHMENT_BACK_LEFT_MASK;
-   s->visual.color_format = a.srgb ? PIPE_FORMAT_R8G8B8A8_SRGB : PIPE_FORMAT_R8G8B8A8_UNORM;
-   s->visual.depth_stencil_format = choose_depth_stencil(a.depth_bits, a.stencil_bits);
-   if (s->visual.depth_stencil_format != PIPE_FORMAT_NONE)
-      s->visual.buffer_mask |= ST_ATTACHMENT_DEPTH_STENCIL_MASK;
-   else if (a.depth_bits || a.stencil_bits) {
-      free(s);
-      set_status(status, WINK_ERROR_BAD_ATTRIBUTE);
-      return NULL;
-   }
-   s->visual.accum_format = PIPE_FORMAT_NONE;
-   s->visual.samples = 0;
-
-   s->base.visual = &s->visual;
-   s->base.fscreen = &wink.fscreen;
-   /* st/mesa keys its framebuffer cache on this; any unique non-zero value. */
-   s->base.ID = ++wink.next_drawable_id;
-   s->base.stamp = 1;
-   s->base.flush_front = surface_flush_front;
-   s->base.validate = surface_validate;
-   s->base.flush_swapbuffers = surface_flush_swapbuffers;
-
-   if (!s->offscreen) {
-      s->canvas = wink_js_create_surface(a.canvas);
-      if (!s->canvas) {
-         free(s);
-         set_status(status, WINK_ERROR_NO_CANVAS);
-         return NULL;
-      }
-   }
-   set_status(status, WINK_OK);
-   return s;
+   struct surface_create_rpc rpc = { &a, WINK_OK, NULL };
+   wink_rpc(surface_create_rpc, &rpc);
+   set_status(status, rpc.status);
+   return rpc.result;
 }
 
 static void
@@ -487,27 +682,70 @@ drop_attachments(wink_surface *s)
       pipe_resource_reference(&s->attachments[i], NULL);
 }
 
-void
-wink_surface_destroy(wink_surface *s)
+static void
+surface_destroy_rpc(void *p)
 {
-   if (!s || check_ready() == WINK_ERROR_WRONG_THREAD)
-      return;
-   if (wink.draw == s || wink.read == s) {
-      wink_context *ctx = wink.current;
-      wink_make_current(ctx, wink.draw == s ? NULL : wink.draw,
-                        wink.read == s ? NULL : wink.read);
-   }
+   wink_surface *s = p;
    /* st/mesa caches a framebuffer per drawable; it must forget this one. */
-   if (wink.initialized)
-      st_api_destroy_drawable(&s->base);
+   st_api_destroy_drawable(&s->base);
    drop_attachments(s);
    if (s->canvas) {
       if (s->configured)
          wgpuSurfaceUnconfigure(s->canvas);
       wgpuSurfaceRelease(s->canvas);
    }
+   util_queue_fence_destroy(&s->swap_fence[0]);
+   util_queue_fence_destroy(&s->swap_fence[1]);
    free(s);
 }
+
+void
+wink_surface_destroy(wink_surface *s)
+{
+   if (!s || !wink.initialized || !calling_thread_ok())
+      return;
+   if (tls_draw == s || tls_read == s)
+      wink_make_current(tls_current, tls_draw == s ? NULL : tls_draw,
+                        tls_read == s ? NULL : tls_read);
+   /* Remote: nothing may still be presenting it. */
+   util_queue_fence_wait(&s->swap_fence[0]);
+   util_queue_fence_wait(&s->swap_fence[1]);
+   wink_rpc(surface_destroy_rpc, s);
+}
+
+struct resize_rpc {
+   wink_surface *s;
+   unsigned width, height;
+};
+
+static void
+surface_resize_here(wink_surface *s, unsigned width, unsigned height)
+{
+   /* The attachments are the old size: drop them so validate builds new
+    * ones, and bump the stamp, which is the only thing that makes st/mesa
+    * ask again. The canvas is reconfigured by the next swap. */
+   s->width = width;
+   s->height = height;
+   drop_attachments(s);
+   p_atomic_inc(&s->base.stamp);
+   s->configured = false;
+}
+
+static void
+resize_rpc(void *p)
+{
+   struct resize_rpc *rpc = p;
+   surface_resize_here(rpc->s, rpc->width, rpc->height);
+}
+
+#if MESA_GLTHREAD_REMOTE
+static void
+resize_glthread(struct gl_context *ctx, void *p)
+{
+   (void)ctx;
+   resize_rpc(p);
+}
+#endif
 
 int
 wink_surface_resize(wink_surface *s, int width, int height)
@@ -521,14 +759,15 @@ wink_surface_resize(wink_surface *s, int width, int height)
       return WINK_ERROR_BAD_ATTRIBUTE;
    if ((unsigned)width == s->width && (unsigned)height == s->height)
       return WINK_OK;
-   /* The attachments are the old size: drop them so validate builds new
-    * ones, and bump the stamp, which is the only thing that makes st/mesa
-    * ask again. The canvas is reconfigured by the next swap. */
-   s->width = width;
-   s->height = height;
-   drop_attachments(s);
-   p_atomic_inc(&s->base.stamp);
-   s->configured = false;
+   struct resize_rpc rpc = { s, (unsigned)width, (unsigned)height };
+#if MESA_GLTHREAD_REMOTE
+   /* After the frames already recorded against the old size, not before. */
+   if (wink.remote && tls_current && (tls_draw == s || tls_read == s)) {
+      _mesa_glthread_call(tls_current->st->ctx, resize_glthread, &rpc);
+      return WINK_OK;
+   }
+#endif
+   wink_rpc(resize_rpc, &rpc);
    return WINK_OK;
 }
 
@@ -537,6 +776,17 @@ wink_surface_get_size(const wink_surface *s, int *width, int *height)
 {
    if (width) *width = s ? (int)s->width : 0;
    if (height) *height = s ? (int)s->height : 0;
+}
+
+int
+wink_swap_interval(wink_surface *s, int interval)
+{
+   if (!s)
+      return WINK_ERROR_BAD_SURFACE;
+   if (interval < 0)
+      return WINK_ERROR_BAD_ATTRIBUTE;
+   s->swap_interval = interval;
+   return WINK_OK;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -587,24 +837,13 @@ create_st(gl_api profile, const wink_context_attribs *a, enum st_context_error *
                                 a->share ? a->share->st : NULL);
 }
 
-wink_context *
-wink_context_create(const wink_context_attribs *attribs, int *status)
+static wink_context *
+context_create_here(const wink_context_attribs *a, int *status)
 {
-   int ready = check_ready();
-   if (ready != WINK_OK) {
-      set_status(status, ready);
-      return NULL;
-   }
-   wink_context_attribs a;
-   wink_context_attribs_default(&a);
-   if (!take_attribs(&a, sizeof(a), attribs) || a.major < 0 || a.minor < 0) {
-      set_status(status, WINK_ERROR_BAD_ATTRIBUTE);
-      return NULL;
-   }
-   const int want = a.major * 10 + a.minor;
+   const int want = a->major * 10 + a->minor;
 
    gl_api profile;
-   switch (a.api) {
+   switch (a->api) {
    case WINK_API_OPENGL_ES:
       if (want && want < 20) {
          /* ES 1.x is not built (gles1=disabled). */
@@ -627,7 +866,7 @@ wink_context_create(const wink_context_attribs *attribs, int *status)
    }
 
    enum st_context_error error = ST_CONTEXT_SUCCESS;
-   struct st_context *st = create_st(profile, &a, &error);
+   struct st_context *st = create_st(profile, a, &error);
    if (!st) {
       set_status(status, error == ST_CONTEXT_ERROR_NO_MEMORY ? WINK_ERROR_OUT_OF_MEMORY
                                                              : WINK_ERROR_BAD_VERSION);
@@ -639,6 +878,15 @@ wink_context_create(const wink_context_attribs *attribs, int *status)
       set_status(status, WINK_ERROR_BAD_VERSION);
       return NULL;
    }
+
+#if MESA_GLTHREAD_REMOTE
+   /* The application's GL calls are recorded on its thread and run here. */
+   if (wink.remote && !_mesa_glthread_init_remote(st->ctx, wink_kick, NULL)) {
+      st_destroy_context(st);
+      set_status(status, WINK_ERROR_OUT_OF_MEMORY);
+      return NULL;
+   }
+#endif
 
    wink_context *c = calloc(1, sizeof(*c));
    if (!c) {
@@ -655,18 +903,55 @@ wink_context_create(const wink_context_attribs *attribs, int *status)
    return c;
 }
 
+struct context_create_rpc {
+   const wink_context_attribs *attribs;
+   int status;
+   wink_context *result;
+};
+
+static void
+context_create_rpc(void *p)
+{
+   struct context_create_rpc *rpc = p;
+   rpc->result = context_create_here(rpc->attribs, &rpc->status);
+}
+
+wink_context *
+wink_context_create(const wink_context_attribs *attribs, int *status)
+{
+   int ready = check_ready();
+   if (ready != WINK_OK) {
+      set_status(status, ready);
+      return NULL;
+   }
+   wink_context_attribs a;
+   wink_context_attribs_default(&a);
+   if (!take_attribs(&a, sizeof(a), attribs) || a.major < 0 || a.minor < 0) {
+      set_status(status, WINK_ERROR_BAD_ATTRIBUTE);
+      return NULL;
+   }
+   struct context_create_rpc rpc = { &a, WINK_OK, NULL };
+   wink_rpc(context_create_rpc, &rpc);
+   set_status(status, rpc.status);
+   return rpc.result;
+}
+
+static void
+context_destroy_rpc(void *p)
+{
+   wink_context *c = p;
+   st_destroy_context(c->st);
+   free(c);
+}
+
 void
 wink_context_destroy(wink_context *c)
 {
-   if (!c || check_ready() == WINK_ERROR_WRONG_THREAD)
+   if (!c || !wink.initialized || !calling_thread_ok())
       return;
-   if (wink.current == c) {
-      st_api_make_current(NULL, NULL, NULL);
-      wink.current = NULL;
-      wink.draw = wink.read = NULL;
-   }
-   st_destroy_context(c->st);
-   free(c);
+   if (tls_current == c)
+      wink_make_current(NULL, NULL, NULL);
+   wink_rpc(context_destroy_rpc, c);
 }
 
 void
@@ -677,6 +962,27 @@ wink_context_get_version(const wink_context *c, int *api, int *major, int *minor
    if (minor) *minor = c ? c->minor : 0;
 }
 
+struct make_current_rpc {
+   wink_context *c;
+   wink_surface *draw, *read;
+   bool ok;
+};
+
+static void
+make_current_rpc(void *p)
+{
+   struct make_current_rpc *rpc = p;
+#if MESA_GLTHREAD_REMOTE
+   /* What the application recorded before this must run against the old
+    * binding; this is the driver thread, so this runs it. */
+   if (wink.remote && rpc->c)
+      _mesa_glthread_finish(rpc->c->st->ctx);
+#endif
+   rpc->ok = st_api_make_current(rpc->c ? rpc->c->st : NULL,
+                                 rpc->draw ? &rpc->draw->base : NULL,
+                                 rpc->read ? &rpc->read->base : NULL);
+}
+
 int
 wink_make_current(wink_context *c, wink_surface *draw, wink_surface *read)
 {
@@ -685,32 +991,51 @@ wink_make_current(wink_context *c, wink_surface *draw, wink_surface *read)
       return status;
    if (!c && (draw || read))
       return WINK_ERROR_BAD_CONTEXT;
-   if (!st_api_make_current(c ? c->st : NULL, draw ? &draw->base : NULL,
-                            read ? &read->base : NULL))
+
+#if MESA_GLTHREAD_REMOTE
+   /* Whatever this thread recorded for the old context goes first. */
+   if (wink.remote && tls_current)
+      _mesa_glthread_flush_batch(tls_current->st->ctx);
+#endif
+
+   struct make_current_rpc rpc = { c, draw, read, false };
+   wink_rpc(make_current_rpc, &rpc);
+   if (!rpc.ok)
       return WINK_ERROR_BAD_CONTEXT;
-   wink.current = c;
-   wink.draw = c ? draw : NULL;
-   wink.read = c ? read : NULL;
+
+#if MESA_GLTHREAD_REMOTE
+   /* This thread becomes the context's application thread: its GL calls go
+    * through the marshal dispatch into the context's batches. */
+   if (wink.remote) {
+      struct gl_context *ctx = c ? c->st->ctx : NULL;
+      _mesa_glapi_set_context(ctx);
+      _mesa_glapi_set_dispatch(ctx ? ctx->MarshalExec : NULL);
+   }
+#endif
+   tls_current = c;
+   tls_draw = c ? draw : NULL;
+   tls_read = c ? read : NULL;
    return WINK_OK;
 }
 
 wink_context *
 wink_get_current_context(void)
 {
-   return wink.current;
+   return tls_current;
 }
 
 wink_surface *
 wink_get_current_surface(void)
 {
-   return wink.draw;
+   return tls_draw;
 }
 
 void *
 wink_get_proc_address(const char *name)
 {
-   /* The dispatch stubs, which call through the current context's table:
-    * valid in any context, and the only GL wink exposes. */
+   /* The dispatch stubs, which call through the calling thread's table --
+    * the execution one here, the marshal one on a remote context's
+    * application thread: valid in any context, and the only GL wink exposes. */
    if (!name || strncmp(name, "gl", 2) != 0)
       return NULL;
    return (void *)_mesa_glapi_get_proc_address(name);
@@ -743,27 +1068,22 @@ configure_canvas(wink_surface *s)
    return true;
 }
 
-int
-wink_swap_buffers(wink_surface *s)
+/* Flush the current context and copy the back buffer onto the canvas. */
+static void
+swap_here(wink_surface *s)
 {
-   int status = check_ready();
-   if (status != WINK_OK)
-      return status;
-   if (!s)
-      return WINK_ERROR_BAD_SURFACE;
-
    /* END_OF_FRAME submits the frame. Not glFinish: that also refreshes
     * persistent mappings, a readback every frame for nothing. */
    struct st_context *st = st_api_get_current();
    if (st)
       st_context_flush(st, ST_FLUSH_END_OF_FRAME, NULL, NULL, NULL);
    if (s->offscreen)
-      return WINK_OK;
+      return;
 
    struct pipe_resource *back = s->attachments[ST_ATTACHMENT_BACK_LEFT];
    WGPUTexture from = back ? gex_wgpu_resource_texture(back) : NULL;
    if (!from)
-      return WINK_OK; /* nothing has been drawn to it yet */
+      return; /* nothing has been drawn to it yet */
 
    configure_canvas(s);
    WGPUSurfaceTexture current;
@@ -775,7 +1095,7 @@ wink_swap_buffers(wink_surface *s)
       if (current.texture)
          wgpuTextureRelease(current.texture);
       s->configured = false;
-      return WINK_OK;
+      return;
    }
 
    /* The canvas may be a different size from the surface -- the page resized
@@ -805,5 +1125,50 @@ wink_swap_buffers(wink_surface *s)
    /* No wgpuSurfacePresent: in a browser the frame is presented when this
     * thread next yields to its event loop. */
    wgpuTextureRelease(current.texture);
+}
+
+static void
+swap_rpc(void *p)
+{
+   swap_here(p);
+}
+
+#if MESA_GLTHREAD_REMOTE
+/* A remote swap, run on the main thread after the frame's batches. The
+ * runner must give the event loop a turn for the frame to be presented, and
+ * waiting for the next animation frame is also the pacing. */
+static void
+swap_glthread(struct gl_context *ctx, void *p)
+{
+   (void)ctx;
+   wink_surface *s = p;
+   swap_here(s);
+   wink_js_yield_frame(s->swap_interval);
+}
+#endif
+
+int
+wink_swap_buffers(wink_surface *s)
+{
+   int status = check_ready();
+   if (status != WINK_OK)
+      return status;
+   if (!s)
+      return WINK_ERROR_BAD_SURFACE;
+
+#if MESA_GLTHREAD_REMOTE
+   if (wink.remote && tls_current) {
+      /* At most two frames in flight: queue this one, then wait until the
+       * one before it has been presented. */
+      const unsigned i = s->swap_index;
+      s->swap_index ^= 1;
+      util_queue_fence_wait(&s->swap_fence[i]);
+      _mesa_glthread_call_async(tls_current->st->ctx, swap_glthread, s,
+                                &s->swap_fence[i]);
+      util_queue_fence_wait(&s->swap_fence[i ^ 1]);
+      return WINK_OK;
+   }
+#endif
+   wink_rpc(swap_rpc, s);
    return WINK_OK;
 }

@@ -11,12 +11,15 @@
  * too -- so wink_get_proc_address() is the only way to GL.
  *
  * Threads and JSPI. WebGPU objects belong to the JavaScript realm that made
- * them, so every call must come from the thread that called wink_init()
- * (anything else gets WINK_ERROR_WRONG_THREAD). Calls that may wait for the
- * GPU -- wink_init() itself, and any GL call that reads back, from
- * glReadPixels to a query result -- suspend through JSPI, so they must run
- * beneath an export the embedder wrapped in WebAssembly.promising. A frame
+ * them. By default every call must come from the thread that called
+ * wink_init() (anything else gets WINK_ERROR_WRONG_THREAD), and calls that
+ * may wait for the GPU -- wink_init() itself, and any GL call that reads back,
+ * from glReadPixels to a query result -- suspend through JSPI, so they must
+ * run beneath an export the embedder wrapped in WebAssembly.promising. A frame
  * reaches the canvas when that thread returns to its event loop.
+ *
+ * WINK_INIT_GL_ON_MAIN_THREAD instead keeps all of that on the main thread and
+ * lets any worker call wink and GL; see its definition.
  *
  * Every attribute struct begins with its own size, and a *_default()
  * initializer fills it; a newer wink reading an older caller's struct uses
@@ -72,9 +75,19 @@ enum wink_api {
 #define WINK_CONTEXT_NO_ERROR            (1u << 4)
 #define WINK_CONTEXT_RELEASE_NONE        (1u << 5)
 
+/* wink_init_attribs.flags */
+/* Threaded builds: the caller is a worker that makes GL calls, and the
+ * device, the canvas and the driver live on the browser's main thread, where
+ * the canvas already is -- no OffscreenCanvas transfer, no JSPI on the worker.
+ * GL calls are recorded on the worker and run on main (Mesa's glthread with
+ * the main thread as its driver thread); a call that needs an answer waits
+ * for it. The main thread must keep returning to its event loop. Ignored when
+ * wink_init is called on the main thread itself. */
+#define WINK_INIT_GL_ON_MAIN_THREAD      (1u << 0)
+
 typedef struct wink_init_attribs {
    uint32_t size;
-   uint32_t flags;               /* reserved; 0 */
+   uint32_t flags;               /* WINK_INIT_* */
    /* A WGPUDevice to render with. NULL: use Module.winkDevice or
     * Module.preinitializedWebGPUDevice if the page set one, or else request an
     * adapter and a device with every feature and limit this driver can use. */
@@ -147,8 +160,15 @@ WINK_EXPORT wink_surface *wink_get_current_surface(void);
 WINK_EXPORT void *wink_get_proc_address(const char *name);
 
 /* Flush the current context and copy the surface's back buffer onto its
- * canvas. Never suspends: pacing is the caller's (requestAnimationFrame). */
+ * canvas. Here it never suspends and pacing is the caller's
+ * (requestAnimationFrame). With WINK_INIT_GL_ON_MAIN_THREAD the swap is queued
+ * behind the frame and paced on the main thread by wink_swap_interval, and
+ * this waits for the frame before it: at most two in flight. */
 WINK_EXPORT int wink_swap_buffers(wink_surface *surface);
+
+/* Animation frames each swap waits for on the main thread (0: none, just a
+ * turn of the event loop). Only WINK_INIT_GL_ON_MAIN_THREAD paces; default 1. */
+WINK_EXPORT int wink_swap_interval(wink_surface *surface, int interval);
 
 /* Non-zero once the WebGPU device is lost; every later call fails. */
 WINK_EXPORT int wink_device_lost(void);

@@ -88,6 +88,69 @@ class PrintCode(gl_XML.gl_print_base):
         if func.marshal_call_after and ret == '' and not unmarshal:
             out(func.marshal_call_after);
 
+    def print_remote_call(self, func):
+        # MESA_GLTHREAD_REMOTE: this context's driver may only be called on
+        # its glthread executor, so a call glthread would make here, on the
+        # application thread, is made there instead (_mesa_glthread_call).
+        args = func.get_called_parameter_string()
+        call = '_mesa_glthread_call_{0}(ctx{1})'.format(
+            func.name, ', ' + args if args else '')
+        out('#if MESA_GLTHREAD_REMOTE')
+        out('if (unlikely(ctx->GLThread.remote)) {')
+        with indent():
+            if func.return_type != 'void':
+                out('return {0};'.format(call))
+            else:
+                out('{0};'.format(call))
+                if func.marshal_call_after:
+                    out(func.marshal_call_after)
+                out('return;')
+        out('}')
+        out('#endif')
+
+    def print_remote_helper(self, func):
+        params = [p for p in func.parameterIterator() if not p.is_padding]
+        void = func.return_type == 'void'
+        name = func.name
+        out('#if MESA_GLTHREAD_REMOTE')
+        out('struct glthread_call_{0} {{'.format(name))
+        with indent():
+            for p in params:
+                out('{0};'.format(p.string()))
+            if not void:
+                out('{0} ret;'.format(func.return_type))
+            if not params and void:
+                out('char unused;')
+        out('};')
+        out('')
+        out('static void')
+        out('glthread_call_{0}_run(struct gl_context *ctx, void *data)'.format(name))
+        out('{')
+        with indent():
+            out('UNUSED struct glthread_call_{0} *a = data;'.format(name))
+            call = 'CALL_{0}(ctx->Dispatch.Current, ({1}))'.format(
+                name, ', '.join('a->' + p.name for p in params))
+            out('{0}{1};'.format('' if void else 'a->ret = ', call))
+        out('}')
+        out('')
+        out('{0}'.format(func.return_type))
+        out('_mesa_glthread_call_{0}(struct gl_context *ctx{1})'.format(
+            name, ', ' + func.get_parameter_string() if params else ''))
+        out('{')
+        with indent():
+            # Not `a`: that is a GL parameter name (glColorMaski's alpha).
+            if params:
+                out('struct glthread_call_{0} call_args = {{ {1} }};'.format(
+                    name, ', '.join(p.name for p in params)))
+            else:
+                out('struct glthread_call_{0} call_args = {{ 0 }};'.format(name))
+            out('_mesa_glthread_call(ctx, glthread_call_{0}_run, &call_args);'.format(name))
+            if not void:
+                out('return call_args.ret;')
+        out('}')
+        out('#endif')
+        out('')
+
     def print_sync_body(self, func):
         out('/* {0}: marshalled synchronously */'.format(func.name))
         out('{0}{1} GLAPIENTRY'.format('static ' if func.marshal_is_static() else '', func.return_type))
@@ -97,6 +160,7 @@ class PrintCode(gl_XML.gl_print_base):
             out('GET_CURRENT_CONTEXT(ctx);')
             if func.marshal_call_before:
                 out(func.marshal_call_before);
+            self.print_remote_call(func)
             out('_mesa_glthread_finish_before(ctx, "{0}");'.format(func.name))
             self.print_call(func)
         out('}')
@@ -168,6 +232,7 @@ class PrintCode(gl_XML.gl_print_base):
 
             out('if ({0}) {{'.format(func.marshal_sync))
             with indent():
+                self.print_remote_call(func)
                 out('_mesa_glthread_finish_before(ctx, "{0}");'.format(func.name))
                 self.print_call(func)
                 out('return;')
@@ -203,6 +268,7 @@ class PrintCode(gl_XML.gl_print_base):
 
                 out('if (unlikely({0})) {{'.format(' || '.join(list)))
                 with indent():
+                    self.print_remote_call(func)
                     out('_mesa_glthread_finish_before(ctx, "{0}");'.format(func.name))
                     self.print_call(func)
                     out('return;')
@@ -346,7 +412,14 @@ class PrintCode(gl_XML.gl_print_base):
         func_per_file = len(functions) // file_count + 1
         functions = functions[file_index*func_per_file:(file_index+1)*func_per_file]
 
+        # The hand-written marshal functions call these too.
+        if file_index == 0:
+            for func in api.functionIterateAll():
+                if func.marshal_flavor() == 'custom':
+                    self.print_remote_helper(func)
+
         for func in functions:
+            self.print_remote_helper(func)
             flavor = func.marshal_flavor()
             if flavor == 'async':
                 self.print_async_body(func)

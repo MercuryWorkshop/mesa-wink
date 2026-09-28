@@ -118,6 +118,11 @@ for v in $WINK_VARIANTS; do
     have node || die "--test needs node (22 or newer)"
     run bash "$WINK_DIR/test/build-smoke.sh" "$v" "$WINK_OUT/$v" "$WINK_EMBIN/emcc" "$WINK_BUILD_ROOT/test/$v" >/dev/null
     run node "$WINK_DIR/test/run-browser.mjs" "$WINK_BUILD_ROOT/test/$v" || die "smoke test failed"
+    if [ "$v" = mt ]; then
+      # And GL from a worker, executed on the main thread.
+      run node "$WINK_DIR/test/run-browser.mjs" "$WINK_BUILD_ROOT/test/$v" --page=main-thread.html \
+        || die "main-thread smoke test failed"
+    fi
   fi
 done
 WINK_STAGE=wink

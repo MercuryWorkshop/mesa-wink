@@ -158,7 +158,7 @@ wink_swap_buffers(surface);                        /* never suspends */
 
 * **Owner thread.** WebGPU objects belong to the JavaScript realm that created
   them, so every wink call must come from the thread that called `wink_init`.
-  Others get `WINK_ERROR_WRONG_THREAD`.
+  Others get `WINK_ERROR_WRONG_THREAD`. (See below for the exception.)
 * **Waiting uses JSPI.** Anything that waits for the GPU (`wink_init` itself,
   and GL calls that read back, from `glReadPixels` to a query result) suspends
   through JSPI. The export that leads there must be entered through
@@ -171,6 +171,44 @@ wink_swap_buffers(surface);                        /* never suspends */
   `wink_init` returns `WINK_ERROR_NO_JSPI` rather than hanging later.
 * **Frames.** A frame reaches the canvas when the owning thread returns to its
   event loop. Pacing (requestAnimationFrame) is the caller's job.
+
+#### GL from a worker, run on the main thread
+
+In `mt`, `WINK_INIT_GL_ON_MAIN_THREAD` in `wink_init_attribs.flags` keeps the
+device, the canvas and the driver on the browser's main thread. The canvas
+stays where it is, so there is no OffscreenCanvas transfer, and the worker
+needs no JSPI. Any worker may then call wink and GL, but the main thread may
+not, because it would wait for itself.
+
+How it works:
+
+* **Mesa's glthread, with main as its driver thread.** The worker's GL calls
+  are marshalled into batches, as glthread always does. Instead of a Mesa
+  thread, a JS runner on the main thread executes them
+  (`util_queue_init_external`). Enqueueing a batch posts a message that
+  schedules the runner.
+* **Calls that need an answer wait for it.** `glGet*`, `glReadPixels`, query
+  results and `glMapBuffer*` run on main while the worker blocks with
+  `Atomics.wait`. Each GL function has a generated `_mesa_glthread_call_<F>`
+  for this.
+* **Client memory is not copied ahead.** Client-array draws and client-memory
+  uploads run on main against the worker's memory. That is safe because both
+  threads share one heap, and the worker waits until they finish.
+* **JSPI only on main.** The runner enters wasm through
+  `WebAssembly.promising` on a private 16 MB stack (`Module.winkRunnerStackSize`).
+  It swaps the stack pointer around each suspension, so other main-thread
+  code, such as the .NET runtime's, keeps its own stack. Main can therefore
+  suspend for readbacks without the embedder wrapping anything.
+* **Pacing.** `wink_swap_buffers` queues the present behind the frame's GL.
+  It returns once the previous frame is on screen, so at most two frames are
+  in flight. `wink_swap_interval` sets the number of animation frames per
+  swap (default 1; 0 means just a turn of the event loop). Pacing therefore
+  happens on main, and the worker never has to yield.
+
+The main thread must keep returning to its event loop. Anything that blocks it
+also blocks every GL call that waits for an answer. `st` builds refuse the flag
+with `WINK_ERROR_BAD_ATTRIBUTE`. If `wink_init` itself is called on the main
+thread, the flag is ignored.
 
 ### Page-side knobs
 
@@ -226,7 +264,8 @@ emcc, exactly as the manifest says to, and runs it in headless Chrome
 It also samples ASTC (4x4, and 6x6 blocks on a 7x5 texture) and ETC2 blocks.
 Then it shuts down and repeats everything on a fresh device with ASTC and ETC2
 hidden, to exercise st/mesa's CPU decode. In `st` it also proves Mesa never
-starts a thread.
+starts a thread. In `mt` it runs the whole suite a second time from a pthread
+with `WINK_INIT_GL_ON_MAIN_THREAD` (`main-thread.html`).
 
 `test/dotnet/` links a variant into a real .NET 10 browser-wasm app through
 `wink.targets`, then checks from managed code that the native side is there.

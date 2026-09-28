@@ -120,6 +120,13 @@ glthread_unmarshal_batch(void *job, void *gdata, int thread_index)
    if (ctx->GLThread.GlobalLockUpdateBatchCounter++ % 64 == 0)
       glthread_update_global_locking(ctx);
 
+#if MESA_GLTHREAD_REMOTE
+   /* One executor thread serves every remote context, so the one current
+    * there is not necessarily this batch's. */
+   if (ctx->GLThread.remote)
+      _mesa_glapi_set_context(ctx);
+#endif
+
    /* Execute the GL calls. */
    _mesa_glapi_set_dispatch(ctx->Dispatch.Current);
 
@@ -207,6 +214,8 @@ _mesa_glthread_init_dispatch(struct gl_context *ctx,
    _mesa_glthread_init_dispatch7(ctx, table);
 }
 
+static void glthread_init_state(struct gl_context *ctx);
+
 void
 _mesa_glthread_init(struct gl_context *ctx)
 {
@@ -223,6 +232,59 @@ _mesa_glthread_init(struct gl_context *ctx)
       return;
    }
 
+   glthread_init_state(ctx);
+   if (!util_queue_is_initialized(&glthread->queue))
+      return;
+
+   /* Execute the thread initialization function in the thread. */
+   struct util_queue_fence fence;
+   util_queue_fence_init(&fence);
+   util_queue_add_job(&glthread->queue, ctx, &fence,
+                      glthread_thread_initialization, NULL, 0);
+   util_queue_fence_wait(&fence);
+   util_queue_fence_destroy(&fence);
+
+   glthread->thread_sched_enabled = ctx->pipe->set_context_param &&
+                                    util_thread_scheduler_enabled();
+   util_thread_scheduler_init_state(&glthread->thread_sched_state);
+   glthread_apply_thread_sched_policy(ctx, true);
+}
+
+#if MESA_GLTHREAD_REMOTE
+bool
+_mesa_glthread_init_remote(struct gl_context *ctx, util_queue_kick_func kick,
+                           void *kick_data)
+{
+   struct glthread_state *glthread = &ctx->GLThread;
+   assert(!glthread->enabled);
+
+   /* No map_unsynchronized_thread_safe requirement: nothing is mapped on the
+    * application thread, because a remote context never uploads. */
+   if (!util_queue_init_external(&glthread->queue, "gl",
+                                 MARSHAL_MAX_BATCHES - 2, 0, NULL,
+                                 kick, kick_data))
+      return false;
+
+   glthread->remote = true;
+   glthread->driver_thread = thrd_current();
+   glthread_init_state(ctx);
+   if (!util_queue_is_initialized(&glthread->queue)) {
+      glthread->remote = false;
+      return false;
+   }
+
+   /* This is the driver thread. */
+   glthread_thread_initialization(ctx, NULL, 0);
+   glthread->thread_sched_enabled = false;
+   return true;
+}
+#endif
+
+static void
+glthread_init_state(struct gl_context *ctx)
+{
+   struct glthread_state *glthread = &ctx->GLThread;
+
    _mesa_InitHashTable(&glthread->VAOs);
    _mesa_glthread_reset_vao(&glthread->DefaultVAO);
    glthread->CurrentVAO = &glthread->DefaultVAO;
@@ -231,6 +293,7 @@ _mesa_glthread_init(struct gl_context *ctx)
    if (!ctx->MarshalExec) {
       _mesa_DeinitHashTable(&glthread->VAOs, NULL, NULL);
       util_queue_destroy(&glthread->queue);
+      memset(&glthread->queue, 0, sizeof(glthread->queue));
       return;
    }
 
@@ -249,19 +312,6 @@ _mesa_glthread_init(struct gl_context *ctx)
    _mesa_glthread_init_call_fence(&glthread->LastDListChangeBatchIndex);
 
    _mesa_glthread_enable(ctx);
-
-   /* Execute the thread initialization function in the thread. */
-   struct util_queue_fence fence;
-   util_queue_fence_init(&fence);
-   util_queue_add_job(&glthread->queue, ctx, &fence,
-                      glthread_thread_initialization, NULL, 0);
-   util_queue_fence_wait(&fence);
-   util_queue_fence_destroy(&fence);
-
-   glthread->thread_sched_enabled = ctx->pipe->set_context_param &&
-                                    util_thread_scheduler_enabled();
-   util_thread_scheduler_init_state(&glthread->thread_sched_state);
-   glthread_apply_thread_sched_policy(ctx, true);
 }
 
 static void
@@ -270,12 +320,14 @@ free_vao(void *data, UNUSED void *userData)
    free(data);
 }
 
+static void glthread_disable(struct gl_context *ctx);
+
 void
 _mesa_glthread_destroy(struct gl_context *ctx)
 {
    struct glthread_state *glthread = &ctx->GLThread;
 
-   _mesa_glthread_disable(ctx);
+   glthread_disable(ctx);
 
    if (util_queue_is_initialized(&glthread->queue)) {
       util_queue_destroy(&glthread->queue);
@@ -292,7 +344,7 @@ void _mesa_glthread_enable(struct gl_context *ctx)
 {
    if (ctx->GLThread.enabled ||
        ctx->Dispatch.Current == ctx->Dispatch.ContextLost ||
-       ctx->GLThread.DebugOutputSynchronous)
+       (ctx->GLThread.DebugOutputSynchronous && !GLTHREAD_IS_REMOTE(ctx)))
       return;
 
    ctx->GLThread.enabled = true;
@@ -308,6 +360,18 @@ void _mesa_glthread_enable(struct gl_context *ctx)
 }
 
 void _mesa_glthread_disable(struct gl_context *ctx)
+{
+   /* A remote context cannot run without glthread: turning it off would put
+    * the application thread on the direct dispatch, calling a driver that
+    * only works on the executor. Context loss is handled by the lost
+    * dispatch on the driver side, and synchronous debug output is simply not
+    * synchronous. */
+   if (GLTHREAD_IS_REMOTE(ctx))
+      return;
+   glthread_disable(ctx);
+}
+
+static void glthread_disable(struct gl_context *ctx)
 {
    if (!ctx->GLThread.enabled)
       return;
@@ -360,7 +424,8 @@ _mesa_glthread_flush_batch(struct gl_context *ctx)
    if (!glthread->enabled)
       return;
 
-   if (ctx->Dispatch.Current == ctx->Dispatch.ContextLost) {
+   if (ctx->Dispatch.Current == ctx->Dispatch.ContextLost &&
+       !GLTHREAD_IS_REMOTE(ctx)) {
       _mesa_glthread_disable(ctx);
       return;
    }
@@ -392,6 +457,32 @@ _mesa_glthread_finish(struct gl_context *ctx)
    struct glthread_state *glthread = &ctx->GLThread;
    if (!glthread->enabled)
       return;
+
+#if MESA_GLTHREAD_REMOTE
+   if (glthread->remote) {
+      /* Inside one of this context's own jobs: what is queued behind it must
+       * not run first, and nothing else would run it. */
+      if (util_queue_is_external_executor(&glthread->queue))
+         return;
+      /* Elsewhere on the driver thread -- the embedder making the context
+       * current, say. The application thread flushed before asking for that
+       * and is waiting, so what is queued can run here and now; waiting for
+       * it would wait for this very thread. */
+      if (u_thread_is_self(glthread->driver_thread)) {
+         util_queue_run_external(&glthread->queue);
+         return;
+      }
+      /* The application thread: never execute here (the partial batch below
+       * would call the driver on the wrong thread); submit and wait. */
+      _mesa_glthread_flush_batch(ctx);
+      struct glthread_batch *last = &glthread->batches[glthread->last];
+      if (!util_queue_fence_is_signalled(&last->fence)) {
+         util_queue_fence_wait(&last->fence);
+         p_atomic_inc(&glthread->stats.num_syncs);
+      }
+      return;
+   }
+#endif
 
    /* If this is called from the worker thread, then we've hit a path that
     * might be called from either the main thread or the worker (such as some
@@ -431,6 +522,70 @@ _mesa_glthread_finish(struct gl_context *ctx)
    if (synced)
       p_atomic_inc(&glthread->stats.num_syncs);
 }
+
+#if MESA_GLTHREAD_REMOTE
+struct glthread_call {
+   struct gl_context *ctx;
+   void (*fn)(struct gl_context *ctx, void *data);
+   void *data;
+};
+
+static void
+glthread_call_execute(void *job, void *gdata, int thread_index)
+{
+   struct glthread_call *call = job;
+   _mesa_glapi_set_context(call->ctx);
+   _mesa_glapi_set_dispatch(call->ctx->Dispatch.Current);
+   call->fn(call->ctx, call->data);
+}
+
+static void
+glthread_call_free(void *job, void *gdata, int thread_index)
+{
+   free(job);
+}
+
+void
+_mesa_glthread_call(struct gl_context *ctx,
+                    void (*fn)(struct gl_context *ctx, void *data),
+                    void *data)
+{
+   struct glthread_state *glthread = &ctx->GLThread;
+
+   if (u_thread_is_self(glthread->driver_thread)) {
+      _mesa_glthread_finish(ctx);
+      struct _glapi_table *dispatch = GET_DISPATCH();
+      _mesa_glapi_set_dispatch(ctx->Dispatch.Current);
+      fn(ctx, data);
+      _mesa_glapi_set_dispatch(dispatch);
+      return;
+   }
+
+   struct glthread_call call = { ctx, fn, data };
+   struct util_queue_fence fence;
+   util_queue_fence_init(&fence);
+   _mesa_glthread_flush_batch(ctx);
+   util_queue_add_job(&glthread->queue, &call, &fence, glthread_call_execute,
+                      NULL, 0);
+   util_queue_fence_wait(&fence);
+   util_queue_fence_destroy(&fence);
+   p_atomic_inc(&glthread->stats.num_syncs);
+}
+
+void
+_mesa_glthread_call_async(struct gl_context *ctx,
+                          void (*fn)(struct gl_context *ctx, void *data),
+                          void *data, struct util_queue_fence *fence)
+{
+   struct glthread_call *call = malloc(sizeof(*call));
+   call->ctx = ctx;
+   call->fn = fn;
+   call->data = data;
+   _mesa_glthread_flush_batch(ctx);
+   util_queue_add_job(&ctx->GLThread.queue, call, fence, glthread_call_execute,
+                      glthread_call_free, 0);
+}
+#endif
 
 void
 _mesa_glthread_finish_before(struct gl_context *ctx, const char *func)

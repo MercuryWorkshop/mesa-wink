@@ -131,6 +131,7 @@ _mesa_marshal_GetIntegerv(GLenum pname, GLint *p)
    }
 
 sync:
+   GLTHREAD_REMOTE_CALL(ctx, GetIntegerv, pname, p);
    _mesa_glthread_finish_before(ctx, "GetIntegerv");
    CALL_GetIntegerv(ctx->Dispatch.Current, (pname, p));
 }

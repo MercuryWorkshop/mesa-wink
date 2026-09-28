@@ -51,6 +51,12 @@ extern "C" {
 #define UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY      (1 << 0)
 #define UTIL_QUEUE_INIT_RESIZE_IF_FULL            (1 << 1)
 #define UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY  (1 << 2)
+/* No thread of its own: jobs run wherever util_queue_run_external is called,
+ * and each util_queue_add_job calls the queue's kick hook to ask for that.
+ * For a platform whose only suitable executor is a thread the queue does not
+ * own -- a browser's main thread, the one that holds the WebGPU device. Set by
+ * util_queue_init_external, not by util_queue_init. */
+#define UTIL_QUEUE_INIT_EXTERNAL_EXECUTOR         (1 << 3)
 
 #if UTIL_FUTEX_SUPPORTED
 #define UTIL_QUEUE_FENCE_FUTEX
@@ -220,6 +226,9 @@ struct util_queue_job {
    util_queue_execute_func cleanup;
 };
 
+struct util_queue;
+typedef void (*util_queue_kick_func)(struct util_queue *queue);
+
 /* Put this into your context. */
 struct util_queue {
    char name[14]; /* 13 characters = the thread name without the index */
@@ -238,6 +247,13 @@ struct util_queue {
    struct util_queue_job *jobs;
    void *global_data;
 
+   /* UTIL_QUEUE_INIT_EXTERNAL_EXECUTOR: called after a job is added, and the
+    * thread currently inside util_queue_run_external (or none). */
+   util_queue_kick_func kick;
+   void *kick_data;
+   bool external_running;
+   thrd_t external_thread;
+
    /* for cleanup at exit(), protected by exit_mutex */
    struct list_head head;
 };
@@ -249,6 +265,33 @@ bool util_queue_init(struct util_queue *queue,
                      unsigned flags,
                      void *global_data);
 void util_queue_destroy(struct util_queue *queue);
+
+/* A queue with no threads (UTIL_QUEUE_INIT_EXTERNAL_EXECUTOR): `kick` is
+ * called, on the adding thread and without the queue lock, after every job is
+ * added; whoever it wakes calls util_queue_run_external. Fences, finish and
+ * drop_job behave as for a threaded queue, except that nothing may wait on the
+ * queue from inside util_queue_run_external for a job queued behind the one
+ * running -- there is no second thread to run it. */
+bool util_queue_init_external(struct util_queue *queue,
+                              const char *name,
+                              unsigned max_jobs,
+                              unsigned flags,
+                              void *global_data,
+                              util_queue_kick_func kick,
+                              void *kick_data);
+
+/* Run every job queued, including ones added while running, and return how
+ * many ran. For an external-executor queue; the caller is the executor. */
+unsigned util_queue_run_external(struct util_queue *queue);
+
+/* Whether the calling thread is inside util_queue_run_external for `queue`. */
+static inline bool
+util_queue_is_external_executor(struct util_queue *queue)
+{
+   return (queue->flags & UTIL_QUEUE_INIT_EXTERNAL_EXECUTOR) &&
+          queue->external_running &&
+          u_thread_is_self(queue->external_thread);
+}
 
 /* optional cleanup callback is called after fence is signaled: */
 void util_queue_add_job(struct util_queue *queue,

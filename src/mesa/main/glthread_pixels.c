@@ -84,6 +84,8 @@ _mesa_marshal_Bitmap(GLsizei width, GLsizei height, GLfloat xorig,
       }
    }
 
+   GLTHREAD_REMOTE_CALL(ctx, Bitmap, width, height, xorig, yorig, xmove, ymove,
+                        bitmap);
    _mesa_glthread_finish_before(ctx, "Bitmap");
    CALL_Bitmap(ctx->Dispatch.Current,
                (width, height, xorig, yorig, xmove, ymove, bitmap));
@@ -156,6 +158,7 @@ _mesa_marshal_DrawPixels(GLsizei width, GLsizei height, GLenum format,
       }
    }
 
+   GLTHREAD_REMOTE_CALL(ctx, DrawPixels, width, height, format, type, pixels);
    _mesa_glthread_finish_before(ctx, "DrawPixels");
    CALL_DrawPixels(ctx->Dispatch.Current,
                    (width, height, format, type, pixels));

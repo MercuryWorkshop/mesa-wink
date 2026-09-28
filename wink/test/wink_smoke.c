@@ -26,6 +26,8 @@
 #define H 48
 
 static int failures;
+/* wink_init's flags for this run: 0, or WINK_INIT_GL_ON_MAIN_THREAD. */
+static uint32_t init_flags;
 
 static void
 note(const char *fmt, ...)
@@ -345,7 +347,10 @@ void wink_test_publish(void);
 static int
 run_pass(const char *label)
 {
-   int status = wink_init(NULL);
+   wink_init_attribs ia;
+   wink_init_attribs_default(&ia);
+   ia.flags = init_flags;
+   int status = wink_init(&ia);
    if (status != WINK_OK) {
       note("FAIL %s: init: %s", label, wink_status_string(status));
       return 1;
@@ -390,16 +395,49 @@ run_pass(const char *label)
    return 0;
 }
 
-EMSCRIPTEN_KEEPALIVE int
-wink_smoke_main(void)
+static int
+run_all(void)
 {
-   wink_test_publish();
    run_pass("native compression");
    /* And again from a fresh device with ASTC and ETC2 hidden from the
     * driver: st/mesa must still expose GL ES 3.2, decoding on the CPU. */
    wink_setenv("GEX_WGPU_NO_ASTC", "1");
    wink_setenv("GEX_WGPU_NO_ETC2", "1");
    run_pass("cpu-decoded compression");
+   wink_setenv("GEX_WGPU_NO_ASTC", NULL);
+   wink_setenv("GEX_WGPU_NO_ETC2", NULL);
    note(failures ? "FAILED %d" : "PASS", failures);
    return failures;
 }
+
+EMSCRIPTEN_KEEPALIVE int
+wink_smoke_main(void)
+{
+   wink_test_publish();
+   return run_all();
+}
+
+#ifdef __EMSCRIPTEN_PTHREADS__
+/* The same suite from a worker, with GL executed on the main thread: this
+ * returns at once, so the main thread stays free to be the driver thread,
+ * and the result arrives through Module.winkSmokeDone. */
+static void *
+smoke_thread(void *arg)
+{
+   (void)arg;
+   init_flags = WINK_INIT_GL_ON_MAIN_THREAD;
+   int rc = run_all();
+   MAIN_THREAD_ASYNC_EM_ASM({ Module['winkSmokeDone']($0); }, rc);
+   return NULL;
+}
+
+EMSCRIPTEN_KEEPALIVE int
+wink_smoke_start_worker(void)
+{
+   pthread_t thread;
+   if (pthread_create(&thread, NULL, smoke_thread, NULL) != 0)
+      return 1;
+   pthread_detach(thread);
+   return 0;
+}
+#endif

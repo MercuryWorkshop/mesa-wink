@@ -4,7 +4,7 @@
 // Serve a directory, open its index.html in headless Chrome, relay the
 // console, and wait for the page to set globalThis.__winkResult.
 //
-//   node run-browser.mjs <dir> [--timeout=SECONDS]
+//   node run-browser.mjs <dir> [--page=index.html] [--timeout=SECONDS]
 //
 // The server always sends COOP/COEP: the mt build needs SharedArrayBuffer,
 // and the st build does not mind them. CHROME overrides the browser;
@@ -18,8 +18,9 @@ import { extname, join, normalize } from 'node:path';
 
 const dir = process.argv[2];
 const timeout = Number((process.argv.find((a) => a.startsWith('--timeout=')) || '=120').split('=')[1]) * 1000;
-if (!dir || !existsSync(join(dir, 'index.html'))) {
-  console.error('usage: run-browser.mjs <dir with index.html> [--timeout=SECONDS]');
+const pageName = (process.argv.find((a) => a.startsWith('--page=')) || '=index.html').split('=')[1];
+if (!dir || !existsSync(join(dir, pageName))) {
+  console.error('usage: run-browser.mjs <dir> [--page=index.html] [--timeout=SECONDS]');
   process.exit(2);
 }
 
@@ -42,7 +43,7 @@ const server = createServer((req, res) => {
   res.end(readFileSync(file));
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
-const url = `http://127.0.0.1:${server.address().port}/`;
+const url = `http://127.0.0.1:${server.address().port}/${pageName}`;
 
 function findChrome() {
   if (process.env.CHROME) return process.env.CHROME;

@@ -9,18 +9,96 @@
 // ikvm-wasm-build's .NET runtime already uses for its frame pacing, and it
 // needs nothing from the link.
 //
+// With WINK_INIT_GL_ON_MAIN_THREAD the driver runs on the main thread, in
+// jobs a worker queues and wink_js_kick announces. The main thread's runner
+// below enters them through WebAssembly.promising itself, so the embedder has
+// nothing to wrap there; and it runs them on a shadow stack of its own. That
+// matters because a suspended job's frames sit on the C stack while the event
+// loop runs other wasm -- the embedder's own suspending calls among them --
+// and two suspended stacks interleaved on one shadow stack corrupt it. So
+// while a job is suspended the stack pointer is the main stack's, and while it
+// runs it is the runner's.
+//
 // Every page-facing knob is a Module property, bracketed so closure keeps it:
 //   Module.winkDevice          a GPUDevice to use (or preinitializedWebGPUDevice)
 //   Module.winkAdapterOptions  passed to navigator.gpu.requestAdapter
 //   Module.winkDeviceDescriptor(adapter, desc)  may amend or replace desc
 //   Module.winkCanvas          a canvas, or function(selector) -> canvas
 //   Module.winkEnv             {NAME: value} or ["NAME=value"], applied as setenv
+//   Module.winkRunnerStackSize the main-thread runner's stack (default 16MB)
 
 var LibraryWink = {
+  $WINK__deps: ['stackSave', 'stackRestore', 'malloc', 'wink_main_run_queue', 'wink_set_device_lost'],
   $WINK: {
     waiting: [],
     lost: false,
     errors: 0,
+
+    // The main thread's runner. `pending` is made on first use: a library
+    // object is written out as a literal, and a Set does not survive that.
+    pending: null,
+    running: false,
+    scheduled: false,
+    inRunner: false,
+    runnerTop: 0,
+    outerSP: 0,
+    promisingRun: null,
+
+    schedule: function () {
+      if (WINK.running || WINK.scheduled) return;
+      WINK.scheduled = true;
+      // A fresh task-free stack: no wasm frames under the promising call.
+      queueMicrotask(WINK.drain);
+    },
+
+    drain: async function () {
+      WINK.scheduled = false;
+      WINK.running = true;
+      try {
+        while (WINK.pending && WINK.pending.size) {
+          var queues = Array.from(WINK.pending);
+          WINK.pending.clear();
+          for (var i = 0; i < queues.length; ++i) await WINK.runQueue(queues[i]);
+        }
+      } catch (e) {
+        err('wink: main-thread runner failed: ' + (e && e.stack || e));
+      } finally {
+        WINK.running = false;
+      }
+    },
+
+    runQueue: async function (queue) {
+      if (!WINK.promisingRun) {
+        var size = Module['winkRunnerStackSize'] || 16 * 1024 * 1024;
+        var base = _malloc(size);
+        if (!base) throw new Error('no memory for the runner stack');
+        WINK.runnerTop = (base + size) & ~15;
+        WINK.promisingRun = WebAssembly.promising(wasmExports['wink_main_run_queue']);
+      }
+      WINK.outerSP = stackSave();
+      stackRestore(WINK.runnerTop);
+      WINK.inRunner = true;
+      try {
+        await WINK.promisingRun(queue);
+      } finally {
+        WINK.inRunner = false;
+        stackRestore(WINK.outerSP);
+      }
+    },
+
+    // What every suspending import returns. Inside the runner the stack
+    // pointer is handed back to the main stack for the duration, and taken
+    // back just before the job resumes.
+    suspend: function (promise) {
+      if (!WINK.inRunner) return promise;
+      var mine = stackSave();
+      stackRestore(WINK.outerSP);
+      return promise.then(function (value) {
+        WINK.outerSP = stackSave();
+        stackRestore(mine);
+        return value;
+      });
+    },
 
     wakeAll: function () {
       var waiting = WINK.waiting;
@@ -94,6 +172,7 @@ var LibraryWink = {
     adopt: function (device) {
       device['lost']['then'](function (info) {
         WINK.lost = true;
+        _wink_set_device_lost();
         err('wink: WebGPU device lost: ' + info['reason'] + ': ' + info['message']);
         // A waiter whose map will now never complete is woken to see the loss.
         WINK.wakeAll();
@@ -112,7 +191,7 @@ var LibraryWink = {
   gex_wgpu_jspi_wait__deps: ['$WINK'],
   gex_wgpu_jspi_wait: function () {
     if (WINK.lost) return;
-    return new Promise(function (resolve) { WINK.waiting.push(resolve); });
+    return WINK.suspend(new Promise(function (resolve) { WINK.waiting.push(resolve); }));
   },
   gex_wgpu_jspi_wait__postset:
     "if (typeof WebAssembly.Suspending == 'function') _gex_wgpu_jspi_wait = new WebAssembly.Suspending(_gex_wgpu_jspi_wait);",
@@ -136,7 +215,7 @@ var LibraryWink = {
       err('wink: navigator.gpu is unavailable');
       return 0;
     }
-    return (async function () {
+    return WINK.suspend((async function () {
       try {
         var adapter = await gpu['requestAdapter'](Module['winkAdapterOptions'] || {'powerPreference': 'high-performance'});
         if (!adapter) {
@@ -150,7 +229,7 @@ var LibraryWink = {
         err('wink: requesting a WebGPU device failed: ' + e);
         return 0;
       }
-    })();
+    })());
   },
   wink_js_acquire_device__postset:
     "if (typeof WebAssembly.Suspending == 'function') _wink_js_acquire_device = new WebAssembly.Suspending(_wink_js_acquire_device);",
@@ -203,10 +282,33 @@ var LibraryWink = {
     return need;
   },
 
-  wink_js_device_lost__deps: ['$WINK'],
-  wink_js_device_lost: function () {
-    return WINK.lost ? 1 : 0;
+  // From any thread: the runner lives on main.
+  wink_js_kick__deps: ['$WINK'],
+  wink_js_kick__proxy: 'async',
+  wink_js_kick__sig: 'vp',
+  wink_js_kick: function (queue) {
+    if (!WINK.pending) WINK.pending = new Set();
+    WINK.pending.add(queue);
+    WINK.schedule();
   },
+
+  // A presented frame needs the event loop; pacing is waiting for more of it.
+  // The setTimeout fallback is for hidden tabs, where requestAnimationFrame
+  // never fires and a job waiting on it would park the runner for good.
+  wink_js_yield_frame__deps: ['$WINK'],
+  wink_js_yield_frame: function (frames) {
+    return WINK.suspend(new Promise(function (resolve) {
+      var left = frames;
+      var settled = false;
+      var done = function () { if (!settled) { settled = true; resolve(); } };
+      var tick = function () { if (--left <= 0) done(); else requestAnimationFrame(tick); };
+      if (left > 0 && typeof requestAnimationFrame == 'function') requestAnimationFrame(tick);
+      else setTimeout(done, 0);
+      setTimeout(done, 1000);
+    }));
+  },
+  wink_js_yield_frame__postset:
+    "if (typeof WebAssembly.Suspending == 'function') _wink_js_yield_frame = new WebAssembly.Suspending(_wink_js_yield_frame);",
 };
 
 mergeInto(LibraryManager.library, LibraryWink);

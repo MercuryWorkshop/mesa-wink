@@ -504,8 +504,11 @@ util_queue_kill_threads(struct util_queue *queue, unsigned keep_num_threads,
    queue->num_threads = keep_num_threads;
    cnd_broadcast(&queue->has_queued_cond);
 
-   /* Wait for threads to terminate. */
-   if (keep_num_threads < old_num_threads) {
+   /* Wait for threads to terminate. An external executor is not ours. */
+   if (queue->flags & UTIL_QUEUE_INIT_EXTERNAL_EXECUTOR) {
+      if (!locked)
+         mtx_unlock(&queue->lock);
+   } else if (keep_num_threads < old_num_threads) {
       /* We need to unlock the mutex to allow threads to terminate. */
       mtx_unlock(&queue->lock);
       for (unsigned i = keep_num_threads; i < old_num_threads; i++)
@@ -642,6 +645,86 @@ util_queue_add_job(struct util_queue *queue,
 {
    util_queue_add_job_locked(queue, job, fence, execute, cleanup, job_size,
                              false);
+   if (queue->flags & UTIL_QUEUE_INIT_EXTERNAL_EXECUTOR)
+      queue->kick(queue);
+}
+
+bool
+util_queue_init_external(struct util_queue *queue,
+                         const char *name,
+                         unsigned max_jobs,
+                         unsigned flags,
+                         void *global_data,
+                         util_queue_kick_func kick,
+                         void *kick_data)
+{
+   memset(queue, 0, sizeof(*queue));
+   snprintf(queue->name, sizeof(queue->name), "%s", name);
+   /* One notional thread -- the executor -- so everything that counts
+    * threads (add_job refusing work at zero, finish's barrier) behaves. */
+   queue->create_threads_on_demand = false;
+   queue->flags = flags | UTIL_QUEUE_INIT_EXTERNAL_EXECUTOR;
+   queue->max_threads = 1;
+   queue->num_threads = 1;
+   queue->max_jobs = max_jobs;
+   queue->global_data = global_data;
+   queue->kick = kick;
+   queue->kick_data = kick_data;
+
+   (void) mtx_init(&queue->lock, mtx_plain);
+   cnd_init(&queue->has_queued_cond);
+   cnd_init(&queue->has_space_cond);
+
+   queue->jobs = (struct util_queue_job*)
+                 calloc(max_jobs, sizeof(struct util_queue_job));
+   /* Never a real thread, but util_queue_is_initialized looks for it. */
+   queue->threads = (thrd_t*) calloc(1, sizeof(thrd_t));
+   if (!queue->jobs || !queue->threads) {
+      free(queue->jobs);
+      free(queue->threads);
+      cnd_destroy(&queue->has_space_cond);
+      cnd_destroy(&queue->has_queued_cond);
+      mtx_destroy(&queue->lock);
+      memset(queue, 0, sizeof(*queue));
+      return false;
+   }
+   add_to_atexit_list(queue);
+   return true;
+}
+
+unsigned
+util_queue_run_external(struct util_queue *queue)
+{
+   unsigned ran = 0;
+   assert(queue->flags & UTIL_QUEUE_INIT_EXTERNAL_EXECUTOR);
+
+   mtx_lock(&queue->lock);
+   const bool nested = queue->external_running;
+   queue->external_running = true;
+   queue->external_thread = thrd_current();
+   while (queue->num_threads && queue->num_queued > 0) {
+      struct util_queue_job job = queue->jobs[queue->read_idx];
+      memset(&queue->jobs[queue->read_idx], 0, sizeof(struct util_queue_job));
+      queue->read_idx = (queue->read_idx + 1) % queue->max_jobs;
+      queue->num_queued--;
+      cnd_signal(&queue->has_space_cond);
+      if (job.job)
+         queue->total_jobs_size -= job.job_size;
+      mtx_unlock(&queue->lock);
+
+      if (job.job) {
+         job.execute(job.job, job.global_data, 0);
+         if (job.fence)
+            util_queue_fence_signal(job.fence);
+         if (job.cleanup)
+            job.cleanup(job.job, job.global_data, 0);
+         ran++;
+      }
+      mtx_lock(&queue->lock);
+   }
+   queue->external_running = nested;
+   mtx_unlock(&queue->lock);
+   return ran;
 }
 
 /**

@@ -99,7 +99,10 @@ _mesa_glthread_upload(struct gl_context *ctx, const void *data,
    struct glthread_state *glthread = &ctx->GLThread;
    const unsigned default_size = 1024 * 1024;
 
-   if (unlikely(size > INT_MAX))
+   /* An upload buffer is created and mapped here, on the application thread,
+    * which a remote context's driver does not allow. Every caller falls back
+    * to sending the data along or to a synchronous call. */
+   if (unlikely(size > INT_MAX) || GLTHREAD_IS_REMOTE(ctx))
       return;
 
    /* The alignment was chosen arbitrarily. */
@@ -393,6 +396,15 @@ _mesa_marshal_BufferData_merged(GLuint target_or_name, GLsizeiptr size,
 
    if (unlikely(size < 0 || size > INT_MAX || cmd_size > MARSHAL_MAX_CMD_SIZE ||
                 (named && target_or_name == 0))) {
+#if MESA_GLTHREAD_REMOTE
+      if (GLTHREAD_IS_REMOTE(ctx)) {
+         if (named)
+            _mesa_glthread_call_NamedBufferData(ctx, target_or_name, size, data, usage);
+         else
+            _mesa_glthread_call_BufferData(ctx, target_or_name, size, data, usage);
+         return;
+      }
+#endif
       _mesa_glthread_finish_before(ctx, func);
       if (named) {
          CALL_NamedBufferData(ctx->Dispatch.Current,
@@ -535,6 +547,15 @@ _mesa_marshal_BufferSubData_merged(GLuint target_or_name, GLintptr offset,
    if (unlikely(size < 0 || size > INT_MAX || cmd_size < 0 ||
                 cmd_size > MARSHAL_MAX_CMD_SIZE || !data ||
                 (named && target_or_name == 0))) {
+#if MESA_GLTHREAD_REMOTE
+      if (GLTHREAD_IS_REMOTE(ctx)) {
+         if (named)
+            _mesa_glthread_call_NamedBufferSubData(ctx, target_or_name, offset, size, data);
+         else
+            _mesa_glthread_call_BufferSubData(ctx, target_or_name, offset, size, data);
+         return;
+      }
+#endif
       _mesa_glthread_finish_before(ctx, func);
       if (named) {
          CALL_NamedBufferSubData(ctx->Dispatch.Current,
