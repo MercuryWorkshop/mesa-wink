@@ -462,7 +462,8 @@ blend_factor(uint8_t vk)
    case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: return WGPUBlendFactor_OneMinusSrcAlpha;
    case VK_BLEND_FACTOR_DST_ALPHA: return WGPUBlendFactor_DstAlpha;
    case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return WGPUBlendFactor_OneMinusDstAlpha;
-   /* WebGPU has one constant: the alpha ones use its colour. */
+   /* WebGPU has one constant. As a colour factor, CONSTANT_ALPHA is it
+    * with its alpha everywhere: see blend_constant. */
    case VK_BLEND_FACTOR_CONSTANT_COLOR:
    case VK_BLEND_FACTOR_CONSTANT_ALPHA: return WGPUBlendFactor_Constant;
    case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR:
@@ -1436,6 +1437,41 @@ set_pulled_buffers(struct wvk_device *dev, struct wvk_replay *replay)
    }
 }
 
+static bool
+is_constant_alpha(uint8_t factor)
+{
+   return factor == VK_BLEND_FACTOR_CONSTANT_ALPHA || factor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+}
+
+static bool
+is_constant_color(uint8_t factor)
+{
+   return factor == VK_BLEND_FACTOR_CONSTANT_COLOR || factor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+}
+
+/* The blend constant, as WebGPU's one constant has to be: where colour
+ * factors use CONSTANT_ALPHA, its alpha in every channel. For alpha
+ * factors both are the alpha anyway. Colour factors that use both
+ * CONSTANT_COLOR and CONSTANT_ALPHA cannot be had. */
+static WGPUColor
+blend_constant(const struct vk_dynamic_graphics_state *dyn, uint32_t color_count)
+{
+   const float *bc = dyn->cb.blend_constants;
+   bool alpha = false, color = false;
+   for (uint32_t i = 0; i < MIN2(color_count, dyn->cb.attachment_count); ++i) {
+      const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
+      if (!a->blend_enable)
+         continue;
+      alpha |= is_constant_alpha(a->src_color_blend_factor) || is_constant_alpha(a->dst_color_blend_factor);
+      color |= is_constant_color(a->src_color_blend_factor) || is_constant_color(a->dst_color_blend_factor);
+   }
+   if (alpha && color)
+      mesa_logw_once("wvk: colour blend factors with both CONSTANT_COLOR and CONSTANT_ALPHA");
+   if (alpha && !color)
+      return (WGPUColor){ bc[3], bc[3], bc[3], bc[3] };
+   return (WGPUColor){ bc[0], bc[1], bc[2], bc[3] };
+}
+
 /* Everything a draw needs set on the pass. False skips the draw. */
 static bool
 flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
@@ -1502,8 +1538,7 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
       wvk_replay_read(replay, ib->mem, ib->offset, ib->size);
    }
 
-   const float *bc = dyn->cb.blend_constants;
-   const WGPUColor blend = { bc[0], bc[1], bc[2], bc[3] };
+   const WGPUColor blend = blend_constant(dyn, replay->rendering.color_count);
    wgpuRenderPassEncoderSetBlendConstant(pass, &blend);
    wgpuRenderPassEncoderSetStencilReference(pass, dyn->ds.stencil.front.reference);
    return true;

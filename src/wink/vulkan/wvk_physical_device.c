@@ -179,7 +179,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .constantAlphaColorBlendFactors = true,
       .events = true,
       .imageViewFormatReinterpretation = false,
-      .imageViewFormatSwizzle = true,
+      .imageViewFormatSwizzle = false, /* WebGPU views have no swizzle */
       .imageView2DOn3DImage = false,
       .multisampleArrayImage = false,
       .mutableComparisonSamplers = true,

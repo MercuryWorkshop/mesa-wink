@@ -108,11 +108,15 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 
 - Texel buffers, in shaders.
 - Dynamically indexed arrays of descriptors: the first element is used.
-- Layered rendering: a pass is one layer. This affects blits of several
-  layers and 3D blits, and multiview.
+- Layered rendering: a pass is one layer. This affects multiview too.
 - Precise occlusion queries, and timestamps.
 - Subgroups.
-- Sampler LOD bias, border colours, and component swizzles.
+- Sampler LOD bias, border colours, and component swizzles, which the
+  portability subset says (`imageViewFormatSwizzle` is false).
+- Blend states whose colour factors use both CONSTANT_COLOR and
+  CONSTANT_ALPHA: WebGPU has one constant.
+- Blits of several layers, and 3D blits: a pass is one layer.
+- Multisampled array images.
 
 Some of these are what WebGPU has no way to express. The rest are work still
 to do.
