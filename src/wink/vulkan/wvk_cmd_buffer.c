@@ -406,6 +406,11 @@ wvk_replay_drop_snapshots(struct wvk_replay *replay)
    util_dynarray_foreach(&replay->snapshots, struct wvk_snapshot, s)
       wgpuTextureRelease(s->texture);
    util_dynarray_clear(&replay->snapshots);
+   for (uint32_t i = 0; i < replay->rendering.color_count; ++i) {
+      struct wvk_image_view *view = replay->rendering.color[i];
+      if (view)
+         wvk_image_written(wvk_image_view_image(view), view->texture, view->vk.base_mip_level, 1);
+   }
 }
 
 void

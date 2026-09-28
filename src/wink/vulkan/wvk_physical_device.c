@@ -284,7 +284,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* VK_KHR_portability_subset: what WebGPU leaves out */
       .constantAlphaColorBlendFactors = true,
       .events = true,
-      .imageViewFormatReinterpretation = false,
+      /* Of another texture of the image's, kept in step (wvk_image.h). */
+      .imageViewFormatReinterpretation = true,
       .imageViewFormatSwizzle = true, /* by the shader: wvk_nir_descriptors.c */
       .imageView2DOn3DImage = false,
       .multisampleArrayImage = false,

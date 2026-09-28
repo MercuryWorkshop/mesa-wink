@@ -89,8 +89,15 @@ static WGPUTextureView
 attachment_view(struct wvk_replay *replay, struct wvk_image_view *view, WGPUTextureAspect aspect)
 {
    struct wvk_image *image = wvk_image_view_image(view);
+   /* What the pass renders to has to be up to date first, and is then
+    * what is. */
+   if (image->tracked) {
+      if (!wvk_image_current(image, view->texture, view->vk.base_mip_level, 1))
+         wvk_image_make_current(replay->dev, replay, image, view->texture, view->vk.base_mip_level, 1);
+      wvk_image_written(image, view->texture, view->vk.base_mip_level, 1);
+   }
    /* A pass of several layers is one for each: this one's. */
-   WGPUTextureView v = wvk_image_attachment_view(image, view->format, aspect, view->vk.base_mip_level,
+   WGPUTextureView v = wvk_image_attachment_view(image, view->texture, view->format, aspect, view->vk.base_mip_level,
                                                  view->vk.base_array_layer + replay->pass_layer);
    util_dynarray_append(&replay->views, v);
    return v;

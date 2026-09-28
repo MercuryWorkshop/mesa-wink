@@ -30,6 +30,7 @@
 #include "vk_pipeline_layout.h"
 
 #include "util/hash_table.h"
+#include "util/u_atomic.h"
 #include "util/u_dynarray.h"
 
 #include <stdlib.h>
@@ -1124,12 +1125,12 @@ placeholder_view_locked(struct wvk_device *dev, const struct wvk_shader_binding 
 static const struct vk_stencil_test_face_state *draw_stencil_face(const struct wvk_replay *replay,
                                                                    const struct vk_dynamic_graphics_state *dyn);
 
-/* The copy of an image the pass renders to, if it has one. */
+/* The copy of an image's texture the pass renders to, if it has one. */
 static WGPUTexture
-find_snapshot(const struct wvk_replay *replay, const struct wvk_image *image)
+find_snapshot(const struct wvk_replay *replay, const struct wvk_image *image, uint32_t t)
 {
    util_dynarray_foreach(&replay->snapshots, struct wvk_snapshot, s) {
-      if (s->image == image)
+      if (s->image == image && s->t == t)
          return s->texture;
    }
    return NULL;
@@ -1200,7 +1201,7 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       case WVK_BINDING_STORAGE_TEXTURE:
          e->textureView = d && d->view ? d->view : placeholder_view(dev, b);
          if (replay && d && d->view_image && b->kind == WVK_BINDING_TEXTURE) {
-            WGPUTexture copy = find_snapshot(replay, d->view_image);
+            WGPUTexture copy = find_snapshot(replay, d->view_image, d->view_texture);
             WGPUTextureView v = copy ? wgpuTextureCreateView(copy, &d->view_desc) : NULL;
             if (v) {
                util_dynarray_append(&replay->views, v);
@@ -1282,6 +1283,42 @@ sync_atomic_buffers(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout,
       wvk_replay_restart_pass(cmd, replay->pass_layer);
 }
 
+/* Images the layout's shaders read or write through textures of theirs
+ * behind the one last written -- aliases of other formats, shadows --
+ * brought up to date: outside any pass, and a render pass begun again
+ * after. Storage images are then what is up to date. */
+static void
+sync_image_textures(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout, uint32_t bind_point)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   if (!p_atomic_read(&dev->tracked_images))
+      return;
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   const bool in_pass = replay->pass != NULL;
+   for (uint32_t g = 0; g < layout->group_count; ++g) {
+      const struct wvk_bgl *bgl = layout->groups[g];
+      const struct wvk_descriptor_set *set = st->sets[bind_point][g].set;
+      for (uint32_t i = 0; set && i < bgl->count; ++i) {
+         const struct wvk_shader_binding *b = &bgl->entries[i].b;
+         if (b->kind != WVK_BINDING_TEXTURE && b->kind != WVK_BINDING_STORAGE_TEXTURE)
+            continue;
+         bool sampler;
+         uint32_t dynamic_index;
+         const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
+         if (!d || !d->view_image || !d->view_image->tracked)
+            continue;
+         struct wvk_image *image = d->view_image;
+         if (!wvk_image_current(image, d->view_texture, d->view_level, d->view_levels))
+            wvk_image_make_current(dev, replay, image, d->view_texture, d->view_level, d->view_levels);
+         if (b->kind == WVK_BINDING_STORAGE_TEXTURE)
+            wvk_image_written(image, d->view_texture, d->view_level, d->view_levels);
+      }
+   }
+   if (in_pass && !replay->pass)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+}
+
 /* A set's inline uniform blocks as it has them now: written before the
  * submit, in the queue's order, after what used them before. */
 static void
@@ -1305,7 +1342,7 @@ reads_snapshot(const struct wvk_replay *replay, const struct wvk_bgl *bgl, const
       bool sampler;
       uint32_t dynamic_index;
       const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
-      if (d && d->view_image && find_snapshot(replay, d->view_image))
+      if (d && d->view_image && find_snapshot(replay, d->view_image, d->view_texture))
          return true;
    }
    return false;
@@ -1313,12 +1350,14 @@ reads_snapshot(const struct wvk_replay *replay, const struct wvk_bgl *bgl, const
 
 /* Whether the pass renders to what a descriptor reads of an image, which
  * WebGPU will not let it read as well: an aspect of depth or stencil it
- * may, read-only. */
+ * may, read-only. Of another texture of the image's, what it reads is a
+ * copy already (sync_image_textures). */
 static bool
 is_rendered_to(const struct wvk_replay *replay, const struct wvk_descriptor *d)
 {
    for (uint32_t i = 0; i < replay->rendering.color_count; ++i) {
-      if (replay->rendering.color[i] && wvk_image_view_image(replay->rendering.color[i]) == d->view_image)
+      const struct wvk_image_view *color = replay->rendering.color[i];
+      if (color && wvk_image_view_image(color) == d->view_image && color->texture == d->view_texture)
          return true;
    }
    const struct wvk_image_view *ds = replay->rendering.depth_stencil;
@@ -1354,18 +1393,19 @@ snapshot_feedback(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout)
          bool sampler;
          uint32_t dynamic_index;
          const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
-         if (!d || !d->view_image || !is_rendered_to(replay, d) || find_snapshot(replay, d->view_image))
+         if (!d || !d->view_image || !is_rendered_to(replay, d) ||
+             find_snapshot(replay, d->view_image, d->view_texture))
             continue;
          if (!ended) {
             wvk_replay_end_passes(replay);
             ended = true;
          }
-         WGPUTexture copy = wvk_image_snapshot(dev->wgpu, d->view_image, replay->encoder);
+         WGPUTexture copy = wvk_image_snapshot(dev->wgpu, d->view_image, d->view_texture, replay->encoder);
          if (!copy) {
             mesa_logw_once("wvk: a pass reads a multisampled or depth image it renders to");
             continue;
          }
-         const struct wvk_snapshot snapshot = { d->view_image, copy };
+         const struct wvk_snapshot snapshot = { d->view_image, d->view_texture, copy };
          util_dynarray_append(&replay->snapshots, snapshot);
       }
    }
@@ -1892,6 +1932,7 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    struct wvk_render_pipeline *p = get_render_pipeline(dev, cmd, indexed);
    if (!p)
       return false;
+   sync_image_textures(cmd, p->layout, WVK_BIND_GRAPHICS);
    sync_atomic_buffers(cmd, p->layout, WVK_BIND_GRAPHICS);
    snapshot_feedback(cmd, p->layout);
    pass = replay->pass;
@@ -2487,6 +2528,7 @@ flush_dispatch(struct wvk_cmd_buffer *cmd)
    struct wvk_compute_pipeline *p = get_compute_pipeline(dev, st, st->cs);
    if (!p)
       return NULL;
+   sync_image_textures(cmd, p->layout, WVK_BIND_COMPUTE);
    sync_atomic_buffers(cmd, p->layout, WVK_BIND_COMPUTE);
    if (!replay->compute) {
       WGPUComputePassDescriptor desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;

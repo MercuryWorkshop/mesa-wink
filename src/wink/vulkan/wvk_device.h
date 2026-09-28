@@ -82,6 +82,9 @@ struct wvk_device {
       WGPUTextureFormat format;
       WGPURenderPipeline pipeline;
    } depth_in_pipelines[4];
+   /* Images made with aliases or a shadow (wvk_image.h), whose textures
+    * draws bring up to date: none, and they need not look. */
+   uint32_t tracked_images;
    /* Compressed texels into a shadow (wvk_image.h): for each format of
     * shadow, from a 2D array and from a 3D texture. */
    WGPURenderPipeline shadow_pipelines[3][2];

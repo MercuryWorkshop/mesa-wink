@@ -228,6 +228,9 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
       }
       if (wgpu) {
          d->view_image = wvk_image_view_image(view);
+         d->view_texture = view->texture;
+         d->view_level = view->vk.base_mip_level;
+         d->view_levels = view->vk.level_count;
          d->view_desc = *desc;
          d->view_desc.label = (WGPUStringView)WGPU_STRING_VIEW_INIT;
          d->view = wgpu;

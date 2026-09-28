@@ -35,6 +35,10 @@ struct wvk_descriptor {
    WGPUTextureView view;
    struct wvk_image *view_image;
    WGPUTextureViewDescriptor view_desc;
+   /* Which of the image's textures the view is of, and its levels. */
+   uint32_t view_texture;
+   uint32_t view_level;
+   uint32_t view_levels;
    VkFormat view_format;
    uint32_t swizzle;
    uint32_t channels;

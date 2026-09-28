@@ -9,8 +9,26 @@
 
 #include "vk_image.h"
 
+struct wvk_device;
 struct wvk_device_memory;
 struct wvk_physical_device;
+struct wvk_replay;
+
+/* A texture of the image's in another format, which WebGPU cannot view
+ * the image's own as: of the same bytes a texel, or for an uncompressed
+ * view of a compressed image a texel a block, at one level. */
+struct wvk_image_alias {
+   WGPUTextureFormat format;
+   WGPUTexture texture;
+   /* The image's levels it has, from its level 0. */
+   uint32_t first_level;
+   uint32_t level_count;
+};
+
+#define WVK_IMAGE_MAX_ALIASES 8
+/* An image's textures: its own, alias i as i + 1, and its shadow. */
+#define WVK_IMAGE_TEXTURE 0
+#define WVK_IMAGE_SHADOW 31
 
 /* A WGPUTexture of its own; its memory is accounting only. A 1D image is
  * a 2D texture one texel high, so that it can have mips and be rendered
@@ -27,6 +45,17 @@ struct wvk_image {
     * is decoded into (wvk_cmd_copy.c). */
    WGPUTexture shadow;
    WGPUTextureFormat shadow_format;
+   /* Made as views need them, and kept with the image. */
+   struct wvk_image_alias aliases[WVK_IMAGE_MAX_ALIASES];
+   uint32_t alias_count;
+   /* An image with aliases or a shadow: which of its textures have, at
+    * each level, what was last written there, and which one it was
+    * written to. Kept as submits are replayed, which is the queue's
+    * order; copies between them bring one up to date when it is used
+    * (wvk_image_make_current). */
+   bool tracked;
+   uint32_t valid[16];
+   uint8_t owner[16];
    WGPUTextureFormat format;
    WGPUTextureDimension dimension;
    WGPUTextureUsage usage;
@@ -51,10 +80,68 @@ struct wvk_image {
    bool atomic_in_buffer;
 };
 
-/* Decode what the image's texture has at a level, in layers or a 3D
- * image's every slice, into its shadow, after a copy there. */
+/* Decode what the image's texture has at a level, every layer or 3D
+ * slice, into its shadow (wvk_cmd_copy.c). */
 void wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
-                             uint32_t level, uint32_t base_layer, uint32_t layer_count);
+                             uint32_t level);
+
+/* The image's texture `t`, and the image's level its level 0 is. */
+static inline WGPUTexture
+wvk_image_texture(const struct wvk_image *image, uint32_t t, uint32_t *first_level)
+{
+   *first_level = 0;
+   if (t == WVK_IMAGE_SHADOW)
+      return image->shadow;
+   if (t == WVK_IMAGE_TEXTURE)
+      return image->texture;
+   *first_level = image->aliases[t - 1].first_level;
+   return image->aliases[t - 1].texture;
+}
+
+/* Whether the image's texture `t` has what was last written to levels
+ * [first, first + count). */
+static inline bool
+wvk_image_current(const struct wvk_image *image, uint32_t t, uint32_t first, uint32_t count)
+{
+   if (!image->tracked)
+      return true;
+   for (uint32_t l = first; l < first + count && l < ARRAY_SIZE(image->valid); ++l) {
+      if (!(image->valid[l] & BITFIELD_BIT(t)))
+         return false;
+   }
+   return true;
+}
+
+/* Bring it up to date, by copies from the texture written last: outside
+ * any pass, whose end this is if one is going on. */
+void wvk_image_make_current(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+                            uint32_t t, uint32_t first, uint32_t count);
+
+/* After a write to texture `t` of the levels, the others are behind. */
+static inline void
+wvk_image_written(struct wvk_image *image, uint32_t t, uint32_t first, uint32_t count)
+{
+   if (!image->tracked)
+      return;
+   for (uint32_t l = first; l < first + count && l < ARRAY_SIZE(image->valid); ++l) {
+      image->owner[l] = t;
+      image->valid[l] = BITFIELD_BIT(t);
+   }
+}
+
+/* A transfer's use of the image's own texture, which it first brings up
+ * to date: outside any pass. */
+static inline void
+wvk_image_use(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image, uint32_t first,
+              uint32_t count, bool write)
+{
+   if (!image->tracked)
+      return;
+   if (!wvk_image_current(image, WVK_IMAGE_TEXTURE, first, count))
+      wvk_image_make_current(dev, replay, image, WVK_IMAGE_TEXTURE, first, count);
+   if (write)
+      wvk_image_written(image, WVK_IMAGE_TEXTURE, first, count);
+}
 
 /* The texture layer `layer` of the image is in, and which layer of it. */
 static inline WGPUTexture
@@ -71,7 +158,8 @@ wvk_image_layer_texture(const struct wvk_image *image, uint32_t layer, uint32_t 
 /* A copy of the image's texture, every level and layer of it, for a pass
  * that reads the image as it renders to it. Colour images of one sample
  * only; NULL for the rest. */
-WGPUTexture wvk_image_snapshot(WGPUDevice device, const struct wvk_image *image, WGPUCommandEncoder encoder);
+WGPUTexture wvk_image_snapshot(WGPUDevice device, const struct wvk_image *image, uint32_t t,
+                               WGPUCommandEncoder encoder);
 
 /* Copy an atomic image's texels from its texture to its buffer, or back,
  * outside any pass. */
@@ -97,6 +185,8 @@ struct wvk_image_view {
    WGPUTextureViewDescriptor view_desc, array_desc;
    WGPUTextureFormat format;
    WGPUTextureAspect aspect;
+   /* Which of the image's textures it is of (wvk_image_texture). */
+   uint32_t texture;
    /* Its components, which WebGPU views have no way to remap, for shaders
     * to: WVK_META_TEX_SWIZZLE; and those its format has. */
    uint32_t swizzle;
@@ -112,8 +202,9 @@ wvk_image_view_image(const struct wvk_image_view *view)
 }
 
 /* A single-level, single-layer 2D (or 3D slice) view for a render
- * attachment, which WebGPU insists on. The caller releases it. */
-WGPUTextureView wvk_image_attachment_view(struct wvk_image *image, WGPUTextureFormat format,
+ * attachment, which WebGPU insists on, of the image's texture `t`. The
+ * caller releases it. */
+WGPUTextureView wvk_image_attachment_view(struct wvk_image *image, uint32_t t, WGPUTextureFormat format,
                                           WGPUTextureAspect aspect, uint32_t level, uint32_t layer);
 
 WGPUTextureAspect wvk_aspect(VkImageAspectFlags aspects);

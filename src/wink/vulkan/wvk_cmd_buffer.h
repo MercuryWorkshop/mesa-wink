@@ -210,10 +210,14 @@ void wvk_replay_end_passes(struct wvk_replay *replay);
 
 struct wvk_snapshot {
    const struct wvk_image *image;
+   /* Which of the image's textures it is of. */
+   uint32_t t;
    WGPUTexture texture;
 };
 
-/* Forget the copies of what the pass renders to: it may render more. */
+/* Forget the copies of what the pass renders to: it may render more. And
+ * the textures of the images it renders to are, again, all that is up to
+ * date (wvk_image_written), after what was read of them through others. */
 void wvk_replay_drop_snapshots(struct wvk_replay *replay);
 
 /* Images with atomics, their buffers of texels copied back to their

@@ -57,6 +57,15 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   draw, with the pass begun again after, and kept until a barrier. Depth
   and stencil in read-only layouts are read-only to WebGPU, which lets
   shaders read them as they are.
+- **Views in other formats.** WebGPU views a texture only as its format
+  or its sRGB twin. A view of another format of the same texel size, or an
+  uncompressed view of a compressed image (a texel a block), is of another
+  texture of the image's, in that format. The image keeps, at each level,
+  which of its textures are up to date, and brings one up to date with
+  copies through a buffer when a draw, a pass or a transfer uses it.
+  A compressed image whose size is not whole blocks is sampled from a
+  shadow of its own size, decoded from it by a pass when sampled after a
+  write.
 - **16-bit packed formats** (565, 4444, 5551, 1555), which WebGPU does not
   have, are RGBA8 textures. Copies to and from buffers are a shader's,
   which packs and unpacks the texels; a format without alpha keeps its
@@ -181,6 +190,10 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   SPIR-V. Every operation but the quad ones is there, trivially.
 - Blend states whose colour factors use both CONSTANT_COLOR and
   CONSTANT_ALPHA: WebGPU has one constant.
+- Views of multisampled images in formats other than the image's, or its
+  sRGB twin: other views are of a texture of the view's format, which
+  copies through a buffer keep up to date, and WebGPU copies no
+  multisampled texture.
 - Multisampled array images are a texture for each layer, since WebGPU
   has no multisampled arrays: attachments, clears and resolves are right,
   but a shader sampling one sees its first layer.

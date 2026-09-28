@@ -700,7 +700,7 @@ depth_in(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *im
       bg.entries = entries;
       WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
 
-      WGPUTextureView view = wvk_image_attachment_view(image, image->format, WGPUTextureAspect_All,
+      WGPUTextureView view = wvk_image_attachment_view(image, WVK_IMAGE_TEXTURE, image->format, WGPUTextureAspect_All,
                                                        tex->mipLevel, tex->origin.z + z);
       util_dynarray_append(&replay->views, view);
       WGPURenderPassDepthStencilAttachment ds = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
@@ -784,17 +784,14 @@ shadow_pipeline(struct wvk_device *dev, WGPUTextureFormat format, bool is_3d)
 }
 
 void
-wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
-                        uint32_t level, uint32_t base_layer, uint32_t layer_count)
+wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image, uint32_t level)
 {
    const bool is_3d = image->dimension == WGPUTextureDimension_3D;
    WGPURenderPipeline pipeline = shadow_pipeline(dev, image->shadow_format, is_3d);
    if (!pipeline)
       return;
-   if (is_3d) {
-      base_layer = 0;
-      layer_count = u_minify(image->vk.extent.depth, level);
-   }
+   const uint32_t base_layer = 0;
+   const uint32_t layer_count = is_3d ? u_minify(image->vk.extent.depth, level) : image->vk.array_layers;
 
    WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
    vd.dimension = is_3d ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2DArray;
@@ -904,6 +901,7 @@ wvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIma
    wvk_replay_end_passes(replay);
    for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; ++i) {
       const VkBufferImageCopy2 *r = &pCopyBufferToImageInfo->pRegions[i];
+      wvk_image_use(wvk_cmd_buffer_device(cmd), replay, dst, r->imageSubresource.mipLevel, 1, true);
       WGPUTexelCopyTextureInfo tex;
       WGPUExtent3D size;
       image_region(dst, &r->imageSubresource, r->imageOffset, r->imageExtent, &tex, &size);
@@ -923,10 +921,6 @@ wvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIma
                            size, buffer_wgpu(src), off, &l);
       else
          copy_color(wvk_cmd_buffer_device(cmd), replay, dst, true, buffer_wgpu(src), off, &l, &tex, size);
-      if (dst->shadow)
-         wvk_image_update_shadow(wvk_cmd_buffer_device(cmd), replay, dst, r->imageSubresource.mipLevel,
-                                 r->imageSubresource.baseArrayLayer,
-                                 vk_image_subresource_layer_count(&dst->vk, &r->imageSubresource));
    }
 }
 
@@ -941,6 +935,7 @@ wvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBuff
    wvk_replay_end_passes(replay);
    for (uint32_t i = 0; i < pCopyImageToBufferInfo->regionCount; ++i) {
       const VkBufferImageCopy2 *r = &pCopyImageToBufferInfo->pRegions[i];
+      wvk_image_use(wvk_cmd_buffer_device(cmd), replay, src, r->imageSubresource.mipLevel, 1, false);
       WGPUTexelCopyTextureInfo tex;
       WGPUExtent3D size;
       image_region(src, &r->imageSubresource, r->imageOffset, r->imageExtent, &tex, &size);
@@ -1050,6 +1045,8 @@ wvk_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyIm
                      ((!is_packed16(src) && !is_packed16(dst)) || src->vk.format == dst->vk.format);
    for (uint32_t i = 0; i < pCopyImageInfo->regionCount; ++i) {
       const VkImageCopy2 *r = &pCopyImageInfo->pRegions[i];
+      wvk_image_use(dev, replay, src, r->srcSubresource.mipLevel, 1, false);
+      wvk_image_use(dev, replay, dst, r->dstSubresource.mipLevel, 1, true);
       if (src->linear || dst->linear) {
          copy_image_linear(dev, replay, src, dst, r);
          continue;
@@ -1099,13 +1096,6 @@ wvk_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyIm
       dl.block_h = util_format_get_blockheight(df);
       copy_color(dev, replay, dst, true, temp, 0, &dl, &d, dsize);
    }
-   if (dst->shadow) {
-      for (uint32_t i = 0; i < pCopyImageInfo->regionCount; ++i) {
-         const VkImageSubresourceLayers *sub = &pCopyImageInfo->pRegions[i].dstSubresource;
-         wvk_image_update_shadow(dev, replay, dst, sub->mipLevel, sub->baseArrayLayer,
-                                 vk_image_subresource_layer_count(&dst->vk, sub));
-      }
-   }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1115,7 +1105,7 @@ static void
 clear_pass(struct wvk_replay *replay, struct wvk_image *image, uint32_t level, uint32_t layer,
            const VkClearColorValue *color, const VkClearDepthStencilValue *ds, VkImageAspectFlags aspects)
 {
-   WGPUTextureView view = wvk_image_attachment_view(image, image->format, WGPUTextureAspect_All, level, layer);
+   WGPUTextureView view = wvk_image_attachment_view(image, WVK_IMAGE_TEXTURE, image->format, WGPUTextureAspect_All, level, layer);
    util_dynarray_append(&replay->views, view);
 
    WGPURenderPassDescriptor desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
@@ -1231,6 +1221,9 @@ clear_ranges(struct wvk_cmd_buffer *cmd, struct wvk_image *image, const VkClearC
 {
    struct wvk_replay *replay = cmd->replay;
    wvk_replay_end_passes(replay);
+   for (uint32_t r = 0; r < range_count; ++r)
+      wvk_image_use(wvk_cmd_buffer_device(cmd), replay, image, ranges[r].baseMipLevel,
+                    vk_image_subresource_level_count(&image->vk, &ranges[r]), true);
    if (image->linear || !(image->usage & WGPUTextureUsage_RenderAttachment)) {
       if (color)
          clear_by_fill(cmd, image, color, range_count, ranges);
@@ -1301,11 +1294,12 @@ wvk_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *p
          wvk_cmd_meta_resolve_image(cmd, &one);
          continue;
       }
+      wvk_image_use(wvk_cmd_buffer_device(cmd), replay, dst, r->dstSubresource.mipLevel, 1, true);
       for (uint32_t l = 0; l < layers; ++l) {
-         WGPUTextureView s = wvk_image_attachment_view(src, src->format, WGPUTextureAspect_All,
+         WGPUTextureView s = wvk_image_attachment_view(src, WVK_IMAGE_TEXTURE, src->format, WGPUTextureAspect_All,
                                                        r->srcSubresource.mipLevel,
                                                        r->srcSubresource.baseArrayLayer + l);
-         WGPUTextureView d = wvk_image_attachment_view(dst, dst->format, WGPUTextureAspect_All,
+         WGPUTextureView d = wvk_image_attachment_view(dst, WVK_IMAGE_TEXTURE, dst->format, WGPUTextureAspect_All,
                                                        r->dstSubresource.mipLevel,
                                                        r->dstSubresource.baseArrayLayer + l);
          util_dynarray_append(&replay->views, s);
