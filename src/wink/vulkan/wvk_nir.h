@@ -28,6 +28,10 @@ bool wvk_nir_lower_view_swizzles(nir_shader *nir, const uint32_t *meta_base);
  * sampling integer textures at all. */
 bool wvk_nir_lower_samplers(nir_shader *nir, const uint32_t *meta_base);
 
+/* Storage images shaders do atomics on, as their image's buffer of
+ * texels (wvk_image.h), where their records say. */
+bool wvk_nir_lower_image_atomics(nir_shader *nir, const uint32_t *meta_base);
+
 /* Subgroups of one invocation (wvk_nir_subgroups.c). */
 bool wvk_nir_lower_subgroups(nir_shader *nir);
 

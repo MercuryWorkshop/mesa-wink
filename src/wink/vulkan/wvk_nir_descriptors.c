@@ -345,6 +345,145 @@ wvk_nir_lower_texel_buffers(nir_shader *nir, const uint32_t *meta_base)
 }
 
 /* ---------------------------------------------------------------------- */
+/* Images with atomics */
+
+/* A storage image a shader does atomics on is its image's buffer of texels
+ * (wvk_image.h): loads, stores, atomics and size queries are words of it,
+ * where the record says the view's texels are. Out of bounds, loads are
+ * zero and the rest nothing, as robustImageAccess has it. */
+static nir_variable *
+atomic_image_var(nir_intrinsic_instr *intr)
+{
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
+   if (!var || nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF ||
+       nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_MS)
+      return NULL;
+   return var;
+}
+
+static bool
+find_atomic_images(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   /* Atomics, and the memory model's atomic loads and stores. */
+   const bool atomic_access = (intr->intrinsic == nir_intrinsic_image_deref_load ||
+                               intr->intrinsic == nir_intrinsic_image_deref_store) &&
+                              (nir_intrinsic_access(intr) & ACCESS_ATOMIC);
+   if (intr->intrinsic != nir_intrinsic_image_deref_atomic && intr->intrinsic != nir_intrinsic_image_deref_atomic_swap &&
+       !atomic_access)
+      return false;
+   nir_variable *var = atomic_image_var(intr);
+   if (var)
+      _mesa_set_add(data, var);
+   return false;
+}
+
+struct atomic_images {
+   const uint32_t *meta;
+   struct set *vars;
+};
+
+static bool
+lower_atomic_image_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct atomic_images *state = data;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_image_deref_size:
+   case nir_intrinsic_image_deref_samples:
+      break;
+   default:
+      return false;
+   }
+   nir_variable *var = atomic_image_var(intr);
+   if (!var || !_mesa_set_search(state->vars, var))
+      return false;
+   const uint32_t group = var->data.descriptor_set, slot = var->data.binding;
+   const uint32_t *meta = state->meta;
+   b->cursor = nir_before_instr(&intr->instr);
+   if (intr->intrinsic == nir_intrinsic_image_deref_samples) {
+      nir_def_replace(&intr->def, nir_imm_int(b, 1));
+      return true;
+   }
+
+   nir_def *s = nir_imm_int(b, slot);
+   nir_def *width = wvk_nir_load_meta(b, meta, group, s, WVK_META_IMG_WIDTH);
+   nir_def *height = wvk_nir_load_meta(b, meta, group, s, WVK_META_IMG_HEIGHT);
+   nir_def *layers = wvk_nir_load_meta(b, meta, group, s, WVK_META_IMG_LAYERS);
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const bool array = nir_intrinsic_image_array(intr);
+   if (intr->intrinsic == nir_intrinsic_image_deref_size) {
+      nir_def *size[3] = { width, height, layers };
+      if (dim == GLSL_SAMPLER_DIM_1D)
+         size[1] = layers;
+      else if (dim == GLSL_SAMPLER_DIM_CUBE)
+         size[2] = nir_udiv_imm(b, layers, 6);
+      nir_def_replace(&intr->def, nir_vec(b, size, intr->def.num_components));
+      return true;
+   }
+
+   /* The texel, and whether it is in the view. */
+   nir_def *coord = intr->src[1].ssa;
+   nir_def *x = nir_channel(b, coord, 0);
+   nir_def *y = dim == GLSL_SAMPLER_DIM_1D ? nir_imm_int(b, 0) : nir_channel(b, coord, 1);
+   nir_def *z = nir_imm_int(b, 0);
+   if (dim == GLSL_SAMPLER_DIM_1D && array)
+      z = nir_channel(b, coord, 1);
+   else if (array || dim == GLSL_SAMPLER_DIM_3D || dim == GLSL_SAMPLER_DIM_CUBE)
+      z = nir_channel(b, coord, 2);
+   nir_def *inside = nir_iand(b, nir_iand(b, nir_ult(b, x, width), nir_ult(b, y, height)), nir_ult(b, z, layers));
+   nir_def *word = nir_iadd(b, wvk_nir_load_meta(b, meta, group, s, WVK_META_IMG_BASE),
+                            nir_iadd(b, x, nir_iadd(b, nir_imul(b, y, wvk_nir_load_meta(b, meta, group, s, WVK_META_IMG_ROW)),
+                                                    nir_imul(b, z, wvk_nir_load_meta(b, meta, group, s, WVK_META_IMG_LAYER)))));
+   nir_def *at = nir_ishl_imm(b, word, 2);
+   nir_def *buffer = buffer_index(b, group, slot);
+   nir_def *zero = nir_imm_int(b, 0);
+
+   if (intr->intrinsic == nir_intrinsic_image_deref_store) {
+      nir_push_if(b, inside);
+      nir_store_ssbo(b, nir_channel(b, intr->src[3].ssa, 0), buffer, at, .align_mul = 4);
+      nir_pop_if(b, NULL);
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+
+   nir_push_if(b, inside);
+   nir_def *value;
+   if (intr->intrinsic == nir_intrinsic_image_deref_load)
+      value = nir_load_ssbo(b, 1, 32, buffer, at, .align_mul = 4);
+   else if (intr->intrinsic == nir_intrinsic_image_deref_atomic_swap)
+      value = nir_ssbo_atomic_swap(b, 32, buffer, at, intr->src[3].ssa, intr->src[4].ssa,
+                                   .atomic_op = nir_intrinsic_atomic_op(intr));
+   else
+      value = nir_ssbo_atomic(b, 32, buffer, at, intr->src[3].ssa, .atomic_op = nir_intrinsic_atomic_op(intr));
+   nir_pop_if(b, NULL);
+   value = nir_if_phi(b, value, zero);
+   if (intr->intrinsic == nir_intrinsic_image_deref_load) {
+      /* One channel: the rest are 0, and alpha 1. */
+      const bool is_float = nir_alu_type_get_base_type(nir_intrinsic_dest_type(intr)) == nir_type_float;
+      nir_def *texel[4] = { value, zero, zero, is_float ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1) };
+      value = nir_vec(b, texel, intr->def.num_components);
+   }
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
+bool
+wvk_nir_lower_image_atomics(nir_shader *nir, const uint32_t *meta_base)
+{
+   struct atomic_images state = { .meta = meta_base, .vars = _mesa_pointer_set_create(NULL) };
+   nir_shader_intrinsics_pass(nir, find_atomic_images, nir_metadata_all, state.vars);
+   bool progress = false;
+   if (state.vars->entries)
+      progress = nir_shader_intrinsics_pass(nir, lower_atomic_image_instr, nir_metadata_none, &state);
+   _mesa_set_destroy(state.vars, NULL);
+   return progress;
+}
+
+/* ---------------------------------------------------------------------- */
 /* Swizzles */
 
 /* One component of a swizzled texel: VkComponentSwizzle `code` of it. */

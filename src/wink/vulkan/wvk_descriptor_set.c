@@ -225,6 +225,27 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
          d->swizzle = view->swizzle;
          d->channels = view->channels;
       }
+      struct wvk_image *image = view ? wvk_image_view_image(view) : NULL;
+      if (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && image && image->atomic_buffer &&
+          wvk_format_has_atomics(view->vk.view_format)) {
+         /* The view's texels in the image's buffer of them. */
+         const uint32_t level = view->vk.base_mip_level;
+         const VkExtent3D e = vk_image_mip_level_extent(&image->vk, level);
+         const bool is_3d = image->vk.image_type == VK_IMAGE_TYPE_3D;
+         const uint32_t row = image->atomic_pitch[level] / 4;
+         d->atomic_image = image;
+         d->buffer = image->atomic_buffer;
+         wgpuBufferAddRef(d->buffer);
+         d->offset = 0;
+         d->size = image->atomic_size;
+         d->atomic_meta[WVK_META_IMG_BASE] =
+            (uint32_t)(image->atomic_offset[level] / 4) + (is_3d ? 0 : view->vk.base_array_layer * row * e.height);
+         d->atomic_meta[WVK_META_IMG_ROW] = row;
+         d->atomic_meta[WVK_META_IMG_LAYER] = row * e.height;
+         d->atomic_meta[WVK_META_IMG_WIDTH] = e.width;
+         d->atomic_meta[WVK_META_IMG_HEIGHT] = image->vk.image_type == VK_IMAGE_TYPE_1D ? 1 : e.height;
+         d->atomic_meta[WVK_META_IMG_LAYERS] = is_3d ? e.depth : view->vk.layer_count;
+      }
    }
    if (has_sampler && !bl->immutable_samplers)
       set_sampler(d, wvk_sampler_from_handle(info->sampler));
@@ -373,6 +394,10 @@ wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words, u
       case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
          record[WVK_META_TEX_SWIZZLE] = d->swizzle;
          record[WVK_META_TEX_CHANNELS] = d->channels;
+         break;
+      case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+         if (d->atomic_image)
+            memcpy(record, d->atomic_meta, sizeof(d->atomic_meta));
          break;
       case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
       case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:

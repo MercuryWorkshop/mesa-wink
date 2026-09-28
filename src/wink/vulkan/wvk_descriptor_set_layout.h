@@ -119,6 +119,17 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 #define WVK_META_TEXEL_SHIFTS 4    /* 8 bits a channel: its first bit in the texel */
 #define WVK_META_TEXEL_SWIZZLE 5   /* 4 bits for each of R, G, B, A: a channel, 4 for 0, 5 for 1 */
 
+/* A storage image's record, when it is an image with atomics and so the
+ * image's buffer of its texels (wvk_image.h) to a shader that does
+ * atomics on it: where the view's texels are, in words. */
+#define WVK_META_IMG_BASE 0        /* the view's first texel */
+#define WVK_META_IMG_ROW 1         /* from one row to the next */
+#define WVK_META_IMG_LAYER 2       /* from one layer or slice to the next */
+#define WVK_META_IMG_WIDTH 3
+#define WVK_META_IMG_HEIGHT 4
+#define WVK_META_IMG_LAYERS 5      /* layers, or a 3D image's depth */
+#define WVK_META_IMG_WORDS 6
+
 enum wvk_texel_type {
    WVK_TEXEL_UNORM,
    WVK_TEXEL_SNORM,

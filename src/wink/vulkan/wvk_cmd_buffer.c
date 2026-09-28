@@ -14,6 +14,7 @@
  * copied back once it ran, before the submit counts as finished.
  */
 #include "wvk_cmd_buffer.h"
+#include "wvk_image.h"
 
 #include "vk_framebuffer.h"
 #include "vk_render_pass.h"
@@ -307,6 +308,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_init(&replay.push_buffers, NULL);
    util_dynarray_init(&replay.push_sets, NULL);
    util_dynarray_init(&replay.meta_memory, NULL);
+   util_dynarray_init(&replay.atomic_images, NULL);
    util_dynarray_init(&replay.pass_queries, NULL);
    replay.serial = serial;
 
@@ -327,6 +329,8 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
       replay_queue(&replay, &cmds[i]->cmd_queue, wvk_cmd_buffer_to_handle(rcmd), &dev->vk.dispatch_table);
    }
    wvk_replay_end_passes(&replay);
+   wvk_replay_sync_atomic_images(NULL, &replay);
+   util_dynarray_fini(&replay.atomic_images);
    rcmd->replay = NULL;
    /* What the replay itself recorded is of no further use. */
    vk_command_buffer_reset(&rcmd->vk);
@@ -389,13 +393,35 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
 /* ---------------------------------------------------------------------- */
 /* Synchronization: one in-order queue has nothing to wait for. */
 
+void
+wvk_replay_sync_atomic_images(struct wvk_cmd_buffer *cmd, struct wvk_replay *replay)
+{
+   if (!replay->atomic_images.size)
+      return;
+   const bool in_pass = replay->pass != NULL;
+   wvk_replay_end_passes(replay);
+   util_dynarray_foreach(&replay->atomic_images, struct wvk_image *, image) {
+      wvk_image_copy_atomic(*image, replay->encoder, false);
+      (*image)->atomic_in_buffer = false;
+   }
+   util_dynarray_clear(&replay->atomic_images);
+   if (in_pass && cmd)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+}
+
+/* But for images with atomics: what shaders did to them as buffers goes
+ * back to their textures. */
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer, const VkDependencyInfo *pDependencyInfo)
 {
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   wvk_replay_sync_atomic_images(cmd, cmd->replay);
 }
 
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdWaitEvents2(VkCommandBuffer commandBuffer, uint32_t eventCount, const VkEvent *pEvents,
                    const VkDependencyInfo *pDependencyInfos)
 {
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   wvk_replay_sync_atomic_images(cmd, cmd->replay);
 }

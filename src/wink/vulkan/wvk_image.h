@@ -29,7 +29,22 @@ struct wvk_image {
    uint32_t pitch;
    struct wvk_device_memory *mem;
    uint64_t offset;
+
+   /* A 32-bit storage image, which shaders may do atomics on, and WGSL
+    * has no atomics on textures: a storage buffer of its texels too, each
+    * level's rows `atomic_pitch[level]` bytes apart, which shaders doing
+    * atomics use for all they do with it. Between barriers one or the
+    * other is the image (wvk_replay_sync_atomic_images). */
+   WGPUBuffer atomic_buffer;
+   uint64_t atomic_size;
+   uint64_t atomic_offset[16];
+   uint32_t atomic_pitch[16];
+   bool atomic_in_buffer;
 };
+
+/* Copy an atomic image's texels from its texture to its buffer, or back,
+ * outside any pass. */
+void wvk_image_copy_atomic(struct wvk_image *image, WGPUCommandEncoder encoder, bool to_buffer);
 
 /* Whether an image of this format, type and so on can be linear. */
 bool wvk_image_linear_supported(const struct wvk_physical_device *pdev, VkFormat format, VkImageType type,

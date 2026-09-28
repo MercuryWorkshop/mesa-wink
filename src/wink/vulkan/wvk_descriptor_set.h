@@ -44,6 +44,10 @@ struct wvk_descriptor {
    VkFormat texel_format;
    uint32_t texel_elements;
    uint32_t texel_start;
+   /* Storage images with atomics: the image, whose buffer of texels
+    * `buffer` is then, and the record saying where the view's are. */
+   struct wvk_image *atomic_image;
+   uint32_t atomic_meta[WVK_META_IMG_WORDS];
 };
 
 /* Bind groups made from a set, for the layouts that asked. A layout is

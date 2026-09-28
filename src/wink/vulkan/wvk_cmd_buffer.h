@@ -81,6 +81,13 @@ struct wvk_replay {
     * vk_meta draws layer after layer in a pass of its own (see
     * wvk_meta_draw_volume). Valid while the pass is. */
    const VkRenderingInfo *pass_info;
+   /* What pass_info points to: a copy of the pass as begun, which the
+    * runtime's render passes have only on their stack. */
+   struct {
+      VkRenderingInfo info;
+      VkRenderingAttachmentInfo colors[8];
+      VkRenderingAttachmentInfo depth, stencil;
+   } pass_copy;
 
    /* Push constants for the submit's draws, 256 bytes apart: written to
     * the device's push buffer just before it. */
@@ -91,6 +98,9 @@ struct wvk_replay {
    struct util_dynarray push_sets;
    /* Memory for vk_meta's vertices, freed after. */
    struct util_dynarray meta_memory;   /* VkDeviceMemory */
+   /* Images with atomics whose buffer of texels is the image now, until
+    * the next barrier (wvk_replay_sync_atomic_images). */
+   struct util_dynarray atomic_images; /* struct wvk_image * */
 
    /* The serial this submit finishes at. */
    uint64_t serial;
@@ -172,6 +182,11 @@ WGPUColor wvk_clear_color(VkFormat format, const VkClearColorValue *value);
 
 /* End whatever pass is open: copies and clears happen between passes. */
 void wvk_replay_end_passes(struct wvk_replay *replay);
+
+/* Images with atomics, their buffers of texels copied back to their
+ * textures: at a barrier, which is when anything else may see them, and
+ * at the end of the submit. A render pass `cmd` is in goes on after. */
+void wvk_replay_sync_atomic_images(struct wvk_cmd_buffer *cmd, struct wvk_replay *replay);
 
 /* A submit reads or writes a range of a buffer's memory. Only host-visible
  * memory is tracked; the rest lives on the GPU alone. */

@@ -1203,6 +1203,42 @@ driver_key(const struct wvk_device *dev, const struct wvk_bgl *bgl, uint32_t gro
    return key;
 }
 
+/* Images with atomics that the layout's shaders have as their buffers of
+ * texels, copied there from their textures where those are the image:
+ * outside any pass, and a render pass begun again after. */
+static void
+sync_atomic_buffers(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout, uint32_t bind_point)
+{
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   const bool in_pass = replay->pass != NULL;
+   bool ended = false;
+   for (uint32_t g = 0; g < layout->group_count; ++g) {
+      const struct wvk_bgl *bgl = layout->groups[g];
+      const struct wvk_descriptor_set *set = st->sets[bind_point][g].set;
+      for (uint32_t i = 0; set && i < bgl->count; ++i) {
+         const struct wvk_shader_binding *b = &bgl->entries[i].b;
+         if ((b->kind != WVK_BINDING_STORAGE && b->kind != WVK_BINDING_STORAGE_READ) ||
+             (g == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE))
+            continue;
+         bool sampler;
+         uint32_t dynamic_index;
+         const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
+         if (!d || !d->atomic_image || d->atomic_image->atomic_in_buffer)
+            continue;
+         if (!ended) {
+            wvk_replay_end_passes(replay);
+            ended = true;
+         }
+         wvk_image_copy_atomic(d->atomic_image, replay->encoder, true);
+         d->atomic_image->atomic_in_buffer = true;
+         util_dynarray_append(&replay->atomic_images, d->atomic_image);
+      }
+   }
+   if (ended && in_pass)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+}
+
 /* A set's bind group for this layout: kept in the set until it changes. */
 static WGPUBindGroup
 get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descriptor_set *set, uint32_t group,
@@ -1679,6 +1715,10 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    struct wvk_render_pipeline *p = get_render_pipeline(dev, cmd, indexed);
    if (!p)
       return false;
+   sync_atomic_buffers(cmd, p->layout, WVK_BIND_GRAPHICS);
+   pass = replay->pass;
+   if (!pass)
+      return false;
 
    if (st->pass_serial != replay->rendering.serial) {
       st->pass_serial = replay->rendering.serial;
@@ -1892,6 +1932,7 @@ flush_dispatch(struct wvk_cmd_buffer *cmd)
    struct wvk_compute_pipeline *p = get_compute_pipeline(dev, st, st->cs);
    if (!p)
       return NULL;
+   sync_atomic_buffers(cmd, p->layout, WVK_BIND_COMPUTE);
    if (!replay->compute) {
       WGPUComputePassDescriptor desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
       replay->compute = wgpuCommandEncoderBeginComputePass(replay->encoder, &desc);

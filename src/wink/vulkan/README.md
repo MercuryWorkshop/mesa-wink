@@ -42,6 +42,11 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   colours, mirroring once, LOD bias and unnormalized coordinates are the
   shader's. Integer textures, which WebGPU does not sample, are fetched
   from, with the sampler's address modes and LOD applied.
+- **Image atomics**, which WGSL does not have, are on a storage buffer of
+  the image's texels. A 32-bit integer storage image has one besides its
+  texture, and a shader that does atomics on it uses it for everything.
+  Between barriers one or the other is the image: the texture is copied to
+  the buffer before such a shader runs, and back at the next barrier.
 - **Arrays of descriptors** are bindings of their own. A dynamic or
   non-uniform index chooses among them in the shader: reads from each,
   selected; writes only where the index is.
@@ -124,8 +129,8 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 ## Not there yet
 
 - WebGPU has 10 storage buffers a stage in browsers, and texel buffers are
-  storage buffers, beyond what Vulkan counts as such. Image atomics, which
-  WGSL does not have.
+  storage buffers, beyond what Vulkan counts as such; so are storage images
+  a shader does atomics on.
 - Vulkan 1.3 is reported, but for `bufferDeviceAddress`: WebGPU has no
   pointers.
 - Descriptor indexing's features, each of them, but not

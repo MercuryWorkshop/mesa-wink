@@ -941,6 +941,26 @@ lower_word_access(nir_builder *b, struct word_buffers *wb, nir_intrinsic_instr *
 
    /* Atomics, on one word. */
    nir_deref_instr *word = nir_build_deref_array(b, words, first);
+   const nir_atomic_op op = nir_intrinsic_atomic_op(intr);
+   if (op == nir_atomic_op_imin || op == nir_atomic_op_imax) {
+      /* The words are unsigned, and so are WGSL's atomics on them: a
+       * signed minimum or maximum is swapped in until nothing came
+       * between. */
+      nir_variable *old = nir_local_variable_create(b->impl, glsl_uint_type(), "atomic_old");
+      nir_store_var(b, old, nir_deref_atomic(b, 32, &word->def, nir_imm_int(b, 0), .atomic_op = nir_atomic_op_iadd),
+                    0x1);
+      nir_loop *loop = nir_push_loop(b);
+      {
+         nir_def *cur = nir_load_var(b, old);
+         nir_def *data = intr->src[2].ssa;
+         nir_def *want = op == nir_atomic_op_imin ? nir_imin(b, cur, data) : nir_imax(b, cur, data);
+         nir_def *prev = nir_deref_atomic_swap(b, 32, &word->def, cur, want, .atomic_op = nir_atomic_op_cmpxchg);
+         nir_store_var(b, old, prev, 0x1);
+         nir_break_if(b, nir_ieq(b, prev, cur));
+      }
+      nir_pop_loop(b, loop);
+      return nir_load_var(b, old);
+   }
    if (intr->intrinsic == nir_intrinsic_ssbo_atomic_swap)
       return nir_deref_atomic_swap(b, 32, &word->def, intr->src[2].ssa, intr->src[3].ssa,
                                    .atomic_op = nir_intrinsic_atomic_op(intr));
@@ -2029,8 +2049,11 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    NIR_PASS(_, nir, lower_ms_arrays);
    NIR_PASS(_, nir, pad_io_vectors);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, demote_to_terminate_instr, nir_metadata_all, NULL);
+   NIR_PASS(_, nir, wvk_nir_lower_image_atomics, shader->meta_base);
    NIR_PASS(_, nir, wvk_nir_lower_texel_buffers, shader->meta_base);
    lower_buffers_to_words(nir, info, pipeline_state, shader, mem_ctx);
+   /* The signed atomics' loops' variables. */
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    optimize(nir);
    /* The combined and arrayed originals, now without a use. */
    hash_table_foreach(state.split, he)

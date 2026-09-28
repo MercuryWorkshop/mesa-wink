@@ -140,6 +140,24 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }
 
+   /* Texels atomics can be done on, as a buffer too. */
+   if ((wusage & WGPUTextureUsage_StorageBinding) && wvk_format_has_atomics(pCreateInfo->format)) {
+      uint64_t size = 0;
+      for (uint32_t l = 0; l < image->vk.mip_levels && l < ARRAY_SIZE(image->atomic_offset); ++l) {
+         const VkExtent3D e = vk_image_mip_level_extent(&image->vk, l);
+         image->atomic_offset[l] = size;
+         image->atomic_pitch[l] = align(e.width * 4, 256);
+         size += (uint64_t)image->atomic_pitch[l] * e.height *
+                 (image->vk.image_type == VK_IMAGE_TYPE_3D ? e.depth : image->vk.array_layers);
+      }
+      WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
+      bd.label = wvk_sv("VkImage atomics");
+      bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+      bd.size = size;
+      image->atomic_size = size;
+      image->atomic_buffer = wgpuDeviceCreateBuffer(dev->wgpu, &bd);
+   }
+
    *pImage = wvk_image_to_handle(image);
    return VK_SUCCESS;
 }
@@ -156,7 +174,32 @@ wvk_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks *
     * it, and it goes with the last of them. */
    if (image->texture)
       wgpuTextureRelease(image->texture);
+   if (image->atomic_buffer)
+      wgpuBufferRelease(image->atomic_buffer);
    vk_image_destroy(&dev->vk, pAllocator, &image->vk);
+}
+
+void
+wvk_image_copy_atomic(struct wvk_image *image, WGPUCommandEncoder encoder, bool to_buffer)
+{
+   for (uint32_t l = 0; l < image->vk.mip_levels && l < ARRAY_SIZE(image->atomic_offset); ++l) {
+      const VkExtent3D e = vk_image_mip_level_extent(&image->vk, l);
+      WGPUTexelCopyTextureInfo texture = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+      texture.texture = image->texture;
+      texture.mipLevel = l;
+      WGPUTexelCopyBufferInfo buffer = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+      buffer.buffer = image->atomic_buffer;
+      buffer.layout.offset = image->atomic_offset[l];
+      buffer.layout.bytesPerRow = image->atomic_pitch[l];
+      buffer.layout.rowsPerImage = e.height;
+      const WGPUExtent3D extent = {
+         e.width, e.height, image->vk.image_type == VK_IMAGE_TYPE_3D ? e.depth : image->vk.array_layers,
+      };
+      if (to_buffer)
+         wgpuCommandEncoderCopyTextureToBuffer(encoder, &texture, &buffer, &extent);
+      else
+         wgpuCommandEncoderCopyBufferToTexture(encoder, &buffer, &texture, &extent);
+   }
 }
 
 /* What the texture would take, for applications that suballocate. */

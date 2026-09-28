@@ -752,6 +752,9 @@ optimal_features(const struct wvk_physical_device *pdev, VkFormat format)
       if (caps & WVK_CAP_STORAGE_RW)
          f |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
               VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      /* Through the image's buffer of its texels (wvk_image.h). */
+      if (wvk_format_has_atomics(format))
+         f |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
    }
    /* Transfers work on every format: the ones WebGPU will not copy --
     * Depth24Plus at all, Depth32Float into -- go through a shader. */

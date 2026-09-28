@@ -120,7 +120,29 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
 
    wvk_replay_end_passes(replay);
    wvk_replay_set_pass_layer(replay);
-   replay->pass_info = info;
+   if (info != &replay->pass_copy.info) {
+      /* Kept, to begin the pass again with (wvk_replay_restart_pass). */
+      replay->pass_copy.info = *info;
+      replay->pass_copy.info.pNext = NULL;
+      const uint32_t n = MIN2(info->colorAttachmentCount, ARRAY_SIZE(replay->pass_copy.colors));
+      for (uint32_t i = 0; i < n; ++i) {
+         replay->pass_copy.colors[i] = info->pColorAttachments[i];
+         replay->pass_copy.colors[i].pNext = NULL;
+      }
+      replay->pass_copy.info.colorAttachmentCount = n;
+      replay->pass_copy.info.pColorAttachments = n ? replay->pass_copy.colors : NULL;
+      if (info->pDepthAttachment) {
+         replay->pass_copy.depth = *info->pDepthAttachment;
+         replay->pass_copy.depth.pNext = NULL;
+         replay->pass_copy.info.pDepthAttachment = &replay->pass_copy.depth;
+      }
+      if (info->pStencilAttachment) {
+         replay->pass_copy.stencil = *info->pStencilAttachment;
+         replay->pass_copy.stencil.pNext = NULL;
+         replay->pass_copy.info.pStencilAttachment = &replay->pass_copy.stencil;
+      }
+   }
+   replay->pass_info = &replay->pass_copy.info;
 
    const struct wvk_physical_device *pdev = wvk_device_physical(wvk_cmd_buffer_device(cmd));
    WGPURenderPassColorAttachment colors[8];

@@ -47,4 +47,11 @@ uint32_t wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format
  * for formats that cannot be. */
 bool wvk_texel_buffer_format(VkFormat format, uint32_t *record);
 
+/* A storage image format shaders can do atomics on. */
+static inline bool
+wvk_format_has_atomics(VkFormat format)
+{
+   return format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT;
+}
+
 #endif

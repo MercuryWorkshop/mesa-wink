@@ -513,6 +513,47 @@ gex_wgpu_tex_offset_is_dynamic(const nir_instr *instr, const void *data)
  * `shared uint lane[64]` summed to 3144 instead of 2016, and a shared struct
  * array to 120, which is exactly sum(0..15). Every KHR-GL44 compute_shader
  * shared-memory case failed on values with nothing in any log. */
+/* ntv's shared block is an array of uints, which Tint makes atomic<u32>:
+ * SMin and SMax on it come out as WGSL's atomicMin and atomicMax on a
+ * u32, which compare unsigned. So a signed minimum or maximum is swapped
+ * in until nothing came between. */
+static bool
+gex_wgpu_lower_signed_shared_atomic(nir_builder *b, nir_intrinsic_instr *intr,
+                                    void *data)
+{
+   (void)data;
+   if (intr->intrinsic != nir_intrinsic_shared_atomic)
+      return false;
+   const nir_atomic_op op = nir_intrinsic_atomic_op(intr);
+   if ((op != nir_atomic_op_imin && op != nir_atomic_op_imax) ||
+       intr->def.bit_size != 32)
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *offset = intr->src[0].ssa;
+   nir_def *value = intr->src[1].ssa;
+   const unsigned base = nir_intrinsic_base(intr);
+   nir_variable *old =
+      nir_local_variable_create(b->impl, glsl_uint_type(), "shared_old");
+   nir_store_var(b, old,
+                 nir_load_shared(b, 1, 32, offset, .base = base,
+                                 .align_mul = 4),
+                 0x1);
+   nir_loop *loop = nir_push_loop(b);
+   {
+      nir_def *cur = nir_load_var(b, old);
+      nir_def *want = op == nir_atomic_op_imin ? nir_imin(b, cur, value)
+                                               : nir_imax(b, cur, value);
+      nir_def *prev = nir_shared_atomic_swap(b, 32, offset, cur, want,
+                                             .base = base,
+                                             .atomic_op = nir_atomic_op_cmpxchg);
+      nir_store_var(b, old, prev, 0x1);
+      nir_break_if(b, nir_ieq(b, prev, cur));
+   }
+   nir_pop_loop(b, loop);
+   nir_def_replace(&intr->def, nir_load_var(b, old));
+   return true;
+}
+
 static bool
 gex_wgpu_scale_shared_offset(nir_builder *b, nir_intrinsic_instr *intr,
                              void *data)
@@ -1336,6 +1377,11 @@ gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y,
                  (unsigned)nir->info.stage);
       }
    }
+   /* Out of SSA by now: the loops' variable stays one, which the emitter
+    * takes as a function variable. */
+   if (nir->info.stage == MESA_SHADER_COMPUTE)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass,
+               gex_wgpu_lower_signed_shared_atomic, nir_metadata_none, NULL);
    /* Word indices, not byte offsets; see the note above. Last, so anything
     * this file added earlier is scaled too. */
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, gex_wgpu_scale_shared_offset,
