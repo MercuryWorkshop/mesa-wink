@@ -115,7 +115,10 @@ static const struct wvk_format formats[VK_FORMAT_ASTC_12x12_SRGB_BLOCK + 1] = {
    TEX(D16_UNORM, Depth16Unorm, WVK_CAP_SAMPLE | WVK_CAP_DEPTH | MS | WVK_CAP_COPY_SRC | WVK_CAP_COPY_DST),
    TEX(X8_D24_UNORM_PACK32, Depth24Plus, WVK_CAP_SAMPLE | WVK_CAP_DEPTH | MS),
    TEX(D32_SFLOAT, Depth32Float, WVK_CAP_SAMPLE | WVK_CAP_DEPTH | MS | WVK_CAP_COPY_SRC),
-   TEX(S8_UINT, Stencil8, WVK_CAP_SAMPLE | WVK_CAP_INT | WVK_CAP_STENCIL | MS | WVK_CAP_COPY_SRC | WVK_CAP_COPY_DST),
+   /* Stencil alone with a depth aspect nothing uses: a fragment shader may
+    * write depth with no depth attachment, and WebGPU refuses one that does
+    * to Stencil8. */
+   TEX(S8_UINT, Depth24PlusStencil8, WVK_CAP_SAMPLE | WVK_CAP_INT | WVK_CAP_STENCIL | MS | WVK_CAP_COPY_SRC | WVK_CAP_COPY_DST),
    TEX(D24_UNORM_S8_UINT, Depth24PlusStencil8, WVK_CAP_SAMPLE | WVK_CAP_DEPTH | WVK_CAP_STENCIL | MS),
    FEAT(D32_SFLOAT_S8_UINT, Depth32FloatStencil8, Depth32FloatStencil8,
         WVK_CAP_SAMPLE | WVK_CAP_DEPTH | WVK_CAP_STENCIL | MS | WVK_CAP_COPY_SRC),

@@ -1630,7 +1630,10 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
                             k->depth_format == WGPUTextureFormat_Depth32FloatStencil8 ||
                             k->depth_format == WGPUTextureFormat_Stencil8;
    if (k->depth_format) {
-      const bool depth_test = dyn->ds.depth.test_enable;
+      /* Without a depth aspect there is no depth test, whatever it says. */
+      const struct wvk_image_view *ds_view = replay->rendering.depth_stencil;
+      const bool has_depth = ds_view && vk_format_has_depth(wvk_image_view_image(ds_view)->vk.format);
+      const bool depth_test = dyn->ds.depth.test_enable && has_depth;
       k->depth_compare = depth_test ? dyn->ds.depth.compare_op : VK_COMPARE_OP_ALWAYS;
       k->depth_write = depth_test && dyn->ds.depth.write_enable && !replay->rendering.depth_read_only;
       /* WebGPU wants the stencil state left alone without a stencil. */

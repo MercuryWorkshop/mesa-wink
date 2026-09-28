@@ -254,7 +254,12 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
          } else {
             /* Not rendered to in this pass: kept as it is. */
             ds.depthReadOnly = true;
+            replay->rendering.depth_read_only = true;
          }
+      } else if (replay->rendering.depth_format == WGPUTextureFormat_Depth24PlusStencil8) {
+         /* A stencil format's depth aspect, which is nobody's. */
+         ds.depthReadOnly = true;
+         replay->rendering.depth_read_only = true;
       }
       if (vk_format_has_stencil(format)) {
          if (stencil && !stencil_ro) {
@@ -267,7 +272,9 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
                                 : store_op(stencil->storeOp, suspending);
             ds.stencilClearValue = stencil->clearValue.depthStencil.stencil;
          } else {
+            /* Nor is this, and pipelines then write none of it. */
             ds.stencilReadOnly = true;
+            replay->rendering.stencil_read_only = true;
          }
       }
       if (ds_clear.aspectMask)

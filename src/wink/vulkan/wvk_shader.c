@@ -286,6 +286,8 @@ is_pulled(const struct vk_vertex_input_state *vi, int location)
    return vb->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE && vb->divisor != 1;
 }
 
+static bool wants_sample_shading(const struct vk_graphics_pipeline_state *state);
+
 static void
 wvk_hash_state(struct vk_physical_device *device, const struct vk_graphics_pipeline_state *state,
                const struct vk_features *enabled_features, VkShaderStageFlags stages,
@@ -305,7 +307,84 @@ wvk_hash_state(struct vk_physical_device *device, const struct vk_graphics_pipel
          _mesa_blake3_update(&ctx, words, sizeof(words));
       }
    }
+   /* And whether fragments are shaded per sample. */
+   if (stages & VK_SHADER_STAGE_FRAGMENT_BIT) {
+      const uint8_t per_sample = wants_sample_shading(state);
+      _mesa_blake3_update(&ctx, &per_sample, 1);
+   }
    _mesa_blake3_final(&ctx, blake3_out);
+}
+
+/* Sample shading, which WebGPU does where a fragment shader reads its
+ * sample: at every sample, which is at least as many as any minimum. */
+static bool
+wants_sample_shading(const struct vk_graphics_pipeline_state *state)
+{
+   return state && state->ms && state->ms->sample_shading_enable && state->ms->min_sample_shading > 0.0f;
+}
+
+/* Where a sample is in its pixel: WebGPU's multisampling is of 4 samples,
+ * at Vulkan's standard locations for 4, or of 1 at the centre. */
+static nir_def *
+sample_position(nir_builder *b, nir_def *id, unsigned samples)
+{
+   if (samples <= 1)
+      return nir_imm_vec2(b, 0.5f, 0.5f);
+   static const float x[4] = { 0.375f, 0.875f, 0.125f, 0.625f }, y[4] = { 0.125f, 0.375f, 0.625f, 0.875f };
+   nir_def *px = nir_imm_float(b, x[3]), *py = nir_imm_float(b, y[3]);
+   for (int i = 2; i >= 0; --i) {
+      px = nir_bcsel(b, nir_ieq_imm(b, id, i), nir_imm_float(b, x[i]), px);
+      py = nir_bcsel(b, nir_ieq_imm(b, id, i), nir_imm_float(b, y[i]), py);
+   }
+   return nir_vec2(b, px, py);
+}
+
+struct sample_state {
+   unsigned samples;
+   bool frag_coord;
+};
+
+/* gl_SamplePosition, which WGSL has not; and with sample shading
+ * gl_FragCoord at the sample, which WGSL's is at the pixel's centre. */
+static bool
+lower_sample_pos_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct sample_state *s = data;
+   if (intr->intrinsic == nir_intrinsic_load_sample_pos || intr->intrinsic == nir_intrinsic_load_sample_pos_or_center) {
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def_replace(&intr->def, sample_position(b, nir_load_sample_id(b), s->samples));
+      return true;
+   }
+   if (intr->intrinsic == nir_intrinsic_load_frag_coord && s->frag_coord && s->samples > 1) {
+      b->cursor = nir_after_instr(&intr->instr);
+      nir_def *pos = sample_position(b, nir_load_sample_id(b), s->samples);
+      nir_def *xy = nir_fadd(b, nir_ffloor(b, nir_trim_vector(b, &intr->def, 2)), pos);
+      nir_def *fc = nir_vec4(b, nir_channel(b, xy, 0), nir_channel(b, xy, 1), nir_channel(b, &intr->def, 2),
+                             nir_channel(b, &intr->def, 3));
+      nir_def_rewrite_uses_after(&intr->def, fc);
+      return true;
+   }
+   return false;
+}
+
+/* The fragment shader made to run for each sample: it reads the sample,
+ * in a test that never passes and that nothing can tell never does -- the
+ * draw's viewport, from the driver's data, is under 16. */
+static bool
+shade_per_sample(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *viewport = nir_load_ssbo(&b, 1, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                     nir_imm_int(&b, WVK_DRIVER_VIEWPORT), .align_mul = 4,
+                                     .access = ACCESS_NON_WRITEABLE);
+   nir_demote_if(&b, nir_ieq(&b, nir_load_sample_id(&b), nir_iadd_imm(&b, viewport, 0x10000)));
+   BITSET_SET(nir->info.system_values_read, SYSTEM_VALUE_SAMPLE_ID);
+   nir->info.fs.uses_sample_shading = true;
+   /* Its inputs stay at the pixel's centre, not each sample's: WebGPU has
+    * a vertex output and the fragment input it meets interpolate alike, and
+    * the vertex shader is made without knowing. */
+   return nir_progress(true, impl, nir_metadata_none);
 }
 
 /* The layout of Vulkan binding (set, binding), or NULL. */
@@ -2215,6 +2294,16 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       mesa_logw_once("wvk: a pipeline layout of more descriptors than their records have room for");
 
    NIR_PASS(_, nir, lower_push_constants);
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      const bool per_sample = wants_sample_shading(pipeline_state);
+      if (per_sample)
+         NIR_PASS(_, nir, shade_per_sample);
+      struct sample_state s = {
+         .samples = pipeline_state && pipeline_state->ms ? pipeline_state->ms->rasterization_samples : 4,
+         .frag_coord = per_sample,
+      };
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_sample_pos_instr, nir_metadata_control_flow, &s);
+   }
    /* Shared memory as words, as ntv's is, and accessed a word at a time:
     * a 64-bit or 16-bit value is words' worth, which WGSL has no types of. */
    if (nir->info.stage == MESA_SHADER_COMPUTE) {

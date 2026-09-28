@@ -170,6 +170,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .textureCompressionASTC_LDR = astc,
       .textureCompressionBC = bc,
       .fragmentStoresAndAtomics = true,
+      /* Every sample, the fragment shader made to read its sample. */
+      .sampleRateShading = true,
       /* 64-bit integers are pairs of words (nir_lower_int64). */
       .shaderInt64 = true,
       .shaderClipDistance = clip,

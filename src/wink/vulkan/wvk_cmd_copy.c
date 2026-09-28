@@ -1009,6 +1009,9 @@ clear_pass(struct wvk_replay *replay, struct wvk_image *image, uint32_t level, u
          d.depthLoadOp = (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? WGPULoadOp_Clear : WGPULoadOp_Load;
          d.depthStoreOp = WGPUStoreOp_Store;
          d.depthClearValue = ds->depth;
+      } else if (image->format == WGPUTextureFormat_Depth24PlusStencil8) {
+         /* A stencil format's depth aspect, which is nobody's. */
+         d.depthReadOnly = true;
       }
       if (vk_format_has_stencil(image->vk.format)) {
          d.stencilLoadOp = (aspects & VK_IMAGE_ASPECT_STENCIL_BIT) ? WGPULoadOp_Clear : WGPULoadOp_Load;
