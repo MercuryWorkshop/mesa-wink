@@ -110,7 +110,6 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Dynamically indexed arrays of descriptors: the first element is used.
 - Layered rendering: a pass is one layer. This affects blits of several
   layers and 3D blits, and multiview.
-- Copies into a depth32 or depth24 aspect.
 - Precise occlusion queries, and timestamps.
 - Subgroups.
 - Sampler LOD bias, border colours, and component swizzles.

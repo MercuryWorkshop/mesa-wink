@@ -224,6 +224,16 @@ region_bytes(const struct copy_layout *l, WGPUExtent3D size)
  * a byte-wise shader repacks into or out of the application's layout; the
  * depth aspect is read out by a shader, whatever its format. */
 
+/* Whether the region's bytes in the buffer have gaps the copy leaves be:
+ * rows further apart than they are long, or images than their rows. */
+static bool
+region_has_gaps(const struct copy_layout *l, WGPUExtent3D size)
+{
+   const uint32_t row = DIV_ROUND_UP(size.width, l->block_w) * l->block_bytes;
+   const uint32_t rows = DIV_ROUND_UP(size.height, l->block_h);
+   return (rows > 1 && l->row_bytes > row) || (size.depthOrArrayLayers > 1 && l->rows_per_image > rows);
+}
+
 static const char repack_wgsl[] =
    "struct P { src_byte: u32, src_pitch: u32, src_image: u32, dst_byte: u32,\n"
    "           dst_pitch: u32, dst_image: u32, row_bytes: u32, rows: u32 }\n"
@@ -263,6 +273,65 @@ static const char depth_out_wgsl[] =
    "    atomicStore(&dst[(at + id.x * 4u) / 4u], v);\n"
    "  }\n"
    "}\n";
+
+/* A buffer into a depth24 or depth32 aspect, which WebGPU does not copy:
+ * a triangle over the region writing each texel's frag_depth. Buffers hold
+ * depth24 as the low 24 bits of 32, depth32 as a float. */
+static const char depth_in_wgsl[] =
+   "struct P { ox: u32, oy: u32, src_byte: u32, src_pitch: u32, kind: u32 }\n"
+   "@group(0) @binding(0) var<storage, read> src: array<u32>;\n"
+   "@group(0) @binding(1) var<uniform> p: P;\n"
+   "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n"
+   "  let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n"
+   "  return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);\n"
+   "}\n"
+   "@fragment fn fs(@builtin(position) pos: vec4f) -> @builtin(frag_depth) f32 {\n"
+   "  let x = u32(pos.x) - p.ox;\n"
+   "  let y = u32(pos.y) - p.oy;\n"
+   "  let w = src[(p.src_byte + y * p.src_pitch + x * 4u) / 4u];\n"
+   "  return select(bitcast<f32>(w), f32(w & 0xffffffu) / 16777215.0, p.kind == 1u);\n"
+   "}\n";
+
+static WGPURenderPipeline
+depth_in_pipeline(struct wvk_device *dev, WGPUTextureFormat format)
+{
+   WGPURenderPipeline pipeline = NULL;
+   simple_mtx_lock(&dev->cache_lock);
+   uint32_t i = 0;
+   while (i < ARRAY_SIZE(dev->depth_in_pipelines) && dev->depth_in_pipelines[i].pipeline &&
+          dev->depth_in_pipelines[i].format != format)
+      ++i;
+   if (i < ARRAY_SIZE(dev->depth_in_pipelines) && !dev->depth_in_pipelines[i].pipeline) {
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(depth_in_wgsl);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      sm.label = wvk_sv("wvk depth in");
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      /* Depth only: the stencil stays as it is. */
+      WGPUDepthStencilState ds = WGPU_DEPTH_STENCIL_STATE_INIT;
+      ds.format = format;
+      ds.depthWriteEnabled = WGPUOptionalBool_True;
+      ds.depthCompare = WGPUCompareFunction_Always;
+      ds.stencilWriteMask = 0;
+      WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+      fragment.module = module;
+      fragment.entryPoint = wvk_sv("fs");
+      WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk depth in");
+      desc.vertex.module = module;
+      desc.vertex.entryPoint = wvk_sv("vs");
+      desc.depthStencil = &ds;
+      desc.fragment = &fragment;
+      dev->depth_in_pipelines[i].format = format;
+      dev->depth_in_pipelines[i].pipeline = wgpuDeviceCreateRenderPipeline(dev->wgpu, &desc);
+      wgpuShaderModuleRelease(module);
+   }
+   if (i < ARRAY_SIZE(dev->depth_in_pipelines))
+      pipeline = dev->depth_in_pipelines[i].pipeline;
+   simple_mtx_unlock(&dev->cache_lock);
+   return pipeline;
+}
 
 static WGPUComputePipeline
 copy_pipeline(struct wvk_device *dev, WGPUComputePipeline *slot, const char *wgsl, const char *label)
@@ -447,6 +516,73 @@ depth_out(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *i
             DIV_ROUND_UP(size.height, 8), size.depthOrArrayLayers);
 }
 
+/* A pass a layer, drawing over the region only. */
+static void
+depth_in(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+         const WGPUTexelCopyTextureInfo *tex, WGPUExtent3D size, WGPUBuffer src, uint64_t src_offset,
+         const struct copy_layout *l)
+{
+   WGPURenderPipeline pipeline = depth_in_pipeline(dev, image->format);
+   if (!pipeline || !size.width || !size.height)
+      return;
+   const enum pipe_format depth = vk_format_to_pipe_format(vk_format_depth_only(image->vk.format));
+   const bool stencil = vk_format_has_stencil(image->vk.format);
+   const uint32_t image_bytes = l->rows_per_image * l->row_bytes;
+   const uint64_t bytes = (uint64_t)(size.depthOrArrayLayers - 1) * image_bytes +
+                          (uint64_t)(size.height - 1) * l->row_bytes + size.width * 4;
+   uint32_t src_byte;
+   const WGPUBindGroupEntry source = storage_range(0, src, src_offset, bytes, &src_byte);
+   WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+   const uint32_t width = u_minify(image->vk.extent.width, tex->mipLevel);
+   const uint32_t height = u_minify(image->vk.extent.height, tex->mipLevel);
+
+   wvk_replay_end_passes(replay);
+   for (uint32_t z = 0; z < size.depthOrArrayLayers; ++z) {
+      const uint32_t params[8] = {
+         tex->origin.x, tex->origin.y, src_byte + z * image_bytes, l->row_bytes,
+         depth == PIPE_FORMAT_Z32_FLOAT ? 0 : 1,
+      };
+      WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform,
+                                                        params);
+      if (!params_buffer)
+         break;
+      const WGPUBindGroupEntry entries[] = {
+         source,
+         { .binding = 1, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
+      };
+      WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+      bg.layout = bgl;
+      bg.entryCount = ARRAY_SIZE(entries);
+      bg.entries = entries;
+      WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+
+      WGPUTextureView view = wvk_image_attachment_view(image, image->format, WGPUTextureAspect_All,
+                                                       tex->mipLevel, tex->origin.z + z);
+      util_dynarray_append(&replay->views, view);
+      WGPURenderPassDepthStencilAttachment ds = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+      ds.view = view;
+      ds.depthLoadOp = WGPULoadOp_Load;
+      ds.depthStoreOp = WGPUStoreOp_Store;
+      if (stencil) {
+         ds.stencilLoadOp = WGPULoadOp_Load;
+         ds.stencilStoreOp = WGPUStoreOp_Store;
+      }
+      WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+      pd.label = wvk_sv("wvk depth in");
+      pd.depthStencilAttachment = &ds;
+      WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &pd);
+      wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+      wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+      wgpuRenderPassEncoderSetViewport(pass, 0, 0, (float)width, (float)height, 0.0f, 1.0f);
+      wgpuRenderPassEncoderSetScissorRect(pass, tex->origin.x, tex->origin.y, size.width, size.height);
+      wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+      wgpuRenderPassEncoderEnd(pass);
+      wgpuRenderPassEncoderRelease(pass);
+      wgpuBindGroupRelease(group);
+   }
+   wgpuBindGroupLayoutRelease(bgl);
+}
+
 /* A depth or stencil aspect to a buffer. */
 static void
 copy_ds_to_buffer(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
@@ -475,11 +611,9 @@ copy_buffer_to_ds(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_
                   VkImageAspectFlags aspect, const WGPUTexelCopyTextureInfo *tex, WGPUExtent3D size,
                   WGPUBuffer src, uint64_t src_offset, const struct copy_layout *l)
 {
-   const enum pipe_format depth = vk_format_to_pipe_format(vk_format_depth_only(image->vk.format));
-   if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT && depth != PIPE_FORMAT_Z16_UNORM) {
-      /* TODO: a pass writing frag_depth. */
-      mesa_logw_once("wvk: copies into a %s depth aspect are not supported yet",
-                     util_format_short_name(depth));
+   if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT &&
+       vk_format_to_pipe_format(vk_format_depth_only(image->vk.format)) != PIPE_FORMAT_Z16_UNORM) {
+      depth_in(dev, replay, image, tex, size, src, src_offset, l);
       return;
    }
    const uint32_t bytes = aspect == VK_IMAGE_ASPECT_DEPTH_BIT ? 2 : 1;
@@ -550,6 +684,10 @@ wvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBuff
       const struct copy_layout l = buffer_layout(src->vk.format, r->imageSubresource.aspectMask,
                                                  r->bufferRowLength, r->bufferImageHeight, r->imageExtent);
       const uint64_t off = buffer_offset(dst, r->bufferOffset);
+      /* What is read back is the whole range: where the copy leaves gaps,
+       * the buffer has to have what the host has there first. */
+      if (region_has_gaps(&l, size))
+         wvk_replay_read(replay, dst->mem, off, region_bytes(&l, size));
       wvk_replay_write(replay, dst->mem, off, region_bytes(&l, size));
       if (src->linear) {
          const uint32_t bpp = util_format_get_blocksize(vk_format_to_pipe_format(src->vk.format));
@@ -603,6 +741,24 @@ copy_image_linear(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_
    }
 }
 
+/* Whether WebGPU copies a depth-stencil region itself: only whole
+ * subresources, every aspect of them, between textures of one format. */
+static bool
+whole_ds_copy(const struct wvk_image *src, const struct wvk_image *dst, const VkImageCopy2 *r)
+{
+   if (src->format != dst->format || r->srcSubresource.aspectMask != vk_format_aspects(src->vk.format))
+      return false;
+   const struct wvk_image *images[] = { src, dst };
+   const VkOffset3D offsets[] = { r->srcOffset, r->dstOffset };
+   const uint32_t levels[] = { r->srcSubresource.mipLevel, r->dstSubresource.mipLevel };
+   for (uint32_t i = 0; i < 2; ++i) {
+      if (offsets[i].x || offsets[i].y || r->extent.width != u_minify(images[i]->vk.extent.width, levels[i]) ||
+          r->extent.height != u_minify(images[i]->vk.extent.height, levels[i]))
+         return false;
+   }
+   return true;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyImageInfo)
 {
@@ -634,6 +790,25 @@ wvk_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyIm
       dext.width = DIV_ROUND_UP(dext.width, util_format_get_blockwidth(sf)) * util_format_get_blockwidth(df);
       dext.height = DIV_ROUND_UP(dext.height, util_format_get_blockheight(sf)) * util_format_get_blockheight(df);
       image_region(dst, &r->dstSubresource, r->dstOffset, dext, &d, &dsize);
+      /* Depth and stencil otherwise through a buffer, an aspect at a
+       * time, as a buffer holds them. */
+      if (is_ds_aspect(r->srcSubresource.aspectMask) && !whole_ds_copy(src, dst, r)) {
+         u_foreach_bit(bit, r->srcSubresource.aspectMask) {
+            const VkImageAspectFlags aspect = 1u << bit;
+            const struct copy_layout l = buffer_layout(src->vk.format, aspect, 0, 0, r->extent);
+            const uint64_t bytes = (uint64_t)size.depthOrArrayLayers * l.rows_per_image * l.row_bytes;
+            WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay, align64(bytes, 4),
+                                                     WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst |
+                                                     WGPUBufferUsage_Storage, NULL);
+            if (!temp)
+               break;
+            WGPUTexelCopyTextureInfo sa = s, da = d;
+            sa.aspect = da.aspect = wvk_aspect(aspect);
+            copy_ds_to_buffer(dev, replay, src, aspect, &sa, size, temp, 0, &l);
+            copy_buffer_to_ds(dev, replay, dst, aspect, &da, size, temp, 0, &l);
+         }
+         continue;
+      }
       if (same) {
          wgpuCommandEncoderCopyTextureToTexture(replay->encoder, &s, &d, &size);
          continue;

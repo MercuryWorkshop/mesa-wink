@@ -423,6 +423,10 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuComputePipelineRelease(dev->repack_pipeline);
    if (dev->depth_out_pipeline)
       wgpuComputePipelineRelease(dev->depth_out_pipeline);
+   for (uint32_t i = 0; i < ARRAY_SIZE(dev->depth_in_pipelines); ++i) {
+      if (dev->depth_in_pipelines[i].pipeline)
+         wgpuRenderPipelineRelease(dev->depth_in_pipelines[i].pipeline);
+   }
    if (dev->null_buffer)
       wgpuBufferRelease(dev->null_buffer);
    if (dev->null_sampler)

@@ -11,6 +11,8 @@
  *   - a negative viewport height (VK_KHR_maintenance1) flipping it back
  *   - a textured quad: a uniform buffer and a combined image sampler
  *   - vkCmdClearAttachments inside a pass, and vkCmdBlitImage scaling up
+ *   - BaseVertex, BaseInstance and DrawIndex, in direct and indirect
+ *     draws, and an attribute with a divisor of 2
  *
  * Build: src/wink/vulkan/test/build.sh OUT
  */
@@ -19,6 +21,7 @@
 #include "quad_vert.h"
 #include "color_frag.h"
 #include "texture_frag.h"
+#include "instanced_vert.h"
 
 enum { W = 64, H = 64 };
 
@@ -36,8 +39,10 @@ static const float quad[] = {
     1,  1,      1, 1, 1,   /* bottom right: white */
 };
 
+/* The pipeline for the quad, or with `divisor` for instanced.vert: one
+ * instance-rate attribute of that divisor, and strips of four indices. */
 static VkPipeline
-make_pipeline(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs)
+make_pipeline_with(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, uint32_t divisor)
 {
    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
    const VkPipelineShaderStageCreateInfo stages[] = {
@@ -50,6 +55,10 @@ make_pipeline(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs)
       { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = 0 },
       { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = 8 },
    };
+   const VkVertexInputAttributeDescription instance_attr = {
+      .location = 0, .binding = 0, .format = VK_FORMAT_R8G8B8A8_UNORM, .offset = 0,
+   };
+   const VkVertexInputBindingDivisorDescriptionKHR binding_divisor = { .binding = 0, .divisor = divisor };
    const VkDynamicState dynamic[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
    VkPipeline pipeline;
    VK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &(VkGraphicsPipelineCreateInfo){
@@ -59,7 +68,18 @@ make_pipeline(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs)
          .colorAttachmentCount = 1, .pColorAttachmentFormats = &format,
       },
       .stageCount = 2, .pStages = stages,
-      .pVertexInputState = &(VkPipelineVertexInputStateCreateInfo){
+      .pVertexInputState = divisor ? &(VkPipelineVertexInputStateCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+         .pNext = &(VkPipelineVertexInputDivisorStateCreateInfoKHR){
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR,
+            .vertexBindingDivisorCount = 1, .pVertexBindingDivisors = &binding_divisor,
+         },
+         .vertexBindingDescriptionCount = 1,
+         .pVertexBindingDescriptions = &(VkVertexInputBindingDescription){
+            .binding = 0, .stride = 4, .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE,
+         },
+         .vertexAttributeDescriptionCount = 1, .pVertexAttributeDescriptions = &instance_attr,
+      } : &(VkPipelineVertexInputStateCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
          .vertexBindingDescriptionCount = 1,
          .pVertexBindingDescriptions = &(VkVertexInputBindingDescription){
@@ -98,6 +118,12 @@ make_pipeline(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs)
       .layout = layout,
    }, NULL, &pipeline));
    return pipeline;
+}
+
+static VkPipeline
+make_pipeline(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs)
+{
+   return make_pipeline_with(layout, vs, fs, 0);
 }
 
 static PFN_vkCmdBeginRenderingKHR begin_rendering;
@@ -408,12 +434,125 @@ test_blit(void)
    printf("blit: done\n");
 }
 
+/* A 4x2 grid of cells: the cell of pixel (x, y). */
+static const uint8_t *
+cell(const struct buffer *b, int column, int row)
+{
+   return pixel(b, column * (W / 4) + W / 8, row * (H / 2) + H / 4);
+}
+
+static void
+test_instances(void)
+{
+   VkPipelineLayout layout;
+   VK(vkCreatePipelineLayout(dev, &(VkPipelineLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &(VkPushConstantRange){
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(struct push),
+      },
+   }, NULL, &layout));
+   VkShaderModule vs = make_module(spv_instanced_vert, sizeof(spv_instanced_vert));
+   VkShaderModule fs = make_module(spv_color_frag, sizeof(spv_color_frag));
+   VkPipeline pipeline = make_pipeline_with(layout, vs, fs, 2);
+
+   /* Per instance, a divisor of 2 apart: element firstInstance +
+    * (InstanceIndex - firstInstance) / 2. */
+   static const uint8_t colors[][4] = {
+      { 0, 0, 0, 255 }, { 255, 0, 0, 255 }, { 0, 255, 0, 255 }, { 0, 0, 255, 255 }, { 255, 255, 255, 255 },
+   };
+   struct buffer instances = make_buffer(sizeof(colors), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HOST);
+   memcpy(instances.map, colors, sizeof(colors));
+   static const uint16_t strip[] = { 0, 1, 2, 3 };
+   struct buffer indices = make_buffer(sizeof(strip), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, HOST);
+   memcpy(indices.map, strip, sizeof(strip));
+   /* Past something else, as buffers of commands are. */
+   const VkDrawIndexedIndirectCommand commands[] = {
+      { .indexCount = 4, .instanceCount = 4, .vertexOffset = 10, .firstInstance = 1 },
+      { .indexCount = 4, .instanceCount = 4, .vertexOffset = 20, .firstInstance = 3 },
+   };
+   const VkDeviceSize command_offset = 100;
+   struct buffer indirect = make_buffer(command_offset + sizeof(commands), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, HOST);
+   memcpy((uint8_t *)indirect.map + command_offset, commands, sizeof(commands));
+
+   struct image target = make_image(W, H, VK_FORMAT_R8G8B8A8_UNORM,
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+   struct buffer out = make_buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST);
+   const VkDeviceSize zero = 0;
+   const struct push push = { { 1, 1, 1, 1 }, { 0, 0 } };
+
+   /* Two indirect draws, one a row: row 0 instances 1-4, row 1 3-6. */
+   VkCommandBuffer cmd = begin();
+   begin_pass(cmd, &target, false);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   vkCmdBindVertexBuffers(cmd, 0, 1, &instances.buffer, &zero);
+   vkCmdBindIndexBuffer(cmd, indices.buffer, 0, VK_INDEX_TYPE_UINT16);
+   vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                      sizeof(push), &push);
+   vkCmdDrawIndexedIndirect(cmd, indirect.buffer, command_offset, 2, sizeof(VkDrawIndexedIndirectCommand));
+   end_pass_and_read(cmd, &target, &out);
+   submit_and_wait(cmd);
+   static const int expect[2][4] = { { 1, 1, 2, 2 }, { 3, 3, 4, 4 } };
+   for (int row = 0; row < 2; ++row) {
+      for (int column = 0; column < 4; ++column) {
+         const uint8_t *p = cell(&out, column, row), *c = colors[expect[row][column]];
+         CHECK(is(p, c[0], c[1], c[2]), "indirect: cell %d,%d is %u %u %u %u, not colour %d", column, row,
+               p[0], p[1], p[2], p[3], expect[row][column]);
+      }
+   }
+
+   /* A direct draw: row 0 again, instances 2-5. */
+   cmd = begin();
+   begin_pass(cmd, &target, false);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   vkCmdBindVertexBuffers(cmd, 0, 1, &instances.buffer, &zero);
+   vkCmdBindIndexBuffer(cmd, indices.buffer, 0, VK_INDEX_TYPE_UINT16);
+   vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                      sizeof(push), &push);
+   vkCmdDrawIndexed(cmd, 4, 4, 0, 30, 2);
+   end_pass_and_read(cmd, &target, &out);
+   submit_and_wait(cmd);
+   static const int direct[4] = { 2, 2, 3, 3 };
+   for (int column = 0; column < 4; ++column) {
+      const uint8_t *p = cell(&out, column, 0), *c = colors[direct[column]];
+      CHECK(is(p, c[0], c[1], c[2]), "direct: cell %d is %u %u %u %u, not colour %d", column, p[0], p[1],
+            p[2], p[3], direct[column]);
+   }
+   const uint8_t *empty = cell(&out, 0, 1);
+   CHECK(empty[0] == 0 && empty[1] == 0 && empty[2] == 0, "direct: row 1 was drawn: %u %u %u", empty[0],
+         empty[1], empty[2]);
+
+   free_buffer(&out);
+   free_image(&target);
+   free_buffer(&indirect);
+   free_buffer(&indices);
+   free_buffer(&instances);
+   vkDestroyPipeline(dev, pipeline, NULL);
+   vkDestroyShaderModule(dev, vs, NULL);
+   vkDestroyShaderModule(dev, fs, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   printf("draw parameters and divisors: done\n");
+}
+
 int
 main(void)
 {
-   const char *extensions[] = { "VK_KHR_portability_subset", "VK_KHR_dynamic_rendering" };
-   test_init(2, extensions, &(VkPhysicalDeviceDynamicRenderingFeatures){
-      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, .dynamicRendering = VK_TRUE,
+   const char *extensions[] = { "VK_KHR_portability_subset", "VK_KHR_dynamic_rendering",
+                                "VK_KHR_vertex_attribute_divisor" };
+   VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR,
+      .vertexAttributeInstanceRateDivisor = VK_TRUE,
+   };
+   VkPhysicalDeviceDynamicRenderingFeatures rendering = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, .pNext = &divisor,
+      .dynamicRendering = VK_TRUE,
+   };
+   VkPhysicalDeviceVulkan11Features vk11 = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &rendering,
+      .shaderDrawParameters = VK_TRUE,
+   };
+   test_init(3, extensions, &(VkPhysicalDeviceFeatures2){
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &vk11,
+      .features = { .multiDrawIndirect = VK_TRUE },
    });
    begin_rendering = (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(dev, "vkCmdBeginRenderingKHR");
    end_rendering = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(dev, "vkCmdEndRenderingKHR");
@@ -425,6 +564,7 @@ main(void)
    test_texture(vertices.buffer);
    test_clear_attachments();
    test_blit();
+   test_instances();
 
    free_buffer(&vertices);
    return test_finish();
