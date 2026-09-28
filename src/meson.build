@@ -124,7 +124,7 @@ endif
 if with_kosmickrisp_vk
   subdir('kosmickrisp')
 endif
-if with_wink_vk
+if with_wink_vk or get_option('gex-emdawn-dir') != ''
   subdir('wink')
 endif
 if with_gallium

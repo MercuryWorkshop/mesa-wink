@@ -56,7 +56,6 @@ endif
 # The driver itself is winsys-agnostic: a browser build takes its device from
 # the page, a desktop one from native Dawn. Either needs the WebGPU headers.
 if get_option('gex-emdawn-dir') != ''
-  subdir('drivers/zink/nir_to_spirv')
   subdir('drivers/gex_wgpu')
 else
   driver_gex_wgpu = declare_dependency()

@@ -11,8 +11,8 @@ gex_emdawn_include = include_directories(
   join_paths(gex_emdawn_dir, 'webgpu', 'include'),
   join_paths(gex_emdawn_dir, 'webgpu_cpp', 'include'),
 )
-gex_tint_include = include_directories(join_paths(gex_tint_dir, 'include'))
-gex_tint = cpp.find_library('tint', dirs : gex_tint_dir, static : true)
+# The shader compiler is src/wink/compiler's, shared with the Vulkan driver.
+gex_tint = wink_tint
 
 # On a desktop the WebGPU implementation is a library to link; in a browser it
 # is the page. gex_wgpu_native.c is only built for the former: it is the device
@@ -29,7 +29,6 @@ libgex_wgpu = static_library(
   'gex_wgpu',
   gex_native_sources + files(
     'gex_wgpu_screen.c',
-    'gex_wgpu_tint.cpp',
     '../../../microsoft/compiler/dxil_nir_lower_int_cubemaps.c',
   ),
   include_directories : [
@@ -38,30 +37,12 @@ libgex_wgpu = static_library(
     inc_gallium_aux,
     inc_include,
     inc_src,
-    include_directories('../zink/nir_to_spirv'),
-    gex_tint_include,
   ],
   # Not gex_tint: a static library's dependencies travel to everything that
   # links it, and wink ships Tint as its own archive so a consumer that
   # already links the same Tint (MobileGL's, from the same Dawn revision) can
   # leave one copy out. driver_gex_wgpu below still carries it.
-  dependencies : [idep_mesautil, idep_nir, idep_ntv],
-  cpp_args : [
-    '-std=c++20',
-    '-fno-rtti',
-    '-fno-exceptions',
-    '-DTINT_BUILD_SPV_READER=1',
-    '-DTINT_BUILD_WGSL_READER=1',
-    '-DTINT_BUILD_WGSL_WRITER=1',
-    '-DTINT_BUILD_SPV_WRITER=0',
-    '-DTINT_BUILD_GLSL_WRITER=0',
-    '-DTINT_BUILD_HLSL_WRITER=0',
-    '-DTINT_BUILD_MSL_WRITER=0',
-    '-DTINT_BUILD_IR_BINARY=0',
-    '-DTINT_BUILD_IS_LINUX=1',
-    '-DTINT_BUILD_IS_MAC=0',
-    '-DTINT_BUILD_IS_WIN=0',
-  ],
+  dependencies : [idep_mesautil, idep_nir, idep_wink_compiler],
   gnu_symbol_visibility : 'hidden',
 )
 
