@@ -514,6 +514,13 @@ vk_sync_timeline_wait_locked(struct vk_device *device,
     * time point pending that's at least as high as wait_value.
     */
    while (state->highest_pending < wait_value) {
+      /* The deadline, checked here rather than left to timedwait: where
+       * there are no threads (Emscripten's single-threaded build) it may
+       * return at once without timing out, and a zero-timeout wait for a
+       * point that is not pending -- what deferred submission does -- would
+       * spin forever. */
+      if (os_time_get_nano() >= abs_timeout_ns)
+         return VK_TIMEOUT;
       int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex,
                                           &abs_timeout_ts);
       if (ret == thrd_timedout)
