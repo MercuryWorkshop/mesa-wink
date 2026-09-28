@@ -1,0 +1,3 @@
+# Tests not run at all; one regex per line. Keep this for real reasons -- a
+# test that hangs the device, or needs a feature WebGPU cannot have -- and put
+# ordinary failures in gex_wgpu-fails.txt instead, where a fix shows up.

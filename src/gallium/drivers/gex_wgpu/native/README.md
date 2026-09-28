@@ -69,3 +69,21 @@ largest unbuilt item on the ladder, because there is no hardware tessellator
 to drive. See `docs/gl-ceiling-on-webgpu.md` in the gex repository for the
 rung-by-rung account; its conclusion is that GL 4.6 is reachable and nothing
 on the way is provably impossible.
+
+## Conformance: GL ES
+
+```sh
+./build-cts.sh                 # VK-GL-CTS opengl-es-cts-3.2.14.1 and deqp-runner 0.23.3 (Mesa CI's pins)
+xvfb-run -a ./run-deqp.sh      # dEQP-GLES2/3/31 + KHR-GLES2/3/31/32, native ASTC/ETC2
+xvfb-run -a ./run-deqp.sh cpu  # the same with ASTC/ETC2 hidden, so st/mesa decodes on the CPU
+```
+
+The expectations are `../ci/gex_wgpu-{fails,flakes,skips}.txt`, which
+deqp-runner compares against. They start empty; seed `gex_wgpu-fails.txt` from
+the first full run's `failures.csv`. The suite checks that the context really
+is "OpenGL ES 3.2" on "gex WebGPU" before running anything. A browser build
+gets the same driconf defaults (wink fills them), so what passes here should
+pass there.
+
+These two scripts were written on a machine without this native flow and have
+not been run yet.

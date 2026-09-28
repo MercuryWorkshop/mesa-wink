@@ -1,0 +1,3 @@
+# Expected failures for native/run-deqp.sh, as deqp-runner's baseline:
+# one "Test.Name,Fail" (or Crash, Timeout) per line. Empty until the first
+# full run on Linux; seed it from that run's failures.csv.
