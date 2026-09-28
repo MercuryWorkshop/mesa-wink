@@ -1458,7 +1458,14 @@ clear_ranges(struct wvk_cmd_buffer *cmd, struct wvk_image *image, const VkClearC
    for (uint32_t r = 0; r < range_count; ++r)
       wvk_image_use(wvk_cmd_buffer_device(cmd), replay, image, ranges[r].baseMipLevel,
                     vk_image_subresource_level_count(&image->vk, &ranges[r]), true);
-   if (image->linear || !(image->usage & WGPUTextureUsage_RenderAttachment)) {
+   /* What a load op does not clear right: a draw where there are samples,
+    * else copies. */
+   if (color && !wvk_format_clears_by_load(image->vk.format) && image->vk.samples > 1) {
+      wvk_cmd_meta_clear_color_image(cmd, image, color, range_count, ranges);
+      return;
+   }
+   if (image->linear || !(image->usage & WGPUTextureUsage_RenderAttachment) ||
+       (color && !wvk_format_clears_by_load(image->vk.format))) {
       if (color)
          clear_by_fill(cmd, image, color, range_count, ranges);
       else

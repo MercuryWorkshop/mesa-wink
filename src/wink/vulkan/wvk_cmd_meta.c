@@ -200,6 +200,18 @@ wvk_cmd_meta_resolve_image(struct wvk_cmd_buffer *cmd, const VkResolveImageInfo2
 }
 
 void
+wvk_cmd_meta_clear_color_image(struct wvk_cmd_buffer *cmd, struct wvk_image *image, const VkClearColorValue *color,
+                               uint32_t range_count, const VkImageSubresourceRange *ranges)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_meta_save save;
+   meta_begin(cmd, &save);
+   vk_meta_clear_color_image(&cmd->vk, &dev->meta, &image->vk, VK_IMAGE_LAYOUT_GENERAL, image->vk.format, color,
+                             range_count, ranges);
+   meta_end(cmd, &save);
+}
+
+void
 wvk_cmd_meta_resolve_rendering(struct wvk_cmd_buffer *cmd, const VkRenderingInfo *info)
 {
    struct wvk_device *dev = wvk_cmd_buffer_device(cmd);

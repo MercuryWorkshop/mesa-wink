@@ -180,7 +180,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       if (wvk_image_view_image(view)->dimension == WGPUTextureDimension_3D)
          colors[i].depthSlice = view->vk.base_array_layer + replay->pass_layer;
       colors[i].loadOp = load_op(att->loadOp, resuming);
-      if (!resuming && !area_covers(&info->renderArea, view)) {
+      if (!resuming && (!area_covers(&info->renderArea, view) || !wvk_format_clears_by_load(view->vk.format))) {
          colors[i].loadOp = WGPULoadOp_Load;
          if (att->loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
             clears[clear_count++] = (VkClearAttachment){ VK_IMAGE_ASPECT_COLOR_BIT, i, att->clearValue };

@@ -163,6 +163,8 @@ void wvk_replay_free_meta_memory(struct wvk_device *dev, struct wvk_replay *repl
 /* The resolves of a render pass instance WebGPU could not do itself. */
 /* vkCmdResolveImage2 by vk_meta: what WebGPU's resolves cannot do. */
 void wvk_cmd_meta_resolve_image(struct wvk_cmd_buffer *cmd, const VkResolveImageInfo2 *info);
+void wvk_cmd_meta_clear_color_image(struct wvk_cmd_buffer *cmd, struct wvk_image *image, const VkClearColorValue *color,
+                                    uint32_t range_count, const VkImageSubresourceRange *ranges);
 void wvk_cmd_meta_resolve_rendering(struct wvk_cmd_buffer *cmd, const VkRenderingInfo *info);
 
 /* A view of an R8 texture at least `extent`, for a pass without
@@ -204,6 +206,15 @@ VkResult wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
 
 /* A clear value as WebGPU wants it for a format: integers for integers. */
 WGPUColor wvk_clear_color(VkFormat format, const VkClearColorValue *value);
+
+/* Whether a pass's load op clears the format right: Metal's clear of
+ * RGB10A2Uint keeps each channel to 8 bits, so it is cleared by a draw,
+ * or by copies. */
+static inline bool
+wvk_format_clears_by_load(VkFormat format)
+{
+   return format != VK_FORMAT_A2B10G10R10_UINT_PACK32;
+}
 
 /* End whatever pass is open: copies and clears happen between passes. */
 void wvk_replay_end_passes(struct wvk_replay *replay);

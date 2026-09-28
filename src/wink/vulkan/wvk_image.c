@@ -636,6 +636,17 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
             *c[i] = VK_COMPONENT_SWIZZLE_ONE;
       }
    }
+   /* Depth or stencil is (x, 0, 0, 1) to Vulkan; WebGPU leaves what else
+    * a combined format's aspect reads as the backend has it. */
+   if (view->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+      VkComponentSwizzle *c[4] = { &mapping.r, &mapping.g, &mapping.b, &mapping.a };
+      for (unsigned i = 0; i < 4; ++i) {
+         if (*c[i] == VK_COMPONENT_SWIZZLE_G || *c[i] == VK_COMPONENT_SWIZZLE_B)
+            *c[i] = VK_COMPONENT_SWIZZLE_ZERO;
+         else if (*c[i] == VK_COMPONENT_SWIZZLE_A)
+            *c[i] = VK_COMPONENT_SWIZZLE_ONE;
+      }
+   }
    const VkComponentMapping *m = &mapping;
    if (m->r != VK_COMPONENT_SWIZZLE_R || m->g != VK_COMPONENT_SWIZZLE_G || m->b != VK_COMPONENT_SWIZZLE_B ||
        m->a != VK_COMPONENT_SWIZZLE_A)
