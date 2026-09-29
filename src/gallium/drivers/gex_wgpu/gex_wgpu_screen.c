@@ -3054,6 +3054,13 @@ struct gex_wgpu_rasterizer {
 struct gex_wgpu_varying_layout {
    unsigned count;
    uint32_t location[GEX_WGPU_MAX_VARYINGS];
+   /* Each slot's type as declared, a glsl_base_type -- float unless the
+    * producer declared an integer -- and its interpolation qualifier. The
+    * buffer is words either way; these are for the rasterizing passthrough,
+    * whose outputs have to match the fragment shader's inputs in both, or
+    * WebGPU refuses the pipeline. */
+   uint8_t base_type[GEX_WGPU_MAX_VARYINGS];
+   uint8_t interpolation[GEX_WGPU_MAX_VARYINGS];
 };
 
 static unsigned
@@ -28856,9 +28863,13 @@ gex_wgpu_collect_varyings(nir_shader *nir, nir_variable_mode mode,
       unsigned at = layout->count;
       while (at > 0 && layout->location[at - 1] > var->data.location) {
          layout->location[at] = layout->location[at - 1];
+         layout->base_type[at] = layout->base_type[at - 1];
+         layout->interpolation[at] = layout->interpolation[at - 1];
          --at;
       }
       layout->location[at] = var->data.location;
+      layout->base_type[at] = (uint8_t)glsl_get_base_type(type);
+      layout->interpolation[at] = (uint8_t)var->data.interpolation;
       ++layout->count;
       /* A merged clip/cull array occupies *two* varying slots.
        *
@@ -28888,9 +28899,13 @@ gex_wgpu_collect_varyings(nir_shader *nir, nir_variable_mode mode,
          while (second > 0 &&
                 layout->location[second - 1] > VARYING_SLOT_CLIP_DIST1) {
             layout->location[second] = layout->location[second - 1];
+            layout->base_type[second] = layout->base_type[second - 1];
+            layout->interpolation[second] = layout->interpolation[second - 1];
             --second;
          }
          layout->location[second] = VARYING_SLOT_CLIP_DIST1;
+         layout->base_type[second] = GLSL_TYPE_FLOAT;
+         layout->interpolation[second] = INTERP_MODE_NONE;
          ++layout->count;
       }
    }
@@ -29037,13 +29052,34 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
        * Declared the way nir_lower_clip does it, compact flag included, so
        * that ntv and Tint see what they would from an ordinary shader. */
       const bool is_clip = outputs->location[i] == VARYING_SLOT_CLIP_DIST0;
+      /* Of the producer's type and interpolation: the fragment shader's
+       * input at this location is declared the same way, and WebGPU checks
+       * both. An integer varying forwarded as a float vec4 was refused --
+       *
+       *   The base type (f32) of the vertex output at location 0 is
+       *   different from the base type (i32) of the fragment input at
+       *   location 0.
+       *
+       * -- and the invalid command buffer took the geometry stage's
+       * transform feedback with it: every integer builtin_functions case
+       * read through a geometry shader came back zero. */
+      const enum glsl_base_type base =
+         (enum glsl_base_type)outputs->base_type[i];
+      const struct glsl_type *slot_type =
+         base == GLSL_TYPE_INT ? glsl_ivec4_type()
+         : base == GLSL_TYPE_UINT ? glsl_uvec4_type()
+                                  : glsl_vec4_type();
       nir_variable *out = nir_variable_create(
          b.shader, nir_var_shader_out,
          is_clip ? glsl_array_type(glsl_float_type(),
                                    clip1_slot >= 0 ? 8 : 4, sizeof(float))
-                 : glsl_vec4_type(), name);
+                 : slot_type, name);
       out->data.location = outputs->location[i];
       out->data.driver_location = i;
+      if (!is_clip)
+         out->data.interpolation =
+            (base == GLSL_TYPE_INT || base == GLSL_TYPE_UINT)
+               ? INTERP_MODE_FLAT : outputs->interpolation[i];
       /* A slot keeps its place in the record whether or not it is
        * forwarded, so the offset is the slot number and not a compacted
        * one -- which is the whole reason the storage form needs no
