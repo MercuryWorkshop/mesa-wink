@@ -108,6 +108,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_shader_draw_parameters = true,
       .KHR_16bit_storage = true,
       .EXT_scalar_block_layout = true,
+      .EXT_multi_draw = true,
       .KHR_8bit_storage = true,
       .KHR_shader_float16_int8 = true,
       .KHR_shader_float_controls = true,
@@ -165,6 +166,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .dualSrcBlend = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DualSourceBlending),
       /* A CPU loop over indirect draws. */
       .multiDrawIndirect = true,
+      /* VK_EXT_multi_draw: a draw for each. */
+      .multiDraw = true,
       .drawIndirectFirstInstance = wvk_physical_device_has_feature(pdev, WGPUFeatureName_IndirectFirstInstance),
       /* WebGPU clamps depth always; unclippedDepth turns off the clipping. */
       .depthClamp = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
@@ -455,6 +458,8 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .mipmapPrecisionBits = 4,
       .maxDrawIndexedIndexValue = UINT32_MAX,
       .maxDrawIndirectCount = UINT32_MAX,
+      /* VK_EXT_multi_draw */
+      .maxMultiDrawCount = 2048,
       /* WebGPU samplers have no LOD bias. */
       /* Vulkan's minimum. WebGPU samplers have no bias: it is ignored. */
       .maxSamplerLodBias = WVK_MAX_SAMPLER_LOD_BIAS,

@@ -44,7 +44,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 9
+#define WVK_SHADER_BINARY_VERSION 10
 
 enum wvk_shader_variant {
    /* Vulkan's y points down, WebGPU's up: gl_Position.y negated. */

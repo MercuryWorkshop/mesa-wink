@@ -1682,6 +1682,9 @@ lower_draw_parameters_instr(nir_builder *b, nir_intrinsic_instr *intr, void *dat
    default:
       return false;
    }
+   /* DrawIndex alone too: the draw's words say it. */
+   struct wvk_shader *shader = data;
+   shader->uses_draw_parameters = true;
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *where = nir_load_ssbo(b, 4, 32, driver_buffer(b, WVK_DRIVER_SLOT_PUSH),
                                   nir_imm_int(b, WVK_DRIVER_DRAW_OFFSET), .align_mul = 16,
@@ -1917,7 +1920,7 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
    NIR_PASS(_, nir, pull_divided_attributes, state, shader);
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_draw_parameters_instr, nir_metadata_control_flow,
-               NULL);
+               shader);
    }
    /* Stores of less than a word, atomics on the bits of it: others may
     * store to the rest of the word. */

@@ -2584,25 +2584,54 @@ draw_fan_elements(struct wvk_cmd_buffer *cmd, uint32_t first_index, uint32_t ind
                 true, draw_id);
 }
 
+/* A draw, the `draw_id`th of a vkCmdDrawMulti*EXT. */
+static void
+draw_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
+            uint32_t firstInstance, uint32_t draw_id)
+{
+   if (!vertexCount || !instanceCount)
+      return;
+   if (draw_polygon_mode(cmd, false, 0, vertexCount, instanceCount, (int32_t)firstVertex, firstInstance, draw_id))
+      return;
+   if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+      draw_fan_arrays(cmd, vertexCount, instanceCount, firstVertex, firstInstance, draw_id);
+      return;
+   }
+   foreach_viewport(cmd) {
+      set_draw_parameters(cmd->replay->state, NULL, 0, false, (int32_t)firstVertex, firstInstance, draw_id);
+      if (!flush_draw(cmd, false))
+         continue;
+      wgpuRenderPassEncoderDraw(cmd->replay->pass, vertexCount, instanceCount, firstVertex, firstInstance);
+   }
+}
+
+static void
+draw_elements(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
+              int32_t vertexOffset, uint32_t firstInstance, uint32_t draw_id)
+{
+   if (!indexCount || !instanceCount)
+      return;
+   if (draw_polygon_mode(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id))
+      return;
+   if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+      draw_fan_elements(cmd, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
+      return;
+   }
+   foreach_viewport(cmd) {
+      set_draw_parameters(cmd->replay->state, NULL, 0, true, vertexOffset, firstInstance, draw_id);
+      if (!flush_draw(cmd, true))
+         continue;
+      wgpuRenderPassEncoderDrawIndexed(cmd->replay->pass, indexCount, instanceCount, firstIndex,
+                                       vertexOffset, firstInstance);
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instanceCount,
             uint32_t firstVertex, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
-   if (!vertexCount || !instanceCount)
-      return;
-   if (draw_polygon_mode(cmd, false, 0, vertexCount, instanceCount, (int32_t)firstVertex, firstInstance, 0))
-      return;
-   if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
-      draw_fan_arrays(cmd, vertexCount, instanceCount, firstVertex, firstInstance, 0);
-      return;
-   }
-   foreach_viewport(cmd) {
-      set_draw_parameters(cmd->replay->state, NULL, 0, false, (int32_t)firstVertex, firstInstance, 0);
-      if (!flush_draw(cmd, false))
-         continue;
-      wgpuRenderPassEncoderDraw(cmd->replay->pass, vertexCount, instanceCount, firstVertex, firstInstance);
-   }
+   draw_arrays(cmd, vertexCount, instanceCount, firstVertex, firstInstance, 0);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2610,20 +2639,32 @@ wvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t 
                    uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
-   if (!indexCount || !instanceCount)
-      return;
-   if (draw_polygon_mode(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, 0))
-      return;
-   if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
-      draw_fan_elements(cmd, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, 0);
-      return;
+   draw_elements(cmd, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance, 0);
+}
+
+/* VK_EXT_multi_draw: a draw for each, DrawIndex its number. */
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdDrawMultiEXT(VkCommandBuffer commandBuffer, uint32_t drawCount, const VkMultiDrawInfoEXT *pVertexInfo,
+                    uint32_t instanceCount, uint32_t firstInstance, uint32_t stride)
+{
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   for (uint32_t i = 0; i < drawCount; ++i) {
+      const VkMultiDrawInfoEXT *d = (const VkMultiDrawInfoEXT *)((const uint8_t *)pVertexInfo + (size_t)i * stride);
+      draw_arrays(cmd, d->vertexCount, instanceCount, d->firstVertex, firstInstance, i);
    }
-   foreach_viewport(cmd) {
-      set_draw_parameters(cmd->replay->state, NULL, 0, true, vertexOffset, firstInstance, 0);
-      if (!flush_draw(cmd, true))
-         continue;
-      wgpuRenderPassEncoderDrawIndexed(cmd->replay->pass, indexCount, instanceCount, firstIndex,
-                                       vertexOffset, firstInstance);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
+                           const VkMultiDrawIndexedInfoEXT *pIndexInfo, uint32_t instanceCount,
+                           uint32_t firstInstance, uint32_t stride, const int32_t *pVertexOffset)
+{
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   for (uint32_t i = 0; i < drawCount; ++i) {
+      const VkMultiDrawIndexedInfoEXT *d =
+         (const VkMultiDrawIndexedInfoEXT *)((const uint8_t *)pIndexInfo + (size_t)i * stride);
+      draw_elements(cmd, d->indexCount, instanceCount, d->firstIndex, pVertexOffset ? *pVertexOffset : d->vertexOffset,
+                    firstInstance, i);
    }
 }
 
