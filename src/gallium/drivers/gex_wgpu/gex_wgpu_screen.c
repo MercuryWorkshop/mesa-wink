@@ -1459,6 +1459,17 @@ static_assert(GEX_WGPU_MAX_BUFFER_TEXTURES == GEX_WGPU_MAX_SAMPLERS,
 #define GEX_WGPU_CONSTANT_RING_BYTES (8u << 20)
 #define GEX_WGPU_MAX_BATCHED_DRAWS 1024
 
+/* What a compressed texture of a size not whole blocks is sampled as: see
+ * gex_wgpu_sampler_view.decoded. */
+enum gex_wgpu_decode_format {
+   GEX_WGPU_DECODE_RGBA8,
+   GEX_WGPU_DECODE_RGBA8_SRGB,
+   GEX_WGPU_DECODE_R16F,
+   GEX_WGPU_DECODE_RG16F,
+   GEX_WGPU_DECODE_RGBA16F,
+   GEX_WGPU_DECODE_FORMATS,
+};
+
 struct gex_wgpu_screen {
    struct pipe_screen base;
    /* The de-indexing gather shader, built on first use and kept: it is one
@@ -1491,6 +1502,9 @@ struct gex_wgpu_screen {
     * and writes @builtin(frag_depth). Stencil, again, needs none of this. */
    WGPURenderPipeline depth_upload[5];
    WGPUBindGroupLayout depth_upload_layout;
+   /* The passes decoding a compressed texture into a sampler view's scratch
+    * (gex_wgpu_sampler_view_refresh), one per scratch format. */
+   WGPURenderPipeline decode_pipelines[GEX_WGPU_DECODE_FORMATS];
    /* The multisampled-depth resolve, one pipeline per depth format. Distinct
     * from `depth_resolve` above, which turns a packed depth texture into
     * something readable: this one turns 4x samples into one. WebGPU resolves
@@ -3604,6 +3618,19 @@ struct gex_wgpu_sampler_view {
    uint32_t reinterpret_layers;
    /* The source's write_serial the copy was taken at; UINT64_MAX means never. */
    uint64_t reinterpret_serial;
+   /* A compressed texture whose size is not whole blocks. WebGPU holds it
+    * rounded up to the block grid, which sampling cannot see past: every
+    * level's normalized coordinates, its wrapping and its LOD would be of the
+    * larger size. So the view samples an uncompressed scratch of the true
+    * size, with the view's levels and layers, decoded from the texture by
+    * texel fetches (gex_wgpu_sampler_view_refresh) whenever it was written
+    * since. */
+   WGPUTexture decoded;
+   enum gex_wgpu_decode_format decoded_which;
+   WGPUTextureFormat decoded_format;
+   WGPUTextureFormat decoded_source_format;
+   uint32_t decoded_levels, decoded_layers;
+   uint64_t decoded_serial;
 };
 
 /* One occlusion query.
@@ -19402,6 +19429,41 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
    FREE(converted);
 }
 
+/* The scratch a compressed texture decodes into: what holds its values at
+ * their precision -- 8 bits for the colour formats, a half float for the
+ * 11 bits of EAC and the interpolated ones of BC4 and BC5, and BC6H's. */
+static enum gex_wgpu_decode_format
+gex_wgpu_decode_format_of(enum pipe_format view_format)
+{
+   if (util_format_is_srgb(view_format))
+      return GEX_WGPU_DECODE_RGBA8_SRGB;
+   switch (view_format) {
+   case PIPE_FORMAT_RGTC1_UNORM:
+   case PIPE_FORMAT_RGTC1_SNORM:
+   case PIPE_FORMAT_ETC2_R11_UNORM:
+   case PIPE_FORMAT_ETC2_R11_SNORM:
+      return GEX_WGPU_DECODE_R16F;
+   case PIPE_FORMAT_RGTC2_UNORM:
+   case PIPE_FORMAT_RGTC2_SNORM:
+   case PIPE_FORMAT_ETC2_RG11_UNORM:
+   case PIPE_FORMAT_ETC2_RG11_SNORM:
+      return GEX_WGPU_DECODE_RG16F;
+   case PIPE_FORMAT_BPTC_RGB_FLOAT:
+   case PIPE_FORMAT_BPTC_RGB_UFLOAT:
+      return GEX_WGPU_DECODE_RGBA16F;
+   default:
+      return GEX_WGPU_DECODE_RGBA8;
+   }
+}
+
+static const WGPUTextureFormat gex_wgpu_decode_wgpu_format[GEX_WGPU_DECODE_FORMATS] = {
+   [GEX_WGPU_DECODE_RGBA8] = WGPUTextureFormat_RGBA8Unorm,
+   [GEX_WGPU_DECODE_RGBA8_SRGB] = WGPUTextureFormat_RGBA8UnormSrgb,
+   [GEX_WGPU_DECODE_R16F] = WGPUTextureFormat_R16Float,
+   [GEX_WGPU_DECODE_RG16F] = WGPUTextureFormat_RG16Float,
+   [GEX_WGPU_DECODE_RGBA16F] = WGPUTextureFormat_RGBA16Float,
+};
+
 static struct pipe_sampler_view *
 gex_wgpu_create_sampler_view(struct pipe_context *pipe,
                              struct pipe_resource *texture,
@@ -19802,6 +19864,46 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
       desc.arrayLayerCount = volume ? 1 : layers;
       desc.aspect = WGPUTextureAspect_All;
    }
+   /* A compressed texture of a size not whole blocks samples a scratch of
+    * its true size (see decoded). A 3D one is left sampling the rounded
+    * texture, as it was. */
+   const uint32_t block_w = util_format_get_blockwidth(texture->format);
+   const uint32_t block_h = util_format_get_blockheight(texture->format);
+   if (!reinterpreting && gex_wgpu_is_compressed_format(texture->format) &&
+       texture->target != PIPE_TEXTURE_3D && templ->target != PIPE_TEXTURE_3D &&
+       (texture->width0 % block_w || texture->height0 % block_h)) {
+      const enum gex_wgpu_decode_format which =
+         gex_wgpu_decode_format_of(templ->format);
+      WGPUTextureDescriptor scratch_desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+      scratch_desc.label = (WGPUStringView){"gex decoded", WGPU_STRLEN};
+      scratch_desc.dimension = WGPUTextureDimension_2D;
+      scratch_desc.size = (WGPUExtent3D){
+         MAX2(u_minify(texture->width0, templ->u.tex.first_level), 1u),
+         MAX2(u_minify(texture->height0, templ->u.tex.first_level), 1u),
+         MAX2(desc.arrayLayerCount, 1u)};
+      scratch_desc.format = gex_wgpu_decode_wgpu_format[which];
+      scratch_desc.mipLevelCount = desc.mipLevelCount;
+      scratch_desc.sampleCount = 1;
+      scratch_desc.usage = WGPUTextureUsage_TextureBinding |
+                           WGPUTextureUsage_RenderAttachment;
+      view->decoded =
+         wgpuDeviceCreateTexture(gex_screen(pipe->screen)->device, &scratch_desc);
+      if (!view->decoded) {
+         GEX_SAMPLER_VIEW_REFUSED("decoded scratch allocation");
+         FREE(view);
+         return NULL;
+      }
+      view->decoded_which = which;
+      view->decoded_format = scratch_desc.format;
+      view->decoded_source_format = desc.format;
+      view->decoded_levels = desc.mipLevelCount;
+      view->decoded_layers = MAX2(desc.arrayLayerCount, 1u);
+      view->decoded_serial = UINT64_MAX;
+      view_source = view->decoded;
+      desc.format = scratch_desc.format;
+      desc.baseMipLevel = 0;
+      desc.baseArrayLayer = 0;
+   }
    /* A view whose format differs from its texture's is the interesting case
     * and there are only a handful per program, so say what was built. An
     * sRGB view of a linear texture reads zero in the browser and 55
@@ -19829,16 +19931,18 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
       if (view->reinterpret) wgpuTextureRelease(view->reinterpret);
       if (view->reinterpret_staging)
          wgpuBufferRelease(view->reinterpret_staging);
+      if (view->decoded) wgpuTextureRelease(view->decoded);
       FREE(view);
       return NULL;
    }
    if (texture->target == PIPE_TEXTURE_CUBE ||
        texture->target == PIPE_TEXTURE_CUBE_ARRAY) {
       desc.dimension = WGPUTextureViewDimension_2DArray;
-      view->array_view =
-         wgpuTextureCreateView(gex_resource(texture)->texture, &desc);
+      /* Of what the view is of: the decoded scratch where there is one. */
+      view->array_view = wgpuTextureCreateView(view_source, &desc);
       if (!view->array_view) {
          wgpuTextureViewRelease(view->view);
+         if (view->decoded) wgpuTextureRelease(view->decoded);
          FREE(view);
          return NULL;
       }
@@ -19882,6 +19986,8 @@ gex_wgpu_sampler_view_destroy(struct pipe_context *pipe,
       wgpuTextureViewRelease(view->array_view);
    if (view->reinterpret)
       wgpuTextureRelease(view->reinterpret);
+   if (view->decoded)
+      wgpuTextureRelease(view->decoded);
    if (view->reinterpret_staging)
       wgpuBufferRelease(view->reinterpret_staging);
    FREE(view);
@@ -25165,10 +25271,148 @@ gex_wgpu_texture_barrier(struct pipe_context *pipe, unsigned flags)
  * This is what gl44-texture-view-probe's format-class case asks for -- the
  * one case in the suite this driver used to fail -- and what Blender's
  * viewport asks for with r16g16_float over an r32_float texture. */
+/* The pass decoding a compressed texture's level and layer into the same
+ * of a view's scratch: a texel fetch each, which addresses the rounded
+ * texture by texel and so sees only the texels GL has. */
+static WGPURenderPipeline
+gex_wgpu_decode_pipeline(struct gex_wgpu_screen *screen,
+                         enum gex_wgpu_decode_format which)
+{
+   if (screen->decode_pipelines[which])
+      return screen->decode_pipelines[which];
+   static const char wgsl[] =
+      "@group(0) @binding(0) var src: texture_2d<f32>;\n"
+      "@vertex fn vs(@builtin(vertex_index) i: u32)"
+      " -> @builtin(position) vec4<f32> {\n"
+      "  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0),"
+      " vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));\n"
+      "  return vec4<f32>(p[i], 0.0, 1.0);\n"
+      "}\n"
+      "@fragment fn fs(@builtin(position) pos: vec4<f32>)"
+      " -> @location(0) vec4<f32> {\n"
+      "  return textureLoad(src, vec2<i32>(pos.xy), 0);\n"
+      "}\n";
+   WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+   source.code = (WGPUStringView){wgsl, WGPU_STRLEN};
+   WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+   module_desc.nextInChain = &source.chain;
+   WGPUShaderModule module =
+      wgpuDeviceCreateShaderModule(screen->device, &module_desc);
+   if (!module)
+      return NULL;
+   WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+   target.format = gex_wgpu_decode_wgpu_format[which];
+   target.writeMask = WGPUColorWriteMask_All;
+   WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+   fragment.module = module;
+   fragment.entryPoint = (WGPUStringView){"fs", WGPU_STRLEN};
+   fragment.targetCount = 1;
+   fragment.targets = &target;
+   WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+   desc.label = (WGPUStringView){"gex decode", WGPU_STRLEN};
+   desc.vertex.module = module;
+   desc.vertex.entryPoint = (WGPUStringView){"vs", WGPU_STRLEN};
+   desc.fragment = &fragment;
+   desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+   desc.multisample.count = 1;
+   desc.multisample.mask = 0xffffffffu;
+   screen->decode_pipelines[which] =
+      wgpuDeviceCreateRenderPipeline(screen->device, &desc);
+   wgpuShaderModuleRelease(module);
+   return screen->decode_pipelines[which];
+}
+
+/* A decoded view's scratch brought up to date with its texture: every level
+ * and layer of the view, if the texture was written since. */
+static void
+gex_wgpu_sampler_view_decode(struct pipe_context *pipe,
+                             struct gex_wgpu_sampler_view *view)
+{
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   struct gex_wgpu_resource *source = gex_resource(view->base.texture);
+   if (!source->texture || view->decoded_serial == source->write_serial)
+      return;
+   struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
+   WGPURenderPipeline pipeline = gex_wgpu_decode_pipeline(screen, view->decoded_which);
+   if (!pipeline)
+      return;
+   /* The texture's writes have to reach the queue before they are read. */
+   gex_wgpu_submit_pending(ctx);
+   WGPUBindGroupLayout layout = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+   WGPUCommandEncoder encoder =
+      wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+   if (!encoder || !layout) {
+      if (encoder) wgpuCommandEncoderRelease(encoder);
+      if (layout) wgpuBindGroupLayoutRelease(layout);
+      return;
+   }
+   for (uint32_t level = 0; level < view->decoded_levels; ++level) {
+      for (uint32_t layer = 0; layer < view->decoded_layers; ++layer) {
+         WGPUTextureViewDescriptor from_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+         from_desc.format = view->decoded_source_format;
+         from_desc.dimension = WGPUTextureViewDimension_2D;
+         from_desc.baseMipLevel = view->base.u.tex.first_level + level;
+         from_desc.mipLevelCount = 1;
+         from_desc.baseArrayLayer = view->base.u.tex.first_layer + layer;
+         from_desc.arrayLayerCount = 1;
+         from_desc.aspect = WGPUTextureAspect_All;
+         WGPUTextureView from = wgpuTextureCreateView(source->texture, &from_desc);
+         WGPUTextureViewDescriptor into_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+         into_desc.format = view->decoded_format;
+         into_desc.dimension = WGPUTextureViewDimension_2D;
+         into_desc.baseMipLevel = level;
+         into_desc.mipLevelCount = 1;
+         into_desc.baseArrayLayer = layer;
+         into_desc.arrayLayerCount = 1;
+         into_desc.aspect = WGPUTextureAspect_All;
+         WGPUTextureView into = wgpuTextureCreateView(view->decoded, &into_desc);
+         if (from && into) {
+            WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+            entry.binding = 0;
+            entry.textureView = from;
+            WGPUBindGroupDescriptor bg_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            bg_desc.layout = layout;
+            bg_desc.entryCount = 1;
+            bg_desc.entries = &entry;
+            WGPUBindGroup group = wgpuDeviceCreateBindGroup(screen->device, &bg_desc);
+            WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            color.view = into;
+            color.loadOp = WGPULoadOp_Clear;
+            color.storeOp = WGPUStoreOp_Store;
+            WGPURenderPassDescriptor pass_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            pass_desc.colorAttachmentCount = 1;
+            pass_desc.colorAttachments = &color;
+            WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+            wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+            if (group)
+               wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+            wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+            wgpuRenderPassEncoderEnd(pass);
+            wgpuRenderPassEncoderRelease(pass);
+            if (group) wgpuBindGroupRelease(group);
+         }
+         if (from) wgpuTextureViewRelease(from);
+         if (into) wgpuTextureViewRelease(into);
+      }
+   }
+   wgpuBindGroupLayoutRelease(layout);
+   WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
+   wgpuCommandEncoderRelease(encoder);
+   if (!commands)
+      return;
+   gex_wgpu_queue_submit(screen, 1, &commands);
+   wgpuCommandBufferRelease(commands);
+   view->decoded_serial = source->write_serial;
+}
+
 static void
 gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
                               struct gex_wgpu_sampler_view *view)
 {
+   if (view && view->decoded && view->base.texture) {
+      gex_wgpu_sampler_view_decode(pipe, view);
+      return;
+   }
    if (!view || !view->reinterpret || !view->base.texture)
       return;
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
@@ -25554,6 +25798,41 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
          }
          return false;
       }
+   }
+
+   /* A compressed copy is counted in whole blocks.
+    *
+    * GL lets a compressed copy end mid-block where it reaches the edge of the
+    * image, so a 130x124 ASTC 5x4 texture's level 4 is copied as the 8x7 it
+    * is. WebGPU counts in blocks and against the physical size, which is the
+    * logical one rounded up to a block:
+    *
+    *   copySize.width (8) is not a multiple of compressed texture format
+    *   block width (5).
+    *
+    * The same copy rounded up to 10x8 names exactly the blocks GL's did, and
+    * it fits both textures whenever GL's rule was met at both ends. Where it
+    * would not fit, the box is left alone and WebGPU says why. */
+   struct pipe_box block_box;
+   if (util_format_is_compressed(src->format) && !flip_y) {
+      const unsigned bw = util_format_get_blockwidth(src->format);
+      const unsigned bh = util_format_get_blockheight(src->format);
+      const uint32_t src_w = util_align_npot(
+         MAX2(1u, wgpuTextureGetWidth(gex_src->texture) >> src_level), bw);
+      const uint32_t src_h = util_align_npot(
+         MAX2(1u, wgpuTextureGetHeight(gex_src->texture) >> src_level), bh);
+      const uint32_t dst_w = util_align_npot(
+         MAX2(1u, wgpuTextureGetWidth(gex_dst->texture) >> dst_level), bw);
+      const uint32_t dst_h = util_align_npot(
+         MAX2(1u, wgpuTextureGetHeight(gex_dst->texture) >> dst_level), bh);
+      const uint32_t w = util_align_npot((uint32_t)box->width, bw);
+      const uint32_t h = util_align_npot((uint32_t)box->height, bh);
+      block_box = *box;
+      if (box->x + w <= src_w && dstx + w <= dst_w)
+         block_box.width = w;
+      if (box->y + h <= src_h && dsty + h <= dst_h)
+         block_box.height = h;
+      box = &block_box;
    }
 
    WGPUTexture scratch = NULL;
