@@ -400,6 +400,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   a buffer as the aspect's buffer copies do, and depth24's unorm comes
   back from its float as the one that made it. Events, barriers and
   queue family ownership are nothing to one in-order queue.
+- **Smaller ones**: a pipeline's executables (pipelineExecutableInfo)
+  are its shaders' WGSL, which is what there is to show; depth clamps to
+  [0, 1] as Dawn does anyway (depthClampZeroOne); workgroup memory of an
+  explicit layout is the words shared memory already is, each block at
+  0; and an attribute the shader reads that the draw has none of reads
+  (0, 0, 0, 1) (vertexAttributeRobustness), in a variant.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
   have to stay.

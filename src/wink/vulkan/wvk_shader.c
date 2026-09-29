@@ -548,6 +548,12 @@ pull_key(const struct vk_vertex_input_state *vi, uint32_t read, bool all)
    _mesa_blake3_init(&ctx);
    _mesa_blake3_update(&ctx, &all, sizeof(all));
    bool any = false;
+   /* And those it reads that the draw has none of (vertexAttributeRobustness). */
+   const uint32_t missing = read & ~vi->attributes_valid;
+   if (missing) {
+      _mesa_blake3_update(&ctx, &missing, sizeof(missing));
+      any = true;
+   }
    u_foreach_bit(location, vi->attributes_valid & read) {
       if (!pulls(vi, location, all))
          continue;
@@ -4165,6 +4171,20 @@ pull_divided_attributes(nir_shader *nir, const struct vk_graphics_pipeline_state
                location += nir_src_as_uint(deref->arr.index);
             else if (deref->deref_type != nir_deref_type_var)
                continue;
+            /* One the draw has no attribute at (vertexAttributeRobustness):
+             * (0, 0, 0, 1), as a format's missing components are. */
+            if (location >= 0 && location < MESA_VK_MAX_VERTEX_ATTRIBUTES &&
+                !(vi->attributes_valid & BITFIELD_BIT(location))) {
+               b.cursor = nir_before_instr(instr);
+               const unsigned bits = intr->def.bit_size;
+               const bool is_float = glsl_base_type_is_float(glsl_get_base_type(glsl_without_array(deref->type)));
+               nir_def *zero = nir_imm_zero(&b, 1, bits);
+               nir_def *one = is_float ? nir_imm_floatN_t(&b, 1.0, bits) : nir_imm_intN_t(&b, 1, bits);
+               nir_def *c[4] = { zero, zero, zero, one };
+               nir_def_replace(&intr->def, nir_vec(&b, c, intr->def.num_components));
+               progress = true;
+               continue;
+            }
             if (!pulls(vi, location, shader->key.points || shader->key.runs || shader->key.lines))
                continue;
             if (glsl_get_bit_size(deref->type) == 64) {
@@ -5878,6 +5898,10 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
     * a 64-bit or 16-bit value is words' worth, which WGSL has no types of. */
    if (nir->info.stage == MESA_SHADER_COMPUTE) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
+      /* In words, which the size is made a whole number of: ntv's block is
+       * of them, and a block of one 16-bit value (an explicit layout's,
+       * workgroupMemoryExplicitLayout16BitAccess) would be none. */
+      nir->info.shared_size = align(nir->info.shared_size, 4);
       /* A null initializer (shaderZeroInitializeWorkgroupMemory): stores of
        * zero, and the variable gone, which ntv would lay out again. */
       bool initialized = false;
@@ -5886,11 +5910,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
          var->constant_initializer = NULL;
          var->pointer_initializer = NULL;
       }
-      if (initialized) {
-         /* In words, which the size is made a whole number of. */
-         nir->info.shared_size = align(nir->info.shared_size, 4);
+      if (initialized)
          NIR_PASS(_, nir, nir_zero_initialize_shared_memory, nir->info.shared_size, 4);
-      }
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
       NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_mem_shared, NULL);
       /* Stores of less than a word, atomics on the bits of it. */
@@ -7004,33 +7025,88 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    return VK_SUCCESS;
 }
 
+/* VK_KHR_pipeline_executable_properties: a shader is one executable, its
+ * WGSL, which is what there is to show of it -- the WebGPU implementation
+ * compiles it on. */
+#define WRITE_STR(field, ...)                                   \
+   do {                                                         \
+      memset(field, 0, sizeof(field));                          \
+      snprintf(field, sizeof(field), __VA_ARGS__);              \
+   } while (0)
+
 static VkResult
-wvk_shader_get_executable_properties(struct vk_device *device, const struct vk_shader *shader,
+wvk_shader_get_executable_properties(struct vk_device *device, const struct vk_shader *vk_shader,
                                      uint32_t *executable_count,
                                      VkPipelineExecutablePropertiesKHR *properties)
 {
-   *executable_count = 0;
-   return VK_SUCCESS;
+   VK_OUTARRAY_MAKE_TYPED(VkPipelineExecutablePropertiesKHR, out, properties, executable_count);
+   vk_outarray_append_typed(VkPipelineExecutablePropertiesKHR, &out, props) {
+      props->stages = mesa_to_vk_shader_stage(vk_shader->stage);
+      props->subgroupSize = 1;
+      WRITE_STR(props->name, "%s", _mesa_shader_stage_to_string(vk_shader->stage));
+      WRITE_STR(props->description, "%s shader, as WGSL", _mesa_shader_stage_to_string(vk_shader->stage));
+   }
+   return vk_outarray_status(&out);
 }
 
 static VkResult
-wvk_shader_get_executable_statistics(struct vk_device *device, const struct vk_shader *shader,
+wvk_shader_get_executable_statistics(struct vk_device *device, const struct vk_shader *vk_shader,
                                      uint32_t executable_index, uint32_t *statistic_count,
                                      VkPipelineExecutableStatisticKHR *statistics)
 {
-   *statistic_count = 0;
-   return VK_SUCCESS;
+   const struct wvk_shader *shader = container_of(vk_shader, struct wvk_shader, vk);
+   VK_OUTARRAY_MAKE_TYPED(VkPipelineExecutableStatisticKHR, out, statistics, statistic_count);
+   vk_outarray_append_typed(VkPipelineExecutableStatisticKHR, &out, stat) {
+      WRITE_STR(stat->name, "WGSL bytes");
+      WRITE_STR(stat->description, "How long the shader's WGSL is");
+      stat->format = VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR;
+      stat->value.u64 = shader->wgsl[WVK_SHADER_FLIPPED] ? strlen(shader->wgsl[WVK_SHADER_FLIPPED]) : 0;
+   }
+   vk_outarray_append_typed(VkPipelineExecutableStatisticKHR, &out, stat) {
+      WRITE_STR(stat->name, "Bindings");
+      WRITE_STR(stat->description, "The WebGPU bindings the shader has, the driver's among them");
+      stat->format = VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR;
+      stat->value.u64 = shader->binding_count;
+   }
+   return vk_outarray_status(&out);
 }
 
 static VkResult
 wvk_shader_get_executable_internal_representations(
-   struct vk_device *device, const struct vk_shader *shader, uint32_t executable_index,
+   struct vk_device *device, const struct vk_shader *vk_shader, uint32_t executable_index,
    uint32_t *internal_representation_count,
    VkPipelineExecutableInternalRepresentationKHR *internal_representations)
 {
-   *internal_representation_count = 0;
-   return VK_SUCCESS;
+   const struct wvk_shader *shader = container_of(vk_shader, struct wvk_shader, vk);
+   VK_OUTARRAY_MAKE_TYPED(VkPipelineExecutableInternalRepresentationKHR, out, internal_representations,
+                          internal_representation_count);
+   bool incomplete = false;
+   for (uint32_t i = 0; i < WVK_SHADER_VARIANTS; ++i) {
+      const char *text = shader->wgsl[i];
+      if (!text)
+         continue;
+      vk_outarray_append_typed(VkPipelineExecutableInternalRepresentationKHR, &out, ir) {
+         WRITE_STR(ir->name, "%s", i == WVK_SHADER_UNFLIPPED ? "WGSL, unflipped" : "WGSL");
+         WRITE_STR(ir->description, "%s", i == WVK_SHADER_UNFLIPPED
+                                             ? "The shader as WebGPU is given it, for a pass not flipped in y"
+                                             : "The shader as WebGPU is given it");
+         ir->isText = VK_TRUE;
+         const size_t size = strlen(text) + 1;
+         if (!ir->pData) {
+            ir->dataSize = size;
+         } else {
+            memcpy(ir->pData, text, MIN2(ir->dataSize, size));
+            if (ir->dataSize < size) {
+               ((char *)ir->pData)[ir->dataSize - 1] = 0;
+               incomplete = true;
+            }
+            ir->dataSize = MIN2(ir->dataSize, size);
+         }
+      }
+   }
+   return incomplete ? VK_INCOMPLETE : vk_outarray_status(&out);
 }
+#undef WRITE_STR
 
 static const struct vk_shader_ops wvk_shader_ops = {
    .destroy = wvk_shader_destroy,

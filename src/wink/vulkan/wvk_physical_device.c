@@ -115,6 +115,11 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_maintenance7 = true,
       .KHR_maintenance8 = true,
       .KHR_maintenance9 = true,
+      .KHR_pipeline_executable_properties = true,
+      .EXT_depth_clamp_zero_one = true,
+      .KHR_depth_clamp_zero_one = true,
+      .KHR_workgroup_memory_explicit_layout = true,
+      .EXT_vertex_attribute_robustness = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -581,6 +586,16 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Events and barriers of one in-order queue; and a device of no
        * queues has its own, which nothing submits to. */
       .maintenance9 = true,
+      /* A shader's WGSL (wvk_shader.c). */
+      .pipelineExecutableInfo = true,
+      /* Dawn clamps to [0, 1] whatever the viewport's range. */
+      .depthClampZeroOne = true,
+      /* Shared memory is words already, where any block may be at 0. */
+      .workgroupMemoryExplicitLayout = true,
+      .workgroupMemoryExplicitLayoutScalarBlockLayout = true,
+      .workgroupMemoryExplicitLayout8BitAccess = true,
+      .workgroupMemoryExplicitLayout16BitAccess = true,
+      .vertexAttributeRobustness = true,
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,
