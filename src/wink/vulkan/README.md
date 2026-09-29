@@ -186,6 +186,15 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   end and moves it by half the width, up or down where the line runs more
   across than up, else sideways, which the other end's captured position
   says. Segments across a restart go. The same limits as for points.
+- **Line rasterization modes** (VK_KHR_line_rasterization): Bresenham's
+  lines are those parallelograms, and WebGPU's own at one pixel;
+  rectangular lines the same quads moved along the line's normal instead,
+  at any width, and smooth ones a pixel wider, the fragment shader's alpha
+  multiplied by how much of the pixel is within half the width. A
+  stippled line's quads carry where along the line each fragment is --
+  from the start of a list's line, or of a strip back to its last
+  restart -- and the fragment shader discards those whose bit of the
+  pattern is clear.
 - **Geometry shaders** (geometryShader) run as compute, which is all a
   WebGPU device has besides vertex and fragment stages: the vertex shader
   run as compute writes a record of its outputs a vertex of each instance
@@ -494,6 +503,9 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   `VK_EXT_descriptor_indexing`: that asks for 500000 descriptors a stage,
   where WebGPU has a few dozen bindings.
 - 64-bit floats as vertex inputs: WebGPU has none.
+- Line rasterization modes, stipples and widths of lines with adjacency,
+  which are WebGPU's one-pixel lines; and Bresenham's lines on a
+  multisampled pass, whose quads cover samples, not whole pixels.
 - RG32 storage images both read and written: WebGPU's read-write storage
   textures are of one-channel 32-bit formats and tier2's, which RG32 is
   not. And atomics of 64-bit integers or floats, and of 16-bit floats:

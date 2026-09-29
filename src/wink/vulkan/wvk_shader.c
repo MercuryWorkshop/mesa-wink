@@ -1176,11 +1176,17 @@ load_index(nir_builder *b, nir_def *start, nir_def *size, nir_def *at, nir_def *
  * vertex_index % 6, which is of one endpoint: the vertex shader runs for
  * that one, with its attributes pulled there. At its end the position
  * moves across the line by half its width: up or down where the line is
- * more across than up, else sideways, as Vulkan's non-strict lines are --
- * the other endpoint's position read from what the draw's vertex shader,
- * run as compute, captured (run_vertices). A segment across a restart goes. */
+ * more across than up, else sideways, as Vulkan's non-strict and Bresenham
+ * lines are; or along its normal, for rectangular lines, and by a pixel
+ * more for smooth ones -- the other endpoint's position read from what the
+ * draw's vertex shader, run as compute, captured (run_vertices). A segment
+ * across a restart goes. With `line_coord`, the varying there says where
+ * on the line the vertex is, in pixels: across it, and along it from the
+ * start of the list's line or the strip -- a rectangle's length, or a
+ * parallelogram's along its major axis -- for the stipple and the coverage
+ * (lower_line_fs). */
 static void
-expand_lines(nir_shader *nir)
+expand_lines(nir_shader *nir, unsigned line_coord)
 {
    NIR_PASS(_, nir, nir_lower_returns);
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -1189,8 +1195,8 @@ expand_lines(nir_shader *nir)
    nir_def *raw = nir_load_vertex_id(&b);
    nir_def *segment = nir_udiv_imm(&b, raw, 6);
    nir_def *corner = nir_umod_imm(&b, raw, 6);
-   nir_def *line = nir_load_ssbo(&b, 2, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
-                                 nir_imm_int(&b, WVK_DRIVER_LINE), .align_mul = 8, .access = ACCESS_NON_WRITEABLE);
+   nir_def *line = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                 nir_imm_int(&b, WVK_DRIVER_LINE), .align_mul = 16, .access = ACCESS_NON_WRITEABLE);
    nir_def *run = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
                                 nir_imm_int(&b, WVK_DRIVER_VERTEX_RUN), .align_mul = 16,
                                 .access = ACCESS_NON_WRITEABLE);
@@ -1271,9 +1277,82 @@ expand_lines(nir_shader *nir)
    nir_def *zero = nir_imm_float(&b, 0.0f);
    nir_def *dx = nir_bcsel(&b, across, zero, nir_fmul(&b, reach, nir_channel(&b, scale, 0)));
    nir_def *dy = nir_bcsel(&b, across, nir_fmul(&b, reach, nir_channel(&b, scale, 1)), zero);
+   /* A rectangle's: along the normal of A to B -- d is twice the pixels,
+    * from the vertex to the other end -- by half the width, and a pixel
+    * more where it is smooth, the coverage falling off there. */
+   nir_def *mode = nir_channel(&b, line, 2);
+   nir_def *rectangle = nir_ine_imm(&b, mode, 0);
+   nir_def *ab = nir_fmul_imm(&b, nir_bcsel(&b, at_b, nir_fneg(&b, d), d), 0.5f);
+   nir_def *length = nir_fsqrt(&b, nir_fdot(&b, ab, ab));
+   nir_def *normal = nir_bcsel(&b, nir_flt_imm(&b, length, 1e-6f), nir_imm_vec2(&b, 0.0f, 1.0f),
+                               nir_fdiv(&b, nir_vec2(&b, nir_fneg(&b, nir_channel(&b, ab, 1)), nir_channel(&b, ab, 0)),
+                                        length));
+   nir_def *half = nir_fadd(&b, nir_fmul_imm(&b, width, 0.5f),
+                            nir_bcsel(&b, nir_ieq_imm(&b, mode, 2), nir_imm_float(&b, 1.0f), zero));
+   nir_def *out = nir_fmul(&b, nir_fmul_imm(&b, nir_fmul(&b, side, half), 2.0f), nir_channel(&b, pos, 3));
+   dx = nir_bcsel(&b, rectangle, nir_fmul(&b, out, nir_fmul(&b, nir_channel(&b, normal, 0), nir_channel(&b, scale, 0))),
+                  dx);
+   dy = nir_bcsel(&b, rectangle, nir_fmul(&b, out, nir_fmul(&b, nir_channel(&b, normal, 1), nir_channel(&b, scale, 1))),
+                  dy);
    nir_def *moved = nir_vec4(&b, nir_fadd(&b, nir_channel(&b, pos, 0), dx), nir_fadd(&b, nir_channel(&b, pos, 1), dy),
                              nir_channel(&b, pos, 2), nir_channel(&b, pos, 3));
    nir_store_var(&b, position_out, nir_bcsel(&b, gone, nir_imm_zero(&b, 4, 32), moved), 0xf);
+
+   if (line_coord) {
+      /* How long a segment is, of pixels: a rectangle's length, a
+       * parallelogram's along its major axis. */
+#define SEGMENT_LENGTH(v)                                                                                        \
+      nir_bcsel(&b, rectangle, nir_fsqrt(&b, nir_fdot(&b, v, v)),                                             \
+                nir_fmax(&b, nir_fabs(&b, nir_channel(&b, v, 0)), nir_fabs(&b, nir_channel(&b, v, 1))))
+      /* Of a stippled strip, the segments before this one, back to the
+       * strip's start or its last restart: from their ends' positions. */
+      nir_variable *before = nir_local_variable_create(impl, glsl_float_type(), "wvk_line_before");
+      nir_variable *at = nir_local_variable_create(impl, glsl_uint_type(), "wvk_line_segment");
+      nir_store_var(&b, before, zero, 0x1);
+      nir_store_var(&b, at, segment, 0x1);
+      nir_push_if(&b, nir_iand(&b, nir_ine_imm(&b, nir_channel(&b, line, 1), 0),
+                              nir_ine_imm(&b, nir_channel(&b, line, 3), 0)));
+      nir_loop *loop = nir_push_loop(&b);
+      {
+         nir_def *j = nir_load_var(&b, at);
+         nir_break_if(&b, nir_ieq_imm(&b, j, 0));
+         nir_def *prev = nir_iadd_imm(&b, j, -1);
+         nir_def *no_restart = nir_imm_false(&b);
+         nir_push_if(&b, nir_iand(&b, nir_ine_imm(&b, size, 0), nir_ine_imm(&b, nir_channel(&b, run, 3), 0)));
+         nir_def *r0, *r1;
+         load_index(&b, start, size, nir_iadd(&b, first, prev), &r0);
+         load_index(&b, start, size, nir_iadd(&b, first, j), &r1);
+         nir_def *restarted = nir_ior(&b, r0, r1);
+         nir_pop_if(&b, NULL);
+         nir_break_if(&b, nir_if_phi(&b, restarted, no_restart));
+         nir_def *slot = nir_iadd(&b, nir_imul(&b, instance, nir_channel(&b, run, 0)), prev);
+         nir_def *p = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_CAPTURE), nir_ishl_imm(&b, slot, 4),
+                                    .align_mul = 16, .access = ACCESS_NON_WRITEABLE);
+         nir_def *q = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_CAPTURE),
+                                    nir_ishl_imm(&b, nir_iadd_imm(&b, slot, 1), 4), .align_mul = 16,
+                                    .access = ACCESS_NON_WRITEABLE);
+         nir_def *pq = nir_fmul_imm(&b, nir_fdiv(&b, nir_fsub(&b, nir_fdiv(&b, nir_trim_vector(&b, q, 2), nir_channel(&b, q, 3)),
+                                                            nir_fdiv(&b, nir_trim_vector(&b, p, 2), nir_channel(&b, p, 3))),
+                                                 scale),
+                                    0.5f);
+         nir_store_var(&b, before, nir_fadd(&b, nir_load_var(&b, before), SEGMENT_LENGTH(pq)), 0x1);
+         nir_store_var(&b, at, prev, 0x1);
+      }
+      nir_pop_loop(&b, loop);
+      nir_pop_if(&b, NULL);
+      nir_def *along = nir_fadd(&b, nir_load_var(&b, before), nir_bcsel(&b, at_b, SEGMENT_LENGTH(ab), zero));
+#undef SEGMENT_LENGTH
+      nir_def *across_px = nir_fmul(&b, side, nir_bcsel(&b, rectangle, half, nir_fmul_imm(&b, width, 0.5f)));
+      /* The output the fragment shader's input there was given, if any
+       * (match_fragment_inputs), as expand_points has it. */
+      nir_variable *coord = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_VAR0 + line_coord - 1);
+      if (!coord) {
+         coord = nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), "wvk_line_coord");
+         coord->data.location = VARYING_SLOT_VAR0 + line_coord - 1;
+      }
+      coord->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
+      nir_store_var(&b, coord, nir_vec4(&b, across_px, along, zero, zero), 0xf);
+   }
    nir_progress(true, impl, nir_metadata_none);
 }
 
@@ -2332,6 +2411,52 @@ lower_point_fs(nir_shader *nir, unsigned point_coord)
       coord->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
    }
    return nir_shader_intrinsics_pass(nir, lower_point_fs_instr, nir_metadata_control_flow, coord);
+}
+
+/* A line's quad's fragments where they are on the line (expand_lines):
+ * gone where its stipple's bit for where along the line they are is clear
+ * -- the bit of that in pixels over the factor -- and of a smooth line, of
+ * alpha by how much of their pixel is within half the width of it. */
+static bool
+lower_line_fs(nir_shader *nir, unsigned line_coord)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_variable *coord = nir_variable_create(nir, nir_var_shader_in, glsl_vec4_type(), "wvk_line_coord");
+   coord->data.location = VARYING_SLOT_VAR0 + line_coord - 1;
+   coord->data.interpolation = INTERP_MODE_NOPERSPECTIVE;
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *at = nir_load_var(&b, coord);
+   nir_def *line = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                 nir_imm_int(&b, WVK_DRIVER_LINE), .align_mul = 16, .access = ACCESS_NON_WRITEABLE);
+   nir_def *stipple = nir_channel(&b, line, 3);
+   nir_def *factor = nir_umax(&b, nir_ushr_imm(&b, stipple, 16), nir_imm_int(&b, 1));
+   nir_def *place = nir_f2u32(&b, nir_fmax(&b, nir_channel(&b, at, 1), nir_imm_float(&b, 0.0f)));
+   nir_def *bit = nir_iand_imm(&b, nir_udiv(&b, place, factor), 15);
+   nir_def *clear = nir_ieq_imm(&b, nir_iand_imm(&b, nir_ushr(&b, stipple, bit), 1), 0);
+   nir_terminate_if(&b, nir_iand(&b, nir_ine_imm(&b, stipple, 0), clear));
+   nir_def *half = nir_fmul_imm(&b, nir_channel(&b, line, 0), 0.5f);
+   nir_def *covered = nir_fsat(&b, nir_fsub(&b, nir_fadd_imm(&b, half, 0.5f), nir_fabs(&b, nir_channel(&b, at, 0))));
+   nir_def *coverage = nir_bcsel(&b, nir_ieq_imm(&b, nir_channel(&b, line, 2), 2), covered, nir_imm_float(&b, 1.0f));
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_deref)
+            continue;
+         nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+         nir_variable *var = nir_deref_instr_get_variable(deref);
+         if (!var || var->data.mode != nir_var_shader_out || var->data.location < FRAG_RESULT_DATA0 ||
+             !glsl_type_is_vector(deref->type) || glsl_get_base_type(deref->type) != GLSL_TYPE_FLOAT ||
+             glsl_get_vector_elements(deref->type) < 4 || !(nir_intrinsic_write_mask(intr) & 0x8))
+            continue;
+         b.cursor = nir_before_instr(instr);
+         nir_def *value = intr->src[1].ssa;
+         nir_def *alpha = nir_fmul(&b, nir_channel(&b, value, 3), coverage);
+         nir_src_rewrite(&intr->src[1], nir_vector_insert_imm(&b, value, alpha, 3));
+      }
+   }
+   return nir_progress(true, impl, nir_metadata_none);
 }
 
 /* What of a point a fragment shader reads: 1 gl_PointCoord, 2 gl_FrontFacing. */
@@ -5534,7 +5659,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       nir_shader_intrinsics_pass(nir, writes_storage_instr, nir_metadata_all, &shader->writes_storage);
       if (records && records->lines) {
          shader->key.lines = 1;
-         expand_lines(nir);
+         shader->key.line_coord = records->line_coord;
+         expand_lines(nir, records->line_coord);
       }
       /* WebGPU has no cull distances: a draw with them culls in its
        * geometry shader (lower_geometry), which is the records'. */
@@ -5614,6 +5740,10 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
          NIR_PASS(_, nir, lower_point_fs, records->point_coord);
          shader->key.points = 1;
          shader->key.point_coord = records->point_coord;
+      }
+      if (records && records->line_coord) {
+         NIR_PASS(_, nir, lower_line_fs, records->line_coord);
+         shader->key.line_coord = records->line_coord;
       }
       /* A draw's depth bounds test and logic op, for its variant. */
       if (records && records->depth_bounds) {
@@ -6358,8 +6488,9 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
          key.clip_varying = other->key.clip_varying;
          key.clip_slots = other->key.clip_slots;
       }
-      if (shape == WVK_DRAW_LINES) {
+      if (shape == WVK_DRAW_LINES || shape == WVK_DRAW_LINES_PLACED) {
          key.lines = 1;
+         key.line_coord = other ? other->key.line_coord : 0;
          if (other)
             memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
          key.pulled = pull_key(&vi, shader->attribs_read, true);
@@ -6415,6 +6546,13 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
                 (!key.clip_varying || i + 1 < key.clip_varying || i + 1 >= key.clip_varying + key.clip_slots))
                key.point_coord = i + 1;
          }
+      }
+      /* A line's that is stippled or smooth: where on the line fragments
+       * are, at the first location free after those. */
+      for (uint32_t i = 0; shape == WVK_DRAW_LINES_PLACED && i < WVK_MAX_VARYINGS && !key.line_coord; ++i) {
+         if (!shader->varyings[i] && i + 1 != key.primitive_id && i + 1 != key.point_coord &&
+             (!key.clip_varying || i + 1 < key.clip_varying || i + 1 >= key.clip_varying + key.clip_slots))
+            key.line_coord = i + 1;
       }
       /* The logic op, where it changes anything: COPY is the output as it
        * is. On a single-sampled pass, whose attachments are copied texel

@@ -189,6 +189,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_shader_atomic_float = true,
       .EXT_shader_atomic_float2 = true,
       .EXT_primitive_topology_list_restart = true,
+      .KHR_line_rasterization = true,
+      .EXT_line_rasterization = true,
       .EXT_depth_clip_enable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
       .KHR_global_priority = true,
       .EXT_global_priority = true,
@@ -486,6 +488,16 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
        * tessellation would have to read so too. */
       .primitiveTopologyListRestart = true,
       .primitiveTopologyPatchListRestart = false,
+      /* Lines of each mode but the default one-pixel ones are quads, as
+       * wide ones are, rectangles or parallelograms (Bresenham's), and a
+       * fragment shader's stipple and coverage for them (wvk_shader.c's
+       * expand_lines and lower_line_fs). */
+      .rectangularLines = true,
+      .bresenhamLines = true,
+      .smoothLines = true,
+      .stippledRectangularLines = true,
+      .stippledBresenhamLines = true,
+      .stippledSmoothLines = true,
       .pipelineCreationCacheControl = true,
       .privateData = true,
       /* Subgroups are one invocation, and so are full, and of the size
@@ -520,6 +532,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
        * chosen at the draw. */
       .extendedDynamicState3RasterizationStream = true,
       .extendedDynamicState3ProvokingVertexMode = true,
+      .extendedDynamicState3LineRasterizationMode = true,
+      .extendedDynamicState3LineStippleEnable = true,
       .vertexInputDynamicState = true,
       .extendedDynamicState3DepthClampEnable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
       .extendedDynamicState3DepthClipEnable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
@@ -741,6 +755,9 @@ get_device_properties(const struct wvk_physical_device *pdev,
       /* VK_EXT_provoking_vertex: the lists are the draw's. */
       .provokingVertexModePerPipeline = true,
       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
+      /* VK_KHR_line_rasterization: the quads' corners are the vertex
+       * shader's positions moved, as precise as the rest. */
+      .lineSubPixelPrecisionBits = 4,
       /* VK_EXT_robustness2: a word's bounds. */
       .robustStorageBufferAccessSizeAlignment = 4,
       .robustUniformBufferAccessSizeAlignment = 4,

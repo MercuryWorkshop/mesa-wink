@@ -218,8 +218,10 @@ enum wvk_texel_type {
  *   - for a vertex shader's storage writes, done by it as compute before
  *     the draw: the draw's vertices an instance, its vertices in all, its
  *     first vertex or index, and whether it restarts primitives, 4 uints;
- *   - for wide lines drawn as quads, their width, a float, and whether
- *     they are a strip, a uint;
+ *   - for lines drawn as quads, their width, a float; whether they are a
+ *     strip; how they are rasterized, 0 as parallelograms, 1 rectangles
+ *     and 2 smooth ones; and their stipple, its factor << 16 | pattern,
+ *     0 for none, 3 uints;
  *   - for a geometry shader run as compute: the draw's vertices an
  *     instance, its primitives an instance, the shader's invocations in
  *     all, and the draw's topology, 4 uints;

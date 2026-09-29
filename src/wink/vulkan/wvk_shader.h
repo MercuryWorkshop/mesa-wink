@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 27
+#define WVK_SHADER_BINARY_VERSION 28
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -66,11 +66,13 @@ struct wvk_shader_binding {
  * input it did not know, multisampling set at the draw -- draws a variant
  * compiled for that (wvk_shader_draw_variant). */
 /* What a draw's primitives are drawn as: themselves, or quads of points
- * or of wide lines (wvk_shader_draw_variant). */
+ * or of lines (wvk_shader_draw_variant) -- lines whose fragments know
+ * where on the line they are too, stippled or smooth. */
 enum wvk_draw_shape {
    WVK_DRAW_PRIMITIVES,
    WVK_DRAW_POINTS,
    WVK_DRAW_LINES,
+   WVK_DRAW_LINES_PLACED,
 };
 
 /* The largest point drawn as a quad, in pixels (largePoints), and line. */
@@ -142,6 +144,11 @@ struct wvk_shader_key {
    /* Geometry as compute: its primitives' lists beginning at their last
     * vertex, whose flat varyings they have (VK_EXT_provoking_vertex). */
    uint8_t provoking_last;
+   /* Lines drawn as quads that are stippled or smooth: where on the line a
+    * fragment is -- across it and along it, in pixels -- as the varying at
+    * location line_coord - 1 (0: none), which the vertex shader writes and
+    * the fragment shader stipples and covers by (expand_lines). */
+   uint8_t line_coord;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */

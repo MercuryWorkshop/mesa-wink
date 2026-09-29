@@ -3407,6 +3407,8 @@ unformatted_image_formats(const struct wvk_bound_state *st, uint32_t bind_point,
    }
 }
 
+static bool lines_placed(const struct wvk_cmd_buffer *cmd);
+
 static void
 select_draw_shaders(struct wvk_cmd_buffer *cmd)
 {
@@ -3426,8 +3428,8 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
    VkFormat fs_images[WVK_MAX_UNFORMATTED_IMAGES], vs_images[WVK_MAX_UNFORMATTED_IMAGES];
    unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_fs, fs_images);
    unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_vs, vs_images);
-   const enum wvk_draw_shape shape = replay->draw_points ? WVK_DRAW_POINTS
-                                     : replay->draw_lines ? WVK_DRAW_LINES
+   const enum wvk_draw_shape shape = replay->draw_points  ? WVK_DRAW_POINTS
+                                     : replay->draw_lines ? (lines_placed(cmd) ? WVK_DRAW_LINES_PLACED : WVK_DRAW_LINES)
                                                           : WVK_DRAW_PRIMITIVES;
    /* After a geometry or tessellation evaluation shader, whose outputs the
     * fragment shader reads. */
@@ -3503,10 +3505,24 @@ draws_lines(const struct wvk_cmd_buffer *cmd)
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    const struct wvk_bound_state *st = cmd->replay->state;
    const VkPrimitiveTopology t = dyn->ia.primitive_topology;
-   if ((t != VK_PRIMITIVE_TOPOLOGY_LINE_LIST && t != VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) || !st->bound_vs ||
-       dyn->rs.line.width <= 1.0f || dyn->rs.rasterizer_discard_enable)
+   /* Wide ones, and any that are rectangles or stippled
+    * (VK_KHR_line_rasterization): WebGPU's are one pixel, and plain. */
+   const bool quads = dyn->rs.line.width > 1.0f || dyn->rs.line.stipple.enable ||
+                      dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_RECTANGULAR_KHR ||
+                      dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_KHR;
+   if ((t != VK_PRIMITIVE_TOPOLOGY_LINE_LIST && t != VK_PRIMITIVE_TOPOLOGY_LINE_STRIP) || !st->bound_vs || !quads ||
+       dyn->rs.rasterizer_discard_enable)
       return false;
    return pulls_every_attribute(cmd, "wide lines");
+}
+
+/* Whether lines drawn as quads have fragments that know where on the line
+ * they are: stippled, or smooth (lower_line_fs). */
+static bool
+lines_placed(const struct wvk_cmd_buffer *cmd)
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   return dyn->rs.line.stipple.enable || dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_KHR;
 }
 
 /* A draw of wide lines as quads (draws_lines): the vertex shader run as
@@ -3539,9 +3555,13 @@ draw_lines(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t co
       return;
    }
    const float width = dyn->rs.line.width;
-   uint32_t line[2];
+   uint32_t line[4];
    memcpy(&line[0], &width, 4);
    line[1] = strip;
+   line[2] = dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH_KHR ? 2
+             : dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_RECTANGULAR_KHR      ? 1
+                                                                                     : 0;
+   line[3] = dyn->rs.line.stipple.enable ? dyn->rs.line.stipple.factor << 16 | dyn->rs.line.stipple.pattern : 0;
    if (memcmp(st->push + WVK_DRIVER_LINE, line, sizeof(line))) {
       memcpy(st->push + WVK_DRIVER_LINE, line, sizeof(line));
       st->push_offset = UINT32_MAX;
