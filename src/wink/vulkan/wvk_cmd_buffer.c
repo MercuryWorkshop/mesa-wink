@@ -312,6 +312,8 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_init(&replay.meta_memory, NULL);
    util_dynarray_init(&replay.atomic_images, NULL);
    util_dynarray_init(&replay.snapshots, NULL);
+   util_dynarray_init(&replay.buffer_swaps, NULL);
+   util_dynarray_init(&replay.pass_buffers, NULL);
    util_dynarray_init(&replay.pass_queries, NULL);
    replay.serial = serial;
    replay.dev = dev;
@@ -337,6 +339,8 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_fini(&replay.atomic_images);
    wvk_replay_drop_snapshots(&replay);
    util_dynarray_fini(&replay.snapshots);
+   util_dynarray_fini(&replay.buffer_swaps);
+   util_dynarray_fini(&replay.pass_buffers);
    rcmd->replay = NULL;
    /* What the replay itself recorded is of no further use. */
    vk_command_buffer_reset(&rcmd->vk);

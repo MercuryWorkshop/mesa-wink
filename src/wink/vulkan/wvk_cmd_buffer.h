@@ -123,6 +123,14 @@ struct wvk_replay {
    /* Copies of images the pass reads as it renders to them, until the
     * pass ends or a barrier (wvk_cmd_draw.c). */
    struct util_dynarray snapshots;     /* struct wvk_snapshot */
+   /* What a draw or dispatch reads of a buffer it also writes, which
+    * WebGPU has in no usage scope with the write: copies made before it,
+    * which its bind groups name instead. */
+   struct util_dynarray buffer_swaps;  /* struct wvk_buffer_swap */
+   /* The buffers the render pass has used so far, and whether written: a
+    * draw that would write what it read, or read what it wrote, begins it
+    * again -- a render pass is one usage scope. */
+   struct util_dynarray pass_buffers;  /* struct wvk_buffer_use */
 
    /* The serial this submit finishes at. */
    uint64_t serial;
@@ -222,6 +230,17 @@ wvk_format_clears_by_load(VkFormat format)
 
 /* End whatever pass is open: copies and clears happen between passes. */
 void wvk_replay_end_passes(struct wvk_replay *replay);
+
+struct wvk_buffer_swap {
+   uint32_t group, binding;
+   WGPUBuffer copy;
+   uint64_t size;
+};
+
+struct wvk_buffer_use {
+   WGPUBuffer buffer;
+   bool write;
+};
 
 struct wvk_snapshot {
    const struct wvk_image *image;

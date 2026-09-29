@@ -1171,8 +1171,38 @@ find_snapshot(const struct wvk_replay *replay, const struct wvk_image *image, ui
    return NULL;
 }
 
+/* How much of a buffer a binding binds. Storage bindings are whole words:
+ * the last one taken whole, as shaders read and write words of what is
+ * less. A uniform buffer binds as much of the buffer as there is: WebGPU
+ * wants all of the shader's block bound, where Vulkan wants only what is
+ * read. */
+static uint64_t
+binding_size(const struct wvk_physical_device *pdev, const struct wvk_shader_binding *b,
+             const struct wvk_descriptor *d)
+{
+   const uint64_t max = b->kind == WVK_BINDING_UNIFORM ? pdev->limits.maxUniformBufferBindingSize
+                                                       : pdev->limits.maxStorageBufferBindingSize;
+   uint64_t size = d->size;
+   if (b->kind == WVK_BINDING_UNIFORM && d->mem)
+      size = MIN2(MAX2(size, b->min_size), d->mem->buffer_size - d->offset);
+   else if (d->mem)
+      size = MIN2(align64(size, 4), d->mem->buffer_size - d->offset);
+   return MIN2(size, max) & ~3ull;
+}
+
+/* The copy a draw or dispatch reads instead of a binding, if it has one. */
+static const struct wvk_buffer_swap *
+find_buffer_swap(const struct wvk_replay *replay, uint32_t group, uint32_t binding)
+{
+   util_dynarray_foreach(&replay->buffer_swaps, struct wvk_buffer_swap, s) {
+      if (s->group == group && s->binding == binding)
+         return s;
+   }
+   return NULL;
+}
+
 /* A bind group of the set; with `replay`, what it reads of images the
- * pass renders to read their copies instead. */
+ * pass renders to read their copies instead, and of buffers it writes. */
 static WGPUBindGroup
 make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct wvk_descriptor_set *set,
                 uint32_t group, const struct wvk_bound_state *st, struct wvk_replay *replay)
@@ -1217,20 +1247,16 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
             e->size = 256;
             break;
          }
-         const uint64_t max = b->kind == WVK_BINDING_UNIFORM ? pdev->limits.maxUniformBufferBindingSize
-                                                             : pdev->limits.maxStorageBufferBindingSize;
+         const struct wvk_buffer_swap *swap = replay ? find_buffer_swap(replay, group, b->binding) : NULL;
+         if (swap) {
+            e->buffer = swap->copy;
+            e->offset = 0;
+            e->size = swap->size;
+            break;
+         }
          e->buffer = d->buffer;
          e->offset = d->offset;
-         /* Storage bindings are whole words: the last one taken whole, as
-          * shaders read and write words of what is less. A uniform buffer
-          * binds as much of the buffer as there is: WebGPU wants all of the
-          * shader's block bound, where Vulkan wants only what is read. */
-         uint64_t size = d->size;
-         if (b->kind == WVK_BINDING_UNIFORM && d->mem)
-            size = MIN2(MAX2(size, b->min_size), d->mem->buffer_size - d->offset);
-         else if (d->mem)
-            size = MIN2(align64(size, 4), d->mem->buffer_size - d->offset);
-         e->size = MIN2(size, max) & ~3ull;
+         e->size = binding_size(pdev, b, d);
          break;
       }
       case WVK_BINDING_SAMPLER:
@@ -1566,6 +1592,104 @@ push_offset(struct wvk_device *dev, struct wvk_replay *replay, uint32_t bind_poi
    return offset;
 }
 
+/* What a draw or dispatch binds of buffers through its sets: WebGPU
+ * lets none that it writes have another use in the same usage scope,
+ * where suballocated memory, one WGPUBuffer, has many. */
+struct buffer_use {
+   uint32_t group, binding;
+   WGPUBuffer buffer;
+   uint64_t offset, size;
+   bool write;
+};
+
+static uint32_t
+gather_buffer_uses(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_layout *layout,
+                   uint32_t bind_point, struct buffer_use *out, uint32_t max)
+{
+   const struct wvk_physical_device *pdev = wvk_device_physical(dev);
+   struct wvk_bound_state *st = replay->state;
+   uint32_t n = 0;
+   for (uint32_t g = 0; g < layout->group_count; ++g) {
+      const struct wvk_bgl *bgl = layout->groups[g];
+      const struct wvk_bound_set *bound = &st->sets[bind_point][g];
+      for (uint32_t i = 0; bound->set && i < bgl->count && n < max; ++i) {
+         const struct wvk_shader_binding *b = &bgl->entries[i].b;
+         if ((g == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) ||
+             (b->kind != WVK_BINDING_UNIFORM && b->kind != WVK_BINDING_STORAGE && b->kind != WVK_BINDING_STORAGE_READ))
+            continue;
+         bool sampler;
+         uint32_t dynamic_index = 0;
+         const struct wvk_descriptor *d = slot_descriptor(bound->set, b->binding, &sampler, &dynamic_index);
+         if (!d || !d->buffer || !d->mem)
+            continue;
+         const uint32_t dynamic = b->dynamic && dynamic_index < WVK_MAX_DYNAMIC ? bound->dynamic_offsets[dynamic_index] : 0;
+         out[n++] = (struct buffer_use){ g, b->binding, d->buffer, d->offset + dynamic, binding_size(pdev, b, d),
+                                         b->kind == WVK_BINDING_STORAGE };
+      }
+   }
+   return n;
+}
+
+static bool
+writes_buffer(const struct buffer_use *uses, uint32_t n, WGPUBuffer buffer)
+{
+   for (uint32_t i = 0; i < n; ++i) {
+      if (uses[i].write && uses[i].buffer == buffer)
+         return true;
+   }
+   return false;
+}
+
+/* Copies of what the draw or dispatch reads of buffers it also writes,
+ * made here, outside any pass -- which ends one if it has to. True if it
+ * made any. A shader reading what it writes of the same range, which
+ * Vulkan lets it, sees what was there before. */
+static bool
+swap_conflicting_reads(struct wvk_device *dev, struct wvk_replay *replay, const struct buffer_use *uses, uint32_t n)
+{
+   util_dynarray_clear(&replay->buffer_swaps);
+   bool made = false;
+   for (uint32_t i = 0; i < n; ++i) {
+      if (uses[i].write || !writes_buffer(uses, n, uses[i].buffer) || !uses[i].size)
+         continue;
+      WGPUBuffer copy = wvk_replay_temp_buffer(dev, replay, uses[i].size,
+                                               WGPUBufferUsage_Uniform | WGPUBufferUsage_Storage |
+                                               WGPUBufferUsage_CopyDst, NULL);
+      if (!copy)
+         continue;
+      if (!made)
+         wvk_replay_end_passes(replay);
+      made = true;
+      wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, uses[i].buffer, uses[i].offset, copy, 0, uses[i].size);
+      const struct wvk_buffer_swap swap = { uses[i].group, uses[i].binding, copy, uses[i].size };
+      util_dynarray_append(&replay->buffer_swaps, swap);
+   }
+   return made;
+}
+
+/* Whether the render pass has used a buffer as the draw would not: a
+ * write of what it read, a read of what it wrote. */
+static bool
+pass_conflicts(const struct wvk_replay *replay, WGPUBuffer buffer, bool write)
+{
+   util_dynarray_foreach(&replay->pass_buffers, struct wvk_buffer_use, u) {
+      if (u->buffer == buffer && u->write != write)
+         return true;
+   }
+   return false;
+}
+
+static void
+note_pass_use(struct wvk_replay *replay, WGPUBuffer buffer, bool write)
+{
+   util_dynarray_foreach(&replay->pass_buffers, struct wvk_buffer_use, u) {
+      if (u->buffer == buffer && u->write == write)
+         return;
+   }
+   const struct wvk_buffer_use use = { buffer, write };
+   util_dynarray_append(&replay->pass_buffers, use);
+}
+
 /* Bind every group of the layout, or only the driver's. Returns false if
  * one could not be made, and the draw is to be skipped. */
 static bool
@@ -1593,8 +1717,11 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
       struct wvk_bgl *bgl = layout->groups[g];
       struct wvk_bound_set *bound = &st->sets[bind_point][g];
       /* One of its own, for this draw alone, where it reads copies. */
-      const bool reads_copies = pass && replay->snapshots.size && bgl->count && bound->set &&
-                                reads_snapshot(replay, bgl, bound->set);
+      bool swapped = false;
+      util_dynarray_foreach(&replay->buffer_swaps, struct wvk_buffer_swap, s)
+         swapped |= s->group == g;
+      const bool reads_copies = swapped || (pass && replay->snapshots.size && bgl->count && bound->set &&
+                                            reads_snapshot(replay, bgl, bound->set));
       WGPUBindGroup bg;
       if (reads_copies) {
          upload_inline_blocks(dev, bound->set);
@@ -1629,7 +1756,8 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
          uint32_t dynamic = 0;
          if (b->dynamic && offset_count < WVK_MAX_DYNAMIC) {
             dynamic = dynamic_index < WVK_MAX_DYNAMIC ? bound->dynamic_offsets[dynamic_index] : 0;
-            offsets[offset_count++] = dynamic;
+            /* A copy starts where its range did. */
+            offsets[offset_count++] = swapped && find_buffer_swap(replay, g, b->binding) ? 0 : dynamic;
          }
          if (d && d->mem) {
             struct wvk_descriptor at = *d;
@@ -2019,6 +2147,45 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    sync_image_textures(cmd, p->layout, WVK_BIND_GRAPHICS);
    sync_atomic_buffers(cmd, p->layout, WVK_BIND_GRAPHICS);
    snapshot_feedback(cmd, p->layout);
+
+   /* A render pass is one usage scope: what the draw reads of buffers it
+    * writes, copies; and a draw at odds with what the pass used before, a
+    * pass of its own. */
+   struct buffer_use uses[64];
+   uint32_t n = gather_buffer_uses(dev, replay, p->layout, WVK_BIND_GRAPHICS, uses, ARRAY_SIZE(uses));
+   if (swap_conflicting_reads(dev, replay, uses, n))
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+   /* The rest of what it reads: vertex, index and pulled buffers. */
+   for (uint32_t slot = 0; slot < p->key.vb_count && n < ARRAY_SIZE(uses); ++slot) {
+      const struct wvk_bound_buffer *vb = &st->vb[p->key.vb_bindings[slot]];
+      if (vb->buffer)
+         uses[n++] = (struct buffer_use){ UINT32_MAX, 0, vb->buffer, vb->offset, vb->size, false };
+   }
+   if (indexed && st->ib.buffer && n < ARRAY_SIZE(uses))
+      uses[n++] = (struct buffer_use){ UINT32_MAX, 0, st->ib.buffer, st->ib.offset, st->ib.size, false };
+   for (uint32_t i = 0; i < st->vs->pulled_count && n < ARRAY_SIZE(uses); ++i) {
+      const struct wvk_bound_buffer *vb = &st->vb[st->vs->pulled_bindings[i]];
+      if (vb->buffer)
+         uses[n++] = (struct buffer_use){ UINT32_MAX, 0, vb->buffer, vb->offset, vb->size, false };
+   }
+   if (st->draw.buffer && n < ARRAY_SIZE(uses))
+      uses[n++] = (struct buffer_use){ UINT32_MAX, 0, st->draw.buffer, st->draw.offset, st->draw.size, false };
+   bool restart = false;
+   for (uint32_t i = 0; i < n; ++i) {
+      const bool copied = uses[i].group != UINT32_MAX && find_buffer_swap(replay, uses[i].group, uses[i].binding);
+      if (copied)
+         continue;
+      if (!uses[i].write && uses[i].group == UINT32_MAX && writes_buffer(uses, n, uses[i].buffer))
+         mesa_logw_once("wvk: a draw writes a buffer it reads vertices, indices or its command from");
+      restart |= pass_conflicts(replay, uses[i].buffer, uses[i].write);
+   }
+   if (restart)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+   for (uint32_t i = 0; i < n; ++i) {
+      if (uses[i].group == UINT32_MAX || !find_buffer_swap(replay, uses[i].group, uses[i].binding))
+         note_pass_use(replay, uses[i].buffer, uses[i].write);
+   }
+
    pass = replay->pass;
    if (!pass)
       return false;
@@ -2038,7 +2205,9 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    st->graphics_layout = p->layout;
    if (st->vs->pulled_count)
       set_pulled_buffers(dev, cmd, replay);
-   if (!bind_groups(dev, replay, p->layout, WVK_BIND_GRAPHICS, pass, NULL, false))
+   const bool bound = bind_groups(dev, replay, p->layout, WVK_BIND_GRAPHICS, pass, NULL, false);
+   util_dynarray_clear(&replay->buffer_swaps);
+   if (!bound)
       return false;
 
    for (uint32_t slot = 0; slot < p->key.vb_count; ++slot) {
@@ -2595,8 +2764,10 @@ set_base_group(struct wvk_replay *replay, uint32_t x, uint32_t y, uint32_t z)
    }
 }
 
+/* `indirect`, if given, is the dispatch's command, made a copy where the
+ * dispatch writes its buffer. */
 static WGPUComputePassEncoder
-flush_dispatch(struct wvk_cmd_buffer *cmd)
+flush_dispatch(struct wvk_cmd_buffer *cmd, struct wvk_bound_buffer *indirect)
 {
    struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
    struct wvk_replay *replay = cmd->replay;
@@ -2614,14 +2785,28 @@ flush_dispatch(struct wvk_cmd_buffer *cmd)
       return NULL;
    sync_image_textures(cmd, p->layout, WVK_BIND_COMPUTE);
    sync_atomic_buffers(cmd, p->layout, WVK_BIND_COMPUTE);
+   /* A dispatch is a usage scope: what it reads of buffers it writes,
+    * copies. */
+   struct buffer_use uses[64];
+   const uint32_t n = gather_buffer_uses(dev, replay, p->layout, WVK_BIND_COMPUTE, uses, ARRAY_SIZE(uses));
+   swap_conflicting_reads(dev, replay, uses, n);
+   if (indirect && writes_buffer(uses, n, indirect->buffer)) {
+      WGPUBuffer copy = wvk_replay_temp_buffer(dev, replay, 16, WGPUBufferUsage_Indirect | WGPUBufferUsage_CopyDst, NULL);
+      if (copy) {
+         wvk_replay_end_passes(replay);
+         wvk_replay_read(replay, indirect->mem, indirect->offset, indirect->size);
+         wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, indirect->buffer, indirect->offset, copy, 0, 12);
+         *indirect = (struct wvk_bound_buffer){ NULL, copy, 0, 12 };
+      }
+   }
    if (!replay->compute) {
       WGPUComputePassDescriptor desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
       replay->compute = wgpuCommandEncoderBeginComputePass(replay->encoder, &desc);
    }
    wgpuComputePassEncoderSetPipeline(replay->compute, p->pipeline);
-   if (!bind_groups(dev, replay, p->layout, WVK_BIND_COMPUTE, NULL, replay->compute, false))
-      return NULL;
-   return replay->compute;
+   const bool bound = bind_groups(dev, replay, p->layout, WVK_BIND_COMPUTE, NULL, replay->compute, false);
+   util_dynarray_clear(&replay->buffer_swaps);
+   return bound ? replay->compute : NULL;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -2632,7 +2817,7 @@ wvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX, uint32_t
    if (!groupCountX || !groupCountY || !groupCountZ)
       return;
    set_base_group(cmd->replay, baseGroupX, baseGroupY, baseGroupZ);
-   WGPUComputePassEncoder compute = flush_dispatch(cmd);
+   WGPUComputePassEncoder compute = flush_dispatch(cmd, NULL);
    if (compute)
       wgpuComputePassEncoderDispatchWorkgroups(compute, groupCountX, groupCountY, groupCountZ);
 }
@@ -2651,9 +2836,10 @@ wvk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDevice
    if (!b.buffer)
       return;
    set_base_group(cmd->replay, 0, 0, 0);
-   WGPUComputePassEncoder compute = flush_dispatch(cmd);
+   WGPUComputePassEncoder compute = flush_dispatch(cmd, &b);
    if (!compute)
       return;
-   wvk_replay_read(cmd->replay, b.mem, b.offset, b.size);
+   if (b.mem)
+      wvk_replay_read(cmd->replay, b.mem, b.offset, b.size);
    wgpuComputePassEncoderDispatchWorkgroupsIndirect(compute, b.buffer, b.offset);
 }

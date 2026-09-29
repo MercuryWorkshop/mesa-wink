@@ -82,6 +82,13 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   have, are RGBA8 textures. Copies to and from buffers are a shader's,
   which packs and unpacks the texels; a format without alpha keeps its
   texture's at one. Blending is at 8 bits, not the format's.
+- **Memory is one WGPUBuffer**, which the buffers bound to it share. WebGPU
+  lets a buffer written as storage have no other use in a usage scope --
+  a dispatch, or a whole render pass -- which suballocated memory has all
+  the time: a uniform buffer and a storage buffer of one allocation. What
+  a draw or dispatch reads of a buffer it writes, it reads from a copy
+  made before it; and a draw at odds with what its pass used before
+  begins the pass again.
 - **Arrays of descriptors** are bindings of their own. A dynamic or
   non-uniform index chooses among them in the shader: reads from each,
   selected; writes only where the index is.

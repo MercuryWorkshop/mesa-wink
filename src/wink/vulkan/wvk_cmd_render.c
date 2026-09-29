@@ -327,6 +327,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    desc.depthStencilAttachment = (depth || stencil) ? &ds : NULL;
    desc.occlusionQuerySet = wvk_replay_query_set(wvk_cmd_buffer_device(cmd), replay);
    replay->pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &desc);
+   util_dynarray_clear(&replay->pass_buffers);
    wvk_replay_resume_query(replay);
    if (clear_count) {
       const VkClearRect rect = { info->renderArea, 0, MAX2(info->layerCount, 1) };
