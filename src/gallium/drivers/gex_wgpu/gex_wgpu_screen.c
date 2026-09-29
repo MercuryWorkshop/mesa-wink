@@ -16015,9 +16015,8 @@ gex_wgpu_blend_factor(unsigned factor)
       return WGPUBlendFactor_OneMinusSrc1Alpha;
    /* GL's CONSTANT_ALPHA means "the constant's alpha in all three colour
     * channels", which WebGPU's `constant` -- the whole blend colour, per
-    * channel -- does not express. It is right for the alpha equation and
-    * wrong for the colour one; correcting that needs the blend constant
-    * rewritten per draw, so it is left as it was and named here. */
+    * channel -- does not express. The blend constant a draw is given says
+    * it instead (gex_wgpu_blend_constant). */
    case PIPE_BLENDFACTOR_CONST_COLOR:
    case PIPE_BLENDFACTOR_CONST_ALPHA:
       return WGPUBlendFactor_Constant;
@@ -16026,6 +16025,62 @@ gex_wgpu_blend_factor(unsigned factor)
       return WGPUBlendFactor_OneMinusConstant;
    default: return WGPUBlendFactor_Undefined;
    }
+}
+
+static bool
+gex_wgpu_factor_is_constant_alpha(unsigned factor)
+{
+   return factor == PIPE_BLENDFACTOR_CONST_ALPHA ||
+          factor == PIPE_BLENDFACTOR_INV_CONST_ALPHA;
+}
+
+static bool
+gex_wgpu_factor_is_constant_color(unsigned factor)
+{
+   return factor == PIPE_BLENDFACTOR_CONST_COLOR ||
+          factor == PIPE_BLENDFACTOR_INV_CONST_COLOR;
+}
+
+/* The blend constant WebGPU is given for a draw.
+ *
+ * WebGPU's `constant` factor is the blend colour channel by channel, and
+ * GL's CONSTANT_ALPHA its alpha in every channel. Where the colour factors
+ * of the bound state use the alpha and never the colour, the constant is
+ * given as its alpha four times: the alpha factors read the alpha whichever
+ * they name. A state whose colour factors use both kinds -- one source,
+ * one destination, or across targets -- has no one constant that serves;
+ * it keeps the colour, and says so once. */
+static WGPUColor
+gex_wgpu_blend_constant(const struct gex_wgpu_context *ctx)
+{
+   const float *c = ctx->blend_color.color;
+   WGPUColor color = {c[0], c[1], c[2], c[3]};
+   if (!ctx->blend)
+      return color;
+   bool alpha = false, colour = false;
+   const unsigned count = ctx->blend->independent_blend_enable
+      ? MIN2(ctx->color_count, GEX_WGPU_MAX_COLOR_TARGETS) : 1;
+   for (unsigned i = 0; i < count; ++i) {
+      const struct pipe_rt_blend_state *rt = &ctx->blend->rt[i];
+      if (!rt->blend_enable)
+         continue;
+      alpha |= gex_wgpu_factor_is_constant_alpha(rt->rgb_src_factor) ||
+               gex_wgpu_factor_is_constant_alpha(rt->rgb_dst_factor);
+      colour |= gex_wgpu_factor_is_constant_color(rt->rgb_src_factor) ||
+                gex_wgpu_factor_is_constant_color(rt->rgb_dst_factor);
+   }
+   if (alpha && !colour) {
+      color.r = color.g = color.b = c[3];
+   } else if (alpha && colour) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: a blend state's colour factors use both "
+                 "CONSTANT_COLOR and CONSTANT_ALPHA; WebGPU has one blend "
+                 "constant, and it is the colour\n");
+      }
+   }
+   return color;
 }
 
 static void
@@ -43567,15 +43622,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       blend_states[i].alpha.dstFactor =
          gex_wgpu_blend_factor(rt->alpha_dst_factor);
       color_targets[i].blend = &blend_states[i];
-      uses_blend_constant |=
-         rt->rgb_src_factor == PIPE_BLENDFACTOR_CONST_COLOR ||
-         rt->rgb_src_factor == PIPE_BLENDFACTOR_INV_CONST_COLOR ||
-         rt->rgb_dst_factor == PIPE_BLENDFACTOR_CONST_COLOR ||
-         rt->rgb_dst_factor == PIPE_BLENDFACTOR_INV_CONST_COLOR ||
-         rt->alpha_src_factor == PIPE_BLENDFACTOR_CONST_ALPHA ||
-         rt->alpha_src_factor == PIPE_BLENDFACTOR_INV_CONST_ALPHA ||
-         rt->alpha_dst_factor == PIPE_BLENDFACTOR_CONST_ALPHA ||
-         rt->alpha_dst_factor == PIPE_BLENDFACTOR_INV_CONST_ALPHA;
+      /* Any of the four factors, of either kind: a colour factor of
+       * CONSTANT_ALPHA reads the constant as much as one of CONSTANT_COLOR,
+       * and was missed here, so the draw blended with whatever constant the
+       * pass last had. */
+      const unsigned factors[4] = {rt->rgb_src_factor, rt->rgb_dst_factor,
+                                   rt->alpha_src_factor, rt->alpha_dst_factor};
+      for (unsigned f = 0; f < 4; ++f)
+         uses_blend_constant |= gex_wgpu_factor_is_constant_alpha(factors[f]) ||
+                                gex_wgpu_factor_is_constant_color(factors[f]);
    }
    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
    const int64_t t_fsmod_start = gex_timing ? os_time_get_nano() : 0;
@@ -46413,10 +46468,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          wgpuRenderPassEncoderSetStencilReference(
             pass, ctx->stencil_ref.ref_value[gex_wgpu_stencil_back_drawn(ctx)]);
       if (uses_blend_constant) {
-         const WGPUColor blend_color = {
-            ctx->blend_color.color[0], ctx->blend_color.color[1],
-            ctx->blend_color.color[2], ctx->blend_color.color[3],
-         };
+         const WGPUColor blend_color = gex_wgpu_blend_constant(ctx);
          wgpuRenderPassEncoderSetBlendConstant(pass, &blend_color);
       }
       /* A one-pixel difference this driver does not correct, measured and
