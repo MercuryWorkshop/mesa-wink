@@ -208,7 +208,7 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   cannot describe. Strips of 16-bit indices with primitive restart off
   still restart at 0xFFFF, as WebGPU's always do.
 - Precise occlusion queries: WebGPU's count is exact on some backends
-  only. Alpha to coverage with a sample mask the shader writes.
+  only.
 - Subgroups are one invocation each: Tint reads no subgroup operations from
   SPIR-V. Every operation but the quad ones is there, trivially.
 - Blend states whose colour factors use both CONSTANT_COLOR and

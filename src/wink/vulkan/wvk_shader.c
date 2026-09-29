@@ -503,8 +503,71 @@ wvk_hash_state(struct vk_physical_device *device, const struct vk_graphics_pipel
    if (stages & VK_SHADER_STAGE_FRAGMENT_BIT) {
       const uint8_t per_sample = wants_sample_shading(state);
       _mesa_blake3_update(&ctx, &per_sample, 1);
+      /* And alpha to one and to coverage, which it may do itself. */
+      const uint8_t alpha[3] = {
+         state && state->ms && state->ms->alpha_to_one_enable,
+         state && state->ms && state->ms->alpha_to_coverage_enable,
+         state && state->ms ? state->ms->rasterization_samples : 1,
+      };
+      _mesa_blake3_update(&ctx, alpha, sizeof(alpha));
    }
    _mesa_blake3_final(&ctx, blake3_out);
+}
+
+/* Alpha to one, which WebGPU has not: a fragment shader's colour outputs
+ * with an alpha of one. And alpha to coverage where it is on too, or the
+ * shader writes its own sample mask, which WebGPU's will not go with:
+ * the shader's, the samples covered as its first output's alpha says,
+ * that many of them. */
+static bool
+lower_alpha_to_one(nir_shader *nir, bool to_one, bool to_coverage, unsigned samples)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_create(impl);
+   nir_variable *mask_var = NULL;
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location == FRAG_RESULT_SAMPLE_MASK)
+         mask_var = var;
+   }
+   bool progress = false;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_deref)
+            continue;
+         nir_variable *var = nir_intrinsic_get_var(intr, 0);
+         nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+         if (!var || var->data.mode != nir_var_shader_out || var->data.location < FRAG_RESULT_DATA0 ||
+             !glsl_type_is_vector_or_scalar(deref->type) || glsl_get_base_type(deref->type) != GLSL_TYPE_FLOAT ||
+             glsl_get_vector_elements(deref->type) < 4 || !(nir_intrinsic_write_mask(intr) & 0x8))
+            continue;
+         b.cursor = nir_before_instr(instr);
+         nir_def *value = intr->src[1].ssa;
+         if (to_coverage && var->data.location == FRAG_RESULT_DATA0 && var->data.index == 0) {
+            nir_def *alpha = nir_fsat(&b, nir_channel(&b, value, 3));
+            nir_def *n = nir_f2u32(&b, nir_fround_even(&b, nir_fmul_imm(&b, alpha, samples)));
+            nir_def *covered = nir_bcsel(&b, nir_uge_imm(&b, n, 32), nir_imm_int(&b, -1),
+                                         nir_iadd_imm(&b, nir_ishl(&b, nir_imm_int(&b, 1), n), -1));
+            if (!mask_var) {
+               mask_var = nir_create_variable_with_location(nir, nir_var_shader_out, FRAG_RESULT_SAMPLE_MASK,
+                                                            glsl_array_type(glsl_int_type(), 1, 0));
+               /* Of every sample, until the shader says. */
+               nir_builder top = nir_builder_at(nir_before_impl(impl));
+               nir_store_deref(&top, nir_build_deref_array_imm(&top, nir_build_deref_var(&top, mask_var), 0),
+                               nir_imm_int(&top, -1), 0x1);
+            }
+            nir_deref_instr *m = nir_build_deref_array_imm(&b, nir_build_deref_var(&b, mask_var), 0);
+            nir_store_deref(&b, m, nir_iand(&b, nir_load_deref(&b, m), covered), 0x1);
+         }
+         if (to_one) {
+            nir_src_rewrite(&intr->src[1], nir_vector_insert_imm(&b, value, nir_imm_floatN_t(&b, 1.0, value->bit_size), 3));
+         }
+         progress = true;
+      }
+   }
+   return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
 /* Sample shading, which WebGPU does where a fragment shader reads its
@@ -2585,6 +2648,17 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       }
    }
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      const struct vk_multisample_state *ms = pipeline_state ? pipeline_state->ms : NULL;
+      bool own_mask = false;
+      nir_foreach_shader_out_variable(var, nir)
+         own_mask |= var->data.location == FRAG_RESULT_SAMPLE_MASK;
+      const bool to_one = ms && ms->alpha_to_one_enable;
+      const bool by_alpha = ms && ms->alpha_to_coverage_enable && (to_one || own_mask);
+      if (to_one || by_alpha)
+         NIR_PASS(_, nir, lower_alpha_to_one, to_one, by_alpha, ms->rasterization_samples);
+      shader->covers_by_alpha = by_alpha;
+   }
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       const bool per_sample = wants_sample_shading(pipeline_state);
       if (per_sample)
          NIR_PASS(_, nir, shade_per_sample);
@@ -2848,6 +2922,7 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->uses_draw_parameters);
    blob_write_uint8(blob, shader->writes_layer);
    blob_write_uint8(blob, shader->writes_viewport);
+   blob_write_uint8(blob, shader->covers_by_alpha);
    blob_write_bytes(blob, shader->meta_base, sizeof(shader->meta_base));
    blob_write_uint32(blob, shader->meta_words);
    blob_write_uint8(blob, shader->pulled_count);
@@ -2876,6 +2951,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const bool uses_draw_parameters = blob_read_uint8(blob);
    const bool writes_layer = blob_read_uint8(blob);
    const bool writes_viewport = blob_read_uint8(blob);
+   const bool covers_by_alpha = blob_read_uint8(blob);
    uint32_t meta_base[4];
    blob_copy_bytes(blob, meta_base, sizeof(meta_base));
    const uint32_t meta_words = blob_read_uint32(blob);
@@ -2912,6 +2988,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->uses_draw_parameters = uses_draw_parameters;
    shader->writes_layer = writes_layer;
    shader->writes_viewport = writes_viewport;
+   shader->covers_by_alpha = covers_by_alpha;
    memcpy(shader->meta_base, meta_base, sizeof(meta_base));
    shader->meta_words = meta_words;
    shader->pulled_count = MIN2(pulled_count, WVK_MAX_PULLED_BINDINGS);

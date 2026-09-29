@@ -1844,7 +1844,8 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
 
    k->samples = MAX2(replay->rendering.samples, 1);
    k->sample_mask = dyn->ms.sample_mask;
-   k->alpha_to_coverage = dyn->ms.alpha_to_coverage_enable;
+   /* Not where the fragment shader covers samples itself. */
+   k->alpha_to_coverage = dyn->ms.alpha_to_coverage_enable && !(st->fs && st->fs->covers_by_alpha);
 
    k->color_count = replay->rendering.color_count;
    for (uint32_t i = 0; i < k->color_count; ++i) {

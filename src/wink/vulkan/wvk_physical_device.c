@@ -186,6 +186,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .variableMultisampleRate = true,
       /* Every sample, the fragment shader made to read its sample. */
       .sampleRateShading = true,
+      /* The fragment shader's alpha, and its coverage by it (wvk_shader.c). */
+      .alphaToOne = true,
       /* 64-bit integers are pairs of words (nir_lower_int64). */
       .shaderInt64 = true,
 #ifdef WVK_HAVE_FLOAT64
