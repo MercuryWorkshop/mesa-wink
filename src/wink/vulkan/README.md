@@ -129,6 +129,20 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   end and moves it by half the width, up or down where the line runs more
   across than up, else sideways, which the other end's captured position
   says. Segments across a restart go. The same limits as for points.
+- **Geometry shaders** (geometryShader) run as compute, which is all a
+  WebGPU device has besides vertex and fragment stages: the vertex shader
+  run as compute writes a record of its outputs a vertex of each instance
+  -- a vec4 a slot, builtins then generic varyings -- which the geometry
+  shader, run as compute an invocation a primitive of each instance and
+  invocation of its, reads by the draw's topology's primitive assembly;
+  EmitVertex writes its record out, at the invocation's next vertex, with
+  the indices of what that vertex completes of a strip, as a list. Then a
+  draw of that list, whose vertex shader is made of the geometry shader's
+  outputs and reads the records. gl_PrimitiveID reaches the fragment
+  shader as a flat varying; gl_Layer draws in each layer of a pass drawn a
+  layer at a time. Streams but the first go, and indexed strips do not
+  restart their primitives for it. Without one, topologies with adjacency
+  are drawn without the adjacent vertices, as lists the driver makes.
 - **A vertex shader's storage writes** (vertexPipelineStoresAndAtomics)
   are a compute shader's: WebGPU's vertex shaders write no storage. A
   draw whose vertex shader writes buffers or images first dispatches the

@@ -73,7 +73,7 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* Vertex buffers whose attributes the vertex shader reads itself: those
  * of bindings with a divisor other than 1, which WebGPU cannot step. */
 #define WVK_DRIVER_SLOT_VERTEX (WVK_DRIVER_SLOT_BASE + 2)
-#define WVK_MAX_PULLED_BINDINGS 4
+#define WVK_MAX_PULLED_BINDINGS 6
 /* A copy of each colour attachment a logic op reads, as it was before the
  * draw: WebGPU has no logic ops, so the fragment shader does them. */
 #define WVK_DRIVER_SLOT_LOGIC_OP (WVK_DRIVER_SLOT_VERTEX + WVK_MAX_PULLED_BINDINGS)
@@ -87,6 +87,10 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* What a vertex shader run as compute captures of the draw's vertices,
  * their clip positions, which a draw of wide lines reads (wvk_shader.c). */
 #define WVK_DRIVER_SLOT_CAPTURE (WVK_DRIVER_SLOT_INDEX + 1)
+/* A geometry shader run as compute: the vertices it emits, and the
+ * indices of the primitives they make, which the draw after reads. */
+#define WVK_DRIVER_SLOT_GS_VERTICES (WVK_DRIVER_SLOT_CAPTURE + 1)
+#define WVK_DRIVER_SLOT_GS_INDICES (WVK_DRIVER_SLOT_CAPTURE + 2)
 
 #define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
 
@@ -176,7 +180,12 @@ enum wvk_texel_type {
  *     the draw: the draw's vertices an instance, its vertices in all, its
  *     first vertex or index, and whether it restarts primitives, 4 uints;
  *   - for wide lines drawn as quads, their width, a float, and whether
- *     they are a strip, a uint. */
+ *     they are a strip, a uint;
+ *   - for a geometry shader run as compute: the draw's vertices an
+ *     instance, its primitives an instance, the shader's invocations in
+ *     all, and the draw's topology, 4 uints;
+ *   - the pulled vertex buffers' starts and strides past the first four,
+ *     2 uints each. */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
@@ -192,7 +201,9 @@ enum wvk_texel_type {
 #define WVK_DRIVER_POINT_INDEX (WVK_DRIVER_DATA_OFFSET + 128)
 #define WVK_DRIVER_VERTEX_RUN (WVK_DRIVER_DATA_OFFSET + 144)
 #define WVK_DRIVER_LINE (WVK_DRIVER_DATA_OFFSET + 160)
-#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 176)
+#define WVK_DRIVER_GEOMETRY (WVK_DRIVER_DATA_OFFSET + 176)
+#define WVK_DRIVER_PULL_MORE (WVK_DRIVER_DATA_OFFSET + 192)
+#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 208)
 #define WVK_META_OFFSET WVK_PUSH_DATA_SIZE
 /* How much of the push buffer the push binding shows: its data, and as
  * many records as that leaves room for. */
@@ -208,6 +219,7 @@ struct wvk_driver_key {
    uint64_t vertex[WVK_MAX_PULLED_BINDINGS];
    uint64_t index;
    uint64_t capture;
+   uint64_t gs_vertices, gs_indices;
 };
 
 static inline bool

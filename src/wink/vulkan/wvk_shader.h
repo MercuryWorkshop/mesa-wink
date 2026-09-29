@@ -45,7 +45,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 17
+#define WVK_SHADER_BINARY_VERSION 20
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -98,11 +98,23 @@ struct wvk_shader_key {
     * of the draw, doing its storage writes, which WebGPU's vertex shaders
     * cannot (vertexPipelineStoresAndAtomics; wvk_cmd_draw.c runs it before
     * the draw, whose vertex shader has them stripped); 2 for one that
-    * only captures the vertices' clip positions, which wide lines read. */
+    * only captures the vertices' clip positions, which wide lines read; 3
+    * for one that captures all of its outputs, a record a vertex, which a
+    * geometry shader reads (WVK_RECORD_BUILTINS). */
    uint8_t runs;
    /* Vertex: wide lines drawn as quads, six vertices a segment (wideLines;
     * key.runs 2 capturing the positions they read). */
    uint8_t lines;
+   /* Geometry: the shader as compute, an invocation a primitive of the
+    * draw and invocation of the shader, reading the vertex shader's
+    * records (key.runs 3) and writing its vertices' and their primitives'
+    * (1); or the vertex shader of the draw after, reading those (2). And
+    * the generic varyings the vertex shader's records have (vs_vars). */
+   uint8_t geometry, vs_vars;
+   /* Fragment, and the vertex shader after a geometry shader: gl_PrimitiveID
+    * as the flat varying at location primitive_id - 1 (0: none), which the
+    * geometry shader's records carry. */
+   uint8_t primitive_id;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
@@ -157,11 +169,20 @@ struct wvk_shader {
    bool reads_depth_bounds;
    /* Vertex: writes PointSize, and so draws points as quads. Fragment:
     * reads gl_PointCoord (1) or gl_FrontFacing (2), which a point's quad
-    * has not. */
+    * has not; or gl_PrimitiveID (4), which the draw after a geometry
+    * shader has not. */
    bool writes_point_size;
    uint8_t point_state;
    /* Vertex: writes storage, which a draw does as compute (key.runs). */
    bool writes_storage;
+   /* The generic varyings of the records it writes: a vertex shader
+    * capturing its outputs, a geometry shader its vertices. */
+   uint8_t record_vars;
+   /* Geometry: its input and output primitives (enum mesa_prim), the
+    * vertices an invocation emits at most, and its invocations. */
+   uint8_t gs_input, gs_output;
+   uint16_t gs_max_vertices;
+   uint8_t gs_invocations;
    /* Its storage images without a format, as the set and slot of each
     * (set << 10 | slot), whose views' formats a draw or dispatch compiles
     * a variant for (key.image_format). */
@@ -243,6 +264,37 @@ struct wvk_shader *wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_sh
  * bound). */
 struct wvk_shader *wvk_shader_dispatch_variant(struct wvk_device *dev, struct wvk_shader *shader,
                                                const VkFormat *image_formats);
+
+/* A geometry shader's variant (key.geometry): as compute for a vertex
+ * shader whose records have `vs_vars` generic varyings (1), or the vertex
+ * shader of the draw after it, with `other` the fragment shader (2). */
+struct wvk_shader *wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsigned kind,
+                                               unsigned vs_vars, const struct wvk_shader *other,
+                                               const struct vk_dynamic_graphics_state *dyn);
+
+/* A record of a stage's outputs as the next reads them from a buffer: a
+ * vec4 a slot, of the builtins (position, point size, clip and cull
+ * distances, layer, viewport, primitive ID) and then the generic varyings,
+ * to the last the stage has. */
+#define WVK_RECORD_BUILTINS 9
+static inline uint32_t
+wvk_record_stride(unsigned vars)
+{
+   return 16 * (WVK_RECORD_BUILTINS + vars);
+}
+
+/* How many indices a geometry shader's invocation writes of its output
+ * primitives, as lists: three a triangle of a strip, two a segment, one a
+ * point. */
+static inline uint32_t
+wvk_geometry_indices(unsigned output, unsigned max_vertices)
+{
+   switch (output) {
+   case MESA_PRIM_TRIANGLE_STRIP: return max_vertices > 2 ? 3 * (max_vertices - 2) : 0;
+   case MESA_PRIM_LINE_STRIP: return max_vertices > 1 ? 2 * (max_vertices - 1) : 0;
+   default: return max_vertices;
+   }
+}
 
 /* Whether a logic op does anything to an attachment of `format`. */
 bool wvk_format_takes_logic_op(VkFormat format);

@@ -206,6 +206,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Points of the size the vertex shader gives them: quads, a variant
        * of the shader moving six vertices to a point's corners. */
       .largePoints = true,
+      /* As compute, before a draw of what it emits (draw_geometry). */
+      .geometryShader = true,
       /* Lines of the width the draw has: quads the same way, the vertex
        * shader run as compute giving the ends' positions. */
       .wideLines = true,
@@ -505,6 +507,13 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxVertexInputAttributeOffset = l->maxVertexBufferArrayStride - 1,
       .maxVertexInputBindingStride = l->maxVertexBufferArrayStride,
       .maxVertexOutputComponents = l->maxInterStageShaderVariables * 4,
+      /* A geometry shader is compute, its records a buffer's (wvk_shader.c);
+       * its outputs are the draw's vertex shader's after it. */
+      .maxGeometryShaderInvocations = 32,
+      .maxGeometryInputComponents = 128,
+      .maxGeometryOutputComponents = l->maxInterStageShaderVariables * 4,
+      .maxGeometryOutputVertices = 256,
+      .maxGeometryTotalOutputComponents = 1024,
       .maxFragmentInputComponents = l->maxInterStageShaderVariables * 4,
       .maxFragmentOutputAttachments = l->maxColorAttachments,
       .maxFragmentDualSrcAttachments =

@@ -775,6 +775,8 @@ struct wvk_bound_state {
     * for its state (select_draw_shaders). */
    struct wvk_shader *vs, *fs, *cs;
    struct wvk_shader *bound_vs, *bound_fs, *bound_cs;
+   /* A geometry shader, whose variants run as compute (draw_geometry). */
+   struct wvk_shader *bound_gs;
    struct wvk_bound_set sets[WVK_BIND_POINTS][WVK_MAX_GROUPS];
 
    struct wvk_bound_buffer vb[MESA_VK_MAX_VERTEX_BINDINGS];
@@ -795,8 +797,10 @@ struct wvk_bound_state {
    struct wvk_driver_buffer pulled[WVK_MAX_PULLED_BINDINGS];
    /* The index buffer a draw of points as quads reads. See draw_points. */
    struct wvk_driver_buffer index;
-   /* The positions a draw of wide lines reads. See draw_lines. */
+   /* The positions a draw of wide lines reads, or the records a geometry
+    * shader does (draw_lines, draw_geometry); and what the latter writes. */
    struct wvk_driver_buffer capture;
+   struct wvk_driver_buffer gs_vertices, gs_indices;
    /* The last draw's pipeline layout. */
    struct wvk_layout *graphics_layout;
 
@@ -927,6 +931,7 @@ wvk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
       case MESA_SHADER_VERTEX: st->vs = st->bound_vs = shader; break;
       case MESA_SHADER_FRAGMENT: st->fs = st->bound_fs = shader; break;
       case MESA_SHADER_COMPUTE: st->cs = st->bound_cs = shader; break;
+      case MESA_SHADER_GEOMETRY: st->bound_gs = shader; break;
       default:
          if (shader)
             mesa_logw_once("wvk: %s shaders are not supported", _mesa_shader_stage_to_string(stages[i]));
@@ -1143,6 +1148,10 @@ driver_binding_buffer(const struct wvk_bound_state *st, uint32_t binding)
       return &st->index;
    if (binding == WVK_DRIVER_SLOT_CAPTURE)
       return &st->capture;
+   if (binding == WVK_DRIVER_SLOT_GS_VERTICES)
+      return &st->gs_vertices;
+   if (binding == WVK_DRIVER_SLOT_GS_INDICES)
+      return &st->gs_indices;
    return NULL;
 }
 
@@ -1522,6 +1531,10 @@ driver_key(const struct wvk_device *dev, const struct wvk_bgl *bgl, uint32_t gro
          key.index = d->serial;
       else if (binding == WVK_DRIVER_SLOT_CAPTURE)
          key.capture = d->serial;
+      else if (binding == WVK_DRIVER_SLOT_GS_VERTICES)
+         key.gs_vertices = d->serial;
+      else if (binding == WVK_DRIVER_SLOT_GS_INDICES)
+         key.gs_indices = d->serial;
       else
          key.vertex[binding - WVK_DRIVER_SLOT_VERTEX] = d->serial;
    }
@@ -2286,10 +2299,14 @@ set_pulled_buffers(struct wvk_device *dev, struct wvk_cmd_buffer *cmd, struct wv
       starts[i] = (uint32_t)(vb->offset - offset);
       wvk_replay_read(replay, vb->mem, vb->offset, vb->size);
    }
-   if (memcmp(st->push + WVK_DRIVER_PULL_OFFSET, starts, sizeof(starts)) ||
-       memcmp(st->push + WVK_DRIVER_PULL_STRIDES, strides, sizeof(strides))) {
-      memcpy(st->push + WVK_DRIVER_PULL_OFFSET, starts, sizeof(starts));
-      memcpy(st->push + WVK_DRIVER_PULL_STRIDES, strides, sizeof(strides));
+   /* The first four, and the rest past them. */
+   const uint32_t more[4] = { starts[4], starts[5], strides[4], strides[5] };
+   if (memcmp(st->push + WVK_DRIVER_PULL_OFFSET, starts, 16) ||
+       memcmp(st->push + WVK_DRIVER_PULL_STRIDES, strides, 16) ||
+       memcmp(st->push + WVK_DRIVER_PULL_MORE, more, sizeof(more))) {
+      memcpy(st->push + WVK_DRIVER_PULL_OFFSET, starts, 16);
+      memcpy(st->push + WVK_DRIVER_PULL_STRIDES, strides, 16);
+      memcpy(st->push + WVK_DRIVER_PULL_MORE, more, sizeof(more));
       st->push_offset = UINT32_MAX;
    }
 }
@@ -2649,6 +2666,8 @@ enum list_mode {
    LIST_TRIANGLES,
    LIST_EDGES,
    LIST_CORNERS,
+   /* The lines of a topology with adjacency. */
+   LIST_SEGMENTS,
 };
 
 static const char triangles_wgsl[] =
@@ -2668,7 +2687,19 @@ static const char triangles_wgsl[] =
    "fn corners(t: u32) -> vec3u {\n"
    "  if (p.topology == 0u) { return vec3u(t * 3u, t * 3u + 1u, t * 3u + 2u); }\n"
    "  if (p.topology == 1u) { return vec3u(t, t + 1u + (t & 1u), t + 2u - (t & 1u)); }\n"
+   /* With adjacency, without the adjacent: a list's, and a strip's, of
+    * Vulkan's table -- the same for its first and last primitives. */
+   "  if (p.topology == 5u) { return vec3u(t * 6u, t * 6u + 2u, t * 6u + 4u); }\n"
+   "  if (p.topology == 6u) {\n"
+   "    if ((t & 1u) != 0u) { return vec3u(t * 2u + 2u, t * 2u, t * 2u + 4u); }\n"
+   "    return vec3u(t * 2u, t * 2u + 2u, t * 2u + 4u);\n"
+   "  }\n"
    "  return vec3u(t + 1u, t + 2u, 0u);\n"
+   "}\n"
+   /* A line's ends, of a list and a strip with adjacency. */
+   "fn ends(t: u32) -> vec2u {\n"
+   "  if (p.topology == 3u) { return vec2u(t * 4u + 1u, t * 4u + 2u); }\n"
+   "  return vec2u(t + 1u, t + 2u);\n"
    "}\n"
    "fn emit(slot: u32, v: vec3u) {\n"
    "  if (p.mode == 1u) {\n"
@@ -2704,24 +2735,64 @@ static const char triangles_wgsl[] =
    "  }\n"
    "  for (; out < p.triangles; out++) { emit(out, select(vec3u(0u), last, p.mode == 2u)); }\n"
    "}\n"
+   /* And a strip with adjacency: each run between restarts a strip of
+    * its own, whose primitives' vertices are the same of any. */
+   "fn restarting_adjacent() {\n"
+   "  var out = 0u;\n"
+   "  var begin = 0u;\n"
+   "  for (var i = 0u; i <= p.count; i++) {\n"
+   "    if (i < p.count && index(i) != p.restart) { continue; }\n"
+   "    let len = i - begin;\n"
+   "    if (p.topology == 4u) {\n"
+   "      for (var t = 0u; t + 3u < len; t++) {\n"
+   "        dst[out * 2u] = index(begin + t + 1u); dst[out * 2u + 1u] = index(begin + t + 2u); out++;\n"
+   "      }\n"
+   "    } else if (len >= 6u) {\n"
+   "      for (var t = 0u; t < (len - 4u) / 2u; t++) {\n"
+   "        let c = corners(t);\n"
+   "        emit(out, vec3u(index(begin + c.x), index(begin + c.y), index(begin + c.z))); out++;\n"
+   "      }\n"
+   "    }\n"
+   "    begin = i + 1u;\n"
+   "  }\n"
+   "  for (; out < p.triangles; out++) {\n"
+   "    if (p.mode == 3u) { dst[out * 2u] = 0u; dst[out * 2u + 1u] = 0u; } else { emit(out, vec3u(0u)); }\n"
+   "  }\n"
+   "}\n"
    "@compute @workgroup_size(64)\n"
    "fn main(@builtin(global_invocation_id) id: vec3u) {\n"
    "  let t = id.x + id.y * 65535u * 64u;\n"
-   "  if (p.restart != 0u && p.topology != 0u) {\n"
+   "  if (p.restart != 0u && (p.topology == 1u || p.topology == 2u)) {\n"
    "    if (t == 0u) { restarting(); }\n"
    "    return;\n"
    "  }\n"
+   "  if (p.restart != 0u && (p.topology == 4u || p.topology == 6u)) {\n"
+   "    if (t == 0u) { restarting_adjacent(); }\n"
+   "    return;\n"
+   "  }\n"
    "  if (t >= p.triangles) { return; }\n"
+   "  if (p.mode == 3u) {\n"
+   "    let e = ends(t);\n"
+   "    dst[t * 2u] = index(e.x); dst[t * 2u + 1u] = index(e.y);\n"
+   "    return;\n"
+   "  }\n"
    "  let c = corners(t);\n"
    "  emit(t, vec3u(index(c.x), index(c.y), index(c.z)));\n"
    "}\n";
 
+/* The primitives a list is made of: triangles, or the lines of a
+ * topology with adjacency. */
 static uint32_t
 list_triangles(VkPrimitiveTopology topology, uint32_t count)
 {
-   if (topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
-      return count / 3;
-   return count >= 3 ? count - 2 : 0;
+   switch (topology) {
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: return count / 3;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY: return count / 4;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY: return count >= 4 ? count - 3 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY: return count / 6;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY: return count >= 6 ? (count - 4) / 2 : 0;
+   default: return count >= 3 ? count - 2 : 0;
+   }
 }
 
 /* A list of a draw's triangles, their edges or their corners, from the
@@ -2764,13 +2835,18 @@ triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
       base = start & ~255ull;
       end = start + (uint64_t)count * (wide ? 4 : 2);
    }
-   const uint32_t per = mode == LIST_EDGES ? 6 : 3;
+   const uint32_t per = mode == LIST_EDGES ? 6 : mode == LIST_SEGMENTS ? 2 : 3;
    const uint64_t out_bytes = (uint64_t)triangles * per * 4;
    WGPUBuffer out = wvk_replay_temp_buffer(dev, replay, out_bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_Index, NULL);
    /* The restart index, or 0 for none: no index is 0 and restarts. */
    const uint32_t restart = indexed && dyn->ia.primitive_restart_enable ? (wide ? 0xffffffffu : 0xffffu) : 0;
-   const uint32_t kind = topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ? 0
-                         : topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ? 1 : 2;
+   const uint32_t kind = topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST                    ? 0
+                         : topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP                 ? 1
+                         : topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY       ? 3
+                         : topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY      ? 4
+                         : topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY   ? 5
+                         : topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY  ? 6
+                                                                                           : 2;
    const uint32_t params[8] = { (uint32_t)(start - base), wide, count, restart, kind, mode, indexed, triangles };
    WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
    if (!out || !params_buffer)
@@ -2845,12 +2921,25 @@ polygon_list(const struct wvk_cmd_buffer *cmd, enum list_mode *mode, WGPUPrimiti
 {
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    const VkPrimitiveTopology t = dyn->ia.primitive_topology;
-   if (dyn->rs.polygon_mode == VK_POLYGON_MODE_FILL ||
+   /* Topologies with adjacency, which WebGPU has not, drawn without it:
+    * lines, and triangles as the polygon mode has them. */
+   if (t == VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY || t == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY) {
+      *mode = LIST_SEGMENTS;
+      *topology = WGPUPrimitiveTopology_LineList;
+      return true;
+   }
+   const bool adjacent = t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY ||
+                         t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+   if ((dyn->rs.polygon_mode == VK_POLYGON_MODE_FILL && !adjacent) ||
        (t != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && t != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP &&
-        t != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN))
+        t != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && !adjacent))
       return false;
-   *mode = dyn->rs.polygon_mode == VK_POLYGON_MODE_POINT ? LIST_CORNERS : LIST_EDGES;
-   *topology = *mode == LIST_CORNERS ? WGPUPrimitiveTopology_PointList : WGPUPrimitiveTopology_LineList;
+   *mode = dyn->rs.polygon_mode == VK_POLYGON_MODE_POINT  ? LIST_CORNERS
+           : dyn->rs.polygon_mode == VK_POLYGON_MODE_LINE ? LIST_EDGES
+                                                          : LIST_TRIANGLES;
+   *topology = *mode == LIST_CORNERS  ? WGPUPrimitiveTopology_PointList
+               : *mode == LIST_EDGES ? WGPUPrimitiveTopology_LineList
+                                     : WGPUPrimitiveTopology_TriangleList;
    return true;
 }
 
@@ -2951,8 +3040,9 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
    const enum wvk_draw_shape shape = replay->draw_points ? WVK_DRAW_POINTS
                                      : replay->draw_lines ? WVK_DRAW_LINES
                                                           : WVK_DRAW_PRIMITIVES;
-   st->fs = wvk_shader_draw_variant(dev, st->bound_fs, st->bound_vs, dyn, samples, has_depth, color_formats,
-                                    fs_images, shape, 0);
+   /* After a geometry shader, whose outputs the fragment shader reads. */
+   st->fs = wvk_shader_draw_variant(dev, st->bound_fs, st->bound_gs ? st->bound_gs : st->bound_vs, dyn, samples,
+                                    has_depth, color_formats, fs_images, shape, 0);
    st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats, vs_images,
                                     shape, 0);
    /* No fragment shader to do the depth bounds test: the driver's. */
@@ -2965,6 +3055,7 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
  * (expand_points), which it can of so many vertex buffers. */
 static bool run_vertices(struct wvk_cmd_buffer *cmd, unsigned runs, bool indexed, uint32_t first, uint32_t count,
                          uint32_t instances, int32_t base_vertex, uint32_t first_instance, uint32_t draw_id);
+static void dispatch_graphics(struct wvk_cmd_buffer *cmd, struct wvk_shader *cs, uint64_t invocations);
 
 /* Whether the vertex shader can pull every attribute it reads itself: of
  * formats it can read, of no more vertex buffers than it can bind. */
@@ -3146,9 +3237,28 @@ run_vertices(struct wvk_cmd_buffer *cmd, unsigned runs, bool indexed, uint32_t f
       memcpy(st->push + WVK_DRIVER_VERTEX_RUN, run, sizeof(run));
       st->push_offset = UINT32_MAX;
    }
+   /* The draw's parameters as the compute shader reads them. */
+   struct wvk_shader *draw_vs = st->vs;
+   st->vs = cs;
    set_draw_parameters(st, NULL, 0, indexed, indexed ? base_vertex : (int32_t)first, first_instance, draw_id);
+   st->vs = draw_vs;
    set_pulled_buffers(dev, cmd, replay, cs);
+   dispatch_graphics(cmd, cs, total);
+   return true;
+}
 
+/* A compute shader of the draw's -- a vertex or geometry shader run as one
+ * -- of `invocations`, rows of 64 by as many workgroups as fit, with the
+ * draw's sets and push data, whose records are its own: the render pass
+ * ended, and begun again after. */
+static void
+dispatch_graphics(struct wvk_cmd_buffer *cmd, struct wvk_shader *cs, uint64_t invocations)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   struct wvk_shader *vs = st->vs;
+   st->vs = cs;
    const bool in_pass = replay->pass != NULL;
    wvk_replay_end_passes(replay);
    struct wvk_compute_pipeline *p = get_compute_pipeline(dev, st, cs, WVK_BIND_GRAPHICS);
@@ -3165,7 +3275,7 @@ run_vertices(struct wvk_cmd_buffer *cmd, unsigned runs, bool indexed, uint32_t f
       }
       wgpuComputePassEncoderSetPipeline(replay->compute, p->pipeline);
       if (bind_groups(dev, replay, p->layout, WVK_BIND_GRAPHICS, NULL, replay->compute, false)) {
-         const uint32_t groups = (uint32_t)DIV_ROUND_UP(total, 64);
+         const uint32_t groups = (uint32_t)DIV_ROUND_UP(invocations, 64);
          const uint32_t x = MIN2(groups, 65535);
          wgpuComputePassEncoderDispatchWorkgroups(replay->compute, x, DIV_ROUND_UP(groups, x), 1);
       }
@@ -3173,9 +3283,9 @@ run_vertices(struct wvk_cmd_buffer *cmd, unsigned runs, bool indexed, uint32_t f
       util_dynarray_clear(&replay->texture_swaps);
    }
    wvk_replay_end_passes(replay);
+   st->vs = vs;
    if (in_pass)
       wvk_replay_restart_pass(cmd, replay->pass_layer);
-   return true;
 }
 
 /* A draw of points as quads (draws_points): a triangle list of six
@@ -3205,6 +3315,124 @@ draw_points(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t c
    replay->list_topology = WGPUPrimitiveTopology_Undefined;
 }
 
+/* The primitives of `count` vertices of a topology, an instance, as a
+ * geometry shader takes them; 0 for a topology it does not take them of. */
+static uint32_t
+geometry_primitives(VkPrimitiveTopology topology, enum mesa_prim input, uint32_t count)
+{
+   switch (topology) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+      return input == MESA_PRIM_POINTS ? count : 0;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+      return input == MESA_PRIM_LINES ? count / 2 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
+      return input == MESA_PRIM_LINES && count > 1 ? count - 1 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
+      return input == MESA_PRIM_TRIANGLES ? count / 3 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
+      return input == MESA_PRIM_TRIANGLES && count > 2 ? count - 2 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:
+      return input == MESA_PRIM_LINES_ADJACENCY ? count / 4 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY:
+      return input == MESA_PRIM_LINES_ADJACENCY && count > 3 ? count - 3 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:
+      return input == MESA_PRIM_TRIANGLES_ADJACENCY ? count / 6 : 0;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY:
+      return input == MESA_PRIM_TRIANGLES_ADJACENCY && count >= 6 ? (count - 4) / 2 : 0;
+   default:
+      return 0;
+   }
+}
+
+/* A draw with a geometry shader, which WebGPU has no stage of: the vertex
+ * shader run as compute, a record a vertex of each instance (key.runs 3);
+ * the geometry shader run as compute, an invocation a primitive of each
+ * instance and invocation of its, reading those, and writing the vertices
+ * it emits and the indices of the primitives they make, as a list
+ * (key.geometry 1); then a draw of that list, whose vertex shader reads
+ * the vertices (key.geometry 2). Primitives restarting in an indexed
+ * strip are not: the strip goes on. */
+static void
+draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t count, uint32_t instances,
+              int32_t base_vertex, uint32_t first_instance, uint32_t draw_id)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   const struct wvk_physical_device *pdev = wvk_device_physical(dev);
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   struct wvk_shader *gs = st->bound_gs;
+   if (!st->bound_vs || !count || !instances || replay->pass_idle)
+      return;
+   const VkPrimitiveTopology topology = dyn->ia.primitive_topology;
+   const uint32_t prims = geometry_primitives(topology, gs->gs_input, count);
+   if (!prims) {
+      if (!geometry_primitives(topology, gs->gs_input, 1024))
+         mesa_logw_once("wvk: a draw of a topology its geometry shader does not take");
+      return;
+   }
+   if (indexed && dyn->ia.primitive_restart_enable)
+      mesa_logw_once("wvk: an indexed draw with a geometry shader, whose primitives do not restart");
+   const uint64_t total = (uint64_t)prims * instances * gs->gs_invocations;
+   const uint32_t per = wvk_geometry_indices(gs->gs_output, gs->gs_max_vertices);
+   const uint64_t limit = pdev->limits.maxStorageBufferBindingSize;
+
+   /* The vertex shader's records. */
+   VkFormat images[WVK_MAX_UNFORMATTED_IMAGES];
+   unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_vs, images);
+   struct wvk_shader *vs =
+      wvk_shader_draw_variant(dev, st->bound_vs, NULL, dyn, 1, false, NULL, images, WVK_DRAW_PRIMITIVES, 3);
+   if (!vs || vs->vk.stage != MESA_SHADER_COMPUTE) {
+      mesa_logw_once("wvk: a vertex shader before a geometry shader, which could not be made a compute shader");
+      return;
+   }
+   const uint64_t records = (uint64_t)count * instances * wvk_record_stride(vs->record_vars);
+   /* The geometry shader's, and the draw's. */
+   struct wvk_shader *cs = wvk_shader_geometry_variant(dev, gs, 1, vs->record_vars, NULL, dyn);
+   struct wvk_shader *passthrough = wvk_shader_geometry_variant(dev, gs, 2, 0, st->fs, dyn);
+   if (!cs || !passthrough) {
+      mesa_logw_once("wvk: a geometry shader that could not be made compute");
+      return;
+   }
+   /* A pass drawn a layer at a time draws in its others only what chooses
+    * its layer: again, each culling what is not its. */
+   if (replay->pass_layered && !replay->pass_multiview && replay->pass_layer && !passthrough->writes_layer)
+      return;
+   const uint64_t vertices = (1 + total * gs->gs_max_vertices) * wvk_record_stride(gs->record_vars);
+   const uint64_t indices = total * per;
+   if (records > limit || vertices > limit || indices * 4 > limit || total > UINT32_MAX) {
+      mesa_logw_once("wvk: a draw with a geometry shader of more than its buffers can bind");
+      return;
+   }
+   WGPUBuffer capture = wvk_replay_temp_buffer(dev, replay, MAX2(records, 16), WGPUBufferUsage_Storage, NULL);
+   WGPUBuffer out = wvk_replay_temp_buffer(dev, replay, vertices, WGPUBufferUsage_Storage, NULL);
+   WGPUBuffer list = wvk_replay_temp_buffer(dev, replay, MAX2(indices * 4, 16),
+                                            WGPUBufferUsage_Storage | WGPUBufferUsage_Index, NULL);
+   if (!capture || !out || !list)
+      return;
+   st->capture = (struct wvk_driver_buffer){ capture, ++dev->temp_serial | (1ull << 62), 0, MAX2(records, 16) };
+   st->gs_vertices = (struct wvk_driver_buffer){ out, ++dev->temp_serial | (1ull << 62), 0, vertices };
+   st->gs_indices = (struct wvk_driver_buffer){ list, ++dev->temp_serial | (1ull << 62), 0, MAX2(indices * 4, 16) };
+
+   if (!run_vertices(cmd, 3, indexed, first, count, instances, base_vertex, first_instance, draw_id))
+      return;
+   const uint32_t geometry[4] = { count, prims, (uint32_t)total, topology };
+   if (memcmp(st->push + WVK_DRIVER_GEOMETRY, geometry, sizeof(geometry))) {
+      memcpy(st->push + WVK_DRIVER_GEOMETRY, geometry, sizeof(geometry));
+      st->push_offset = UINT32_MAX;
+   }
+   dispatch_graphics(cmd, cs, total);
+
+   struct wvk_shader *draw_vs = st->vs;
+   st->vs = passthrough;
+   const WGPUPrimitiveTopology primitives = gs->gs_output == MESA_PRIM_TRIANGLE_STRIP ? WGPUPrimitiveTopology_TriangleList
+                                            : gs->gs_output == MESA_PRIM_LINE_STRIP  ? WGPUPrimitiveTopology_LineList
+                                                                                     : WGPUPrimitiveTopology_PointList;
+   draw_list(cmd, list, (uint32_t)indices, primitives, 1, 0, 0, true, draw_id);
+   st->vs = draw_vs;
+}
+
 static void
 draw_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
             uint32_t firstInstance, uint32_t draw_id)
@@ -3214,6 +3442,10 @@ draw_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertexCount, uint32_t instanceC
    cmd->replay->draw_points = draws_points(cmd);
    cmd->replay->draw_lines = draws_lines(cmd);
    select_draw_shaders(cmd);
+   if (cmd->replay->state->bound_gs) {
+      draw_geometry(cmd, false, firstVertex, vertexCount, instanceCount, 0, firstInstance, draw_id);
+      return;
+   }
    run_vertex_writes(cmd, false, firstVertex, vertexCount, instanceCount, 0, firstInstance, draw_id);
    if (cmd->replay->draw_points || cmd->replay->draw_lines) {
       if (cmd->replay->draw_points)
@@ -3246,6 +3478,10 @@ draw_elements(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instance
    cmd->replay->draw_points = draws_points(cmd);
    cmd->replay->draw_lines = draws_lines(cmd);
    select_draw_shaders(cmd);
+   if (cmd->replay->state->bound_gs) {
+      draw_geometry(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
+      return;
+   }
    run_vertex_writes(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
    if (cmd->replay->draw_points || cmd->replay->draw_lines) {
       if (cmd->replay->draw_points)
