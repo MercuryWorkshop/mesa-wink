@@ -162,8 +162,21 @@ create_device(void)
    WGPUInstanceDescriptor instance_desc = WGPU_INSTANCE_DESCRIPTOR_INIT;
    /* WaitAny is what the two requests below are answered through, and it is
     * off unless asked for. */
+#ifdef WGPU_INSTANCE_LIMITS_INIT
+   /* An instance feature and limit since mid-2025's webgpu.h, which had them
+    * as instance "capabilities". */
+   static const WGPUInstanceFeatureName instance_features[] = {
+      WGPUInstanceFeatureName_TimedWaitAny,
+   };
+   WGPUInstanceLimits instance_limits = WGPU_INSTANCE_LIMITS_INIT;
+   instance_limits.timedWaitAnyMaxCount = 4;
+   instance_desc.requiredFeatureCount = ARRAY_SIZE(instance_features);
+   instance_desc.requiredFeatures = instance_features;
+   instance_desc.requiredLimits = &instance_limits;
+#else
    instance_desc.capabilities.timedWaitAnyEnable = 1;
    instance_desc.capabilities.timedWaitAnyMaxCount = 4;
+#endif
    WGPUInstance instance = wgpuCreateInstance(&instance_desc);
    native_instance = instance;
    if (!instance) {
@@ -263,6 +276,19 @@ create_device(void)
     * 12, and storage buffers in the vertex stage default to none at all. */
    WGPULimits adapter_limits = WGPU_LIMITS_INIT;
    WGPULimits limits = WGPU_LIMITS_INIT;
+#ifdef WGPU_COMPATIBILITY_MODE_LIMITS_INIT
+   /* The per-stage storage limits, in a struct of their own since mid-2025's
+    * webgpu.h: chained to both the query and the request. */
+   WGPUCompatibilityModeLimits adapter_stage_limits = WGPU_COMPATIBILITY_MODE_LIMITS_INIT;
+   WGPUCompatibilityModeLimits stage_limits = WGPU_COMPATIBILITY_MODE_LIMITS_INIT;
+   adapter_limits.nextInChain = &adapter_stage_limits.chain;
+   limits.nextInChain = &stage_limits.chain;
+#define GEX_ADAPTER_STAGE adapter_stage_limits
+#define GEX_STAGE stage_limits
+#else
+#define GEX_ADAPTER_STAGE adapter_limits
+#define GEX_STAGE limits
+#endif
    const bool have_limits =
       wgpuAdapterGetLimits(adapter_result.adapter, &adapter_limits) ==
       WGPUStatus_Success;
@@ -271,6 +297,10 @@ create_device(void)
       if (adapter_limits.field != WGPU_LIMIT_U32_UNDEFINED &&               \
           adapter_limits.field > 0)                                         \
          limits.field = MIN2(adapter_limits.field, (uint32_t)(value))
+#define GEX_WANT_STAGE(field, value)                                        \
+      if (GEX_ADAPTER_STAGE.field != WGPU_LIMIT_U32_UNDEFINED &&            \
+          GEX_ADAPTER_STAGE.field > 0)                                      \
+         GEX_STAGE.field = MIN2(GEX_ADAPTER_STAGE.field, (uint32_t)(value))
       GEX_WANT(maxUniformBuffersPerShaderStage, 16);
       GEX_WANT(maxInterStageShaderVariables, 32);
       /* A uniform block is bound with a dynamic offset here -- one buffer
@@ -314,8 +344,8 @@ create_device(void)
        * tessellation_shader's max_in_out_attributes. */
       GEX_WANT(maxVertexAttributes, 32);
       GEX_WANT(maxStorageBuffersPerShaderStage, 24);
-      GEX_WANT(maxStorageBuffersInVertexStage, 24);
-      GEX_WANT(maxStorageBuffersInFragmentStage, 24);
+      GEX_WANT_STAGE(maxStorageBuffersInVertexStage, 24);
+      GEX_WANT_STAGE(maxStorageBuffersInFragmentStage, 24);
       /* Storage *textures*, which WebGPU defaults to four per stage where
        * GL 4.2 asks for eight image uniforms. Dawn says so itself when a
        * shader wants more --
@@ -330,8 +360,8 @@ create_device(void)
        * GEX_WGPU_MAX_SAMPLERS, which live in gex_wgpu_screen.c and are
        * not visible here; keep them in step. */
       GEX_WANT(maxStorageTexturesPerShaderStage, 8);
-      GEX_WANT(maxStorageTexturesInVertexStage, 8);
-      GEX_WANT(maxStorageTexturesInFragmentStage, 8);
+      GEX_WANT_STAGE(maxStorageTexturesInVertexStage, 8);
+      GEX_WANT_STAGE(maxStorageTexturesInFragmentStage, 8);
       /* And sampled textures, for the same reason: GL 3.3 wants sixteen per
        * stage, which is WebGPU's default, but a stage that also splits
        * combined samplers can name more. */
@@ -384,6 +414,7 @@ create_device(void)
       GEX_WANT_LOW(minUniformBufferOffsetAlignment, 32);
       GEX_WANT_LOW(minStorageBufferOffsetAlignment, 32);
 #undef GEX_WANT_LOW
+#undef GEX_WANT_STAGE
 #undef GEX_WANT
       if (getenv("GEX_WGPU_LIMIT_TRACE"))
          fprintf(stderr, "gex-limits: adapter vertex attributes %u "
@@ -398,8 +429,8 @@ create_device(void)
                  adapter_limits.maxStorageTexturesPerShaderStage,
                  adapter_limits.maxStorageBuffersPerShaderStage,
                  limits.maxStorageBuffersPerShaderStage,
-                 adapter_limits.maxStorageBuffersInVertexStage,
-                 adapter_limits.maxStorageBuffersInFragmentStage);
+                 GEX_ADAPTER_STAGE.maxStorageBuffersInVertexStage,
+                 GEX_ADAPTER_STAGE.maxStorageBuffersInFragmentStage);
       if (getenv("GEX_WGPU_LIMIT_TRACE"))
          fprintf(stderr, "gex-limits: adapter buffer offset alignment "
                  "uniform %u storage %u (lower is better; the default is "

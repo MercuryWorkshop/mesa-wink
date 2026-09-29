@@ -1,0 +1,166 @@
+Tint's AST SPIR-V reader maps only the original storage texel formats; WGSL at
+this Dawn revision has every texture-formats-tier1 one. Map the rest.
+Applies to Dawn cdda346c7ce9483630118c275e20ee128b736afb.
+
+--- a/src/tint/lang/spirv/reader/ast_parser/ast_parser.cc	2026-09-28 21:48:49
++++ b/src/tint/lang/spirv/reader/ast_parser/ast_parser.cc	2026-09-28 21:48:49
+@@ -2701,6 +2701,11 @@
+         case core::TexelFormat::kRg32Uint:
+         case core::TexelFormat::kRgba16Uint:
+         case core::TexelFormat::kRgba32Uint:
++        case core::TexelFormat::kR8Uint:
++        case core::TexelFormat::kRg8Uint:
++        case core::TexelFormat::kR16Uint:
++        case core::TexelFormat::kRg16Uint:
++        case core::TexelFormat::kRgb10A2Uint:
+             return ty_.U32();
+ 
+         case core::TexelFormat::kR32Sint:
+@@ -2708,6 +2713,10 @@
+         case core::TexelFormat::kRg32Sint:
+         case core::TexelFormat::kRgba16Sint:
+         case core::TexelFormat::kRgba32Sint:
++        case core::TexelFormat::kR8Sint:
++        case core::TexelFormat::kRg8Sint:
++        case core::TexelFormat::kR16Sint:
++        case core::TexelFormat::kRg16Sint:
+             return ty_.I32();
+ 
+         case core::TexelFormat::kRgba8Unorm:
+@@ -2716,6 +2725,20 @@
+         case core::TexelFormat::kRg32Float:
+         case core::TexelFormat::kRgba16Float:
+         case core::TexelFormat::kRgba32Float:
++        case core::TexelFormat::kR8Unorm:
++        case core::TexelFormat::kR8Snorm:
++        case core::TexelFormat::kRg8Unorm:
++        case core::TexelFormat::kRg8Snorm:
++        case core::TexelFormat::kR16Unorm:
++        case core::TexelFormat::kR16Snorm:
++        case core::TexelFormat::kR16Float:
++        case core::TexelFormat::kRg16Unorm:
++        case core::TexelFormat::kRg16Snorm:
++        case core::TexelFormat::kRg16Float:
++        case core::TexelFormat::kRgba16Unorm:
++        case core::TexelFormat::kRgba16Snorm:
++        case core::TexelFormat::kRgb10A2Unorm:
++        case core::TexelFormat::kRg11B10Ufloat:
+             return ty_.F32();
+         default:
+             break;
+@@ -2729,15 +2752,37 @@
+         case core::TexelFormat::kR32Float:
+         case core::TexelFormat::kR32Sint:
+         case core::TexelFormat::kR32Uint:
++        case core::TexelFormat::kR8Unorm:
++        case core::TexelFormat::kR8Snorm:
++        case core::TexelFormat::kR8Uint:
++        case core::TexelFormat::kR8Sint:
++        case core::TexelFormat::kR16Unorm:
++        case core::TexelFormat::kR16Snorm:
++        case core::TexelFormat::kR16Uint:
++        case core::TexelFormat::kR16Sint:
++        case core::TexelFormat::kR16Float:
+             // One channel
+             return 1;
+ 
+         case core::TexelFormat::kRg32Float:
+         case core::TexelFormat::kRg32Sint:
+         case core::TexelFormat::kRg32Uint:
++        case core::TexelFormat::kRg8Unorm:
++        case core::TexelFormat::kRg8Snorm:
++        case core::TexelFormat::kRg8Uint:
++        case core::TexelFormat::kRg8Sint:
++        case core::TexelFormat::kRg16Unorm:
++        case core::TexelFormat::kRg16Snorm:
++        case core::TexelFormat::kRg16Uint:
++        case core::TexelFormat::kRg16Sint:
++        case core::TexelFormat::kRg16Float:
+             // Two channels
+             return 2;
+ 
++        case core::TexelFormat::kRg11B10Ufloat:
++            // Three channels
++            return 3;
++
+         case core::TexelFormat::kRgba16Float:
+         case core::TexelFormat::kRgba16Sint:
+         case core::TexelFormat::kRgba16Uint:
+@@ -2748,6 +2793,10 @@
+         case core::TexelFormat::kRgba8Snorm:
+         case core::TexelFormat::kRgba8Uint:
+         case core::TexelFormat::kRgba8Unorm:
++        case core::TexelFormat::kRgba16Unorm:
++        case core::TexelFormat::kRgba16Snorm:
++        case core::TexelFormat::kRgb10A2Unorm:
++        case core::TexelFormat::kRgb10A2Uint:
+             // Four channels
+             return 4;
+ 
+--- a/src/tint/lang/spirv/reader/ast_parser/enum_converter.cc	2026-09-28 21:47:37
++++ b/src/tint/lang/spirv/reader/ast_parser/enum_converter.cc	2026-09-28 21:48:49
+@@ -159,8 +159,49 @@
+             return core::TexelFormat::kRgba8Uint;
+         case spv::ImageFormat::Rgba8i:
+             return core::TexelFormat::kRgba8Sint;
++        // texture-formats-tier1
++        case spv::ImageFormat::R8:
++            return core::TexelFormat::kR8Unorm;
++        case spv::ImageFormat::R8Snorm:
++            return core::TexelFormat::kR8Snorm;
++        case spv::ImageFormat::R8ui:
++            return core::TexelFormat::kR8Uint;
++        case spv::ImageFormat::R8i:
++            return core::TexelFormat::kR8Sint;
++        case spv::ImageFormat::Rg8:
++            return core::TexelFormat::kRg8Unorm;
++        case spv::ImageFormat::Rg8Snorm:
++            return core::TexelFormat::kRg8Snorm;
++        case spv::ImageFormat::Rg8ui:
++            return core::TexelFormat::kRg8Uint;
++        case spv::ImageFormat::Rg8i:
++            return core::TexelFormat::kRg8Sint;
+ 
+         // 16 bit channels
++        case spv::ImageFormat::R16:
++            return core::TexelFormat::kR16Unorm;
++        case spv::ImageFormat::R16Snorm:
++            return core::TexelFormat::kR16Snorm;
++        case spv::ImageFormat::R16ui:
++            return core::TexelFormat::kR16Uint;
++        case spv::ImageFormat::R16i:
++            return core::TexelFormat::kR16Sint;
++        case spv::ImageFormat::R16f:
++            return core::TexelFormat::kR16Float;
++        case spv::ImageFormat::Rg16:
++            return core::TexelFormat::kRg16Unorm;
++        case spv::ImageFormat::Rg16Snorm:
++            return core::TexelFormat::kRg16Snorm;
++        case spv::ImageFormat::Rg16ui:
++            return core::TexelFormat::kRg16Uint;
++        case spv::ImageFormat::Rg16i:
++            return core::TexelFormat::kRg16Sint;
++        case spv::ImageFormat::Rg16f:
++            return core::TexelFormat::kRg16Float;
++        case spv::ImageFormat::Rgba16:
++            return core::TexelFormat::kRgba16Unorm;
++        case spv::ImageFormat::Rgba16Snorm:
++            return core::TexelFormat::kRgba16Snorm;
+         case spv::ImageFormat::Rgba16ui:
+             return core::TexelFormat::kRgba16Uint;
+         case spv::ImageFormat::Rgba16i:
+@@ -187,6 +228,14 @@
+             return core::TexelFormat::kRgba32Sint;
+         case spv::ImageFormat::Rgba32f:
+             return core::TexelFormat::kRgba32Float;
++
++        // Packed, texture-formats-tier1
++        case spv::ImageFormat::Rgb10A2:
++            return core::TexelFormat::kRgb10A2Unorm;
++        case spv::ImageFormat::Rgb10a2ui:
++            return core::TexelFormat::kRgb10A2Uint;
++        case spv::ImageFormat::R11fG11fB10f:
++            return core::TexelFormat::kRg11B10Ufloat;
+         default:
+             break;
+     }

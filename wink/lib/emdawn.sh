@@ -1,12 +1,13 @@
 # emdawnwebgpu: webgpu.h and its JS implementation. Sourced by wink/build.sh.
 #
 # Pinned to the release whose Dawn revision is the one Tint is built from
-# (b465e23), which is also what gex and MobileGL use. The package was built
-# against emsdk 4.0.3; tools/patch-emdawnwebgpu.py carries the edits that make
-# its JS load under 3.1.56 and behave in a heap over 2 GB.
+# (cdda346): the last with Tint's AST SPIR-V reader, and the first release
+# with texture-formats-tier1/tier2 and primitive-index that still has it. The
+# package was built against emsdk 4.0.8; tools/patch-emdawnwebgpu.py carries
+# the edits that make its JS load under 3.1.56 and behave in a heap over 2 GB.
 
-WINK_EMDAWN_VERSION=v20250428.134257
-WINK_EMDAWN_SHA512=e8eb56157f52c229e87848a6c9cd062035a987ee420cfe05287dc7b7d6bd0cae1cdcd8d010ad362f40f6a785b3133ca2efe0e655c94f5b3d92210fb0e59c574e
+WINK_EMDAWN_VERSION=v20250822.104650
+WINK_EMDAWN_SHA512=7658dabf1bc593d23f57878edf48c8b1d3e5e55cab40cfb7523598ac90accddde6c4806e8ce9c53bd668f9116ad8c1bc7ed81d46b889feb8f7beb180b8eac0d3
 WINK_EMDAWN_URL="https://github.com/google/dawn/releases/download/$WINK_EMDAWN_VERSION/emdawnwebgpu_pkg-$WINK_EMDAWN_VERSION.zip"
 
 emdawn_setup() {

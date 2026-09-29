@@ -99,5 +99,7 @@ libwink_webgpu = static_library(
   'wink_webgpu',
   join_paths(gex_emdawn_dir, 'webgpu', 'src', 'webgpu.cpp'),
   include_directories : [gex_emdawn_include],
+  # std::span, since emdawnwebgpu v20250822.
+  override_options : ['cpp_std=c++20'],
   install : false,
 )

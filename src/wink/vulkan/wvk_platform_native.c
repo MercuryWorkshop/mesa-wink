@@ -15,8 +15,23 @@ wvk_platform_create_instance(void)
    WGPUInstanceDescriptor desc = WGPU_INSTANCE_DESCRIPTOR_INIT;
    /* WaitAny with a timeout is how requests, fences and vkWaitSemaphores
     * are answered, and it is off unless asked for. */
+#ifdef WGPU_INSTANCE_LIMITS_INIT
+   /* An instance feature and limit since mid-2025's webgpu.h. So is a device
+    * per VkDevice from the one adapter: Dawn otherwise marks an adapter
+    * consumed by its first device, as WebGPU says. */
+   static const WGPUInstanceFeatureName features[] = {
+      WGPUInstanceFeatureName_TimedWaitAny,
+      WGPUInstanceFeatureName_MultipleDevicesPerAdapter,
+   };
+   WGPUInstanceLimits limits = WGPU_INSTANCE_LIMITS_INIT;
+   limits.timedWaitAnyMaxCount = 64;
+   desc.requiredFeatureCount = ARRAY_SIZE(features);
+   desc.requiredFeatures = features;
+   desc.requiredLimits = &limits;
+#else
    desc.capabilities.timedWaitAnyEnable = 1;
    desc.capabilities.timedWaitAnyMaxCount = 64;
+#endif
    return wgpuCreateInstance(&desc);
 }
 

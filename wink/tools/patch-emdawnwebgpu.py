@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Make the pinned emdawnwebgpu package work under Emscripten 3.1.56.
 
-The package (Dawn b465e23, release v20250428.134257) was built against emsdk
-4.0.3. Each edit below is applied independently and idempotently: text already
+The package (Dawn cdda346, release v20250822.104650) was built against emsdk
+4.0.8. Each edit below is applied independently and idempotently: text already
 in its new form is left alone, text in its old form is replaced, and text in
 neither form is an error -- a silently unpatched library is the failure this
 exists to prevent.
@@ -21,13 +21,16 @@ EDITS = {
         # The non-Asyncify stub must take the arguments its signature declares,
         # or 3.1.56's library processing rejects the mismatch.
         ('emwgpuWaitAny: () => {',
-         'emwgpuWaitAny: (futurePtr, futureCount, timeoutNSPtr) => {'),
+         'emwgpuWaitAny: (futurePtr, futureCount, timeoutMSPtr) => {'),
         # Objects are keyed by pointer, but _emwgpuCreate* returns reach JS as
         # signed i32: in a heap over 2 GB -- the .NET host's is about 4 GB --
-        # inserts land under negative keys while lookups are >>> 0. Make every
-        # key unsigned.
-        ('WebGPU.Internals.jsObjects[ptr]',
-         'WebGPU.Internals.jsObjects[ptr >>> 0]'),
+        # inserts land under negative keys while lookups are >>> 0. Upstream
+        # made jsObjectInsert and getJsObject unsigned; the import and delete
+        # paths still are not.
+        ('WebGPU.Internals.jsObjects[ptr] = obj;',
+         'WebGPU.Internals.jsObjects[ptr >>> 0] = obj;'),
+        ('delete WebGPU.Internals.jsObjects[ptr];',
+         'delete WebGPU.Internals.jsObjects[ptr >>> 0];'),
     ],
     'webgpu/src/library_webgpu_enum_tables.js': [
         # Upstream typo: the WebGPU blend factor is 'src1-alpha'. The wrong

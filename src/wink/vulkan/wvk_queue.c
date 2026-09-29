@@ -28,8 +28,14 @@ pending_at(struct wvk_queue *queue, uint32_t i)
    return &queue->pending[(queue->pending_first + i) % WVK_MAX_PENDING_SUBMITS];
 }
 
+/* webgpu.h gave the callback a message in mid-2025, in the same revision that
+ * moved the per-stage storage limits to WGPUCompatibilityModeLimits. */
 static void
+#ifdef WGPU_COMPATIBILITY_MODE_LIMITS_INIT
+on_work_done(WGPUQueueWorkDoneStatus status, WGPUStringView message, void *userdata1, void *userdata2)
+#else
 on_work_done(WGPUQueueWorkDoneStatus status, void *userdata1, void *userdata2)
+#endif
 {
    struct wvk_queue *queue = userdata1;
    struct wvk_pending_submit *p = userdata2;

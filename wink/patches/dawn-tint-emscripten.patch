@@ -1,7 +1,7 @@
 Provenance: r58Playz/MobileGL feat/wasm-webgpu-backend, tools/tint/dawn-tint-emscripten.patch.
 Dawn's CMake builds only emdawnwebgpu under Emscripten; these two hunks let it
 build Tint's SPIR-V reader and WGSL writer for wasm instead. Applies to Dawn
-b465e23d19a5e27402d80191c0f8de1fb3b385b5.
+b465e23d19a5e27402d80191c0f8de1fb3b385b5 and cdda346c7ce9483630118c275e20ee128b736afb.
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 9ce9f3d3..a6886ed3 100644

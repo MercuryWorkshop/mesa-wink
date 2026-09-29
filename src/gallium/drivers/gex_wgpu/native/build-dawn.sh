@@ -17,7 +17,7 @@ set -euo pipefail
 ROOT="${GEX_DAWN_ROOT:-$HOME/.cache/gex-wgpu-dawn}"
 SRC="${GEX_DAWN_SRC:-$ROOT/dawn}"
 BUILD="$ROOT/build"
-REF=b465e23d19a5e27402d80191c0f8de1fb3b385b5
+REF=cdda346c7ce9483630118c275e20ee128b736afb
 JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 if [ -n "${GEX_DAWN_SRC:-}" ]; then

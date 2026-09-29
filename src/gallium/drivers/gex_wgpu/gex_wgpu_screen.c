@@ -47937,6 +47937,16 @@ gex_wgpu_screen_create(WGPUDevice device)
       feedback that recorded nothing. */
    gex_wgpu_check_capture_formats();
    WGPULimits limits = WGPU_LIMITS_INIT;
+   /* The per-stage storage buffer limits: WGPULimits fields in older webgpu.h,
+    * a chained WGPUCompatibilityModeLimits in newer ones. emdawnwebgpu fills
+    * neither, and asserts that the struct it fills has no chain, so in a
+    * browser they stay undefined -- which the fallbacks below expect. */
+   uint32_t storage_buffers_vertex = WGPU_LIMIT_U32_UNDEFINED;
+   uint32_t storage_buffers_fragment = WGPU_LIMIT_U32_UNDEFINED;
+#if defined(WGPU_COMPATIBILITY_MODE_LIMITS_INIT) && !defined(__EMSCRIPTEN__)
+   WGPUCompatibilityModeLimits stage_limits = WGPU_COMPATIBILITY_MODE_LIMITS_INIT;
+   limits.nextInChain = &stage_limits.chain;
+#endif
    /* WebGPU's guaranteed minimums, which is what the device is assumed to
     * have until it says otherwise. */
    screen->max_texture_2d = 8192;
@@ -47955,6 +47965,13 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->storage_offset_alignment = 256;
    const bool got_limits =
       wgpuDeviceGetLimits(device, &limits) == WGPUStatus_Success;
+#if !defined(WGPU_COMPATIBILITY_MODE_LIMITS_INIT)
+   storage_buffers_vertex = limits.maxStorageBuffersInVertexStage;
+   storage_buffers_fragment = limits.maxStorageBuffersInFragmentStage;
+#elif !defined(__EMSCRIPTEN__)
+   storage_buffers_vertex = stage_limits.maxStorageBuffersInVertexStage;
+   storage_buffers_fragment = stage_limits.maxStorageBuffersInFragmentStage;
+#endif
    if (got_limits) {
       screen->max_uniform_buffers = limits.maxUniformBuffersPerShaderStage;
       if (limits.maxDynamicUniformBuffersPerPipelineLayout !=
@@ -48026,9 +48043,9 @@ gex_wgpu_screen_create(WGPUDevice device)
        * an overflow and silently *lowered* a cap. Fall back to the limit that
        * is always present. */
       screen->max_storage_buffers_vertex =
-         limits.maxStorageBuffersInVertexStage == WGPU_LIMIT_U32_UNDEFINED
+         storage_buffers_vertex == WGPU_LIMIT_U32_UNDEFINED
             ? limits.maxStorageBuffersPerShaderStage
-            : limits.maxStorageBuffersInVertexStage;
+            : storage_buffers_vertex;
       if (screen->max_storage_buffers_vertex == WGPU_LIMIT_U32_UNDEFINED)
          screen->max_storage_buffers_vertex = 0;
       /* Same undefined-means-absent rule as the vertex figure above. */
@@ -48069,7 +48086,7 @@ gex_wgpu_screen_create(WGPUDevice device)
     * capability path above already falls back for it, and only this line took
     * it literally. An instrument that misnames a field and prints a sentinel
     * as a quantity is worse than no instrument. */
-   const uint32_t storage_fragment = limits.maxStorageBuffersInFragmentStage;
+   const uint32_t storage_fragment = storage_buffers_fragment;
    fprintf(stderr,
            "gex-wgpu: compute limits invocations/workgroup %u "
            "workgroup %ux%ux%u grid %ux%ux%u storage/fragment %s%u\n",
