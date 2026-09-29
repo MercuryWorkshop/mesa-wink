@@ -17672,6 +17672,22 @@ gex_wgpu_backing_is_float32(enum pipe_format format)
           backing == PIPE_FORMAT_R32G32B32A32_FLOAT;
 }
 
+/* The format st/mesa's glCopyImageSubData reinterprets a texel's bytes
+ * through, where the two formats differ.
+ *
+ * For two 16-bit channels it picks R16G16_UNORM, which this driver stores
+ * widened to float32 (gex_wgpu_format_backing), so no four-byte texture
+ * can be viewed as it: every copy of the 32-bit view class that went that
+ * way was declined -- 800-odd of dEQP-GLES31.functional.copy_image. It
+ * reinterprets, so the channel type is the caller's to ignore, and
+ * R16G16_UINT is the same bytes stored as they are. */
+static enum pipe_format
+gex_wgpu_get_canonical_format(struct pipe_screen *screen, enum pipe_format format)
+{
+   (void)screen;
+   return format == PIPE_FORMAT_R16G16_UNORM ? PIPE_FORMAT_R16G16_UINT : format;
+}
+
 static WGPUTextureFormat
 gex_wgpu_texture_format(enum pipe_format format)
 {
@@ -48755,6 +48771,7 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->base.get_vendor = gex_wgpu_get_vendor;
    screen->base.get_device_vendor = gex_wgpu_get_device_vendor;
    screen->base.is_format_supported = gex_wgpu_is_format_supported;
+   screen->base.get_canonical_format = gex_wgpu_get_canonical_format;
    /* Required alongside caps.query_timestamp: st/mesa calls this for
     * glGetInteger64v(GL_TIMESTAMP). Same CPU clock as the timer queries. */
    screen->base.get_timestamp = u_default_get_timestamp;
