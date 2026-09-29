@@ -1208,6 +1208,77 @@ cube_image_as_array(nir_builder *b, nir_intrinsic_instr *intr)
    nir_instr_remove(nir_def_instr(placeholder));
 }
 
+/* Whether an image variable is written: stored to, or its texels atomics'. */
+static bool
+image_written_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_image_deref_store && intr->intrinsic != nir_intrinsic_image_deref_atomic &&
+       intr->intrinsic != nir_intrinsic_image_deref_atomic_swap)
+      return false;
+   nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+   if (var)
+      _mesa_set_add(data, var);
+   return false;
+}
+
+/* Storage images without a format (shaderStorageImageWriteWithoutFormat
+ * and ReadWithoutFormat), which WGSL's have to have: the format of the
+ * view a draw or dispatch binds there, which its variant is compiled for
+ * (`records`); until one is, the 32-bit one-channel format of the image's
+ * type, which WebGPU reads and writes, and atomics want. One only read is
+ * a texture, which needs none. After split_resource_vars, where each
+ * variable is one slot. */
+static void
+format_storage_images(nir_shader *nir, struct wvk_shader *shader, const struct wvk_shader_key *records,
+                      struct util_dynarray *bgra)
+{
+   struct set *written = _mesa_pointer_set_create(NULL);
+   nir_shader_intrinsics_pass(nir, image_written_instr, nir_metadata_all, written);
+   nir_foreach_variable_with_modes(var, nir, nir_var_image) {
+      if (var->data.image.format != PIPE_FORMAT_NONE || !_mesa_set_search(written, var))
+         continue;
+      const enum glsl_base_type base = glsl_get_sampler_result_type(glsl_without_array(var->type));
+      VkFormat format = base == GLSL_TYPE_INT    ? VK_FORMAT_R32_SINT
+                        : base == GLSL_TYPE_UINT ? VK_FORMAT_R32_UINT
+                                                 : VK_FORMAT_R32_SFLOAT;
+      if (shader->unformatted_count < WVK_MAX_UNFORMATTED_IMAGES) {
+         const unsigned i = shader->unformatted_count++;
+         shader->unformatted[i] = (uint16_t)(var->data.descriptor_set << 10 | var->data.binding);
+         if (records && records->image_format[i])
+            format = (VkFormat)records->image_format[i];
+         shader->key.image_format[i] = format;
+      } else {
+         mesa_logw_once("wvk: more storage images without a format than %u", WVK_MAX_UNFORMATTED_IMAGES);
+      }
+      /* SPIR-V has no BGRA8 format, which WGSL's storage textures have
+       * (bgra8unorm-storage), and which is the same to the shader: RGBA8
+       * as ntv declares it, BGRA8 in the WGSL and the layout after. */
+      if (format == VK_FORMAT_B8G8R8A8_UNORM) {
+         format = VK_FORMAT_R8G8B8A8_UNORM;
+         const uint32_t at = var->data.descriptor_set << 16 | var->data.binding;
+         util_dynarray_append(bgra, at);
+      }
+      var->data.image.format = vk_format_to_pipe_format(format);
+   }
+   _mesa_set_destroy(written, NULL);
+}
+
+/* A storage texture ntv declared rgba8unorm that is bgra8unorm (see
+ * format_storage_images): its declaration in the WGSL, in place. */
+static void
+declare_bgra_storage(char *wgsl, uint32_t group, uint32_t binding)
+{
+   char decl[48];
+   snprintf(decl, sizeof(decl), "@group(%u) @binding(%u) var ", group, binding);
+   char *at = wgsl ? strstr(wgsl, decl) : NULL;
+   if (!at)
+      return;
+   const char *end = strchr(at, ';');
+   char *format = strstr(at, "<rgba8unorm,");
+   if (format && end && format < end)
+      memcpy(format + 1, "bgra8unorm", strlen("bgra8unorm"));
+}
+
 /* Image loads and stores typed as the image is: SignExtend and ZeroExtend
  * let the value's signedness differ, and WGSL does not. The bits are the
  * same. */
@@ -3376,6 +3447,9 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    /* Writes by a dynamic index are ladders of ifs. */
    NIR_PASS(_, nir, nir_shader_instructions_pass, rewrite_resource_instr, nir_metadata_none, &state);
    NIR_PASS(_, nir, nir_shader_instructions_pass, integer_cube_query_instr, nir_metadata_control_flow, NULL);
+   struct util_dynarray bgra;
+   util_dynarray_init(&bgra, mem_ctx);
+   format_storage_images(nir, shader, records, &bgra);
    bool retyped = false;
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, match_image_type_instr, nir_metadata_all, &retyped);
    if (retyped)
@@ -3424,6 +3498,13 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    if (!reflect_bindings(nir, info, shader, mem_ctx)) {
       result = vk_errorf(dev, VK_ERROR_UNKNOWN, "a shader uses what WebGPU cannot bind");
       goto fail;
+   }
+   util_dynarray_foreach(&bgra, uint32_t, at) {
+      for (uint32_t i = 0; i < shader->binding_count; ++i) {
+         struct wvk_shader_binding *b = &shader->bindings[i];
+         if (b->kind == WVK_BINDING_STORAGE_TEXTURE && b->group == *at >> 16 && b->binding == (*at & 0xffff))
+            b->format = WGPUTextureFormat_BGRA8Unorm;
+      }
    }
 
    /* The compiler keeps a vertex input's driver_location as its WGSL
@@ -3481,6 +3562,10 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
          goto fail;
       }
    }
+   util_dynarray_foreach(&bgra, uint32_t, at) {
+      for (uint32_t i = 0; i < WVK_SHADER_VARIANTS; ++i)
+         declare_bgra_storage(shader->wgsl[i], *at >> 16, *at & 0xffff);
+   }
    if (getenv("WINK_VK_DUMP_WGSL"))
       fprintf(stderr, "wvk: %s WGSL:\n%s\n", wi.label, shader->wgsl[WVK_SHADER_FLIPPED]);
 
@@ -3522,6 +3607,18 @@ link_interpolation(nir_shader *producer, nir_shader *fs)
    }
 }
 
+/* Whether a shader may write a storage image without a format, which its
+ * draws and dispatches compile variants for (format_storage_images). */
+static bool
+has_unformatted_images(const nir_shader *nir)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_image) {
+      if (var->data.image.format == PIPE_FORMAT_NONE && !(var->data.access & ACCESS_NON_WRITEABLE))
+         return true;
+   }
+   return false;
+}
+
 static VkResult
 wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_compile_info *infos,
             const struct vk_graphics_pipeline_state *state, const struct vk_features *enabled_features,
@@ -3537,7 +3634,10 @@ wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_co
          vs = infos[i].nir;
       else if (infos[i].stage == MESA_SHADER_FRAGMENT)
          fs = infos[i].nir;
-      if ((infos[i].stage == MESA_SHADER_VERTEX || infos[i].stage == MESA_SHADER_FRAGMENT) &&
+      /* And a compute shader's, where its variants are of the formats of
+       * storage images it has none for. */
+      if ((infos[i].stage == MESA_SHADER_VERTEX || infos[i].stage == MESA_SHADER_FRAGMENT ||
+           has_unformatted_images(infos[i].nir)) &&
           i < ARRAY_SIZE(sources))
          sources[i] = source_create(&infos[i]);
    }
@@ -3583,7 +3683,7 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
    if (stage == MESA_SHADER_VERTEX) {
       match_fragment_inputs(nir, key->fs_inputs);
       state.vi = vi;
-   } else {
+   } else if (stage == MESA_SHADER_FRAGMENT) {
       ms.rasterization_samples = key->samples ? key->samples : 4;
       ms.alpha_to_one_enable = key->alpha_to_one;
       ms.alpha_to_coverage_enable = key->by_alpha;
@@ -3608,16 +3708,35 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
    return variant;
 }
 
+static struct wvk_shader *variant_for(struct wvk_device *dev, struct wvk_shader *shader,
+                                      const struct wvk_shader_key *key, const struct vk_vertex_input_state *vi);
+
+/* The formats of the views bound where the shader has storage images
+ * without one into `key`, the shader's own where none is bound. Whether
+ * they are the shader's. */
+static bool
+key_image_formats(const struct wvk_shader *shader, const VkFormat *image_formats, struct wvk_shader_key *key)
+{
+   bool same = true;
+   for (uint32_t i = 0; i < shader->unformatted_count; ++i) {
+      const uint32_t f = image_formats && image_formats[i] ? image_formats[i] : shader->key.image_format[i];
+      key->image_format[i] = f;
+      same &= f == shader->key.image_format[i];
+   }
+   return same;
+}
+
 struct wvk_shader *
 wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_shader *other,
                         const struct vk_dynamic_graphics_state *dyn, unsigned samples, bool has_depth,
-                        const VkFormat *color_formats)
+                        const VkFormat *color_formats, const VkFormat *image_formats)
 {
    if (!shader || !shader->source)
       return shader;
 
    struct wvk_shader_key key;
    memset(&key, 0, sizeof(key));
+   const bool images = key_image_formats(shader, image_formats, &key);
    /* The records: every set either stage's layout has, in order. */
    for (uint32_t g = 0; g < 4; ++g) {
       key.meta_base[g] = key.meta_words;
@@ -3633,7 +3752,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       u_foreach_bit(b, vi.bindings_valid)
          vi.bindings[b].stride = dyn->vi_binding_strides[b];
       key.pulled = pull_key(&vi, shader->attribs_read);
-      if (records && key.pulled == shader->key.pulled && varyings_match(shader, other))
+      if (records && images && key.pulled == shader->key.pulled && varyings_match(shader, other))
          return shader;
       if (other)
          memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
@@ -3671,7 +3790,15 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
    } else {
       return shader;
    }
+   return variant_for(dev, shader, &key, &vi);
+}
 
+/* The source's variant for `key`: made the first time. */
+static struct wvk_shader *
+variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_shader_key *k_in,
+            const struct vk_vertex_input_state *vi)
+{
+   const struct wvk_shader_key key = *k_in;
    struct wvk_shader_source *src = shader->source;
    simple_mtx_lock(&src->lock);
    struct hash_entry *he = _mesa_hash_table_search(src->variants, &key);
@@ -3679,16 +3806,24 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
    if (!he) {
       /* A variant that failed is kept as none, not tried at every draw. */
       if (getenv("WINK_VK_VARIANT_LOG")) {
-         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s\n", _mesa_shader_stage_to_string(shader->vk.stage),
-                 shader->id, key.pulled != shader->key.pulled ? " vertex input" : "",
-                 shader->vk.stage == MESA_SHADER_VERTEX && !varyings_match(shader, other) ? " varyings" : "",
-                 key.alpha_to_one != shader->key.alpha_to_one || key.by_alpha != shader->key.by_alpha ? " alpha" : "",
-                 key.samples != shader->key.samples ? " samples" : "", records ? "" : " records",
-                 key.no_depth != shader->key.no_depth ? " depth" : "");
+         const struct wvk_shader_key *own = &shader->key;
+         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s\n",
+                 _mesa_shader_stage_to_string(shader->vk.stage), shader->id,
+                 key.pulled != own->pulled ? " vertex input" : "",
+                 memcmp(key.fs_inputs, own->fs_inputs, sizeof(key.fs_inputs)) ? " varyings" : "",
+                 key.alpha_to_one != own->alpha_to_one || key.by_alpha != own->by_alpha ? " alpha" : "",
+                 key.samples != own->samples ? " samples" : "",
+                 memcmp(key.meta_base, own->meta_base, sizeof(key.meta_base)) || key.meta_words != own->meta_words
+                    ? " records" : "",
+                 key.no_depth != own->no_depth ? " depth" : "",
+                 key.logic_op != own->logic_op || memcmp(key.logic_format, own->logic_format, sizeof(key.logic_format))
+                    ? " logic op" : "",
+                 key.depth_bounds != own->depth_bounds ? " depth bounds" : "",
+                 memcmp(key.image_format, own->image_format, sizeof(key.image_format)) ? " image formats" : "");
       }
-      variant = compile_variant(dev, shader, &key, &vi);
+      variant = compile_variant(dev, shader, &key, vi);
       if (!variant)
-         mesa_logw_once("wvk: a shader's variant for a draw failed to compile");
+         mesa_logw_once("wvk: a shader's variant for a draw or dispatch failed to compile");
       struct wvk_shader_key *k = ralloc(src->variants, struct wvk_shader_key);
       if (k) {
          *k = key;
@@ -3700,6 +3835,17 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
    }
    simple_mtx_unlock(&src->lock);
    return variant ? variant : shader;
+}
+
+struct wvk_shader *
+wvk_shader_dispatch_variant(struct wvk_device *dev, struct wvk_shader *shader, const VkFormat *image_formats)
+{
+   if (!shader || !shader->source || !shader->unformatted_count)
+      return shader;
+   struct wvk_shader_key key = shader->key;
+   if (key_image_formats(shader, image_formats, &key))
+      return shader;
+   return variant_for(dev, shader, &key, NULL);
 }
 
 static void
@@ -3733,6 +3879,8 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint32(blob, shader->io_mask);
    blob_write_uint8(blob, shader->logic_op_reads);
    blob_write_uint8(blob, shader->reads_depth_bounds);
+   blob_write_uint8(blob, shader->unformatted_count);
+   blob_write_bytes(blob, shader->unformatted, sizeof(shader->unformatted));
    blob_write_uint8(blob, shader->writes_depth);
    blob_write_uint8(blob, shader->uses_push_constants);
    blob_write_uint8(blob, shader->uses_draw_parameters);
@@ -3775,6 +3923,9 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const uint32_t io_mask = blob_read_uint32(blob);
    const uint8_t logic_op_reads = blob_read_uint8(blob);
    const bool reads_depth_bounds = blob_read_uint8(blob);
+   const uint8_t unformatted_count = blob_read_uint8(blob);
+   uint16_t unformatted[WVK_MAX_UNFORMATTED_IMAGES];
+   blob_copy_bytes(blob, unformatted, sizeof(unformatted));
    const bool writes_depth = blob_read_uint8(blob);
    const bool uses_push_constants = blob_read_uint8(blob);
    const bool uses_draw_parameters = blob_read_uint8(blob);
@@ -3830,6 +3981,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->io_mask = io_mask;
    shader->logic_op_reads = logic_op_reads;
    shader->reads_depth_bounds = reads_depth_bounds;
+   shader->unformatted_count = MIN2(unformatted_count, WVK_MAX_UNFORMATTED_IMAGES);
+   memcpy(shader->unformatted, unformatted, sizeof(unformatted));
    shader->writes_depth = writes_depth;
    shader->uses_push_constants = uses_push_constants;
    shader->uses_draw_parameters = uses_draw_parameters;

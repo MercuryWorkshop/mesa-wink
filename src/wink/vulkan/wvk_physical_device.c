@@ -219,6 +219,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .fillModeNonSolid = true,
       /* Every format it names is texture-formats-tier1's storage. */
       .shaderStorageImageExtendedFormats = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureFormatsTier1),
+      /* A storage image without a format has the bound view's: a variant
+       * of the shader for it, made at the draw or dispatch (wvk_shader.c). */
+      .shaderStorageImageReadWithoutFormat = true,
+      .shaderStorageImageWriteWithoutFormat = true,
       /* 64-bit integers are pairs of words (nir_lower_int64). */
       .shaderInt64 = true,
 #ifdef WVK_HAVE_FLOAT64
@@ -890,8 +894,12 @@ optimal_features(const struct wvk_physical_device *pdev, VkFormat format)
       f |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
    if (caps & WVK_CAP_STORAGE) {
       f |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
-      /* Not without a format: WGSL's storage textures have theirs in the
-       * shader, which is made before any view is bound. */
+      /* Without a format too: a variant of the shader has the view's
+       * (wvk_shader.c), which reads it where WebGPU reads and writes the
+       * format -- and where the shader only reads, it is a texture. */
+      f |= VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      if (caps & WVK_CAP_STORAGE_RW)
+         f |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
       /* Through the image's buffer of its texels (wvk_image.h). */
       if (wvk_format_has_atomics(format))
          f |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;

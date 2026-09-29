@@ -112,6 +112,14 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   test is, or at the start where it asks for early tests; a draw without a
   fragment shader gets the driver's own, which is the test alone. Not on a
   multisampled pass, which says so.
+- **Storage images without a format** have the format of the view bound
+  there: WGSL's storage textures declare theirs, so a draw or dispatch
+  compiles a variant of the shader for the views' formats, as it does for
+  the rest of its state (compute shaders with such images keep their
+  source for it too). Until one is bound, the 32-bit one-channel format
+  of the image's type. BGRA8, which SPIR-V has no format for, is declared
+  RGBA8 to ntv and renamed in the WGSL. An image only read is a texture,
+  and needs none.
 - **A dispatch that samples what it writes as storage** -- a mip chain
   built a level at a time, sampling the whole chain -- samples a view
   that stops below the lowest level written where it can, which keeps

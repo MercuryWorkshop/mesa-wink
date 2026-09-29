@@ -774,7 +774,7 @@ struct wvk_bound_state {
    /* The shaders a draw is of, which are the bound ones, or their variants
     * for its state (select_draw_shaders). */
    struct wvk_shader *vs, *fs, *cs;
-   struct wvk_shader *bound_vs, *bound_fs;
+   struct wvk_shader *bound_vs, *bound_fs, *bound_cs;
    struct wvk_bound_set sets[WVK_BIND_POINTS][WVK_MAX_GROUPS];
 
    struct wvk_bound_buffer vb[MESA_VK_MAX_VERTEX_BINDINGS];
@@ -922,7 +922,7 @@ wvk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
       switch (stages[i]) {
       case MESA_SHADER_VERTEX: st->vs = st->bound_vs = shader; break;
       case MESA_SHADER_FRAGMENT: st->fs = st->bound_fs = shader; break;
-      case MESA_SHADER_COMPUTE: st->cs = shader; break;
+      case MESA_SHADER_COMPUTE: st->cs = st->bound_cs = shader; break;
       default:
          if (shader)
             mesa_logw_once("wvk: %s shaders are not supported", _mesa_shader_stage_to_string(stages[i]));
@@ -2881,6 +2881,27 @@ draw_fan_elements(struct wvk_cmd_buffer *cmd, uint32_t first_index, uint32_t ind
 /* The bound shaders, or their variants for the state the draw has: the
  * fragment shader for its multisampling, the vertex shader for its vertex
  * input and for that fragment shader (wvk_shader_draw_variant). */
+/* The formats of the views bound where a shader has storage images
+ * without one (wvk_shader::unformatted), which its variant is of; 0 where
+ * none is. */
+static void
+unformatted_image_formats(const struct wvk_bound_state *st, uint32_t bind_point, const struct wvk_shader *shader,
+                          VkFormat formats[WVK_MAX_UNFORMATTED_IMAGES])
+{
+   for (uint32_t i = 0; i < WVK_MAX_UNFORMATTED_IMAGES; ++i) {
+      formats[i] = VK_FORMAT_UNDEFINED;
+      if (!shader || i >= shader->unformatted_count)
+         continue;
+      const uint32_t set = shader->unformatted[i] >> 10, slot = shader->unformatted[i] & 0x3ff;
+      bool sampler;
+      uint32_t dynamic_index;
+      const struct wvk_descriptor *d =
+         set < WVK_MAX_GROUPS ? slot_descriptor(st->sets[bind_point][set].set, slot, &sampler, &dynamic_index) : NULL;
+      if (d && d->view)
+         formats[i] = d->view_format;
+   }
+}
+
 static void
 select_draw_shaders(struct wvk_cmd_buffer *cmd)
 {
@@ -2897,8 +2918,12 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
       const struct wvk_image_view *view = replay->rendering.color[i];
       color_formats[i] = view ? view->vk.view_format : VK_FORMAT_UNDEFINED;
    }
-   st->fs = wvk_shader_draw_variant(dev, st->bound_fs, st->bound_vs, dyn, samples, has_depth, color_formats);
-   st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats);
+   VkFormat fs_images[WVK_MAX_UNFORMATTED_IMAGES], vs_images[WVK_MAX_UNFORMATTED_IMAGES];
+   unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_fs, fs_images);
+   unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_vs, vs_images);
+   st->fs = wvk_shader_draw_variant(dev, st->bound_fs, st->bound_vs, dyn, samples, has_depth, color_formats,
+                                    fs_images);
+   st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats, vs_images);
    /* No fragment shader to do the depth bounds test: the driver's. */
    if (!st->fs && dyn->ds.depth.bounds_test.enable && has_depth && samples <= 1)
       st->fs = dev->depth_bounds_fs;
@@ -3320,6 +3345,10 @@ flush_dispatch(struct wvk_cmd_buffer *cmd, struct wvk_bound_buffer *indirect)
    struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
    struct wvk_replay *replay = cmd->replay;
    struct wvk_bound_state *st = replay->state;
+   /* Or its variant for the formats of storage images it has none for. */
+   VkFormat images[WVK_MAX_UNFORMATTED_IMAGES];
+   unformatted_image_formats(st, WVK_BIND_COMPUTE, st->bound_cs, images);
+   st->cs = wvk_shader_dispatch_variant(dev, st->bound_cs, images);
    if (!st->cs) {
       mesa_logw_once("wvk: a dispatch without a compute shader");
       return NULL;

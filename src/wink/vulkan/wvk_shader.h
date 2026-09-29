@@ -45,7 +45,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 13
+#define WVK_SHADER_BINARY_VERSION 14
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -62,6 +62,9 @@ struct wvk_shader_binding {
  * with other state -- a fragment shader it was not linked with, vertex
  * input it did not know, multisampling set at the draw -- draws a variant
  * compiled for that (wvk_shader_draw_variant). */
+/* Storage images without a format a shader is compiled for the views of. */
+#define WVK_MAX_UNFORMATTED_IMAGES 8
+
 struct wvk_shader_key {
    /* Vertex: the fragment shader's inputs its outputs are made to match. */
    uint8_t fs_inputs[WVK_MAX_VARYINGS];
@@ -86,6 +89,10 @@ struct wvk_shader_key {
    /* Fragment: the depth bounds test, against a copy of the depth
     * attachment at WVK_DRIVER_SLOT_DEPTH_BOUNDS. */
    uint32_t depth_bounds;
+   /* The format of each storage image the shader has none for, which
+    * WGSL's must have: the VkFormat of the view bound there, in the order
+    * of wvk_shader::unformatted. */
+   uint32_t image_format[WVK_MAX_UNFORMATTED_IMAGES];
 };
 
 struct wvk_shader_source;
@@ -122,6 +129,11 @@ struct wvk_shader {
    /* Fragment: whether it reads the depth attachment's copy for the depth
     * bounds test. */
    bool reads_depth_bounds;
+   /* Its storage images without a format, as the set and slot of each
+    * (set << 10 | slot), whose views' formats a draw or dispatch compiles
+    * a variant for (key.image_format). */
+   uint8_t unformatted_count;
+   uint16_t unformatted[WVK_MAX_UNFORMATTED_IMAGES];
    /* Fragment: writes gl_FragDepth, discards. */
    bool writes_depth;
    /* The push constants read, as a storage buffer at the driver's
@@ -177,14 +189,23 @@ extern const struct vk_device_shader_ops wvk_device_shader_ops;
 
 /* The shader, or its variant, for a draw of this state: a vertex shader
  * for this vertex input and fragment shader (which may be NULL), a
- * fragment shader for this multisampling at `samples` and a pass with or
- * without a depth attachment; either for the
- * records of both its and `other`'s layouts. The shader itself where it
- * was compiled for that, or a variant it could not compile. */
+ * fragment shader for this multisampling at `samples`, a pass with or
+ * without a depth attachment, and the logic op for these colour formats;
+ * either for the records of both its and `other`'s layouts, and the
+ * formats of the views bound where it has storage images without one
+ * (`image_formats`, as for wvk_shader_dispatch_variant). The shader itself
+ * where it was compiled for that, or a variant it could not compile. */
 struct wvk_shader *wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader,
                                            const struct wvk_shader *other,
                                            const struct vk_dynamic_graphics_state *dyn, unsigned samples,
-                                           bool has_depth, const VkFormat *color_formats);
+                                           bool has_depth, const VkFormat *color_formats,
+                                           const VkFormat *image_formats);
+
+/* The shader, or its variant for the formats of the views bound where it
+ * has storage images without one (wvk_shader::unformatted; 0 for one not
+ * bound). */
+struct wvk_shader *wvk_shader_dispatch_variant(struct wvk_device *dev, struct wvk_shader *shader,
+                                               const VkFormat *image_formats);
 
 /* Whether a logic op does anything to an attachment of `format`. */
 bool wvk_format_takes_logic_op(VkFormat format);
