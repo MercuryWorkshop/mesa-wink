@@ -4141,7 +4141,9 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    const uint32_t t = (uint32_t)patches * 4;
    wvk_replay_add_stats(replay, counts, counts_bytes, t, 1,
                         VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_EVALUATION_SHADER_INVOCATIONS_BIT);
-   if (gs)
+   /* The pipeline's own geometry shader counts; the driver's, for cull
+    * distances or transform feedback, is none. */
+   if (gs && gs == st->bound_gs)
       wvk_replay_add_stats(replay, counts, counts_bytes, t + 13, 1,
                            VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_INVOCATIONS_BIT);
    else
