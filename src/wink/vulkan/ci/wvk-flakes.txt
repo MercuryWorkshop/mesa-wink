@@ -77,3 +77,6 @@ dEQP-VK.pipeline.fast_linked_library.creation_feedback.graphics_tests.vertex_sta
 dEQP-VK.synchronization.timeline_semaphore.device_host.write_copy_image_read_copy_image_to_buffer.image_128x128_s8_uint
 dEQP-VK.synchronization2.timeline_semaphore.device_host.write_copy_image_read_copy_image_to_buffer.image_128x128_s8_uint
 dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.atomic_atomic.atomicrmw.device.payload_local.image.guard_nonlocal.buffer.frag
+dEQP-VK.memory_model.message_passing.ext.u32.coherent.fence_atomic.atomicwrite.device.payload_local.image.guard_nonlocal.buffer.frag
+dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.fence_atomic.atomicwrite.device.payload_local.image.guard_nonlocal.buffer.frag
+dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.fence_fence.atomicwrite.device.payload_local.image.guard_nonlocal.buffer.frag

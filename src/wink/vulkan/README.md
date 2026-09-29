@@ -104,6 +104,14 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   level and layer, made before each such draw with the pass begun again
   after, so primitives of one draw that overlap see the attachment as it
   was before the draw. Not on a multisampled pass, which says so.
+- **Blend states WebGPU cannot express**, colour factors that use both
+  CONSTANT_COLOR and CONSTANT_ALPHA where WebGPU has one constant, are the
+  fragment shader's as well. The attachments whose colour factors use
+  CONSTANT_ALPHA blend in a variant: it keeps what the shader writes to
+  them, and at the end blends it with a copy of the attachment, made as a
+  logic op's is, by the attachment's equation, clamped as normalized
+  formats are. Dual-source blending works the same way. WebGPU blends the
+  others with the real constant. Not on a multisampled pass either.
 - **The depth bounds test** is the fragment shader's too. It tests the
   depth the attachment holds, so a draw with it on gets a variant that
   reads a copy of the depth attachment (R32Float, made before the draw)
@@ -378,7 +386,8 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Subgroups are one invocation each: Tint reads no subgroup operations from
   SPIR-V. Every operation but the quad ones is there, trivially.
 - Blend states whose colour factors use both CONSTANT_COLOR and
-  CONSTANT_ALPHA: WebGPU has one constant.
+  CONSTANT_ALPHA, on a multisampled pass: WebGPU has one constant, and
+  the fragment shader's blending reads single-sampled copies.
 - Views of multisampled images in formats other than the image's, or its
   sRGB twin: other views are of a texture of the view's format, which
   copies through a buffer keep up to date, and WebGPU copies no

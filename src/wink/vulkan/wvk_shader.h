@@ -45,7 +45,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 21
+#define WVK_SHADER_BINARY_VERSION 22
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -135,6 +135,13 @@ struct wvk_shader_key {
     * representation it is done on. */
    uint32_t logic_op;
    uint32_t logic_format[8];
+   /* Fragment: the colour attachments the shader blends itself, where
+    * WebGPU's blending cannot be Vulkan's (a colour factor of
+    * CONSTANT_ALPHA beside CONSTANT_COLOR), of a copy of the attachment as
+    * a logic op is; each one's equation (wvk_blend_equation), and its
+    * format in logic_format. */
+   uint32_t blend_mask;
+   uint32_t blend_equation[8];
    /* Fragment: the depth bounds test, against a copy of the depth
     * attachment at WVK_DRIVER_SLOT_DEPTH_BOUNDS. */
    uint32_t depth_bounds;
@@ -328,6 +335,18 @@ wvk_geometry_indices(unsigned output, unsigned max_vertices)
    default: return max_vertices;
    }
 }
+
+/* A blend equation in a word: colour and alpha source and destination
+ * factors (VkBlendFactor, 5 bits each) and operations (VkBlendOp, 3). */
+static inline uint32_t
+wvk_blend_equation(uint32_t src_c, uint32_t dst_c, uint32_t op_c, uint32_t src_a, uint32_t dst_a, uint32_t op_a)
+{
+   return src_c | dst_c << 5 | op_c << 10 | src_a << 13 | dst_a << 18 | op_a << 23;
+}
+
+/* The colour attachments of those `written` whose blending the fragment
+ * shader does, which WebGPU's cannot: see lower_blend. */
+uint32_t wvk_shader_blend_mask(const struct vk_dynamic_graphics_state *dyn, uint32_t written);
 
 /* Whether a logic op does anything to an attachment of `format`. */
 bool wvk_format_takes_logic_op(VkFormat format);

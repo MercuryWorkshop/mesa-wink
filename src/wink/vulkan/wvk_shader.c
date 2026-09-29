@@ -806,6 +806,225 @@ lower_logic_op(nir_shader *nir, const struct wvk_shader_key *key, uint8_t *reads
    return progress;
 }
 
+/* Blending WebGPU cannot do, done by the fragment shader: where colour
+ * factors use both CONSTANT_COLOR and CONSTANT_ALPHA, which WebGPU's one
+ * blend constant cannot both be (wvk_shader_blend_mask). What the shader
+ * writes to such an attachment goes to a local, and at the end it is
+ * blended with what the attachment holds -- a copy of it, as a logic op
+ * reads -- by the attachment's equation, with the blend constants of the
+ * driver's data, and written. Its second output, a dual-source blend's,
+ * is then only a local. */
+static nir_def *
+blend_factor_value(nir_builder *b, VkBlendFactor f, unsigned c, nir_def *s, nir_def *s1, nir_def *d, nir_def *k)
+{
+   nir_def *one = nir_imm_float(b, 1.0f);
+   switch (f) {
+   case VK_BLEND_FACTOR_ZERO: return nir_imm_float(b, 0.0f);
+   case VK_BLEND_FACTOR_SRC_COLOR: return nir_channel(b, s, c);
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR: return nir_fsub(b, one, nir_channel(b, s, c));
+   case VK_BLEND_FACTOR_DST_COLOR: return nir_channel(b, d, c);
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR: return nir_fsub(b, one, nir_channel(b, d, c));
+   case VK_BLEND_FACTOR_SRC_ALPHA: return nir_channel(b, s, 3);
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA: return nir_fsub(b, one, nir_channel(b, s, 3));
+   case VK_BLEND_FACTOR_DST_ALPHA: return nir_channel(b, d, 3);
+   case VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA: return nir_fsub(b, one, nir_channel(b, d, 3));
+   case VK_BLEND_FACTOR_CONSTANT_COLOR: return nir_channel(b, k, c);
+   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR: return nir_fsub(b, one, nir_channel(b, k, c));
+   case VK_BLEND_FACTOR_CONSTANT_ALPHA: return nir_channel(b, k, 3);
+   case VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA: return nir_fsub(b, one, nir_channel(b, k, 3));
+   case VK_BLEND_FACTOR_SRC_ALPHA_SATURATE:
+      return c == 3 ? one : nir_fmin(b, nir_channel(b, s, 3), nir_fsub(b, one, nir_channel(b, d, 3)));
+   case VK_BLEND_FACTOR_SRC1_COLOR: return nir_channel(b, s1, c);
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR: return nir_fsub(b, one, nir_channel(b, s1, c));
+   case VK_BLEND_FACTOR_SRC1_ALPHA: return nir_channel(b, s1, 3);
+   case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA: return nir_fsub(b, one, nir_channel(b, s1, 3));
+   case VK_BLEND_FACTOR_ONE:
+   default: return one;
+   }
+}
+
+/* Each component clamped as a normalized attachment's are, before
+ * blending: its values and its factors. */
+static nir_def *
+blend_clamp(nir_builder *b, nir_def *v, const struct util_format_description *d)
+{
+   if (d && d->is_unorm)
+      return nir_fsat(b, v);
+   if (d && d->is_snorm)
+      return nir_fmax(b, nir_fmin(b, v, nir_imm_float(b, 1.0f)), nir_imm_float(b, -1.0f));
+   return v;
+}
+
+static nir_def *
+blend_apply(nir_builder *b, uint32_t eq, VkFormat format, nir_def *s, nir_def *s1, nir_def *d, nir_def *k)
+{
+   const struct util_format_description *desc = vk_format_description(format);
+   s = blend_clamp(b, s, desc);
+   s1 = blend_clamp(b, s1, desc);
+   d = blend_clamp(b, d, desc);
+   k = blend_clamp(b, k, desc);
+   nir_def *out[4];
+   for (unsigned c = 0; c < 4; ++c) {
+      const uint32_t e = c == 3 ? eq >> 13 : eq;
+      const VkBlendOp op = (VkBlendOp)((e >> 10) & 7);
+      nir_def *sc = nir_channel(b, s, c), *dc = nir_channel(b, d, c);
+      if (op == VK_BLEND_OP_MIN) {
+         out[c] = nir_fmin(b, sc, dc);
+         continue;
+      }
+      if (op == VK_BLEND_OP_MAX) {
+         out[c] = nir_fmax(b, sc, dc);
+         continue;
+      }
+      nir_def *sf = blend_clamp(b, blend_factor_value(b, (VkBlendFactor)(e & 31), c, s, s1, d, k), desc);
+      nir_def *df = blend_clamp(b, blend_factor_value(b, (VkBlendFactor)((e >> 5) & 31), c, s, s1, d, k), desc);
+      nir_def *st = nir_fmul(b, sc, sf), *dt = nir_fmul(b, dc, df);
+      out[c] = op == VK_BLEND_OP_SUBTRACT           ? nir_fsub(b, st, dt)
+               : op == VK_BLEND_OP_REVERSE_SUBTRACT ? nir_fsub(b, dt, st)
+                                                    : nir_fadd(b, st, dt);
+   }
+   return nir_vec(b, out, 4);
+}
+
+/* The attachment an output's store is to, and the component it starts
+ * at, or -1. */
+static int
+blend_store_target(nir_intrinsic_instr *intr, unsigned *index)
+{
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return -1;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_shader_out || var->data.location < FRAG_RESULT_DATA0 ||
+       var->data.location >= FRAG_RESULT_DATA0 + 8 || !glsl_type_is_vector_or_scalar(deref->type) ||
+       !glsl_type_is_float_16_32(deref->type))
+      return -1;
+   int rt = var->data.location - FRAG_RESULT_DATA0;
+   if (deref->deref_type == nir_deref_type_array) {
+      if (!nir_src_is_const(deref->arr.index))
+         return -1;
+      rt += nir_src_as_uint(deref->arr.index);
+   } else if (deref->deref_type != nir_deref_type_var) {
+      return -1;
+   }
+   *index = var->data.index;
+   return rt < 8 ? rt : -1;
+}
+
+static bool
+lower_blend(nir_shader *nir, const struct wvk_shader_key *key, uint8_t *reads)
+{
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_shader_out, UINT32_MAX);
+   NIR_PASS(_, nir, nir_lower_returns);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_variable *src[8] = { 0 }, *src1 = NULL;
+   u_foreach_bit(rt, key->blend_mask)
+      src[rt] = nir_local_variable_create(impl, glsl_vec4_type(), "wvk_blend_src");
+   /* Every store to them, to the locals instead. */
+   bool dual = false;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         unsigned index;
+         const int rt = blend_store_target(intr, &index);
+         if (rt < 0 || !(key->blend_mask & BITFIELD_BIT(rt)) || (index && rt))
+            continue;
+         nir_variable *var = nir_intrinsic_get_var(intr, 0);
+         if (index && !src1)
+            src1 = nir_local_variable_create(impl, glsl_vec4_type(), "wvk_blend_src1");
+         dual |= index != 0;
+         b.cursor = nir_before_instr(instr);
+         const unsigned frac = var->data.location_frac;
+         nir_def *v = nir_f2f32(&b, intr->src[1].ssa);
+         nir_def *comps[4];
+         for (unsigned c = 0; c < 4; ++c)
+            comps[c] = c >= frac && c - frac < v->num_components ? nir_channel(&b, v, c - frac)
+                                                                  : nir_undef(&b, 1, 32);
+         nir_store_var(&b, index ? src1 : src[rt], nir_vec(&b, comps, 4),
+                       (nir_intrinsic_write_mask(intr) << frac) & 0xf);
+         nir_instr_remove(instr);
+      }
+   }
+   /* At the end, blended and written. */
+   b.cursor = nir_after_impl(impl);
+   nir_def *coord = nir_f2i32(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2));
+   nir_def *k = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH), nir_imm_int(&b, WVK_DRIVER_BLEND),
+                              .align_mul = 16, .access = ACCESS_NON_WRITEABLE);
+   u_foreach_bit(rt, key->blend_mask) {
+      nir_variable *tex = nir_variable_create(nir, nir_var_uniform,
+                                              glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_FLOAT),
+                                              "wvk_blend_dst");
+      tex->data.descriptor_set = WVK_DRIVER_GROUP;
+      tex->data.binding = WVK_DRIVER_SLOT_LOGIC_OP + rt;
+      nir_def *d = nir_txf(&b, coord, .texture_deref = nir_build_deref_var(&b, tex), .lod = nir_imm_int(&b, 0),
+                           .dest_type = nir_type_float32);
+      nir_def *s1 = rt == 0 && src1 ? nir_load_var(&b, src1) : nir_imm_vec4(&b, 0, 0, 0, 0);
+      nir_def *r = blend_apply(&b, key->blend_equation[rt], (VkFormat)key->logic_format[rt],
+                               nir_load_var(&b, src[rt]), s1, d, k);
+      nir_foreach_shader_out_variable(var, nir) {
+         if (var->data.index != 0 || var->data.location < FRAG_RESULT_DATA0)
+            continue;
+         const unsigned loc = var->data.location - FRAG_RESULT_DATA0;
+         const struct glsl_type *t = var->type;
+         nir_deref_instr *deref = nir_build_deref_var(&b, var);
+         if (glsl_type_is_array(t)) {
+            if (rt < loc || rt >= loc + glsl_get_length(t))
+               continue;
+            deref = nir_build_deref_array_imm(&b, deref, rt - loc);
+            t = glsl_get_array_element(t);
+         } else if (rt != loc) {
+            continue;
+         }
+         if (!glsl_type_is_vector_or_scalar(t) || !glsl_type_is_float_16_32(t))
+            continue;
+         const unsigned n = glsl_get_vector_elements(t), frac = var->data.location_frac;
+         nir_def *v = nir_channels(&b, r, BITFIELD_RANGE(frac, n));
+         nir_store_deref(&b, deref, glsl_get_bit_size(t) == 16 ? nir_f2f16(&b, v) : v, BITFIELD_MASK(n));
+      }
+      *reads |= BITFIELD_BIT(rt);
+   }
+   /* The second output, a local now. */
+   if (dual) {
+      nir_remove_dead_derefs_impl(impl);
+      nir_foreach_shader_out_variable_safe(var, nir) {
+         if (var->data.index != 0 && var->data.location == FRAG_RESULT_DATA0)
+            exec_node_remove(&var->node);
+      }
+   }
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
+static bool
+is_constant_alpha_factor(uint8_t f)
+{
+   return f == VK_BLEND_FACTOR_CONSTANT_ALPHA || f == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+}
+
+static bool
+is_constant_color_factor(uint8_t f)
+{
+   return f == VK_BLEND_FACTOR_CONSTANT_COLOR || f == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+}
+
+uint32_t
+wvk_shader_blend_mask(const struct vk_dynamic_graphics_state *dyn, uint32_t written)
+{
+   uint32_t alpha = 0, color = 0;
+   for (uint32_t i = 0; i < MIN2(dyn->cb.attachment_count, 8); ++i) {
+      const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
+      if (!a->blend_enable || !(written & BITFIELD_BIT(i)) || !a->write_mask)
+         continue;
+      if (is_constant_alpha_factor(a->src_color_blend_factor) || is_constant_alpha_factor(a->dst_color_blend_factor))
+         alpha |= BITFIELD_BIT(i);
+      if (is_constant_color_factor(a->src_color_blend_factor) || is_constant_color_factor(a->dst_color_blend_factor))
+         color |= BITFIELD_BIT(i);
+   }
+   return alpha && color ? alpha : 0;
+}
+
 /* The vertex a point drawn as a quad is of (expand_points), or a vertex
  * shader run as compute (run_vertices), in a local of this name: where its
  * attributes are pulled from; and the instance, of the latter. */
@@ -4677,6 +4896,12 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
          shader->key.logic_op = records->logic_op;
          memcpy(shader->key.logic_format, records->logic_format, sizeof(records->logic_format));
       }
+      if (records && records->blend_mask) {
+         NIR_PASS(_, nir, lower_blend, records, &shader->logic_op_reads);
+         shader->key.blend_mask = records->blend_mask;
+         memcpy(shader->key.blend_equation, records->blend_equation, sizeof(records->blend_equation));
+         memcpy(shader->key.logic_format, records->logic_format, sizeof(records->logic_format));
+      }
    }
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       /* Depth dropped where the pass has none: the pipeline's, or the
@@ -5266,6 +5491,28 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
             }
          }
       }
+      /* Blending WebGPU's cannot be, on a single-sampled pass as a logic
+       * op: every attachment whose colour factors use CONSTANT_ALPHA
+       * where another's (or its own) use CONSTANT_COLOR, which WebGPU's
+       * one blend constant cannot both be. */
+      const uint32_t blends = color_formats && !dyn->cb.logic_op_enable
+                                 ? wvk_shader_blend_mask(dyn, shader->io_mask & dyn->cb.color_write_enables)
+                                 : 0;
+      if (blends && samples > 1) {
+         mesa_logw_once("wvk: colour blend factors with both CONSTANT_COLOR and CONSTANT_ALPHA on a multisampled "
+                        "pass, which is not done");
+      } else {
+         u_foreach_bit(i, blends) {
+            const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
+            if (!color_formats[i])
+               continue;
+            key.blend_mask |= BITFIELD_BIT(i);
+            key.blend_equation[i] = wvk_blend_equation(a->src_color_blend_factor, a->dst_color_blend_factor,
+                                                       a->color_blend_op, a->src_alpha_blend_factor,
+                                                       a->dst_alpha_blend_factor, a->alpha_blend_op);
+            key.logic_format[i] = color_formats[i];
+         }
+      }
       /* The depth bounds test, where there is depth to test: against a
        * copy of a single-sampled attachment, texel for texel. */
       if (dyn->ds.depth.bounds_test.enable && has_depth) {
@@ -5296,7 +5543,7 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
       /* A variant that failed is kept as none, not tried at every draw. */
       if (getenv("WINK_VK_VARIANT_LOG")) {
          const struct wvk_shader_key *own = &shader->key;
-         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s\n",
+         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s\n",
                  _mesa_shader_stage_to_string(shader->vk.stage), shader->id,
                  key.pulled != own->pulled ? " vertex input" : "",
                  memcmp(key.fs_inputs, own->fs_inputs, sizeof(key.fs_inputs)) ? " varyings" : "",
@@ -5308,6 +5555,9 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
                  key.logic_op != own->logic_op || memcmp(key.logic_format, own->logic_format, sizeof(key.logic_format))
                     ? " logic op" : "",
                  key.depth_bounds != own->depth_bounds ? " depth bounds" : "",
+                 key.blend_mask != own->blend_mask ||
+                       memcmp(key.blend_equation, own->blend_equation, sizeof(key.blend_equation))
+                    ? " blending" : "",
                  memcmp(key.image_format, own->image_format, sizeof(key.image_format)) ? " image formats" : "");
       }
       variant = compile_variant(dev, shader, &key, vi);

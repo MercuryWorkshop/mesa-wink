@@ -2102,8 +2102,10 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
             k->color[i].write_mask &= ~VK_COLOR_COMPONENT_A_BIT;
       }
       /* A logic op is blending's place, for every attachment: Vulkan has
-       * blending off while one is on, whether or not it applies. */
-      k->color[i].blend = a->blend_enable && written && !dyn->cb.logic_op_enable;
+       * blending off while one is on, whether or not it applies. And none
+       * where the fragment shader blends (lower_blend). */
+      k->color[i].blend = a->blend_enable && written && !dyn->cb.logic_op_enable &&
+                          !(st->fs->key.blend_mask & BITFIELD_BIT(i));
       if (k->color[i].blend) {
          k->color[i].src_c = blend_factor(a->src_color_blend_factor);
          k->color[i].dst_c = blend_factor(a->dst_color_blend_factor);
@@ -2334,31 +2336,34 @@ is_constant_alpha(uint8_t factor)
    return factor == VK_BLEND_FACTOR_CONSTANT_ALPHA || factor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
 }
 
-static bool
-is_constant_color(uint8_t factor)
-{
-   return factor == VK_BLEND_FACTOR_CONSTANT_COLOR || factor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
-}
-
 /* The blend constant, as WebGPU's one constant has to be: where colour
  * factors use CONSTANT_ALPHA, its alpha in every channel. For alpha
- * factors both are the alpha anyway. Colour factors that use both
- * CONSTANT_COLOR and CONSTANT_ALPHA cannot be had. */
+ * factors both are the alpha anyway. Where some use CONSTANT_COLOR too,
+ * the fragment shader blends those that use CONSTANT_ALPHA itself
+ * (lower_blend), with the constants the driver's data has. */
 static WGPUColor
-blend_constant(const struct vk_dynamic_graphics_state *dyn, uint32_t color_count)
+blend_constant(struct wvk_bound_state *st, const struct vk_dynamic_graphics_state *dyn, uint32_t color_count)
 {
    const float *bc = dyn->cb.blend_constants;
-   bool alpha = false, color = false;
+   if (st->fs && st->fs->key.blend_mask) {
+      if (memcmp(st->push + WVK_DRIVER_BLEND, bc, 16)) {
+         memcpy(st->push + WVK_DRIVER_BLEND, bc, 16);
+         st->push_offset = UINT32_MAX;
+      }
+      return (WGPUColor){ bc[0], bc[1], bc[2], bc[3] };
+   }
+   bool alpha = false;
    for (uint32_t i = 0; i < MIN2(color_count, dyn->cb.attachment_count); ++i) {
       const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
-      if (!a->blend_enable)
-         continue;
-      alpha |= is_constant_alpha(a->src_color_blend_factor) || is_constant_alpha(a->dst_color_blend_factor);
-      color |= is_constant_color(a->src_color_blend_factor) || is_constant_color(a->dst_color_blend_factor);
+      if (a->blend_enable)
+         alpha |= is_constant_alpha(a->src_color_blend_factor) || is_constant_alpha(a->dst_color_blend_factor);
    }
-   if (alpha && color)
-      mesa_logw_once("wvk: colour blend factors with both CONSTANT_COLOR and CONSTANT_ALPHA");
-   if (alpha && !color)
+   const uint32_t written = st->fs ? st->fs->io_mask & dyn->cb.color_write_enables : 0;
+   if (wvk_shader_blend_mask(dyn, written)) {
+      mesa_logw_once("wvk: colour blend factors with both CONSTANT_COLOR and CONSTANT_ALPHA, not blended");
+      return (WGPUColor){ bc[0], bc[1], bc[2], bc[3] };
+   }
+   if (alpha)
       return (WGPUColor){ bc[3], bc[3], bc[3], bc[3] };
    return (WGPUColor){ bc[0], bc[1], bc[2], bc[3] };
 }
@@ -2398,6 +2403,12 @@ snapshot_logic_op(struct wvk_cmd_buffer *cmd)
       td.dimension = WGPUTextureDimension_2D;
       td.size = (WGPUExtent3D){ e.width, e.height, 1 };
       td.format = wgpuTextureGetFormat(texture);
+      /* Seen as the pass sees it: an sRGB view of a texture that is not,
+       * decoded, for blending. */
+      if (view->format != td.format) {
+         td.viewFormatCount = 1;
+         td.viewFormats = &view->format;
+      }
       WGPUTexture copy = wgpuDeviceCreateTexture(dev->wgpu, &td);
       if (!copy)
          continue;
@@ -2407,7 +2418,9 @@ snapshot_logic_op(struct wvk_cmd_buffer *cmd)
       src.origin.z = texture_layer;
       dst.texture = copy;
       wgpuCommandEncoderCopyTextureToTexture(replay->encoder, &src, &dst, &td.size);
-      WGPUTextureView v = wgpuTextureCreateView(copy, NULL);
+      WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+      vd.format = view->format;
+      WGPUTextureView v = wgpuTextureCreateView(copy, td.viewFormatCount ? &vd : NULL);
       wgpuTextureRelease(copy);
       if (!v)
          continue;
@@ -2556,9 +2569,10 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
       st->pipeline = p->pipeline;
    }
    st->pipeline_flipped = p->key.variant == WVK_SHADER_FLIPPED;
-   /* Before the bind groups: it writes the driver's data among the push
+   /* Before the bind groups: they write the driver's data among the push
     * constants. */
    set_viewport_scissor(cmd, pass);
+   const WGPUColor blend = blend_constant(st, dyn, replay->rendering.color_count);
    st->graphics_layout = p->layout;
    if (st->vs->pulled_count)
       set_pulled_buffers(dev, cmd, replay, st->vs);
@@ -2586,7 +2600,6 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
       wvk_replay_read(replay, ib->mem, ib->offset, ib->size);
    }
 
-   const WGPUColor blend = blend_constant(dyn, replay->rendering.color_count);
    wgpuRenderPassEncoderSetBlendConstant(pass, &blend);
    wgpuRenderPassEncoderSetStencilReference(pass, draw_stencil_face(replay, dyn)->reference);
    return true;
