@@ -139,6 +139,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_extended_dynamic_state = true,
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
+      .EXT_graphics_pipeline_library = true,
+      .KHR_pipeline_library = true,
       .EXT_host_query_reset = true,
       .EXT_image_robustness = true,
       .EXT_inline_uniform_block = true,
@@ -342,6 +344,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
 
       .maintenance5 = true,
       .maintenance6 = true,
+      /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
+       * apart, which draws link (wvk_shader_draw_variant). */
+      .graphicsPipelineLibrary = true,
       /* VK_EXT_4444_formats: packed, as the core's are (wvk_format.c). */
       .formatA4R4G4B4 = true,
       .formatA4B4G4R4 = true,
@@ -619,6 +624,11 @@ get_device_properties(const struct wvk_physical_device *pdev,
       /* VK_EXT_extended_dynamic_state3: a pipeline is of its draw's
        * topology, whichever it is. */
       .dynamicPrimitiveTopologyUnrestricted = true,
+
+      /* VK_EXT_graphics_pipeline_library: a vertex shader of other
+       * interpolation than its fragment shader's is a variant of it. */
+      .graphicsPipelineLibraryFastLinking = true,
+      .graphicsPipelineLibraryIndependentInterpolationDecoration = true,
 
       /* VK_KHR_maintenance6 */
       .blockTexelViewCompatibleMultipleLayers = false,

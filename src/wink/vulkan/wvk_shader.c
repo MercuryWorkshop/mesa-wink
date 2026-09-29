@@ -2944,8 +2944,8 @@ match_fragment_inputs(nir_shader *vs, const uint8_t inputs[WVK_MAX_VARYINGS])
 
 static VkResult
 compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
-            const struct vk_graphics_pipeline_state *pipeline_state, const VkAllocationCallbacks *pAllocator,
-            struct vk_shader **shader_out)
+            const struct vk_graphics_pipeline_state *pipeline_state, const struct wvk_shader_key *records,
+            const VkAllocationCallbacks *pAllocator, struct vk_shader **shader_out)
 {
    nir_shader *nir = info->nir;
    const mesa_shader_stage stage = nir->info.stage;
@@ -2964,17 +2964,26 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       .info = info,
       .split = _mesa_pointer_hash_table_create(mem_ctx),
    };
-   /* The records of the pipeline layout's sets, set after set. */
+   /* The records of the pipeline layout's sets, set after set; or where
+    * a draw has them, of both its stages' layouts. */
    uint32_t meta_words = 0;
    for (uint32_t g = 0; g < 4; ++g) {
       shader->meta_base[g] = meta_words;
+      shader->set_words[g] = -1;
       if (g < info->set_layout_count && info->set_layouts[g]) {
          const struct wvk_descriptor_set_layout *layout =
             container_of(info->set_layouts[g], struct wvk_descriptor_set_layout, vk);
+         shader->set_words[g] = layout->slot_count * WVK_META_WORDS;
          meta_words += layout->slot_count * WVK_META_WORDS;
       }
    }
    shader->meta_words = meta_words;
+   if (records) {
+      memcpy(shader->meta_base, records->meta_base, sizeof(shader->meta_base));
+      shader->meta_words = meta_words = records->meta_words;
+   }
+   memcpy(shader->key.meta_base, shader->meta_base, sizeof(shader->meta_base));
+   shader->key.meta_words = shader->meta_words;
    if (WVK_META_OFFSET + meta_words * 4 > WVK_PUSH_WINDOW)
       mesa_logw_once("wvk: a pipeline layout of more descriptors than their records have room for");
 
@@ -3243,7 +3252,7 @@ wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_co
    if (vs && fs)
       link_interpolation(vs, fs);
    for (uint32_t i = 0; i < shader_count; ++i) {
-      VkResult result = compile_one(dev, &infos[i], state, pAllocator, &shaders_out[i]);
+      VkResult result = compile_one(dev, &infos[i], state, NULL, pAllocator, &shaders_out[i]);
       if (result != VK_SUCCESS) {
          /* compile consumes every NIR, whatever happens. */
          for (uint32_t j = i + 1; j < shader_count; ++j)
@@ -3299,7 +3308,7 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
       .set_layouts = src->vk_layouts,
    };
    struct vk_shader *out;
-   if (compile_one(dev, &info, &state, NULL, &out) != VK_SUCCESS)
+   if (compile_one(dev, &info, &state, key, NULL, &out) != VK_SUCCESS)
       return NULL;
    struct wvk_shader *variant = wvk_shader_from_vk(out);
    if (stage == MESA_SHADER_VERTEX)
@@ -3308,7 +3317,7 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
 }
 
 struct wvk_shader *
-wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_shader *fs,
+wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_shader *other,
                         const struct vk_dynamic_graphics_state *dyn, unsigned samples)
 {
    if (!shader || !shader->source)
@@ -3316,6 +3325,14 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
 
    struct wvk_shader_key key;
    memset(&key, 0, sizeof(key));
+   /* The records: every set either stage's layout has, in order. */
+   for (uint32_t g = 0; g < 4; ++g) {
+      key.meta_base[g] = key.meta_words;
+      const int32_t words = MAX2(shader->set_words[g], other ? other->set_words[g] : -1);
+      key.meta_words += MAX2(words, 0);
+   }
+   const bool records = !memcmp(key.meta_base, shader->key.meta_base, sizeof(key.meta_base)) &&
+                        key.meta_words == shader->key.meta_words;
    struct vk_vertex_input_state vi;
    if (shader->vk.stage == MESA_SHADER_VERTEX) {
       /* The strides the draw has, which may be dynamic. */
@@ -3323,10 +3340,10 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       u_foreach_bit(b, vi.bindings_valid)
          vi.bindings[b].stride = dyn->vi_binding_strides[b];
       key.pulled = pull_key(&vi, shader->attribs_read);
-      if (key.pulled == shader->key.pulled && varyings_match(shader, fs))
+      if (records && key.pulled == shader->key.pulled && varyings_match(shader, other))
          return shader;
-      if (fs)
-         memcpy(key.fs_inputs, fs->varyings, sizeof(key.fs_inputs));
+      if (other)
+         memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
    } else if (shader->vk.stage == MESA_SHADER_FRAGMENT) {
       key.alpha_to_one = dyn->ms.alpha_to_one_enable;
       key.by_alpha = dyn->ms.alpha_to_coverage_enable && (key.alpha_to_one || shader->own_mask || samples <= 1);
@@ -3344,11 +3361,11 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
    if (!he) {
       /* A variant that failed is kept as none, not tried at every draw. */
       if (getenv("WINK_VK_VARIANT_LOG")) {
-         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s\n", _mesa_shader_stage_to_string(shader->vk.stage),
+         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s\n", _mesa_shader_stage_to_string(shader->vk.stage),
                  shader->id, key.pulled != shader->key.pulled ? " vertex input" : "",
-                 shader->vk.stage == MESA_SHADER_VERTEX && !varyings_match(shader, fs) ? " varyings" : "",
+                 shader->vk.stage == MESA_SHADER_VERTEX && !varyings_match(shader, other) ? " varyings" : "",
                  key.alpha_to_one != shader->key.alpha_to_one || key.by_alpha != shader->key.by_alpha ? " alpha" : "",
-                 key.samples != shader->key.samples ? " samples" : "");
+                 key.samples != shader->key.samples ? " samples" : "", records ? "" : " records");
       }
       variant = compile_variant(dev, shader, &key, &vi);
       if (!variant)
@@ -3409,6 +3426,7 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_bytes(blob, &shader->key, sizeof(shader->key));
    blob_write_bytes(blob, shader->varyings, sizeof(shader->varyings));
    blob_write_uint32(blob, shader->attribs_read);
+   blob_write_bytes(blob, shader->set_words, sizeof(shader->set_words));
    blob_write_uint8(blob, shader->per_sample);
    blob_write_uint8(blob, shader->own_mask);
    blob_write_uint8(blob, shader->uses_samples);
@@ -3452,6 +3470,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    uint8_t varyings[WVK_MAX_VARYINGS];
    blob_copy_bytes(blob, varyings, sizeof(varyings));
    const uint32_t attribs_read = blob_read_uint32(blob);
+   int32_t set_words[4];
+   blob_copy_bytes(blob, set_words, sizeof(set_words));
    const bool per_sample = blob_read_uint8(blob);
    const bool own_mask = blob_read_uint8(blob);
    const bool uses_samples = blob_read_uint8(blob);
@@ -3497,6 +3517,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->key = key;
    memcpy(shader->varyings, varyings, sizeof(varyings));
    shader->attribs_read = attribs_read;
+   memcpy(shader->set_words, set_words, sizeof(set_words));
    shader->per_sample = per_sample;
    shader->own_mask = own_mask;
    shader->uses_samples = uses_samples;

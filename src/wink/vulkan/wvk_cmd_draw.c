@@ -2601,7 +2601,7 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
    const unsigned samples = replay->rendering.empty && dyn->ms.rasterization_samples
                                ? dyn->ms.rasterization_samples
                                : MAX2(replay->rendering.samples, 1);
-   st->fs = wvk_shader_draw_variant(dev, st->bound_fs, NULL, dyn, samples);
+   st->fs = wvk_shader_draw_variant(dev, st->bound_fs, st->bound_vs, dyn, samples);
    st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples);
 }
 
