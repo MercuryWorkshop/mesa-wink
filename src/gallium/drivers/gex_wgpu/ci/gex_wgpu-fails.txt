@@ -84,7 +84,6 @@ KHR-GL46.get_texture_sub_image.functional_test,Fail
 KHR-GL46.gpu_shader5.precise_qualifier,Fail
 KHR-GL46.gpu_shader_fp64.builtin.inverse_dmat4,Timeout
 KHR-GL46.incomplete_texture_access.sampler,Fail
-KHR-GL46.layout_binding.image2D_layout_binding_imageLoad_FragmentShader,Crash
 KHR-GL46.limits.max_compute_work_group_count,Fail
 KHR-GL46.limits.max_fragment_input_components,Fail
 KHR-GL46.limits.max_geometry_output_components,Fail
@@ -300,7 +299,6 @@ KHR-GLES3.packed_pixels.varied_rectangle.rgba_format_rgba,Crash
 KHR-GLES3.texture_lod_bias.texture_lod_bias_all,Fail
 KHR-GLES31.core.draw_buffers_indexed.color_masks,Fail
 KHR-GLES31.core.gpu_shader5.precise_qualifier,Fail
-KHR-GLES31.core.layout_binding.image2D_layout_binding_imageLoad_VertexShader,Crash
 KHR-GLES31.core.pixelstoragemodes.teximage2d.r32f.0_0,Fail
 KHR-GLES31.core.pixelstoragemodes.teximage2d.r8snorm.16_1,Fail
 KHR-GLES31.core.pixelstoragemodes.teximage2d.rg16ui.16_0,Fail

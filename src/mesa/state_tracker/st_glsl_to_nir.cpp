@@ -637,7 +637,7 @@ st_link_glsl_to_nir(struct gl_context *ctx,
       char *error = st_finalize_program(st, prog, true);
 
       if (error) {
-         linker_error(shader_program, error);
+         linker_error(shader_program, "%s", error);
          free(error);
          return false;
       }

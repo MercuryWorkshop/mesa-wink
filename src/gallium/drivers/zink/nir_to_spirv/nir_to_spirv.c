@@ -71,11 +71,7 @@ struct ntv_context {
    nir_variable *ssbo_vars;
 
    struct hash_table image_types;
-   nir_variable *sampler_var[PIPE_MAX_SHADER_SAMPLER_VIEWS]; /* driver_location -> variable */
-   nir_variable *bindless_sampler_var[2];
-   unsigned last_sampler;
    unsigned bindless_set_idx;
-   nir_variable *image_var[PIPE_MAX_SHADER_IMAGES]; /* driver_location -> variable */
 
    SpvId entry_ifaces[PIPE_MAX_SHADER_INPUTS * 4 + PIPE_MAX_SHADER_OUTPUTS * 4];
    size_t num_entry_ifaces;
@@ -5639,22 +5635,10 @@ nir_to_spirv(struct nir_shader *s, const struct ntv_info *sinfo)
    nir_foreach_variable_with_modes(var, s, nir_var_mem_ssbo)
       emit_bo(&ctx, var, ssbo_counter > 1);
 
-   nir_foreach_variable_with_modes(var, s, nir_var_image)
-      ctx.image_var[var->data.driver_location] = var;
-   nir_foreach_variable_with_modes(var, s, nir_var_uniform) {
-      if (glsl_type_is_sampler(glsl_without_array(var->type))) {
-         if (var->data.descriptor_set == ctx.bindless_set_idx) {
-            /* A driver that leaves bindless_set_idx at a set it actually uses
-             * would otherwise scribble past this table.
-             */
-            assert(var->data.driver_location <
-                   ARRAY_SIZE(ctx.bindless_sampler_var));
-            ctx.bindless_sampler_var[var->data.driver_location] = var;
-         } else
-            ctx.sampler_var[var->data.driver_location] = var;
-         ctx.last_sampler = MAX2(ctx.last_sampler, var->data.driver_location);
-      }
-   }
+   /* Zink's tables of samplers and images by driver_location are gone:
+    * nothing here read them, and ntv_shader_prepare makes driver_location
+    * the binding, which the drivers here have above the tables' sizes -- a
+    * GL image at unit 8 is at binding 64, and wrote over entry_ifaces. */
    nir_foreach_variable_with_modes(var, s, nir_var_image | nir_var_uniform) {
       const struct glsl_type *type = glsl_without_array(var->type);
       if (glsl_type_is_bare_sampler(type))

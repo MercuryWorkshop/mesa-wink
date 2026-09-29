@@ -2,7 +2,6 @@
 # The fp64 builtins' doubles are Mesa's float64.glsl, and a case takes one to
 # four minutes beside the other suites -- over the 300 s limit, some runs.
 KHR-GL46.gpu_shader_fp64.builtin.*
-KHR-GL46.layout_binding.image2D_layout_binding_imageLoad_VertexShader
 KHR-GL46.texture_swizzle.smoke_access_idx_5_channel_idx_0
 KHR-GL46.texture_swizzle.smoke_access_idx_5_channel_idx_2
 KHR-GL46.texture_swizzle.smoke_access_idx_7_channel_idx_0
