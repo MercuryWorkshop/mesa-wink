@@ -3051,14 +3051,18 @@ struct gex_wgpu_rasterizer {
  * order. One vec4 slot each, so the stride is count * 16 and slot i sits at
  * i * 16 -- the same shape the passthrough vertex shader's vertex elements
  * describe, because that buffer is read back as a vertex buffer. */
+enum { GEX_WGPU_VARYING_FLOAT, GEX_WGPU_VARYING_INT, GEX_WGPU_VARYING_UINT };
+
 struct gex_wgpu_varying_layout {
    unsigned count;
    uint32_t location[GEX_WGPU_MAX_VARYINGS];
-   /* Each slot's type as declared, a glsl_base_type -- float unless the
-    * producer declared an integer -- and its interpolation qualifier. The
-    * buffer is words either way; these are for the rasterizing passthrough,
-    * whose outputs have to match the fragment shader's inputs in both, or
-    * WebGPU refuses the pipeline. */
+   /* Each slot's type as declared -- GEX_WGPU_VARYING_FLOAT, _INT or _UINT
+    * -- and its interpolation qualifier. The buffer is words either way;
+    * these are for the rasterizing passthrough, whose outputs have to match
+    * the fragment shader's inputs in both, or WebGPU refuses the pipeline.
+    * Zero is float, so that a layout built without them, which several
+    * are, says what it always meant: glsl_base_type's zero is UINT, and
+    * storing that made every such passthrough's outputs flat uvec4s. */
    uint8_t base_type[GEX_WGPU_MAX_VARYINGS];
    uint8_t interpolation[GEX_WGPU_MAX_VARYINGS];
 };
@@ -28947,7 +28951,10 @@ gex_wgpu_collect_varyings(nir_shader *nir, nir_variable_mode mode,
          --at;
       }
       layout->location[at] = var->data.location;
-      layout->base_type[at] = (uint8_t)glsl_get_base_type(type);
+      layout->base_type[at] =
+         glsl_get_base_type(type) == GLSL_TYPE_INT    ? GEX_WGPU_VARYING_INT
+         : glsl_get_base_type(type) == GLSL_TYPE_UINT ? GEX_WGPU_VARYING_UINT
+                                                      : GEX_WGPU_VARYING_FLOAT;
       layout->interpolation[at] = (uint8_t)var->data.interpolation;
       ++layout->count;
       /* A merged clip/cull array occupies *two* varying slots.
@@ -28983,7 +28990,7 @@ gex_wgpu_collect_varyings(nir_shader *nir, nir_variable_mode mode,
             --second;
          }
          layout->location[second] = VARYING_SLOT_CLIP_DIST1;
-         layout->base_type[second] = GLSL_TYPE_FLOAT;
+         layout->base_type[second] = GEX_WGPU_VARYING_FLOAT;
          layout->interpolation[second] = INTERP_MODE_NONE;
          ++layout->count;
       }
@@ -29142,12 +29149,11 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
        * -- and the invalid command buffer took the geometry stage's
        * transform feedback with it: every integer builtin_functions case
        * read through a geometry shader came back zero. */
-      const enum glsl_base_type base =
-         (enum glsl_base_type)outputs->base_type[i];
+      const unsigned base = outputs->base_type[i];
       const struct glsl_type *slot_type =
-         base == GLSL_TYPE_INT ? glsl_ivec4_type()
-         : base == GLSL_TYPE_UINT ? glsl_uvec4_type()
-                                  : glsl_vec4_type();
+         base == GEX_WGPU_VARYING_INT ? glsl_ivec4_type()
+         : base == GEX_WGPU_VARYING_UINT ? glsl_uvec4_type()
+                                         : glsl_vec4_type();
       nir_variable *out = nir_variable_create(
          b.shader, nir_var_shader_out,
          is_clip ? glsl_array_type(glsl_float_type(),
@@ -29156,9 +29162,9 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
       out->data.location = outputs->location[i];
       out->data.driver_location = i;
       if (!is_clip)
-         out->data.interpolation =
-            (base == GLSL_TYPE_INT || base == GLSL_TYPE_UINT)
-               ? INTERP_MODE_FLAT : outputs->interpolation[i];
+         out->data.interpolation = base != GEX_WGPU_VARYING_FLOAT
+                                      ? INTERP_MODE_FLAT
+                                      : outputs->interpolation[i];
       /* A slot keeps its place in the record whether or not it is
        * forwarded, so the offset is the slot number and not a compacted
        * one -- which is the whole reason the storage form needs no
