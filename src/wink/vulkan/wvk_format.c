@@ -240,6 +240,12 @@ wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format)
       return 0;
 
    uint32_t caps = f->caps;
+   /* A packed format's texture is RGBA8 holding its channels, not its
+    * bits, so what WebGPU grants RGBA8Unorm is not the packed format's: a
+    * storage view of one as R16 or RG8 would read and write the wrong
+    * bytes. */
+   if (caps & WVK_CAP_PACKED16)
+      return caps;
    const bool tier1 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureFormatsTier1);
    const bool tier2 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureFormatsTier2);
    switch (f->texture) {

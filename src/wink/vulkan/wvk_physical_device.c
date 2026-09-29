@@ -965,7 +965,10 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    if (!caps)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    if (info->tiling == VK_IMAGE_TILING_LINEAR) {
-      if (!wvk_image_linear_supported(pdev, info->format, info->type, info->usage) || info->flags)
+      /* A linear image is memory copied to and from, and never has a view,
+       * so being allowed views of other formats changes nothing about it. */
+      if (!wvk_image_linear_supported(pdev, info->format, info->type, info->usage) ||
+          (info->flags & ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)))
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
       pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
          .maxExtent = { l->maxTextureDimension2D, l->maxTextureDimension2D, 1 },
