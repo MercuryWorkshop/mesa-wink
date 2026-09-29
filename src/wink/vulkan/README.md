@@ -16,7 +16,10 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **One in-order queue.** The runtime's emulated timelines defer a submit
   until what it waits for is pending. On one in-order WebGPU queue, nothing
   is then left to wait for on the GPU: barriers and events cost nothing, and
-  acquiring a swapchain image never blocks.
+  acquiring a swapchain image never blocks. A second queue family, of
+  compute and transfer, has a queue that submits to the same WebGPU queue.
+  Two families let two threads submit at once, so native Dawn is asked for
+  `ImplicitDeviceSynchronization`.
 - **Host-visible memory is a copy on the host.** Ranges a submit reads are
   uploaded with `wgpuQueueWriteBuffer` before it. Ranges it writes are read
   back after it, and the submit counts as finished only then.
@@ -33,8 +36,27 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   itself, from the vertex buffer bound as storage, since WebGPU steps an
   instance attribute every instance; so are attributes of strides not
   whole words, or at offsets their formats are not aligned to, which
-  WebGPU cannot lay out. It is the one piece of pipeline state compiled
-  into shaders.
+  WebGPU cannot lay out.
+- **Shaders are compiled for some of the state they're drawn with.** What
+  they depend on:
+  - the vertex input they pull;
+  - the fragment shader's interpolation, which WebGPU wants a vertex
+    shader's outputs to have;
+  - alpha to one, and coverage from alpha where WebGPU's won't do (with
+    one sample, or with the shader's own mask);
+  - the samples positions are placed for;
+  - whether the pass has a depth attachment to write to;
+  - where each set's records are.
+
+  Shaders compiled apart don't know that state: shader objects, a fast
+  link's pipeline libraries, and anything with dynamic vertex input or
+  multisampling. Each keeps its source for that: its NIR as compiled, and
+  copies of its set layouts, serialized with it. A draw whose state
+  differs from what a shader was compiled for uses a variant compiled
+  from the source and cached (`wvk_shader_draw_variant`).
+  `WINK_VK_VARIANT_LOG=1` says when one is compiled, and why.
+  Monolithic pipelines' shaders are compiled for their draws and have no
+  variants.
 - **64-bit floats**, which WGSL has none of, are Mesa's float64.glsl in
   integer arithmetic (built by glslang, where there is one), inlined by
   nir_lower_doubles; and 64-bit integers are pairs of words
@@ -215,6 +237,7 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 | `WINK_VK_ABORT_ON_ERROR=1` | abort on a WebGPU validation error, which is a driver bug |
 | `WINK_VK_FALLBACK_ADAPTER=1` | use Dawn's software adapter |
 | `WINK_VK_API_VERSION` | the Vulkan version reported |
+| `WINK_VK_VARIANT_LOG=1` | say when a shader variant is compiled for a draw, and why |
 | `GEX_WGPU_SPIRV_DIR=dir` | write every module to `dir/N.spv` before Tint reads it, for one Tint does not come back from |
 
 ## Not there yet
