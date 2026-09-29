@@ -24,6 +24,7 @@
 
 #include "vk_enum_defines.h"
 #include "vk_format.h"
+#include "vk_shader_module.h"
 
 #include "git_sha1.h"
 #include "util/u_atomic.h"
@@ -120,6 +121,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_depth_clamp_zero_one = true,
       .KHR_workgroup_memory_explicit_layout = true,
       .EXT_vertex_attribute_robustness = true,
+      .EXT_shader_module_identifier = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -596,6 +598,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .workgroupMemoryExplicitLayout8BitAccess = true,
       .workgroupMemoryExplicitLayout16BitAccess = true,
       .vertexAttributeRobustness = true,
+      /* The runtime's, pipelines of them found in its caches. */
+      .shaderModuleIdentifier = true,
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,
@@ -997,6 +1001,10 @@ get_device_properties(const struct wvk_physical_device *pdev,
    /* Shaders are cached as WGSL, which is this build's. */
    memcpy(p->shaderBinaryUUID, instance->driver_uuid, VK_UUID_SIZE);
    p->shaderBinaryVersion = WVK_SHADER_BINARY_VERSION;
+   /* The runtime's identifiers of modules (VK_EXT_shader_module_identifier). */
+   STATIC_ASSERT(sizeof(vk_shaderModuleIdentifierAlgorithmUUID) == sizeof(p->shaderModuleIdentifierAlgorithmUUID));
+   memcpy(p->shaderModuleIdentifierAlgorithmUUID, vk_shaderModuleIdentifierAlgorithmUUID,
+          sizeof(p->shaderModuleIdentifierAlgorithmUUID));
    /* The device: the adapter's IDs, and which backend it is reached by. */
    uint32_t uuid[4] = { pdev->info.vendorID, pdev->info.deviceID, (uint32_t)pdev->info.backendType,
                         0x77696e6b /* "wink" */ };
