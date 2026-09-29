@@ -793,6 +793,8 @@ struct wvk_bound_state {
    struct wvk_driver_buffer draw;
    /* The vertex shader's pulled vertex buffers. See set_pulled_buffers. */
    struct wvk_driver_buffer pulled[WVK_MAX_PULLED_BINDINGS];
+   /* The index buffer a draw of points as quads reads. See draw_points. */
+   struct wvk_driver_buffer index;
    /* The last draw's pipeline layout. */
    struct wvk_layout *graphics_layout;
 
@@ -1135,6 +1137,8 @@ driver_binding_buffer(const struct wvk_bound_state *st, uint32_t binding)
       return &st->draw;
    if (binding >= WVK_DRIVER_SLOT_VERTEX && binding < WVK_DRIVER_SLOT_VERTEX + WVK_MAX_PULLED_BINDINGS)
       return &st->pulled[binding - WVK_DRIVER_SLOT_VERTEX];
+   if (binding == WVK_DRIVER_SLOT_INDEX)
+      return &st->index;
    return NULL;
 }
 
@@ -1510,6 +1514,8 @@ driver_key(const struct wvk_device *dev, const struct wvk_bgl *bgl, uint32_t gro
          continue;
       if (binding == WVK_DRIVER_SLOT_DRAW)
          key.draw = d->serial;
+      else if (binding == WVK_DRIVER_SLOT_INDEX)
+         key.index = d->serial;
       else
          key.vertex[binding - WVK_DRIVER_SLOT_VERTEX] = d->serial;
    }
@@ -2031,6 +2037,9 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
    /* A draw for one face culls the other. */
    if (replay->draw_face)
       k->cull_mode = replay->draw_face == 1 ? WGPUCullMode_Back : WGPUCullMode_Front;
+   /* A point is not culled, whichever way its quad's triangles face. */
+   if (replay->draw_points)
+      k->cull_mode = WGPUCullMode_None;
    k->unclipped_depth = dyn->rs.depth_clamp_enable;
 
    k->samples = MAX2(replay->rendering.samples, 1);
@@ -2110,8 +2119,9 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
          k->back.fail = k->back.pass = k->back.depth_fail = VK_STENCIL_OP_KEEP;
          k->stencil_write_mask = 0;
       }
-      /* Which WebGPU has of triangles alone. */
-      if (dyn->rs.depth_bias.enable && k->topology != WGPUPrimitiveTopology_LineList &&
+      /* Which WebGPU has of triangles alone: and Vulkan not of points,
+       * which the triangles of a point's quad are. */
+      if (dyn->rs.depth_bias.enable && !replay->draw_points && k->topology != WGPUPrimitiveTopology_LineList &&
           k->topology != WGPUPrimitiveTopology_PointList && k->topology != WGPUPrimitiveTopology_LineStrip) {
          k->depth_bias = (int32_t)dyn->rs.depth_bias.constant_factor;
          k->depth_bias_slope = dyn->rs.depth_bias.slope_factor;
@@ -2183,6 +2193,15 @@ set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
    }
    if (dyn->vp.viewport_count) {
       VkViewport v = dyn->vp.viewports[MIN2(index, dyn->vp.viewport_count - 1)];
+      /* A point's quad is its size in the viewport's pixels, down in
+       * framebuffer y whatever the viewport's sign (expand_points). */
+      if (cmd->replay->draw_points && v.width && v.height) {
+         const float scale[2] = { 1.0f / v.width, 1.0f / v.height };
+         if (memcmp(st->push + WVK_DRIVER_POINT_SCALE, scale, sizeof(scale))) {
+            memcpy(st->push + WVK_DRIVER_POINT_SCALE, scale, sizeof(scale));
+            st->push_offset = UINT32_MAX;
+         }
+      }
       if (v.height < 0) {
          v.y += v.height;
          v.height = -v.height;
@@ -2921,12 +2940,87 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
    VkFormat fs_images[WVK_MAX_UNFORMATTED_IMAGES], vs_images[WVK_MAX_UNFORMATTED_IMAGES];
    unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_fs, fs_images);
    unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_vs, vs_images);
+   const bool points = replay->draw_points;
    st->fs = wvk_shader_draw_variant(dev, st->bound_fs, st->bound_vs, dyn, samples, has_depth, color_formats,
-                                    fs_images);
-   st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats, vs_images);
+                                    fs_images, points);
+   st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats, vs_images,
+                                    points);
    /* No fragment shader to do the depth bounds test: the driver's. */
    if (!st->fs && dyn->ds.depth.bounds_test.enable && has_depth && samples <= 1)
       st->fs = dev->depth_bounds_fs;
+}
+
+/* Whether a draw's points are quads of the size the vertex shader gives
+ * them (largePoints): where it gives them one, and can pull what it reads
+ * (expand_points), which it can of so many vertex buffers. */
+static bool
+draws_points(const struct wvk_cmd_buffer *cmd)
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   const struct wvk_bound_state *st = cmd->replay->state;
+   if (dyn->ia.primitive_topology != VK_PRIMITIVE_TOPOLOGY_POINT_LIST || !st->bound_vs ||
+       !st->bound_vs->writes_point_size || dyn->rs.rasterizer_discard_enable)
+      return false;
+   uint32_t bindings = 0;
+   u_foreach_bit(location, dyn->vi->attributes_valid & st->bound_vs->attribs_read) {
+      const struct vk_vertex_attribute_state *a = &dyn->vi->attributes[location];
+      if (!wvk_format_vertex_pullable(a->format)) {
+         mesa_logw_once("wvk: points of an attribute the shader cannot read itself, drawn a pixel each");
+         return false;
+      }
+      bindings |= BITFIELD_BIT(a->binding);
+   }
+   if (util_bitcount(bindings) > WVK_MAX_PULLED_BINDINGS) {
+      mesa_logw_once("wvk: points of more than %u vertex buffers, drawn a pixel each", WVK_MAX_PULLED_BINDINGS);
+      return false;
+   }
+   return true;
+}
+
+/* A draw of points as quads (draws_points): a triangle list of six
+ * vertices a point, whose vertex shader reads an indexed draw's indices
+ * from the index buffer, bound as storage (expand_points). */
+static void
+draw_points(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t count, uint32_t instances,
+            int32_t base_vertex, uint32_t first_instance, uint32_t draw_id)
+{
+   const struct wvk_physical_device *pdev = wvk_device_physical(wvk_cmd_buffer_device(cmd));
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   if (!count || !instances)
+      return;
+   if ((uint64_t)first * 6 + (uint64_t)count * 6 > UINT32_MAX) {
+      mesa_logw_once("wvk: a draw of more points than six vertices each can number");
+      return;
+   }
+   uint32_t words[2] = { 0, 0 };
+   st->index = (struct wvk_driver_buffer){ 0 };
+   if (indexed) {
+      const struct wvk_bound_buffer *ib = &st->ib;
+      if (!ib->buffer || !ib->mem)
+         return;
+      const uint64_t whole = ib->mem->buffer_size;
+      const uint64_t size = MIN2(whole, pdev->limits.maxStorageBufferBindingSize) & ~3ull;
+      const uint64_t offset = MIN2(ib->offset, whole - size) & ~255ull;
+      st->index = (struct wvk_driver_buffer){ ib->mem->buffer, ib->mem->serial, (uint32_t)offset, size };
+      words[0] = (uint32_t)(ib->offset - offset);
+      words[1] = st->index_type == VK_INDEX_TYPE_UINT32  ? 4
+                 : st->index_type == VK_INDEX_TYPE_UINT8 ? 1
+                                                         : 2;
+      wvk_replay_read(replay, ib->mem, ib->offset, ib->size);
+   }
+   if (memcmp(st->push + WVK_DRIVER_POINT_INDEX, words, sizeof(words))) {
+      memcpy(st->push + WVK_DRIVER_POINT_INDEX, words, sizeof(words));
+      st->push_offset = UINT32_MAX;
+   }
+   replay->list_topology = WGPUPrimitiveTopology_TriangleList;
+   foreach_viewport(cmd) {
+      set_draw_parameters(st, NULL, 0, indexed, indexed ? base_vertex : (int32_t)first, first_instance, draw_id);
+      if (!flush_draw(cmd, false))
+         continue;
+      wgpuRenderPassEncoderDraw(replay->pass, count * 6, instances, first * 6, first_instance);
+   }
+   replay->list_topology = WGPUPrimitiveTopology_Undefined;
 }
 
 static void
@@ -2935,7 +3029,13 @@ draw_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertexCount, uint32_t instanceC
 {
    if (!vertexCount || !instanceCount)
       return;
+   cmd->replay->draw_points = draws_points(cmd);
    select_draw_shaders(cmd);
+   if (cmd->replay->draw_points) {
+      draw_points(cmd, false, firstVertex, vertexCount, instanceCount, 0, firstInstance, draw_id);
+      cmd->replay->draw_points = false;
+      return;
+   }
    if (draw_polygon_mode(cmd, false, 0, vertexCount, instanceCount, (int32_t)firstVertex, firstInstance, draw_id))
       return;
    if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
@@ -2956,7 +3056,13 @@ draw_elements(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instance
 {
    if (!indexCount || !instanceCount)
       return;
+   cmd->replay->draw_points = draws_points(cmd);
    select_draw_shaders(cmd);
+   if (cmd->replay->draw_points) {
+      draw_points(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
+      cmd->replay->draw_points = false;
+      return;
+   }
    if (draw_polygon_mode(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id))
       return;
    if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
@@ -3022,6 +3128,22 @@ draw_indirect_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_b
    struct wvk_bound_state *st = replay->state;
    if (!drawCount || !b.buffer)
       return;
+   /* Points as quads, as the host has the draws (draw_indirect). */
+   if (replay->draw_points) {
+      for (uint32_t i = 0; i < drawCount; ++i) {
+         const uint8_t *at = (const uint8_t *)b.mem->host + b.offset + (uint64_t)i * stride;
+         if (indexed) {
+            VkDrawIndexedIndirectCommand c;
+            memcpy(&c, at, sizeof(c));
+            draw_points(cmd, true, c.firstIndex, c.indexCount, c.instanceCount, c.vertexOffset, c.firstInstance, i);
+         } else {
+            VkDrawIndirectCommand c;
+            memcpy(&c, at, sizeof(c));
+            draw_points(cmd, false, c.firstVertex, c.vertexCount, c.instanceCount, 0, c.firstInstance, i);
+         }
+      }
+      return;
+   }
    /* A fan's draws, and those of lines or points of triangles, as the
     * host has them, one by one as the lists the driver makes. */
    enum list_mode mode;
@@ -3084,10 +3206,14 @@ draw_indirect(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDevic
 {
    if (!drawCount)
       return;
-   select_draw_shaders(cmd);
    const uint32_t size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
-   draw_indirect_bound(cmd, indexed, bound_buffer(cmd, buffer, offset, (uint64_t)(drawCount - 1) * stride + size),
-                       drawCount, stride);
+   const struct wvk_bound_buffer b = bound_buffer(cmd, buffer, offset, (uint64_t)(drawCount - 1) * stride + size);
+   /* Points as quads need the draws' counts, which the host has where the
+    * memory is its too. */
+   cmd->replay->draw_points = draws_points(cmd) && b.mem && b.mem->host;
+   select_draw_shaders(cmd);
+   draw_indirect_bound(cmd, indexed, b, drawCount, stride);
+   cmd->replay->draw_points = false;
 }
 
 /* vkCmdDraw*IndirectCount, which WebGPU does not have: the draws copied,

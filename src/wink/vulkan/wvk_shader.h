@@ -45,7 +45,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 14
+#define WVK_SHADER_BINARY_VERSION 15
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -62,6 +62,9 @@ struct wvk_shader_binding {
  * with other state -- a fragment shader it was not linked with, vertex
  * input it did not know, multisampling set at the draw -- draws a variant
  * compiled for that (wvk_shader_draw_variant). */
+/* The largest point drawn as a quad, in pixels (largePoints). */
+#define WVK_MAX_POINT_SIZE 256.0f
+
 /* Storage images without a format a shader is compiled for the views of. */
 #define WVK_MAX_UNFORMATTED_IMAGES 8
 
@@ -77,6 +80,10 @@ struct wvk_shader_key {
    /* Fragment: its depth write dropped, for a pass without a depth
     * attachment, which WebGPU will not have it write to. */
    uint8_t no_depth;
+   /* Points drawn as quads (largePoints): the vertex shader making six
+    * vertices a point, the fragment shader reading gl_PointCoord from the
+    * varying at location point_coord - 1 (0: none) and facing front. */
+   uint8_t points, point_coord;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
@@ -129,6 +136,11 @@ struct wvk_shader {
    /* Fragment: whether it reads the depth attachment's copy for the depth
     * bounds test. */
    bool reads_depth_bounds;
+   /* Vertex: writes PointSize, and so draws points as quads. Fragment:
+    * reads gl_PointCoord (1) or gl_FrontFacing (2), which a point's quad
+    * has not. */
+   bool writes_point_size;
+   uint8_t point_state;
    /* Its storage images without a format, as the set and slot of each
     * (set << 10 | slot), whose views' formats a draw or dispatch compiles
     * a variant for (key.image_format). */
@@ -193,13 +205,14 @@ extern const struct vk_device_shader_ops wvk_device_shader_ops;
  * without a depth attachment, and the logic op for these colour formats;
  * either for the records of both its and `other`'s layouts, and the
  * formats of the views bound where it has storage images without one
- * (`image_formats`, as for wvk_shader_dispatch_variant). The shader itself
+ * (`image_formats`, as for wvk_shader_dispatch_variant); and for points
+ * drawn as quads. The shader itself
  * where it was compiled for that, or a variant it could not compile. */
 struct wvk_shader *wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader,
                                            const struct wvk_shader *other,
                                            const struct vk_dynamic_graphics_state *dyn, unsigned samples,
                                            bool has_depth, const VkFormat *color_formats,
-                                           const VkFormat *image_formats);
+                                           const VkFormat *image_formats, bool points);
 
 /* The shader, or its variant for the formats of the views bound where it
  * has storage images without one (wvk_shader::unformatted; 0 for one not

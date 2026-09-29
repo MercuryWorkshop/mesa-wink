@@ -200,6 +200,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .textureCompressionASTC_LDR = astc,
       .textureCompressionBC = bc,
       .fragmentStoresAndAtomics = true,
+      /* Points of the size the vertex shader gives them: quads, a variant
+       * of the shader moving six vertices to a point's corners. */
+      .largePoints = true,
       /* Gathers at several offsets, or one not constant (wvk_shader.c). */
       .shaderImageGatherExtended = true,
       /* Explicit LODs raised, gradients scaled (wvk_nir_descriptors.c). */
@@ -559,9 +562,10 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxCullDistances = 0,
       .maxCombinedClipAndCullDistances = clip ? 8 : 0,
       .discreteQueuePriorities = 2,
-      .pointSizeRange = { 1.0f, 1.0f },
+      /* Points are quads of any size (expand_points in wvk_shader.c). */
+      .pointSizeRange = { 1.0f, WVK_MAX_POINT_SIZE },
       .lineWidthRange = { 1.0f, 1.0f },
-      .pointSizeGranularity = 0.0f,
+      .pointSizeGranularity = 0.125f,
       .lineWidthGranularity = 0.0f,
       .strictLines = false,
       .standardSampleLocations = true,
@@ -636,9 +640,9 @@ get_device_properties(const struct wvk_physical_device *pdev,
       /* VK_KHR_portability_subset */
       .minVertexInputBindingStrideAlignment = 4,
 
-      /* VK_KHR_maintenance5. Points are a pixel, whatever PointSize says;
-       * a depth or stencil view's missing channels are 0, and its alpha 1
-       * (wvk_image.c). */
+      /* VK_KHR_maintenance5. A polygon's corners in point mode are a
+       * pixel, whatever PointSize says; a depth or stencil view's missing
+       * channels are 0, and its alpha 1 (wvk_image.c). */
       .earlyFragmentMultisampleCoverageAfterSampleCounting = true,
       .earlyFragmentSampleMaskTestBeforeSampleCounting = true,
       .depthStencilSwizzleOneSupport = true,

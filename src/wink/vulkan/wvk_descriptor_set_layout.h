@@ -81,6 +81,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* A copy of the depth attachment the depth bounds test reads, as it was
  * before the draw, in R32Float. */
 #define WVK_DRIVER_SLOT_DEPTH_BOUNDS (WVK_DRIVER_SLOT_LOGIC_OP + WVK_MAX_LOGIC_OP_ATTACHMENTS)
+/* The index buffer of an indexed draw of points drawn as quads, which the
+ * vertex shader reads its point's index from (wvk_shader.c). */
+#define WVK_DRIVER_SLOT_INDEX (WVK_DRIVER_SLOT_DEPTH_BOUNDS + 1)
 
 #define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
 
@@ -162,7 +165,10 @@ enum wvk_texel_type {
  *   - each pulled vertex buffer's stride, which may be dynamic, 4 uints;
  *   - a dispatch's base workgroup, 3 uints; and the viewport a draw is
  *     drawn in, a uint (a draw per viewport, see wvk_cmd_draw.c);
- *   - the depth bounds, 2 floats, which the fragment shader tests. */
+ *   - the depth bounds, 2 floats, which the fragment shader tests;
+ *   - for points drawn as quads, 1 over the viewport's width and height,
+ *     2 floats; and where an indexed draw's indices start in the index
+ *     binding, in bytes, and their size, 0 for a draw without, 2 uints. */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
@@ -174,7 +180,9 @@ enum wvk_texel_type {
 #define WVK_DRIVER_BASE_GROUP (WVK_DRIVER_DATA_OFFSET + 96)
 #define WVK_DRIVER_VIEWPORT (WVK_DRIVER_BASE_GROUP + 12)
 #define WVK_DRIVER_DEPTH_BOUNDS (WVK_DRIVER_DATA_OFFSET + 112)
-#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 128)
+#define WVK_DRIVER_POINT_SCALE (WVK_DRIVER_DATA_OFFSET + 120)
+#define WVK_DRIVER_POINT_INDEX (WVK_DRIVER_DATA_OFFSET + 128)
+#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 144)
 #define WVK_META_OFFSET WVK_PUSH_DATA_SIZE
 /* How much of the push buffer the push binding shows: its data, and as
  * many records as that leaves room for. */
@@ -182,11 +190,13 @@ enum wvk_texel_type {
 
 /* What a group-3 bind group's driver bindings are bound to: the push
  * buffer's generation, and memory serials (0: none) for the draw binding
- * (none: the push buffer) and the pulled vertex buffers. */
+ * (none: the push buffer), the pulled vertex buffers and a point draw's
+ * index buffer. */
 struct wvk_driver_key {
    uint64_t push_generation;
    uint64_t draw;
    uint64_t vertex[WVK_MAX_PULLED_BINDINGS];
+   uint64_t index;
 };
 
 static inline bool

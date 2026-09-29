@@ -119,6 +119,9 @@ struct wvk_replay {
     * triangles of a fan, or the edges or corners of each where the polygon
     * mode is lines or points (wvk_cmd_draw.c); else Undefined. */
    WGPUPrimitiveTopology list_topology;
+   /* A draw of points as quads, six vertices a point, which the vertex
+    * shader moves to its corners (largePoints; wvk_shader.c). */
+   bool draw_points;
    /* Images with atomics whose buffer of texels is the image now, until
     * the next barrier (wvk_replay_sync_atomic_images). */
    struct util_dynarray atomic_images; /* struct wvk_image * */

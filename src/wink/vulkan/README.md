@@ -112,6 +112,16 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   test is, or at the start where it asks for early tests; a draw without a
   fragment shader gets the driver's own, which is the test alone. Not on a
   multisampled pass, which says so.
+- **Points of any size** (largePoints) are quads: WebGPU's points are a
+  pixel. A draw of a point list whose vertex shader writes PointSize is a
+  triangle list of six vertices a point, drawn with a variant of the
+  vertex shader that takes the point from vertex_index / 6 -- an indexed
+  draw's index from the index buffer, bound as storage -- pulls every
+  attribute itself at it, and moves the position to the corner, by half
+  of PointSize in the viewport's pixels; gl_PointCoord goes to the
+  fragment shader as a varying, and it faces front. Not for attributes of
+  more vertex buffers than the pulled ones (4), nor for indirect draws in
+  memory the host has no copy of: those are a pixel each, and say so.
 - **Storage images without a format** have the format of the view bound
   there: WGSL's storage textures declare theirs, so a draw or dispatch
   compiles a variant of the shader for the views' formats, as it does for
