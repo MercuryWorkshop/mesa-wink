@@ -129,6 +129,9 @@ struct wvk_replay {
     * WebGPU has in no usage scope with the write: copies made before it,
     * which its bind groups name instead. */
    struct util_dynarray buffer_swaps;  /* struct wvk_buffer_swap */
+   /* And what a dispatch samples of a texture it writes as storage: views
+    * of the levels it does not write, or of a copy (wvk_cmd_draw.c). */
+   struct util_dynarray texture_swaps; /* struct wvk_texture_swap */
    /* The buffers the render pass has used so far, and whether written: a
     * draw that would write what it read, or read what it wrote, begins it
     * again -- a render pass is one usage scope. */
@@ -237,6 +240,11 @@ struct wvk_buffer_swap {
    uint32_t group, binding;
    WGPUBuffer copy;
    uint64_t size;
+};
+
+struct wvk_texture_swap {
+   uint32_t group, binding;
+   WGPUTextureView view;
 };
 
 struct wvk_buffer_use {

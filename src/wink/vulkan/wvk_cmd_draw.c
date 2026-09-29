@@ -1176,6 +1176,17 @@ find_snapshot(const struct wvk_replay *replay, const struct wvk_image *image, ui
    return NULL;
 }
 
+/* The view a dispatch samples instead of a binding's, if it has one. */
+static const struct wvk_texture_swap *
+find_texture_swap(const struct wvk_replay *replay, uint32_t group, uint32_t binding)
+{
+   util_dynarray_foreach(&replay->texture_swaps, struct wvk_texture_swap, s) {
+      if (s->group == group && s->binding == binding)
+         return s;
+   }
+   return NULL;
+}
+
 /* How much of a buffer a binding binds. Storage bindings are whole words:
  * the last one taken whole, as shaders read and write words of what is
  * less. A uniform buffer binds as much of the buffer as there is: WebGPU
@@ -1322,6 +1333,13 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       case WVK_BINDING_TEXTURE:
       case WVK_BINDING_STORAGE_TEXTURE:
          e->textureView = d && d->view ? d->view : placeholder_view(dev, b);
+         if (replay && b->kind == WVK_BINDING_TEXTURE) {
+            const struct wvk_texture_swap *swap = find_texture_swap(replay, group, b->binding);
+            if (swap) {
+               e->textureView = swap->view;
+               break;
+            }
+         }
          if (replay && d && d->view_image && b->kind == WVK_BINDING_TEXTURE) {
             const uint32_t key = snapshot_key(d, b);
             WGPUTexture copy = find_snapshot(replay, d->view_image, key);
@@ -1801,6 +1819,8 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
       /* One of its own, for this draw alone, where it reads copies. */
       bool swapped = false;
       util_dynarray_foreach(&replay->buffer_swaps, struct wvk_buffer_swap, s)
+         swapped |= s->group == g;
+      util_dynarray_foreach(&replay->texture_swaps, struct wvk_texture_swap, s)
          swapped |= s->group == g;
       const bool reads_copies = swapped || (pass && replay->snapshots.size && bgl->count && bound->set &&
                                             reads_snapshot(replay, bgl, bound->set));
@@ -3035,6 +3055,75 @@ set_base_group(struct wvk_replay *replay, uint32_t x, uint32_t y, uint32_t z)
    }
 }
 
+/* What a dispatch samples of a texture it also writes as storage.
+ *
+ * WebGPU has the two in no usage scope together, per level and layer,
+ * where Vulkan asks only that no texel be both read and written. A
+ * mip chain built a level at a time does exactly that: EEVEE's samples
+ * a view of the whole chain and writes the next level of it.
+ *
+ * Where every level written is above the sampled view's base, the view
+ * stops short of them. It keeps its base, so a lod names the same level
+ * as before, and the levels it loses are ones the dispatch writes, which
+ * it could not have read in Vulkan either. Otherwise it samples a copy
+ * made before the dispatch. */
+static void
+swap_sampled_storage(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout, uint32_t bind_point)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   for (uint32_t g = 0; g < layout->group_count; ++g) {
+      const struct wvk_bgl *bgl = layout->groups[g];
+      const struct wvk_descriptor_set *set = st->sets[bind_point][g].set;
+      for (uint32_t i = 0; set && i < bgl->count; ++i) {
+         const struct wvk_shader_binding *b = &bgl->entries[i].b;
+         if (b->kind != WVK_BINDING_TEXTURE || (g == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE))
+            continue;
+         bool sampler;
+         uint32_t dynamic_index;
+         const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
+         if (!d || !d->view || !d->view_image || (d->view_image->vk.aspects & ~VK_IMAGE_ASPECT_COLOR_BIT))
+            continue;
+         uint32_t lowest = UINT32_MAX;
+         for (uint32_t og = 0; og < layout->group_count; ++og) {
+            const struct wvk_bgl *obgl = layout->groups[og];
+            const struct wvk_descriptor_set *oset = st->sets[bind_point][og].set;
+            for (uint32_t j = 0; oset && j < obgl->count; ++j) {
+               const struct wvk_shader_binding *o = &obgl->entries[j].b;
+               if (o->kind != WVK_BINDING_STORAGE_TEXTURE || o->access == WGPUStorageTextureAccess_ReadOnly ||
+                   (og == WVK_DRIVER_GROUP && o->binding >= WVK_DRIVER_SLOT_BASE))
+                  continue;
+               const struct wvk_descriptor *od = slot_descriptor(oset, o->binding, &sampler, &dynamic_index);
+               if (od && od->view && storage_views_alias(d, od))
+                  lowest = MIN2(lowest, od->view_level);
+            }
+         }
+         if (lowest == UINT32_MAX)
+            continue;
+         WGPUTextureViewDescriptor vd = d->view_desc;
+         WGPUTextureView v = NULL;
+         if (lowest > d->view_level) {
+            vd.mipLevelCount = lowest - d->view_level;
+            uint32_t first_level;
+            v = wgpuTextureCreateView(wvk_image_texture(d->view_image, d->view_texture, &first_level), &vd);
+         } else {
+            wvk_replay_end_passes(replay);
+            WGPUTexture copy = wvk_image_snapshot(dev->wgpu, d->view_image, d->view_texture, replay->encoder);
+            if (copy) {
+               v = wgpuTextureCreateView(copy, &vd);
+               wgpuTextureRelease(copy);
+            }
+         }
+         if (!v)
+            continue;
+         util_dynarray_append(&replay->views, v);
+         const struct wvk_texture_swap swap = { g, b->binding, v };
+         util_dynarray_append(&replay->texture_swaps, swap);
+      }
+   }
+}
+
 /* `indirect`, if given, is the dispatch's command, made a copy where the
  * dispatch writes its buffer. */
 static WGPUComputePassEncoder
@@ -3061,6 +3150,7 @@ flush_dispatch(struct wvk_cmd_buffer *cmd, struct wvk_bound_buffer *indirect)
    struct buffer_use uses[64];
    const uint32_t n = gather_buffer_uses(dev, replay, p->layout, WVK_BIND_COMPUTE, uses, ARRAY_SIZE(uses));
    swap_conflicting_reads(dev, replay, uses, n);
+   swap_sampled_storage(cmd, p->layout, WVK_BIND_COMPUTE);
    if (indirect && writes_buffer(uses, n, indirect->buffer)) {
       WGPUBuffer copy = wvk_replay_temp_buffer(dev, replay, 16, WGPUBufferUsage_Indirect | WGPUBufferUsage_CopyDst, NULL);
       if (copy) {
@@ -3077,6 +3167,7 @@ flush_dispatch(struct wvk_cmd_buffer *cmd, struct wvk_bound_buffer *indirect)
    wgpuComputePassEncoderSetPipeline(replay->compute, p->pipeline);
    const bool bound = bind_groups(dev, replay, p->layout, WVK_BIND_COMPUTE, NULL, replay->compute, false);
    util_dynarray_clear(&replay->buffer_swaps);
+   util_dynarray_clear(&replay->texture_swaps);
    return bound ? replay->compute : NULL;
 }
 

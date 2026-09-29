@@ -95,6 +95,25 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   WebGPU, which lets shaders read them as they are. Passes store what
   they render even where Vulkan does not care, since one may be ended
   and begun again before Vulkan's is over.
+- **A dispatch that samples what it writes as storage** -- a mip chain
+  built a level at a time, sampling the whole chain -- samples a view
+  that stops below the lowest level written where it can, which keeps
+  every lod where it was, and a copy made before the dispatch where it
+  cannot. WebGPU has a sampled and a written use of one level in no usage
+  scope together; Vulkan asks only that no texel be both. A storage image
+  of a view of several levels binds its base level, which is all Vulkan
+  reads or writes of it and all WebGPU will bind as storage.
+- **Barriers WGSL cannot prove uniform.** WGSL refuses a barrier under a
+  branch its uniformity analysis cannot show the whole workgroup takes,
+  and the analysis is conservative: a load from a read-write storage
+  buffer is never uniform to it, nor any component of a vector that
+  `gl_LocalInvocationID` went into. For a module Tint refuses for that
+  alone, the condition of each `if` around a barrier, and of each exit
+  from a loop that has one, is broadcast through a workgroup variable
+  and `workgroupUniformLoad`. That is uniform for WGSL, and in a valid
+  Vulkan program the condition was uniform already
+  (`src/wink/compiler/gex_wgpu_tint.cpp`). `GEX_WGPU_UNIFORM_LOG=1` says
+  why a module stayed refused.
 - **Views in other formats.** WebGPU views a texture only as its format
   or its sRGB twin. A view of another format of the same texel size, or an
   uncompressed view of a compressed image (a texel a block), is of another
@@ -244,6 +263,7 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 | `WINK_VK_API_VERSION` | the Vulkan version reported |
 | `WINK_VK_VARIANT_LOG=1` | say when a shader variant is compiled for a draw, and why |
 | `GEX_WGPU_SPIRV_DIR=dir` | write every module to `dir/N.spv` before Tint reads it, for one Tint does not come back from |
+| `GEX_WGPU_UNIFORM_LOG=1` | say why a module refused for a barrier in non-uniform control flow could not be made uniform |
 
 ## Not there yet
 
@@ -261,6 +281,13 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - 64-bit floats as vertex inputs or varyings: WebGPU has neither.
 - Scalar 8-bit division and remainder, and 8-bit specialization
   constants, fail a few CTS cases not yet understood.
+- A return before a barrier, taken by some invocations: WGSL refuses the
+  barrier, and broadcasting the return's condition would send the rest
+  of the workgroup home too.
+- Blender's EEVEE renders, but about 0.6% of pixels have no G-buffer (the
+  same pixels in the normal, colour and AO passes, in a pattern that
+  repeats every 32 pixels; depth matches Metal), and the world lights
+  the scene about 20% more brightly than on Metal.
 - Device-scope memory ordering between workgroups: WGSL's barriers are
   the workgroup's, and none can be in non-uniform control flow, so a
   memory barrier there is dropped.

@@ -733,6 +733,11 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
          view->array_view = wgpuTextureCreateView(texture, &desc);
          view->array_desc = desc;
       }
+      if ((view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) && desc.mipLevelCount > 1) {
+         view->storage_desc = view->array_view ? view->array_desc : view->view_desc;
+         view->storage_desc.mipLevelCount = 1;
+         view->storage_view = wgpuTextureCreateView(texture, &view->storage_desc);
+      }
    }
 
    *pView = wvk_image_view_to_handle(view);
@@ -750,6 +755,8 @@ wvk_DestroyImageView(VkDevice _device, VkImageView _view, const VkAllocationCall
       wgpuTextureViewRelease(view->view);
    if (view->array_view)
       wgpuTextureViewRelease(view->array_view);
+   if (view->storage_view)
+      wgpuTextureViewRelease(view->storage_view);
    vk_image_view_destroy(&dev->vk, pAllocator, &view->vk);
 }
 

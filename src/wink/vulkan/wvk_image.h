@@ -189,9 +189,13 @@ struct wvk_image_view {
     * attachment's, as a 2D array, fetched at the layer drawn. */
    WGPUTextureView view;
    WGPUTextureView array_view;
+   /* And for a storage image of more than one level, its base level:
+    * that is all a storage image reads and writes, and WebGPU binds no
+    * more than one level as storage. */
+   WGPUTextureView storage_view;
    /* How they were made, for a view alike of a copy of the image: a pass
     * that reads what it renders to reads a copy (wvk_cmd_draw.c). */
-   WGPUTextureViewDescriptor view_desc, array_desc;
+   WGPUTextureViewDescriptor view_desc, array_desc, storage_desc;
    WGPUTextureFormat format;
    WGPUTextureAspect aspect;
    /* Which of the image's textures it is of (wvk_image_texture). */

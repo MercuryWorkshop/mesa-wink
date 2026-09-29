@@ -226,11 +226,15 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
          wgpu = view->array_view;
          desc = &view->array_desc;
       }
+      if (view && view->storage_view && type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
+         wgpu = view->storage_view;
+         desc = &view->storage_desc;
+      }
       if (wgpu) {
          d->view_image = wvk_image_view_image(view);
          d->view_texture = view->texture;
          d->view_level = view->vk.base_mip_level;
-         d->view_levels = view->vk.level_count;
+         d->view_levels = desc->mipLevelCount;
          d->view_desc = *desc;
          d->view_desc.label = (WGPUStringView)WGPU_STRING_VIEW_INIT;
          d->view = wgpu;
