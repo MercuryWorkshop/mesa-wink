@@ -200,6 +200,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .textureCompressionASTC_LDR = astc,
       .textureCompressionBC = bc,
       .fragmentStoresAndAtomics = true,
+      /* A vertex shader's storage writes are its compute shader's, run
+       * before the draw (run_vertex_writes in wvk_cmd_draw.c). */
+      .vertexPipelineStoresAndAtomics = true,
       /* Points of the size the vertex shader gives them: quads, a variant
        * of the shader moving six vertices to a point's corners. */
       .largePoints = true,

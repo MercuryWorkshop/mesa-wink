@@ -45,7 +45,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 15
+#define WVK_SHADER_BINARY_VERSION 16
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -84,6 +84,11 @@ struct wvk_shader_key {
     * vertices a point, the fragment shader reading gl_PointCoord from the
     * varying at location point_coord - 1 (0: none) and facing front. */
    uint8_t points, point_coord;
+   /* Vertex: the vertex shader as a compute shader, an invocation a vertex
+    * of the draw, doing its storage writes, which WebGPU's vertex shaders
+    * cannot (vertexPipelineStoresAndAtomics; wvk_cmd_draw.c runs it before
+    * the draw, whose vertex shader has them stripped). */
+   uint8_t runs;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
@@ -141,6 +146,8 @@ struct wvk_shader {
     * has not. */
    bool writes_point_size;
    uint8_t point_state;
+   /* Vertex: writes storage, which a draw does as compute (key.runs). */
+   bool writes_storage;
    /* Its storage images without a format, as the set and slot of each
     * (set << 10 | slot), whose views' formats a draw or dispatch compiles
     * a variant for (key.image_format). */
@@ -206,13 +213,14 @@ extern const struct vk_device_shader_ops wvk_device_shader_ops;
  * either for the records of both its and `other`'s layouts, and the
  * formats of the views bound where it has storage images without one
  * (`image_formats`, as for wvk_shader_dispatch_variant); and for points
- * drawn as quads. The shader itself
+ * drawn as quads. Or with `runs`, the vertex shader's compute shader
+ * doing its storage writes (key.runs). The shader itself
  * where it was compiled for that, or a variant it could not compile. */
 struct wvk_shader *wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader,
                                            const struct wvk_shader *other,
                                            const struct vk_dynamic_graphics_state *dyn, unsigned samples,
                                            bool has_depth, const VkFormat *color_formats,
-                                           const VkFormat *image_formats, bool points);
+                                           const VkFormat *image_formats, bool points, bool runs);
 
 /* The shader, or its variant for the formats of the views bound where it
  * has storage images without one (wvk_shader::unformatted; 0 for one not

@@ -2255,15 +2255,16 @@ set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
  * offsets are, as far as a binding can reach. The driver's data says
  * where in that the bound range starts. */
 static void
-set_pulled_buffers(struct wvk_device *dev, struct wvk_cmd_buffer *cmd, struct wvk_replay *replay)
+set_pulled_buffers(struct wvk_device *dev, struct wvk_cmd_buffer *cmd, struct wvk_replay *replay,
+                   const struct wvk_shader *vs)
 {
    const struct wvk_physical_device *pdev = wvk_device_physical(dev);
    struct wvk_bound_state *st = replay->state;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    uint32_t starts[WVK_MAX_PULLED_BINDINGS] = { 0 }, strides[WVK_MAX_PULLED_BINDINGS] = { 0 };
-   for (uint32_t i = 0; i < st->vs->pulled_count; ++i) {
-      const struct wvk_bound_buffer *vb = &st->vb[st->vs->pulled_bindings[i]];
-      strides[i] = dyn->vi_binding_strides[st->vs->pulled_bindings[i]];
+   for (uint32_t i = 0; i < vs->pulled_count; ++i) {
+      const struct wvk_bound_buffer *vb = &st->vb[vs->pulled_bindings[i]];
+      strides[i] = dyn->vi_binding_strides[vs->pulled_bindings[i]];
       struct wvk_driver_buffer *d = &st->pulled[i];
       if (!vb->buffer || !vb->mem) {
          *d = (struct wvk_driver_buffer){ 0 };
@@ -2519,7 +2520,7 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    set_viewport_scissor(cmd, pass);
    st->graphics_layout = p->layout;
    if (st->vs->pulled_count)
-      set_pulled_buffers(dev, cmd, replay);
+      set_pulled_buffers(dev, cmd, replay, st->vs);
    const bool bound = bind_groups(dev, replay, p->layout, WVK_BIND_GRAPHICS, pass, NULL, false);
    util_dynarray_clear(&replay->buffer_swaps);
    if (!bound)
@@ -2942,9 +2943,9 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
    unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_vs, vs_images);
    const bool points = replay->draw_points;
    st->fs = wvk_shader_draw_variant(dev, st->bound_fs, st->bound_vs, dyn, samples, has_depth, color_formats,
-                                    fs_images, points);
+                                    fs_images, points, false);
    st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats, vs_images,
-                                    points);
+                                    points, false);
    /* No fragment shader to do the depth bounds test: the driver's. */
    if (!st->fs && dyn->ds.depth.bounds_test.enable && has_depth && samples <= 1)
       st->fs = dev->depth_bounds_fs;
@@ -2977,28 +2978,22 @@ draws_points(const struct wvk_cmd_buffer *cmd)
    return true;
 }
 
-/* A draw of points as quads (draws_points): a triangle list of six
- * vertices a point, whose vertex shader reads an indexed draw's indices
- * from the index buffer, bound as storage (expand_points). */
-static void
-draw_points(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t count, uint32_t instances,
-            int32_t base_vertex, uint32_t first_instance, uint32_t draw_id)
+/* The index buffer as storage at WVK_DRIVER_SLOT_INDEX, for a vertex
+ * shader that reads an indexed draw's indices itself (expand_points,
+ * run_vertices), and where they start and their size in the driver's data;
+ * none, of size 0, for a draw without. False where there is none bound. */
+static bool
+bind_index_storage(struct wvk_cmd_buffer *cmd, bool indexed)
 {
    const struct wvk_physical_device *pdev = wvk_device_physical(wvk_cmd_buffer_device(cmd));
    struct wvk_replay *replay = cmd->replay;
    struct wvk_bound_state *st = replay->state;
-   if (!count || !instances)
-      return;
-   if ((uint64_t)first * 6 + (uint64_t)count * 6 > UINT32_MAX) {
-      mesa_logw_once("wvk: a draw of more points than six vertices each can number");
-      return;
-   }
    uint32_t words[2] = { 0, 0 };
    st->index = (struct wvk_driver_buffer){ 0 };
    if (indexed) {
       const struct wvk_bound_buffer *ib = &st->ib;
       if (!ib->buffer || !ib->mem)
-         return;
+         return false;
       const uint64_t whole = ib->mem->buffer_size;
       const uint64_t size = MIN2(whole, pdev->limits.maxStorageBufferBindingSize) & ~3ull;
       const uint64_t offset = MIN2(ib->offset, whole - size) & ~255ull;
@@ -3013,6 +3008,97 @@ draw_points(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t c
       memcpy(st->push + WVK_DRIVER_POINT_INDEX, words, sizeof(words));
       st->push_offset = UINT32_MAX;
    }
+   return true;
+}
+
+static struct wvk_compute_pipeline *get_compute_pipeline(struct wvk_device *dev, const struct wvk_bound_state *st,
+                                                         struct wvk_shader *cs, uint32_t bind_point);
+static void swap_sampled_storage(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout, uint32_t bind_point);
+
+/* A draw's vertex shader's storage writes, which WebGPU's vertex shaders
+ * cannot do (vertexPipelineStoresAndAtomics): its compute shader, an
+ * invocation a vertex of each instance (run_vertices), dispatched with the
+ * draw's sets before the draw, the pass ended and begun again after. The
+ * draw's own vertex shader has them stripped. Once a draw: not again in
+ * the other layers of a pass drawn a layer at a time. */
+static void
+run_vertex_writes(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t count, uint32_t instances,
+                  int32_t base_vertex, uint32_t first_instance, uint32_t draw_id)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   if (!st->bound_vs || !st->bound_vs->writes_storage || !count || !instances || replay->pass_idle ||
+       (replay->pass_layered && !replay->pass_multiview && replay->pass_layer))
+      return;
+   const uint64_t total = (uint64_t)count * instances;
+   if (total > UINT32_MAX) {
+      mesa_logw_once("wvk: a vertex shader's storage writes for more vertices than can be numbered");
+      return;
+   }
+   VkFormat images[WVK_MAX_UNFORMATTED_IMAGES];
+   unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_vs, images);
+   struct wvk_shader *cs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, 1, false, NULL, images, false, true);
+   if (!cs || cs->vk.stage != MESA_SHADER_COMPUTE) {
+      mesa_logw_once("wvk: a vertex shader's storage writes, which could not be made a compute shader");
+      return;
+   }
+   if (!bind_index_storage(cmd, indexed))
+      return;
+   const uint32_t run[4] = { count, (uint32_t)total, first, indexed && dyn->ia.primitive_restart_enable };
+   if (memcmp(st->push + WVK_DRIVER_VERTEX_RUN, run, sizeof(run))) {
+      memcpy(st->push + WVK_DRIVER_VERTEX_RUN, run, sizeof(run));
+      st->push_offset = UINT32_MAX;
+   }
+   set_draw_parameters(st, NULL, 0, indexed, indexed ? base_vertex : (int32_t)first, first_instance, draw_id);
+   set_pulled_buffers(dev, cmd, replay, cs);
+
+   const bool in_pass = replay->pass != NULL;
+   wvk_replay_end_passes(replay);
+   struct wvk_compute_pipeline *p = get_compute_pipeline(dev, st, cs, WVK_BIND_GRAPHICS);
+   if (p) {
+      sync_image_textures(cmd, p->layout, WVK_BIND_GRAPHICS);
+      sync_atomic_buffers(cmd, p->layout, WVK_BIND_GRAPHICS);
+      struct buffer_use uses[64];
+      const uint32_t n = gather_buffer_uses(dev, replay, p->layout, WVK_BIND_GRAPHICS, uses, ARRAY_SIZE(uses));
+      swap_conflicting_reads(dev, replay, uses, n);
+      swap_sampled_storage(cmd, p->layout, WVK_BIND_GRAPHICS);
+      if (!replay->compute) {
+         WGPUComputePassDescriptor desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+         replay->compute = wgpuCommandEncoderBeginComputePass(replay->encoder, &desc);
+      }
+      wgpuComputePassEncoderSetPipeline(replay->compute, p->pipeline);
+      if (bind_groups(dev, replay, p->layout, WVK_BIND_GRAPHICS, NULL, replay->compute, false)) {
+         const uint32_t groups = (uint32_t)DIV_ROUND_UP(total, 64);
+         const uint32_t x = MIN2(groups, 65535);
+         wgpuComputePassEncoderDispatchWorkgroups(replay->compute, x, DIV_ROUND_UP(groups, x), 1);
+      }
+      util_dynarray_clear(&replay->buffer_swaps);
+      util_dynarray_clear(&replay->texture_swaps);
+   }
+   wvk_replay_end_passes(replay);
+   if (in_pass)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+}
+
+/* A draw of points as quads (draws_points): a triangle list of six
+ * vertices a point, whose vertex shader reads an indexed draw's indices
+ * from the index buffer, bound as storage (expand_points). */
+static void
+draw_points(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t count, uint32_t instances,
+            int32_t base_vertex, uint32_t first_instance, uint32_t draw_id)
+{
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   if (!count || !instances)
+      return;
+   if ((uint64_t)first * 6 + (uint64_t)count * 6 > UINT32_MAX) {
+      mesa_logw_once("wvk: a draw of more points than six vertices each can number");
+      return;
+   }
+   if (!bind_index_storage(cmd, indexed))
+      return;
    replay->list_topology = WGPUPrimitiveTopology_TriangleList;
    foreach_viewport(cmd) {
       set_draw_parameters(st, NULL, 0, indexed, indexed ? base_vertex : (int32_t)first, first_instance, draw_id);
@@ -3031,6 +3117,7 @@ draw_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertexCount, uint32_t instanceC
       return;
    cmd->replay->draw_points = draws_points(cmd);
    select_draw_shaders(cmd);
+   run_vertex_writes(cmd, false, firstVertex, vertexCount, instanceCount, 0, firstInstance, draw_id);
    if (cmd->replay->draw_points) {
       draw_points(cmd, false, firstVertex, vertexCount, instanceCount, 0, firstInstance, draw_id);
       cmd->replay->draw_points = false;
@@ -3058,6 +3145,7 @@ draw_elements(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instance
       return;
    cmd->replay->draw_points = draws_points(cmd);
    select_draw_shaders(cmd);
+   run_vertex_writes(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
    if (cmd->replay->draw_points) {
       draw_points(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
       cmd->replay->draw_points = false;
@@ -3128,6 +3216,26 @@ draw_indirect_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_b
    struct wvk_bound_state *st = replay->state;
    if (!drawCount || !b.buffer)
       return;
+   /* The vertex shader's storage writes, of each draw as the host has it. */
+   if (st->bound_vs && st->bound_vs->writes_storage) {
+      if (!b.mem || !b.mem->host) {
+         mesa_logw_once("wvk: an indirect draw's vertex shader storage writes, in memory the host has no copy of");
+      } else {
+         for (uint32_t i = 0; i < drawCount; ++i) {
+            const uint8_t *at = (const uint8_t *)b.mem->host + b.offset + (uint64_t)i * stride;
+            if (indexed) {
+               VkDrawIndexedIndirectCommand c;
+               memcpy(&c, at, sizeof(c));
+               run_vertex_writes(cmd, true, c.firstIndex, c.indexCount, c.instanceCount, c.vertexOffset,
+                                 c.firstInstance, i);
+            } else {
+               VkDrawIndirectCommand c;
+               memcpy(&c, at, sizeof(c));
+               run_vertex_writes(cmd, false, c.firstVertex, c.vertexCount, c.instanceCount, 0, c.firstInstance, i);
+            }
+         }
+      }
+   }
    /* Points as quads, as the host has the draws (draw_indirect). */
    if (replay->draw_points) {
       for (uint32_t i = 0; i < drawCount; ++i) {
@@ -3245,8 +3353,12 @@ draw_indirect_count(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, V
    const struct wvk_bound_buffer c = bound_buffer(cmd, count_buffer, count_offset, 4);
    if (!b.buffer || !c.buffer)
       return;
-   /* A fan's are drawn from the host's copy, the count too. */
-   if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
+   /* A fan's are drawn from the host's copy, the count too; and those
+    * whose vertex shader writes storage, which is done for each draw
+    * (run_vertex_writes), and for no more than there are. */
+   const struct wvk_bound_state *st = replay->state;
+   if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
+       (st->bound_vs && st->bound_vs->writes_storage)) {
       uint32_t count = max_draws;
       if (c.mem && c.mem->host)
          memcpy(&count, (const uint8_t *)c.mem->host + c.offset, 4);
@@ -3345,10 +3457,13 @@ wvk_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDev
 /* ---------------------------------------------------------------------- */
 /* Dispatches */
 
+/* A compute pipeline of the shader, for the sets bound at `bind_point`:
+ * the graphics ones for a vertex shader run as compute (run_vertices). */
 static struct wvk_compute_pipeline *
-get_compute_pipeline(struct wvk_device *dev, const struct wvk_bound_state *st, struct wvk_shader *cs)
+get_compute_pipeline(struct wvk_device *dev, const struct wvk_bound_state *st, struct wvk_shader *cs,
+                     uint32_t bind_point)
 {
-   const uint64_t key[2] = { cs->id, binding_variant(dev, st, WVK_BIND_COMPUTE, &cs, 1) };
+   const uint64_t key[2] = { cs->id, binding_variant(dev, st, bind_point, &cs, 1) };
    simple_mtx_lock(&dev->cache_lock);
    struct hash_entry *he = _mesa_hash_table_search(dev->compute_pipelines, key);
    if (he) {
@@ -3483,7 +3598,7 @@ flush_dispatch(struct wvk_cmd_buffer *cmd, struct wvk_bound_buffer *indirect)
       mesa_logw_once("wvk: a dispatch inside a render pass");
       return NULL;
    }
-   struct wvk_compute_pipeline *p = get_compute_pipeline(dev, st, st->cs);
+   struct wvk_compute_pipeline *p = get_compute_pipeline(dev, st, st->cs, WVK_BIND_COMPUTE);
    if (!p)
       return NULL;
    sync_image_textures(cmd, p->layout, WVK_BIND_COMPUTE);

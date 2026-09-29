@@ -168,7 +168,10 @@ enum wvk_texel_type {
  *   - the depth bounds, 2 floats, which the fragment shader tests;
  *   - for points drawn as quads, 1 over the viewport's width and height,
  *     2 floats; and where an indexed draw's indices start in the index
- *     binding, in bytes, and their size, 0 for a draw without, 2 uints. */
+ *     binding, in bytes, and their size, 0 for a draw without, 2 uints;
+ *   - for a vertex shader's storage writes, done by it as compute before
+ *     the draw: the draw's vertices an instance, its vertices in all, its
+ *     first vertex or index, and whether it restarts primitives, 4 uints. */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
@@ -182,7 +185,8 @@ enum wvk_texel_type {
 #define WVK_DRIVER_DEPTH_BOUNDS (WVK_DRIVER_DATA_OFFSET + 112)
 #define WVK_DRIVER_POINT_SCALE (WVK_DRIVER_DATA_OFFSET + 120)
 #define WVK_DRIVER_POINT_INDEX (WVK_DRIVER_DATA_OFFSET + 128)
-#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 144)
+#define WVK_DRIVER_VERTEX_RUN (WVK_DRIVER_DATA_OFFSET + 144)
+#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 160)
 #define WVK_META_OFFSET WVK_PUSH_DATA_SIZE
 /* How much of the push buffer the push binding shows: its data, and as
  * many records as that leaves room for. */

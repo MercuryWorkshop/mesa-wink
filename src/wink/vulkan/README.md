@@ -122,6 +122,16 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   fragment shader as a varying, and it faces front. Not for attributes of
   more vertex buffers than the pulled ones (4), nor for indirect draws in
   memory the host has no copy of: those are a pixel each, and say so.
+- **A vertex shader's storage writes** (vertexPipelineStoresAndAtomics)
+  are a compute shader's: WebGPU's vertex shaders write no storage. A
+  draw whose vertex shader writes buffers or images first dispatches the
+  shader made compute -- an invocation a vertex of each instance, the
+  vertex an index of the index buffer where the draw is indexed and it
+  does not restart, every attribute pulled -- with the draw's sets and the
+  pass ended and begun again after; then draws with the vertex shader
+  without its writes, whose atomics give the value as it is. So a vertex
+  shader's outputs do not see what its own atomics return. An indirect
+  draw's writes are of the commands as the host has them.
 - **Storage images without a format** have the format of the view bound
   there: WGSL's storage textures declare theirs, so a draw or dispatch
   compiles a variant of the shader for the views' formats, as it does for

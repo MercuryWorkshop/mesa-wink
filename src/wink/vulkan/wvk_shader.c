@@ -806,9 +806,11 @@ lower_logic_op(nir_shader *nir, const struct wvk_shader_key *key, uint8_t *reads
    return progress;
 }
 
-/* The vertex a point drawn as a quad is of (expand_points), in a local of
- * this name: where its attributes are pulled from. */
-#define WVK_POINT_VERTEX "wvk_point_vertex"
+/* The vertex a point drawn as a quad is of (expand_points), or a vertex
+ * shader run as compute (run_vertices), in a local of this name: where its
+ * attributes are pulled from; and the instance, of the latter. */
+#define WVK_POINT_VERTEX "wvk_vertex"
+#define WVK_RUN_INSTANCE "wvk_instance"
 
 /* Points drawn as quads (largePoints), which WebGPU has none of: six
  * vertices a point, which wvk_cmd_draw.c draws as a triangle list. The
@@ -913,6 +915,133 @@ expand_points(nir_shader *nir, unsigned point_coord)
    if (size_out)
       exec_node_remove(&size_out->node);
    nir_progress(true, impl, nir_metadata_none);
+}
+
+/* Whether an instruction writes storage: a buffer, or an image. */
+static bool
+writes_storage_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   bool *writes = data;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_deref:
+   case nir_intrinsic_deref_atomic:
+   case nir_intrinsic_deref_atomic_swap:
+      *writes |= nir_deref_mode_is(nir_src_as_deref(intr->src[0]), nir_var_mem_ssbo);
+      break;
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+      *writes = true;
+      break;
+   default:
+      break;
+   }
+   return false;
+}
+
+/* A vertex shader's storage writes gone, for the draw: WebGPU's vertex
+ * shaders write no storage, and its compute shader has done them before
+ * (run_vertices). An atomic gives the value as it is. */
+static bool
+strip_storage_writes_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_deref:
+      if (!nir_deref_mode_is(nir_src_as_deref(intr->src[0]), nir_var_mem_ssbo))
+         return false;
+      nir_instr_remove(&intr->instr);
+      return true;
+   case nir_intrinsic_deref_atomic:
+   case nir_intrinsic_deref_atomic_swap:
+      if (!nir_deref_mode_is(nir_src_as_deref(intr->src[0]), nir_var_mem_ssbo))
+         return false;
+      nir_def_replace(&intr->def, nir_load_deref(b, nir_src_as_deref(intr->src[0])));
+      return true;
+   case nir_intrinsic_image_deref_store:
+      nir_instr_remove(&intr->instr);
+      return true;
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+      nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components, intr->def.bit_size));
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* A vertex shader as the compute shader doing its storage writes (key.runs;
+ * vertexPipelineStoresAndAtomics): an invocation a vertex of each instance
+ * of the draw the driver's data has (WVK_DRIVER_VERTEX_RUN) -- the vertex
+ * an index of the index buffer for an indexed draw, but where it restarts
+ * primitives -- with its attributes all pulled there, and its outputs gone.
+ * Compute's stage after its buffers are words (compile_one). */
+static void
+run_vertices(nir_shader *nir)
+{
+   nir_foreach_shader_out_variable(var, nir)
+      var->data.mode = nir_var_shader_temp;
+   nir_fixup_deref_modes(nir);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_cf_list body;
+   nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+
+   /* Which vertex of which instance: rows of 64 * groups wide. */
+   nir_def *id = nir_load_global_invocation_id(&b, 32);
+   nir_def *groups = nir_load_num_workgroups(&b);
+   nir_def *slot = nir_iadd(&b, nir_channel(&b, id, 0),
+                            nir_imul(&b, nir_channel(&b, id, 1), nir_imul_imm(&b, nir_channel(&b, groups, 0), 64)));
+   nir_def *run = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                nir_imm_int(&b, WVK_DRIVER_VERTEX_RUN), .align_mul = 16,
+                                .access = ACCESS_NON_WRITEABLE);
+   nir_def *count = nir_umax(&b, nir_channel(&b, run, 0), nir_imm_int(&b, 1));
+   nir_def *at = nir_iadd(&b, nir_channel(&b, run, 2), nir_umod(&b, slot, count));
+   nir_def *instance = nir_iadd(&b, nir_load_base_instance(&b), nir_udiv(&b, slot, count));
+   nir_def *index = nir_load_ssbo(&b, 2, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                  nir_imm_int(&b, WVK_DRIVER_POINT_INDEX), .align_mul = 8,
+                                  .access = ACCESS_NON_WRITEABLE);
+   nir_def *start = nir_channel(&b, index, 0), *size = nir_channel(&b, index, 1);
+   nir_def *no = nir_imm_false(&b);
+   nir_push_if(&b, nir_ine_imm(&b, size, 0));
+   nir_def *byte = nir_iadd(&b, start, nir_imul(&b, at, size));
+   nir_def *word = nir_load_ssbo(&b, 1, 32, driver_buffer(&b, WVK_DRIVER_SLOT_INDEX), nir_iand_imm(&b, byte, ~3),
+                                 .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+   nir_def *bits = nir_ishl_imm(&b, size, 3);
+   nir_def *part = nir_ubitfield_extract(&b, word, nir_ishl_imm(&b, nir_iand_imm(&b, byte, 3), 3), bits);
+   nir_def *value = nir_bcsel(&b, nir_ieq_imm(&b, size, 4), word, part);
+   nir_def *all_ones = nir_bcsel(&b, nir_ieq_imm(&b, size, 4), nir_imm_int(&b, -1),
+                                 nir_iadd_imm(&b, nir_ishl(&b, nir_imm_int(&b, 1), bits), -1));
+   nir_def *restarts = nir_iand(&b, nir_ine_imm(&b, nir_channel(&b, run, 3), 0), nir_ieq(&b, value, all_ones));
+   nir_def *indexed = nir_iadd(&b, value, nir_load_base_vertex(&b));
+   nir_push_else(&b, NULL);
+   nir_pop_if(&b, NULL);
+   nir_def *vertex = nir_if_phi(&b, indexed, at);
+   nir_def *restart = nir_if_phi(&b, restarts, no);
+   nir_def *skip = nir_ior(&b, nir_uge(&b, slot, nir_channel(&b, run, 1)), restart);
+   nir_variable *vertex_var = nir_local_variable_create(impl, glsl_uint_type(), WVK_POINT_VERTEX);
+   nir_variable *instance_var = nir_local_variable_create(impl, glsl_uint_type(), WVK_RUN_INSTANCE);
+   nir_store_var(&b, vertex_var, vertex, 0x1);
+   nir_store_var(&b, instance_var, instance, 0x1);
+   nir_push_if(&b, nir_inot(&b, skip));
+   nir_cf_reinsert(&body, b.cursor);
+   nir_pop_if(&b, NULL);
+
+   /* What the shader says of its vertex and instance is these. */
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_vertex_id)
+            nir_def_replace(&intr->def, vertex);
+         else if (intr->intrinsic == nir_intrinsic_load_instance_id)
+            nir_def_replace(&intr->def, instance);
+      }
+   }
+   nir_progress(true, impl, nir_metadata_none);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_temp, NULL);
 }
 
 /* What of a fragment shader a point's quad does not give it: gl_PointCoord,
@@ -2232,7 +2361,8 @@ fetch_channel(nir_builder *b, nir_def *address, const struct util_format_descrip
    }
 }
 
-/* The vertex a vertex-rate attribute is fetched for. */
+/* The vertex a vertex-rate attribute is fetched for, and the instance an
+ * instance-rate one. */
 static nir_def *
 vertex_element(nir_builder *b)
 {
@@ -2241,6 +2371,16 @@ vertex_element(nir_builder *b)
          return nir_load_var(b, var);
    }
    return nir_load_vertex_id(b);
+}
+
+static nir_def *
+instance_element(nir_builder *b)
+{
+   nir_foreach_function_temp_variable(var, b->impl) {
+      if (var->name && !strcmp(var->name, WVK_RUN_INSTANCE))
+         return nir_load_var(b, var);
+   }
+   return nir_load_instance_id(b);
 }
 
 /* An attribute's value: Vulkan's element firstInstance + (InstanceIndex -
@@ -2258,7 +2398,7 @@ fetch_attribute(nir_builder *b, const struct vk_vertex_input_state *vi, int loca
       nir_def *first = nir_load_base_instance(b);
       element = first;
       if (vb->divisor)
-         element = nir_iadd(b, first, nir_udiv_imm(b, nir_isub(b, nir_load_instance_id(b), first), vb->divisor));
+         element = nir_iadd(b, first, nir_udiv_imm(b, nir_isub(b, instance_element(b), first), vb->divisor));
    }
    nir_def *starts = nir_load_ssbo(b, 4, 32, driver_buffer(b, WVK_DRIVER_SLOT_PUSH),
                                    nir_imm_int(b, WVK_DRIVER_PULL_OFFSET), .align_mul = 16,
@@ -2322,7 +2462,7 @@ pull_divided_attributes(nir_shader *nir, const struct vk_graphics_pipeline_state
                location += nir_src_as_uint(deref->arr.index);
             else if (deref->deref_type != nir_deref_type_var)
                continue;
-            if (!pulls(vi, location, shader->key.points))
+            if (!pulls(vi, location, shader->key.points || shader->key.runs))
                continue;
             if (glsl_get_bit_size(deref->type) == 64) {
                mesa_logw_once("wvk: a 64-bit attribute the shader pulls");
@@ -3456,7 +3596,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
             const VkAllocationCallbacks *pAllocator, struct vk_shader **shader_out)
 {
    nir_shader *nir = info->nir;
-   const mesa_shader_stage stage = nir->info.stage;
+   /* Compute's, for a vertex shader run as one (run_vertices). */
+   mesa_shader_stage stage = nir->info.stage;
    VkResult result = VK_SUCCESS;
 
    struct wvk_shader *shader = vk_shader_zalloc(&dev->vk, &wvk_shader_ops, stage, pAllocator,
@@ -3518,8 +3659,17 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
          shader->key.point_coord = records->point_coord;
          expand_points(nir, records->point_coord);
       }
-      shader->key.pulled =
-         pull_key(pipeline_state ? pipeline_state->vi : NULL, shader->attribs_read, shader->key.points);
+      /* Storage writes, which its compute shader does (run_vertices), and
+       * the draw's vertex shader has not. */
+      nir_shader_intrinsics_pass(nir, writes_storage_instr, nir_metadata_all, &shader->writes_storage);
+      if (records && records->runs) {
+         shader->key.runs = 1;
+         run_vertices(nir);
+      } else if (shader->writes_storage) {
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass, strip_storage_writes_instr, nir_metadata_control_flow, NULL);
+      }
+      shader->key.pulled = pull_key(pipeline_state ? pipeline_state->vi : NULL, shader->attribs_read,
+                                    shader->key.points || shader->key.runs);
    }
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       const struct vk_multisample_state *ms = pipeline_state ? pipeline_state->ms : NULL;
@@ -3672,6 +3822,16 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    NIR_PASS(_, nir, wvk_nir_lower_image_atomics, shader->meta_base);
    NIR_PASS(_, nir, wvk_nir_lower_texel_buffers, shader->meta_base);
    lower_buffers_to_words(nir, info, pipeline_state, shader, mem_ctx);
+   /* A vertex shader run as compute is compute's from here. */
+   if (shader->key.runs) {
+      nir->info.stage = stage = MESA_SHADER_COMPUTE;
+      nir->info.workgroup_size[0] = 64;
+      nir->info.workgroup_size[1] = nir->info.workgroup_size[2] = 1;
+      nir->info.workgroup_size_variable = false;
+      shader->vk.stage = MESA_SHADER_COMPUTE;
+      nir_foreach_variable_with_modes_safe(var, nir, nir_var_shader_in | nir_var_shader_out)
+         exec_node_remove(&var->node);
+   }
    /* The signed atomics' loops' variables. */
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    optimize(nir);
@@ -3925,7 +4085,7 @@ key_image_formats(const struct wvk_shader *shader, const VkFormat *image_formats
 struct wvk_shader *
 wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_shader *other,
                         const struct vk_dynamic_graphics_state *dyn, unsigned samples, bool has_depth,
-                        const VkFormat *color_formats, const VkFormat *image_formats, bool points)
+                        const VkFormat *color_formats, const VkFormat *image_formats, bool points, bool runs)
 {
    if (!shader || !shader->source)
       return shader;
@@ -3947,6 +4107,13 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       vi = *dyn->vi;
       u_foreach_bit(b, vi.bindings_valid)
          vi.bindings[b].stride = dyn->vi_binding_strides[b];
+      /* Its compute shader doing its storage writes, which reads every
+       * attribute itself (run_vertices). */
+      if (runs) {
+         key.runs = 1;
+         key.pulled = pull_key(&vi, shader->attribs_read, true);
+         return variant_for(dev, shader, &key, &vi);
+      }
       /* Points as quads where it gives them a size, and gl_PointCoord where
        * the fragment shader reads it (expand_points). */
       points &= shader->writes_point_size;
@@ -4093,6 +4260,7 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->logic_op_reads);
    blob_write_uint8(blob, shader->reads_depth_bounds);
    blob_write_uint8(blob, shader->writes_point_size);
+   blob_write_uint8(blob, shader->writes_storage);
    blob_write_uint8(blob, shader->point_state);
    blob_write_uint8(blob, shader->unformatted_count);
    blob_write_bytes(blob, shader->unformatted, sizeof(shader->unformatted));
@@ -4139,6 +4307,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const uint8_t logic_op_reads = blob_read_uint8(blob);
    const bool reads_depth_bounds = blob_read_uint8(blob);
    const bool writes_point_size = blob_read_uint8(blob);
+   const bool writes_storage = blob_read_uint8(blob);
    const uint8_t point_state = blob_read_uint8(blob);
    const uint8_t unformatted_count = blob_read_uint8(blob);
    uint16_t unformatted[WVK_MAX_UNFORMATTED_IMAGES];
@@ -4199,6 +4368,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->logic_op_reads = logic_op_reads;
    shader->reads_depth_bounds = reads_depth_bounds;
    shader->writes_point_size = writes_point_size;
+   shader->writes_storage = writes_storage;
    shader->point_state = point_state;
    shader->unformatted_count = MIN2(unformatted_count, WVK_MAX_UNFORMATTED_IMAGES);
    memcpy(shader->unformatted, unformatted, sizeof(unformatted));
