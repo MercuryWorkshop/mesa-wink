@@ -80,3 +80,5 @@ dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.atomic_atomic.atomicrmw
 dEQP-VK.memory_model.message_passing.ext.u32.coherent.fence_atomic.atomicwrite.device.payload_local.image.guard_nonlocal.buffer.frag
 dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.fence_atomic.atomicwrite.device.payload_local.image.guard_nonlocal.buffer.frag
 dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.fence_fence.atomicwrite.device.payload_local.image.guard_nonlocal.buffer.frag
+# Multisampled input attachments a draw reads as it writes: half pass, half not, at HEAD too.
+dEQP-VK\.renderpasses\..*\.input\..*\.self_dep_.*_ms$

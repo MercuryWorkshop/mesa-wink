@@ -379,5 +379,19 @@ wvk_CmdEndRendering(VkCommandBuffer commandBuffer)
    info.pDepthAttachment = depth.resolveMode ? &depth : NULL;
    info.pStencilAttachment = stencil.resolveMode ? &stencil : NULL;
    replay->rendering.resolve.pending = false;
+   /* A pass replayed per layer resolves the layer it is at, in vk_meta's
+    * passes, which are not the replay's. */
+   const bool layered = replay->pass_layered, multiview = replay->pass_multiview;
+   const uint32_t layer = replay->pass_layer;
+   if (layered) {
+      info.viewMask = BITFIELD_BIT(layer);
+      replay->pass_layered = replay->pass_multiview = false;
+      replay->pass_layer = 0;
+   }
    wvk_cmd_meta_resolve_rendering(cmd, &info);
+   if (layered) {
+      replay->pass_layered = true;
+      replay->pass_multiview = multiview;
+      replay->pass_layer = layer;
+   }
 }

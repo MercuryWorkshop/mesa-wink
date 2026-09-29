@@ -216,8 +216,13 @@ wvk_cmd_meta_resolve_rendering(struct wvk_cmd_buffer *cmd, const VkRenderingInfo
 {
    struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
    struct wvk_meta_save save;
+   /* A layer at a time, as a view mask has vk_meta do it: a multisampled
+    * array is a texture for each layer, which is all a shader can read. */
+   VkRenderingInfo layered = *info;
+   if (!layered.viewMask && layered.layerCount > 1 && layered.layerCount <= 32)
+      layered.viewMask = BITFIELD_MASK(layered.layerCount);
    meta_begin(cmd, &save);
-   vk_meta_resolve_rendering(&cmd->vk, &dev->meta, info);
+   vk_meta_resolve_rendering(&cmd->vk, &dev->meta, &layered);
    meta_end(cmd, &save);
 }
 

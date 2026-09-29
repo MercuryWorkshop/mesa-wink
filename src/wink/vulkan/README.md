@@ -397,8 +397,12 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Lines and points of triangles are not culled: which way a triangle
   faces is the vertex shader's to say, after the lists are made.
 - Multisampled array images are a texture for each layer, since WebGPU
-  has no multisampled arrays: attachments, clears and resolves are right,
-  but a shader sampling one sees its first layer.
+  has no multisampled arrays: attachments, clears, copies and resolves
+  (vk_meta's, for formats WebGPU does not resolve, a layer at a time) are
+  right, but a shader sampling one sees its first layer.
+- Copies of part of a multisampled depth or stencil image, or of one of
+  its aspects: WebGPU copies multisampled textures whole, and a buffer
+  holds one sample.
 - Feedback loops on multisampled depth or stencil that is written.
 - Formats WebGPU does not multisample (RG32 and RGBA32 among them) have
   one sample, though Vulkan wants every colour attachment format to have

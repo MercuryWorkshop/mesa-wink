@@ -1314,6 +1314,18 @@ wvk_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyIm
          }
          continue;
       }
+      if (same && (src->layer_textures || dst->layer_textures)) {
+         /* A multisampled array's layers are textures of their own. */
+         for (uint32_t l = 0; l < size.depthOrArrayLayers; ++l) {
+            WGPUTexelCopyTextureInfo sl = s, dl = d;
+            sl.texture = wvk_image_layer_texture(src, s.origin.z + l, &sl.origin.z);
+            dl.texture = wvk_image_layer_texture(dst, d.origin.z + l, &dl.origin.z);
+            WGPUExtent3D one = size;
+            one.depthOrArrayLayers = 1;
+            wgpuCommandEncoderCopyTextureToTexture(replay->encoder, &sl, &dl, &one);
+         }
+         continue;
+      }
       if (same) {
          wgpuCommandEncoderCopyTextureToTexture(replay->encoder, &s, &d, &size);
          continue;
@@ -1526,13 +1538,24 @@ wvk_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *p
                                  : r->srcSubresource.layerCount;
       const VkExtent3D full = vk_image_mip_level_extent(&dst->vk, r->dstSubresource.mipLevel);
       const struct wvk_physical_device *pdev = wvk_device_physical(wvk_cmd_buffer_device(cmd));
+      const VkExtent3D src_full = vk_image_mip_level_extent(&src->vk, r->srcSubresource.mipLevel);
       if (r->srcOffset.x || r->srcOffset.y || r->dstOffset.x || r->dstOffset.y ||
           r->extent.width != full.width || r->extent.height != full.height || src->format != dst->format ||
+          src_full.width != full.width || src_full.height != full.height ||
           !(wvk_format_caps(pdev, dst->vk.format) & WVK_CAP_RESOLVE)) {
-         VkResolveImageInfo2 one = *pResolveImageInfo;
-         one.regionCount = 1;
-         one.pRegions = r;
-         wvk_cmd_meta_resolve_image(cmd, &one);
+         /* A layer at a time: a multisampled array is a texture for each
+          * layer, which is all a shader can read of it. */
+         for (uint32_t l = 0; l < layers; ++l) {
+            VkImageResolve2 layer = *r;
+            layer.srcSubresource.baseArrayLayer += l;
+            layer.srcSubresource.layerCount = 1;
+            layer.dstSubresource.baseArrayLayer += l;
+            layer.dstSubresource.layerCount = 1;
+            VkResolveImageInfo2 one = *pResolveImageInfo;
+            one.regionCount = 1;
+            one.pRegions = &layer;
+            wvk_cmd_meta_resolve_image(cmd, &one);
+         }
          continue;
       }
       wvk_image_use(wvk_cmd_buffer_device(cmd), replay, dst, r->dstSubresource.mipLevel, 1, true);
