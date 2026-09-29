@@ -20,6 +20,82 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Colour outputs of fewer components than four, made four.
+ *
+ * GL lets a fragment shader write a float to an RGBA target and leaves the
+ * other channels undefined; WebGPU refuses the pipeline, whose output has
+ * fewer components than its target, and the draw is lost. Every colour
+ * output is a vec4 after this, the components it did not write zero.
+ * dEQP-GLES3.functional.fragment_out wrote scalars, vec2s and vec3s to
+ * every format and lost most of them. An output sharing its location with
+ * another's components is left alone. */
+static bool
+gex_wgpu_pad_color_output(nir_shader *nir, nir_variable *var)
+{
+   const struct glsl_type *old = glsl_without_array(var->type);
+   if (!glsl_type_is_vector_or_scalar(old) || glsl_get_vector_elements(old) == 4 ||
+       glsl_get_bit_size(old) != 32 || var->data.location_frac)
+      return false;
+   nir_foreach_variable_with_modes(other, nir, nir_var_shader_out) {
+      if (other != var && other->data.location == var->data.location &&
+          other->data.index == var->data.index)
+         return false;
+   }
+   const struct glsl_type *vec4 = glsl_vector_type(glsl_get_base_type(old), 4);
+   var->type = glsl_type_is_array(var->type)
+      ? glsl_array_type(vec4, glsl_get_length(var->type), 0) : vec4;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            const bool load = intr->intrinsic == nir_intrinsic_load_deref;
+            if ((intr->intrinsic != nir_intrinsic_store_deref && !load) ||
+                nir_intrinsic_get_var(intr, 0) != var ||
+                !glsl_type_is_vector_or_scalar(nir_src_as_deref(intr->src[0])->type))
+               continue;
+            if (load) {
+               const unsigned n = intr->def.num_components;
+               b.cursor = nir_after_instr(instr);
+               intr->num_components = 4;
+               intr->def.num_components = 4;
+               nir_def *trimmed = nir_trim_vector(&b, &intr->def, n);
+               nir_def_rewrite_uses_after(&intr->def, trimmed);
+               continue;
+            }
+            b.cursor = nir_before_instr(instr);
+            nir_def *value = intr->src[1].ssa;
+            nir_def *comps[4];
+            for (unsigned c = 0; c < 4; ++c)
+               comps[c] = c < value->num_components
+                  ? nir_channel(&b, value, c)
+                  : nir_imm_zero(&b, 1, value->bit_size);
+            nir_src_rewrite(&intr->src[1], nir_vec(&b, comps, 4));
+            intr->num_components = 4;
+            nir_intrinsic_set_write_mask(intr, nir_intrinsic_write_mask(intr) |
+                                                  BITFIELD_RANGE(value->num_components,
+                                                                 4 - value->num_components));
+         }
+      }
+   }
+   return true;
+}
+
+static bool
+gex_wgpu_pad_color_outputs(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
+      if (var->data.location >= FRAG_RESULT_DATA0)
+         progress |= gex_wgpu_pad_color_output(nir, var);
+   }
+   if (progress)
+      nir_fixup_deref_types(nir);
+   return progress;
+}
+
 static bool
 gex_wgpu_lower_position_y(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -1067,6 +1143,7 @@ gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y,
       NIR_PASS(_, nir, nir_lower_fragcolor,
                nir->info.fs.color_is_dual_source ? 1
                                                  : GEX_WGPU_MAX_COLOR_TARGETS);
+      NIR_PASS(_, nir, gex_wgpu_pad_color_outputs);
       /* `discard` under a condition arrives as the `terminate_if` intrinsic,
        * and the SPIR-V emitter below implements only the unconditional
        * `terminate`. It did not refuse it -- it hit an `unreachable`, which is
