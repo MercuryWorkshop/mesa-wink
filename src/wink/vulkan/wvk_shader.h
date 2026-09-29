@@ -71,6 +71,9 @@ struct wvk_shader_key {
    /* Fragment: alpha to one, the coverage it computes from alpha itself,
     * and the samples it places positions or that coverage for (0: none). */
    uint8_t alpha_to_one, by_alpha, samples;
+   /* Fragment: its depth write dropped, for a pass without a depth
+    * attachment, which WebGPU will not have it write to. */
+   uint8_t no_depth;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
@@ -145,8 +148,9 @@ struct wvk_shader {
     * layout does not have. */
    int32_t set_words[4];
    /* Fragment: shades per sample, as its pipeline said; writes its own
-    * sample mask; places sample positions for a number of samples. */
-   bool per_sample, own_mask, uses_samples;
+    * sample mask; places sample positions for a number of samples; writes
+    * depth, before it was dropped. */
+   bool per_sample, own_mask, uses_samples, source_writes_depth;
 };
 
 static inline struct wvk_shader *
@@ -159,12 +163,14 @@ extern const struct vk_device_shader_ops wvk_device_shader_ops;
 
 /* The shader, or its variant, for a draw of this state: a vertex shader
  * for this vertex input and fragment shader (which may be NULL), a
- * fragment shader for this multisampling at `samples`; either for the
+ * fragment shader for this multisampling at `samples` and a pass with or
+ * without a depth attachment; either for the
  * records of both its and `other`'s layouts. The shader itself where it
  * was compiled for that, or a variant it could not compile. */
 struct wvk_shader *wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader,
                                            const struct wvk_shader *other,
-                                           const struct vk_dynamic_graphics_state *dyn, unsigned samples);
+                                           const struct vk_dynamic_graphics_state *dyn, unsigned samples,
+                                           bool has_depth);
 
 /* The physical device's NIR options, which differ from the GL driver's in
  * one thing: Vulkan's InstanceIndex is WebGPU's instance_index. */

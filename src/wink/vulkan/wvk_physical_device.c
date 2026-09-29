@@ -140,6 +140,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_extended_dynamic_state2 = true,
       .EXT_extended_dynamic_state3 = true,
       .EXT_graphics_pipeline_library = true,
+      .EXT_shader_object = true,
+      .EXT_color_write_enable = true,
       .KHR_pipeline_library = true,
       .EXT_host_query_reset = true,
       .EXT_image_robustness = true,
@@ -347,6 +349,11 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,
+      /* The runtime's too (vk_shader.c): shaders compiled alone, which a
+       * draw links, of state that is all dynamic. */
+      .shaderObject = true,
+      /* Of the pipeline's colour write masks (wvk_cmd_draw.c). */
+      .colorWriteEnable = true,
       /* VK_EXT_4444_formats: packed, as the core's are (wvk_format.c). */
       .formatA4R4G4B4 = true,
       .formatA4B4G4R4 = true,

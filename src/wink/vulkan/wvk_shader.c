@@ -2801,7 +2801,9 @@ source_deserialize(struct blob_reader *blob)
       blob_write_bytes(&src->nir, nir, nir_size);
    src->flags = blob_read_uint32(blob);
    src->next_stage_mask = blob_read_uint32(blob);
-   src->set_layout_count = MIN2(blob_read_uint32(blob), ARRAY_SIZE(src->layouts));
+   /* Read once: MIN2 would read it twice. */
+   const uint32_t set_layout_count = blob_read_uint32(blob);
+   src->set_layout_count = MIN2(set_layout_count, ARRAY_SIZE(src->layouts));
    for (uint32_t g = 0; !blob->overrun && g < src->set_layout_count; ++g) {
       if (!blob_read_uint8(blob))
          continue;
@@ -2942,6 +2944,19 @@ match_fragment_inputs(nir_shader *vs, const uint8_t inputs[WVK_MAX_VARYINGS])
    nir_progress(added, impl, nir_metadata_control_flow);
 }
 
+/* A fragment shader's depth written nowhere: for a pass without depth. */
+static bool
+drop_depth_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_shader_out || var->data.location != FRAG_RESULT_DEPTH)
+      return false;
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
 static VkResult
 compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
             const struct vk_graphics_pipeline_state *pipeline_state, const struct wvk_shader_key *records,
@@ -3020,6 +3035,24 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       shader->own_mask = own_mask;
       shader->key.alpha_to_one = to_one;
       shader->key.by_alpha = by_alpha;
+   }
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      /* Depth dropped where the pass has none: the pipeline's, or the
+       * draw's for a variant. */
+      nir_foreach_shader_out_variable(var, nir)
+         shader->source_writes_depth |= var->data.location == FRAG_RESULT_DEPTH;
+      const struct vk_render_pass_state *rp = pipeline_state ? pipeline_state->rp : NULL;
+      const bool no_depth = records ? records->no_depth
+                                    : rp && rp->depth_attachment_format == VK_FORMAT_UNDEFINED &&
+                                         rp->stencil_attachment_format == VK_FORMAT_UNDEFINED;
+      if (no_depth && shader->source_writes_depth) {
+         NIR_PASS(_, nir, nir_shader_intrinsics_pass, drop_depth_instr, nir_metadata_control_flow, NULL);
+         nir_foreach_shader_out_variable_safe(var, nir) {
+            if (var->data.location == FRAG_RESULT_DEPTH)
+               exec_node_remove(&var->node);
+         }
+         shader->key.no_depth = true;
+      }
    }
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       const bool per_sample = wants_sample_shading(pipeline_state);
@@ -3318,7 +3351,7 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
 
 struct wvk_shader *
 wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_shader *other,
-                        const struct vk_dynamic_graphics_state *dyn, unsigned samples)
+                        const struct vk_dynamic_graphics_state *dyn, unsigned samples, bool has_depth)
 {
    if (!shader || !shader->source)
       return shader;
@@ -3348,6 +3381,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       key.alpha_to_one = dyn->ms.alpha_to_one_enable;
       key.by_alpha = dyn->ms.alpha_to_coverage_enable && (key.alpha_to_one || shader->own_mask || samples <= 1);
       key.samples = shader->uses_samples || key.by_alpha ? samples : 0;
+      key.no_depth = shader->source_writes_depth && !has_depth;
       if (key_equal(&key, &shader->key))
          return shader;
    } else {
@@ -3361,11 +3395,12 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
    if (!he) {
       /* A variant that failed is kept as none, not tried at every draw. */
       if (getenv("WINK_VK_VARIANT_LOG")) {
-         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s\n", _mesa_shader_stage_to_string(shader->vk.stage),
+         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s\n", _mesa_shader_stage_to_string(shader->vk.stage),
                  shader->id, key.pulled != shader->key.pulled ? " vertex input" : "",
                  shader->vk.stage == MESA_SHADER_VERTEX && !varyings_match(shader, other) ? " varyings" : "",
                  key.alpha_to_one != shader->key.alpha_to_one || key.by_alpha != shader->key.by_alpha ? " alpha" : "",
-                 key.samples != shader->key.samples ? " samples" : "", records ? "" : " records");
+                 key.samples != shader->key.samples ? " samples" : "", records ? "" : " records",
+                 key.no_depth != shader->key.no_depth ? " depth" : "");
       }
       variant = compile_variant(dev, shader, &key, &vi);
       if (!variant)
@@ -3430,6 +3465,7 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->per_sample);
    blob_write_uint8(blob, shader->own_mask);
    blob_write_uint8(blob, shader->uses_samples);
+   blob_write_uint8(blob, shader->source_writes_depth);
    blob_write_uint8(blob, shader->source != NULL);
    if (shader->source)
       source_serialize(shader->source, blob);
@@ -3475,6 +3511,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const bool per_sample = blob_read_uint8(blob);
    const bool own_mask = blob_read_uint8(blob);
    const bool uses_samples = blob_read_uint8(blob);
+   const bool source_writes_depth = blob_read_uint8(blob);
    struct wvk_shader_source *source = blob_read_uint8(blob) ? source_deserialize(blob) : NULL;
    if (blob->overrun || !wgsl[0]) {
       for (uint32_t i = 0; i < WVK_SHADER_VARIANTS; ++i)
@@ -3521,6 +3558,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->per_sample = per_sample;
    shader->own_mask = own_mask;
    shader->uses_samples = uses_samples;
+   shader->source_writes_depth = source_writes_depth;
    shader->source = source;
    VkResult result = shader->bindings ? VK_SUCCESS : vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    for (uint32_t i = 0; result == VK_SUCCESS && i < WVK_SHADER_VARIANTS; ++i) {
