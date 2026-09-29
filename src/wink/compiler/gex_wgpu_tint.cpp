@@ -49,6 +49,17 @@ gex_wgpu_spirv_to_wgsl(const uint32_t *words, size_t word_count,
    std::call_once(initialized, [] { tint::Initialize(); });
 
    std::vector<uint32_t> spirv(words, words + word_count);
+   /* GEX_WGPU_SPIRV_DIR=<dir> writes every module there as N.spv before Tint
+    * reads it: for the ones Tint does not come back from. */
+   if (const char *dir = getenv("GEX_WGPU_SPIRV_DIR")) {
+      static int next = 0;
+      char path[1024];
+      snprintf(path, sizeof(path), "%s/%d.spv", dir, next++);
+      if (FILE *f = fopen(path, "wb")) {
+         fwrite(words, 4, word_count, f);
+         fclose(f);
+      }
+   }
    tint::spirv::reader::Options options;
    options.allow_non_uniform_derivatives = true;
    options.allowed_features = tint::wgsl::AllowedFeatures::Everything();
