@@ -132,6 +132,11 @@ struct wvk_replay {
    /* And what a dispatch samples of a texture it writes as storage: views
     * of the levels it does not write, or of a copy (wvk_cmd_draw.c). */
    struct util_dynarray texture_swaps; /* struct wvk_texture_swap */
+   /* The copies of colour attachments a draw's logic op reads, made
+    * before it (wvk_cmd_draw.c), at WVK_DRIVER_SLOT_LOGIC_OP + i. */
+   WGPUTextureView logic_op_views[8];
+   /* And the copy of the depth attachment a depth bounds test reads. */
+   WGPUTextureView depth_bounds_view;
    /* The buffers the render pass has used so far, and whether written: a
     * draw that would write what it read, or read what it wrote, begins it
     * again -- a render pass is one usage scope. */

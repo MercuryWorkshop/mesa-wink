@@ -45,7 +45,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 11
+#define WVK_SHADER_BINARY_VERSION 13
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -78,6 +78,14 @@ struct wvk_shader_key {
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
    uint32_t meta_base[4], meta_words;
+   /* Fragment: the logic op, VkLogicOp + 1 (0: none), and the format of
+    * each colour attachment it applies to (0: none), whose integer
+    * representation it is done on. */
+   uint32_t logic_op;
+   uint32_t logic_format[8];
+   /* Fragment: the depth bounds test, against a copy of the depth
+    * attachment at WVK_DRIVER_SLOT_DEPTH_BOUNDS. */
+   uint32_t depth_bounds;
 };
 
 struct wvk_shader_source;
@@ -108,6 +116,12 @@ struct wvk_shader {
    /* Vertex: the attribute locations read. Fragment: the colour
     * attachments written. */
    uint32_t io_mask;
+   /* Fragment: the colour attachments a logic op reads the copies of, at
+    * WVK_DRIVER_SLOT_LOGIC_OP + i. */
+   uint8_t logic_op_reads;
+   /* Fragment: whether it reads the depth attachment's copy for the depth
+    * bounds test. */
+   bool reads_depth_bounds;
    /* Fragment: writes gl_FragDepth, discards. */
    bool writes_depth;
    /* The push constants read, as a storage buffer at the driver's
@@ -170,7 +184,10 @@ extern const struct vk_device_shader_ops wvk_device_shader_ops;
 struct wvk_shader *wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader,
                                            const struct wvk_shader *other,
                                            const struct vk_dynamic_graphics_state *dyn, unsigned samples,
-                                           bool has_depth);
+                                           bool has_depth, const VkFormat *color_formats);
+
+/* Whether a logic op does anything to an attachment of `format`. */
+bool wvk_format_takes_logic_op(VkFormat format);
 
 /* The physical device's NIR options, which differ from the GL driver's in
  * one thing: Vulkan's InstanceIndex is WebGPU's instance_index. */

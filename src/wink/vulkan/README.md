@@ -95,6 +95,23 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   WebGPU, which lets shaders read them as they are. Passes store what
   they render even where Vulkan does not care, since one may be ended
   and begun again before Vulkan's is over.
+- **Logic ops** are the fragment shader's: WebGPU has no colour state
+  for them. A draw with one on gets a variant that takes each output to
+  its attachment format's integers (unorm, snorm, uint and sint, at the
+  format's own bits), combines them with the destination's and brings the
+  result back; float and sRGB attachments pass unchanged, and blending is
+  off, as Vulkan has it. The destination is a copy of the attachment's
+  level and layer, made before each such draw with the pass begun again
+  after, so primitives of one draw that overlap see the attachment as it
+  was before the draw. Not on a multisampled pass, which says so.
+- **The depth bounds test** is the fragment shader's too. It tests the
+  depth the attachment holds, so a draw with it on gets a variant that
+  reads a copy of the depth attachment (R32Float, made before the draw)
+  at its fragment and leaves where the depth is outside the bounds, which
+  the driver's push data has. At the end of the shader, as Vulkan's late
+  test is, or at the start where it asks for early tests; a draw without a
+  fragment shader gets the driver's own, which is the test alone. Not on a
+  multisampled pass, which says so.
 - **A dispatch that samples what it writes as storage** -- a mip chain
   built a level at a time, sampling the whole chain -- samples a view
   that stops below the lowest level written where it can, which keeps

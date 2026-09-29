@@ -190,6 +190,11 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* WebGPU clamps depth always; unclippedDepth turns off the clipping. */
       .depthClamp = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
       .depthBiasClamp = true,
+      /* The fragment shader's, against a copy of the attachment taken
+       * before the draw (wvk_shader.c, wvk_cmd_draw.c). */
+      .logicOp = true,
+      /* The fragment shader's too, against a copy of the depth attachment. */
+      .depthBounds = true,
       .samplerAnisotropy = true,
       .textureCompressionETC2 = etc2,
       .textureCompressionASTC_LDR = astc,
@@ -323,10 +328,13 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Pipelines are made at the draw from the dynamic state
        * (wvk_cmd_draw.c): any of it can be dynamic, what shaders are
        * compiled for included -- a draw of other state draws a variant
-       * (wvk_shader_draw_variant). WebGPU has no logic operations or
-       * tessellation, and only the state of what is supported is. */
+       * (wvk_shader_draw_variant). WebGPU has no tessellation, and only
+       * the state of what is supported is. */
       .extendedDynamicState = true,
       .extendedDynamicState2 = true,
+      /* Logic ops are the fragment shader's (wvk_shader.c), and so as
+       * dynamic as any state a variant is compiled for. */
+      .extendedDynamicState2LogicOp = true,
       .vertexInputDynamicState = true,
       .extendedDynamicState3DepthClampEnable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
       .extendedDynamicState3PolygonMode = true,
@@ -337,6 +345,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .extendedDynamicState3ColorBlendEnable = true,
       .extendedDynamicState3ColorBlendEquation = true,
       .extendedDynamicState3ColorWriteMask = true,
+      .extendedDynamicState3LogicOpEnable = true,
 
       /* Samplers' records do what WebGPU's samplers cannot
        * (wvk_nir_descriptors.c); a view's swizzle applies to the border. */

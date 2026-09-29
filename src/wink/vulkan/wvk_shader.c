@@ -608,6 +608,190 @@ lower_alpha_to_one(nir_shader *nir, bool to_one, bool to_coverage, unsigned samp
    return nir_progress(progress, impl, nir_metadata_control_flow);
 }
 
+/* Vulkan's logic ops, which WebGPU has no colour state for.
+ *
+ * The fragment shader does them. A logic op is defined on an attachment's
+ * integer representation -- XOR of 0.5 and 0.25 is not a float operation --
+ * so each output is taken to the attachment format's own integers, combined
+ * with the destination's, and brought back; float and sRGB attachments are
+ * not logic-op'd, and their outputs pass as they are. The destination is a
+ * copy of the attachment taken before the draw (wvk_cmd_draw.c), read at
+ * the fragment: WebGPU will not have a pass read what it renders to. So
+ * primitives of one draw that overlap see the attachment as it was before
+ * the draw rather than each other. */
+enum logic_kind {
+   LOGIC_NONE,
+   LOGIC_UNORM,
+   LOGIC_SNORM,
+   LOGIC_UINT,
+   LOGIC_SINT,
+};
+
+/* A component's representation in the format: its kind and its bits. */
+static enum logic_kind
+logic_channel(VkFormat format, unsigned component, unsigned *bits)
+{
+   const struct util_format_description *d = vk_format_description(format);
+   *bits = 0;
+   if (!d || d->colorspace != UTIL_FORMAT_COLORSPACE_RGB || d->layout != UTIL_FORMAT_LAYOUT_PLAIN ||
+       d->swizzle[component] > PIPE_SWIZZLE_W)
+      return LOGIC_NONE;
+   const struct util_format_channel_description *c = &d->channel[d->swizzle[component]];
+   *bits = c->size;
+   if (!c->size || c->size > 32)
+      return LOGIC_NONE;
+   if (c->type == UTIL_FORMAT_TYPE_UNSIGNED)
+      return c->normalized ? LOGIC_UNORM : LOGIC_UINT;
+   if (c->type == UTIL_FORMAT_TYPE_SIGNED)
+      return c->normalized ? LOGIC_SNORM : LOGIC_SINT;
+   return LOGIC_NONE;
+}
+
+/* Whether a logic op does anything to an attachment of `format`. */
+bool
+wvk_format_takes_logic_op(VkFormat format)
+{
+   for (unsigned c = 0; c < 4; ++c) {
+      unsigned bits;
+      if (logic_channel(format, c, &bits) != LOGIC_NONE)
+         return true;
+   }
+   return false;
+}
+
+static nir_def *
+logic_apply(nir_builder *b, VkLogicOp op, nir_def *s, nir_def *d)
+{
+   switch (op) {
+   case VK_LOGIC_OP_CLEAR: return nir_imm_int(b, 0);
+   case VK_LOGIC_OP_AND: return nir_iand(b, s, d);
+   case VK_LOGIC_OP_AND_REVERSE: return nir_iand(b, s, nir_inot(b, d));
+   case VK_LOGIC_OP_COPY: return s;
+   case VK_LOGIC_OP_AND_INVERTED: return nir_iand(b, nir_inot(b, s), d);
+   case VK_LOGIC_OP_NO_OP: return d;
+   case VK_LOGIC_OP_XOR: return nir_ixor(b, s, d);
+   case VK_LOGIC_OP_OR: return nir_ior(b, s, d);
+   case VK_LOGIC_OP_NOR: return nir_inot(b, nir_ior(b, s, d));
+   case VK_LOGIC_OP_EQUIVALENT: return nir_inot(b, nir_ixor(b, s, d));
+   case VK_LOGIC_OP_INVERT: return nir_inot(b, d);
+   case VK_LOGIC_OP_OR_REVERSE: return nir_ior(b, s, nir_inot(b, d));
+   case VK_LOGIC_OP_COPY_INVERTED: return nir_inot(b, s);
+   case VK_LOGIC_OP_OR_INVERTED: return nir_ior(b, nir_inot(b, s), d);
+   case VK_LOGIC_OP_NAND: return nir_inot(b, nir_iand(b, s, d));
+   case VK_LOGIC_OP_SET: default: return nir_imm_int(b, -1);
+   }
+}
+
+/* One component: the source and the destination as the format's integers,
+ * combined, and the result as the output's value again. */
+static nir_def *
+logic_component(nir_builder *b, VkLogicOp op, enum logic_kind kind, unsigned bits, nir_def *src,
+                nir_def *dst)
+{
+   const uint32_t mask = bits >= 32 ? ~0u : (1u << bits) - 1u;
+   nir_def *s, *d;
+   switch (kind) {
+   case LOGIC_UNORM:
+      s = nir_f2u32(b, nir_fround_even(b, nir_fmul_imm(b, nir_fsat(b, src), mask)));
+      d = nir_f2u32(b, nir_fround_even(b, nir_fmul_imm(b, nir_fsat(b, dst), mask)));
+      break;
+   case LOGIC_SNORM: {
+      const double max = (double)((1u << (bits - 1)) - 1u);
+      s = nir_f2i32(b, nir_fround_even(b, nir_fmul_imm(b, nir_fmax(b, nir_fmin(b, src, nir_imm_float(b, 1.0f)),
+                                                                       nir_imm_float(b, -1.0f)), max)));
+      d = nir_f2i32(b, nir_fround_even(b, nir_fmul_imm(b, nir_fmax(b, nir_fmin(b, dst, nir_imm_float(b, 1.0f)),
+                                                                       nir_imm_float(b, -1.0f)), max)));
+      break;
+   }
+   default:
+      s = src;
+      d = dst;
+      break;
+   }
+   nir_def *r = nir_iand_imm(b, logic_apply(b, op, nir_iand_imm(b, s, mask), nir_iand_imm(b, d, mask)), mask);
+   /* Signed kinds take their sign from the top bit they have. */
+   if ((kind == LOGIC_SNORM || kind == LOGIC_SINT) && bits < 32)
+      r = nir_ishr_imm(b, nir_ishl_imm(b, r, 32 - bits), 32 - bits);
+   switch (kind) {
+   case LOGIC_UNORM:
+      return nir_fmul_imm(b, nir_u2f32(b, r), 1.0 / (double)mask);
+   case LOGIC_SNORM:
+      return nir_fmax(b, nir_fmul_imm(b, nir_i2f32(b, r), 1.0 / (double)((1u << (bits - 1)) - 1u)),
+                      nir_imm_float(b, -1.0f));
+   default:
+      return r;
+   }
+}
+
+struct logic_op_state {
+   const struct wvk_shader_key *key;
+   nir_variable *dst[8];
+   uint8_t reads;
+};
+
+static bool
+lower_logic_op_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct logic_op_state *state = data;
+   if (intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = nir_intrinsic_get_var(intr, 0);
+   if (!var || var->data.mode != nir_var_shader_out || var->data.location < FRAG_RESULT_DATA0 ||
+       var->data.index != 0 || !glsl_type_is_vector_or_scalar(deref->type))
+      return false;
+   unsigned rt = var->data.location - FRAG_RESULT_DATA0;
+   if (deref->deref_type == nir_deref_type_array) {
+      if (!nir_src_is_const(deref->arr.index))
+         return false;
+      rt += nir_src_as_uint(deref->arr.index);
+   } else if (deref->deref_type != nir_deref_type_var) {
+      return false;
+   }
+   if (rt >= 8 || !state->key->logic_format[rt])
+      return false;
+   const VkFormat format = (VkFormat)state->key->logic_format[rt];
+   const VkLogicOp op = (VkLogicOp)(state->key->logic_op - 1);
+
+   /* The copy of the attachment, as the format samples. */
+   if (!state->dst[rt]) {
+      const enum glsl_base_type base = vk_format_is_uint(format)   ? GLSL_TYPE_UINT
+                                       : vk_format_is_sint(format) ? GLSL_TYPE_INT
+                                                                   : GLSL_TYPE_FLOAT;
+      nir_variable *tex = nir_variable_create(b->shader, nir_var_uniform,
+                                              glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, base), "wvk_logic_op_dst");
+      tex->data.descriptor_set = WVK_DRIVER_GROUP;
+      tex->data.binding = WVK_DRIVER_SLOT_LOGIC_OP + rt;
+      state->dst[rt] = tex;
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *coord = nir_f2i32(b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
+   nir_def *dst = nir_txf(b, coord, .texture_deref = nir_build_deref_var(b, state->dst[rt]), .lod = nir_imm_int(b, 0),
+                          .dest_type = vk_format_is_uint(format)   ? nir_type_uint32
+                                       : vk_format_is_sint(format) ? nir_type_int32
+                                                                   : nir_type_float32);
+   nir_def *src = intr->src[1].ssa;
+   nir_def *out[4];
+   for (unsigned c = 0; c < src->num_components; ++c) {
+      unsigned bits;
+      const enum logic_kind kind = logic_channel(format, c, &bits);
+      out[c] = kind == LOGIC_NONE ? nir_channel(b, src, c)
+                                  : logic_component(b, op, kind, bits, nir_channel(b, src, c), nir_channel(b, dst, c));
+   }
+   nir_src_rewrite(&intr->src[1], nir_vec(b, out, src->num_components));
+   state->reads |= BITFIELD_BIT(rt);
+   return true;
+}
+
+static bool
+lower_logic_op(nir_shader *nir, const struct wvk_shader_key *key, uint8_t *reads)
+{
+   struct logic_op_state state = { .key = key };
+   const bool progress = nir_shader_intrinsics_pass(nir, lower_logic_op_instr, nir_metadata_control_flow, &state);
+   *reads = state.reads;
+   return progress;
+}
+
 /* Sample shading, which WebGPU does where a fragment shader reads its
  * sample: at every sample, which is at least as many as any minimum. */
 static bool
@@ -820,6 +1004,9 @@ split_resource_vars(nir_shader *nir, struct lower_state *state)
       nir_variable *var = *v;
       const struct glsl_type *bare = glsl_without_array(var->type);
       if (!glsl_type_is_sampler(bare) && !glsl_type_is_texture(bare) && !glsl_type_is_image(bare))
+         continue;
+      /* The driver's own are where they go: a logic op's copies. */
+      if (var->data.descriptor_set == WVK_DRIVER_GROUP && var->data.binding >= WVK_DRIVER_SLOT_BASE)
          continue;
       const struct wvk_descriptor_set_binding_layout *bl =
          binding_layout(state->info, var->data.descriptor_set, var->data.binding);
@@ -1696,6 +1883,40 @@ driver_buffer(nir_builder *b, uint32_t binding)
                                               .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
    nir_def *desc = nir_load_vulkan_descriptor(b, 2, 32, index, .desc_type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
    return nir_channel(b, desc, 0);
+}
+
+/* The depth bounds test, which WebGPU has no depth-stencil state for.
+ *
+ * It tests the depth the attachment *holds*, not the fragment's, so the
+ * fragment shader reads it from a copy of the attachment taken before the
+ * draw (wvk_cmd_draw.c) and leaves where it is outside the bounds, which
+ * the driver's data has. At the end, as Vulkan's late test is, so that a
+ * killed fragment's side effects still happen; at the start for a shader
+ * that asks for early fragment tests, which would not have them. */
+static bool
+lower_depth_bounds(nir_shader *nir)
+{
+   const bool early = nir->info.fs.early_fragment_tests;
+   /* One way out, so that the end is where every invocation gets to. */
+   if (!early)
+      NIR_PASS(_, nir, nir_lower_returns);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(early ? nir_before_impl(impl) : nir_after_impl(impl));
+   nir_variable *tex = nir_variable_create(nir, nir_var_uniform,
+                                           glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_FLOAT),
+                                           "wvk_depth_bounds_dst");
+   tex->data.descriptor_set = WVK_DRIVER_GROUP;
+   tex->data.binding = WVK_DRIVER_SLOT_DEPTH_BOUNDS;
+   nir_def *coord = nir_f2i32(&b, nir_trim_vector(&b, nir_load_frag_coord(&b), 2));
+   nir_def *held = nir_channel(&b, nir_txf(&b, coord, .texture_deref = nir_build_deref_var(&b, tex),
+                                           .lod = nir_imm_int(&b, 0), .dest_type = nir_type_float32), 0);
+   nir_def *bounds = nir_load_ssbo(&b, 2, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                   nir_imm_int(&b, WVK_DRIVER_DEPTH_BOUNDS), .align_mul = 8,
+                                   .access = ACCESS_NON_WRITEABLE);
+   nir_def *outside = nir_ior(&b, nir_flt(&b, held, nir_channel(&b, bounds, 0)),
+                              nir_flt(&b, nir_channel(&b, bounds, 1), held));
+   nir_terminate_if(&b, outside);
+   return nir_progress(true, impl, nir_metadata_none);
 }
 
 /* BaseVertex, BaseInstance and DrawIndex. The driver's data says which
@@ -3056,6 +3277,17 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       shader->own_mask = own_mask;
       shader->key.alpha_to_one = to_one;
       shader->key.by_alpha = by_alpha;
+      /* A draw's depth bounds test and logic op, for its variant. */
+      if (records && records->depth_bounds) {
+         NIR_PASS(_, nir, lower_depth_bounds);
+         shader->reads_depth_bounds = true;
+         shader->key.depth_bounds = 1;
+      }
+      if (records && records->logic_op) {
+         NIR_PASS(_, nir, lower_logic_op, records, &shader->logic_op_reads);
+         shader->key.logic_op = records->logic_op;
+         memcpy(shader->key.logic_format, records->logic_format, sizeof(records->logic_format));
+      }
    }
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       /* Depth dropped where the pass has none: the pipeline's, or the
@@ -3378,7 +3610,8 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
 
 struct wvk_shader *
 wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_shader *other,
-                        const struct vk_dynamic_graphics_state *dyn, unsigned samples, bool has_depth)
+                        const struct vk_dynamic_graphics_state *dyn, unsigned samples, bool has_depth,
+                        const VkFormat *color_formats)
 {
    if (!shader || !shader->source)
       return shader;
@@ -3409,6 +3642,30 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       key.by_alpha = dyn->ms.alpha_to_coverage_enable && (key.alpha_to_one || shader->own_mask || samples <= 1);
       key.samples = shader->uses_samples || key.by_alpha ? samples : 0;
       key.no_depth = shader->source_writes_depth && !has_depth;
+      /* The logic op, where it changes anything: COPY is the output as it
+       * is. On a single-sampled pass, whose attachments are copied texel
+       * for texel; a multisampled one would need each sample's. */
+      if (dyn->cb.logic_op_enable && dyn->cb.logic_op != VK_LOGIC_OP_COPY && color_formats) {
+         if (samples > 1) {
+            mesa_logw_once("wvk: a logic op on a multisampled pass, which is not done");
+         } else {
+            for (uint32_t i = 0; i < 8; ++i) {
+               if (color_formats[i] && (shader->io_mask & BITFIELD_BIT(i)) &&
+                   wvk_format_takes_logic_op(color_formats[i])) {
+                  key.logic_format[i] = color_formats[i];
+                  key.logic_op = dyn->cb.logic_op + 1u;
+               }
+            }
+         }
+      }
+      /* The depth bounds test, where there is depth to test: against a
+       * copy of a single-sampled attachment, texel for texel. */
+      if (dyn->ds.depth.bounds_test.enable && has_depth) {
+         if (samples > 1)
+            mesa_logw_once("wvk: a depth bounds test on a multisampled pass, which is not done");
+         else
+            key.depth_bounds = 1;
+      }
       if (key_equal(&key, &shader->key))
          return shader;
    } else {
@@ -3474,6 +3731,8 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint32(blob, shader->binding_count);
    blob_write_bytes(blob, shader->bindings, shader->binding_count * sizeof(*shader->bindings));
    blob_write_uint32(blob, shader->io_mask);
+   blob_write_uint8(blob, shader->logic_op_reads);
+   blob_write_uint8(blob, shader->reads_depth_bounds);
    blob_write_uint8(blob, shader->writes_depth);
    blob_write_uint8(blob, shader->uses_push_constants);
    blob_write_uint8(blob, shader->uses_draw_parameters);
@@ -3514,6 +3773,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const uint32_t binding_count = blob_read_uint32(blob);
    const void *bindings = blob_read_bytes(blob, binding_count * sizeof(struct wvk_shader_binding));
    const uint32_t io_mask = blob_read_uint32(blob);
+   const uint8_t logic_op_reads = blob_read_uint8(blob);
+   const bool reads_depth_bounds = blob_read_uint8(blob);
    const bool writes_depth = blob_read_uint8(blob);
    const bool uses_push_constants = blob_read_uint8(blob);
    const bool uses_draw_parameters = blob_read_uint8(blob);
@@ -3567,6 +3828,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    if (shader->bindings)
       memcpy(shader->bindings, bindings, binding_count * sizeof(*shader->bindings));
    shader->io_mask = io_mask;
+   shader->logic_op_reads = logic_op_reads;
+   shader->reads_depth_bounds = reads_depth_bounds;
    shader->writes_depth = writes_depth;
    shader->uses_push_constants = uses_push_constants;
    shader->uses_draw_parameters = uses_draw_parameters;

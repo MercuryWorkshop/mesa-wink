@@ -55,6 +55,9 @@ struct wvk_device {
    /* A fragment shader with no outputs, for pipelines without one that
     * still have colour attachments to match. */
    WGPUShaderModule empty_fragment;
+   /* The fragment shader of a draw without one whose depth bounds test is
+    * on: the test alone (wvk_cmd_draw.c). */
+   struct wvk_shader *depth_bounds_fs;
    /* Where a submit's push constants go; grown when a submit needs more. */
    WGPUBuffer push_buffer;
    uint64_t push_buffer_size;

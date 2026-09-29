@@ -65,7 +65,9 @@ deref_binding(nir_src src, uint32_t *group, uint32_t *slot)
       return false;
    *group = var->data.descriptor_set;
    *slot = var->data.binding;
-   return true;
+   /* The driver's own textures (the copies logic ops and the depth bounds
+    * test read) are no descriptors, and have no records. */
+   return *group != WVK_DRIVER_GROUP || *slot < WVK_DRIVER_SLOT_BASE;
 }
 
 /* ---------------------------------------------------------------------- */

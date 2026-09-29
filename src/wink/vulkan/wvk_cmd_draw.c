@@ -364,6 +364,63 @@ compute_equal(const void *a, const void *b)
    return !memcmp(a, b, 2 * sizeof(uint64_t));
 }
 
+
+/* The fragment shader of a draw that has none, with the depth bounds test
+ * on: WebGPU draws depth without a fragment stage, and the test is the
+ * fragment shader's (wvk_shader.c's lower_depth_bounds). Its bindings are
+ * the two a lowered shader's are, so the layout, the copy and the bind
+ * group are made for it as for any other. */
+static struct wvk_shader *
+create_depth_bounds_fs(struct wvk_device *dev)
+{
+   char wgsl[1024];
+   snprintf(wgsl, sizeof(wgsl),
+            "struct WvkPush { words: array<u32> }\n"
+            "@group(%u) @binding(%u) var<storage, read> wvk_push: WvkPush;\n"
+            "@group(%u) @binding(%u) var wvk_depth: texture_2d<f32>;\n"
+            "@fragment fn main(@builtin(position) pos: vec4f) {\n"
+            "  let held = textureLoad(wvk_depth, vec2i(pos.xy), 0).x;\n"
+            "  let lo = bitcast<f32>(wvk_push.words[%uu]);\n"
+            "  let hi = bitcast<f32>(wvk_push.words[%uu]);\n"
+            "  if (held < lo || held > hi) { discard; }\n"
+            "}\n",
+            WVK_DRIVER_GROUP, WVK_DRIVER_SLOT_PUSH, WVK_DRIVER_GROUP, WVK_DRIVER_SLOT_DEPTH_BOUNDS,
+            WVK_DRIVER_DEPTH_BOUNDS / 4, WVK_DRIVER_DEPTH_BOUNDS / 4 + 1);
+   struct wvk_shader *fs = calloc(1, sizeof(*fs));
+   struct wvk_shader_binding *bindings = calloc(2, sizeof(*bindings));
+   if (!fs || !bindings) {
+      free(fs);
+      free(bindings);
+      return NULL;
+   }
+   bindings[0] = (struct wvk_shader_binding){
+      .group = WVK_DRIVER_GROUP,
+      .kind = WVK_BINDING_STORAGE_READ,
+      .binding = WVK_DRIVER_SLOT_PUSH,
+      .dynamic = true,
+   };
+   bindings[1] = (struct wvk_shader_binding){
+      .group = WVK_DRIVER_GROUP,
+      .kind = WVK_BINDING_TEXTURE,
+      .binding = WVK_DRIVER_SLOT_DEPTH_BOUNDS,
+      .view_dimension = WGPUTextureViewDimension_2D,
+      .sample_type = WGPUTextureSampleType_UnfilterableFloat,
+   };
+   fs->vk.stage = MESA_SHADER_FRAGMENT;
+   fs->id = p_atomic_inc_return(&dev->next_shader_id);
+   fs->bindings = bindings;
+   fs->binding_count = 2;
+   fs->reads_depth_bounds = true;
+   fs->uses_push_constants = true;
+   WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+   source.code = wvk_sv(wgsl);
+   WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+   sm.nextInChain = &source.chain;
+   sm.label = wvk_sv("wvk depth bounds fragment");
+   fs->module[0] = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+   return fs;
+}
+
 VkResult
 wvk_device_init_pipeline_caches(struct wvk_device *dev)
 {
@@ -389,6 +446,7 @@ wvk_device_init_pipeline_caches(struct wvk_device *dev)
    sm.nextInChain = &source.chain;
    sm.label = wvk_sv("wvk empty fragment");
    dev->empty_fragment = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+   dev->depth_bounds_fs = create_depth_bounds_fs(dev);
 
    WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
    bd.label = wvk_sv("wvk null buffer");
@@ -442,6 +500,12 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuBindGroupRelease(dev->empty_bind_group);
    if (dev->empty_fragment)
       wgpuShaderModuleRelease(dev->empty_fragment);
+   if (dev->depth_bounds_fs) {
+      if (dev->depth_bounds_fs->module[0])
+         wgpuShaderModuleRelease(dev->depth_bounds_fs->module[0]);
+      free(dev->depth_bounds_fs->bindings);
+      free(dev->depth_bounds_fs);
+   }
    if (dev->push_buffer)
       wgpuBufferRelease(dev->push_buffer);
    for (uint32_t i = 0; i < ARRAY_SIZE(dev->driver_groups); ++i) {
@@ -1285,6 +1349,18 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       WGPUBindGroupEntry *e = &entries[i];
       *e = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
       e->binding = b->binding;
+      if (group == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_LOGIC_OP &&
+          b->binding < WVK_DRIVER_SLOT_LOGIC_OP + WVK_MAX_LOGIC_OP_ATTACHMENTS) {
+         /* The copy of the attachment a logic op reads (snapshot_logic_op). */
+         const uint32_t rt = b->binding - WVK_DRIVER_SLOT_LOGIC_OP;
+         e->textureView = replay && replay->logic_op_views[rt] ? replay->logic_op_views[rt] : placeholder_view(dev, b);
+         continue;
+      }
+      if (group == WVK_DRIVER_GROUP && b->binding == WVK_DRIVER_SLOT_DEPTH_BOUNDS) {
+         /* The copy of the depth attachment (prepare_depth_bounds). */
+         e->textureView = replay && replay->depth_bounds_view ? replay->depth_bounds_view : placeholder_view(dev, b);
+         continue;
+      }
       if (group == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
          const struct wvk_driver_buffer *d = driver_binding_buffer(st, b->binding);
          e->offset = 0;
@@ -1822,12 +1898,19 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
          swapped |= s->group == g;
       util_dynarray_foreach(&replay->texture_swaps, struct wvk_texture_swap, s)
          swapped |= s->group == g;
-      const bool reads_copies = swapped || (pass && replay->snapshots.size && bgl->count && bound->set &&
-                                            reads_snapshot(replay, bgl, bound->set));
+      /* And the driver's group of a draw whose logic op reads copies of
+       * the attachments, which are new at every draw. */
+      const bool logic_op = pass && g == WVK_DRIVER_GROUP && st->fs &&
+                            (st->fs->logic_op_reads || st->fs->reads_depth_bounds);
+      const bool reads_copies = swapped || logic_op ||
+                                (pass && replay->snapshots.size && bgl->count && bound->set &&
+                                 reads_snapshot(replay, bgl, bound->set));
       WGPUBindGroup bg;
       if (reads_copies) {
-         upload_inline_blocks(dev, bound->set);
-         bg = make_bind_group(dev, bgl, bound->set, g, st, replay);
+         /* A group of the driver's bindings alone has no set. */
+         if (bound->set)
+            upload_inline_blocks(dev, bound->set);
+         bg = make_bind_group(dev, bgl, bgl->count ? bound->set : NULL, g, st, replay);
       } else {
          bg = get_bind_group(dev, bgl, bgl->count ? bound->set : NULL, g, st);
       }
@@ -1973,7 +2056,9 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
              !util_format_has_alpha(vk_format_to_pipe_format(view->vk.view_format)))
             k->color[i].write_mask &= ~VK_COLOR_COMPONENT_A_BIT;
       }
-      k->color[i].blend = a->blend_enable && written;
+      /* A logic op is blending's place, for every attachment: Vulkan has
+       * blending off while one is on, whether or not it applies. */
+      k->color[i].blend = a->blend_enable && written && !dyn->cb.logic_op_enable;
       if (k->color[i].blend) {
          k->color[i].src_c = blend_factor(a->src_color_blend_factor);
          k->color[i].dst_c = blend_factor(a->dst_color_blend_factor);
@@ -2217,6 +2302,99 @@ blend_constant(const struct vk_dynamic_graphics_state *dyn, uint32_t color_count
    return (WGPUColor){ bc[0], bc[1], bc[2], bc[3] };
 }
 
+/* What a draw's logic op reads of the colour attachments: a copy of the
+ * level and layer the pass renders to, made before the draw with the pass
+ * begun again after -- for every such draw, since each has to see what the
+ * one before it wrote. A 2D texture of the level's size, so its texels are
+ * at the fragments' coordinates. */
+static void
+snapshot_logic_op(struct wvk_cmd_buffer *cmd)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   const struct wvk_shader *fs = replay->state->fs;
+   if (!fs || !fs->logic_op_reads)
+      return;
+   wvk_replay_end_passes(replay);
+   u_foreach_bit(i, fs->logic_op_reads) {
+      replay->logic_op_views[i] = NULL;
+      struct wvk_image_view *view = i < replay->rendering.color_count ? replay->rendering.color[i] : NULL;
+      if (!view)
+         continue;
+      struct wvk_image *image = wvk_image_view_image(view);
+      const uint32_t level = view->vk.base_mip_level;
+      const uint32_t layer = view->vk.base_array_layer + replay->pass_layer;
+      uint32_t texture_layer = layer, first_level = 0;
+      WGPUTexture texture = view->texture != WVK_IMAGE_TEXTURE
+                               ? wvk_image_texture(image, view->texture, &first_level)
+                               : wvk_image_layer_texture(image, layer, &texture_layer);
+      if (!texture)
+         continue;
+      const VkExtent3D e = vk_image_mip_level_extent(&image->vk, level);
+      WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+      td.label = wvk_sv("wvk logic op destination");
+      td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+      td.dimension = WGPUTextureDimension_2D;
+      td.size = (WGPUExtent3D){ e.width, e.height, 1 };
+      td.format = wgpuTextureGetFormat(texture);
+      WGPUTexture copy = wgpuDeviceCreateTexture(dev->wgpu, &td);
+      if (!copy)
+         continue;
+      WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+      src.texture = texture;
+      src.mipLevel = level - first_level;
+      src.origin.z = texture_layer;
+      dst.texture = copy;
+      wgpuCommandEncoderCopyTextureToTexture(replay->encoder, &src, &dst, &td.size);
+      WGPUTextureView v = wgpuTextureCreateView(copy, NULL);
+      wgpuTextureRelease(copy);
+      if (!v)
+         continue;
+      util_dynarray_append(&replay->views, v);
+      replay->logic_op_views[i] = v;
+   }
+   wvk_replay_restart_pass(cmd, replay->pass_layer);
+}
+
+/* What a draw's depth bounds test reads: a copy of the depth the
+ * attachment holds, in R32Float, made before the draw with the pass begun
+ * again after; and the bounds, in the driver's data. */
+static void
+prepare_depth_bounds(struct wvk_cmd_buffer *cmd)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   if (!st->fs || !st->fs->reads_depth_bounds)
+      return;
+   const float bounds[2] = { dyn->ds.depth.bounds_test.min, dyn->ds.depth.bounds_test.max };
+   if (memcmp(st->push + WVK_DRIVER_DEPTH_BOUNDS, bounds, sizeof(bounds))) {
+      memcpy(st->push + WVK_DRIVER_DEPTH_BOUNDS, bounds, sizeof(bounds));
+      st->push_offset = UINT32_MAX;
+   }
+   replay->depth_bounds_view = NULL;
+   const struct wvk_image_view *ds = replay->rendering.depth_stencil;
+   if (!ds)
+      return;
+   WGPUTexture copy = wvk_image_snapshot_ds(dev, replay, wvk_image_view_image(ds), false);
+   if (copy) {
+      WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+      vd.dimension = WGPUTextureViewDimension_2D;
+      vd.baseMipLevel = ds->vk.base_mip_level;
+      vd.mipLevelCount = 1;
+      vd.baseArrayLayer = ds->vk.base_array_layer + replay->pass_layer;
+      vd.arrayLayerCount = 1;
+      WGPUTextureView v = wgpuTextureCreateView(copy, &vd);
+      wgpuTextureRelease(copy);
+      if (v) {
+         util_dynarray_append(&replay->views, v);
+         replay->depth_bounds_view = v;
+      }
+   }
+   wvk_replay_restart_pass(cmd, replay->pass_layer);
+}
+
 /* Everything a draw needs set on the pass. False skips the draw. */
 static bool
 flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
@@ -2263,6 +2441,8 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    sync_image_textures(cmd, p->layout, WVK_BIND_GRAPHICS);
    sync_atomic_buffers(cmd, p->layout, WVK_BIND_GRAPHICS);
    snapshot_feedback(cmd, p->layout);
+   snapshot_logic_op(cmd);
+   prepare_depth_bounds(cmd);
 
    /* A render pass is one usage scope: what the draw reads of buffers it
     * writes, copies; and a draw at odds with what the pass used before, a
@@ -2712,8 +2892,16 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
                                ? dyn->ms.rasterization_samples
                                : MAX2(replay->rendering.samples, 1);
    const bool has_depth = replay->rendering.depth_format != WGPUTextureFormat_Undefined;
-   st->fs = wvk_shader_draw_variant(dev, st->bound_fs, st->bound_vs, dyn, samples, has_depth);
-   st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth);
+   VkFormat color_formats[8] = { VK_FORMAT_UNDEFINED };
+   for (uint32_t i = 0; i < MIN2(replay->rendering.color_count, 8); ++i) {
+      const struct wvk_image_view *view = replay->rendering.color[i];
+      color_formats[i] = view ? view->vk.view_format : VK_FORMAT_UNDEFINED;
+   }
+   st->fs = wvk_shader_draw_variant(dev, st->bound_fs, st->bound_vs, dyn, samples, has_depth, color_formats);
+   st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats);
+   /* No fragment shader to do the depth bounds test: the driver's. */
+   if (!st->fs && dyn->ds.depth.bounds_test.enable && has_depth && samples <= 1)
+      st->fs = dev->depth_bounds_fs;
 }
 
 static void

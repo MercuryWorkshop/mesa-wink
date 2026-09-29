@@ -64,7 +64,8 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* The driver's own bindings are at the top of the last group, which they
  * share with set 3 if a pipeline layout has one. */
 #define WVK_DRIVER_GROUP 3
-#define WVK_DRIVER_SLOT_BASE 992
+/* Below WebGPU's thousand bindings a group, with room for all of them. */
+#define WVK_DRIVER_SLOT_BASE 984
 #define WVK_DRIVER_SLOT_PUSH (WVK_DRIVER_SLOT_BASE + 0)
 /* The draw's parameters (BaseVertex, BaseInstance): the push buffer again
  * for a direct draw, the indirect buffer for an indirect one. */
@@ -73,6 +74,13 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
  * of bindings with a divisor other than 1, which WebGPU cannot step. */
 #define WVK_DRIVER_SLOT_VERTEX (WVK_DRIVER_SLOT_BASE + 2)
 #define WVK_MAX_PULLED_BINDINGS 4
+/* A copy of each colour attachment a logic op reads, as it was before the
+ * draw: WebGPU has no logic ops, so the fragment shader does them. */
+#define WVK_DRIVER_SLOT_LOGIC_OP (WVK_DRIVER_SLOT_VERTEX + WVK_MAX_PULLED_BINDINGS)
+#define WVK_MAX_LOGIC_OP_ATTACHMENTS 8
+/* A copy of the depth attachment the depth bounds test reads, as it was
+ * before the draw, in R32Float. */
+#define WVK_DRIVER_SLOT_DEPTH_BOUNDS (WVK_DRIVER_SLOT_LOGIC_OP + WVK_MAX_LOGIC_OP_ATTACHMENTS)
 
 #define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
 
@@ -153,7 +161,8 @@ enum wvk_texel_type {
  *     wvk_cmd_buffer.c);
  *   - each pulled vertex buffer's stride, which may be dynamic, 4 uints;
  *   - a dispatch's base workgroup, 3 uints; and the viewport a draw is
- *     drawn in, a uint (a draw per viewport, see wvk_cmd_draw.c). */
+ *     drawn in, a uint (a draw per viewport, see wvk_cmd_draw.c);
+ *   - the depth bounds, 2 floats, which the fragment shader tests. */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
@@ -164,7 +173,8 @@ enum wvk_texel_type {
 #define WVK_DRIVER_PULL_STRIDES (WVK_DRIVER_DATA_OFFSET + 80)
 #define WVK_DRIVER_BASE_GROUP (WVK_DRIVER_DATA_OFFSET + 96)
 #define WVK_DRIVER_VIEWPORT (WVK_DRIVER_BASE_GROUP + 12)
-#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 112)
+#define WVK_DRIVER_DEPTH_BOUNDS (WVK_DRIVER_DATA_OFFSET + 112)
+#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 128)
 #define WVK_META_OFFSET WVK_PUSH_DATA_SIZE
 /* How much of the push buffer the push binding shows: its data, and as
  * many records as that leaves room for. */
