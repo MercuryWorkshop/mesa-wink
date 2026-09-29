@@ -312,6 +312,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .uniformAndStorageBuffer8BitAccess = true,
       .storagePushConstant8 = true,
       .shaderSubgroupExtendedTypes = true,
+      /* A subgroup of one reads its own value, whichever id. */
+      .subgroupBroadcastDynamicId = true,
       .imagelessFramebuffer = true,
       .uniformBufferStandardLayout = true,
       /* Buffers are words at the offsets SPIR-V gives. */
@@ -611,7 +613,9 @@ get_device_properties(const struct wvk_physical_device *pdev,
       /* Every invocation is a subgroup of its own (wvk_nir_subgroups.c):
        * Tint reads no subgroup operations. Quads would need four. */
       .subgroupSize = 1,
-      .subgroupSupportedStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+      .subgroupSupportedStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT |
+                                 VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                 VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
       .subgroupSupportedOperations = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT |
                                      VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
                                      VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
