@@ -31,6 +31,12 @@ WGPUDevice gex_wgpu_screen_device(struct pipe_screen *screen);
 struct sw_winsys;
 struct pipe_screen *gex_wgpu_sw_screen_create(struct sw_winsys *winsys);
 
+/* The process's native Dawn device, made on first use, and the instance it
+ * came from -- for a frontend that presents to a surface of its own. Not
+ * retained: they last as long as the process. */
+WGPUDevice gex_wgpu_native_device(void);
+WGPUInstance gex_wgpu_native_instance(void);
+
 #ifdef __cplusplus
 }
 #endif

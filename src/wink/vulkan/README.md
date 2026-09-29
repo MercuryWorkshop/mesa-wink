@@ -156,6 +156,13 @@ dEQP-VK: `test/build-cts.sh` builds it, and `test/run-cts.sh OUT GROUP...`
 runs mustpass groups (`api`, `draw`, `texture`, …) with deqp-runner.
 Anything after `--` goes to deqp-runner, such as `--fraction 25`.
 
+Minecraft: `test/run-minecraft.py INSTANCE [--world NAME] [--capture N]
+[--seconds S]` runs a Prism Launcher instance offline, on this build's ICD
+through brew's loader, with `--graphicsBackend vulkan`. It uses a scratch game
+directory, with copies of the instance's options and the world. 26.3 and
+26.4-snapshot-1 render their title screens and worlds. `--gl` runs the
+OpenGL backend on wink's GL instead (`wink/README.md`).
+
 ## In a browser
 
 `wink/build.sh` builds it into libwink. There is no loader, so an app
@@ -188,6 +195,7 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 | `WINK_VK_ABORT_ON_ERROR=1` | abort on a WebGPU validation error, which is a driver bug |
 | `WINK_VK_FALLBACK_ADAPTER=1` | use Dawn's software adapter |
 | `WINK_VK_API_VERSION` | the Vulkan version reported |
+| `GEX_WGPU_SPIRV_DIR=dir` | write every module to `dir/N.spv` before Tint reads it, for one Tint does not come back from |
 
 ## Not there yet
 

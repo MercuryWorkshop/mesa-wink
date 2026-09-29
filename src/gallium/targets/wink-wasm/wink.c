@@ -47,9 +47,15 @@
 #include "util/u_queue.h"
 #include "gex_wgpu_public.h"
 
+#ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #include <emscripten/threading.h>
+#else
+#define EMSCRIPTEN_KEEPALIVE
+#endif
+#include <inttypes.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -191,7 +197,12 @@ wink_rpc_execute(void *job, void *gdata, int thread_index)
 static void
 wink_rpc(void (*fn)(void *arg), void *arg)
 {
-   if (!wink.remote || emscripten_is_main_browser_thread()) {
+#ifdef __EMSCRIPTEN__
+   const bool here = !wink.remote || emscripten_is_main_browser_thread();
+#else
+   const bool here = true;
+#endif
+   if (here) {
       fn(arg);
       return;
    }
@@ -602,9 +613,14 @@ surface_create_here(const wink_surface_attribs *a, int *status)
 
    /* RGBA8 even without alpha: the canvas is configured RGBA8Unorm so the
     * present is a plain copy (WebGPU will not copy between RGBA and BGRA),
-    * and an opaque composite mode is what hides the alpha channel. */
+    * and an opaque composite mode is what hides the alpha channel. A native
+    * surface is BGRA8, which is what Metal presents. */
    s->visual.buffer_mask = ST_ATTACHMENT_FRONT_LEFT_MASK | ST_ATTACHMENT_BACK_LEFT_MASK;
+#ifdef __EMSCRIPTEN__
    s->visual.color_format = a->srgb ? PIPE_FORMAT_R8G8B8A8_SRGB : PIPE_FORMAT_R8G8B8A8_UNORM;
+#else
+   s->visual.color_format = a->srgb ? PIPE_FORMAT_B8G8R8A8_SRGB : PIPE_FORMAT_B8G8R8A8_UNORM;
+#endif
    s->visual.depth_stencil_format = choose_depth_stencil(a->depth_bits, a->stencil_bits);
    if (s->visual.depth_stencil_format != PIPE_FORMAT_NONE)
       s->visual.buffer_mask |= ST_ATTACHMENT_DEPTH_STENCIL_MASK;
@@ -626,7 +642,11 @@ surface_create_here(const wink_surface_attribs *a, int *status)
    s->base.flush_swapbuffers = surface_flush_swapbuffers;
 
    if (!s->offscreen) {
+#ifdef __EMSCRIPTEN__
       s->canvas = wink_js_create_surface(a->canvas);
+#else
+      s->canvas = wink_native_create_surface(a->native_layer);
+#endif
       if (!s->canvas) {
          free(s);
          set_status(status, WINK_ERROR_NO_CANVAS);
@@ -1065,12 +1085,19 @@ configure_canvas(wink_surface *s)
    WGPUSurfaceConfiguration cfg;
    memset(&cfg, 0, sizeof(cfg));
    cfg.device = wink.device;
-   cfg.format = WGPUTextureFormat_RGBA8Unorm;
    cfg.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopyDst;
+#ifdef __EMSCRIPTEN__
+   cfg.format = WGPUTextureFormat_RGBA8Unorm;
    /* emdawnwebgpu sets the canvas element's size from these unless they are
     * zero; zero leaves the page in charge of it. */
    cfg.width = s->manage_canvas_size ? s->width : 0;
    cfg.height = s->manage_canvas_size ? s->height : 0;
+#else
+   /* A native surface is the surface's size, which the window's resizes set. */
+   cfg.format = WGPUTextureFormat_BGRA8Unorm;
+   cfg.width = s->width;
+   cfg.height = s->height;
+#endif
    /* A browser composites a WebGPU canvas either opaque or premultiplied;
     * GPUCanvasAlphaMode has no unpremultiplied. */
    cfg.alphaMode = s->opaque ? WGPUCompositeAlphaMode_Opaque
@@ -1080,6 +1107,63 @@ configure_canvas(wink_surface *s)
    s->configured = true;
    return true;
 }
+
+#ifndef __EMSCRIPTEN__
+/* WINK_CAPTURE=N:FILE.bmp writes the back buffer of the Nth swap to a file,
+ * for looking at what reached the screen where nothing can capture it. Read
+ * back through the context, as glReadPixels would. */
+static void
+maybe_capture(struct st_context *st, struct pipe_resource *back)
+{
+   static int64_t frame = -1;
+   static uint64_t swaps;
+   static char path[512];
+   if (frame < 0) {
+      const char *env = getenv("WINK_CAPTURE");
+      frame = 0;
+      if (!env || sscanf(env, "%" SCNd64 ":%511s", &frame, path) != 2)
+         frame = INT64_MAX;
+   }
+   if (++swaps != (uint64_t)frame || !st)
+      return;
+
+   const unsigned w = back->width0, h = back->height0;
+   struct pipe_transfer *transfer = NULL;
+   const uint8_t *data = pipe_texture_map(st->pipe, back, 0, 0, PIPE_MAP_READ, 0, 0, w, h, &transfer);
+   FILE *f = data ? fopen(path, "wb") : NULL;
+   if (f) {
+      /* A bottom-up 32-bit BMP, which is BGRA: swap for RGBA buffers. */
+      const bool rgba = back->format == PIPE_FORMAT_R8G8B8A8_UNORM ||
+                        back->format == PIPE_FORMAT_R8G8B8A8_SRGB;
+      const uint32_t bytes = w * h * 4;
+      uint8_t header[54] = { 'B', 'M' };
+      const uint32_t fields[] = { 54 + bytes, 54, 40, w, h };
+      memcpy(header + 2, &fields[0], 4);
+      memcpy(header + 10, &fields[1], 4);
+      memcpy(header + 14, &fields[2], 4);
+      memcpy(header + 18, &fields[3], 4);
+      memcpy(header + 22, &fields[4], 4);
+      header[26] = 1;
+      header[28] = 32;
+      fwrite(header, 1, sizeof(header), f);
+      uint8_t *row = malloc(w * 4);
+      for (unsigned y = h; row && y-- > 0;) {
+         memcpy(row, data + (uint64_t)y * transfer->stride, w * 4);
+         for (unsigned x = 0; rgba && x < w; ++x) {
+            const uint8_t r = row[x * 4];
+            row[x * 4] = row[x * 4 + 2];
+            row[x * 4 + 2] = r;
+         }
+         fwrite(row, 1, w * 4, f);
+      }
+      free(row);
+      fclose(f);
+      fprintf(stderr, "wink: swap %" PRIu64 " written to %s\n", swaps, path);
+   }
+   if (data)
+      pipe_texture_unmap(st->pipe, transfer);
+}
+#endif
 
 /* Flush the current context and copy the back buffer onto the canvas. */
 static void
@@ -1097,6 +1181,9 @@ swap_here(wink_surface *s)
    WGPUTexture from = back ? gex_wgpu_resource_texture(back) : NULL;
    if (!from)
       return; /* nothing has been drawn to it yet */
+#ifndef __EMSCRIPTEN__
+   maybe_capture(st, back);
+#endif
 
    configure_canvas(s);
    WGPUSurfaceTexture current;
@@ -1135,8 +1222,12 @@ swap_here(wink_surface *s)
       }
       wgpuCommandEncoderRelease(encoder);
    }
-   /* No wgpuSurfacePresent: in a browser the frame is presented when this
-    * thread next yields to its event loop. */
+   /* No wgpuSurfacePresent in a browser: the frame is presented when this
+    * thread next yields to its event loop. Natively it is presented here,
+    * FIFO, which is also the pacing. */
+#ifndef __EMSCRIPTEN__
+   wgpuSurfacePresent(s->canvas);
+#endif
    wgpuTextureRelease(current.texture);
 }
 

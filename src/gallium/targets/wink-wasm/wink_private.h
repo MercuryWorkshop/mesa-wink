@@ -25,6 +25,9 @@ void wink_js_kick(struct util_queue *queue);
  * runner, or on a thread entered through WebAssembly.promising. */
 void wink_js_yield_frame(int frames);
 
+/* wink_native.c: a surface of a native layer (a CAMetalLayer), or NULL. */
+void *wink_native_create_surface(void *layer);                  /* WGPUSurface */
+
 /* wink.c, called by library_wink.js: the main thread's runner, and the
  * device-lost notice. */
 void wink_main_run_queue(struct util_queue *queue);

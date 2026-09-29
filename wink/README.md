@@ -262,6 +262,57 @@ Driver switches worth knowing:
   feature, so st/mesa decodes on the CPU instead.
 * `GEX_WGPU_TIMING=1` shows the share of time spent in draws and in present.
 
+## Natively, on macOS
+
+Against native Dawn (the package `src/gallium/drivers/gex_wgpu/native/`
+builds), the same API is `libwink.dylib`, for a windowing layer to make its
+GL. The wink fork of SDL does that in its Cocoa backend. A window's frames go
+to a CAMetalLayer of its own, BGRA8, presented FIFO at every swap.
+
+```sh
+PKG=~/.cache/mesa-wink/dawn-native/pkg
+PATH=/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$PATH \
+meson setup build/wink-mac -Dvulkan-drivers= -Dgallium-drivers=gex_wgpu \
+  -Dplatforms= -Dglx=disabled -Degl=disabled -Dopengl=true -Dgles1=disabled \
+  -Dgles2=enabled -Dgbm=disabled -Dllvm=disabled -Dvideo-codecs= -Dtools= \
+  -Dvulkan-layers= -Dgex-emdawn-dir=$PKG -Dgex-dawn-native-dir=$PKG/lib \
+  -Dgex-tint-dir=$PKG -Dwink=enabled
+ninja -C build/wink-mac src/gallium/targets/wink-wasm/libwink.dylib
+
+cmake -S ../SDL -B build/sdl-mac -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DSDL_COCOA_WINK_INCLUDE_DIR=$PWD/src/gallium/targets/wink-wasm \
+  -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF
+ninja -C build/sdl-mac
+```
+
+`SDL_VIDEO_COCOA_WINK=path/to/libwink.dylib` (a hint, or the environment)
+makes SDL's GL wink's in place of NSOpenGL. Contexts follow the usual
+`SDL_GL_SetAttribute`s, and the surface follows the window's pixel size.
+
+Here the library **does** export `gl*`, unlike the wasm build. They are
+linker aliases of the dispatch stubs that `wink_get_proc_address` returns
+(`wink_gl_aliases.py`), because LWJGL finds GL by `dlsym` and Minecraft
+checks the result against `SDL_GL_GetProcAddress`. Nothing else is exported.
+Tint's archive has default visibility, and its weak symbols, if exported,
+would be coalesced with libwebgpu_dawn's copy of Tint.
+
+`wink/test/native/run.sh build/wink-mac/src/gallium/targets/wink-wasm/libwink.dylib build/sdl-mac`
+opens a window and checks that:
+
+* `dlsym` and SDL resolve `gl*` to the same functions;
+* a clear and a GLSL draw read back, before and after a resize.
+
+`WINK_CAPTURE=N:file.bmp` writes the back buffer of the Nth swap. To run
+Minecraft's OpenGL backend on it, from a Prism Launcher instance:
+
+```sh
+src/wink/vulkan/test/run-minecraft.py 26.4-snapshot-1 --gl --world "New World" --capture 1500 --seconds 150
+```
+
+That sets `org.lwjgl.sdl.libname` to the fork, and `org.lwjgl.opengl.libname`
+and `SDL_VIDEO_COCOA_WINK` to libwink. 26.3 and 26.4-snapshot-1 both render
+their title screens and worlds.
+
 ## Symbol checks
 
 The packaging stage runs `tools/wink-symbols.py`, which **fails** on:

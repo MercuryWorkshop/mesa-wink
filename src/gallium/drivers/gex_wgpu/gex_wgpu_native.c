@@ -457,6 +457,19 @@ create_device(void)
 void gex_wgpu_jspi_wait(void);
 void gex_wgpu_jspi_signal(void);
 
+WGPUDevice
+gex_wgpu_native_device(void)
+{
+   return create_device();
+}
+
+WGPUInstance
+gex_wgpu_native_instance(void)
+{
+   create_device();
+   return native_instance;
+}
+
 void
 gex_wgpu_jspi_wait(void)
 {

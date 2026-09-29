@@ -109,6 +109,9 @@ typedef struct wink_surface_attribs {
                                   * the content must be premultiplied */
    uint8_t manage_canvas_size;   /* set the canvas's width/height to the surface size */
    uint8_t offscreen;            /* no canvas at all, like a pbuffer */
+   /* Native builds: where frames go instead of a canvas -- a CAMetalLayer
+    * on macOS. The surface is always its size. */
+   void *native_layer;
 } wink_surface_attribs;
 
 typedef struct wink_context_attribs {
