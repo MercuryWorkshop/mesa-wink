@@ -67,6 +67,20 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   operations stay WGSL's f16; words of them, from memory or moves, are
   packHalf2x16's bits. Memory is words already: a store of less than a
   word is atomics on its bits, and interpolated half floats are floats.
+- **Min and max reductions** (samplerFilterMinmax), which WebGPU's
+  samplers do not do: a sample of a sampler that reduces fetches the
+  filter's footprint -- the texels of weight not zero, at the level the LOD
+  selects or the two of linear mipmaps, each wrapped as the sampler says
+  or the border -- and takes their least or greatest, component by
+  component. The WebGPU sampler of one filters nothing, so it takes depth
+  textures too. A cube's, whose texels are across faces, is the base
+  level's gathers, which the hardware finds the edges of: not the level a
+  minified sample selects.
+- **8-bit indices** (indexTypeUint8) are widened to 16 bits by a pass of
+  the driver's at the first draw after a bind, the restart index 0xFFFF
+  where the draw restarts primitives.
+- **Primitives generated queries** count what clipping has, as the
+  pipeline statistics queries do.
 - **Variable pointers** (variablePointers, variablePointersStorageBuffer):
   a buffer access whose binding a phi or select chooses, which cannot be
   traced back to one, is an access of each buffer of its kind the shader

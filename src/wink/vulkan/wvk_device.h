@@ -78,6 +78,7 @@ struct wvk_device {
    WGPUComputePipeline add_stats_pipeline;
    WGPUComputePipeline finish_stats_pipeline;
    WGPUComputePipeline fan_pipeline;
+   WGPUComputePipeline uint8_index_pipeline;
    WGPUComputePipeline draw_count_pipeline;
    /* The tessellator's passes: count, scan, generate (wvk_tessellator.c),
     * and their bind group layout. */

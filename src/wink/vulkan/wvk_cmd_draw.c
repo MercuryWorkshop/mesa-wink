@@ -523,6 +523,8 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuComputePipelineRelease(dev->finish_stats_pipeline);
    if (dev->fan_pipeline)
       wgpuComputePipelineRelease(dev->fan_pipeline);
+   if (dev->uint8_index_pipeline)
+      wgpuComputePipelineRelease(dev->uint8_index_pipeline);
    if (dev->draw_count_pipeline)
       wgpuComputePipelineRelease(dev->draw_count_pipeline);
    for (uint32_t i = 0; i < ARRAY_SIZE(dev->tess_pipelines); ++i) {
@@ -794,6 +796,11 @@ struct wvk_bound_state {
    struct wvk_bound_buffer vb[MESA_VK_MAX_VERTEX_BINDINGS];
    struct wvk_bound_buffer ib;
    VkIndexType index_type;
+   /* 8-bit indices as 16-bit ones, which WebGPU has: made at the first
+    * draw of them after the bind, as that draw restarts primitives or not
+    * (widen_indices). */
+   struct wvk_bound_buffer ib16;
+   bool ib16_valid, ib16_restart;
 
    /* The push constants, and the driver's data after them. */
    uint8_t push[WVK_PUSH_DATA_SIZE];
@@ -1085,8 +1092,115 @@ wvk_CmdBindIndexBuffer2(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDevice
    struct wvk_bound_state *st = cmd->replay->state;
    st->ib = bound_buffer(cmd, buffer, offset, size);
    st->index_type = indexType;
-   if (indexType == VK_INDEX_TYPE_UINT8)
-      mesa_logw_once("wvk: 8-bit indices are not supported");
+   st->ib16_valid = false;
+}
+
+static const char widen_indices_wgsl[] =
+   "struct P { start: u32, count: u32, restart: u32, pad: u32 }\n"
+   "@group(0) @binding(0) var<storage, read> src: array<u32>;\n"
+   "@group(0) @binding(1) var<storage, read_write> dst: array<u32>;\n"
+   "@group(0) @binding(2) var<uniform> p: P;\n"
+   "@compute @workgroup_size(64)\n"
+   "fn main(@builtin(global_invocation_id) id: vec3u) {\n"
+   "  let i = id.x + id.y * 65535u * 64u;\n"
+   "  if (i * 2u >= p.count) { return; }\n"
+   "  var word = 0u;\n"
+   "  for (var k = 0u; k < 2u; k++) {\n"
+   "    let e = i * 2u + k;\n"
+   "    if (e < p.count) {\n"
+   "      let byte = p.start + e;\n"
+   "      var v = (src[byte / 4u] >> ((byte % 4u) * 8u)) & 0xffu;\n"
+   "      if (v == 0xffu && p.restart != 0u) { v = 0xffffu; }\n"
+   "      word |= v << (k * 16u);\n"
+   "    }\n"
+   "  }\n"
+   "  dst[i] = word;\n"
+   "}\n";
+
+/* The bound 8-bit indices as 16-bit ones for a draw (VK_KHR_index_type_uint8),
+ * which WebGPU has no 8-bit indices of: a copy made by a pass of the
+ * driver's -- the render pass ended for it and begun again -- where the
+ * restart index is 0xFFFF if the draw restarts primitives, else 255 as it
+ * is. Kept until the next bind, or a draw that restarts otherwise. True
+ * where the bound indices are these for now, `saved` what to put back. */
+static bool
+widen_indices(struct wvk_cmd_buffer *cmd, struct wvk_bound_buffer *saved)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   if (st->index_type != VK_INDEX_TYPE_UINT8 || !st->ib.buffer)
+      return false;
+   const bool restart = cmd->vk.dynamic_graphics_state.ia.primitive_restart_enable;
+   if (!st->ib16_valid || st->ib16_restart != restart) {
+      simple_mtx_lock(&dev->cache_lock);
+      if (!dev->uint8_index_pipeline) {
+         WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+         source.code = wvk_sv(widen_indices_wgsl);
+         WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+         sm.nextInChain = &source.chain;
+         WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+         WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+         desc.label = wvk_sv("wvk 8-bit indices");
+         desc.compute.module = module;
+         desc.compute.entryPoint = wvk_sv("main");
+         dev->uint8_index_pipeline = wgpuDeviceCreateComputePipeline(dev->wgpu, &desc);
+         wgpuShaderModuleRelease(module);
+      }
+      simple_mtx_unlock(&dev->cache_lock);
+      const struct wvk_bound_buffer *ib = &st->ib;
+      const uint64_t count = MIN2(ib->size, UINT32_MAX / 2);
+      const uint64_t base = ib->offset & ~255ull;
+      const uint64_t out_bytes = align64(MAX2(count * 2, 4), 4);
+      WGPUBuffer out = wvk_replay_temp_buffer(dev, replay, out_bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_Index,
+                                              NULL);
+      const uint32_t params[4] = { (uint32_t)(ib->offset - base), (uint32_t)count, restart };
+      WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
+      if (!dev->uint8_index_pipeline || !out || !params_buffer || !count)
+         return false;
+      wvk_replay_read(replay, ib->mem, ib->offset, ib->size);
+      const WGPUBindGroupEntry entries[] = {
+         { .binding = 0, .buffer = ib->buffer, .offset = base, .size = align64(ib->offset + count - base, 4) },
+         { .binding = 1, .buffer = out, .offset = 0, .size = out_bytes },
+         { .binding = 2, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
+      };
+      WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+      bg.layout = wgpuComputePipelineGetBindGroupLayout(dev->uint8_index_pipeline, 0);
+      bg.entryCount = ARRAY_SIZE(entries);
+      bg.entries = entries;
+      WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+      wgpuBindGroupLayoutRelease(bg.layout);
+      const bool in_pass = replay->pass != NULL;
+      wvk_replay_end_passes(replay);
+      WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+      WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
+      wgpuComputePassEncoderSetPipeline(pass, dev->uint8_index_pipeline);
+      wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+      const uint32_t groups = (uint32_t)DIV_ROUND_UP(DIV_ROUND_UP(count, 2), 64);
+      wgpuComputePassEncoderDispatchWorkgroups(pass, MIN2(groups, 65535), DIV_ROUND_UP(groups, 65535), 1);
+      wgpuComputePassEncoderEnd(pass);
+      wgpuComputePassEncoderRelease(pass);
+      wgpuBindGroupRelease(group);
+      if (in_pass)
+         wvk_replay_restart_pass(cmd, replay->pass_layer);
+      /* Whole words, as storage bindings of it want: the pad is no index
+       * a draw of these reaches. */
+      st->ib16 = (struct wvk_bound_buffer){ NULL, out, 0, out_bytes, ++dev->temp_serial | (1ull << 62) };
+      st->ib16_valid = true;
+      st->ib16_restart = restart;
+   }
+   *saved = st->ib;
+   st->ib = st->ib16;
+   st->index_type = VK_INDEX_TYPE_UINT16;
+   return true;
+}
+
+static void
+narrow_indices(struct wvk_cmd_buffer *cmd, const struct wvk_bound_buffer *saved)
+{
+   struct wvk_bound_state *st = cmd->replay->state;
+   st->ib = *saved;
+   st->index_type = VK_INDEX_TYPE_UINT8;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -3226,8 +3340,19 @@ bind_index_storage(struct wvk_cmd_buffer *cmd, bool indexed)
    st->index = (struct wvk_driver_buffer){ 0 };
    if (indexed) {
       const struct wvk_bound_buffer *ib = &st->ib;
-      if (!ib->buffer || !ib->mem)
+      if (!ib->buffer)
          return false;
+      /* A buffer of the driver's own, which has no memory: all of it. */
+      if (!ib->mem) {
+         st->index = (struct wvk_driver_buffer){ ib->buffer, ib->serial, 0, ib->offset + ib->size };
+         words[0] = (uint32_t)ib->offset;
+         words[1] = st->index_type == VK_INDEX_TYPE_UINT32 ? 4 : 2;
+         if (memcmp(st->push + WVK_DRIVER_POINT_INDEX, words, sizeof(words))) {
+            memcpy(st->push + WVK_DRIVER_POINT_INDEX, words, sizeof(words));
+            st->push_offset = UINT32_MAX;
+         }
+         return true;
+      }
       const uint64_t whole = ib->mem->buffer_size;
       const uint64_t size = MIN2(whole, pdev->limits.maxStorageBufferBindingSize) & ~3ull;
       const uint64_t offset = MIN2(ib->offset, whole - size) & ~255ull;
@@ -3985,9 +4110,25 @@ draw_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertexCount, uint32_t instanceC
    }
 }
 
+static void draw_elements_widened(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instanceCount,
+                                  uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance, uint32_t draw_id);
+
 static void
 draw_elements(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
               int32_t vertexOffset, uint32_t firstInstance, uint32_t draw_id)
+{
+   if (!indexCount || !instanceCount)
+      return;
+   struct wvk_bound_buffer saved;
+   const bool widened = widen_indices(cmd, &saved);
+   draw_elements_widened(cmd, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance, draw_id);
+   if (widened)
+      narrow_indices(cmd, &saved);
+}
+
+static void
+draw_elements_widened(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
+                      int32_t vertexOffset, uint32_t firstInstance, uint32_t draw_id)
 {
    if (!indexCount || !instanceCount)
       return;
@@ -4195,9 +4336,23 @@ draw_indirect_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_b
    }
 }
 
+static void draw_indirect_widened(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDeviceSize offset,
+                                  uint32_t drawCount, uint32_t stride);
+
 static void
 draw_indirect(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount,
               uint32_t stride)
+{
+   struct wvk_bound_buffer saved;
+   const bool widened = indexed && drawCount && widen_indices(cmd, &saved);
+   draw_indirect_widened(cmd, indexed, buffer, offset, drawCount, stride);
+   if (widened)
+      narrow_indices(cmd, &saved);
+}
+
+static void
+draw_indirect_widened(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDeviceSize offset,
+                      uint32_t drawCount, uint32_t stride)
 {
    if (!drawCount)
       return;
@@ -4226,9 +4381,24 @@ static const char draw_count_wgsl[] =
    "  if (id.x >= count[p.count_word]) { draws[id.x * p.stride_words + 1u] = 0u; }\n"
    "}\n";
 
+static void draw_indirect_count_widened(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer,
+                                        VkDeviceSize offset, VkBuffer count_buffer, VkDeviceSize count_offset,
+                                        uint32_t max_draws, uint32_t stride);
+
 static void
 draw_indirect_count(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDeviceSize offset,
                     VkBuffer count_buffer, VkDeviceSize count_offset, uint32_t max_draws, uint32_t stride)
+{
+   struct wvk_bound_buffer saved;
+   const bool widened = indexed && max_draws && widen_indices(cmd, &saved);
+   draw_indirect_count_widened(cmd, indexed, buffer, offset, count_buffer, count_offset, max_draws, stride);
+   if (widened)
+      narrow_indices(cmd, &saved);
+}
+
+static void
+draw_indirect_count_widened(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDeviceSize offset,
+                            VkBuffer count_buffer, VkDeviceSize count_offset, uint32_t max_draws, uint32_t stride)
 {
    struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
    struct wvk_replay *replay = cmd->replay;

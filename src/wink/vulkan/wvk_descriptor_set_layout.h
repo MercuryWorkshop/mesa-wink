@@ -154,6 +154,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* What a shader does itself when sampling a float texture: an axis
  * clamps to the border or mirrors once, or coordinates are texels. */
 #define WVK_SAMPLER_EMULATE (1u << 17)
+/* A min or max reduction (samplerFilterMinmax), which the shader does. */
+#define WVK_SAMPLER_REDUCE_MIN (1u << 18)
+#define WVK_SAMPLER_REDUCE_MAX (1u << 19)
 /* The largest LOD bias a sampler has, which maxSamplerLodBias reports. */
 #define WVK_MAX_SAMPLER_LOD_BIAS 15.0f
 

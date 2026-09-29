@@ -367,7 +367,7 @@ one_pass(struct wvk_device *dev, struct wvk_replay *replay, WGPUComputePipeline 
 uint32_t
 wvk_replay_stats(const struct wvk_replay *replay)
 {
-   return replay->stats_pool ? replay->stats_pool->vk.pipeline_statistics : 0;
+   return replay->stats_pool ? replay->stats_mask : 0;
 }
 
 void
@@ -420,6 +420,10 @@ begin_stats(struct wvk_replay *replay, struct wvk_query_pool *pool, uint32_t que
    static const uint32_t zero[16] = { 0 };
    replay->stats_pool = pool;
    replay->stats_query = query;
+   /* A primitives generated query counts what clipping has. */
+   replay->stats_mask = pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS
+                           ? pool->vk.pipeline_statistics
+                           : VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT;
    memset(replay->stats_host, 0, sizeof(replay->stats_host));
    replay->stats_buffer = wvk_replay_temp_buffer(replay->dev, replay, sizeof(zero),
                                                  WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc, zero);
@@ -463,7 +467,7 @@ end_stats(struct wvk_cmd_buffer *cmd, struct wvk_query_pool *pool, uint32_t quer
       params[2 * i] = (uint32_t)replay->stats_host[i];
       params[2 * i + 1] = (uint32_t)(replay->stats_host[i] >> 32);
    }
-   params[22] = pool->vk.pipeline_statistics;
+   params[22] = replay->stats_mask;
    params[23] = query * pool->values * 2;
    WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
    if (pipeline && params_buffer) {
@@ -491,7 +495,8 @@ wvk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(wvk_query_pool, pool, queryPool);
    struct wvk_replay *replay = cmd->replay;
-   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
+   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS ||
+       pool->vk.query_type == VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT) {
       begin_stats(replay, pool, query);
       return;
    }
@@ -520,7 +525,8 @@ wvk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, 
    struct wvk_replay *replay = cmd->replay;
    if (query < pool->vk.query_count)
       pool->serial[query] = replay->serial;
-   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
+   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS ||
+       pool->vk.query_type == VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT) {
       end_stats(cmd, pool, query);
       return;
    }

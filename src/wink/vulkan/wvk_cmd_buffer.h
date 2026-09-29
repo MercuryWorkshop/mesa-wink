@@ -163,7 +163,7 @@ struct wvk_replay {
     * host counts of it by each statistic's bit, and the counters shaders
     * and the driver's passes add to on the GPU (WVK_DRIVER_SLOT_STATS). */
    struct wvk_query_pool *stats_pool;
-   uint32_t stats_query;
+   uint32_t stats_query, stats_mask;
    uint64_t stats_host[WVK_STATS];
    WGPUBuffer stats_buffer;
    uint64_t stats_serial;

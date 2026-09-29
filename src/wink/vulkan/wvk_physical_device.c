@@ -116,6 +116,17 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_relaxed_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_sampler_ycbcr_conversion = true,
+      .EXT_sampler_filter_minmax = true,
+      .EXT_index_type_uint8 = true,
+      .EXT_nested_command_buffer = true,
+      .EXT_primitives_generated_query = true,
+      .EXT_shader_replicated_composites = true,
+      .EXT_ycbcr_2plane_444_formats = true,
+      .KHR_index_type_uint8 = true,
+      .KHR_load_store_op_none = true,
+      .KHR_shader_expect_assume = true,
+      .KHR_shader_maximal_reconvergence = true,
+      .KHR_shader_subgroup_uniform_control_flow = true,
       .KHR_separate_depth_stencil_layouts = true,
       .KHR_shader_draw_parameters = true,
       .KHR_16bit_storage = true,
@@ -276,6 +287,27 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
        * every buffer it may be, by the index (wvk_shader.c). */
       .variablePointersStorageBuffer = true,
       .variablePointers = true,
+      /* Min and max reductions, the shader's (wvk_nir_descriptors.c). */
+      .samplerFilterMinmax = true,
+      /* What vtn reads and the rest ignores, or subgroups of one have
+       * already. */
+      .shaderExpectAssume = true,
+      .shaderReplicatedComposites = true,
+      .shaderSubgroupUniformControlFlow = true,
+      .shaderMaximalReconvergence = true,
+      .ycbcr2plane444Formats = true,
+      /* Secondaries are commands of the primary's queue (vk_cmd_queue),
+       * however deep. */
+      /* The primitives clipping has, counted as pipeline statistics are
+       * (wvk_query.c). */
+      /* 8-bit indices widened to 16 by a pass of the driver's
+       * (wvk_cmd_draw.c). */
+      .indexTypeUint8 = true,
+      .primitivesGeneratedQuery = true,
+      .primitivesGeneratedQueryWithRasterizerDiscard = true,
+      .nestedCommandBuffer = true,
+      .nestedCommandBufferRendering = true,
+      .nestedCommandBufferSimultaneousUse = true,
       /* Their stages run as compute within each view's replay of the pass,
        * the view index the driver's data. */
       .multiviewGeometryShader = true,
@@ -374,6 +406,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Logic ops are the fragment shader's (wvk_shader.c), and so as
        * dynamic as any state a variant is compiled for. */
       .extendedDynamicState2LogicOp = true,
+      /* Tessellation reads both at the draw (wvk_cmd_draw.c). */
+      .extendedDynamicState2PatchControlPoints = true,
+      .extendedDynamicState3TessellationDomainOrigin = true,
       .vertexInputDynamicState = true,
       .extendedDynamicState3DepthClampEnable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
       .extendedDynamicState3PolygonMode = true,
@@ -420,7 +455,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .imageView2DOn3DImage = false,
       .multisampleArrayImage = false,
       .mutableComparisonSamplers = true,
-      .pointPolygons = false,
+      /* The corners of the triangles, as points (wvk_cmd_draw.c). */
+      .pointPolygons = true,
       .samplerMipLodBias = true,
       .separateStencilMaskRef = true, /* a draw for each face (wvk_cmd_draw.c) */
       .shaderSampleRateInterpolationFunctions = true, /* by derivatives (wvk_shader.c) */
@@ -572,6 +608,8 @@ get_device_properties(const struct wvk_physical_device *pdev,
       /* WebGPU samplers have no LOD bias. */
       /* Vulkan's minimum. WebGPU samplers have no bias: it is ignored. */
       .maxSamplerLodBias = WVK_MAX_SAMPLER_LOD_BIAS,
+      /* VK_EXT_nested_command_buffer */
+      .maxCommandBufferNestingLevel = UINT32_MAX,
       .maxSamplerAnisotropy = 16.0f,
       .maxViewports = WVK_MAX_VIEWPORTS,
       .maxViewportDimensions = { max_2d, max_2d },
@@ -657,8 +695,8 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
       .independentResolveNone = true,
       .independentResolve = true,
-      .filterMinmaxSingleComponentFormats = false,
-      .filterMinmaxImageComponentMapping = false,
+      .filterMinmaxSingleComponentFormats = true,
+      .filterMinmaxImageComponentMapping = true,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
       .framebufferIntegerColorSampleCounts = VK_SAMPLE_COUNT_1_BIT,
 
@@ -949,6 +987,9 @@ optimal_features(const struct wvk_physical_device *pdev, VkFormat format)
       f |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
       if (caps & WVK_CAP_FILTER)
          f |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+      /* Min and max, of float and depth formats: fetched and compared. */
+      if (!(caps & WVK_CAP_INT))
+         f |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
       if (caps & WVK_CAP_DEPTH)
          f |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
    }

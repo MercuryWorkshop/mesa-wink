@@ -76,6 +76,12 @@ wvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
    desc.lodMaxClamp = CLAMP(info->maxLod, desc.lodMinClamp, 32.0f);
    if (info->compareEnable)
       desc.compare = wvk_compare_function(info->compareOp);
+   /* A min or max reduction is the shader's, of fetched texels: WebGPU's
+    * sampler filters nothing, so that it takes any texture. */
+   if (sampler->vk.reduction_mode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE) {
+      desc.magFilter = desc.minFilter = WGPUFilterMode_Nearest;
+      desc.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+   }
    /* Anisotropy wants every filter linear in WebGPU. */
    if (info->anisotropyEnable && desc.magFilter == WGPUFilterMode_Linear &&
        desc.minFilter == WGPUFilterMode_Linear && desc.mipmapFilter == WGPUMipmapFilterMode_Linear)
@@ -112,6 +118,10 @@ wvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
       flags |= WVK_SAMPLER_MIP_LINEAR;
    if (info->compareEnable)
       flags |= WVK_SAMPLER_COMPARE | (((uint32_t)info->compareOp & 7) << WVK_SAMPLER_COMPARE_SHIFT);
+   if (sampler->vk.reduction_mode == VK_SAMPLER_REDUCTION_MODE_MIN)
+      flags |= WVK_SAMPLER_REDUCE_MIN;
+   else if (sampler->vk.reduction_mode == VK_SAMPLER_REDUCTION_MODE_MAX)
+      flags |= WVK_SAMPLER_REDUCE_MAX;
    sampler->meta[WVK_META_SAMPLER_FLAGS] = flags;
    memcpy(&sampler->meta[WVK_META_SAMPLER_BIAS], &info->mipLodBias, 4);
    memcpy(&sampler->meta[WVK_META_SAMPLER_MIN_LOD], &info->minLod, 4);

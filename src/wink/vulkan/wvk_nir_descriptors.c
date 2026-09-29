@@ -831,9 +831,169 @@ lower_query_lod(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32
    return true;
 }
 
+static nir_def *wrap_texel(nir_builder *b, nir_def *t, nir_def *extent, nir_def *mode, nir_def **outside);
+
+/* A sample of a sampler that reduces by the minimum or maximum
+ * (samplerFilterMinmax), which WebGPU's samplers do not: the texels of the
+ * filter's footprint of weight not zero -- at the level the LOD selects,
+ * or the two, of linear mipmaps -- fetched, each wrapped as the sampler
+ * says or the border, and their least or greatest, component by
+ * component. */
+static nir_def *
+reduce_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot, nir_def *flags)
+{
+   const int texture_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   const unsigned spatial = tex->coord_components - (tex->is_array ? 1 : 0);
+   nir_def *lambda = sample_lambda(b, meta, tex, group, slot, coord, spatial);
+   nir_def *is_max = flag(b, flags, WVK_SAMPLER_REDUCE_MAX);
+   nir_def *zero = nir_imm_float(b, 0.0f);
+   nir_def *minified = nir_flt(b, zero, lambda);
+   nir_def *linear = nir_bcsel(b, minified, flag(b, flags, WVK_SAMPLER_MIN_LINEAR),
+                               flag(b, flags, WVK_SAMPLER_MAG_LINEAR));
+   nir_def *mip_linear = nir_iand(b, minified, flag(b, flags, WVK_SAMPLER_MIP_LINEAR));
+   nir_def *last = nir_iadd_imm(b, &texture_query(b, tex, nir_texop_query_levels, NULL)->def, -1);
+   nir_def *l = nir_fmax(b, lambda, zero);
+   nir_def *first = nir_f2i32(b, nir_bcsel(b, mip_linear, nir_ffloor(b, l), nir_fround_even(b, l)));
+   first = nir_bcsel(b, minified, nir_imin(b, first, last), nir_imm_int(b, 0));
+   nir_def *levels[2] = { first, nir_imin(b, nir_iadd_imm(b, first, 1), last) };
+   nir_def *counts[2] = { nir_imm_true(b), nir_iand(b, mip_linear, nir_fneu_imm(b, nir_ffract(b, l), 0.0)) };
+
+   nir_def *border[4];
+   border_texel(b, meta, tex, group, slot, true, border);
+   nir_def *border_value = nir_vec(b, border, 4);
+   nir_def *inf = nir_imm_float(b, INFINITY);
+   nir_def *result = nir_bcsel(b, is_max, nir_fneg(b, nir_vec4(b, inf, inf, inf, inf)), nir_vec4(b, inf, inf, inf, inf));
+   for (unsigned k = 0; k < 2; ++k) {
+      nir_def *size = &texture_query(b, tex, nir_texop_txs, levels[k])->def;
+      /* Each axis's first texel, and its second where the filter is
+       * linear and it weighs anything. */
+      nir_def *texel[3][2], *out[3][2], *second[3];
+      for (unsigned i = 0; i < spatial; ++i) {
+         nir_def *extent = nir_channel(b, size, i);
+         nir_def *c = nir_channel(b, coord, i);
+         nir_def *u = nir_bcsel(b, flag(b, flags, WVK_SAMPLER_UNNORMALIZED), c, nir_fmul(b, c, nir_i2f32(b, extent)));
+         nir_def *shifted = nir_fadd_imm(b, u, -0.5);
+         nir_def *t0 = nir_f2i32(b, nir_ffloor(b, nir_bcsel(b, linear, shifted, u)));
+         second[i] = nir_iand(b, linear, nir_fneu_imm(b, nir_ffract(b, shifted), 0.0));
+         if (offset_idx >= 0 && i < tex->src[offset_idx].src.ssa->num_components)
+            t0 = nir_iadd(b, t0, nir_channel(b, tex->src[offset_idx].src.ssa, i));
+         for (unsigned j = 0; j < 2; ++j) {
+            out[i][j] = nir_imm_false(b);
+            texel[i][j] = wrap_texel(b, nir_iadd_imm(b, t0, j), extent, address_mode(b, flags, i), &out[i][j]);
+         }
+      }
+      nir_def *layer = NULL;
+      if (tex->is_array)
+         layer = nir_imin(b, nir_imax(b, nir_f2i32(b, nir_fround_even(b, nir_channel(b, coord, spatial))),
+                                      nir_imm_int(b, 0)),
+                          nir_iadd_imm(b, nir_channel(b, size, spatial), -1));
+      for (unsigned q = 0; q < (1u << spatial); ++q) {
+         nir_def *comps[4];
+         nir_def *counted = counts[k], *outside = nir_imm_false(b);
+         for (unsigned i = 0; i < spatial; ++i) {
+            const unsigned j = (q >> i) & 1;
+            comps[i] = texel[i][j];
+            outside = nir_ior(b, outside, out[i][j]);
+            if (j)
+               counted = nir_iand(b, counted, second[i]);
+         }
+         if (layer)
+            comps[spatial] = layer;
+         nir_tex_instr *txf = nir_tex_instr_create(b->shader, 3);
+         txf->op = nir_texop_txf;
+         txf->sampler_dim = tex->sampler_dim;
+         txf->is_array = tex->is_array;
+         txf->dest_type = tex->dest_type;
+         txf->coord_components = tex->coord_components;
+         txf->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, tex->src[texture_idx].src.ssa);
+         txf->src[1] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_vec(b, comps, tex->coord_components));
+         txf->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, levels[k]);
+         nir_def_init(&txf->instr, &txf->def, 4, 32);
+         nir_builder_instr_insert(b, &txf->instr);
+         nir_def *value = nir_bcsel(b, outside, border_value, &txf->def);
+         nir_def *reduced = nir_bcsel(b, is_max, nir_fmax(b, result, value), nir_fmin(b, result, value));
+         result = nir_bcsel(b, counted, reduced, result);
+      }
+   }
+   return nir_trim_vector(b, result, tex->def.num_components);
+}
+
+/* A cube's reduction: linear, the 2x2 texels its base level's gathers
+ * have, across edges as the hardware finds them -- which is the footprint
+ * of a sample of level 0; nearest, the texel WebGPU's nearest sampler has
+ * already. */
+static nir_def *
+reduce_cube_sample(nir_builder *b, nir_tex_instr *tex, nir_def *flags)
+{
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   nir_def *is_max = flag(b, flags, WVK_SAMPLER_REDUCE_MAX);
+   nir_def *comps[4];
+   for (unsigned c = 0; c < 4; ++c) {
+      nir_tex_instr *tg4 = nir_tex_instr_create(b->shader, 3);
+      tg4->op = nir_texop_tg4;
+      tg4->sampler_dim = GLSL_SAMPLER_DIM_CUBE;
+      tg4->is_array = tex->is_array;
+      tg4->dest_type = tex->dest_type;
+      tg4->coord_components = tex->coord_components;
+      tg4->component = c;
+      tg4->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref,
+                                        tex->src[nir_tex_instr_src_index(tex, nir_tex_src_texture_deref)].src.ssa);
+      tg4->src[1] = nir_tex_src_for_ssa(nir_tex_src_sampler_deref,
+                                        tex->src[nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref)].src.ssa);
+      tg4->src[2] = nir_tex_src_for_ssa(nir_tex_src_coord, tex->src[coord_idx].src.ssa);
+      nir_def_init(&tg4->instr, &tg4->def, 4, 32);
+      nir_builder_instr_insert(b, &tg4->instr);
+      nir_def *v = &tg4->def;
+      nir_def *lo = nir_fmin(b, nir_fmin(b, nir_channel(b, v, 0), nir_channel(b, v, 1)),
+                             nir_fmin(b, nir_channel(b, v, 2), nir_channel(b, v, 3)));
+      nir_def *hi = nir_fmax(b, nir_fmax(b, nir_channel(b, v, 0), nir_channel(b, v, 1)),
+                             nir_fmax(b, nir_channel(b, v, 2), nir_channel(b, v, 3)));
+      comps[c] = nir_bcsel(b, is_max, hi, lo);
+   }
+   return nir_trim_vector(b, nir_vec(b, comps, 4), tex->def.num_components);
+}
+
+/* Around a float sample, where its sampler reduces: the reduction's result
+ * instead of the average WebGPU filters to. */
+static void
+lower_reduction(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
+{
+   if (tex->is_shadow || tex->def.bit_size != 32 || nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref) < 0 ||
+       nir_tex_instr_src_index(tex, nir_tex_src_texture_deref) < 0 || nir_tex_instr_src_index(tex, nir_tex_src_coord) < 0 ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl && tex->op != nir_texop_txd))
+      return;
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *flags = sampler_word(b, meta, group, slot, WVK_META_SAMPLER_FLAGS);
+   nir_def *reduces = nir_test_mask(b, flags, WVK_SAMPLER_REDUCE_MIN | WVK_SAMPLER_REDUCE_MAX);
+   const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   /* A cube's nearest texel is the sample's own. */
+   if (cube) {
+      const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+      nir_def *lambda = sample_lambda(b, meta, tex, group, slot, tex->src[coord_idx].src.ssa, 3);
+      nir_def *linear = nir_bcsel(b, nir_flt(b, nir_imm_float(b, 0.0f), lambda),
+                                  flag(b, flags, WVK_SAMPLER_MIN_LINEAR), flag(b, flags, WVK_SAMPLER_MAG_LINEAR));
+      reduces = nir_iand(b, reduces, linear);
+   }
+   nir_push_if(b, reduces);
+   nir_def *reduced = cube ? reduce_cube_sample(b, tex, flags)
+                           : reduce_sample(b, meta, tex, group, slot, flags);
+   nir_pop_if(b, NULL);
+   reduced = nir_if_phi(b, reduced, nir_undef(b, reduced->num_components, 32));
+   b->cursor = nir_after_instr(&tex->instr);
+   nir_def *placeholder = nir_undef(b, tex->def.num_components, tex->def.bit_size);
+   nir_def_rewrite_uses(&tex->def, placeholder);
+   nir_def *value = nir_bcsel(b, reduces, reduced, &tex->def);
+   nir_def_rewrite_uses(placeholder, value);
+   nir_instr_remove(nir_def_instr(placeholder));
+}
+
 static bool
 lower_float_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
 {
+   lower_reduction(b, meta, tex, group, slot);
    b->cursor = nir_before_instr(&tex->instr);
    nir_def *flags = sampler_word(b, meta, group, slot, WVK_META_SAMPLER_FLAGS);
    /* What the emulation below needs of the LOD, before the bias is in. */
