@@ -45,7 +45,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 16
+#define WVK_SHADER_BINARY_VERSION 17
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -62,7 +62,16 @@ struct wvk_shader_binding {
  * with other state -- a fragment shader it was not linked with, vertex
  * input it did not know, multisampling set at the draw -- draws a variant
  * compiled for that (wvk_shader_draw_variant). */
-/* The largest point drawn as a quad, in pixels (largePoints). */
+/* What a draw's primitives are drawn as: themselves, or quads of points
+ * or of wide lines (wvk_shader_draw_variant). */
+enum wvk_draw_shape {
+   WVK_DRAW_PRIMITIVES,
+   WVK_DRAW_POINTS,
+   WVK_DRAW_LINES,
+};
+
+/* The largest point drawn as a quad, in pixels (largePoints), and line. */
+#define WVK_MAX_LINE_WIDTH 64.0f
 #define WVK_MAX_POINT_SIZE 256.0f
 
 /* Storage images without a format a shader is compiled for the views of. */
@@ -82,13 +91,18 @@ struct wvk_shader_key {
    uint8_t no_depth;
    /* Points drawn as quads (largePoints): the vertex shader making six
     * vertices a point, the fragment shader reading gl_PointCoord from the
-    * varying at location point_coord - 1 (0: none) and facing front. */
+    * varying at location point_coord - 1 (0: none) and facing front, as it
+    * does for wide lines too. */
    uint8_t points, point_coord;
    /* Vertex: the vertex shader as a compute shader, an invocation a vertex
     * of the draw, doing its storage writes, which WebGPU's vertex shaders
     * cannot (vertexPipelineStoresAndAtomics; wvk_cmd_draw.c runs it before
-    * the draw, whose vertex shader has them stripped). */
+    * the draw, whose vertex shader has them stripped); 2 for one that
+    * only captures the vertices' clip positions, which wide lines read. */
    uint8_t runs;
+   /* Vertex: wide lines drawn as quads, six vertices a segment (wideLines;
+    * key.runs 2 capturing the positions they read). */
+   uint8_t lines;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
@@ -213,14 +227,16 @@ extern const struct vk_device_shader_ops wvk_device_shader_ops;
  * either for the records of both its and `other`'s layouts, and the
  * formats of the views bound where it has storage images without one
  * (`image_formats`, as for wvk_shader_dispatch_variant); and for points
- * drawn as quads. Or with `runs`, the vertex shader's compute shader
- * doing its storage writes (key.runs). The shader itself
+ * or lines drawn as quads. Or with `runs`, the vertex shader's compute
+ * shader doing its storage writes or capturing positions (key.runs). The
+ * shader itself
  * where it was compiled for that, or a variant it could not compile. */
 struct wvk_shader *wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader,
                                            const struct wvk_shader *other,
                                            const struct vk_dynamic_graphics_state *dyn, unsigned samples,
                                            bool has_depth, const VkFormat *color_formats,
-                                           const VkFormat *image_formats, bool points, bool runs);
+                                           const VkFormat *image_formats, enum wvk_draw_shape shape,
+                                           unsigned runs);
 
 /* The shader, or its variant for the formats of the views bound where it
  * has storage images without one (wvk_shader::unformatted; 0 for one not

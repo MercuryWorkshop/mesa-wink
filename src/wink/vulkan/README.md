@@ -122,6 +122,13 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   fragment shader as a varying, and it faces front. Not for attributes of
   more vertex buffers than the pulled ones (4), nor for indirect draws in
   memory the host has no copy of: those are a pixel each, and say so.
+- **Wide lines** (wideLines) are quads too, a parallelogram across the
+  minor axis, as Vulkan's non-strict lines may be: the vertex shader run
+  as compute captures every vertex's clip position first, then a triangle
+  list of six vertices a segment runs the vertex shader for each corner's
+  end and moves it by half the width, up or down where the line runs more
+  across than up, else sideways, which the other end's captured position
+  says. Segments across a restart go. The same limits as for points.
 - **A vertex shader's storage writes** (vertexPipelineStoresAndAtomics)
   are a compute shader's: WebGPU's vertex shaders write no storage. A
   draw whose vertex shader writes buffers or images first dispatches the

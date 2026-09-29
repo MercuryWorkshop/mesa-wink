@@ -206,6 +206,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Points of the size the vertex shader gives them: quads, a variant
        * of the shader moving six vertices to a point's corners. */
       .largePoints = true,
+      /* Lines of the width the draw has: quads the same way, the vertex
+       * shader run as compute giving the ends' positions. */
+      .wideLines = true,
       /* Gathers at several offsets, or one not constant (wvk_shader.c). */
       .shaderImageGatherExtended = true,
       /* Explicit LODs raised, gradients scaled (wvk_nir_descriptors.c). */
@@ -567,9 +570,11 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .discreteQueuePriorities = 2,
       /* Points are quads of any size (expand_points in wvk_shader.c). */
       .pointSizeRange = { 1.0f, WVK_MAX_POINT_SIZE },
-      .lineWidthRange = { 1.0f, 1.0f },
+      /* And lines quads of any width, a parallelogram across the minor
+       * axis (expand_lines). */
+      .lineWidthRange = { 1.0f, WVK_MAX_LINE_WIDTH },
       .pointSizeGranularity = 0.125f,
-      .lineWidthGranularity = 0.0f,
+      .lineWidthGranularity = 0.125f,
       .strictLines = false,
       .standardSampleLocations = true,
       /* WebGPU's own copy rules: rows of 256 bytes. */
@@ -651,7 +656,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .depthStencilSwizzleOneSupport = true,
       .polygonModePointSize = false,
       .nonStrictSinglePixelWideLinesUseParallelogram = false,
-      .nonStrictWideLinesUseParallelogram = false,
+      .nonStrictWideLinesUseParallelogram = true,
 
       /* VK_EXT_extended_dynamic_state3: a pipeline is of its draw's
        * topology, whichever it is. */

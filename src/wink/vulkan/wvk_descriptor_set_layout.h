@@ -65,7 +65,7 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
  * share with set 3 if a pipeline layout has one. */
 #define WVK_DRIVER_GROUP 3
 /* Below WebGPU's thousand bindings a group, with room for all of them. */
-#define WVK_DRIVER_SLOT_BASE 984
+#define WVK_DRIVER_SLOT_BASE 976
 #define WVK_DRIVER_SLOT_PUSH (WVK_DRIVER_SLOT_BASE + 0)
 /* The draw's parameters (BaseVertex, BaseInstance): the push buffer again
  * for a direct draw, the indirect buffer for an indirect one. */
@@ -84,6 +84,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* The index buffer of an indexed draw of points drawn as quads, which the
  * vertex shader reads its point's index from (wvk_shader.c). */
 #define WVK_DRIVER_SLOT_INDEX (WVK_DRIVER_SLOT_DEPTH_BOUNDS + 1)
+/* What a vertex shader run as compute captures of the draw's vertices,
+ * their clip positions, which a draw of wide lines reads (wvk_shader.c). */
+#define WVK_DRIVER_SLOT_CAPTURE (WVK_DRIVER_SLOT_INDEX + 1)
 
 #define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
 
@@ -171,7 +174,9 @@ enum wvk_texel_type {
  *     binding, in bytes, and their size, 0 for a draw without, 2 uints;
  *   - for a vertex shader's storage writes, done by it as compute before
  *     the draw: the draw's vertices an instance, its vertices in all, its
- *     first vertex or index, and whether it restarts primitives, 4 uints. */
+ *     first vertex or index, and whether it restarts primitives, 4 uints;
+ *   - for wide lines drawn as quads, their width, a float, and whether
+ *     they are a strip, a uint. */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
@@ -186,7 +191,8 @@ enum wvk_texel_type {
 #define WVK_DRIVER_POINT_SCALE (WVK_DRIVER_DATA_OFFSET + 120)
 #define WVK_DRIVER_POINT_INDEX (WVK_DRIVER_DATA_OFFSET + 128)
 #define WVK_DRIVER_VERTEX_RUN (WVK_DRIVER_DATA_OFFSET + 144)
-#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 160)
+#define WVK_DRIVER_LINE (WVK_DRIVER_DATA_OFFSET + 160)
+#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 176)
 #define WVK_META_OFFSET WVK_PUSH_DATA_SIZE
 /* How much of the push buffer the push binding shows: its data, and as
  * many records as that leaves room for. */
@@ -194,13 +200,14 @@ enum wvk_texel_type {
 
 /* What a group-3 bind group's driver bindings are bound to: the push
  * buffer's generation, and memory serials (0: none) for the draw binding
- * (none: the push buffer), the pulled vertex buffers and a point draw's
- * index buffer. */
+ * (none: the push buffer), the pulled vertex buffers, the index buffer a
+ * vertex shader reads, and the vertices it captures. */
 struct wvk_driver_key {
    uint64_t push_generation;
    uint64_t draw;
    uint64_t vertex[WVK_MAX_PULLED_BINDINGS];
    uint64_t index;
+   uint64_t capture;
 };
 
 static inline bool
