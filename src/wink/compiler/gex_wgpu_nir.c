@@ -627,7 +627,8 @@ gex_wgpu_lower_mul_high_instr(nir_builder *b, nir_instr *instr, void *data)
 /* ntv's shared block is an array of uints, which Tint makes atomic<u32>:
  * SMin and SMax on it come out as WGSL's atomicMin and atomicMax on a
  * u32, which compare unsigned. So a signed minimum or maximum is swapped
- * in until nothing came between. */
+ * in until nothing came between; and so is a float sum, minimum or
+ * maximum, which WGSL has no atomics of at all. */
 static bool
 gex_wgpu_lower_signed_shared_atomic(nir_builder *b, nir_intrinsic_instr *intr,
                                     void *data)
@@ -636,7 +637,9 @@ gex_wgpu_lower_signed_shared_atomic(nir_builder *b, nir_intrinsic_instr *intr,
    if (intr->intrinsic != nir_intrinsic_shared_atomic)
       return false;
    const nir_atomic_op op = nir_intrinsic_atomic_op(intr);
-   if ((op != nir_atomic_op_imin && op != nir_atomic_op_imax) ||
+   if ((op != nir_atomic_op_imin && op != nir_atomic_op_imax &&
+        op != nir_atomic_op_fadd && op != nir_atomic_op_fmin &&
+        op != nir_atomic_op_fmax) ||
        intr->def.bit_size != 32)
       return false;
    b->cursor = nir_before_instr(&intr->instr);
@@ -652,8 +655,11 @@ gex_wgpu_lower_signed_shared_atomic(nir_builder *b, nir_intrinsic_instr *intr,
    nir_loop *loop = nir_push_loop(b);
    {
       nir_def *cur = nir_load_var(b, old);
-      nir_def *want = op == nir_atomic_op_imin ? nir_imin(b, cur, value)
-                                               : nir_imax(b, cur, value);
+      nir_def *want = op == nir_atomic_op_imin   ? nir_imin(b, cur, value)
+                      : op == nir_atomic_op_imax ? nir_imax(b, cur, value)
+                      : op == nir_atomic_op_fadd ? nir_fadd(b, cur, value)
+                      : op == nir_atomic_op_fmin ? nir_fmin(b, cur, value)
+                                                 : nir_fmax(b, cur, value);
       nir_def *prev = nir_shared_atomic_swap(b, 32, offset, cur, want,
                                              .base = base,
                                              .atomic_op = nir_atomic_op_cmpxchg);

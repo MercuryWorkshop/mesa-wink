@@ -260,9 +260,21 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       p_atomic_inc(&dev->tracked_images);
    for (uint32_t l = 0; l < ARRAY_SIZE(image->valid); ++l)
       image->valid[l] = ~0u;
+   /* But of one made zero (zeroInitializeDeviceMemory): its texture's
+    * blocks of zeros, which are no shadow's zeros until made into it. */
+   if (pCreateInfo->initialLayout == VK_IMAGE_LAYOUT_ZERO_INITIALIZED_EXT && image->shadow) {
+      for (uint32_t l = 0; l < ARRAY_SIZE(image->valid); ++l)
+         image->valid[l] = BITFIELD_BIT(WVK_IMAGE_TEXTURE);
+   }
 
-   /* Texels atomics can be done on, as a buffer too. */
-   if ((wusage & WGPUTextureUsage_StorageBinding) && wvk_format_has_atomics(pCreateInfo->format)) {
+   /* Texels atomics can be done on, as a buffer too: of floats where the
+    * device does atomics of them, or a view could be of integers. */
+   const struct vk_features *features = &dev->vk.enabled_features;
+   const bool float_atomics = features->shaderImageFloat32Atomics || features->shaderImageFloat32AtomicAdd ||
+                              features->shaderImageFloat32AtomicMinMax ||
+                              (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT);
+   if ((wusage & WGPUTextureUsage_StorageBinding) && wvk_format_has_atomics(pCreateInfo->format) &&
+       (pCreateInfo->format != VK_FORMAT_R32_SFLOAT || float_atomics)) {
       uint64_t size = 0;
       for (uint32_t l = 0; l < image->vk.mip_levels && l < ARRAY_SIZE(image->atomic_offset); ++l) {
          const VkExtent3D e = vk_image_mip_level_extent(&image->vk, l);

@@ -213,7 +213,8 @@ enum wvk_texel_type {
  *   - the depth bounds, 2 floats, which the fragment shader tests;
  *   - for points drawn as quads, 1 over the viewport's width and height,
  *     2 floats; and where an indexed draw's indices start in the index
- *     binding, in bytes, and their size, 0 for a draw without, 2 uints;
+ *     binding, in bytes, their size, 0 for a draw without, and whether
+ *     its primitives restart, 3 uints;
  *   - for a vertex shader's storage writes, done by it as compute before
  *     the draw: the draw's vertices an instance, its vertices in all, its
  *     first vertex or index, and whether it restarts primitives, 4 uints;

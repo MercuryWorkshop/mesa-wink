@@ -119,6 +119,11 @@ struct wvk_replay {
     * triangles of a fan, or the edges or corners of each where the polygon
     * mode is lines or points (wvk_cmd_draw.c); else Undefined. */
    WGPUPrimitiveTopology list_topology;
+   /* A draw of a list whose primitives restart, drawn of the list the
+    * driver made of its whole ones (wvk_cmd_draw.c, LIST_COMPACT): that,
+    * and where in it the indirect draw of them is; else NULL. */
+   WGPUBuffer restart_list;
+   uint64_t restart_args;
    /* A draw of points as quads, six vertices a point, which the vertex
     * shader moves to its corners (largePoints; wvk_shader.c). */
    bool draw_points;

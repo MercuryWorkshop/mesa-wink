@@ -2860,12 +2860,16 @@ enum list_mode {
    LIST_CORNERS,
    /* The lines of a topology with adjacency. */
    LIST_SEGMENTS,
+   /* A list's whole primitives between restarts, as they are
+    * (primitiveTopologyListRestart): WebGPU restarts strips only. */
+   LIST_COMPACT,
 };
 
 static const char triangles_wgsl[] =
    "struct P { first: u32, wide: u32, count: u32, restart: u32,\n"
    "           topology: u32, mode: u32, indexed: u32, triangles: u32,\n"
-   "           last: u32, pad0: u32, pad1: u32, pad2: u32 }\n"
+   "           last: u32, counted: u32, instances: u32, base_vertex: u32,\n"
+   "           first_instance: u32, pad0: u32, pad1: u32, pad2: u32 }\n"
    "@group(0) @binding(0) var<storage, read> src: array<u32>;\n"
    "@group(0) @binding(1) var<storage, read_write> dst: array<u32>;\n"
    "@group(0) @binding(2) var<uniform> p: P;\n"
@@ -2970,9 +2974,56 @@ static const char triangles_wgsl[] =
    "    if (p.mode == 3u) { dst[out * 2u] = 0u; dst[out * 2u + 1u] = 0u; } else { emit(out, vec3u(0u)); }\n"
    "  }\n"
    "}\n"
+   /* A list's primitive's vertices: a point's, a line's, a triangle's, or
+    * with adjacency a line's or a triangle's. And the indices the driver's
+    * list has of each. */
+   "fn vertices() -> u32 {\n"
+   "  if (p.topology == 9u) { return 1u; }\n"
+   "  if (p.topology == 7u) { return 2u; }\n"
+   "  if (p.topology == 3u) { return 4u; }\n"
+   "  if (p.topology == 5u) { return 6u; }\n"
+   "  return 3u;\n"
+   "}\n"
+   "fn per() -> u32 {\n"
+   "  if (p.mode == 1u) { return 6u; }\n"
+   "  if (p.mode == 3u) { return 2u; }\n"
+   "  return 3u;\n"
+   "}\n"
+   /* An indexed indirect draw of `n` of the list's indices, after its
+    * `at` of them. */
+   "fn draw(at: u32, n: u32) {\n"
+   "  dst[at] = n; dst[at + 1u] = p.instances; dst[at + 2u] = 0u;\n"
+   "  dst[at + 3u] = p.base_vertex; dst[at + 4u] = p.first_instance;\n"
+   "}\n"
+   /* A list that restarts: one invocation goes through it, a primitive
+    * begun again after each restart index, the whole ones written. */
+   "fn compacting() {\n"
+   "  let k = vertices();\n"
+   "  var v: array<u32, 6>;\n"
+   "  var n = 0u;\n"
+   "  var out = 0u;\n"
+   "  for (var i = 0u; i < p.count; i++) {\n"
+   "    let x = index(i);\n"
+   "    if (x == p.restart) { n = 0u; continue; }\n"
+   "    v[n] = x;\n"
+   "    n++;\n"
+   "    if (n == k) {\n"
+   "      for (var j = 0u; j < k; j++) { dst[out + j] = v[j]; }\n"
+   "      out += k;\n"
+   "      n = 0u;\n"
+   "    }\n"
+   "  }\n"
+   "  let total = p.triangles * k;\n"
+   "  for (var j = out; j < total; j++) { dst[j] = 0xffffffffu; }\n"
+   "  draw(total, out);\n"
+   "}\n"
    "@compute @workgroup_size(64)\n"
    "fn main(@builtin(global_invocation_id) id: vec3u) {\n"
    "  let t = id.x + id.y * 65535u * 64u;\n"
+   "  if (p.mode == 4u) {\n"
+   "    if (t == 0u) { compacting(); }\n"
+   "    return;\n"
+   "  }\n"
    "  if (p.restart != 0u && (p.topology == 1u || p.topology == 2u)) {\n"
    "    if (t == 0u) { restarting(); }\n"
    "    return;\n"
@@ -2981,7 +3032,14 @@ static const char triangles_wgsl[] =
    "    if (t == 0u) { restarting_adjacent(); }\n"
    "    return;\n"
    "  }\n"
-   "  if (t >= p.triangles) { return; }\n"
+   /* Of a list made so: its whole primitives, which its draw has, and a
+    * draw of as many of this one's. */
+   "  var whole = p.triangles;\n"
+   "  if (p.counted != 0u) {\n"
+   "    whole = src[p.first / 4u + p.count] / vertices();\n"
+   "    if (t == 0u) { draw(p.triangles * per(), whole * per()); }\n"
+   "  }\n"
+   "  if (t >= whole) { return; }\n"
    "  if (p.mode == 3u) {\n"
    "    let e = ends(t);\n"
    "    dst[t * 2u] = index(e.x); dst[t * 2u + 1u] = index(e.y);\n"
@@ -2997,6 +3055,7 @@ static uint32_t
 list_triangles(VkPrimitiveTopology topology, uint32_t count)
 {
    switch (topology) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return count;
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: return count / 3;
    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return count / 2;
    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return count >= 2 ? count - 1 : 0;
@@ -3008,12 +3067,28 @@ list_triangles(VkPrimitiveTopology topology, uint32_t count)
    }
 }
 
+/* The vertices of a primitive of a list, for LIST_COMPACT. */
+static uint32_t
+list_vertices(VkPrimitiveTopology topology)
+{
+   switch (topology) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return 1;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return 2;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY: return 4;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY: return 6;
+   default: return 3;
+   }
+}
+
 /* A list of a draw's triangles, their edges or their corners, from the
  * bound index buffer's indices from `first` on, or of the vertices in
- * order: made before the pass goes on. */
+ * order: made before the pass goes on. Of a list the driver made of one
+ * that restarts (LIST_COMPACT, or the bound index buffer one), an indexed
+ * indirect draw of its `draw` -- instances, base vertex, first instance --
+ * after it, at `*args`; else that is UINT64_MAX. */
 static WGPUBuffer
 triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t count, enum list_mode mode,
-                 bool last, uint32_t *index_count)
+                 bool last, const uint32_t draw[3], uint32_t *index_count, uint64_t *args)
 {
    struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
    struct wvk_replay *replay = cmd->replay;
@@ -3021,6 +3096,7 @@ triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    const VkPrimitiveTopology topology = dyn->ia.primitive_topology;
    const uint32_t triangles = list_triangles(topology, count);
+   *args = UINT64_MAX;
    if (!triangles)
       return NULL;
    simple_mtx_lock(&dev->cache_lock);
@@ -3042,15 +3118,24 @@ triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    if (!dev->fan_pipeline || (indexed && !ib->buffer))
       return NULL;
    const bool wide = st->index_type == VK_INDEX_TYPE_UINT32;
+   /* Of the driver's list of a list that restarts: the draw after it too. */
+   const bool counted = indexed && replay->restart_list && ib->buffer == replay->restart_list;
    uint64_t start = 0, base = 0, end = 4;
    if (indexed) {
       start = ib->offset + (uint64_t)first * (wide ? 4 : 2);
       base = start & ~255ull;
-      end = start + (uint64_t)count * (wide ? 4 : 2);
+      end = start + (uint64_t)count * (wide ? 4 : 2) + (counted ? 20 : 0);
    }
-   const uint32_t per = mode == LIST_EDGES ? 6 : mode == LIST_SEGMENTS ? 2 : 3;
+   const uint32_t per = mode == LIST_EDGES      ? 6
+                        : mode == LIST_SEGMENTS ? 2
+                        : mode == LIST_COMPACT  ? list_vertices(topology)
+                                                : 3;
    const uint64_t out_bytes = (uint64_t)triangles * per * 4;
-   WGPUBuffer out = wvk_replay_temp_buffer(dev, replay, out_bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_Index, NULL);
+   const bool drawn = counted || mode == LIST_COMPACT;
+   WGPUBuffer out = wvk_replay_temp_buffer(dev, replay, out_bytes + (drawn ? 20 : 0),
+                                           WGPUBufferUsage_Storage | WGPUBufferUsage_Index |
+                                              (drawn ? WGPUBufferUsage_Indirect : 0),
+                                           NULL);
    /* The restart index, or 0 for none: no index is 0 and restarts. */
    const uint32_t restart = indexed && dyn->ia.primitive_restart_enable ? (wide ? 0xffffffffu : 0xffffu) : 0;
    const uint32_t kind = topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST                    ? 0
@@ -3061,8 +3146,12 @@ triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
                          : topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY  ? 6
                          : topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST                      ? 7
                          : topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP                     ? 8
+                         : topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST                     ? 9
                                                                                            : 2;
-   const uint32_t params[12] = { (uint32_t)(start - base), wide, count, restart, kind, mode, indexed, triangles, last };
+   const uint32_t params[16] = {
+      (uint32_t)(start - base), wide, count, restart, kind, mode, indexed, triangles, last, counted,
+      draw ? draw[0] : 0, draw ? draw[1] : 0, draw ? draw[2] : 0,
+   };
    WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
    if (!out || !params_buffer)
       return NULL;
@@ -3071,7 +3160,7 @@ triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    const WGPUBindGroupEntry entries[] = {
       { .binding = 0, .buffer = indexed ? ib->buffer : dev->null_buffer, .offset = base,
         .size = indexed ? align64(end - base, 4) : 256 },
-      { .binding = 1, .buffer = out, .offset = 0, .size = out_bytes },
+      { .binding = 1, .buffer = out, .offset = 0, .size = out_bytes + (drawn ? 20 : 0) },
       { .binding = 2, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
    };
    WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
@@ -3086,7 +3175,7 @@ triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
    wgpuComputePassEncoderSetPipeline(pass, dev->fan_pipeline);
    wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
-   const uint32_t groups = DIV_ROUND_UP(triangles, 64);
+   const uint32_t groups = mode == LIST_COMPACT ? 1 : DIV_ROUND_UP(triangles, 64);
    wgpuComputePassEncoderDispatchWorkgroups(pass, MIN2(groups, 65535), DIV_ROUND_UP(groups, 65535), 1);
    wgpuComputePassEncoderEnd(pass);
    wgpuComputePassEncoderRelease(pass);
@@ -3094,6 +3183,8 @@ triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    if (in_pass)
       wvk_replay_restart_pass(cmd, replay->pass_layer);
    *index_count = triangles * per;
+   if (drawn)
+      *args = out_bytes;
    return out;
 }
 
@@ -3114,11 +3205,12 @@ predicated_draw(struct wvk_cmd_buffer *cmd, const uint32_t *args, uint32_t words
 }
 
 /* A draw of a list the driver made, `indices` its, as the bound index
- * buffer for the draw. */
+ * buffer for the draw: of `index_count` indices, or where `args` is not
+ * UINT64_MAX, as many as the indirect draw there in `indices` has. */
 static void
 draw_list_at(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint64_t offset, uint32_t index_count,
              WGPUPrimitiveTopology topology, uint32_t instances, int32_t base_vertex, uint32_t first_instance,
-             bool indexed, uint32_t draw_id)
+             bool indexed, uint32_t draw_id, uint64_t args)
 {
    struct wvk_replay *replay = cmd->replay;
    struct wvk_bound_state *st = replay->state;
@@ -3127,14 +3219,25 @@ draw_list_at(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint64_t offset, ui
    st->ib = (struct wvk_bound_buffer){ NULL, indices, offset, (uint64_t)index_count * 4 };
    st->index_type = VK_INDEX_TYPE_UINT32;
    replay->list_topology = topology;
-   WGPUBuffer predicated =
-      predicated_draw(cmd, (const uint32_t[5]){ index_count, instances, 0, (uint32_t)base_vertex, first_instance }, 5);
+   WGPUBuffer predicated = NULL;
+   if (args == UINT64_MAX) {
+      predicated = predicated_draw(
+         cmd, (const uint32_t[5]){ index_count, instances, 0, (uint32_t)base_vertex, first_instance }, 5);
+   } else if (replay->cond_gpu) {
+      const struct wvk_bound_buffer src = { NULL, indices, args, 20,
+                                            ++wvk_cmd_buffer_device(cmd)->temp_serial | (1ull << 62) };
+      struct wvk_bound_buffer b;
+      if (conditional_args(cmd, NULL, &src, 1, 5, 20, &b))
+         predicated = b.buffer;
+   }
    foreach_viewport(cmd) {
       set_draw_parameters(st, NULL, 0, indexed, base_vertex, first_instance, draw_id);
       if (!flush_draw(cmd, true))
          continue;
       if (predicated)
          wgpuRenderPassEncoderDrawIndexedIndirect(replay->pass, predicated, 0);
+      else if (args != UINT64_MAX)
+         wgpuRenderPassEncoderDrawIndexedIndirect(replay->pass, indices, args);
       else
          wgpuRenderPassEncoderDrawIndexed(replay->pass, index_count, instances, 0, base_vertex, first_instance);
    }
@@ -3145,9 +3248,11 @@ draw_list_at(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint64_t offset, ui
 
 static void
 draw_list(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint32_t index_count, WGPUPrimitiveTopology topology,
-          uint32_t instances, int32_t base_vertex, uint32_t first_instance, bool indexed, uint32_t draw_id)
+          uint32_t instances, int32_t base_vertex, uint32_t first_instance, bool indexed, uint32_t draw_id,
+          uint64_t args)
 {
-   draw_list_at(cmd, indices, 0, index_count, topology, instances, base_vertex, first_instance, indexed, draw_id);
+   draw_list_at(cmd, indices, 0, index_count, topology, instances, base_vertex, first_instance, indexed, draw_id,
+                args);
 }
 
 static void
@@ -3155,7 +3260,7 @@ draw_fan(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint32_t triangles, uin
          int32_t base_vertex, uint32_t first_instance, bool indexed, uint32_t draw_id)
 {
    draw_list(cmd, indices, triangles * 3, WGPUPrimitiveTopology_TriangleList, instances, base_vertex, first_instance,
-             indexed, draw_id);
+             indexed, draw_id, UINT64_MAX);
 }
 
 /* Whether a draw's flat varyings are its primitives' last vertices'
@@ -3228,9 +3333,12 @@ draw_polygon_mode(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint
    if (!polygon_list(cmd, &mode, &topology, true))
       return false;
    uint32_t index_count = 0;
-   WGPUBuffer indices = triangles_on_gpu(cmd, indexed, first, count, mode, provokes_last(cmd), &index_count);
+   uint64_t args;
+   WGPUBuffer indices = triangles_on_gpu(cmd, indexed, first, count, mode, provokes_last(cmd),
+                                         (const uint32_t[3]){ instances, (uint32_t)base_vertex, first_instance },
+                                         &index_count, &args);
    if (indices)
-      draw_list(cmd, indices, index_count, topology, instances, base_vertex, first_instance, indexed, draw_id);
+      draw_list(cmd, indices, index_count, topology, instances, base_vertex, first_instance, indexed, draw_id, args);
    return true;
 }
 
@@ -3266,10 +3374,12 @@ draw_fan_elements(struct wvk_cmd_buffer *cmd, uint32_t first_index, uint32_t ind
    if (index_count < 3 || !instances)
       return;
    uint32_t count = 0;
-   WGPUBuffer indices = triangles_on_gpu(cmd, true, first_index, index_count, LIST_TRIANGLES, provokes_last(cmd), &count);
+   uint64_t args;
+   WGPUBuffer indices = triangles_on_gpu(cmd, true, first_index, index_count, LIST_TRIANGLES, provokes_last(cmd), NULL,
+                                         &count, &args);
    if (indices)
       draw_list(cmd, indices, count, WGPUPrimitiveTopology_TriangleList, instances, vertex_offset, first_instance,
-                true, draw_id);
+                true, draw_id, args);
 }
 
 /* A draw, the `draw_id`th of a vkCmdDrawMulti*EXT. */
@@ -3452,15 +3562,16 @@ draw_lines(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t co
 
 /* The index buffer as storage at WVK_DRIVER_SLOT_INDEX, for a vertex
  * shader that reads an indexed draw's indices itself (expand_points,
- * run_vertices), and where they start and their size in the driver's data;
- * none, of size 0, for a draw without. False where there is none bound. */
+ * run_vertices), and where they start, their size and whether they
+ * restart in the driver's data; none, of size 0, for a draw without.
+ * False where there is none bound. */
 static bool
 bind_index_storage(struct wvk_cmd_buffer *cmd, bool indexed)
 {
    const struct wvk_physical_device *pdev = wvk_device_physical(wvk_cmd_buffer_device(cmd));
    struct wvk_replay *replay = cmd->replay;
    struct wvk_bound_state *st = replay->state;
-   uint32_t words[2] = { 0, 0 };
+   uint32_t words[3] = { 0, 0, indexed && cmd->vk.dynamic_graphics_state.ia.primitive_restart_enable };
    st->index = (struct wvk_driver_buffer){ 0 };
    if (indexed) {
       const struct wvk_bound_buffer *ib = &st->ib;
@@ -4089,7 +4200,8 @@ draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t
    if (quads)
       draw_point_list(cmd, &st->gs_indices, (uint32_t)(raster * indices * 4), (uint32_t)indices, NULL, 0, draw_id);
    else
-      draw_list_at(cmd, list, raster * indices * 4, (uint32_t)indices, primitives, 1, 0, 0, true, draw_id);
+      draw_list_at(cmd, list, raster * indices * 4, (uint32_t)indices, primitives, 1, 0, 0, true, draw_id,
+                   UINT64_MAX);
    st->vs = draw_vs;
 }
 
@@ -4556,6 +4668,32 @@ draw_elements(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instance
       narrow_indices(cmd, &saved);
 }
 
+/* Whether a draw's primitives restart, of a list (primitiveTopologyListRestart):
+ * WebGPU restarts strips only. Not a patch list's, which tessellation
+ * reads the indices of itself. */
+static bool
+restarts_list(const struct wvk_cmd_buffer *cmd)
+{
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   if (!dyn->ia.primitive_restart_enable)
+      return false;
+   switch (dyn->ia.primitive_topology) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static void draw_elements_listed(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instanceCount,
+                                 uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance, uint32_t draw_id);
+static void draw_list_restarts(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instanceCount,
+                               uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance, uint32_t draw_id);
+
 static void
 draw_elements_widened(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
                       int32_t vertexOffset, uint32_t firstInstance, uint32_t draw_id)
@@ -4573,6 +4711,51 @@ draw_elements_widened(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t 
       cmd->replay->draw_points = cmd->replay->draw_lines = false;
       return;
    }
+   if (restarts_list(cmd))
+      draw_list_restarts(cmd, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance, draw_id);
+   else
+      draw_elements_listed(cmd, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance, draw_id);
+}
+
+/* A list that restarts: drawn of the driver's list of its whole
+ * primitives, the restart index to its end, which the draw is of as many
+ * of as there are, and the quads of points and wide lines and the
+ * driver's lists of the rest leave out. */
+static void
+draw_list_restarts(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
+                   int32_t vertexOffset, uint32_t firstInstance, uint32_t draw_id)
+{
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   uint32_t count = 0;
+   uint64_t args;
+   WGPUBuffer list = triangles_on_gpu(cmd, true, firstIndex, indexCount, LIST_COMPACT, false,
+                                      (const uint32_t[3]){ instanceCount, (uint32_t)vertexOffset, firstInstance },
+                                      &count, &args);
+   if (!list) {
+      replay->draw_points = replay->draw_lines = false;
+      return;
+   }
+   const struct wvk_bound_buffer ib = st->ib;
+   const VkIndexType type = st->index_type;
+   st->ib = (struct wvk_bound_buffer){ NULL, list, 0, (uint64_t)count * 4,
+                                       ++wvk_cmd_buffer_device(cmd)->temp_serial | (1ull << 62) };
+   st->index_type = VK_INDEX_TYPE_UINT32;
+   replay->restart_list = list;
+   replay->restart_args = args;
+   draw_elements_listed(cmd, count, instanceCount, 0, vertexOffset, firstInstance, draw_id);
+   replay->restart_list = NULL;
+   st->ib = ib;
+   st->index_type = type;
+}
+
+/* The same, of the draw's indices as WebGPU's are, or the driver's list
+ * of them: after its geometry and tessellation, which read indices of
+ * their own. */
+static void
+draw_elements_listed(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instanceCount, uint32_t firstIndex,
+                     int32_t vertexOffset, uint32_t firstInstance, uint32_t draw_id)
+{
    run_vertex_writes(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
    if (rasterizes_other_stream(cmd)) {
       cmd->replay->draw_points = cmd->replay->draw_lines = false;
@@ -4590,6 +4773,11 @@ draw_elements_widened(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t 
       return;
    if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
       draw_fan_elements(cmd, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
+      return;
+   }
+   if (cmd->replay->restart_list) {
+      draw_list(cmd, cmd->replay->restart_list, indexCount, WGPUPrimitiveTopology_Undefined, instanceCount,
+                vertexOffset, firstInstance, true, draw_id, cmd->replay->restart_args);
       return;
    }
    WGPUBuffer predicated = predicated_draw(
@@ -4855,6 +5043,23 @@ draw_indirect_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_b
       }
       return;
    }
+   /* Lists that restart, each draw as the host has it (draw_list_restarts). */
+   if (indexed && restarts_list(cmd)) {
+      if (!b.mem || !b.mem->host) {
+         mesa_logw_once("wvk: an indirect draw of a list that restarts, in memory the host has no copy of");
+         return;
+      }
+      const bool points = replay->draw_points, lines = replay->draw_lines;
+      for (uint32_t i = 0; i < drawCount; ++i) {
+         VkDrawIndexedIndirectCommand c;
+         memcpy(&c, (const uint8_t *)b.mem->host + b.offset + (uint64_t)i * stride, sizeof(c));
+         replay->draw_points = points;
+         replay->draw_lines = lines;
+         if (c.indexCount && c.instanceCount)
+            draw_list_restarts(cmd, c.indexCount, c.instanceCount, c.firstIndex, c.vertexOffset, c.firstInstance, i);
+      }
+      return;
+   }
    /* The vertex shader's storage writes, of each draw as the host has it. */
    if (st->bound_vs && st->bound_vs->writes_storage) {
       if (!b.mem || !b.mem->host) {
@@ -4956,7 +5161,7 @@ static void draw_indirect_widened(struct wvk_cmd_buffer *cmd, bool indexed, VkBu
 
 /* Whether indirect draws are drawn from the host's copy of them: of
  * tessellation, a geometry shader, storage writes, points or lines as
- * quads, fans, or polygon modes. Under a predicate the GPU has, those
+ * quads, fans, polygon modes, or lists that restart. Under a predicate the GPU has, those
  * are each predicated as they are drawn (cond_gpu). */
 static bool
 indirect_on_host(struct wvk_cmd_buffer *cmd)
@@ -4965,7 +5170,7 @@ indirect_on_host(struct wvk_cmd_buffer *cmd)
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    return st->bound_tes || draw_gs(cmd) || (st->bound_vs && st->bound_vs->writes_storage) || draws_points(cmd) ||
           draws_lines(cmd) || dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
-          dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL;
+          dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL || restarts_list(cmd);
 }
 
 static void

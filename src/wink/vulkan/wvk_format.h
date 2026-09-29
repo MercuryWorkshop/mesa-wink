@@ -61,11 +61,12 @@ bool wvk_format_vertex_pullable(VkFormat format);
  * for formats that cannot be. */
 bool wvk_texel_buffer_format(VkFormat format, uint32_t *record);
 
-/* A storage image format shaders can do atomics on. */
+/* A storage image format shaders can do atomics on: of floats too, as
+ * compare-exchange loops (shaderImageFloat32Atomics). */
 static inline bool
 wvk_format_has_atomics(VkFormat format)
 {
-   return format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT;
+   return format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT || format == VK_FORMAT_R32_SFLOAT;
 }
 
 #endif

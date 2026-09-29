@@ -26,6 +26,7 @@
 #include "vk_format.h"
 
 #include "git_sha1.h"
+#include "util/u_atomic.h"
 #include "util/u_debug.h"
 
 #include <stdio.h>
@@ -173,6 +174,21 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_host_image_copy = true,
       .EXT_conditional_rendering = true,
       .EXT_provoking_vertex = true,
+      .KHR_map_memory2 = true,
+      .EXT_memory_budget = true,
+      .KHR_unified_image_layouts = true,
+      .EXT_zero_initialize_device_memory = true,
+      .KHR_shader_relaxed_extended_instruction = true,
+      .EXT_load_store_op_none = true,
+      .EXT_dynamic_rendering_unused_attachments = true,
+      .EXT_frame_boundary = true,
+      .EXT_depth_bias_control = true,
+      .EXT_attachment_feedback_loop_layout = true,
+      .EXT_attachment_feedback_loop_dynamic_state = true,
+      .EXT_pipeline_protected_access = true,
+      .EXT_shader_atomic_float = true,
+      .EXT_shader_atomic_float2 = true,
+      .EXT_primitive_topology_list_restart = true,
       .EXT_depth_clip_enable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
       .KHR_global_priority = true,
       .EXT_global_priority = true,
@@ -433,6 +449,43 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
        * a geometry shader's. */
       .provokingVertexLast = true,
       .transformFeedbackPreservesProvokingVertex = false,
+      /* Layouts are nothing to WebGPU. */
+      .unifiedImageLayouts = true,
+      /* WebGPU's buffers and textures begin zeroed, and so does the host's
+       * copy of memory. */
+      .zeroInitializeDeviceMemory = true,
+      .shaderRelaxedExtendedInstruction = true,
+      /* Render pipelines are of the pass's attachments, whatever the
+       * pipeline's rendering info said. */
+      .dynamicRenderingUnusedAttachments = true,
+      .frameBoundary = true,
+      /* The default representation only, which is WebGPU's. */
+      .depthBiasControl = true,
+      /* What a draw samples of an attachment of its pass is a copy, made
+       * before it and kept until a barrier (snapshot_feedback). */
+      .attachmentFeedbackLoopLayout = true,
+      .attachmentFeedbackLoopDynamicState = true,
+      /* There is no protected memory: the pipeline flags ask nothing. */
+      .pipelineProtectedAccess = true,
+      /* Atomics of 32-bit floats: exchanges are of their bits, and sums,
+       * minimums and maximums compare-exchange loops on words -- of
+       * buffers, shared memory, and images' buffers of texels
+       * (wvk_shader.c, gex_wgpu_nir.c). WGSL has no 64-bit atomics, and
+       * 16-bit floats would be parts of words. */
+      .shaderBufferFloat32Atomics = true,
+      .shaderBufferFloat32AtomicAdd = true,
+      .shaderSharedFloat32Atomics = true,
+      .shaderSharedFloat32AtomicAdd = true,
+      .shaderImageFloat32Atomics = true,
+      .shaderImageFloat32AtomicAdd = true,
+      .shaderBufferFloat32AtomicMinMax = true,
+      .shaderSharedFloat32AtomicMinMax = true,
+      .shaderImageFloat32AtomicMinMax = true,
+      /* Lists that restart are drawn of the driver's lists of their whole
+       * primitives (wvk_cmd_draw.c, LIST_COMPACT); patches of them
+       * tessellation would have to read so too. */
+      .primitiveTopologyListRestart = true,
+      .primitiveTopologyPatchListRestart = false,
       .pipelineCreationCacheControl = true,
       .privateData = true,
       /* Subgroups are one invocation, and so are full, and of the size
@@ -1098,7 +1151,21 @@ wvk_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
       props->memoryTypes[i] = pdev->memory_types[i];
 
    vk_foreach_struct(stype, ext, pMemoryProperties->pNext) {
-      vk_debug_ignored_stype(stype);
+      switch (stype) {
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
+         /* All of each heap, as far as the driver knows: WebGPU says
+          * nothing of what others use. */
+         VkPhysicalDeviceMemoryBudgetPropertiesEXT *budget = ext;
+         for (uint32_t i = 0; i < VK_MAX_MEMORY_HEAPS; ++i) {
+            budget->heapBudget[i] = i < props->memoryHeapCount ? props->memoryHeaps[i].size : 0;
+            budget->heapUsage[i] = i < props->memoryHeapCount ? p_atomic_read(&pdev->heap_used[i]) : 0;
+         }
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(stype);
+         break;
+      }
    }
 }
 

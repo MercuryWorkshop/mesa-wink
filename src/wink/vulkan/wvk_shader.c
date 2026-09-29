@@ -1042,12 +1042,15 @@ wvk_shader_blend_mask(const struct vk_dynamic_graphics_state *dyn, uint32_t writ
 #define WVK_POINT_VERTEX "wvk_vertex"
 #define WVK_RUN_INSTANCE "wvk_instance"
 
+static nir_def *load_index(nir_builder *b, nir_def *start, nir_def *size, nir_def *at, nir_def **restarts);
+
 /* Points drawn as quads (largePoints), which WebGPU has none of: six
  * vertices a point, which wvk_cmd_draw.c draws as a triangle list. The
  * point is vertex_index / 6 and the corner vertex_index % 6; the point's
  * vertex is that, or for an indexed draw its index in the index buffer
  * plus BaseVertex, and every attribute is pulled at it (the local
- * WVK_POINT_VERTEX, pull_divided_attributes). At the end the position
+ * WVK_POINT_VERTEX, pull_divided_attributes) -- none where the index
+ * restarts primitives, the quad out of the clip volume. At the end the position
  * moves to the corner by half of PointSize, in pixels of the viewport,
  * whose inverse size the driver's data has: in Vulkan's clip space, before
  * the viewport transform, where +y is down whatever the viewport's sign.
@@ -1063,20 +1066,19 @@ expand_points(nir_shader *nir, unsigned point_coord)
    nir_def *raw = nir_load_vertex_id(&b);
    nir_def *point = nir_udiv_imm(&b, raw, 6);
    nir_def *corner = nir_umod_imm(&b, raw, 6);
-   nir_def *index = nir_load_ssbo(&b, 2, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+   nir_def *index = nir_load_ssbo(&b, 3, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
                                   nir_imm_int(&b, WVK_DRIVER_POINT_INDEX), .align_mul = 8,
                                   .access = ACCESS_NON_WRITEABLE);
    nir_def *start = nir_channel(&b, index, 0), *size = nir_channel(&b, index, 1);
+   nir_def *no = nir_imm_false(&b);
    nir_push_if(&b, nir_ine_imm(&b, size, 0));
-   nir_def *byte = nir_iadd(&b, start, nir_imul(&b, point, size));
-   nir_def *word = nir_load_ssbo(&b, 1, 32, driver_buffer(&b, WVK_DRIVER_SLOT_INDEX), nir_iand_imm(&b, byte, ~3),
-                                 .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
-   nir_def *part = nir_ubitfield_extract(&b, word, nir_ishl_imm(&b, nir_iand_imm(&b, byte, 3), 3),
-                                         nir_ishl_imm(&b, size, 3));
-   nir_def *indexed = nir_iadd(&b, nir_bcsel(&b, nir_ieq_imm(&b, size, 4), word, part), nir_load_base_vertex(&b));
+   nir_def *restarts;
+   nir_def *indexed = nir_iadd(&b, load_index(&b, start, size, point, &restarts), nir_load_base_vertex(&b));
+   restarts = nir_iand(&b, restarts, nir_ine_imm(&b, nir_channel(&b, index, 2), 0));
    nir_push_else(&b, NULL);
    nir_pop_if(&b, NULL);
    nir_def *vertex = nir_if_phi(&b, indexed, point);
+   nir_def *gone = nir_if_phi(&b, restarts, no);
    nir_variable *element = nir_local_variable_create(impl, glsl_uint_type(), WVK_POINT_VERTEX);
    nir_store_var(&b, element, vertex, 0x1);
 
@@ -1128,7 +1130,9 @@ expand_points(nir_shader *nir, unsigned point_coord)
    nir_def *reach = nir_fmul(&b, diameter, w);
    nir_def *x = nir_ffma(&b, nir_fmul(&b, dx, nir_channel(&b, scale, 0)), reach, nir_channel(&b, pos, 0));
    nir_def *y = nir_ffma(&b, nir_fmul(&b, dy, nir_channel(&b, scale, 1)), reach, nir_channel(&b, pos, 1));
-   nir_store_var(&b, position_out, nir_vec4(&b, x, y, nir_channel(&b, pos, 2), w), 0xf);
+   nir_store_var(&b, position_out,
+                 nir_bcsel(&b, gone, nir_imm_vec4(&b, 2.0f, 2.0f, 2.0f, 1.0f), nir_vec4(&b, x, y, nir_channel(&b, pos, 2), w)),
+                 0xf);
    if (point_coord) {
       nir_variable *coord = nir_find_variable_with_location(nir, nir_var_shader_out,
                                                             VARYING_SLOT_VAR0 + point_coord - 1);
@@ -3513,10 +3517,13 @@ lower_word_atomic(nir_builder *b, nir_variable *var, nir_intrinsic_instr *intr, 
    nir_deref_instr *words = nir_build_deref_struct(b, nir_build_deref_var(b, var), 0);
    nir_deref_instr *word = nir_build_deref_array(b, words, first);
    const nir_atomic_op op = nir_intrinsic_atomic_op(intr);
-   if (op == nir_atomic_op_imin || op == nir_atomic_op_imax) {
+   if (op == nir_atomic_op_imin || op == nir_atomic_op_imax || op == nir_atomic_op_fadd || op == nir_atomic_op_fmin ||
+       op == nir_atomic_op_fmax) {
       /* The words are unsigned, and so are WGSL's atomics on them: a
        * signed minimum or maximum is swapped in until nothing came
-       * between. */
+       * between; and so is a float sum, minimum or maximum, WGSL having
+       * no atomics of floats (shaderBufferFloat32AtomicAdd and MinMax,
+       * and images' through their buffers of texels). */
       nir_variable *old = nir_local_variable_create(b->impl, glsl_uint_type(), "atomic_old");
       nir_store_var(b, old, nir_deref_atomic(b, 32, &word->def, nir_imm_int(b, 0), .atomic_op = nir_atomic_op_iadd),
                     0x1);
@@ -3524,7 +3531,11 @@ lower_word_atomic(nir_builder *b, nir_variable *var, nir_intrinsic_instr *intr, 
       {
          nir_def *cur = nir_load_var(b, old);
          nir_def *data = intr->src[2].ssa;
-         nir_def *want = op == nir_atomic_op_imin ? nir_imin(b, cur, data) : nir_imax(b, cur, data);
+         nir_def *want = op == nir_atomic_op_imin   ? nir_imin(b, cur, data)
+                         : op == nir_atomic_op_imax ? nir_imax(b, cur, data)
+                         : op == nir_atomic_op_fadd ? nir_fadd(b, cur, data)
+                         : op == nir_atomic_op_fmin ? nir_fmin(b, cur, data)
+                                                    : nir_fmax(b, cur, data);
          nir_def *prev = nir_deref_atomic_swap(b, 32, &word->def, cur, want, .atomic_op = nir_atomic_op_cmpxchg);
          nir_store_var(b, old, prev, 0x1);
          nir_break_if(b, nir_ieq(b, prev, cur));

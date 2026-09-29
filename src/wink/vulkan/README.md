@@ -126,7 +126,14 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   the image's texels. A 32-bit integer storage image has one besides its
   texture, and a shader that does atomics on it uses it for everything.
   Between barriers one or the other is the image: the texture is copied to
-  the buffer before such a shader runs, and back at the next barrier.
+  the buffer before such a shader runs, and back at the next barrier. An
+  R32 float one has one where the device does float atomics, or a view of
+  it could be of integers.
+- **Float atomics** (VK_EXT_shader_atomic_float and float2, 32-bit): WGSL
+  has atomics of integers only. An exchange, load or store is of the
+  float's bits; a sum, minimum or maximum a loop of compare-exchanges on
+  the word until nothing came between -- of buffers, shared memory, and
+  images' buffers of texels.
 - **A pass that reads what it renders to** -- an input attachment of its own
   subpass, a feedback loop -- reads a copy, which WebGPU wants: a texture is
   an attachment or bound in a pass, not both. The copy is made before the
@@ -317,6 +324,11 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   lists of each triangle's edges or corners. Indirect draws of fans are drawn from the host's copy of their
   commands. **vkCmdDraw*IndirectCount** copies the draws and gives those
   past the count no instances, on the GPU.
+- **Lists that restart** (primitiveTopologyListRestart), which WebGPU's
+  do not: the same shader makes a list of their whole primitives, the
+  restart index to its end, and after it an indirect draw of the whole
+  ones; points and wide lines drawn as quads leave out those of the
+  restart index. Patch lists do not restart.
 - **Stencil masks and references of each face**: WebGPU has one of each.
   Where the faces' differ and both are drawn, a draw is drawn twice, each
   culling the other face.

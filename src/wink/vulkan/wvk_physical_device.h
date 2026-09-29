@@ -38,6 +38,8 @@ struct wvk_physical_device {
 
    uint64_t heap_size;
    VkMemoryType memory_types[WVK_MEMORY_TYPE_COUNT];
+   /* What each heap has allocated of it, every device's (memoryBudget). */
+   uint64_t heap_used[2];
 
    /* Binary syncs of our own, and the runtime's timelines made of them;
     * so submits are deferred until their waits are pending, and one

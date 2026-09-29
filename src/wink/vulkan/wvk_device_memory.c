@@ -64,6 +64,7 @@ wvk_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
       memset(mem->host, 0, host_size);
    }
    mem->refs = 1;
+   p_atomic_add(&pdev->heap_used[pdev->memory_types[mem->vk.memory_type_index].heapIndex], mem->vk.size);
 
    *pMem = wvk_device_memory_to_handle(mem);
    return VK_SUCCESS;
@@ -86,6 +87,8 @@ wvk_device_memory_unref(struct wvk_device_memory *mem)
    }
    os_free_aligned(mem->host);
    struct vk_device *dev = mem->vk.base.device;
+   struct wvk_physical_device *pdev = wvk_device_physical(container_of(dev, struct wvk_device, vk));
+   p_atomic_add(&pdev->heap_used[pdev->memory_types[mem->vk.memory_type_index].heapIndex], -(int64_t)mem->vk.size);
    vk_device_memory_destroy(dev, mem->free_with_alloc ? &mem->free_alloc : NULL, &mem->vk);
 }
 
