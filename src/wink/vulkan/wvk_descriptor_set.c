@@ -35,6 +35,21 @@ wvk_descriptor_set_invalidate(struct wvk_descriptor_set *set)
    }
 }
 
+/* A YCbCr conversion's sampler of its chroma filter, in the descriptor of
+ * the second plane. */
+static void
+set_chroma_sampler(struct wvk_descriptor *d, const struct wvk_sampler *sampler)
+{
+   if (d->sampler)
+      wgpuSamplerRelease(d->sampler);
+   d->sampler = sampler && sampler->chroma ? sampler->chroma : NULL;
+   if (d->sampler) {
+      wgpuSamplerAddRef(d->sampler);
+      d->sampler_type = sampler->chroma_binding_type;
+      memcpy(d->sampler_meta, sampler->chroma_meta, sizeof(d->sampler_meta));
+   }
+}
+
 static void
 set_sampler(struct wvk_descriptor *d, const struct wvk_sampler *sampler)
 {
@@ -138,8 +153,11 @@ wvk_descriptor_set_create(struct wvk_device *dev, struct wvk_descriptor_set_layo
       const struct wvk_descriptor_set_binding_layout *bl = &layout->bindings[b];
       if (!bl->immutable_samplers)
          continue;
-      for (uint32_t e = 0; e < bl->count; ++e)
+      for (uint32_t e = 0; e < bl->count; ++e) {
          set_sampler(&set->descriptors[bl->descriptor_index + e], bl->immutable_samplers[e]);
+         if (bl->planes > 1)
+            set_chroma_sampler(&set->descriptors[bl->plane_descriptor_index + e], bl->immutable_samplers[e]);
+      }
    }
    return set;
 }
@@ -213,6 +231,10 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
    clear_descriptor(d, bl->immutable_samplers != NULL);
    if (type != VK_DESCRIPTOR_TYPE_SAMPLER) {
       const struct wvk_image_view *view = wvk_image_view_from_handle(info->imageView);
+      /* A multi-planar view is its first plane's here, the others in the
+       * binding's descriptors of them (write_one). */
+      if (view && view->plane_count)
+         view = view->planes[0];
       /* A storage image of a cube is the 2D array of its faces, and an
        * input attachment an array, fetched at the pass's layer. */
       WGPUTextureView wgpu = view ? view->view : NULL;
@@ -289,6 +311,18 @@ write_one(struct wvk_device *dev, struct wvk_descriptor_set *set, uint32_t bindi
    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
       write_image(d, bl, element, image);
+      /* A view's other planes, each a texture of its own. */
+      for (uint32_t p = 1; p < bl->planes; ++p) {
+         const struct wvk_image_view *view = image ? wvk_image_view_from_handle(image->imageView) : NULL;
+         const VkDescriptorImageInfo plane = {
+            .imageView = view && p < view->plane_count ? wvk_image_view_to_handle(view->planes[p]) : VK_NULL_HANDLE,
+         };
+         /* Its sampler, the second plane's of the chroma filter, stays. */
+         struct wvk_descriptor_set_binding_layout pbl = *bl;
+         pbl.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+         write_image(&set->descriptors[bl->plane_descriptor_index + (p - 1) * bl->count + element], &pbl, element,
+                     &plane);
+      }
       break;
    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
@@ -394,7 +428,7 @@ wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words, u
    for (uint32_t s = 0; s < slots; ++s) {
       const struct wvk_descriptor_slot *slot = &layout->slots[s];
       const struct wvk_descriptor_set_binding_layout *bl = &layout->bindings[slot->binding];
-      const struct wvk_descriptor *d = &set->descriptors[bl->descriptor_index + slot->element];
+      const struct wvk_descriptor *d = &set->descriptors[wvk_slot_descriptor_index(bl, slot)];
       uint32_t *record = words + s * WVK_META_WORDS;
       switch (bl->type) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
@@ -462,11 +496,15 @@ wvk_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
       for (uint32_t j = 0; j < copy->descriptorCount; ++j) {
          if (sb >= src->layout->binding_count || db >= dst->layout->binding_count)
             break;
-         const struct wvk_descriptor *s =
-            &src->descriptors[src->layout->bindings[sb].descriptor_index + se];
-         struct wvk_descriptor *d =
-            &dst->descriptors[dst->layout->bindings[db].descriptor_index + de];
-         copy_descriptor(d, s, dst->layout->bindings[db].immutable_samplers != NULL);
+         const struct wvk_descriptor_set_binding_layout *sbl = &src->layout->bindings[sb];
+         const struct wvk_descriptor_set_binding_layout *dbl = &dst->layout->bindings[db];
+         const struct wvk_descriptor *s = &src->descriptors[sbl->descriptor_index + se];
+         struct wvk_descriptor *d = &dst->descriptors[dbl->descriptor_index + de];
+         copy_descriptor(d, s, dbl->immutable_samplers != NULL);
+         /* And its planes'. */
+         for (uint32_t p = 1; p < MIN2(sbl->planes, dbl->planes); ++p)
+            copy_descriptor(&dst->descriptors[dbl->plane_descriptor_index + (p - 1) * dbl->count + de],
+                            &src->descriptors[sbl->plane_descriptor_index + (p - 1) * sbl->count + se], true);
          next_element(src->layout, &sb, &se);
          next_element(dst->layout, &db, &de);
       }

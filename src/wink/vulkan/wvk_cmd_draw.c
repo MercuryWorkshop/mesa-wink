@@ -1104,7 +1104,7 @@ slot_descriptor(const struct wvk_descriptor_set *set, uint32_t slot, bool *sampl
    const struct wvk_descriptor_set_binding_layout *bl = &set->layout->bindings[s->binding];
    *sampler = s->sampler;
    *dynamic_index = bl->dynamic_index + s->element;
-   return &set->descriptors[bl->descriptor_index + s->element];
+   return &set->descriptors[wvk_slot_descriptor_index(bl, s)];
 }
 
 /* What the bound descriptors say of their bindings that shaders cannot

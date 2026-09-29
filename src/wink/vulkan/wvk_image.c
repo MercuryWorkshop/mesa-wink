@@ -61,12 +61,80 @@ wvk_aspect(VkImageAspectFlags aspects)
    return WGPUTextureAspect_All;
 }
 
+static void get_image_requirements(VkFormat format, VkImageType type, VkImageTiling tiling, VkExtent3D extent,
+                                   uint32_t levels, uint32_t layers, VkSampleCountFlagBits samples,
+                                   VkMemoryRequirements2 *pMemoryRequirements);
+
+/* A plane of a multi-planar image as an image of its own: of the plane's
+ * format and size, and none of the image's extensions. */
+static VkImageCreateInfo
+plane_create_info(const VkImageCreateInfo *info, uint32_t plane)
+{
+   const struct vk_format_ycbcr_info *ycbcr = vk_format_get_ycbcr_info(info->format);
+   VkImageCreateInfo p = *info;
+   p.pNext = NULL;
+   p.format = ycbcr->planes[plane].format;
+   p.extent.width = vk_format_get_plane_width(info->format, plane, info->extent.width);
+   p.extent.height = vk_format_get_plane_height(info->format, plane, info->extent.height);
+   p.flags &= ~VK_IMAGE_CREATE_DISJOINT_BIT;
+   return p;
+}
+
+/* Where each plane of a multi-planar image is in memory it is bound to as
+ * a whole, and how much memory that is. */
+static uint64_t
+plane_offsets(const VkImageCreateInfo *info, uint64_t offsets[3])
+{
+   uint64_t size = 0;
+   for (uint32_t p = 0; p < vk_format_get_plane_count(info->format); ++p) {
+      const VkImageCreateInfo pi = plane_create_info(info, p);
+      VkMemoryRequirements2 req = { .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+      get_image_requirements(pi.format, pi.imageType, pi.tiling, pi.extent, pi.mipLevels, pi.arrayLayers,
+                             pi.samples, &req);
+      size = align64(size, req.memoryRequirements.alignment);
+      if (offsets)
+         offsets[p] = size;
+      size += req.memoryRequirements.size;
+   }
+   return size;
+}
+
+static VkResult
+create_planar_image(VkDevice _device, const VkImageCreateInfo *pCreateInfo, const VkAllocationCallbacks *pAllocator,
+                    VkImage *pImage)
+{
+   VK_FROM_HANDLE(wvk_device, dev, _device);
+   struct wvk_image *image = vk_image_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*image));
+   if (!image)
+      return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   image->linear = pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR;
+   image->dimension = WGPUTextureDimension_2D;
+   plane_offsets(pCreateInfo, image->plane_offset);
+   for (uint32_t p = 0; p < vk_format_get_plane_count(pCreateInfo->format); ++p) {
+      const VkImageCreateInfo pi = plane_create_info(pCreateInfo, p);
+      VkImage plane;
+      const VkResult result = wvk_CreateImage(_device, &pi, pAllocator, &plane);
+      if (result != VK_SUCCESS) {
+         wvk_DestroyImage(_device, wvk_image_to_handle(image), pAllocator);
+         return result;
+      }
+      image->planes[p] = wvk_image_from_handle(plane);
+      image->plane_count = p + 1;
+   }
+   *pImage = wvk_image_to_handle(image);
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
                 const VkAllocationCallbacks *pAllocator, VkImage *pImage)
 {
    VK_FROM_HANDLE(wvk_device, dev, _device);
    const struct wvk_physical_device *pdev = wvk_device_physical(dev);
+
+   if (vk_format_get_plane_count(pCreateInfo->format) > 1)
+      return wvk_format_caps(pdev, pCreateInfo->format) ? create_planar_image(_device, pCreateInfo, pAllocator, pImage)
+                                                         : vk_error(dev, VK_ERROR_FORMAT_NOT_SUPPORTED);
 
    const struct wvk_format *format = wvk_format_get(pCreateInfo->format);
    const uint32_t caps = wvk_format_caps(pdev, pCreateInfo->format);
@@ -222,6 +290,8 @@ wvk_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks *
    VK_FROM_HANDLE(wvk_image, image, _image);
    if (!image)
       return;
+   for (uint32_t p = 0; p < image->plane_count; ++p)
+      wvk_DestroyImage(_device, wvk_image_to_handle(image->planes[p]), pAllocator);
    /* Swapchain images belong to the surface. Released, not destroyed:
     * views of it in descriptors, which may outlive it unused, still have
     * it, and it goes with the last of them. */
@@ -400,8 +470,16 @@ get_image_requirements(VkFormat format, VkImageType type, VkImageTiling tiling, 
                        VkMemoryRequirements2 *pMemoryRequirements)
 {
    const bool linear = tiling == VK_IMAGE_TILING_LINEAR;
-   const uint64_t size = linear ? (uint64_t)wvk_image_linear_pitch(format, extent.width) * extent.height
-                                : image_size(format, type, extent, levels, layers, samples);
+   uint64_t size = linear ? (uint64_t)wvk_image_linear_pitch(format, extent.width) * extent.height
+                          : image_size(format, type, extent, levels, layers, samples);
+   /* A multi-planar image's planes, one after the other. */
+   if (vk_format_get_plane_count(format) > 1) {
+      const VkImageCreateInfo info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = type, .format = format, .extent = extent,
+         .mipLevels = levels, .arrayLayers = layers, .samples = samples, .tiling = tiling,
+      };
+      size = plane_offsets(&info, NULL);
+   }
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){
       .size = align64(MAX2(size, 1), 256),
       .alignment = 256,
@@ -429,6 +507,11 @@ wvk_GetImageMemoryRequirements2(VkDevice _device, const VkImageMemoryRequirement
                                 VkMemoryRequirements2 *pMemoryRequirements)
 {
    VK_FROM_HANDLE(wvk_image, image, pInfo->image);
+   /* A plane of a disjoint image, as the plane is. */
+   const VkImagePlaneMemoryRequirementsInfo *plane =
+      vk_find_struct_const(pInfo->pNext, IMAGE_PLANE_MEMORY_REQUIREMENTS_INFO);
+   if (plane && image->plane_count)
+      image = image->planes[wvk_image_aspect_plane(plane->planeAspect)];
    get_image_requirements(image->vk.format, image->vk.image_type, image->vk.tiling, image->vk.extent,
                           image->vk.mip_levels, image->vk.array_layers, image->vk.samples,
                           pMemoryRequirements);
@@ -439,6 +522,12 @@ wvk_GetDeviceImageMemoryRequirements(VkDevice _device, const VkDeviceImageMemory
                                      VkMemoryRequirements2 *pMemoryRequirements)
 {
    const VkImageCreateInfo *ci = pInfo->pCreateInfo;
+   if (vk_format_get_plane_count(ci->format) > 1 && (ci->flags & VK_IMAGE_CREATE_DISJOINT_BIT)) {
+      const VkImageCreateInfo pi = plane_create_info(ci, wvk_image_aspect_plane(pInfo->planeAspect));
+      get_image_requirements(pi.format, pi.imageType, pi.tiling, pi.extent, pi.mipLevels, pi.arrayLayers,
+                             pi.samples, pMemoryRequirements);
+      return;
+   }
    get_image_requirements(ci->format, ci->imageType, ci->tiling, ci->extent, ci->mipLevels,
                           ci->arrayLayers, ci->samples, pMemoryRequirements);
 }
@@ -468,6 +557,30 @@ wvk_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindImage
       VK_FROM_HANDLE(wvk_image, image, pBindInfos[i].image);
       VK_FROM_HANDLE(wvk_device_memory, mem, pBindInfos[i].memory);
       VkResult r = VK_SUCCESS;
+      /* A multi-planar image's planes: the one named, of a disjoint
+       * image, or each where its part is. */
+      if (image->plane_count) {
+         const VkBindImagePlaneMemoryInfo *plane = vk_find_struct_const(pBindInfos[i].pNext, BIND_IMAGE_PLANE_MEMORY_INFO);
+         for (uint32_t p = 0; p < image->plane_count && r == VK_SUCCESS; ++p) {
+            if (plane && p != wvk_image_aspect_plane(plane->planeAspect))
+               continue;
+            const VkBindImageMemoryInfo one = {
+               .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+               .image = wvk_image_to_handle(image->planes[p]),
+               .memory = pBindInfos[i].memory,
+               .memoryOffset = pBindInfos[i].memoryOffset + (plane ? 0 : image->plane_offset[p]),
+            };
+            r = wvk_BindImageMemory2(_device, 1, &one);
+         }
+         image->mem = mem;
+         image->offset = pBindInfos[i].memoryOffset;
+         const VkBindMemoryStatusKHR *status = vk_find_struct_const(pBindInfos[i].pNext, BIND_MEMORY_STATUS_KHR);
+         if (status && status->pResult)
+            *status->pResult = r;
+         if (r != VK_SUCCESS)
+            result = r;
+         continue;
+      }
       image->mem = mem;
       image->offset = pBindInfos[i].memoryOffset;
       /* A linear image is its memory's buffer. */
@@ -493,9 +606,17 @@ wvk_GetImageSubresourceLayout2KHR(VkDevice device, VkImage _image, const VkImage
    pLayout->subresourceLayout = (VkSubresourceLayout){ 0 };
    if (!image->linear)
       return;
+   /* A plane's, where it is in the image's memory. */
+   uint64_t offset = 0;
+   if (image->plane_count) {
+      const uint32_t p = wvk_image_aspect_plane(pSubresource->imageSubresource.aspectMask);
+      if (!(image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT))
+         offset = image->plane_offset[p];
+      image = image->planes[p];
+   }
    const uint64_t size = (uint64_t)image->pitch * image->vk.extent.height;
    pLayout->subresourceLayout = (VkSubresourceLayout){
-      .offset = 0,
+      .offset = offset,
       .size = size,
       .rowPitch = image->pitch,
       .arrayPitch = size,
@@ -513,10 +634,21 @@ wvk_GetDeviceImageSubresourceLayoutKHR(VkDevice device, const VkDeviceImageSubre
    pLayout->subresourceLayout = (VkSubresourceLayout){ 0 };
    if (ci->tiling != VK_IMAGE_TILING_LINEAR)
       return;
+   uint64_t offset = 0;
+   VkImageCreateInfo plane = *ci;
+   if (vk_format_get_plane_count(ci->format) > 1) {
+      const uint32_t p = wvk_image_aspect_plane(pInfo->pSubresource->imageSubresource.aspectMask);
+      uint64_t offsets[3];
+      plane_offsets(ci, offsets);
+      if (!(ci->flags & VK_IMAGE_CREATE_DISJOINT_BIT))
+         offset = offsets[p];
+      plane = plane_create_info(ci, p);
+      ci = &plane;
+   }
    const uint32_t pitch = wvk_image_linear_pitch(ci->format, ci->extent.width);
    const uint64_t size = (uint64_t)pitch * ci->extent.height;
    pLayout->subresourceLayout = (VkSubresourceLayout){
-      .offset = 0,
+      .offset = offset,
       .size = size,
       .rowPitch = pitch,
       .arrayPitch = size,
@@ -639,9 +771,54 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    VK_FROM_HANDLE(wvk_device, dev, _device);
    VK_FROM_HANDLE(wvk_image, image, pCreateInfo->image);
 
+   /* A plane of a multi-planar image: a view of the plane's image. */
+   const VkImageAspectFlags planes = VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT |
+                                     VK_IMAGE_ASPECT_PLANE_2_BIT;
+   if (image->plane_count && (pCreateInfo->subresourceRange.aspectMask & planes)) {
+      VkImageViewCreateInfo plane = *pCreateInfo;
+      plane.subresourceRange.aspectMask = pCreateInfo->subresourceRange.aspectMask;
+      plane.image = wvk_image_to_handle(wvk_image_for_aspect(image, &plane.subresourceRange.aspectMask));
+      return wvk_CreateImageView(_device, &plane, pAllocator, pView);
+   }
+
    struct wvk_image_view *view = vk_image_view_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*view));
    if (!view)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+
+   /* All of one, for a YCbCr conversion to sample: a view of each plane,
+    * the first's this one's own. */
+   if (image->plane_count) {
+      const struct vk_format_ycbcr_info *ycbcr = vk_format_get_ycbcr_info(view->vk.format);
+      for (uint32_t p = 0; ycbcr && p < MIN2(ycbcr->n_planes, image->plane_count); ++p) {
+         const VkImageViewCreateInfo info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = wvk_image_to_handle(image->planes[p]),
+            .viewType = pCreateInfo->viewType,
+            .format = ycbcr->planes[p].format,
+            .subresourceRange = {
+               .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+               .baseMipLevel = view->vk.base_mip_level,
+               .levelCount = view->vk.level_count,
+               .baseArrayLayer = view->vk.base_array_layer,
+               .layerCount = view->vk.layer_count,
+            },
+         };
+         VkImageView plane;
+         if (wvk_CreateImageView(_device, &info, pAllocator, &plane) != VK_SUCCESS) {
+            wvk_DestroyImageView(_device, wvk_image_view_to_handle(view), pAllocator);
+            return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         }
+         view->planes[p] = wvk_image_view_from_handle(plane);
+         view->plane_count = p + 1;
+      }
+      if (view->plane_count) {
+         view->view = view->planes[0]->view;
+         view->view_desc = view->planes[0]->view_desc;
+         view->format = view->planes[0]->format;
+      }
+      *pView = wvk_image_view_to_handle(view);
+      return VK_SUCCESS;
+   }
 
    const struct wvk_format *format = wvk_format_get(view->vk.format);
    view->format = format ? format->texture : image->format;
@@ -751,6 +928,12 @@ wvk_DestroyImageView(VkDevice _device, VkImageView _view, const VkAllocationCall
    VK_FROM_HANDLE(wvk_image_view, view, _view);
    if (!view)
       return;
+   /* The planes' views, whose first's `view` this one has. */
+   if (view->plane_count) {
+      for (uint32_t p = 0; p < view->plane_count; ++p)
+         wvk_DestroyImageView(_device, wvk_image_view_to_handle(view->planes[p]), pAllocator);
+      view->view = NULL;
+   }
    if (view->view)
       wgpuTextureViewRelease(view->view);
    if (view->array_view)

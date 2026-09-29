@@ -78,7 +78,36 @@ struct wvk_image {
    uint64_t atomic_offset[16];
    uint32_t atomic_pitch[16];
    bool atomic_in_buffer;
+
+   /* A multi-planar image has no texture: an image of each plane's own
+    * format and size, which copies, views and descriptors of the plane are
+    * of, bound where its part of the memory is (plane_offset) -- or to its
+    * own, the image disjoint. */
+   struct wvk_image *planes[3];
+   uint32_t plane_count;
+   uint64_t plane_offset[3];
 };
+
+/* The plane an aspect names, of a multi-planar image. */
+static inline uint32_t
+wvk_image_aspect_plane(VkImageAspectFlags aspect)
+{
+   return (aspect & (VK_IMAGE_ASPECT_PLANE_2_BIT | VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT))   ? 2
+          : (aspect & (VK_IMAGE_ASPECT_PLANE_1_BIT | VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT)) ? 1
+                                                                                             : 0;
+}
+
+/* What a copy or view of `aspect` is of: a multi-planar image's plane, of
+ * the colour aspect, or the image itself. */
+static inline struct wvk_image *
+wvk_image_for_aspect(struct wvk_image *image, VkImageAspectFlags *aspect)
+{
+   if (!image->plane_count)
+      return image;
+   struct wvk_image *plane = image->planes[wvk_image_aspect_plane(*aspect)];
+   *aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+   return plane;
+}
 
 /* Decode what the image's texture has at a level, every layer or 3D
  * slice, into its shadow (wvk_cmd_copy.c). */
@@ -183,6 +212,10 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE
 
 struct wvk_image_view {
    struct vk_image_view vk;
+   /* Of a multi-planar image, sampled through a YCbCr conversion: a view
+    * of each plane, whose first's `view` is this one's too. */
+   struct wvk_image_view *planes[3];
+   uint32_t plane_count;
    /* For binding: the whole subresource range, in the view's dimension;
     * and for a cube's, as a 2D array of its faces, which is how a storage
     * image of it binds, and how one is fetched from; and for an input

@@ -180,6 +180,48 @@ static const struct {
      { .texture = TF(RGBA8Unorm), .caps = SAMPLE_F | RT_FULL | WVK_CAP_PACKED16 } },
    { VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR,
      { .texture = TF(RGBA8Unorm), .caps = SAMPLE_F | RT_FULL | WVK_CAP_PACKED16 } },
+   /* Padded 16-bit formats, the planes of 10- and 12-bit YCbCr formats:
+    * 16-bit normalized textures, whose padding bits are zero. Not
+    * R12X4G12X4B12X4A12X4, which Mesa has no format of to size it by. */
+#define PADDED(vk, tex)                                                               \
+   { VK_FORMAT_##vk, { .texture = TF(tex), .feature = WGPUFeatureName_TextureFormatsTier1, .caps = SAMPLE_F | WVK_CAP_PADDED } }
+   PADDED(R10X6_UNORM_PACK16, R16Unorm),
+   PADDED(R10X6G10X6_UNORM_2PACK16, RG16Unorm),
+   PADDED(R10X6G10X6B10X6A10X6_UNORM_4PACK16, RGBA16Unorm),
+   PADDED(R12X4_UNORM_PACK16, R16Unorm),
+   PADDED(R12X4G12X4_UNORM_2PACK16, RG16Unorm),
+#undef PADDED
+   /* Multi-planar formats, as their first plane's texture. */
+#define PLANAR8(vk) { VK_FORMAT_##vk, { .texture = TF(R8Unorm), .caps = SAMPLE_F | WVK_CAP_PLANAR } }
+#define PLANAR16(vk)                                                                  \
+   { VK_FORMAT_##vk,                                                                  \
+     { .texture = TF(R16Unorm), .feature = WGPUFeatureName_TextureFormatsTier1, .caps = SAMPLE_F | WVK_CAP_PLANAR } }
+   PLANAR8(G8_B8_R8_3PLANE_420_UNORM),
+   PLANAR8(G8_B8R8_2PLANE_420_UNORM),
+   PLANAR8(G8_B8_R8_3PLANE_422_UNORM),
+   PLANAR8(G8_B8R8_2PLANE_422_UNORM),
+   PLANAR8(G8_B8_R8_3PLANE_444_UNORM),
+   PLANAR8(G8_B8R8_2PLANE_444_UNORM),
+   PLANAR16(G10X6_B10X6_R10X6_3PLANE_420_UNORM_3PACK16),
+   PLANAR16(G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16),
+   PLANAR16(G10X6_B10X6_R10X6_3PLANE_422_UNORM_3PACK16),
+   PLANAR16(G10X6_B10X6R10X6_2PLANE_422_UNORM_3PACK16),
+   PLANAR16(G10X6_B10X6_R10X6_3PLANE_444_UNORM_3PACK16),
+   PLANAR16(G10X6_B10X6R10X6_2PLANE_444_UNORM_3PACK16),
+   PLANAR16(G12X4_B12X4_R12X4_3PLANE_420_UNORM_3PACK16),
+   PLANAR16(G12X4_B12X4R12X4_2PLANE_420_UNORM_3PACK16),
+   PLANAR16(G12X4_B12X4_R12X4_3PLANE_422_UNORM_3PACK16),
+   PLANAR16(G12X4_B12X4R12X4_2PLANE_422_UNORM_3PACK16),
+   PLANAR16(G12X4_B12X4_R12X4_3PLANE_444_UNORM_3PACK16),
+   PLANAR16(G12X4_B12X4R12X4_2PLANE_444_UNORM_3PACK16),
+   PLANAR16(G16_B16_R16_3PLANE_420_UNORM),
+   PLANAR16(G16_B16R16_2PLANE_420_UNORM),
+   PLANAR16(G16_B16_R16_3PLANE_422_UNORM),
+   PLANAR16(G16_B16R16_2PLANE_422_UNORM),
+   PLANAR16(G16_B16_R16_3PLANE_444_UNORM),
+   PLANAR16(G16_B16R16_2PLANE_444_UNORM),
+#undef PLANAR8
+#undef PLANAR16
 };
 
 const struct wvk_format *
@@ -249,8 +291,9 @@ wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format)
    /* A packed format's texture is RGBA8 holding its channels, not its
     * bits, so what WebGPU grants RGBA8Unorm is not the packed format's: a
     * storage view of one as R16 or RG8 would read and write the wrong
-    * bytes. */
-   if (caps & WVK_CAP_PACKED16)
+    * bytes. A multi-planar format is its planes', and a padded one has
+    * more bits than its own. */
+   if (caps & (WVK_CAP_PACKED16 | WVK_CAP_PLANAR | WVK_CAP_PADDED))
       return caps;
    const bool tier1 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureFormatsTier1);
    const bool tier2 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureFormatsTier2);

@@ -28,6 +28,7 @@
 #include "wvk_format.h"
 #include "wvk_nir.h"
 #include "wvk_physical_device.h"
+#include "wvk_sampler.h"
 
 #include "gex_wgpu_nir.h"
 
@@ -43,6 +44,8 @@
 #include "util/mesa-blake3.h"
 #include "vk_format.h"
 #include "vk_nir.h"
+#include "vk_nir_convert_ycbcr.h"
+#include "vk_ycbcr_conversion.h"
 #include "vk_graphics_state.h"
 #include "vk_pipeline.h"
 
@@ -2444,6 +2447,11 @@ struct split_var {
    uint32_t count;
    nir_variable **texture;   /* or the image, or the sampler of a bare one */
    nir_variable **sampler;   /* combined image samplers only */
+   /* A combined image sampler's planes after the first, of a YCbCr
+    * conversion (nir_vk_lower_ycbcr_tex): textures of their own, and a
+    * sampler of the chroma filter for them. */
+   nir_variable **planes[2];
+   nir_variable **chroma;
 };
 
 struct lower_state {
@@ -2522,6 +2530,18 @@ split_resource_vars(nir_shader *nir, struct lower_state *state)
                                     glsl_sampler_type_is_shadow(bare) ? glsl_bare_shadow_sampler_type()
                                                                       : glsl_bare_sampler_type(),
                                     var, bl->slot + bl->count + e, "_smp", e);
+            for (uint32_t p = 1; p < MIN2(bl->planes, 3); ++p) {
+               if (!s->planes[p - 1])
+                  s->planes[p - 1] = rzalloc_array(s, nir_variable *, s->count);
+               s->planes[p - 1][e] = new_var(nir, nir_var_uniform, texture, var, bl->slot + (1 + p) * bl->count + e,
+                                             "_plane", e);
+            }
+            if (bl->planes > 1) {
+               if (!s->chroma)
+                  s->chroma = rzalloc_array(s, nir_variable *, s->count);
+               s->chroma[e] = new_var(nir, nir_var_uniform, glsl_bare_sampler_type(), var,
+                                      bl->slot + (1 + bl->planes) * bl->count + e, "_chroma", e);
+            }
          } else if (glsl_type_is_image(bare) && (glsl_get_sampler_dim(bare) == GLSL_SAMPLER_DIM_SUBPASS ||
                                                  glsl_get_sampler_dim(bare) == GLSL_SAMPLER_DIM_SUBPASS_MS)) {
             /* An input attachment: fetched, as a texture, at the layer
@@ -2552,6 +2572,8 @@ struct element_ref {
    struct split_var *s;
    uint32_t base;
    nir_def *index;
+   /* A texture's plane, of a YCbCr conversion's sampling. */
+   uint32_t plane;
 };
 
 static bool
@@ -2585,6 +2607,10 @@ static nir_variable *
 ref_var(const struct element_ref *r, uint32_t element, bool sampler)
 {
    element = MIN2(element, r->s->count - 1);
+   if (!sampler && r->plane && r->plane <= 2 && r->s->planes[r->plane - 1])
+      return r->s->planes[r->plane - 1][element];
+   if (sampler && r->plane && r->s->chroma)
+      return r->s->chroma[element];
    return sampler && r->s->sampler ? r->s->sampler[element] : r->s->texture[element];
 }
 
@@ -2857,12 +2883,20 @@ rewrite_resource_instr(nir_builder *b, nir_instr *instr, void *data)
       struct element_ref refs[2];
       unsigned count = 0;
       bool dynamic = false;
+      /* A plane of a YCbCr conversion's sampling: its own texture. */
+      uint32_t plane = 0;
+      const int plane_src = nir_tex_instr_src_index(tex, nir_tex_src_plane);
+      if (plane_src >= 0) {
+         plane = nir_src_as_uint(tex->src[plane_src].src);
+         nir_tex_instr_remove_src(tex, plane_src);
+      }
       for (unsigned i = 0; i < tex->num_srcs && count < 2; ++i) {
          const bool is_sampler = tex->src[i].src_type == nir_tex_src_sampler_deref;
          if (tex->src[i].src_type != nir_tex_src_texture_deref && !is_sampler)
             continue;
          if (!resolve_element(state, b, nir_src_as_deref(tex->src[i].src), &refs[count]))
             continue;
+         refs[count].plane = plane;
          srcs[count] = i;
          samplers[count] = is_sampler;
          dynamic |= refs[count].index != NULL;
@@ -3197,6 +3231,9 @@ struct word_buffers {
    const struct vk_shader_compile_info *info;
    /* Uniform buffers: how big each block is, from the variables vtn made. */
    struct hash_table *ubo_sizes;
+   /* Accesses whose binding a variable pointer chooses, which only the
+    * index they are given at run time tells (lower_variable_buffers). */
+   bool untraced;
 };
 
 /* The binding an index operand of load_ssbo and friends came from:
@@ -3374,7 +3411,8 @@ lower_to_words_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    uint32_t set, binding;
    nir_def *dynamic;
    if (!index_binding(intr->src[index_src], &set, &binding, &dynamic)) {
-      mesa_loge("wvk: a buffer access whose binding cannot be told");
+      /* A variable pointer's: after the rest. */
+      wb->untraced = true;
       return false;
    }
    if ((intr->intrinsic == nir_intrinsic_load_ubo || intr->intrinsic == nir_intrinsic_load_ssbo) &&
@@ -3420,6 +3458,112 @@ lower_to_words_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    else
       nir_instr_remove(&intr->instr);
    return true;
+}
+
+/* A buffer a variable pointer may choose: its set, WebGPU binding, and
+ * whether uniform. */
+struct buffer_candidate {
+   uint32_t set, binding;
+   bool ubo;
+};
+
+static uint32_t
+buffer_id(uint32_t set, uint32_t binding)
+{
+   return set << 16 | binding;
+}
+
+/* Variable pointers (variablePointersStorageBuffer): a pointer's buffer
+ * chosen by a phi or select, which no access can be told the binding of
+ * from where its index came. So every buffer's index says at run time
+ * which it is -- set << 16 | binding, the element added to the binding
+ * -- and each such access is one on each buffer of its kind the shader
+ * has, reads selected from and writes where the index is. */
+static bool
+lower_variable_buffers(nir_shader *nir, struct word_buffers *wb)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_create(impl);
+   struct util_dynarray candidates;
+   util_dynarray_init(&candidates, NULL);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         b.cursor = nir_before_instr(instr);
+         if (intr->intrinsic == nir_intrinsic_vulkan_resource_index) {
+            const uint32_t set = nir_intrinsic_desc_set(intr), binding = nir_intrinsic_binding(intr);
+            const VkDescriptorType type = (VkDescriptorType)nir_intrinsic_desc_type(intr);
+            const bool ubo = type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                             type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+                             type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+            /* Not the driver's own, which no pointer of the shader's is. */
+            const bool driver = set == WVK_DRIVER_GROUP && binding >= WVK_DRIVER_SLOT_BASE;
+            const uint32_t count = driver ? 0 : slot_elements(wb->info, set, binding);
+            for (uint32_t e = 0; e < count; ++e) {
+               bool seen = false;
+               util_dynarray_foreach(&candidates, struct buffer_candidate, c)
+                  seen |= c->set == set && c->binding == binding + e && c->ubo == ubo;
+               if (!seen)
+                  util_dynarray_append(&candidates, ((struct buffer_candidate){ set, binding + e, ubo }));
+            }
+            nir_def *id = nir_iadd_imm(&b, intr->src[0].ssa, buffer_id(set, binding));
+            nir_def_replace(&intr->def, nir_vec2(&b, id, nir_imm_int(&b, 0)));
+         } else if (intr->intrinsic == nir_intrinsic_vulkan_resource_reindex) {
+            nir_def *index = intr->src[0].ssa;
+            nir_def_replace(&intr->def, nir_vec2(&b, nir_iadd(&b, nir_channel(&b, index, 0), intr->src[1].ssa),
+                                                 nir_channel(&b, index, 1)));
+         } else if (intr->intrinsic == nir_intrinsic_load_vulkan_descriptor) {
+            nir_def_replace(&intr->def, intr->src[0].ssa);
+         }
+      }
+   }
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         bool ubo = false, writes = false;
+         int index_src = 0;
+         switch (intr->intrinsic) {
+         case nir_intrinsic_load_ubo: ubo = true; break;
+         case nir_intrinsic_load_ssbo:
+         case nir_intrinsic_get_ssbo_size: break;
+         case nir_intrinsic_ssbo_atomic:
+         case nir_intrinsic_ssbo_atomic_swap: writes = true; break;
+         case nir_intrinsic_store_ssbo: index_src = 1; writes = true; break;
+         default: continue;
+         }
+         b.cursor = nir_before_instr(instr);
+         nir_def *id = nir_channel(&b, intr->src[index_src].ssa, 0);
+         nir_def *result = NULL;
+         util_dynarray_foreach(&candidates, struct buffer_candidate, c) {
+            if (c->ubo != ubo)
+               continue;
+            nir_def *here = nir_ieq_imm(&b, id, buffer_id(c->set, c->binding));
+            if (writes)
+               nir_push_if(&b, here);
+            nir_def *value = lower_word_access(&b, wb, intr, ubo, c->set, c->binding);
+            if (writes) {
+               nir_pop_if(&b, NULL);
+               if (value)
+                  value = nir_if_phi(&b, value, result ? result : nir_undef(&b, value->num_components, value->bit_size));
+               result = value;
+            } else {
+               result = result ? nir_bcsel(&b, here, value, result) : value;
+            }
+         }
+         if (nir_intrinsic_infos[intr->intrinsic].has_dest && !result)
+            result = nir_undef(&b, intr->def.num_components, intr->def.bit_size);
+         if (result)
+            nir_def_replace(&intr->def, result);
+         else
+            nir_instr_remove(instr);
+      }
+   }
+   util_dynarray_fini(&candidates);
+   return nir_progress(true, impl, nir_metadata_none);
 }
 
 static bool
@@ -3786,6 +3930,8 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
    nir_foreach_variable_with_modes_safe(var, nir, nir_var_mem_ubo | nir_var_mem_ssbo)
       exec_node_remove(&var->node);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_to_words_instr, nir_metadata_none, &wb);
+   if (wb.untraced)
+      NIR_PASS(_, nir, lower_variable_buffers, &wb);
    /* Every access has its binding now; what is left of the descriptors is
     * their offset part, which is zero. */
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, zero_descriptors_instr, nir_metadata_control_flow, NULL);
@@ -4594,13 +4740,15 @@ source_serialize(const struct wvk_shader_source *src, struct blob *blob)
       for (uint32_t i = 0; i < l->binding_count; ++i) {
          const struct wvk_descriptor_set_binding_layout *b = &l->bindings[i];
          const uint32_t words[] = { b->type, b->count, b->stages, b->descriptor_index, b->dynamic_index,
-                                    b->slot, b->inline_offset, b->inline_size };
+                                    b->slot, b->inline_offset, b->inline_size, b->planes,
+                                    b->plane_descriptor_index };
          blob_write_bytes(blob, words, sizeof(words));
       }
       for (uint32_t i = 0; i < l->slot_count; ++i) {
          blob_write_uint32(blob, l->slots[i].binding);
          blob_write_uint32(blob, l->slots[i].element);
          blob_write_uint8(blob, l->slots[i].sampler);
+         blob_write_uint8(blob, l->slots[i].plane);
       }
    }
 }
@@ -4636,17 +4784,19 @@ source_deserialize(struct blob_reader *blob)
       l->dynamic_count = blob_read_uint32(blob);
       l->inline_size = blob_read_uint32(blob);
       for (uint32_t i = 0; i < binding_count; ++i) {
-         uint32_t words[8];
+         uint32_t words[10];
          blob_copy_bytes(blob, words, sizeof(words));
          l->bindings[i] = (struct wvk_descriptor_set_binding_layout){
             .type = words[0], .count = words[1], .stages = words[2], .descriptor_index = words[3],
             .dynamic_index = words[4], .slot = words[5], .inline_offset = words[6], .inline_size = words[7],
+            .planes = words[8], .plane_descriptor_index = words[9],
          };
       }
       for (uint32_t i = 0; i < slot_count; ++i) {
          l->slots[i].binding = blob_read_uint32(blob);
          l->slots[i].element = blob_read_uint32(blob);
          l->slots[i].sampler = blob_read_uint8(blob);
+         l->slots[i].plane = blob_read_uint8(blob);
       }
    }
    if (blob->overrun || !nir || src->nir.out_of_memory) {
@@ -5536,6 +5686,25 @@ has_unformatted_images(const nir_shader *nir)
    return false;
 }
 
+/* The YCbCr conversion of an immutable sampler of the layout's, which
+ * sampling through is a sample of each plane (nir_vk_lower_ycbcr_tex). */
+static const struct vk_ycbcr_conversion_state *
+ycbcr_conversion_lookup(const void *data, uint32_t set, uint32_t binding, uint32_t array_index)
+{
+   const struct vk_shader_compile_info *info = data;
+   if (set >= info->set_layout_count || !info->set_layouts[set])
+      return NULL;
+   const struct wvk_descriptor_set_layout *layout =
+      container_of(info->set_layouts[set], struct wvk_descriptor_set_layout, vk);
+   if (binding >= layout->binding_count)
+      return NULL;
+   const struct wvk_descriptor_set_binding_layout *bl = &layout->bindings[binding];
+   if (!bl->immutable_samplers || array_index >= bl->count || !bl->immutable_samplers[array_index])
+      return NULL;
+   const struct vk_ycbcr_conversion *conversion = bl->immutable_samplers[array_index]->vk.ycbcr_conversion;
+   return conversion ? &conversion->state : NULL;
+}
+
 static VkResult
 wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_compile_info *infos,
             const struct vk_graphics_pipeline_state *state, const struct vk_features *enabled_features,
@@ -5547,6 +5716,9 @@ wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_co
     * of those, linked to whatever they are drawn with. */
    struct wvk_shader_source *sources[MESA_VK_MAX_GRAPHICS_PIPELINE_STAGES] = { NULL };
    for (uint32_t i = 0; i < shader_count; ++i) {
+      /* Sampling through YCbCr conversions, a plane at a time, before the
+       * sources keep it: their layouts have no samplers. */
+      NIR_PASS(_, infos[i].nir, nir_vk_lower_ycbcr_tex, ycbcr_conversion_lookup, &infos[i]);
       if (infos[i].stage == MESA_SHADER_VERTEX)
          vs = infos[i].nir;
       else if (infos[i].stage == MESA_SHADER_FRAGMENT)

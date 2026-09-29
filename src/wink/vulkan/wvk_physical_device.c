@@ -115,6 +115,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
+      .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
       .KHR_shader_draw_parameters = true,
       .KHR_16bit_storage = true,
@@ -268,6 +269,13 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .storagePushConstant16 = true,
       .storageInputOutput16 = true,
       .multiview = true,
+      /* Multi-planar images, a texture a plane (wvk_image.h), sampled a
+       * plane a binding through the conversion (wvk_shader.c). */
+      .samplerYcbcrConversion = true,
+      /* A buffer a pointer's phi or select chooses: each access one on
+       * every buffer it may be, by the index (wvk_shader.c). */
+      .variablePointersStorageBuffer = true,
+      .variablePointers = true,
       /* Their stages run as compute within each view's replay of the pass,
        * the view index the driver's data. */
       .multiviewGeometryShader = true,
@@ -927,6 +935,15 @@ optimal_features(const struct wvk_physical_device *pdev, VkFormat format)
    VkFormatFeatureFlags2 f = 0;
    if (!caps)
       return 0;
+   /* Multi-planar: its planes copied, and sampled through a conversion
+    * (nir_vk_lower_ycbcr_tex), a texture a plane. */
+   if (caps & WVK_CAP_PLANAR)
+      return VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+             VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+             VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT | VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT |
+             VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT |
+             VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT |
+             VK_FORMAT_FEATURE_2_DISJOINT_BIT;
 
    if (caps & WVK_CAP_SAMPLE) {
       f |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
@@ -992,9 +1009,11 @@ wvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat
    const VkFormatFeatureFlags2 buffer = buffer_features(pdev, format);
    /* WebGPU has no linear textures: a linear image is memory, and only
     * copied to and from. */
-   const VkFormatFeatureFlags2 linear =
+   VkFormatFeatureFlags2 linear =
       wvk_image_linear_supported(pdev, format, VK_IMAGE_TYPE_2D, 0)
          ? VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT : 0;
+   if (linear && (wvk_format_caps(pdev, format) & WVK_CAP_PLANAR))
+      linear |= VK_FORMAT_FEATURE_2_DISJOINT_BIT;
 
    pFormatProperties->formatProperties = (VkFormatProperties){
       .linearTilingFeatures = vk_format_features2_to_features(linear),
@@ -1035,7 +1054,8 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
       /* A linear image is memory copied to and from, and never has a view,
        * so being allowed views of other formats changes nothing about it. */
       if (!wvk_image_linear_supported(pdev, info->format, info->type, info->usage) ||
-          (info->flags & ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)))
+          (info->flags & ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
+                           ((caps & WVK_CAP_PLANAR) ? VK_IMAGE_CREATE_DISJOINT_BIT : 0))))
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
       pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
          .maxExtent = { l->maxTextureDimension2D, l->maxTextureDimension2D, 1 },
@@ -1062,7 +1082,10 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    if ((usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
        !(caps & (WVK_CAP_RENDER | WVK_CAP_DEPTH | WVK_CAP_STENCIL)))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
-   if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(caps & WVK_CAP_STORAGE))
+   /* A multi-planar image's planes may be storage, viewed as formats
+    * that are, where it says so. */
+   const bool plane_storage = (caps & WVK_CAP_PLANAR) && (info->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
+   if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(caps & WVK_CAP_STORAGE) && !plane_storage)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    if ((usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !(caps & WVK_CAP_RENDER))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -1108,22 +1131,47 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    }
 
+   /* A multi-planar image: 2D, of one level and layer, not disjoint but
+    * where the format says it may be. */
+   if (caps & WVK_CAP_PLANAR) {
+      if (info->type != VK_IMAGE_TYPE_2D ||
+          (usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                     (plane_storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0))))
+         return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
+         .maxExtent = extent,
+         .maxMipLevels = 1,
+         .maxArrayLayers = 1,
+         .sampleCounts = VK_SAMPLE_COUNT_1_BIT,
+         .maxResourceSize = UINT32_MAX,
+      };
+   } else if (info->flags & VK_IMAGE_CREATE_DISJOINT_BIT) {
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
    VkSampleCountFlags samples = VK_SAMPLE_COUNT_1_BIT;
    if (info->type == VK_IMAGE_TYPE_2D && (caps & WVK_CAP_MSAA) &&
        !(info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
        !(usage & VK_IMAGE_USAGE_STORAGE_BIT))
       samples = WVK_SAMPLE_COUNTS;
 
-   pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
-      .maxExtent = extent,
-      .maxMipLevels = util_logbase2(MAX3(extent.width, extent.height, extent.depth)) + 1,
-      .maxArrayLayers = layers,
-      .sampleCounts = samples,
-      .maxResourceSize = UINT32_MAX,
-   };
+   if (!(caps & WVK_CAP_PLANAR)) {
+      pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
+         .maxExtent = extent,
+         .maxMipLevels = util_logbase2(MAX3(extent.width, extent.height, extent.depth)) + 1,
+         .maxArrayLayers = layers,
+         .sampleCounts = samples,
+         .maxResourceSize = UINT32_MAX,
+      };
+   }
 
    vk_foreach_struct(stype, ext, pImageFormatProperties->pNext) {
       switch (stype) {
+      case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES: {
+         /* A texture a plane, in the bindings a descriptor of it takes. */
+         VkSamplerYcbcrConversionImageFormatProperties *p = ext;
+         p->combinedImageSamplerDescriptorCount = vk_format_get_plane_count(info->format);
+         break;
+      }
       case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES: {
          VkExternalImageFormatProperties *p = ext;
          p->externalMemoryProperties = (VkExternalMemoryProperties){ 0 };

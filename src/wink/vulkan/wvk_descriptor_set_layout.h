@@ -28,6 +28,14 @@ struct wvk_descriptor_set_binding_layout {
    uint32_t slot;
    /* count of them, or NULL. */
    struct wvk_sampler **immutable_samplers;
+   /* The planes of a combined image sampler's views, of the YCbCr
+    * conversions of its immutable samplers: each after the first is a
+    * texture more, at slot + (1 + plane) * count, and a descriptor more,
+    * at plane_descriptor_index + (plane - 1) * count, after the set's
+    * others; and with them a sampler of the chroma filter, at
+    * slot + (1 + planes) * count, the second plane's descriptor's. */
+   uint32_t planes;
+   uint32_t plane_descriptor_index;
    /* An inline uniform block: its bytes, and where they are in the set's
     * buffer of them. */
    uint32_t inline_offset;
@@ -40,7 +48,17 @@ struct wvk_descriptor_slot {
    uint32_t binding;
    uint32_t element;
    bool sampler;
+   /* A texture of a plane after the first: which. */
+   uint8_t plane;
 };
+
+/* The descriptor a slot is: its own, or its plane's. */
+static inline uint32_t
+wvk_slot_descriptor_index(const struct wvk_descriptor_set_binding_layout *bl, const struct wvk_descriptor_slot *s)
+{
+   return s->plane ? bl->plane_descriptor_index + (s->plane - 1) * bl->count + s->element
+                   : bl->descriptor_index + s->element;
+}
 
 struct wvk_descriptor_set_layout {
    struct vk_descriptor_set_layout vk;

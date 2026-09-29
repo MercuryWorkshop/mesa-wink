@@ -9,6 +9,7 @@
 #include "wvk_sampler.h"
 
 #include "vk_alloc.h"
+#include "vk_format.h"
 #include "vk_util.h"
 
 #include "util/mesa-blake3.h"
@@ -31,6 +32,22 @@ find_binding(const VkDescriptorSetLayoutCreateInfo *info, uint32_t binding)
    return NULL;
 }
 
+/* The planes a combined image sampler binding's views have: of the YCbCr
+ * conversions of its immutable samplers, a texture each. */
+static uint32_t
+binding_planes(const VkDescriptorSetLayoutBinding *b)
+{
+   uint32_t planes = 1;
+   if (b->descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || !binding_has_immutable_samplers(b))
+      return 1;
+   for (uint32_t e = 0; e < b->descriptorCount; ++e) {
+      VK_FROM_HANDLE(vk_sampler, sampler, b->pImmutableSamplers[e]);
+      if (sampler && sampler->ycbcr_conversion)
+         planes = MAX2(planes, vk_format_get_plane_count(sampler->ycbcr_conversion->state.format));
+   }
+   return planes;
+}
+
 static void
 count_layout(const VkDescriptorSetLayoutCreateInfo *info, uint32_t *binding_count,
              uint32_t *slot_count, uint32_t *sampler_count)
@@ -44,7 +61,8 @@ count_layout(const VkDescriptorSetLayoutCreateInfo *info, uint32_t *binding_coun
       if (b->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
          *slot_count += 1;
       else
-         *slot_count += b->descriptorCount * wvk_descriptor_type_slots(b->descriptorType);
+         *slot_count += b->descriptorCount * (wvk_descriptor_type_slots(b->descriptorType) + binding_planes(b) - 1 +
+                                              (binding_planes(b) > 1));
       if (binding_has_immutable_samplers(b))
          *sampler_count += b->descriptorCount;
    }
@@ -106,13 +124,18 @@ wvk_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCreat
          bl->dynamic_index = dynamic;
          dynamic += bl->count;
       }
-      const uint32_t halves = wvk_descriptor_type_slots(bl->type);
+      bl->planes = info->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ? 1 : binding_planes(info);
+      /* The texture and sampler, the other planes' textures, and their
+       * sampler of the chroma filter. */
+      const uint32_t halves = wvk_descriptor_type_slots(bl->type) + bl->planes - 1 + (bl->planes > 1);
       for (uint32_t h = 0; h < halves; ++h) {
+         const bool chroma = bl->planes > 1 && h == bl->planes + 1;
          for (uint32_t e = 0; e < bl->count; ++e) {
             layout->slots[slot++] = (struct wvk_descriptor_slot){
                .binding = b,
                .element = e,
-               .sampler = h == 1,
+               .sampler = h == 1 || chroma,
+               .plane = chroma ? 1 : h >= 2 ? h - 1 : 0,
             };
          }
       }
@@ -122,6 +145,14 @@ wvk_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCreat
             bl->immutable_samplers[e] = wvk_sampler_from_handle(info->pImmutableSamplers[e]);
          next_sampler += bl->count;
       }
+   }
+   /* The planes' descriptors, after every binding's own. */
+   for (uint32_t b = 0; b < binding_count; ++b) {
+      struct wvk_descriptor_set_binding_layout *bl = &layout->bindings[b];
+      if (bl->type == VK_DESCRIPTOR_TYPE_MAX_ENUM || bl->planes <= 1)
+         continue;
+      bl->plane_descriptor_index = descriptor;
+      descriptor += bl->count * (bl->planes - 1);
    }
    layout->descriptor_count = descriptor;
    layout->dynamic_count = dynamic;
@@ -139,6 +170,7 @@ wvk_CreateDescriptorSetLayout(VkDevice _device, const VkDescriptorSetLayoutCreat
       _mesa_blake3_update(&ctx, &bl->count, sizeof(bl->count));
       _mesa_blake3_update(&ctx, &bl->stages, sizeof(bl->stages));
       _mesa_blake3_update(&ctx, &bl->slot, sizeof(bl->slot));
+      _mesa_blake3_update(&ctx, &bl->planes, sizeof(bl->planes));
       const bool immutable = bl->immutable_samplers != NULL;
       _mesa_blake3_update(&ctx, &immutable, sizeof(immutable));
    }

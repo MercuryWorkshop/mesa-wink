@@ -67,6 +67,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   operations stay WGSL's f16; words of them, from memory or moves, are
   packHalf2x16's bits. Memory is words already: a store of less than a
   word is atomics on its bits, and interpolated half floats are floats.
+- **Variable pointers** (variablePointers, variablePointersStorageBuffer):
+  a buffer access whose binding a phi or select chooses, which cannot be
+  traced back to one, is an access of each buffer of its kind the shader
+  has. Every buffer index then says at run time which binding it is (set
+  and WebGPU binding), and reads are selected from, writes done where it
+  matches.
 - **What WebGPU's objects cannot hold** of descriptors, shaders do
   themselves: each set has a record for each of its bindings, which the
   shader reads at the draw (`wvk_nir_descriptors.c`), from the push binding
@@ -245,6 +251,17 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   have, are RGBA8 textures. Copies to and from buffers are a shader's,
   which packs and unpacks the texels; a format without alpha keeps its
   texture's at one. Blending is at 8 bits, not the format's.
+- **Multi-planar formats and YCbCr conversions** (samplerYcbcrConversion):
+  the 2- and 3-plane 4:2:0, 4:2:2 and 4:4:4 formats of 8, 10, 12 and 16
+  bits (the last three with texture-formats-tier1). An image of one is an
+  image of each plane, of the plane's format and size (R10X6 and the like
+  are 16-bit normalized textures), bound to its part of the memory or,
+  disjoint, to its own. Copies of a plane are the plane image's, and so is
+  a view of one. A view of the whole has a view of each plane. A combined
+  image sampler whose immutable sampler has a conversion takes a texture
+  binding for each plane after the first, and a sampler of the chroma
+  filter for them. The runtime's nir_vk_lower_ycbcr_tex samples each plane
+  and converts, before the shader's source is kept.
 - **Memory is one WGPUBuffer**, which the buffers bound to it share. WebGPU
   lets a buffer written as storage have no other use in a usage scope --
   a dispatch, or a whole render pass -- which suballocated memory has all
@@ -423,6 +440,12 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   2x2 footprint across its edges is not worked out.
 - Lines and points of triangles are not culled: which way a triangle
   faces is the vertex shader's to say, after the lists are made.
+- The single-plane 4:2:2 formats (G8B8G8R8_422 and the like), which WebGPU
+  has nothing to sample as; and storage of a whole multi-planar image,
+  rather than of its planes' views.
+- Images bound to the same memory share nothing but it: an optimal image's
+  texels are its texture's, so aliasing images see each other's writes only
+  through copies (YCbCr's memory_alias cases among them).
 - Multisampled array images are a texture for each layer, since WebGPU
   has no multisampled arrays: attachments, clears, copies and resolves
   (vk_meta's, for formats WebGPU does not resolve, a layer at a time) are

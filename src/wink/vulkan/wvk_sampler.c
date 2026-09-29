@@ -13,6 +13,9 @@
 #include "wvk_device.h"
 #include "wvk_entrypoints.h"
 
+#include "vk_format.h"
+#include "vk_ycbcr_conversion.h"
+
 static WGPUAddressMode
 address_mode(VkSamplerAddressMode mode)
 {
@@ -115,6 +118,31 @@ wvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
    memcpy(&sampler->meta[WVK_META_SAMPLER_MAX_LOD], &info->maxLod, 4);
    memcpy(&sampler->meta[WVK_META_SAMPLER_BORDER], &sampler->vk.border_color_value, 16);
 
+   /* A YCbCr conversion's chroma planes are filtered its way, where they
+    * are subsampled; else as the rest. */
+   if (sampler->vk.ycbcr_conversion) {
+      const VkFormat format = sampler->vk.ycbcr_conversion->state.format;
+      bool subsampled = false;
+      for (uint32_t p = 1; p < vk_format_get_plane_count(format); ++p)
+         subsampled |= vk_format_get_plane_width(format, p, 2) < 2 || vk_format_get_plane_height(format, p, 2) < 2;
+      const VkFilter chroma = sampler->vk.ycbcr_conversion->state.chroma_filter;
+      desc.label = wvk_sv("VkSampler chroma");
+      desc.magFilter = filter_mode(subsampled ? chroma : info->magFilter);
+      desc.minFilter = filter_mode(subsampled ? chroma : info->minFilter);
+      desc.maxAnisotropy = 1;
+      sampler->chroma = wgpuDeviceCreateSampler(dev->wgpu, &desc);
+      sampler->chroma_binding_type = desc.magFilter == WGPUFilterMode_Linear || desc.minFilter == WGPUFilterMode_Linear ||
+                                           desc.mipmapFilter == WGPUMipmapFilterMode_Linear
+                                        ? WGPUSamplerBindingType_Filtering
+                                        : WGPUSamplerBindingType_NonFiltering;
+      memcpy(sampler->chroma_meta, sampler->meta, sizeof(sampler->meta));
+      sampler->chroma_meta[WVK_META_SAMPLER_FLAGS] &= ~(WVK_SAMPLER_MAG_LINEAR | WVK_SAMPLER_MIN_LINEAR);
+      if (desc.magFilter == WGPUFilterMode_Linear)
+         sampler->chroma_meta[WVK_META_SAMPLER_FLAGS] |= WVK_SAMPLER_MAG_LINEAR;
+      if (desc.minFilter == WGPUFilterMode_Linear)
+         sampler->chroma_meta[WVK_META_SAMPLER_FLAGS] |= WVK_SAMPLER_MIN_LINEAR;
+   }
+
    *pSampler = wvk_sampler_to_handle(sampler);
    return VK_SUCCESS;
 }
@@ -127,5 +155,7 @@ wvk_DestroySampler(VkDevice _device, VkSampler _sampler, const VkAllocationCallb
    if (!sampler)
       return;
    wgpuSamplerRelease(sampler->wgpu);
+   if (sampler->chroma)
+      wgpuSamplerRelease(sampler->chroma);
    vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);
 }

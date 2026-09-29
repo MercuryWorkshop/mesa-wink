@@ -1132,6 +1132,18 @@ wvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIma
    VK_FROM_HANDLE(wvk_image, dst, pCopyBufferToImageInfo->dstImage);
    struct wvk_replay *replay = cmd->replay;
 
+   /* A multi-planar image's planes, a region at a time. */
+   if (dst->plane_count) {
+      for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; ++i) {
+         VkBufferImageCopy2 r = pCopyBufferToImageInfo->pRegions[i];
+         VkCopyBufferToImageInfo2 one = *pCopyBufferToImageInfo;
+         one.dstImage = wvk_image_to_handle(wvk_image_for_aspect(dst, &r.imageSubresource.aspectMask));
+         one.regionCount = 1;
+         one.pRegions = &r;
+         wvk_CmdCopyBufferToImage2(commandBuffer, &one);
+      }
+      return;
+   }
    wvk_replay_end_passes(replay);
    for (uint32_t i = 0; i < pCopyBufferToImageInfo->regionCount; ++i) {
       const VkBufferImageCopy2 *r = &pCopyBufferToImageInfo->pRegions[i];
@@ -1146,6 +1158,7 @@ wvk_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIma
       if (dst->linear) {
          const uint32_t bpp = util_format_get_blocksize(vk_format_to_pipe_format(dst->vk.format));
          const uint64_t at = linear_offset(dst, r->imageOffset);
+         wvk_replay_read(replay, dst->mem, at, linear_bytes(dst, r->imageExtent));
          repack(wvk_cmd_buffer_device(cmd), replay, buffer_wgpu(src), off, l.row_bytes,
                 l.rows_per_image * l.row_bytes, dst->mem->buffer, at, dst->pitch, 0,
                 r->imageExtent.width * bpp, r->imageExtent.height, 1);
@@ -1166,6 +1179,17 @@ wvk_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBuff
    VK_FROM_HANDLE(wvk_buffer, dst, pCopyImageToBufferInfo->dstBuffer);
    struct wvk_replay *replay = cmd->replay;
 
+   if (src->plane_count) {
+      for (uint32_t i = 0; i < pCopyImageToBufferInfo->regionCount; ++i) {
+         VkBufferImageCopy2 r = pCopyImageToBufferInfo->pRegions[i];
+         VkCopyImageToBufferInfo2 one = *pCopyImageToBufferInfo;
+         one.srcImage = wvk_image_to_handle(wvk_image_for_aspect(src, &r.imageSubresource.aspectMask));
+         one.regionCount = 1;
+         one.pRegions = &r;
+         wvk_CmdCopyImageToBuffer2(commandBuffer, &one);
+      }
+      return;
+   }
    wvk_replay_end_passes(replay);
    for (uint32_t i = 0; i < pCopyImageToBufferInfo->regionCount; ++i) {
       const VkBufferImageCopy2 *r = &pCopyImageToBufferInfo->pRegions[i];
@@ -1207,6 +1231,8 @@ copy_image_linear(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_
    if (src->linear && dst->linear) {
       const uint64_t from = linear_offset(src, r->srcOffset), to = linear_offset(dst, r->dstOffset);
       wvk_replay_read(replay, src->mem, from, linear_bytes(src, r->extent));
+      /* What is between the region's rows comes back too: as it is. */
+      wvk_replay_read(replay, dst->mem, to, linear_bytes(dst, r->extent));
       repack(dev, replay, src->mem->buffer, from, src->pitch, 0, dst->mem->buffer, to, dst->pitch, 0,
              r->extent.width * bpp, r->extent.height, 1);
       wvk_replay_write(replay, dst->mem, to, linear_bytes(dst, r->extent));
@@ -1228,13 +1254,17 @@ copy_image_linear(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_
       const struct copy_layout l = { 1, 1, 2, linear->pitch, size.height };
       if (src->linear)
          wvk_replay_read(replay, linear->mem, buf.layout.offset, linear_bytes(linear, r->extent));
+      if (!src->linear)
+         wvk_replay_read(replay, linear->mem, buf.layout.offset, linear_bytes(linear, r->extent));
       convert_packed16(dev, replay, tiled, src->linear, linear->mem->buffer, buf.layout.offset, &l, &tex, size);
       if (!src->linear)
          wvk_replay_write(replay, linear->mem, buf.layout.offset, linear_bytes(linear, r->extent));
       return;
    }
+   /* Into it, what is between the region's rows comes back too, as it is:
+    * the GPU's copy has to have it. */
+   wvk_replay_read(replay, linear->mem, buf.layout.offset, linear_bytes(linear, r->extent));
    if (src->linear) {
-      wvk_replay_read(replay, linear->mem, buf.layout.offset, linear_bytes(linear, r->extent));
       wgpuCommandEncoderCopyBufferToTexture(replay->encoder, &buf, &tex, &size);
    } else {
       wgpuCommandEncoderCopyTextureToBuffer(replay->encoder, &tex, &buf, &size);
@@ -1269,6 +1299,18 @@ wvk_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyIm
    struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
    struct wvk_replay *replay = cmd->replay;
 
+   if (src->plane_count || dst->plane_count) {
+      for (uint32_t i = 0; i < pCopyImageInfo->regionCount; ++i) {
+         VkImageCopy2 r = pCopyImageInfo->pRegions[i];
+         VkCopyImageInfo2 one = *pCopyImageInfo;
+         one.srcImage = wvk_image_to_handle(wvk_image_for_aspect(src, &r.srcSubresource.aspectMask));
+         one.dstImage = wvk_image_to_handle(wvk_image_for_aspect(dst, &r.dstSubresource.aspectMask));
+         one.regionCount = 1;
+         one.pRegions = &r;
+         wvk_CmdCopyImage2(commandBuffer, &one);
+      }
+      return;
+   }
    wvk_replay_end_passes(replay);
    /* WebGPU copies between textures of one format, give or take sRGB;
     * Vulkan between any of one size, which goes through a buffer. */

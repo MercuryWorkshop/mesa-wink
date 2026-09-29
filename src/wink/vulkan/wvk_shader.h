@@ -45,7 +45,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 23
+#define WVK_SHADER_BINARY_VERSION 24
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a

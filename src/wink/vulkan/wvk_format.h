@@ -29,6 +29,12 @@ enum wvk_format_cap {
    /* A 16-bit packed format WebGPU does not have: an RGBA8 texture, whose
     * copies to and from buffers convert (wvk_cmd_copy.c). */
    WVK_CAP_PACKED16     = 1u << 14,
+   /* A multi-planar format: an image of it is one of each plane's format
+    * (wvk_image.h), sampled through a YCbCr conversion. */
+   WVK_CAP_PLANAR       = 1u << 15,
+   /* A padded 16-bit format (R10X6 and the like): a 16-bit normalized
+    * texture, of more bits than the format's own. */
+   WVK_CAP_PADDED       = 1u << 16,
 };
 
 struct wvk_format {

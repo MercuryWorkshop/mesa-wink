@@ -19,6 +19,11 @@ struct wvk_sampler {
    /* What WebGPU's sampler cannot say, for shaders: its descriptor's
     * record (WVK_META_SAMPLER_*). */
    uint32_t meta[WVK_META_WORDS];
+   /* Of a YCbCr conversion: the same, of its chroma filter, which the
+    * chroma planes are sampled with. */
+   WGPUSampler chroma;
+   WGPUSamplerBindingType chroma_binding_type;
+   uint32_t chroma_meta[WVK_META_WORDS];
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_sampler, vk.base, VkSampler, VK_OBJECT_TYPE_SAMPLER)
