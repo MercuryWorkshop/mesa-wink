@@ -4804,7 +4804,7 @@ source_deserialize(struct blob_reader *blob)
          continue;
       const uint32_t binding_count = blob_read_uint32(blob);
       const uint32_t slot_count = blob_read_uint32(blob);
-      if (blob->overrun || binding_count > WVK_MAX_SET_SLOTS || slot_count > WVK_MAX_SET_SLOTS)
+         if (blob->overrun || binding_count > WVK_MAX_SET_SLOTS || slot_count > WVK_MAX_SET_SLOTS)
          break;
       struct wvk_descriptor_set_layout *l = layout_alloc(binding_count, slot_count);
       if (!l)
@@ -6253,7 +6253,9 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const uint8_t xfb_buffers = blob_read_uint8(blob);
    uint16_t xfb_strides[4];
    blob_copy_bytes(blob, xfb_strides, sizeof(xfb_strides));
-   const uint8_t xfb_output_count = MIN2(blob_read_uint8(blob), WVK_MAX_XFB_OUTPUTS);
+   /* Read once: MIN2 would read it twice. */
+   const uint8_t xfb_outputs_read = blob_read_uint8(blob);
+   const uint8_t xfb_output_count = MIN2(xfb_outputs_read, WVK_MAX_XFB_OUTPUTS);
    struct wvk_xfb_output xfb_outputs[WVK_MAX_XFB_OUTPUTS];
    blob_copy_bytes(blob, xfb_outputs, xfb_output_count * sizeof(xfb_outputs[0]));
    const bool writes_storage = blob_read_uint8(blob);

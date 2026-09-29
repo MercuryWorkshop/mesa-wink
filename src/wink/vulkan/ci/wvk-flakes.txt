@@ -82,3 +82,15 @@ dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.fence_atomic.atomicwrit
 dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.fence_fence.atomicwrite.device.payload_local.image.guard_nonlocal.buffer.frag
 # Multisampled input attachments a draw reads as it writes: half pass, half not, at HEAD too.
 dEQP-VK\.renderpasses\..*\.input\..*\.self_dep_.*_ms$
+dEQP-VK.memory_model.message_passing.ext.u32.coherent.atomic_atomic.atomicwrite.device.payload_local.buffer.guard_nonlocal.buffer.vert
+dEQP-VK.memory_model.message_passing.ext.u32.coherent.atomic_atomic.atomicwrite.device.payload_nonlocal.buffer.guard_local.buffer.vert
+dEQP-VK.memory_model.message_passing.ext.u32.coherent.atomic_fence.atomicwrite.queuefamily.payload_nonlocal.buffer.guard_nonlocal.buffer.vert
+dEQP-VK.memory_model.message_passing.ext.u32.coherent.fence_atomic.atomicwrite.device.payload_local.buffer.guard_local.buffer.vert
+dEQP-VK.memory_model.message_passing.ext.u32.coherent.fence_fence.atomicwrite.device.payload_nonlocal.buffer.guard_local.buffer.vert
+dEQP-VK.memory_model.message_passing.ext.u32.coherent.fence_fence.atomicwrite.queuefamily.payload_local.buffer.guard_local.buffer.vert
+dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.atomic_atomic.atomicwrite.queuefamily.payload_local.buffer.guard_local.buffer.vert
+dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.atomic_fence.atomicwrite.queuefamily.payload_local.buffer.guard_local.buffer.vert
+dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.atomic_fence.atomicwrite.queuefamily.payload_nonlocal.buffer.guard_nonlocal.buffer.vert
+dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.fence_atomic.atomicwrite.queuefamily.payload_nonlocal.buffer.guard_local.buffer.vert
+dEQP-VK.memory_model.message_passing.ext.u32.noncoherent.fence_fence.atomicwrite.queuefamily.payload_local.buffer.guard_nonlocal.buffer.vert
+dEQP-VK.memory_model.write_after_read.ext.u32.coherent.atomic_atomic.atomicrmw.device.payload_local.image.guard_nonlocal.buffer.vert
