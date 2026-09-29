@@ -2960,6 +2960,24 @@ drop_depth_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* A float's conversion to an integer where it is past the integer's range:
+ * the integer's largest, as GPUs do. WGSL's saturates at the largest float
+ * below it, 2^31 - 128 for i32. */
+static bool
+saturate_f2i_instr(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if ((alu->op != nir_op_f2i32 && alu->op != nir_op_f2u32) || nir_src_bit_size(alu->src[0].src) != 32)
+      return false;
+   b->cursor = nir_after_instr(&alu->instr);
+   nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
+   const bool is_signed = alu->op == nir_op_f2i32;
+   nir_def *over = nir_fge_imm(b, x, is_signed ? 2147483648.0 : 4294967296.0);
+   nir_def *top = nir_imm_int(b, is_signed ? INT32_MAX : (int32_t)UINT32_MAX);
+   nir_def *out = nir_bcsel(b, over, top, &alu->def);
+   nir_def_rewrite_uses_after(&alu->def, out);
+   return true;
+}
+
 static VkResult
 compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
             const struct vk_graphics_pipeline_state *pipeline_state, const struct wvk_shader_key *records,
@@ -3163,6 +3181,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    /* And what the optimizations made of 64-bit floats since: a subtraction
     * an addition of the negation, say. */
    lower_float64(wvk_device_physical(dev), nir);
+   NIR_PASS(_, nir, nir_shader_alu_pass, saturate_f2i_instr, nir_metadata_control_flow, NULL);
    /* The combined and arrayed originals, now without a use. */
    hash_table_foreach(state.split, he)
       exec_node_remove(&((nir_variable *)he->key)->node);

@@ -40,6 +40,11 @@
    [VK_FORMAT_##vk] = { .texture = WGPUTextureFormat_Undefined, .vertex = VF(vtx), .caps = 0 }
 #define FEAT(vk, tex, feat, caps_) \
    [VK_FORMAT_##vk] = { .texture = TF(tex), .feature = WGPUFeatureName_##feat, .caps = (caps_) }
+/* A vertex format always, and a texture where the feature is. */
+#define VTX_FEAT(vk, vtx, tex, feat, caps_) \
+   [VK_FORMAT_##vk] = { .texture = TF(tex), .vertex = VF(vtx), .feature = WGPUFeatureName_##feat, .caps = (caps_) }
+/* texture-formats-tier1's 16-bit normalized formats: no resolve. */
+#define NORM16 (SAMPLE_F | RT | WVK_CAP_BLEND | MS | ST)
 
 /* Indexed by VkFormat; the core formats end at VK_FORMAT_ASTC_12x12_SRGB_BLOCK. */
 static const struct wvk_format formats[VK_FORMAT_ASTC_12x12_SRGB_BLOCK + 1] = {
@@ -83,18 +88,18 @@ static const struct wvk_format formats[VK_FORMAT_ASTC_12x12_SRGB_BLOCK + 1] = {
    FMT(R16_UINT, R16Uint, Uint16, SAMPLE_I | RT | MS),
    FMT(R16_SINT, R16Sint, Sint16, SAMPLE_I | RT | MS),
    FMT(R16_SFLOAT, R16Float, Float16, SAMPLE_F | RT_FULL),
-   VTX(R16_UNORM, Unorm16),
-   VTX(R16_SNORM, Snorm16),
+   VTX_FEAT(R16_UNORM, Unorm16, R16Unorm, TextureFormatsTier1, NORM16),
+   VTX_FEAT(R16_SNORM, Snorm16, R16Snorm, TextureFormatsTier1, NORM16),
    FMT(R16G16_UINT, RG16Uint, Uint16x2, SAMPLE_I | RT | MS),
    FMT(R16G16_SINT, RG16Sint, Sint16x2, SAMPLE_I | RT | MS),
    FMT(R16G16_SFLOAT, RG16Float, Float16x2, SAMPLE_F | RT_FULL),
-   VTX(R16G16_UNORM, Unorm16x2),
-   VTX(R16G16_SNORM, Snorm16x2),
+   VTX_FEAT(R16G16_UNORM, Unorm16x2, RG16Unorm, TextureFormatsTier1, NORM16),
+   VTX_FEAT(R16G16_SNORM, Snorm16x2, RG16Snorm, TextureFormatsTier1, NORM16),
    FMT(R16G16B16A16_UINT, RGBA16Uint, Uint16x4, SAMPLE_I | RT | MS | ST),
    FMT(R16G16B16A16_SINT, RGBA16Sint, Sint16x4, SAMPLE_I | RT | MS | ST),
    FMT(R16G16B16A16_SFLOAT, RGBA16Float, Float16x4, SAMPLE_F | RT_FULL | ST),
-   VTX(R16G16B16A16_UNORM, Unorm16x4),
-   VTX(R16G16B16A16_SNORM, Snorm16x4),
+   VTX_FEAT(R16G16B16A16_UNORM, Unorm16x4, RGBA16Unorm, TextureFormatsTier1, NORM16),
+   VTX_FEAT(R16G16B16A16_SNORM, Snorm16x4, RGBA16Snorm, TextureFormatsTier1, NORM16),
 
    /* 32-bit: floats are unfilterable and unblendable without features */
    FMT(R32_UINT, R32Uint, Uint32, SAMPLE_I | RT | ST_RW),
@@ -235,6 +240,8 @@ wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format)
       return 0;
 
    uint32_t caps = f->caps;
+   const bool tier1 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureFormatsTier1);
+   const bool tier2 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureFormatsTier2);
    switch (f->texture) {
    case WGPUTextureFormat_R32Float:
    case WGPUTextureFormat_RG32Float:
@@ -243,10 +250,50 @@ wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format)
          caps |= WVK_CAP_FILTER;
       if (wvk_physical_device_has_feature(pdev, WGPUFeatureName_Float32Blendable))
          caps |= WVK_CAP_BLEND;
+      if (f->texture == WGPUTextureFormat_RGBA32Float && tier2)
+         caps |= ST_RW;
       break;
    case WGPUTextureFormat_RG11B10Ufloat:
       if (wvk_physical_device_has_feature(pdev, WGPUFeatureName_RG11B10UfloatRenderable))
          caps |= RT_FULL;
+      if (tier1)
+         caps |= ST;
+      break;
+   /* texture-formats-tier1 and -tier2, as Dawn's Format.cpp has them. */
+   case WGPUTextureFormat_R8Unorm:
+   case WGPUTextureFormat_R8Uint:
+   case WGPUTextureFormat_R8Sint:
+   case WGPUTextureFormat_R16Uint:
+   case WGPUTextureFormat_R16Sint:
+   case WGPUTextureFormat_R16Float:
+      caps |= (tier1 ? ST : 0) | (tier2 ? ST_RW : 0);
+      break;
+   case WGPUTextureFormat_R8Snorm:
+   case WGPUTextureFormat_RG8Snorm:
+      caps |= tier1 ? RT_FULL | ST : 0;
+      break;
+   case WGPUTextureFormat_RGBA8Snorm:
+      caps |= tier1 ? RT_FULL : 0;
+      break;
+   case WGPUTextureFormat_RG8Unorm:
+   case WGPUTextureFormat_RG8Uint:
+   case WGPUTextureFormat_RG8Sint:
+   case WGPUTextureFormat_RG16Uint:
+   case WGPUTextureFormat_RG16Sint:
+   case WGPUTextureFormat_RG16Float:
+   case WGPUTextureFormat_RGB10A2Uint:
+   case WGPUTextureFormat_RGB10A2Unorm:
+      caps |= tier1 ? ST : 0;
+      break;
+   case WGPUTextureFormat_RGBA8Unorm:
+   case WGPUTextureFormat_RGBA8Uint:
+   case WGPUTextureFormat_RGBA8Sint:
+   case WGPUTextureFormat_RGBA16Uint:
+   case WGPUTextureFormat_RGBA16Sint:
+   case WGPUTextureFormat_RGBA16Float:
+   case WGPUTextureFormat_RGBA32Uint:
+   case WGPUTextureFormat_RGBA32Sint:
+      caps |= tier2 ? ST_RW : 0;
       break;
    case WGPUTextureFormat_BGRA8Unorm:
       if (wvk_physical_device_has_feature(pdev, WGPUFeatureName_BGRA8UnormStorage))

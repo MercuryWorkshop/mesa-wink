@@ -32,6 +32,15 @@ wvk_platform_create_instance(void)
    desc.capabilities.timedWaitAnyEnable = 1;
    desc.capabilities.timedWaitAnyMaxCount = 64;
 #endif
+   /* Dawn's Metal backend has texture-formats-tier1 and -tier2 as
+    * experimental, which an adapter only offers with this. They are
+    * WebGPU's, and browsers have them; it enables nothing the driver does
+    * not ask for. */
+   static const char *const toggles[] = { "allow_unsafe_apis" };
+   WGPUDawnTogglesDescriptor toggles_desc = WGPU_DAWN_TOGGLES_DESCRIPTOR_INIT;
+   toggles_desc.enabledToggleCount = ARRAY_SIZE(toggles);
+   toggles_desc.enabledToggles = toggles;
+   desc.nextInChain = &toggles_desc.chain;
    return wgpuCreateInstance(&desc);
 }
 

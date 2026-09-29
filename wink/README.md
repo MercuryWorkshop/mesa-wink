@@ -46,11 +46,18 @@ needed for `--test`. Everything else goes into a cache (default
   natives with upstream 3.1.56 and lets .NET's emsdk link them for the same
   reason, and wink's default does the same. The symbol check stops the build,
   and says why, if the compiler and compiler-rt disagree.
-* **emdawnwebgpu v20250428.134257**, the `webgpu.h` implementation, verified
-  by sha512 and patched for 3.1.56 (`tools/patch-emdawnwebgpu.py`).
-* **Tint** (SPIR-V → WGSL), built for wasm from Dawn `b465e23`, once per
-  variant. To reuse ikvm-wasm-build's `tint-out-<variant>`, set
-  `WINK_TINT_DIR_ST` / `WINK_TINT_DIR_MT`.
+* **emdawnwebgpu v20250822.104650**, the `webgpu.h` implementation, verified
+  by sha512 and patched for 3.1.56 (`tools/patch-emdawnwebgpu.py`). It's the
+  first release with `texture-formats-tier1`/`tier2`, which the drivers
+  request where the browser has them (Chrome 154 does).
+* **Tint** (SPIR-V → WGSL), built for wasm from Dawn `cdda346`, once per
+  variant: the last Dawn with the AST SPIR-V reader wink uses, patched to
+  read the tier1 storage formats (`patches/tint-spirv-reader-texel-formats.patch`).
+  To reuse ikvm-wasm-build's `tint-out-<variant>`, set
+  `WINK_TINT_DIR_ST` / `WINK_TINT_DIR_MT`. The native Dawn package
+  (`src/gallium/drivers/gex_wgpu/native/build-dawn.sh`) is the same revision,
+  built from the same patched source; natively, Dawn's Metal backend offers
+  the tiers only with its `allow_unsafe_apis` toggle, which both drivers set.
 * A Python venv with mako, pyyaml and packaging, plus meson if the host's is
   older than 1.4.
 

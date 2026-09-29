@@ -177,6 +177,14 @@ create_device(void)
    instance_desc.capabilities.timedWaitAnyEnable = 1;
    instance_desc.capabilities.timedWaitAnyMaxCount = 4;
 #endif
+   /* Dawn's Metal backend has texture-formats-tier1 and -tier2 as
+    * experimental, which an adapter only offers with this; it enables nothing
+    * the driver does not ask for. */
+   static const char *const toggles[] = { "allow_unsafe_apis" };
+   WGPUDawnTogglesDescriptor toggles_desc = WGPU_DAWN_TOGGLES_DESCRIPTOR_INIT;
+   toggles_desc.enabledToggleCount = ARRAY_SIZE(toggles);
+   toggles_desc.enabledToggles = toggles;
+   instance_desc.nextInChain = &toggles_desc.chain;
    WGPUInstance instance = wgpuCreateInstance(&instance_desc);
    native_instance = instance;
    if (!instance) {
@@ -244,19 +252,17 @@ create_device(void)
        * OpGroupNonUniformAny, so the extension stays unclaimed. Asking here
        * costs nothing and is one fewer thing to find later. */
       WGPUFeatureName_Subgroups,
-      /* Deliberately *not* here, though this adapter grants both:
-       * Unorm16TextureFormats and Snorm16TextureFormats would let R16_UNORM
-       * and its relatives be stored exactly instead of promoted to float32.
-       * The browser has no equivalent -- Chromium 151 offers no
-       * `texture-formats-tier1` -- so taking them would make the native path
-       * store something the target platform cannot, and every native
-       * measurement would overstate the browser by however much the
-       * promotion costs. The promotion is the honest common denominator
-       * until the browser catches up. GEX_WGPU_FEATURE_TRACE=1 prints what
-       * the adapter actually has, which is how this was checked.
-       *
-       * `texture-component-swizzle` is the mirror image and just as
-       * unusable: Chromium has it and this pinned Dawn does not, so adopting
+      /* texture-formats-tier1 and -tier2, which browsers have since
+       * Chromium 154: the device is the one a browser's would be, and the
+       * Vulkan driver's formats use them. This driver's format tables do
+       * not yet -- R16_UNORM and its relatives are still promoted to float32
+       * -- and Dawn's own Unorm16TextureFormats and Snorm16TextureFormats
+       * stay unrequested, being what no browser has. GEX_WGPU_FEATURE_TRACE=1
+       * prints what the adapter actually has. */
+      WGPUFeatureName_TextureFormatsTier1,
+      WGPUFeatureName_TextureFormatsTier2,
+      /* Deliberately not here: `texture-component-swizzle`. Chromium has
+       * it and this pinned Dawn does not, so adopting
        * it would leave the native path unable to reproduce what the browser
        * does -- and the native path is where the debugger is. */
    };

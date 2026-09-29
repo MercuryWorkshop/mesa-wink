@@ -51,6 +51,9 @@ static const WGPUFeatureName wanted_features[] = {
    WGPUFeatureName_Float32Blendable,
    WGPUFeatureName_ClipDistances,
    WGPUFeatureName_DualSourceBlending,
+   /* More storage formats, and the 16-bit normalized ones (wvk_format.c). */
+   WGPUFeatureName_TextureFormatsTier1,
+   WGPUFeatureName_TextureFormatsTier2,
 #ifndef __EMSCRIPTEN__
    /* Native Dawn is only safe to call from several threads with this, and
     * Vulkan lets them all: queues of two families, and creating while
@@ -209,6 +212,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Lines and points: lists of the triangles' edges and corners
        * (wvk_cmd_draw.c), without culling. */
       .fillModeNonSolid = true,
+      /* Every format it names is texture-formats-tier1's storage. */
+      .shaderStorageImageExtendedFormats = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureFormatsTier1),
       /* 64-bit integers are pairs of words (nir_lower_int64). */
       .shaderInt64 = true,
 #ifdef WVK_HAVE_FLOAT64
