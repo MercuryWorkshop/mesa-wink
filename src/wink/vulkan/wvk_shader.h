@@ -45,7 +45,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 20
+#define WVK_SHADER_BINARY_VERSION 21
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -111,6 +111,11 @@ struct wvk_shader_key {
     * (1); or the vertex shader of the draw after, reading those (2). And
     * the generic varyings the vertex shader's records have (vs_vars). */
    uint8_t geometry, vs_vars;
+   /* Tessellation: the control or evaluation shader as compute (1), reading
+    * the records of the stage before, of vs_vars generic varyings a vertex
+    * and patch_vars patch varyings a patch; or the vertex shader of the draw
+    * after the evaluation shader, reading its records (2). */
+   uint8_t tess, patch_vars;
    /* Fragment, and the vertex shader after a geometry shader: gl_PrimitiveID
     * as the flat varying at location primitive_id - 1 (0: none), which the
     * geometry shader's records carry. */
@@ -183,6 +188,12 @@ struct wvk_shader {
    uint8_t gs_input, gs_output;
    uint16_t gs_max_vertices;
    uint8_t gs_invocations;
+   /* Tessellation control: its patches' vertices, and the patch varyings
+    * of its records. Evaluation: the domain (enum tess_primitive_mode),
+    * spacing (enum gl_tess_spacing), winding and point mode. */
+   uint8_t tess_vertices_out, patch_vars;
+   uint8_t tess_domain, tess_spacing;
+   bool tess_ccw, tess_point_mode;
    /* Its storage images without a format, as the set and slot of each
     * (set << 10 | slot), whose views' formats a draw or dispatch compiles
     * a variant for (key.image_format). */
@@ -271,6 +282,21 @@ struct wvk_shader *wvk_shader_dispatch_variant(struct wvk_device *dev, struct wv
 struct wvk_shader *wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsigned kind,
                                                unsigned vs_vars, const struct wvk_shader *other,
                                                const struct vk_dynamic_graphics_state *dyn);
+
+/* A tessellation shader's variant (key.tess): as compute, for records of
+ * the stage before with `vs_vars` generic varyings a vertex and
+ * `patch_vars` patch varyings a patch (1); or the evaluation shader's draw
+ * after it, with `other` the fragment shader (2). */
+struct wvk_shader *wvk_shader_tess_variant(struct wvk_device *dev, struct wvk_shader *shader, unsigned kind,
+                                           unsigned vs_vars, unsigned patch_vars, const struct wvk_shader *other);
+
+/* A patch's record: the outer and inner levels, a slot each, then its
+ * patch varyings. */
+static inline uint32_t
+wvk_patch_stride(unsigned patch_vars)
+{
+   return 16 * (2 + patch_vars);
+}
 
 /* A record of a stage's outputs as the next reads them from a buffer: a
  * vec4 a slot, of the builtins (position, point size, clip and cull

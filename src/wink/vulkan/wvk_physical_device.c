@@ -208,6 +208,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .largePoints = true,
       /* As compute, before a draw of what it emits (draw_geometry). */
       .geometryShader = true,
+      /* As compute, around a tessellator of the same (draw_tessellated). */
+      .tessellationShader = true,
       /* Lines of the width the draw has: quads the same way, the vertex
        * shader run as compute giving the ends' positions. */
       .wideLines = true,
@@ -400,8 +402,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .samplerMipLodBias = true,
       .separateStencilMaskRef = true, /* a draw for each face (wvk_cmd_draw.c) */
       .shaderSampleRateInterpolationFunctions = true, /* by derivatives (wvk_shader.c) */
-      .tessellationIsolines = false,
-      .tessellationPointMode = false,
+      /* The tessellator makes both (wvk_tessellator.c). */
+      .tessellationIsolines = true,
+      .tessellationPointMode = true,
       .triangleFans = true, /* as triangle lists (wvk_cmd_draw.c) */
       .vertexAttributeAccessBeyondStride = true,
    };
@@ -514,6 +517,16 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxGeometryOutputComponents = l->maxInterStageShaderVariables * 4,
       .maxGeometryOutputVertices = 256,
       .maxGeometryTotalOutputComponents = 1024,
+      /* Tessellation's stages are compute too, and the tessellator the
+       * D3D11 reference's (wvk_tessellator.c). */
+      .maxTessellationGenerationLevel = 64,
+      .maxTessellationPatchSize = 32,
+      .maxTessellationControlPerVertexInputComponents = 128,
+      .maxTessellationControlPerVertexOutputComponents = 128,
+      .maxTessellationControlPerPatchOutputComponents = 120,
+      .maxTessellationControlTotalOutputComponents = 4096,
+      .maxTessellationEvaluationInputComponents = 128,
+      .maxTessellationEvaluationOutputComponents = l->maxInterStageShaderVariables * 4,
       .maxFragmentInputComponents = l->maxInterStageShaderVariables * 4,
       .maxFragmentOutputAttachments = l->maxColorAttachments,
       .maxFragmentDualSrcAttachments =

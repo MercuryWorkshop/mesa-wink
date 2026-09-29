@@ -77,6 +77,7 @@ wvk_files = files(
   'wvk_queue.c',
   'wvk_sampler.c',
   'wvk_shader.c',
+  'wvk_tessellator.c',
   'wvk_sync.c',
   'wvk_wsi.c',
 )

@@ -65,7 +65,7 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
  * share with set 3 if a pipeline layout has one. */
 #define WVK_DRIVER_GROUP 3
 /* Below WebGPU's thousand bindings a group, with room for all of them. */
-#define WVK_DRIVER_SLOT_BASE 976
+#define WVK_DRIVER_SLOT_BASE 970
 #define WVK_DRIVER_SLOT_PUSH (WVK_DRIVER_SLOT_BASE + 0)
 /* The draw's parameters (BaseVertex, BaseInstance): the push buffer again
  * for a direct draw, the indirect buffer for an indirect one. */
@@ -91,6 +91,13 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
  * indices of the primitives they make, which the draw after reads. */
 #define WVK_DRIVER_SLOT_GS_VERTICES (WVK_DRIVER_SLOT_CAPTURE + 1)
 #define WVK_DRIVER_SLOT_GS_INDICES (WVK_DRIVER_SLOT_CAPTURE + 2)
+/* Tessellation run as compute: the control shader's records of its
+ * vertices, and of its patches (levels, then patch varyings); the
+ * tessellator's domain points and counts (wvk_tessellator.c). */
+#define WVK_DRIVER_SLOT_TESS_VERTICES (WVK_DRIVER_SLOT_GS_INDICES + 1)
+#define WVK_DRIVER_SLOT_TESS_PATCHES (WVK_DRIVER_SLOT_GS_INDICES + 2)
+#define WVK_DRIVER_SLOT_TESS_POINTS (WVK_DRIVER_SLOT_GS_INDICES + 3)
+#define WVK_DRIVER_SLOT_TESS_COUNTS (WVK_DRIVER_SLOT_GS_INDICES + 4)
 
 #define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
 
@@ -185,7 +192,10 @@ enum wvk_texel_type {
  *     instance, its primitives an instance, the shader's invocations in
  *     all, and the draw's topology, 4 uints;
  *   - the pulled vertex buffers' starts and strides past the first four,
- *     2 uints each. */
+ *     2 uints each;
+ *   - for tessellation run as compute: the draw's vertices an instance,
+ *     its patches an instance, a patch's vertices, and its patches in
+ *     all, 4 uints. */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
@@ -203,7 +213,8 @@ enum wvk_texel_type {
 #define WVK_DRIVER_LINE (WVK_DRIVER_DATA_OFFSET + 160)
 #define WVK_DRIVER_GEOMETRY (WVK_DRIVER_DATA_OFFSET + 176)
 #define WVK_DRIVER_PULL_MORE (WVK_DRIVER_DATA_OFFSET + 192)
-#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 208)
+#define WVK_DRIVER_TESS (WVK_DRIVER_DATA_OFFSET + 208)
+#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 224)
 #define WVK_META_OFFSET WVK_PUSH_DATA_SIZE
 /* How much of the push buffer the push binding shows: its data, and as
  * many records as that leaves room for. */
@@ -220,6 +231,7 @@ struct wvk_driver_key {
    uint64_t index;
    uint64_t capture;
    uint64_t gs_vertices, gs_indices;
+   uint64_t tess[4];
 };
 
 static inline bool

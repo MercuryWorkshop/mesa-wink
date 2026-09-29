@@ -75,6 +75,10 @@ struct wvk_device {
    WGPUComputePipeline add_query_pipeline;
    WGPUComputePipeline fan_pipeline;
    WGPUComputePipeline draw_count_pipeline;
+   /* The tessellator's passes: count, scan, generate (wvk_tessellator.c),
+    * and their bind group layout. */
+   WGPUComputePipeline tess_pipelines[3];
+   WGPUBindGroupLayout tess_bgl;
    /* Serials for the driver's own indirect buffers, above any memory's. */
    uint64_t temp_serial;
    WGPUComputePipeline repack_pipeline;

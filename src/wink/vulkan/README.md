@@ -143,6 +143,18 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   layer at a time. Streams but the first go, and indexed strips do not
   restart their primitives for it. Without one, topologies with adjacency
   are drawn without the adjacent vertices, as lists the driver makes.
+- **Tessellation** (tessellationShader) is compute too, around a
+  tessellator of the same: the D3D11 reference Mesa's tessellator is, in
+  WGSL (wvk_tessellator.c), an invocation a patch. The vertex shader run
+  as compute writes its records; the control shader, a workgroup a patch
+  and an invocation a vertex of its (barrier() the workgroup's), records
+  of its vertices and patches; the tessellator counts each patch's domain
+  points and indices, adds them up and writes them; the evaluation shader
+  runs an invocation a point, as many as were made (an indirect dispatch),
+  writing records the draw after reads, an indexed indirect draw of the
+  tessellator's lists. Buffers are as big as a patch at level 64 would
+  need, to what a binding holds; patches past that are not drawn. Not with
+  a geometry shader after.
 - **A vertex shader's storage writes** (vertexPipelineStoresAndAtomics)
   are a compute shader's: WebGPU's vertex shaders write no storage. A
   draw whose vertex shader writes buffers or images first dispatches the
