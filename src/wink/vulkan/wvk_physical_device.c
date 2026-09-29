@@ -263,6 +263,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .storagePushConstant16 = true,
       .storageInputOutput16 = true,
       .multiview = true,
+      /* Their stages run as compute within each view's replay of the pass,
+       * the view index the driver's data. */
+      .multiviewGeometryShader = true,
+      .multiviewTessellationShader = true,
       /* A draw in each viewport, the vertex shader's gl_ViewportIndex
        * choosing which (wvk_shader.c). */
       .multiViewport = true,
