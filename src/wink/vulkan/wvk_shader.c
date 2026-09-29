@@ -3044,12 +3044,17 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
        * draw's for a variant. */
       nir_foreach_shader_out_variable(var, nir)
          shader->source_writes_depth |= var->data.location == FRAG_RESULT_DEPTH;
+      /* A render pass without depth is one that says what it has: a
+       * fragment shader library's knows nothing of its attachments. */
       const struct vk_render_pass_state *rp = pipeline_state ? pipeline_state->rp : NULL;
       const bool no_depth = records ? records->no_depth
-                                    : rp && rp->depth_attachment_format == VK_FORMAT_UNDEFINED &&
+                                    : rp && vk_render_pass_state_has_attachment_info(rp) &&
+                                         rp->depth_attachment_format == VK_FORMAT_UNDEFINED &&
                                          rp->stencil_attachment_format == VK_FORMAT_UNDEFINED;
       if (no_depth && shader->source_writes_depth) {
          NIR_PASS(_, nir, nir_shader_intrinsics_pass, drop_depth_instr, nir_metadata_control_flow, NULL);
+         /* The derefs of it go with the stores, and then the variable. */
+         NIR_PASS(_, nir, nir_opt_dce);
          nir_foreach_shader_out_variable_safe(var, nir) {
             if (var->data.location == FRAG_RESULT_DEPTH)
                exec_node_remove(&var->node);
