@@ -188,6 +188,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .sampleRateShading = true,
       /* The fragment shader's alpha, and its coverage by it (wvk_shader.c). */
       .alphaToOne = true,
+      /* Lines and points: lists of the triangles' edges and corners
+       * (wvk_cmd_draw.c), without culling. */
+      .fillModeNonSolid = true,
       /* 64-bit integers are pairs of words (nir_lower_int64). */
       .shaderInt64 = true,
 #ifdef WVK_HAVE_FLOAT64

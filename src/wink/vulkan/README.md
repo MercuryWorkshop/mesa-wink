@@ -99,7 +99,8 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **Triangle fans** are the lists of their triangles, each in the order
   Vulkan's fan has it: a list the host makes, or for a draw by index one a
   compute shader makes of the application's indices, restarting where
-  they do. Indirect draws of fans are drawn from the host's copy of their
+  they do. **Polygon modes** of lines and points are the same shader's
+  lists of each triangle's edges or corners. Indirect draws of fans are drawn from the host's copy of their
   commands. **vkCmdDraw*IndirectCount** copies the draws and gives those
   past the count no instances, on the GPU.
 - **Stencil masks and references of each face**: WebGPU has one of each.
@@ -219,6 +220,8 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   multisampled texture.
 - Gathers from integer cube maps take one texel four times: each face's
   2x2 footprint across its edges is not worked out.
+- Lines and points of triangles are not culled: which way a triangle
+  faces is the vertex shader's to say, after the lists are made.
 - Multisampled array images are a texture for each layer, since WebGPU
   has no multisampled arrays: attachments, clears and resolves are right,
   but a shader sampling one sees its first layer.

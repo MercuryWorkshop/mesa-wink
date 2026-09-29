@@ -115,8 +115,10 @@ struct wvk_replay {
     * a draw for each where their stencil masks or references differ,
     * WebGPU having one of each (wvk_cmd_draw.c). */
    uint32_t draw_face;
-   /* A triangle fan drawn as the list of its triangles (wvk_cmd_draw.c). */
-   bool fan_as_list;
+   /* A draw of triangles drawn as a list the driver made of them: of the
+    * triangles of a fan, or the edges or corners of each where the polygon
+    * mode is lines or points (wvk_cmd_draw.c); else Undefined. */
+   WGPUPrimitiveTopology list_topology;
    /* Images with atomics whose buffer of texels is the image now, until
     * the next barrier (wvk_replay_sync_atomic_images). */
    struct util_dynarray atomic_images; /* struct wvk_image * */
