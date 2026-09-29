@@ -97,6 +97,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   made on the GPU, but where the draw needs its count on the host (a
   geometry or tessellation shader's, points' and lines', and fans'),
   which a counter written in the same submit it does not have yet.
+- **Conditional rendering** (VK_EXT_conditional_rendering): the predicate
+  as the host has it, where the memory is the host's and nothing before
+  in the submit writes it; else each draw and dispatch is an indirect one
+  of arguments a pass of the driver's copies, zero where the predicate
+  fails -- each draw the driver makes of a direct command, too -- and
+  transform feedback's capture reads it. A render pass is ended for each.
 - **Variable pointers** (variablePointers, variablePointersStorageBuffer):
   a buffer access whose binding a phi or select chooses, which cannot be
   traced back to one, is an access of each buffer of its kind the shader

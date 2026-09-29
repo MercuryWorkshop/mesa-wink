@@ -89,6 +89,9 @@ struct wvk_device {
    WGPUComputePipeline xfb_pipeline;
    WGPUComputePipeline xfb_count_pipeline;
    WGPUComputePipeline draw_count_pipeline;
+   /* Conditional rendering's: a command's arguments, zero where its
+    * predicate fails (wvk_cmd_draw.c). */
+   WGPUComputePipeline cond_pipeline;
    /* The tessellator's passes: count, scan, generate (wvk_tessellator.c),
     * and their bind group layout. */
    WGPUComputePipeline tess_pipelines[3];

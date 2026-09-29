@@ -114,7 +114,7 @@ struct wvk_meta_save {
    struct vk_vertex_input_state vi;
    struct vk_sample_locations_state sample_locations;
    void *state;
-   bool xfb_active;
+   bool xfb_active, cond_active;
 };
 
 static void
@@ -127,6 +127,9 @@ meta_begin(struct wvk_cmd_buffer *cmd, struct wvk_meta_save *save)
    /* vk_meta's draws are no application's to capture. */
    save->xfb_active = cmd->replay->xfb_active;
    cmd->replay->xfb_active = false;
+   /* Nor conditional rendering's, but those of vkCmdClearAttachments. */
+   save->cond_active = cmd->replay->cond.active;
+   cmd->replay->cond.active = false;
 }
 
 static void
@@ -141,6 +144,7 @@ meta_end(struct wvk_cmd_buffer *cmd, struct wvk_meta_save *save)
    BITSET_SET_RANGE(cmd->vk.dynamic_graphics_state.dirty, 0, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX - 1);
    wvk_replay_restore_state(cmd->replay, save->state);
    cmd->replay->xfb_active = save->xfb_active;
+   cmd->replay->cond.active = save->cond_active;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -173,10 +177,16 @@ wvk_CmdClearAttachments(VkCommandBuffer commandBuffer, uint32_t attachmentCount,
          render.stencil_attachment_format = format;
    }
 
+   /* Under a predicate: none where it fails, and where the GPU has it,
+    * the meta draws its. */
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP)
+      return;
    struct wvk_meta_save save;
    /* Clears are not drawing, to an occlusion query. */
    wvk_replay_suspend_query(cmd->replay);
    meta_begin(cmd, &save);
+   cmd->replay->cond.active = cond == WVK_CONDITION_GPU;
    vk_meta_clear_attachments(&cmd->vk, &dev->meta, &render, attachmentCount, pAttachments,
                              rectCount, pRects);
    meta_end(cmd, &save);

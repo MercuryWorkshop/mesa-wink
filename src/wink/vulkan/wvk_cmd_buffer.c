@@ -140,6 +140,17 @@ wvk_replay_write(struct wvk_replay *replay, struct wvk_device_memory *mem, uint6
    add_range(&replay->writes, mem, offset, size);
 }
 
+bool
+wvk_replay_written(const struct wvk_replay *replay, const struct wvk_device_memory *mem, uint64_t offset,
+                   uint64_t size)
+{
+   util_dynarray_foreach(&replay->writes, struct wvk_mem_range, r) {
+      if (r->mem == mem && r->offset < offset + size && offset < r->offset + r->size)
+         return true;
+   }
+   return false;
+}
+
 WGPUBuffer
 wvk_replay_temp_buffer(struct wvk_device *dev, struct wvk_replay *replay, uint64_t size,
                        WGPUBufferUsage usage, const void *data)
@@ -333,6 +344,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
       vk_command_buffer_reset(&rcmd->vk);
       vk_command_buffer_begin(&rcmd->vk, &begin);
       wvk_replay_reset_state(&replay);
+      replay.cond.active = false;
       replay.uses_queries = wvk_cmd_queue_has_occlusion_queries(&cmds[i]->cmd_queue);
       replay_queue(&replay, &cmds[i]->cmd_queue, wvk_cmd_buffer_to_handle(rcmd), &dev->vk.dispatch_table);
    }

@@ -3056,6 +3056,22 @@ triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    return out;
 }
 
+static bool conditional_args(struct wvk_cmd_buffer *cmd, const uint32_t *host, const struct wvk_bound_buffer *src,
+                             uint32_t records, uint32_t words, uint32_t stride, struct wvk_bound_buffer *out);
+
+/* A draw the driver makes of a command under a predicate the GPU has
+ * (wvk_cmd_condition): its arguments, zero where the predicate fails,
+ * for an indirect draw of them -- made before its pass state is, as a
+ * pass is ended for them. NULL for one that is drawn as it is. */
+static WGPUBuffer
+predicated_draw(struct wvk_cmd_buffer *cmd, const uint32_t *args, uint32_t words)
+{
+   struct wvk_bound_buffer b;
+   if (!cmd->replay->cond_gpu || !conditional_args(cmd, args, NULL, 1, words, words * 4, &b))
+      return NULL;
+   return b.buffer;
+}
+
 /* A draw of a list the driver made, `indices` its, as the bound index
  * buffer for the draw. */
 static void
@@ -3070,11 +3086,16 @@ draw_list_at(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint64_t offset, ui
    st->ib = (struct wvk_bound_buffer){ NULL, indices, offset, (uint64_t)index_count * 4 };
    st->index_type = VK_INDEX_TYPE_UINT32;
    replay->list_topology = topology;
+   WGPUBuffer predicated =
+      predicated_draw(cmd, (const uint32_t[5]){ index_count, instances, 0, (uint32_t)base_vertex, first_instance }, 5);
    foreach_viewport(cmd) {
       set_draw_parameters(st, NULL, 0, indexed, base_vertex, first_instance, draw_id);
       if (!flush_draw(cmd, true))
          continue;
-      wgpuRenderPassEncoderDrawIndexed(replay->pass, index_count, instances, 0, base_vertex, first_instance);
+      if (predicated)
+         wgpuRenderPassEncoderDrawIndexedIndirect(replay->pass, predicated, 0);
+      else
+         wgpuRenderPassEncoderDrawIndexed(replay->pass, index_count, instances, 0, base_vertex, first_instance);
    }
    replay->list_topology = WGPUPrimitiveTopology_Undefined;
    st->ib = ib;
@@ -3340,11 +3361,15 @@ draw_lines(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t co
       st->push_offset = UINT32_MAX;
    }
    replay->list_topology = WGPUPrimitiveTopology_TriangleList;
+   WGPUBuffer predicated = predicated_draw(cmd, (const uint32_t[4]){ segments * 6, instances, 0, first_instance }, 4);
    foreach_viewport(cmd) {
       set_draw_parameters(st, NULL, 0, indexed, indexed ? base_vertex : (int32_t)first, first_instance, draw_id);
       if (!flush_draw(cmd, false))
          continue;
-      wgpuRenderPassEncoderDraw(replay->pass, segments * 6, instances, 0, first_instance);
+      if (predicated)
+         wgpuRenderPassEncoderDrawIndirect(replay->pass, predicated, 0);
+      else
+         wgpuRenderPassEncoderDraw(replay->pass, segments * 6, instances, 0, first_instance);
    }
    replay->list_topology = WGPUPrimitiveTopology_Undefined;
 }
@@ -3526,11 +3551,16 @@ draw_points(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t c
    if (!bind_index_storage(cmd, indexed))
       return;
    replay->list_topology = WGPUPrimitiveTopology_TriangleList;
+   WGPUBuffer predicated =
+      predicated_draw(cmd, (const uint32_t[4]){ count * 6, instances, first * 6, first_instance }, 4);
    foreach_viewport(cmd) {
       set_draw_parameters(st, NULL, 0, indexed, indexed ? base_vertex : (int32_t)first, first_instance, draw_id);
       if (!flush_draw(cmd, false))
          continue;
-      wgpuRenderPassEncoderDraw(replay->pass, count * 6, instances, first * 6, first_instance);
+      if (predicated)
+         wgpuRenderPassEncoderDrawIndirect(replay->pass, predicated, 0);
+      else
+         wgpuRenderPassEncoderDraw(replay->pass, count * 6, instances, first * 6, first_instance);
    }
    replay->list_topology = WGPUPrimitiveTopology_Undefined;
 }
@@ -3556,6 +3586,16 @@ draw_point_list(struct wvk_cmd_buffer *cmd, const struct wvk_driver_buffer *list
       st->push_offset = UINT32_MAX;
    }
    replay->list_topology = WGPUPrimitiveTopology_TriangleList;
+   /* Of a predicate the GPU has: the command's, zero where it fails. */
+   if (replay->cond_gpu) {
+      struct wvk_bound_buffer b;
+      const struct wvk_bound_buffer src = { NULL, indirect, at, 16, ++wvk_cmd_buffer_device(cmd)->temp_serial };
+      if (indirect ? conditional_args(cmd, NULL, &src, 1, 4, 16, &b)
+                   : conditional_args(cmd, (const uint32_t[4]){ count * 6, 1, 0, 0 }, NULL, 1, 4, 16, &b)) {
+         indirect = b.buffer;
+         at = 0;
+      }
+   }
    foreach_viewport(cmd) {
       set_draw_parameters(st, NULL, 0, true, 0, 0, draw_id);
       if (!flush_draw(cmd, false))
@@ -3671,6 +3711,7 @@ static const char xfb_wgsl[] =
    "}\n"
    "@compute @workgroup_size(1)\n"
    "fn main() {\n"
+   "  if (p[25] != 0u && ((p[26] != 0u) == (p[27] != 0u))) { return; }\n"
    "  var invocations = p[0];\n"
    "  if (p[22] != 0xffffffffu) { invocations = src[p[22]]; }\n"
    "  let per = p[1]; let pv = p[2]; let stride = p[3]; let n = p[4]; let mask = p[5];\n"
@@ -3765,6 +3806,12 @@ capture_xfb(struct wvk_cmd_buffer *cmd, const struct wvk_shader *gs, const struc
       params[22] = count ? count_word : UINT32_MAX;
       params[23] = (uint32_t)(stream * capacity * per);
       params[24] = stream;
+      /* Of a command under a predicate the GPU has: none where it fails,
+       * the predicate copied to word 26. */
+      if (replay->cond_gpu) {
+         params[25] = 1;
+         params[27] = replay->cond.inverted;
+      }
       /* Each of the stream's buffers bound: one binding a WebGPU buffer,
        * over all the ranges of it, as writable bindings must not overlap. */
       WGPUBuffer slots[4] = { NULL };
@@ -3801,7 +3848,8 @@ capture_xfb(struct wvk_cmd_buffer *cmd, const struct wvk_shader *gs, const struc
          params[28 + 2 * o] = x->slot | x->component << 8 | x->count << 16 | (uint32_t)x->buffer << 24;
          params[29 + 2 * o] = x->offset;
       }
-      WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Storage, params);
+      WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params),
+                                                        WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst, params);
       WGPUBuffer counters = wvk_replay_counters(replay);
       static const uint32_t one[4] = { 0 };
       WGPUBuffer none =
@@ -3831,6 +3879,8 @@ capture_xfb(struct wvk_cmd_buffer *cmd, const struct wvk_shader *gs, const struc
       }
       if (!bound)
          break;
+      if (replay->cond_gpu)
+         wvk_replay_read(replay, replay->cond.mem, replay->cond.offset, 4);
       /* What of the buffers is not written is as it was. */
       for (uint32_t b = 0; b < 4; ++b) {
          if (params[5] & BITFIELD_BIT(b))
@@ -3845,6 +3895,9 @@ capture_xfb(struct wvk_cmd_buffer *cmd, const struct wvk_shader *gs, const struc
       wgpuBindGroupLayoutRelease(bg.layout);
       in_pass |= replay->pass != NULL;
       wvk_replay_end_passes(replay);
+      if (replay->cond_gpu)
+         wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, replay->cond.buffer, replay->cond.offset, params_buffer,
+                                              26 * 4, 4);
       WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
       WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
       wgpuComputePassEncoderSetPipeline(pass, pipeline);
@@ -4270,11 +4323,20 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    st->ib = (struct wvk_bound_buffer){ NULL, draw_list, draw_start, draw_bytes };
    st->index_type = VK_INDEX_TYPE_UINT32;
    replay->list_topology = topology;
+   WGPUBuffer draws = counts;
+   if (replay->cond_gpu) {
+      const struct wvk_bound_buffer src = { NULL, counts, draw_command, 20, ++dev->temp_serial };
+      struct wvk_bound_buffer b;
+      if (conditional_args(cmd, NULL, &src, 1, 5, 20, &b)) {
+         draws = b.buffer;
+         draw_command = 0;
+      }
+   }
    foreach_viewport(cmd) {
       set_draw_parameters(st, NULL, 0, true, 0, 0, draw_id);
       if (!flush_draw(cmd, true))
          continue;
-      wgpuRenderPassEncoderDrawIndexedIndirect(replay->pass, counts, draw_command);
+      wgpuRenderPassEncoderDrawIndexedIndirect(replay->pass, draws, draw_command);
    }
    replay->list_topology = WGPUPrimitiveTopology_Undefined;
    st->ib = ib;
@@ -4389,11 +4451,16 @@ draw_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertexCount, uint32_t instanceC
       draw_fan_arrays(cmd, vertexCount, instanceCount, firstVertex, firstInstance, draw_id);
       return;
    }
+   WGPUBuffer predicated =
+      predicated_draw(cmd, (const uint32_t[4]){ vertexCount, instanceCount, firstVertex, firstInstance }, 4);
    foreach_viewport(cmd) {
       set_draw_parameters(cmd->replay->state, NULL, 0, false, (int32_t)firstVertex, firstInstance, draw_id);
       if (!flush_draw(cmd, false))
          continue;
-      wgpuRenderPassEncoderDraw(cmd->replay->pass, vertexCount, instanceCount, firstVertex, firstInstance);
+      if (predicated)
+         wgpuRenderPassEncoderDrawIndirect(cmd->replay->pass, predicated, 0);
+      else
+         wgpuRenderPassEncoderDraw(cmd->replay->pass, vertexCount, instanceCount, firstVertex, firstInstance);
    }
 }
 
@@ -4449,13 +4516,172 @@ draw_elements_widened(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t 
       draw_fan_elements(cmd, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
       return;
    }
+   WGPUBuffer predicated = predicated_draw(
+      cmd, (const uint32_t[5]){ indexCount, instanceCount, firstIndex, (uint32_t)vertexOffset, firstInstance }, 5);
    foreach_viewport(cmd) {
       set_draw_parameters(cmd->replay->state, NULL, 0, true, vertexOffset, firstInstance, draw_id);
       if (!flush_draw(cmd, true))
          continue;
-      wgpuRenderPassEncoderDrawIndexed(cmd->replay->pass, indexCount, instanceCount, firstIndex,
-                                       vertexOffset, firstInstance);
+      if (predicated)
+         wgpuRenderPassEncoderDrawIndexedIndirect(cmd->replay->pass, predicated, 0);
+      else
+         wgpuRenderPassEncoderDrawIndexed(cmd->replay->pass, indexCount, instanceCount, firstIndex,
+                                          vertexOffset, firstInstance);
    }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Conditional rendering (VK_EXT_conditional_rendering): the predicate as
+ * the host has it -- in memory of its own, which nothing of the submit
+ * or before it still to be read back writes -- or else the GPU's: the
+ * command's arguments copied by a pass of the driver's, zero where the
+ * predicate fails, and the command made an indirect one of them. */
+
+enum wvk_condition
+wvk_cmd_condition(struct wvk_cmd_buffer *cmd)
+{
+   struct wvk_replay *replay = cmd->replay;
+   if (!replay->cond.active)
+      return WVK_CONDITION_PASS;
+   struct wvk_device_memory *mem = replay->cond.mem;
+   const uint64_t offset = replay->cond.offset;
+   if (mem && mem->host && !wvk_replay_written(replay, mem, offset, 4) &&
+       !wvk_queue_range_pending(&wvk_cmd_buffer_device(cmd)->queue, mem, offset, 4)) {
+      uint32_t value;
+      memcpy(&value, (const uint8_t *)mem->host + offset, 4);
+      return (value != 0) != replay->cond.inverted ? WVK_CONDITION_PASS : WVK_CONDITION_SKIP;
+   }
+   return WVK_CONDITION_GPU;
+}
+
+static const char cond_wgsl[] =
+   "@group(0) @binding(0) var<storage, read> p: array<u32>;\n"
+   "@group(0) @binding(1) var<storage, read> pred: array<u32>;\n"
+   "@group(0) @binding(2) var<storage, read> src: array<u32>;\n"
+   "@group(0) @binding(3) var<storage, read_write> dst: array<u32>;\n"
+   "@compute @workgroup_size(64)\n"
+   "fn main(@builtin(global_invocation_id) id: vec3u) {\n"
+   "  let r = id.x;\n"
+   "  if (r >= p[2]) { return; }\n"
+   "  let on = (pred[p[0]] != 0u) != (p[1] != 0u);\n"
+   "  for (var w = 0u; w < p[3]; w++) {\n"
+   "    var v = 0u;\n"
+   "    if (on) {\n"
+   "      if (p[6] != 0u) { v = src[p[4] + r * p[5] + w]; } else { v = p[8u + r * p[3] + w]; }\n"
+   "    }\n"
+   "    dst[r * p[3] + w] = v;\n"
+   "  }\n"
+   "}\n";
+
+/* The GPU's: `records` of `words` words, the host's `host` or `src`'s a
+ * `stride` apart, to a buffer of the driver's of them packed -- outside
+ * any pass, the pass ended for it and begun again. */
+static bool
+conditional_args(struct wvk_cmd_buffer *cmd, const uint32_t *host, const struct wvk_bound_buffer *src,
+                 uint32_t records, uint32_t words, uint32_t stride, struct wvk_bound_buffer *out)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   if (!records || !replay->cond.buffer || (src && !src->buffer))
+      return false;
+   WGPUComputePipeline pipeline = xfb_pipeline(dev, &dev->cond_pipeline, cond_wgsl, "wvk conditional rendering");
+   const uint32_t n = 8 + (host ? records * words : 0);
+   uint32_t *params = calloc(n, sizeof(uint32_t));
+   if (!pipeline || !params) {
+      free(params);
+      return false;
+   }
+   const uint64_t pred_base = replay->cond.offset & ~255ull;
+   const uint64_t pred_end = replay->cond.mem ? MIN2(pred_base + 256, replay->cond.mem->buffer_size)
+                                              : replay->cond.offset + 4;
+   const uint64_t src_base = src ? src->offset & ~255ull : 0;
+   const uint64_t src_bytes = src ? align64(src->offset - src_base + (uint64_t)(records - 1) * stride + words * 4, 4)
+                                  : 16;
+   params[0] = (uint32_t)((replay->cond.offset - pred_base) / 4);
+   params[1] = replay->cond.inverted;
+   params[2] = records;
+   params[3] = words;
+   params[4] = src ? (uint32_t)((src->offset - src_base) / 4) : 0;
+   params[5] = stride / 4;
+   params[6] = src != NULL;
+   if (host)
+      memcpy(params + 8, host, (size_t)records * words * 4);
+   WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, n * 4, WGPUBufferUsage_Storage, params);
+   free(params);
+   const uint64_t bytes = (uint64_t)records * words * 4;
+   WGPUBuffer dst = wvk_replay_temp_buffer(dev, replay, bytes + WVK_DRAW_WINDOW,
+                                           WGPUBufferUsage_Storage | WGPUBufferUsage_Indirect |
+                                              WGPUBufferUsage_CopySrc, NULL);
+   WGPUBuffer none = src ? NULL : wvk_replay_temp_buffer(dev, replay, 16, WGPUBufferUsage_Storage, NULL);
+   if (!params_buffer || !dst || (!src && !none))
+      return false;
+   wvk_replay_read(replay, replay->cond.mem, replay->cond.offset, 4);
+   if (src)
+      wvk_replay_read(replay, src->mem, src->offset, src_bytes - (src->offset - src_base));
+   const WGPUBindGroupEntry entries[] = {
+      { .binding = 0, .buffer = params_buffer, .offset = 0, .size = align64(n * 4, 4) },
+      { .binding = 1, .buffer = replay->cond.buffer, .offset = pred_base, .size = align64(pred_end - pred_base, 4) },
+      { .binding = 2, .buffer = src ? src->buffer : none, .offset = src_base, .size = src_bytes },
+      { .binding = 3, .buffer = dst, .offset = 0, .size = align64(bytes, 4) },
+   };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
+   bg.entryCount = ARRAY_SIZE(entries);
+   bg.entries = entries;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bg.layout);
+   const bool in_pass = replay->pass != NULL;
+   wvk_replay_end_passes(replay);
+   WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
+   wgpuComputePassEncoderSetPipeline(pass, pipeline);
+   wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuComputePassEncoderDispatchWorkgroups(pass, DIV_ROUND_UP(records, 64), 1, 1);
+   wgpuComputePassEncoderEnd(pass);
+   wgpuComputePassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+   if (in_pass)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+   *out = (struct wvk_bound_buffer){ NULL, dst, 0, bytes, ++dev->temp_serial | (1ull << 62) };
+   return true;
+}
+
+static void draw_indirect_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_buffer b,
+                                uint32_t drawCount, uint32_t stride);
+
+/* Draws of the arguments conditional_args made. */
+static void
+draw_conditional(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_buffer b, uint32_t draws)
+{
+   const uint32_t stride = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+   struct wvk_bound_buffer saved;
+   const bool widened = indexed && widen_indices(cmd, &saved);
+   select_draw_shaders(cmd);
+   draw_indirect_bound(cmd, indexed, b, draws, stride);
+   if (widened)
+      narrow_indices(cmd, &saved);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer,
+                                    const VkConditionalRenderingBeginInfoEXT *pConditionalRenderingBegin)
+{
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   const struct wvk_bound_buffer b =
+      bound_buffer(cmd, pConditionalRenderingBegin->buffer, pConditionalRenderingBegin->offset, 4);
+   cmd->replay->cond.mem = b.mem;
+   cmd->replay->cond.buffer = b.buffer;
+   cmd->replay->cond.offset = b.offset;
+   cmd->replay->cond.inverted =
+      pConditionalRenderingBegin->flags & VK_CONDITIONAL_RENDERING_INVERTED_BIT_EXT;
+   cmd->replay->cond.active = b.buffer != NULL;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdEndConditionalRenderingEXT(VkCommandBuffer commandBuffer)
+{
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   cmd->replay->cond.active = false;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -4463,7 +4689,12 @@ wvk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount, uint32_t instan
             uint32_t firstVertex, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP)
+      return;
+   cmd->replay->cond_gpu = cond == WVK_CONDITION_GPU;
    draw_arrays(cmd, vertexCount, instanceCount, firstVertex, firstInstance, 0);
+   cmd->replay->cond_gpu = false;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -4471,7 +4702,12 @@ wvk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t 
                    uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP)
+      return;
+   cmd->replay->cond_gpu = cond == WVK_CONDITION_GPU;
    draw_elements(cmd, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance, 0);
+   cmd->replay->cond_gpu = false;
 }
 
 /* VK_EXT_multi_draw: a draw for each, DrawIndex its number. */
@@ -4480,10 +4716,15 @@ wvk_CmdDrawMultiEXT(VkCommandBuffer commandBuffer, uint32_t drawCount, const VkM
                     uint32_t instanceCount, uint32_t firstInstance, uint32_t stride)
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP)
+      return;
+   cmd->replay->cond_gpu = cond == WVK_CONDITION_GPU;
    for (uint32_t i = 0; i < drawCount; ++i) {
       const VkMultiDrawInfoEXT *d = (const VkMultiDrawInfoEXT *)((const uint8_t *)pVertexInfo + (size_t)i * stride);
       draw_arrays(cmd, d->vertexCount, instanceCount, d->firstVertex, firstInstance, i);
    }
+   cmd->replay->cond_gpu = false;
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -4492,12 +4733,17 @@ wvk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer, uint32_t drawCount,
                            uint32_t firstInstance, uint32_t stride, const int32_t *pVertexOffset)
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP)
+      return;
+   cmd->replay->cond_gpu = cond == WVK_CONDITION_GPU;
    for (uint32_t i = 0; i < drawCount; ++i) {
       const VkMultiDrawIndexedInfoEXT *d =
          (const VkMultiDrawIndexedInfoEXT *)((const uint8_t *)pIndexInfo + (size_t)i * stride);
       draw_elements(cmd, d->indexCount, instanceCount, d->firstIndex, pVertexOffset ? *pVertexOffset : d->vertexOffset,
                     firstInstance, i);
    }
+   cmd->replay->cond_gpu = false;
 }
 
 static void
@@ -4632,6 +4878,20 @@ draw_indirect_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_b
 static void draw_indirect_widened(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDeviceSize offset,
                                   uint32_t drawCount, uint32_t stride);
 
+/* Whether indirect draws are drawn from the host's copy of them: of
+ * tessellation, a geometry shader, storage writes, points or lines as
+ * quads, fans, or polygon modes. Under a predicate the GPU has, those
+ * are each predicated as they are drawn (cond_gpu). */
+static bool
+indirect_on_host(struct wvk_cmd_buffer *cmd)
+{
+   const struct wvk_bound_state *st = cmd->replay->state;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   return st->bound_tes || draw_gs(cmd) || (st->bound_vs && st->bound_vs->writes_storage) || draws_points(cmd) ||
+          draws_lines(cmd) || dyn->ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
+          dyn->rs.polygon_mode != VK_POLYGON_MODE_FILL;
+}
+
 static void
 draw_indirect(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDeviceSize offset, uint32_t drawCount,
               uint32_t stride)
@@ -4650,7 +4910,18 @@ draw_indirect_widened(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer,
    if (!drawCount)
       return;
    const uint32_t size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
-   const struct wvk_bound_buffer b = bound_buffer(cmd, buffer, offset, (uint64_t)(drawCount - 1) * stride + size);
+   struct wvk_bound_buffer b = bound_buffer(cmd, buffer, offset, (uint64_t)(drawCount - 1) * stride + size);
+   /* The draws, of none where the predicate fails. */
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP)
+      return;
+   if (cond == WVK_CONDITION_GPU && !indirect_on_host(cmd)) {
+      const struct wvk_bound_buffer src = b;
+      if (!conditional_args(cmd, NULL, &src, drawCount, size / 4, stride, &b))
+         return;
+      stride = size;
+   }
+   cmd->replay->cond_gpu = cond == WVK_CONDITION_GPU && b.mem;
    /* Points as quads need the draws' counts, which the host has where the
     * memory is its too. */
    cmd->replay->draw_points = draws_points(cmd) && b.mem && b.mem->host;
@@ -4658,6 +4929,7 @@ draw_indirect_widened(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer,
    select_draw_shaders(cmd);
    draw_indirect_bound(cmd, indexed, b, drawCount, stride);
    cmd->replay->draw_points = cmd->replay->draw_lines = false;
+   cmd->replay->cond_gpu = false;
 }
 
 /* vkCmdDraw*IndirectCount, which WebGPU does not have: the draws copied,
@@ -4689,21 +4961,45 @@ draw_indirect_count(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, V
       narrow_indices(cmd, &saved);
 }
 
+static void draw_indirect_count_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_buffer b,
+                                      struct wvk_bound_buffer c, uint32_t max_draws, uint32_t stride);
+
 static void
 draw_indirect_count_widened(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDeviceSize offset,
                             VkBuffer count_buffer, VkDeviceSize count_offset, uint32_t max_draws, uint32_t stride)
 {
-   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
-   struct wvk_replay *replay = cmd->replay;
    if (!max_draws)
       return;
-   select_draw_shaders(cmd);
    const uint32_t size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
    const uint64_t bytes = (uint64_t)(max_draws - 1) * stride + size;
-   const struct wvk_bound_buffer b = bound_buffer(cmd, buffer, offset, bytes);
+   struct wvk_bound_buffer b = bound_buffer(cmd, buffer, offset, bytes);
    const struct wvk_bound_buffer c = bound_buffer(cmd, count_buffer, count_offset, 4);
    if (!b.buffer || !c.buffer)
       return;
+   /* The draws, of none where the predicate fails. */
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP)
+      return;
+   if (cond == WVK_CONDITION_GPU && !indirect_on_host(cmd)) {
+      const struct wvk_bound_buffer src = b;
+      if (!conditional_args(cmd, NULL, &src, max_draws, size / 4, stride, &b))
+         return;
+      stride = size;
+   }
+   cmd->replay->cond_gpu = cond == WVK_CONDITION_GPU && b.mem;
+   draw_indirect_count_bound(cmd, indexed, b, c, max_draws, stride);
+   cmd->replay->cond_gpu = false;
+}
+
+static void
+draw_indirect_count_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_buffer b,
+                          struct wvk_bound_buffer c, uint32_t max_draws, uint32_t stride)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   select_draw_shaders(cmd);
+   const uint32_t size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+   const uint64_t bytes = (uint64_t)(max_draws - 1) * stride + size;
    /* A fan's are drawn from the host's copy, the count too; and those
     * whose vertex shader writes storage, which is done for each draw
     * (run_vertex_writes), and for no more than there are. */
@@ -5005,10 +5301,23 @@ wvk_CmdDispatchBase(VkCommandBuffer commandBuffer, uint32_t baseGroupX, uint32_t
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    if (!groupCountX || !groupCountY || !groupCountZ)
       return;
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP)
+      return;
+   /* Under a predicate the GPU has: an indirect dispatch of none where
+    * it fails. */
+   struct wvk_bound_buffer groups;
+   if (cond == WVK_CONDITION_GPU &&
+       !conditional_args(cmd, (const uint32_t[3]){ groupCountX, groupCountY, groupCountZ }, NULL, 1, 3, 12, &groups))
+      return;
    set_base_group(cmd->replay, baseGroupX, baseGroupY, baseGroupZ);
-   WGPUComputePassEncoder compute = flush_dispatch(cmd, NULL);
+   WGPUComputePassEncoder compute = flush_dispatch(cmd, cond == WVK_CONDITION_GPU ? &groups : NULL);
    if (!compute)
       return;
+   if (cond == WVK_CONDITION_GPU) {
+      wgpuComputePassEncoderDispatchWorkgroupsIndirect(compute, groups.buffer, groups.offset);
+      return;
+   }
    wgpuComputePassEncoderDispatchWorkgroups(compute, groupCountX, groupCountY, groupCountZ);
    count_dispatch(cmd, groupCountX, groupCountY, groupCountZ);
 }
@@ -5026,6 +5335,14 @@ wvk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDevice
    struct wvk_bound_buffer b = bound_buffer(cmd, buffer, offset, sizeof(VkDispatchIndirectCommand));
    if (!b.buffer)
       return;
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP)
+      return;
+   if (cond == WVK_CONDITION_GPU) {
+      const struct wvk_bound_buffer src = b;
+      if (!conditional_args(cmd, NULL, &src, 1, 3, 12, &b))
+         return;
+   }
    set_base_group(cmd->replay, 0, 0, 0);
    WGPUComputePassEncoder compute = flush_dispatch(cmd, &b);
    if (!compute)
@@ -5033,7 +5350,7 @@ wvk_CmdDispatchIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDevice
    if (b.mem)
       wvk_replay_read(cmd->replay, b.mem, b.offset, b.size);
    wgpuComputePassEncoderDispatchWorkgroupsIndirect(compute, b.buffer, b.offset);
-   if (wvk_replay_stats(cmd->replay)) {
+   if (wvk_replay_stats(cmd->replay) && cond == WVK_CONDITION_PASS) {
       VK_FROM_HANDLE(wvk_buffer, src, buffer);
       if (src->mem && src->mem->host) {
          uint32_t groups[3];
@@ -5157,6 +5474,9 @@ wvk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t instance
    struct wvk_bound_state *st = replay->state;
    if (!instanceCount)
       return;
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP)
+      return;
    const struct wvk_bound_buffer c = bound_buffer(cmd, counterBuffer, counterBufferOffset & ~3ull, 4);
    /* What needs the count on the host has the host's copy of it: which a
     * counter written in this submit is not yet. */
@@ -5168,8 +5488,10 @@ wvk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t instance
          memcpy(&bytes, (const uint8_t *)c.mem->host + c.offset, 4);
       else
          mesa_logw_once("wvk: a draw by a counter's byte count in memory the host has no copy of");
-      draw_arrays(cmd, bytes > counterOffset ? (bytes - counterOffset) / MAX2(vertexStride, 1) : 0, instanceCount, 0,
-                  firstInstance, 0);
+      const uint32_t vertices = bytes > counterOffset ? (bytes - counterOffset) / MAX2(vertexStride, 1) : 0;
+      cmd->replay->cond_gpu = cond == WVK_CONDITION_GPU;
+      draw_arrays(cmd, vertices, instanceCount, 0, firstInstance, 0);
+      cmd->replay->cond_gpu = false;
       return;
    }
    WGPUComputePipeline pipeline = xfb_pipeline(dev, &dev->xfb_count_pipeline, xfb_count_wgsl, "wvk counter draw");
@@ -5207,6 +5529,14 @@ wvk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t instance
    wgpuBindGroupRelease(group);
    if (in_pass)
       wvk_replay_restart_pass(cmd, replay->pass_layer);
+   /* The command, of no vertices where the predicate fails. */
+   if (cond == WVK_CONDITION_GPU) {
+      const struct wvk_bound_buffer src = { NULL, command, 0, 16, ++dev->temp_serial | (1ull << 62) };
+      struct wvk_bound_buffer b;
+      if (!conditional_args(cmd, NULL, &src, 1, 4, 16, &b))
+         return;
+      command = b.buffer;
+   }
    select_draw_shaders(cmd);
    foreach_viewport(cmd) {
       set_draw_parameters(st, NULL, 0, false, 0, firstInstance, 0);

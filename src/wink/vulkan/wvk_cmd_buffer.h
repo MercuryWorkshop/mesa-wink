@@ -181,6 +181,19 @@ struct wvk_replay {
    } xfb_bindings[4];
    bool xfb_active;
    WGPUBuffer xfb_state;
+   /* Conditional rendering (VK_EXT_conditional_rendering): the predicate's
+    * buffer, whether it is on (but for vk_meta's commands, except those of
+    * vkCmdClearAttachments) and whether it is inverted. */
+   struct {
+      struct wvk_device_memory *mem;
+      WGPUBuffer buffer;
+      uint64_t offset;
+      bool active, inverted;
+   } cond;
+   /* Of a direct command under a predicate the GPU has: each draw the
+    * driver makes of it is an indirect draw of arguments the predicate
+    * zeroes (wvk_cmd_draw.c's predicated_draw). */
+   bool cond_gpu;
    /* Timestamps: a query set of the submit's, and where each is resolved
     * to, 256 bytes apart as resolves want. */
    WGPUQuerySet timestamp_set;
@@ -307,6 +320,14 @@ void wvk_replay_read(struct wvk_replay *replay, struct wvk_device_memory *mem,
                      uint64_t offset, uint64_t size);
 void wvk_replay_write(struct wvk_replay *replay, struct wvk_device_memory *mem,
                       uint64_t offset, uint64_t size);
+/* Conditional rendering's predicate, for a command it applies to: known
+ * on the host to pass or to fail, or the GPU's (wvk_cmd_draw.c). */
+enum wvk_condition { WVK_CONDITION_PASS, WVK_CONDITION_SKIP, WVK_CONDITION_GPU };
+enum wvk_condition wvk_cmd_condition(struct wvk_cmd_buffer *cmd);
+
+/* Whether the submit has written any of a range so far. */
+bool wvk_replay_written(const struct wvk_replay *replay, const struct wvk_device_memory *mem,
+                        uint64_t offset, uint64_t size);
 
 /* A buffer made for this submit alone: filled from `data` if not NULL,
  * destroyed once the submit ran. */

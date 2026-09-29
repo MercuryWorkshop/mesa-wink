@@ -110,6 +110,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_maintenance4 = true,
       .KHR_maintenance5 = true,
       .KHR_maintenance6 = true,
+      .KHR_maintenance7 = true,
       .KHR_multiview = true,
       .KHR_portability_subset = true,
       .KHR_push_descriptor = true,
@@ -165,6 +166,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_pipeline_robustness = true,
       .EXT_depth_clip_control = true,
       .EXT_host_image_copy = true,
+      .EXT_conditional_rendering = true,
       .EXT_depth_clip_enable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
       .KHR_global_priority = true,
       .EXT_global_priority = true,
@@ -408,6 +410,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* The transfers of a command buffer of the device's, waited for
        * (wvk_host_copy.c). */
       .hostImageCopy = true,
+      /* The predicate the host's where it has it, else indirect commands
+       * of the arguments a pass of the driver's zeroes (wvk_cmd_draw.c). */
+      .conditionalRendering = true,
+      .inheritedConditionalRendering = true,
       .pipelineCreationCacheControl = true,
       .privateData = true,
       /* Subgroups are one invocation, and so are full, and of the size
@@ -469,6 +475,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
 
       .maintenance5 = true,
       .maintenance6 = true,
+      /* Secondaries and commands of the pass's own in one pass: all are
+       * the primary's commands, replayed in order (vk_cmd_queue). */
+      .maintenance7 = true,
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,
@@ -809,6 +818,18 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .blockTexelViewCompatibleMultipleLayers = false,
       .maxCombinedImageSamplerDescriptorCount = 3,
       .fragmentShadingRateClampCombinerInputs = false,
+      /* VK_KHR_maintenance7: no fragment shading rate; a pass writes the
+       * depth/stencil attachment whole. */
+      .robustFragmentShadingRateAttachmentAccess = false,
+      .separateDepthStencilAttachmentAccess = false,
+      .maxDescriptorSetTotalUniformBuffersDynamic = l->maxDynamicUniformBuffersPerPipelineLayout,
+      .maxDescriptorSetTotalStorageBuffersDynamic = l->maxDynamicStorageBuffersPerPipelineLayout,
+      .maxDescriptorSetTotalBuffersDynamic =
+         l->maxDynamicUniformBuffersPerPipelineLayout + l->maxDynamicStorageBuffersPerPipelineLayout,
+      .maxDescriptorSetUpdateAfterBindTotalUniformBuffersDynamic = l->maxDynamicUniformBuffersPerPipelineLayout,
+      .maxDescriptorSetUpdateAfterBindTotalStorageBuffersDynamic = l->maxDynamicStorageBuffersPerPipelineLayout,
+      .maxDescriptorSetUpdateAfterBindTotalBuffersDynamic =
+         l->maxDynamicUniformBuffersPerPipelineLayout + l->maxDynamicStorageBuffersPerPipelineLayout,
    };
 
    /* "wink on Apple M2 (Metal)": what the device is, and what it is on. */
