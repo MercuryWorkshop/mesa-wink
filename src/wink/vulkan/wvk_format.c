@@ -193,6 +193,38 @@ wvk_format_get(VkFormat format)
    return f;
 }
 
+/* Whether a vertex shader can read an attribute of `format` itself, where
+ * WebGPU has no vertex format of it (fetch_channel in wvk_shader.c): plain
+ * channels of integers, normalized or scaled, of up to 32 bits and none
+ * across two words, or of 16- and 32-bit floats. */
+bool
+wvk_format_vertex_pullable(VkFormat format)
+{
+   const struct util_format_description *d = vk_format_description(format);
+   if (!d || d->layout != UTIL_FORMAT_LAYOUT_PLAIN || d->colorspace != UTIL_FORMAT_COLORSPACE_RGB ||
+       d->block.bits > 128)
+      return false;
+   for (unsigned c = 0; c < d->nr_channels; ++c) {
+      const struct util_format_channel_description *ch = &d->channel[c];
+      if (ch->type == UTIL_FORMAT_TYPE_VOID)
+         continue;
+      if (ch->size == 0 || ch->size > 32 || (ch->shift % 32) + ch->size > 32 ||
+          (ch->type != UTIL_FORMAT_TYPE_UNSIGNED && ch->type != UTIL_FORMAT_TYPE_SIGNED &&
+           ch->type != UTIL_FORMAT_TYPE_FLOAT) ||
+          (ch->type == UTIL_FORMAT_TYPE_FLOAT && ch->size != 16 && ch->size != 32))
+         return false;
+   }
+   return true;
+}
+
+/* Whether WebGPU has a vertex format of it. */
+bool
+wvk_format_vertex_native(VkFormat format)
+{
+   const struct wvk_format *f = wvk_format_get(format);
+   return f && f->vertex;
+}
+
 uint32_t
 wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format)
 {

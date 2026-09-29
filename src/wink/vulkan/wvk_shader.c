@@ -474,6 +474,9 @@ is_pulled(const struct vk_vertex_input_state *vi, int location)
    const struct vk_vertex_attribute_state *a = &vi->attributes[location];
    const struct vk_vertex_binding_state *vb = &vi->bindings[a->binding];
    const uint32_t align = MIN2(vk_format_get_blocksize(a->format), 4);
+   /* And those WebGPU has no format of, where the shader can read them. */
+   if (!wvk_format_vertex_native(a->format))
+      return wvk_format_vertex_pullable(a->format);
    return (vb->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE && vb->divisor != 1) ||
           (vb->stride % 4) || (align && a->offset % align);
 }

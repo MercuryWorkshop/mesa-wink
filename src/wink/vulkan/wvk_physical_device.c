@@ -894,7 +894,8 @@ buffer_features(const struct wvk_physical_device *pdev, VkFormat format)
    const struct wvk_format *f = wvk_format_get(format);
    (void)pdev;
    VkFormatFeatureFlags2 features = 0;
-   if (f && f->vertex)
+   /* WebGPU's vertex formats, and those the vertex shader reads itself. */
+   if ((f && f->vertex) || wvk_format_vertex_pullable(format))
       features |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
    /* Texel buffers are storage buffers, and any format the shader can
     * take apart and put together will do. */

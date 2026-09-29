@@ -320,6 +320,8 @@ struct wvk_render_key {
    float depth_bias_slope, depth_bias_clamp;
    /* binding_variant of the shaders. */
    uint64_t bindings;
+   /* An attribute read of a format neither WebGPU nor the shader can. */
+   bool unfetchable;
 };
 
 struct wvk_render_pipeline {
@@ -1206,6 +1208,56 @@ find_buffer_swap(const struct wvk_replay *replay, uint32_t group, uint32_t bindi
 
 /* A bind group of the set; with `replay`, what it reads of images the
  * pass renders to read their copies instead, and of buffers it writes. */
+/* A texture of its own for a writable storage binding of what an earlier
+ * one of the group writes too: WebGPU will not have both, where Vulkan
+ * leaves the application to keep their writes apart. What it writes is
+ * lost, as one of the two writes of a texel would have been. */
+static WGPUTextureView
+scratch_storage_view(struct wvk_device *dev, const struct wvk_descriptor *d)
+{
+   const struct wvk_image *image = d->view_image;
+   WGPUTextureViewDescriptor vd = d->view_desc;
+   const VkExtent3D e = vk_image_mip_level_extent(&image->vk, d->view_level);
+   const bool is_3d = vd.dimension == WGPUTextureViewDimension_3D;
+   const uint32_t layers = vd.arrayLayerCount == WGPU_ARRAY_LAYER_COUNT_UNDEFINED
+                              ? image->vk.array_layers - vd.baseArrayLayer
+                              : vd.arrayLayerCount;
+   WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+   td.label = wvk_sv("wvk scratch storage");
+   td.usage = WGPUTextureUsage_StorageBinding;
+   td.format = vd.format != WGPUTextureFormat_Undefined ? vd.format : image->format;
+   td.dimension = is_3d ? WGPUTextureDimension_3D : WGPUTextureDimension_2D;
+   td.size = (WGPUExtent3D){ e.width, e.height, is_3d ? e.depth : MAX2(layers, 1) };
+   WGPUTexture texture = wgpuDeviceCreateTexture(dev->wgpu, &td);
+   if (!texture)
+      return NULL;
+   vd.baseMipLevel = 0;
+   vd.mipLevelCount = 1;
+   vd.baseArrayLayer = 0;
+   WGPUTextureView view = wgpuTextureCreateView(texture, &vd);
+   wgpuTextureRelease(texture);
+   return view;
+}
+
+/* Whether two writable storage views overlap: one of a texture's levels
+ * and layers both, which WebGPU calls aliasing. */
+static bool
+storage_views_alias(const struct wvk_descriptor *a, const struct wvk_descriptor *b)
+{
+   if (!a->view_image || a->view_image != b->view_image || a->view_texture != b->view_texture)
+      return false;
+   const uint32_t a_levels = MAX2(a->view_levels, 1), b_levels = MAX2(b->view_levels, 1);
+   if (a->view_level + a_levels <= b->view_level || b->view_level + b_levels <= a->view_level)
+      return false;
+   const uint32_t all = a->view_image->vk.array_layers;
+   const uint32_t a0 = a->view_desc.baseArrayLayer, b0 = b->view_desc.baseArrayLayer;
+   const uint32_t a1 = a->view_desc.arrayLayerCount == WGPU_ARRAY_LAYER_COUNT_UNDEFINED
+                          ? all : a0 + a->view_desc.arrayLayerCount;
+   const uint32_t b1 = b->view_desc.arrayLayerCount == WGPU_ARRAY_LAYER_COUNT_UNDEFINED
+                          ? all : b0 + b->view_desc.arrayLayerCount;
+   return a0 < b1 && b0 < a1;
+}
+
 static WGPUBindGroup
 make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct wvk_descriptor_set *set,
                 uint32_t group, const struct wvk_bound_state *st, struct wvk_replay *replay)
@@ -1297,6 +1349,33 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
                util_dynarray_append(&own_views, v);
                e->textureView = v;
             }
+         }
+         break;
+      }
+   }
+   /* Writable storage bindings of one level of an image, which WebGPU
+    * refuses: the later ones write to textures of their own. */
+   for (uint32_t i = 0; set && i < bgl->count; ++i) {
+      const struct wvk_shader_binding *b = &bgl->entries[i].b;
+      if (b->kind != WVK_BINDING_STORAGE_TEXTURE || b->access == WGPUStorageTextureAccess_ReadOnly ||
+          (group == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE))
+         continue;
+      bool sampler;
+      uint32_t dynamic_index;
+      const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
+      if (!d || !d->view || entries[i].textureView != d->view)
+         continue;
+      for (uint32_t j = 0; j < i; ++j) {
+         const struct wvk_shader_binding *o = &bgl->entries[j].b;
+         if (o->kind != WVK_BINDING_STORAGE_TEXTURE || o->access == WGPUStorageTextureAccess_ReadOnly)
+            continue;
+         const struct wvk_descriptor *od = slot_descriptor(set, o->binding, &sampler, &dynamic_index);
+         if (!od || !od->view || !storage_views_alias(d, od))
+            continue;
+         WGPUTextureView v = scratch_storage_view(dev, d);
+         if (v) {
+            util_dynarray_append(&own_views, v);
+            entries[i].textureView = v;
          }
          break;
       }
@@ -1802,7 +1881,13 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
          break;
       const struct vk_vertex_attribute_state *a = &vi->attributes[loc];
       const struct wvk_format *f = wvk_format_get(a->format);
-      if (!f || !f->vertex || a->binding >= MESA_VK_MAX_VERTEX_BINDINGS)
+      /* One WebGPU has no format of, that the shader could not read
+       * itself: the pipeline would be invalid, and with it the submit. */
+      if (!f || !f->vertex) {
+         k->unfetchable = true;
+         continue;
+      }
+      if (a->binding >= MESA_VK_MAX_VERTEX_BINDINGS)
          continue;
       /* Bindings take slots in the order attributes name them. */
       const uint32_t stride = dyn->vi_binding_strides[a->binding];
@@ -1938,6 +2023,11 @@ get_render_pipeline(struct wvk_device *dev, struct wvk_cmd_buffer *cmd, bool ind
    if (!key)
       return NULL;
    build_render_key(cmd, indexed, &key->key);
+   if (key->key.unfetchable) {
+      mesa_logw_once("wvk: a draw of a vertex format neither WebGPU nor the vertex shader can read");
+      free(key);
+      return NULL;
+   }
    struct wvk_shader *const stages[] = { st->vs, st->fs };
    key->key.bindings = binding_variant(dev, st, WVK_BIND_GRAPHICS, stages, 2);
    key->hash = _mesa_hash_data(&key->key, sizeof(key->key));

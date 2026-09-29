@@ -45,6 +45,11 @@ const struct wvk_format *wvk_format_get(VkFormat format);
 /* The capabilities on this physical device, optional features applied. */
 uint32_t wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format);
 
+/* Whether WebGPU has a vertex format of it; and, where it has not,
+ * whether a vertex shader can read an attribute of it itself. */
+bool wvk_format_vertex_native(VkFormat format);
+bool wvk_format_vertex_pullable(VkFormat format);
+
 /* A texel buffer's format as shaders decode and encode it: the words
  * WVK_META_TEXEL_FORMAT, SIZES, SHIFTS and SWIZZLE of its record. False
  * for formats that cannot be. */
