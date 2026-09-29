@@ -573,6 +573,38 @@ wvk_hash_state(struct vk_physical_device *device, const struct vk_graphics_pipel
    _mesa_blake3_final(&ctx, blake3_out);
 }
 
+/* The colour outputs at the locations of the attachments they are for
+ * (dynamicRenderingLocalRead's colorAttachmentLocations), WebGPU's targets
+ * being the pass's attachments in order: attachment i's is the output at
+ * location map[i]. An output no attachment is at is gone. */
+static bool
+remap_color_outputs(nir_shader *nir, const uint8_t map[8])
+{
+   NIR_PASS(_, nir, nir_lower_io_array_vars_to_elements_no_indirects, true);
+   bool gone = false;
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location < FRAG_RESULT_DATA0)
+         continue;
+      const unsigned location = var->data.location - FRAG_RESULT_DATA0;
+      int attachment = -1;
+      for (unsigned i = 0; i < 8 && attachment < 0; ++i) {
+         if (map[i] == location)
+            attachment = i;
+      }
+      if (attachment < 0) {
+         var->data.mode = nir_var_shader_temp;
+         gone = true;
+      } else {
+         var->data.location = FRAG_RESULT_DATA0 + attachment;
+      }
+   }
+   if (gone) {
+      nir_fixup_deref_modes(nir);
+      NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   }
+   return nir_progress(true, nir_shader_get_entrypoint(nir), nir_metadata_all);
+}
+
 /* Alpha to one, which WebGPU has not: a fragment shader's colour outputs
  * with an alpha of one. And alpha to coverage where it is on too, or the
  * shader writes its own sample mask, which WebGPU's will not go with:
@@ -5686,6 +5718,11 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       shader->key.pulled = pull_key(pipeline_state ? pipeline_state->vi : NULL, shader->attribs_read,
                                     shader->key.points || shader->key.runs || shader->key.lines);
    }
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && records && records->color_remapped) {
+      NIR_PASS(_, nir, remap_color_outputs, records->color_map);
+      shader->key.color_remapped = 1;
+      memcpy(shader->key.color_map, records->color_map, sizeof(records->color_map));
+   }
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       const struct vk_multisample_state *ms = pipeline_state ? pipeline_state->ms : NULL;
       bool own_mask = false;
@@ -6515,6 +6552,26 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       key.samples = shader->uses_samples || key.by_alpha ? samples : 0;
       key.no_depth = shader->source_writes_depth && !has_depth;
       key.stats = (stats & VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT) != 0;
+      /* Its colour outputs at their attachments' locations
+       * (dynamicRenderingLocalRead), of the attachments the pass has, and
+       * which of them it writes. */
+      uint32_t outputs = shader->io_mask;
+      bool identity = true;
+      for (uint32_t i = 0; i < 8; ++i) {
+         const bool attached = color_formats && color_formats[i];
+         key.color_map[i] = attached ? dyn->cal.color_map[i] : MESA_VK_ATTACHMENT_UNUSED;
+         identity &= !attached || key.color_map[i] == i;
+      }
+      if (identity) {
+         memset(key.color_map, 0, sizeof(key.color_map));
+      } else {
+         key.color_remapped = 1;
+         outputs = 0;
+         for (uint32_t i = 0; i < 8; ++i) {
+            if (key.color_map[i] != MESA_VK_ATTACHMENT_UNUSED && (shader->io_mask & BITFIELD_BIT(key.color_map[i])))
+               outputs |= BITFIELD_BIT(i);
+         }
+      }
       /* After a geometry shader: gl_PrimitiveID a varying, at the first
        * location it has no input at. */
       if (other && other->vk.stage == MESA_SHADER_GEOMETRY && (shader->point_state & 4)) {
@@ -6562,7 +6619,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
             mesa_logw_once("wvk: a logic op on a multisampled pass, which is not done");
          } else {
             for (uint32_t i = 0; i < 8; ++i) {
-               if (color_formats[i] && (shader->io_mask & BITFIELD_BIT(i)) &&
+               if (color_formats[i] && (outputs & BITFIELD_BIT(i)) &&
                    wvk_format_takes_logic_op(color_formats[i])) {
                   key.logic_format[i] = color_formats[i];
                   key.logic_op = dyn->cb.logic_op + 1u;
@@ -6575,7 +6632,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
        * where another's (or its own) use CONSTANT_COLOR, which WebGPU's
        * one blend constant cannot both be. */
       const uint32_t blends = color_formats && !dyn->cb.logic_op_enable
-                                 ? wvk_shader_blend_mask(dyn, shader->io_mask & dyn->cb.color_write_enables)
+                                 ? wvk_shader_blend_mask(dyn, outputs & dyn->cb.color_write_enables)
                                  : 0;
       if (blends && samples > 1) {
          mesa_logw_once("wvk: colour blend factors with both CONSTANT_COLOR and CONSTANT_ALPHA on a multisampled "
@@ -6622,7 +6679,7 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
       /* A variant that failed is kept as none, not tried at every draw. */
       if (getenv("WINK_VK_VARIANT_LOG")) {
          const struct wvk_shader_key *own = &shader->key;
-         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s\n",
+         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s%s%s\n",
                  _mesa_shader_stage_to_string(shader->vk.stage), shader->id,
                  key.pulled != own->pulled ? " vertex input" : "",
                  memcmp(key.fs_inputs, own->fs_inputs, sizeof(key.fs_inputs)) ? " varyings" : "",
@@ -6637,7 +6694,11 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
                  key.blend_mask != own->blend_mask ||
                        memcmp(key.blend_equation, own->blend_equation, sizeof(key.blend_equation))
                     ? " blending" : "",
-                 memcmp(key.image_format, own->image_format, sizeof(key.image_format)) ? " image formats" : "");
+                 memcmp(key.image_format, own->image_format, sizeof(key.image_format)) ? " image formats" : "",
+                 key.line_coord != own->line_coord ? " line fragments" : "",
+                 key.color_remapped != own->color_remapped ||
+                       memcmp(key.color_map, own->color_map, sizeof(key.color_map))
+                    ? " attachment locations" : "");
       }
       variant = compile_variant(dev, shader, &key, vi);
       if (!variant)

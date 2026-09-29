@@ -190,6 +190,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_shader_atomic_float2 = true,
       .EXT_primitive_topology_list_restart = true,
       .KHR_line_rasterization = true,
+      .KHR_dynamic_rendering_local_read = true,
       .EXT_line_rasterization = true,
       .EXT_depth_clip_enable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
       .KHR_global_priority = true,
@@ -492,6 +493,11 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
        * wide ones are, rectangles or parallelograms (Bresenham's), and a
        * fragment shader's stipple and coverage for them (wvk_shader.c's
        * expand_lines and lower_line_fs). */
+      /* What a draw reads of its pass's attachments is a copy, made before
+       * it and kept until a barrier (snapshot_feedback); and a fragment
+       * shader's outputs are moved to the attachments' locations (a
+       * variant's remap_color_outputs). */
+      .dynamicRenderingLocalRead = true,
       .rectangularLines = true,
       .bresenhamLines = true,
       .smoothLines = true,

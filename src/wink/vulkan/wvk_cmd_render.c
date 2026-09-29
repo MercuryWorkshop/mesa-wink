@@ -124,6 +124,13 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    wvk_replay_end_passes(replay);
    wvk_replay_set_pass_layer(replay);
    if (info != &replay->pass_copy.info) {
+      /* The application's: its attachments at their own locations, until
+       * it says otherwise (dynamicRenderingLocalRead). */
+      const VkRenderingAttachmentLocationInfoKHR identity = {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR,
+         .colorAttachmentCount = MESA_VK_MAX_COLOR_ATTACHMENTS,
+      };
+      vk_cmd_set_rendering_attachment_locations(&cmd->vk, &identity);
       /* Kept, to begin the pass again with (wvk_replay_restart_pass). */
       replay->pass_copy.info = *info;
       replay->pass_copy.info.pNext = NULL;

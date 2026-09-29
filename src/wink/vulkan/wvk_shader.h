@@ -149,6 +149,12 @@ struct wvk_shader_key {
     * location line_coord - 1 (0: none), which the vertex shader writes and
     * the fragment shader stipples and covers by (expand_lines). */
    uint8_t line_coord;
+   /* Fragment: its colour outputs moved to the attachments whose
+    * locations they are (dynamicRenderingLocalRead): attachment i's the
+    * output at location color_map[i], none for MESA_VK_ATTACHMENT_UNUSED;
+    * where color_remapped, else each at its own. */
+   uint8_t color_remapped;
+   uint8_t color_map[8];
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */

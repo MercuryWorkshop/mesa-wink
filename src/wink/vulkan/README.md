@@ -143,7 +143,11 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   into R8Uint. Depth and stencil in read-only layouts are read-only to
   WebGPU, which lets shaders read them as they are. Passes store what
   they render even where Vulkan does not care, since one may be ended
-  and begun again before Vulkan's is over.
+  and begun again before Vulkan's is over. Dynamic rendering's local
+  reads (dynamicRenderingLocalRead) are the same copies; attachments at
+  other locations than their own have a fragment shader variant whose
+  outputs are moved to them, WebGPU's targets being the pass's
+  attachments in order, and an output no attachment is at is gone.
 - **Logic ops** are the fragment shader's: WebGPU has no colour state
   for them. A draw with one on gets a variant that takes each output to
   its attachment format's integers (unorm, snorm, uint and sint, at the
