@@ -509,7 +509,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxVertexOutputComponents = l->maxInterStageShaderVariables * 4,
       /* A geometry shader is compute, its records a buffer's (wvk_shader.c);
        * its outputs are the draw's vertex shader's after it. */
-      .maxGeometryShaderInvocations = 32,
+      .maxGeometryShaderInvocations = 127,
       .maxGeometryInputComponents = 128,
       .maxGeometryOutputComponents = l->maxInterStageShaderVariables * 4,
       .maxGeometryOutputVertices = 256,
