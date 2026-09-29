@@ -69,7 +69,7 @@ struct wvk_shader_key {
     * hashed; 0 for none. */
    uint64_t pulled;
    /* Fragment: alpha to one, the coverage it computes from alpha itself,
-    * and the samples it places its sample positions for (0: none). */
+    * and the samples it places positions or that coverage for (0: none). */
    uint8_t alpha_to_one, by_alpha, samples;
 };
 

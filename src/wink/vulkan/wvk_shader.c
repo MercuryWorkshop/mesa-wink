@@ -582,8 +582,12 @@ lower_alpha_to_one(nir_shader *nir, bool to_one, bool to_coverage, unsigned samp
             nir_def *covered = nir_bcsel(&b, nir_uge_imm(&b, n, 32), nir_imm_int(&b, -1),
                                          nir_iadd_imm(&b, nir_ishl(&b, nir_imm_int(&b, 1), n), -1));
             if (!mask_var) {
-               mask_var = nir_create_variable_with_location(nir, nir_var_shader_out, FRAG_RESULT_SAMPLE_MASK,
-                                                            glsl_array_type(glsl_int_type(), 1, 0));
+               /* An array, as the SPIR-V's is: not what
+                * nir_create_variable_with_location will make. */
+               mask_var = nir_variable_create(nir, nir_var_shader_out, glsl_array_type(glsl_int_type(), 1, 0),
+                                              "gl_SampleMask");
+               mask_var->data.location = FRAG_RESULT_SAMPLE_MASK;
+               mask_var->data.driver_location = nir->num_outputs++;
                /* Of every sample, until the shader says. */
                nir_builder top = nir_builder_at(nir_before_impl(impl));
                nir_store_deref(&top, nir_build_deref_array_imm(&top, nir_build_deref_var(&top, mask_var), 0),
@@ -2997,8 +3001,10 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       bool own_mask = false;
       nir_foreach_shader_out_variable(var, nir)
          own_mask |= var->data.location == FRAG_RESULT_SAMPLE_MASK;
+      /* WebGPU has no alpha to coverage of one sample either. */
       const bool to_one = ms && ms->alpha_to_one_enable;
-      const bool by_alpha = ms && ms->alpha_to_coverage_enable && (to_one || own_mask);
+      const bool by_alpha = ms && ms->alpha_to_coverage_enable &&
+                            (to_one || own_mask || ms->rasterization_samples <= 1);
       if (to_one || by_alpha)
          NIR_PASS(_, nir, lower_alpha_to_one, to_one, by_alpha, ms->rasterization_samples);
       shader->covers_by_alpha = by_alpha;
@@ -3020,7 +3026,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       NIR_PASS(placed, nir, lower_input_sampling, &s);
       shader->per_sample = per_sample;
       shader->uses_samples = placed;
-      shader->key.samples = placed ? s.samples : 0;
+      /* The coverage from alpha is of the samples too. */
+      shader->key.samples = placed || shader->key.by_alpha ? s.samples : 0;
    }
    /* Shared memory as words, as ntv's is, and accessed a word at a time:
     * a 64-bit or 16-bit value is words' worth, which WGSL has no types of. */
@@ -3322,8 +3329,8 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
          memcpy(key.fs_inputs, fs->varyings, sizeof(key.fs_inputs));
    } else if (shader->vk.stage == MESA_SHADER_FRAGMENT) {
       key.alpha_to_one = dyn->ms.alpha_to_one_enable;
-      key.by_alpha = dyn->ms.alpha_to_coverage_enable && (key.alpha_to_one || shader->own_mask);
-      key.samples = shader->uses_samples ? samples : 0;
+      key.by_alpha = dyn->ms.alpha_to_coverage_enable && (key.alpha_to_one || shader->own_mask || samples <= 1);
+      key.samples = shader->uses_samples || key.by_alpha ? samples : 0;
       if (key_equal(&key, &shader->key))
          return shader;
    } else {

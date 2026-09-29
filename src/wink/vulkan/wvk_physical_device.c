@@ -138,6 +138,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_custom_border_color = true,
       .EXT_extended_dynamic_state = true,
       .EXT_extended_dynamic_state2 = true,
+      .EXT_extended_dynamic_state3 = true,
       .EXT_host_query_reset = true,
       .EXT_image_robustness = true,
       .EXT_inline_uniform_block = true,
@@ -154,6 +155,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
        * the shader (wvk_shader.c, pull_divided_attributes). */
       .EXT_vertex_attribute_divisor = true,
       .KHR_vertex_attribute_divisor = true,
+      .EXT_vertex_input_dynamic_state = true,
    };
    (void)pdev;
 }
@@ -310,13 +312,22 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .texelBufferAlignment = true,
 
       /* Pipelines are made at the draw from the dynamic state
-       * (wvk_cmd_draw.c): any of it can be dynamic. WebGPU has no logic
-       * operations or tessellation. */
+       * (wvk_cmd_draw.c): any of it can be dynamic, what shaders are
+       * compiled for included -- a draw of other state draws a variant
+       * (wvk_shader_draw_variant). WebGPU has no logic operations or
+       * tessellation, and only the state of what is supported is. */
       .extendedDynamicState = true,
       .extendedDynamicState2 = true,
-      /* Not the vertex input: attributes with divisors are read by the
-       * vertex shader, as the pipeline's state says. */
-      .vertexInputDynamicState = false,
+      .vertexInputDynamicState = true,
+      .extendedDynamicState3DepthClampEnable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
+      .extendedDynamicState3PolygonMode = true,
+      .extendedDynamicState3RasterizationSamples = true,
+      .extendedDynamicState3SampleMask = true,
+      .extendedDynamicState3AlphaToCoverageEnable = true,
+      .extendedDynamicState3AlphaToOneEnable = true,
+      .extendedDynamicState3ColorBlendEnable = true,
+      .extendedDynamicState3ColorBlendEquation = true,
+      .extendedDynamicState3ColorWriteMask = true,
 
       /* Samplers' records do what WebGPU's samplers cannot
        * (wvk_nir_descriptors.c); a view's swizzle applies to the border. */
@@ -604,6 +615,10 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .polygonModePointSize = false,
       .nonStrictSinglePixelWideLinesUseParallelogram = false,
       .nonStrictWideLinesUseParallelogram = false,
+
+      /* VK_EXT_extended_dynamic_state3: a pipeline is of its draw's
+       * topology, whichever it is. */
+      .dynamicPrimitiveTopologyUnrestricted = true,
 
       /* VK_KHR_maintenance6 */
       .blockTexelViewCompatibleMultipleLayers = false,

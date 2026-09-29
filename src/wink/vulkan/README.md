@@ -219,6 +219,9 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 
 ## Not there yet
 
+- Depth clamp clamps to [0, 1], not to the viewport's depth range: Dawn on
+  Metal clamps at the near and far planes. A narrow or inverted range with
+  depth clamp is off where geometry is past it.
 - WebGPU has 10 storage buffers a stage in browsers, and texel buffers are
   storage buffers, beyond what Vulkan counts as such; so are storage images
   a shader does atomics on.
