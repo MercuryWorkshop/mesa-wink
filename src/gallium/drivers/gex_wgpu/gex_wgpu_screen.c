@@ -4106,6 +4106,20 @@ static nir_variable *gex_wgpu_word_block(nir_shader *nir, const char *name,
                                          unsigned driver_location,
                                          bool read_only);
 
+/* The bytes a buffer texture's binding covers: its whole texels, rounded up
+ * to the four a storage binding must be a multiple of. A texel of four
+ * bytes or more then fills the binding exactly, so textureSize can be read
+ * off its length -- GL's size is the whole texels in the range, and a range
+ * of 131071 bytes of RGBA8 is 32767 of them, not the 32768 words that
+ * rounding up the bytes gives. A narrower texel keeps the rounding, and its
+ * size can be up to three over. */
+static uint64_t
+gex_wgpu_buftex_binding_size(const struct pipe_sampler_view *view)
+{
+   const unsigned texel = MAX2(1u, util_format_get_blocksize(view->format));
+   return ALIGN_POT((view->u.buf.size / texel) * texel, 4);
+}
+
 struct gex_wgpu_buftex_lowering {
    const uint8_t *words;                                  /* per slot */
    nir_variable *block[GEX_WGPU_MAX_BUFFER_TEXTURES];
@@ -4148,10 +4162,23 @@ gex_wgpu_lower_buffer_texture(nir_builder *b, nir_instr *instr, void *data)
    const unsigned bound_code = state->words[slot]
       ? state->words[slot]
       : (unsigned)gex_wgpu_buffer_texture_code(PIPE_FORMAT_R32_UINT);
-   /* texelFetch only. textureSize on a buffer would need the binding's
-    * length, which means arrayLength() on the runtime array -- a different
-    * opcode and a different claim, so it is refused by name rather than
-    * answered with a guess. */
+   /* textureSize: the binding's length in whole texels, the binding being
+    * sized to them (gex_wgpu_buftex_binding_size). */
+   if (tex->op == nir_texop_txs && bound_code <= ARRAY_SIZE(gex_wgpu_buftex_texels)) {
+      const struct gex_wgpu_buftex_texel texel =
+         gex_wgpu_buftex_texels[bound_code - 1];
+      const unsigned texel_bytes = texel.comps * (texel.bits / 8);
+      b->cursor = nir_before_instr(instr);
+      nir_deref_instr *words = nir_build_deref_struct(
+         b, nir_build_deref_var(b, state->block[slot]), 0);
+      nir_def *length = nir_deref_buffer_array_length(b, 32, &words->def);
+      nir_def *texels =
+         nir_udiv_imm(b, nir_imul_imm(b, length, 4), MAX2(texel_bytes, 1u));
+      nir_def_rewrite_uses(&tex->def, nir_trim_vector(b, texels, tex->def.num_components));
+      nir_instr_remove(instr);
+      return true;
+   }
+   /* texelFetch otherwise. */
    if (tex->op != nir_texop_txf) {
       state->failed = true;
       if (!state->why[0])
@@ -25034,7 +25061,7 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
        */
       bindings[count].size = buftex_placeholder
          ? ctx->placeholder_storage->width0
-         : ALIGN_POT(view->u.buf.size, 4);
+         : gex_wgpu_buftex_binding_size(view);
       ++count;
    }
 
@@ -32855,7 +32882,7 @@ gex_wgpu_bind_textures_from(struct pipe_context *pipe,
           * R8 texels is five bytes. The allocation is 16-aligned so this
           * never reaches past the buffer, and the extra bytes are outside
           * every texel the shader can address. */
-         size = ALIGN_POT(bufview->u.buf.size, 4);
+         size = gex_wgpu_buftex_binding_size(bufview);
       }
       const unsigned at = group->count;
       group->binding[at] = textures->buftex_bindings[i];
@@ -45959,8 +45986,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          } else {
             buftex_buffer = gex_resource(view->texture)->buffer;
             buftex_offset = view->u.buf.offset;
-            /* Rounded to four; see the note in the capture path. */
-            buftex_size = ALIGN_POT(view->u.buf.size, 4);
+            /* Whole texels, rounded to four; see
+             * gex_wgpu_buftex_binding_size. */
+            buftex_size = gex_wgpu_buftex_binding_size(view);
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = ctx->vs->buftex_bindings[i];
@@ -46327,8 +46355,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          } else {
             buftex_buffer = gex_resource(view->texture)->buffer;
             buftex_offset = view->u.buf.offset;
-            /* Rounded to four; see the note in the capture path. */
-            buftex_size = ALIGN_POT(view->u.buf.size, 4);
+            /* Whole texels, rounded to four; see
+             * gex_wgpu_buftex_binding_size. */
+            buftex_size = gex_wgpu_buftex_binding_size(view);
          }
          entries[at] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[at].binding = ctx->fs->buftex_bindings[i];
