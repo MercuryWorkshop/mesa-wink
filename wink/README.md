@@ -313,6 +313,33 @@ That sets `org.lwjgl.sdl.libname` to the fork, and `org.lwjgl.opengl.libname`
 and `SDL_VIDEO_COCOA_WINK` to libwink. 26.3 and 26.4-snapshot-1 both render
 their title screens and worlds.
 
+### Conformance
+
+The GL and GL ES conformance suites run on libwink here, through
+`wink/test/cts`:
+
+```sh
+wink/test/cts/build-gl-cts.sh                  # into ~/.cache/mesa-wink/gl-cts
+wink/test/cts/run-gl-cts.sh gles OUT           # dEQP-GLES2/3/31, KHR-GLES2/3/31/32
+wink/test/cts/run-gl-cts.sh gl OUT             # KHR-GL46, KHR-Single-GL46
+wink/test/cts/run-gl-cts.sh gl OUT -- --fraction 50 --jobs 4
+```
+
+**Build.** It uses VK-GL-CTS at Mesa CI's pins. `opengl-cts-4.6.8.1` and
+`opengl-es-cts-3.2.14.1` are one commit, so one build serves both. It applies
+Mesa CI's backports, but not its patch that stops building Vulkan utilities:
+that patch breaks dEQP's macOS platform, and it only saves build time.
+
+**Context factory.** dEQP's macOS platform only creates CGL (Apple GL)
+contexts. `deqp-osx-wink-context-factory.patch` adds a "wink" context type,
+chosen with `--deqp-gl-context-type=wink`. It loads the libwink.dylib that
+`DEQP_WINK_LIBRARY` names, and its surfaces are offscreen ones, like the
+pbuffers Mesa CI runs with.
+
+**Runs.** The suites are the ones Mesa CI runs for llvmpipe, with the same
+256x256 `rgba8888d24s8ms0` surface, plus KHR-GLES32 and the 4.6 lists. The
+expectations are `src/gallium/drivers/gex_wgpu/ci/gex_wgpu-*.txt`.
+
 ## Symbol checks
 
 The packaging stage runs `tools/wink-symbols.py`, which **fails** on:

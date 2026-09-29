@@ -1,0 +1,430 @@
+From dcc5a4962df7f56bfc716954672eed79b133b0f8 Mon Sep 17 00:00:00 2001
+From: Mesa CI <mesa@example.com>
+Date: Mon, 28 Sep 2026 19:05:23 -0700
+Subject: [PATCH] osx: a wink GL context factory (--deqp-gl-context-type=wink)
+
+Contexts of the libwink.dylib that DEQP_WINK_LIBRARY names -- mesa-wink's
+GL on WebGPU -- with an offscreen default framebuffer, built when
+DEQP_WINK_INCLUDE_DIR names the directory holding wink.h.
+---
+ framework/platform/CMakeLists.txt             |  10 +
+ framework/platform/osx/tcuOSXPlatform.cpp     |   6 +
+ .../platform/osx/tcuOSXWinkContextFactory.cpp | 313 ++++++++++++++++++
+ .../platform/osx/tcuOSXWinkContextFactory.hpp |  40 +++
+ 4 files changed, 369 insertions(+)
+ create mode 100644 framework/platform/osx/tcuOSXWinkContextFactory.cpp
+ create mode 100644 framework/platform/osx/tcuOSXWinkContextFactory.hpp
+
+diff --git a/framework/platform/CMakeLists.txt b/framework/platform/CMakeLists.txt
+index 8f6e0c5..6320fd0 100644
+--- a/framework/platform/CMakeLists.txt
++++ b/framework/platform/CMakeLists.txt
+@@ -176,6 +176,16 @@ if (NOT DEFINED TCUTIL_PLATFORM_SRCS)
+ 			osx/tcuOSXMetalView.hpp
+ 			)
+ 		list(APPEND TCUTIL_PLATFORM_LIBS ${QUARTZCORE_LIBRARY} ${COCOA_LIBRARY})
++		# wink's GL (--deqp-gl-context-type=wink): the directory holding wink.h.
++		set(DEQP_WINK_INCLUDE_DIR "" CACHE PATH "Build the wink GL context factory against wink.h in this directory")
++		if (DEQP_WINK_INCLUDE_DIR)
++			list(APPEND TCUTIL_PLATFORM_SRCS
++				osx/tcuOSXWinkContextFactory.cpp
++				osx/tcuOSXWinkContextFactory.hpp
++				)
++			include_directories(${DEQP_WINK_INCLUDE_DIR})
++			add_definitions(-DDEQP_SUPPORT_WINK=1)
++		endif ()
+ 
+ 	elseif (DE_OS_IS_FUCHSIA)
+ 		set(TCUTIL_PLATFORM_SRCS
+diff --git a/framework/platform/osx/tcuOSXPlatform.cpp b/framework/platform/osx/tcuOSXPlatform.cpp
+index 7ae7ae0..32ea028 100644
+--- a/framework/platform/osx/tcuOSXPlatform.cpp
++++ b/framework/platform/osx/tcuOSXPlatform.cpp
+@@ -25,6 +25,9 @@
+ #include "tcuRenderTarget.hpp"
+ 
+ #include "tcuOSXVulkanPlatform.hpp"
++#if defined(DEQP_SUPPORT_WINK)
++#include "tcuOSXWinkContextFactory.hpp"
++#endif
+ 
+ #include "gluDefs.hpp"
+ #include "gluPlatform.hpp"
+@@ -97,6 +100,9 @@ public:
+     OSXGLPlatform(void)
+     {
+         m_contextFactoryRegistry.registerFactory(new CGLContextFactory());
++#if defined(DEQP_SUPPORT_WINK)
++        m_contextFactoryRegistry.registerFactory(osx::createWinkContextFactory());
++#endif
+     }
+ 
+     ~OSXGLPlatform(void)
+diff --git a/framework/platform/osx/tcuOSXWinkContextFactory.cpp b/framework/platform/osx/tcuOSXWinkContextFactory.cpp
+new file mode 100644
+index 0000000..cd02fbd
+--- /dev/null
++++ b/framework/platform/osx/tcuOSXWinkContextFactory.cpp
+@@ -0,0 +1,313 @@
++/*-------------------------------------------------------------------------
++ * drawElements Quality Program Tester Core
++ * ----------------------------------------
++ *
++ * Copyright 2026 wink contributors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ *//*!
++ * \file
++ * \brief wink (Mesa's GL on WebGPU) contexts, from a libwink.dylib.
++ *
++ * --deqp-gl-context-type=wink. The library is DEQP_WINK_LIBRARY's, loaded
++ * and initialized on the first context, and every surface is an offscreen
++ * one -- wink's pbuffer -- of the configuration's size.
++ *//*--------------------------------------------------------------------*/
++
++#include "tcuOSXWinkContextFactory.hpp"
++
++#include "gluRenderConfig.hpp"
++#include "gluRenderContext.hpp"
++#include "glwFunctions.hpp"
++#include "glwInitFunctions.hpp"
++#include "tcuDefs.hpp"
++#include "tcuRenderTarget.hpp"
++
++#include <wink.h>
++
++#include <dlfcn.h>
++#include <cstdlib>
++#include <string>
++
++namespace tcu
++{
++namespace osx
++{
++namespace
++{
++
++struct WinkLibrary
++{
++#define WINK_FUNCS(X)                                                                              \
++    X(void, wink_init_attribs_default, (wink_init_attribs *))                                     \
++    X(void, wink_surface_attribs_default, (wink_surface_attribs *))                               \
++    X(void, wink_context_attribs_default, (wink_context_attribs *))                               \
++    X(int, wink_init, (const wink_init_attribs *))                                                \
++    X(wink_surface *, wink_surface_create, (const wink_surface_attribs *, int *))                 \
++    X(void, wink_surface_destroy, (wink_surface *))                                               \
++    X(wink_context *, wink_context_create, (const wink_context_attribs *, int *))                 \
++    X(void, wink_context_destroy, (wink_context *))                                               \
++    X(int, wink_make_current, (wink_context *, wink_surface *, wink_surface *))                   \
++    X(void *, wink_get_proc_address, (const char *))                                              \
++    X(int, wink_swap_buffers, (wink_surface *))                                                   \
++    X(const char *, wink_status_string, (int))
++#define X(ret, name, params) ret(*name) params;
++    WINK_FUNCS(X)
++#undef X
++};
++
++std::string winkError(const WinkLibrary &wink, const char *what, int status)
++{
++    return std::string("wink: ") + what + ": " + wink.wink_status_string(status);
++}
++
++//! The process's libwink, initialized once and never unloaded.
++const WinkLibrary &getWinkLibrary(void)
++{
++    static WinkLibrary library;
++    static std::string failure;
++    static bool loaded = false;
++
++    if (!loaded)
++    {
++        loaded = true;
++        const char *path = getenv("DEQP_WINK_LIBRARY");
++        void *handle     = path && *path ? dlopen(path, RTLD_NOW | RTLD_LOCAL) : nullptr;
++        if (!handle)
++            failure = path && *path ? std::string("wink: ") + dlerror() : "DEQP_WINK_LIBRARY names no libwink";
++#define X(ret, name, params)                                                    \
++    if (handle && failure.empty())                                              \
++    {                                                                           \
++        library.name = (ret(*) params)dlsym(handle, #name);                     \
++        if (!library.name)                                                      \
++            failure = std::string("wink: ") + path + " has no " #name;          \
++    }
++        WINK_FUNCS(X)
++#undef X
++        if (failure.empty())
++        {
++            wink_init_attribs attribs;
++            library.wink_init_attribs_default(&attribs);
++            const int status = library.wink_init(&attribs);
++            if (status != WINK_OK)
++                failure = winkError(library, "wink_init", status);
++        }
++    }
++    if (!failure.empty())
++        throw ResourceError(failure);
++    return library;
++}
++
++class FunctionLoader : public glw::FunctionLoader
++{
++public:
++    FunctionLoader(const WinkLibrary &wink) : m_wink(wink)
++    {
++    }
++
++    glw::GenericFuncType get(const char *name) const
++    {
++        return (glw::GenericFuncType)m_wink.wink_get_proc_address(name);
++    }
++
++private:
++    const WinkLibrary &m_wink;
++};
++
++int winkApi(glu::ApiType api)
++{
++    switch (api.getProfile())
++    {
++    case glu::PROFILE_ES:
++        return WINK_API_OPENGL_ES;
++    case glu::PROFILE_CORE:
++        return WINK_API_OPENGL_CORE;
++    case glu::PROFILE_COMPATIBILITY:
++        return WINK_API_OPENGL_COMPAT;
++    default:
++        throw NotSupportedError("wink: unknown GL profile");
++    }
++}
++
++class WinkRenderContext : public glu::RenderContext
++{
++public:
++    WinkRenderContext(const glu::RenderConfig &config, const WinkRenderContext *share);
++    ~WinkRenderContext(void);
++
++    glu::ContextType getType(void) const
++    {
++        return m_type;
++    }
++    const glw::Functions &getFunctions(void) const
++    {
++        return m_functions;
++    }
++    const tcu::RenderTarget &getRenderTarget(void) const
++    {
++        return m_renderTarget;
++    }
++    void postIterate(void);
++    glw::GenericFuncType getProcAddress(const char *name) const
++    {
++        return (glw::GenericFuncType)m_wink.wink_get_proc_address(name);
++    }
++    void makeCurrent(void);
++
++private:
++    const WinkLibrary &m_wink;
++    const glu::ContextType m_type;
++    wink_surface *m_surface;
++    wink_context *m_context;
++    glw::Functions m_functions;
++    tcu::RenderTarget m_renderTarget;
++};
++
++WinkRenderContext::WinkRenderContext(const glu::RenderConfig &config, const WinkRenderContext *share)
++    : m_wink(getWinkLibrary())
++    , m_type(config.type)
++    , m_surface(nullptr)
++    , m_context(nullptr)
++{
++    using glu::RenderConfig;
++
++    const int red     = glu::getValueOrDefault(config, &RenderConfig::redBits, 8);
++    const int green   = glu::getValueOrDefault(config, &RenderConfig::greenBits, 8);
++    const int blue    = glu::getValueOrDefault(config, &RenderConfig::blueBits, 8);
++    const int alpha   = glu::getValueOrDefault(config, &RenderConfig::alphaBits, 8);
++    const int depth   = glu::getValueOrDefault(config, &RenderConfig::depthBits, 24);
++    const int stencil = glu::getValueOrDefault(config, &RenderConfig::stencilBits, 8);
++    const int samples = glu::getValueOrDefault(config, &RenderConfig::numSamples, 0);
++    const int width   = glu::getValueOrDefault(config, &RenderConfig::width, 256);
++    const int height  = glu::getValueOrDefault(config, &RenderConfig::height, 256);
++
++    if (red != 8 || green != 8 || blue != 8 || (alpha != 8 && alpha != 0))
++        throw NotSupportedError("wink: only RGB(A)8 default framebuffers");
++    if (depth != 0 && depth != 16 && depth != 24 && depth != 32)
++        throw NotSupportedError("wink: unsupported depth size");
++    if (stencil != 0 && stencil != 8)
++        throw NotSupportedError("wink: unsupported stencil size");
++    if (samples > 1)
++        throw NotSupportedError("wink: no multisampled default framebuffers");
++    if (config.componentType == RenderConfig::COMPONENT_TYPE_FLOAT)
++        throw NotSupportedError("wink: no float default framebuffers");
++    if (config.id != RenderConfig::DONT_CARE)
++        throw NotSupportedError("wink: no config ids");
++
++    wink_surface_attribs surfaceAttribs;
++    m_wink.wink_surface_attribs_default(&surfaceAttribs);
++    surfaceAttribs.width        = width;
++    surfaceAttribs.height       = height;
++    surfaceAttribs.alpha_bits   = (uint8_t)alpha;
++    surfaceAttribs.depth_bits   = (uint8_t)depth;
++    surfaceAttribs.stencil_bits = (uint8_t)stencil;
++    surfaceAttribs.offscreen    = 1;
++    int status                  = WINK_OK;
++    m_surface                   = m_wink.wink_surface_create(&surfaceAttribs, &status);
++    if (!m_surface)
++        throw ResourceError(winkError(m_wink, "wink_surface_create", status));
++
++    const glu::ApiType api = config.type.getAPI();
++    wink_context_attribs contextAttribs;
++    m_wink.wink_context_attribs_default(&contextAttribs);
++    contextAttribs.api   = winkApi(api);
++    contextAttribs.major = api.getMajorVersion();
++    contextAttribs.minor = api.getMinorVersion();
++    contextAttribs.share = share ? share->m_context : nullptr;
++    const glu::ContextFlags flags = config.type.getFlags();
++    if (flags & glu::CONTEXT_DEBUG)
++        contextAttribs.flags |= WINK_CONTEXT_DEBUG;
++    if (flags & glu::CONTEXT_FORWARD_COMPATIBLE)
++        contextAttribs.flags |= WINK_CONTEXT_FORWARD_COMPATIBLE;
++    if (flags & glu::CONTEXT_ROBUST)
++        contextAttribs.flags |= WINK_CONTEXT_ROBUST_ACCESS;
++    if (flags & glu::CONTEXT_NO_ERROR)
++        contextAttribs.flags |= WINK_CONTEXT_NO_ERROR;
++    if (config.resetNotificationStrategy == glu::RESET_NOTIFICATION_STRATEGY_LOSE_CONTEXT_ON_RESET)
++        contextAttribs.flags |= WINK_CONTEXT_LOSE_ON_RESET;
++
++    m_context = m_wink.wink_context_create(&contextAttribs, &status);
++    if (!m_context)
++    {
++        m_wink.wink_surface_destroy(m_surface);
++        if (status == WINK_ERROR_BAD_VERSION || status == WINK_ERROR_BAD_PROFILE ||
++            status == WINK_ERROR_BAD_ATTRIBUTE)
++            throw NotSupportedError(winkError(m_wink, "wink_context_create", status));
++        throw ResourceError(winkError(m_wink, "wink_context_create", status));
++    }
++
++    try
++    {
++        makeCurrent();
++        FunctionLoader loader(m_wink);
++        glu::initFunctions(&m_functions, &loader, api);
++    }
++    catch (...)
++    {
++        m_wink.wink_make_current(nullptr, nullptr, nullptr);
++        m_wink.wink_context_destroy(m_context);
++        m_wink.wink_surface_destroy(m_surface);
++        throw;
++    }
++
++    m_renderTarget = tcu::RenderTarget(width, height, tcu::PixelFormat(red, green, blue, alpha), depth, stencil, 0);
++}
++
++WinkRenderContext::~WinkRenderContext(void)
++{
++    m_wink.wink_make_current(nullptr, nullptr, nullptr);
++    m_wink.wink_context_destroy(m_context);
++    m_wink.wink_surface_destroy(m_surface);
++}
++
++void WinkRenderContext::postIterate(void)
++{
++    const int status = m_wink.wink_swap_buffers(m_surface);
++    if (status != WINK_OK)
++        throw ResourceError(winkError(m_wink, "wink_swap_buffers", status));
++}
++
++void WinkRenderContext::makeCurrent(void)
++{
++    const int status = m_wink.wink_make_current(m_context, m_surface, m_surface);
++    if (status != WINK_OK)
++        throw ResourceError(winkError(m_wink, "wink_make_current", status));
++}
++
++class WinkContextFactory : public glu::ContextFactory
++{
++public:
++    WinkContextFactory(void) : glu::ContextFactory("wink", "wink (Mesa on WebGPU), offscreen, from DEQP_WINK_LIBRARY")
++    {
++    }
++
++    glu::RenderContext *createContext(const glu::RenderConfig &config, const tcu::CommandLine &,
++                                      const glu::RenderContext *sharedContext) const
++    {
++        const WinkRenderContext *share = dynamic_cast<const WinkRenderContext *>(sharedContext);
++        if (sharedContext && !share)
++            throw NotSupportedError("wink: can only share with a wink context");
++        return new WinkRenderContext(config, share);
++    }
++};
++
++} // namespace
++
++glu::ContextFactory *createWinkContextFactory(void)
++{
++    return new WinkContextFactory();
++}
++
++} // namespace osx
++} // namespace tcu
+diff --git a/framework/platform/osx/tcuOSXWinkContextFactory.hpp b/framework/platform/osx/tcuOSXWinkContextFactory.hpp
+new file mode 100644
+index 0000000..deb307d
+--- /dev/null
++++ b/framework/platform/osx/tcuOSXWinkContextFactory.hpp
+@@ -0,0 +1,40 @@
++#ifndef _TCUOSXWINKCONTEXTFACTORY_HPP
++#define _TCUOSXWINKCONTEXTFACTORY_HPP
++/*-------------------------------------------------------------------------
++ * drawElements Quality Program Tester Core
++ * ----------------------------------------
++ *
++ * Copyright 2026 wink contributors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ *//*!
++ * \file
++ * \brief wink (Mesa's GL on WebGPU) contexts, from a libwink.dylib.
++ *//*--------------------------------------------------------------------*/
++
++#include "gluContextFactory.hpp"
++
++namespace tcu
++{
++namespace osx
++{
++
++//! The "wink" GL context type: contexts of the libwink.dylib that
++//! DEQP_WINK_LIBRARY names, with an offscreen default framebuffer.
++glu::ContextFactory *createWinkContextFactory(void);
++
++} // namespace osx
++} // namespace tcu
++
++#endif // _TCUOSXWINKCONTEXTFACTORY_HPP
+-- 
+2.54.0 (Apple Git-157)
+

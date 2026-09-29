@@ -86,4 +86,5 @@ gets the same driconf defaults (wink fills them), so what passes here should
 pass there.
 
 These two scripts were written on a machine without this native flow and have
-not been run yet.
+not been run yet. On macOS, `wink/test/cts` runs the same suites, and desktop
+GL's, through libwink (`wink/README.md`).
