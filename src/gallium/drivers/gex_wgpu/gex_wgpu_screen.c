@@ -20376,6 +20376,20 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
       ? WGPUMipmapFilterMode_Linear : WGPUMipmapFilterMode_Nearest;
    desc.lodMinClamp = state->min_lod;
    desc.lodMaxClamp = state->max_lod;
+   /* GL_NEAREST and GL_LINEAR as minification filters read the base level
+    * alone. WebGPU has no mipmap filter of "none", and a sampler with the
+    * application's LOD range took further levels when minifying: dEQP's
+    * filtering cases saw another level's texels through a LINEAR filter.
+    *
+    * Clamping the LOD to zero would pick the level and lose the filter,
+    * since WebGPU -- like Vulkan -- decides between the minification and
+    * magnification filter from the *clamped* LOD. So it is zink's range,
+    * [0, 0.25]: a nearest mip selection rounds all of it to the base level,
+    * and any LOD above zero still minifies. */
+   if (state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE) {
+      desc.lodMinClamp = 0.0f;
+      desc.lodMaxClamp = 0.25f;
+   }
    /* EXT_texture_filter_anisotropic, which WebGPU has as a sampler field and
     * this driver used to refuse outright. That refusal was expensive out of
     * proportion to the feature: a refused sampler binds as NULL, so an
