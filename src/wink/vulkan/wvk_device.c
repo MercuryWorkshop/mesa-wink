@@ -117,6 +117,19 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
    result = wvk_device_init_meta(dev);
    if (result != VK_SUCCESS)
       goto fail_replay;
+   result = wvk_device_init_host_copy(dev);
+   if (result != VK_SUCCESS)
+      goto fail_host_copy;
+
+   /* The one global priority there is (VK_KHR_global_priority). */
+   for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; ++i) {
+      const VkDeviceQueueGlobalPriorityCreateInfoKHR *prio =
+         vk_find_struct_const(pCreateInfo->pQueueCreateInfos[i].pNext, DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR);
+      if (prio && prio->globalPriority != VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR) {
+         result = vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
+         goto fail_host_copy_init;
+      }
+   }
 
    /* Two queue families of a queue each: everything, and compute and
     * transfer. The second's submits are the first's, which always exists
@@ -148,6 +161,9 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
 fail_queue:
    wvk_queue_finish(dev, &dev->queue);
 fail_meta:
+fail_host_copy_init:
+   wvk_device_finish_host_copy(dev);
+fail_host_copy:
    wvk_device_finish_meta(dev);
 fail_replay:
    wvk_cmd_buffer_ops.destroy(&dev->replay_cmd->vk);
@@ -174,6 +190,7 @@ wvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       vk_queue_finish(&dev->compute_queue);
    if (dev->queue.vk.base.device)
       wvk_queue_finish(dev, &dev->queue);
+   wvk_device_finish_host_copy(dev);
    wvk_device_finish_meta(dev);
    wvk_cmd_buffer_ops.destroy(&dev->replay_cmd->vk);
    vk_command_pool_finish(&dev->replay_pool);

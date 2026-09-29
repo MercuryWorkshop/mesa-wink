@@ -67,6 +67,7 @@ wvk_files = files(
   'wvk_descriptor_set_layout.c',
   'wvk_device_memory.c',
   'wvk_format.c',
+  'wvk_host_copy.c',
   'wvk_image.c',
   'wvk_instance.c',
   'wvk_nir_descriptors.c',

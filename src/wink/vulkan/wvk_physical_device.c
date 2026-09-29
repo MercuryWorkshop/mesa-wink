@@ -136,6 +136,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_8bit_storage = true,
       .KHR_shader_float16_int8 = true,
       .KHR_shader_float_controls = true,
+      .KHR_shader_float_controls2 = true,
       .KHR_shader_integer_dot_product = true,
       .KHR_shader_non_semantic_info = true,
       .KHR_shader_terminate_invocation = true,
@@ -161,6 +162,13 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_pipeline_library = true,
       .EXT_host_query_reset = true,
       .EXT_image_robustness = true,
+      .EXT_pipeline_robustness = true,
+      .EXT_depth_clip_control = true,
+      .EXT_host_image_copy = true,
+      .EXT_depth_clip_enable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
+      .KHR_global_priority = true,
+      .EXT_global_priority = true,
+      .EXT_global_priority_query = true,
       .EXT_inline_uniform_block = true,
       .EXT_pipeline_creation_cache_control = true,
       .EXT_pipeline_creation_feedback = true,
@@ -297,18 +305,21 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .shaderSubgroupUniformControlFlow = true,
       .shaderMaximalReconvergence = true,
       .ycbcr2plane444Formats = true,
-      /* Secondaries are commands of the primary's queue (vk_cmd_queue),
-       * however deep. */
-      /* The primitives clipping has, counted as pipeline statistics are
-       * (wvk_query.c). */
       /* 8-bit indices widened to 16 by a pass of the driver's
        * (wvk_cmd_draw.c). */
       .indexTypeUint8 = true,
       /* Of the geometry shader's lists, the driver's where the pipeline
-       * has none, walked by a pass of its (wvk_cmd_draw.c): stream 0. */
+       * has none, walked by a pass of its (wvk_cmd_draw.c), each vertex
+       * stream's; which the geometry shader has a list of each of. */
       .transformFeedback = true,
+      .geometryStreams = true,
+      /* Each stream's primitives, counted as pipeline statistics are
+       * (wvk_query.c). */
       .primitivesGeneratedQuery = true,
       .primitivesGeneratedQueryWithRasterizerDiscard = true,
+      .primitivesGeneratedQueryWithNonZeroStreams = true,
+      /* Secondaries are commands of the primary's queue (vk_cmd_queue),
+       * however deep. */
       .nestedCommandBuffer = true,
       .nestedCommandBufferRendering = true,
       .nestedCommandBufferSimultaneousUse = true,
@@ -383,6 +394,20 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .shaderTerminateInvocation = true,
       .shaderZeroInitializeWorkgroupMemory = true,
       .robustImageAccess = true,
+      /* WebGPU is robust whatever a pipeline asks for: its accesses are
+       * WebGPU's, which keeps them in bounds. */
+      .pipelineRobustness = true,
+      /* The SPIR-V's float modes, which NIR has, and WGSL mostly not. */
+      .shaderFloatControls2 = true,
+      /* The one priority of the one queue. */
+      .globalPriorityQuery = true,
+      /* Unclipped depth, as depth clamp has (wvk_cmd_draw.c). */
+      .depthClipEnable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
+      /* Clip space's z made WebGPU's by the viewport transform's depth. */
+      .depthClipControl = true,
+      /* The transfers of a command buffer of the device's, waited for
+       * (wvk_host_copy.c). */
+      .hostImageCopy = true,
       .pipelineCreationCacheControl = true,
       .privateData = true,
       /* Subgroups are one invocation, and so are full, and of the size
@@ -413,8 +438,14 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Tessellation reads both at the draw (wvk_cmd_draw.c). */
       .extendedDynamicState2PatchControlPoints = true,
       .extendedDynamicState3TessellationDomainOrigin = true,
+      /* The geometry shader's draw is of the rasterized stream's lists,
+       * chosen at the draw. */
+      .extendedDynamicState3RasterizationStream = true,
       .vertexInputDynamicState = true,
       .extendedDynamicState3DepthClampEnable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
+      .extendedDynamicState3DepthClipEnable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
+      /* The depth factors of the viewport transform (wvk_cmd_draw.c). */
+      .extendedDynamicState3DepthClipNegativeOneToOne = true,
       .extendedDynamicState3PolygonMode = true,
       .extendedDynamicState3RasterizationSamples = true,
       .extendedDynamicState3SampleMask = true,
@@ -612,17 +643,25 @@ get_device_properties(const struct wvk_physical_device *pdev,
       /* WebGPU samplers have no LOD bias. */
       /* Vulkan's minimum. WebGPU samplers have no bias: it is ignored. */
       .maxSamplerLodBias = WVK_MAX_SAMPLER_LOD_BIAS,
-      /* VK_EXT_transform_feedback */
-      .maxTransformFeedbackStreams = 1,
+      /* VK_EXT_transform_feedback: NIR's streams and buffers. A vertex's
+       * outputs are written at their offsets, however far apart, to the
+       * stride vertex input has. */
+      .maxTransformFeedbackStreams = 4,
       .maxTransformFeedbackBuffers = 4,
       .maxTransformFeedbackBufferSize = UINT32_MAX,
-      .maxTransformFeedbackStreamDataSize = 512,
-      .maxTransformFeedbackBufferDataSize = 512,
+      .maxTransformFeedbackStreamDataSize = 2048,
+      .maxTransformFeedbackBufferDataSize = 2048,
       .maxTransformFeedbackBufferDataStride = 2048,
       .transformFeedbackQueries = true,
-      .transformFeedbackStreamsLinesTriangles = false,
-      .transformFeedbackRasterizationStreamSelect = false,
+      .transformFeedbackStreamsLinesTriangles = true,
+      .transformFeedbackRasterizationStreamSelect = true,
       .transformFeedbackDraw = true,
+      /* VK_EXT_pipeline_robustness: WebGPU's own, of buffers in bounds
+       * and images of VK_EXT_image_robustness. */
+      .defaultRobustnessStorageBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS,
+      .defaultRobustnessUniformBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS,
+      .defaultRobustnessVertexInputs = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS,
+      .defaultRobustnessImages = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS,
       /* VK_EXT_nested_command_buffer */
       .maxCommandBufferNestingLevel = UINT32_MAX,
       .maxSamplerAnisotropy = 16.0f,
@@ -809,6 +848,33 @@ get_device_properties(const struct wvk_physical_device *pdev,
    uint32_t uuid[4] = { pdev->info.vendorID, pdev->info.deviceID, (uint32_t)pdev->info.backendType,
                         0x77696e6b /* "wink" */ };
    memcpy(p->deviceUUID, uuid, VK_UUID_SIZE);
+   /* VK_EXT_host_image_copy: any layout, which WebGPU has none of; a
+    * memcpy copy's memory is a buffer copy's, which is this build's. */
+   static const VkImageLayout host_copy_layouts[] = {
+      VK_IMAGE_LAYOUT_GENERAL,
+      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_IMAGE_LAYOUT_PREINITIALIZED,
+      VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_STENCIL_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_STENCIL_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_STENCIL_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL,
+      VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+   };
+   p->pCopySrcLayouts = (VkImageLayout *)host_copy_layouts;
+   p->copySrcLayoutCount = ARRAY_SIZE(host_copy_layouts);
+   p->pCopyDstLayouts = (VkImageLayout *)host_copy_layouts;
+   p->copyDstLayoutCount = ARRAY_SIZE(host_copy_layouts);
+   memcpy(p->optimalTilingLayoutUUID, instance->driver_uuid, VK_UUID_SIZE);
+   p->identicalMemoryTypeRequirements = true;
    snprintf(p->driverName, VK_MAX_DRIVER_NAME_SIZE, "wink");
    snprintf(p->driverInfo, VK_MAX_DRIVER_INFO_SIZE, "Mesa " PACKAGE_VERSION MESA_GIT_SHA1
             ", Vulkan on WebGPU (%s)", backend);
@@ -946,7 +1012,17 @@ wvk_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
             .minImageTransferGranularity = { 1, 1, 1 },
          };
          vk_foreach_struct(stype, ext, p->pNext) {
-            vk_debug_ignored_stype(stype);
+            switch (stype) {
+            case VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR: {
+               VkQueueFamilyGlobalPriorityPropertiesKHR *prio = ext;
+               prio->priorityCount = 1;
+               prio->priorities[0] = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
+               break;
+            }
+            default:
+               vk_debug_ignored_stype(stype);
+               break;
+            }
          }
       }
    }
@@ -993,7 +1069,7 @@ optimal_features(const struct wvk_physical_device *pdev, VkFormat format)
    if (caps & WVK_CAP_PLANAR)
       return VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
              VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
-             VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT | VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT |
+             VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT | VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT | VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT |
              VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT |
              VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT |
              VK_FORMAT_FEATURE_2_DISJOINT_BIT;
@@ -1028,8 +1104,10 @@ optimal_features(const struct wvk_physical_device *pdev, VkFormat format)
          f |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
    }
    /* Transfers work on every format: the ones WebGPU will not copy --
-    * Depth24Plus at all, Depth32Float into -- go through a shader. */
-   f |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+    * Depth24Plus at all, Depth32Float into -- go through a shader. And so
+    * do the host's, which are those transfers (wvk_host_copy.c). */
+   f |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+        VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
    return f;
 }
 
@@ -1067,7 +1145,9 @@ wvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat
     * copied to and from. */
    VkFormatFeatureFlags2 linear =
       wvk_image_linear_supported(pdev, format, VK_IMAGE_TYPE_2D, 0)
-         ? VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT : 0;
+         ? VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+              VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT
+         : 0;
    if (linear && (wvk_format_caps(pdev, format) & WVK_CAP_PLANAR))
       linear |= VK_FORMAT_FEATURE_2_DISJOINT_BIT;
 
@@ -1192,6 +1272,7 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    if (caps & WVK_CAP_PLANAR) {
       if (info->type != VK_IMAGE_TYPE_2D ||
           (usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                     VK_IMAGE_USAGE_HOST_TRANSFER_BIT |
                      (plane_storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0))))
          return VK_ERROR_FORMAT_NOT_SUPPORTED;
       pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
@@ -1226,6 +1307,13 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
          /* A texture a plane, in the bindings a descriptor of it takes. */
          VkSamplerYcbcrConversionImageFormatProperties *p = ext;
          p->combinedImageSamplerDescriptorCount = vk_format_get_plane_count(info->format);
+         break;
+      }
+      case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY: {
+         /* The texture is the same with host transfers or without. */
+         VkHostImageCopyDevicePerformanceQuery *p = ext;
+         p->optimalDeviceAccess = true;
+         p->identicalMemoryLayout = true;
          break;
       }
       case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES: {

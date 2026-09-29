@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 25
+#define WVK_SHADER_BINARY_VERSION 26
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -136,8 +136,9 @@ struct wvk_shader_key {
    uint8_t clip_varying, clip_slots;
    /* Fragment: counting its invocations; geometry as compute: its
     * primitives -- for the active pipeline statistics query, in its
-    * counters (WVK_DRIVER_SLOT_STATS). */
-   uint8_t stats;
+    * counters (WVK_DRIVER_SLOT_STATS) -- and, of a shader of more than one
+    * vertex stream, the stream rasterized, whose clipping counts. */
+   uint8_t stats, raster_stream;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
@@ -212,10 +213,12 @@ struct wvk_shader {
    uint8_t clip_inputs;
    /* Vertex, tessellation evaluation, geometry: what transform feedback
     * captures of its outputs (nir_xfb_info), by the words of their slots
-    * in its records -- the buffers it writes, their strides, and each
-    * output's slot, first component, components, buffer and offset. */
+    * in its records -- the buffers it writes, their strides and vertex
+    * streams, and each output's slot, first component, components, buffer
+    * and offset. */
    uint8_t xfb_buffers;
    uint16_t xfb_strides[4];
+   uint8_t xfb_streams[4];
    uint8_t xfb_output_count;
    struct wvk_xfb_output {
       uint8_t slot, component, count, buffer;
@@ -229,10 +232,13 @@ struct wvk_shader {
    uint8_t cull_distances;
    struct wvk_shader *cull_gs[5];
    /* Geometry: its input and output primitives (enum mesa_prim), the
-    * vertices an invocation emits at most, and its invocations. */
+    * vertices an invocation emits at most, and its invocations; and the
+    * vertex streams it emits to, to the last one, each of which has
+    * vertices and lists of its own (lower_geometry). */
    uint8_t gs_input, gs_output;
    uint16_t gs_max_vertices;
    uint8_t gs_invocations;
+   uint8_t gs_streams;
    /* Tessellation control: its patches' vertices, and the patch varyings
     * of its records. Evaluation: the domain (enum tess_primitive_mode),
     * spacing (enum gl_tess_spacing), winding and point mode. */

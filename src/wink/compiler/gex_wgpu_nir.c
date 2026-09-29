@@ -858,6 +858,46 @@ gex_wgpu_split_64bit_undef(nir_shader *nir)
    return any;
 }
 
+/* A 64-bit vector is the fifth: the lowering's packs gathered into one --
+ * a varying read as its words, packed a component at a time and made the
+ * vector the shader reads -- and unpacked a channel at a time again. Copy
+ * propagation reaches only through moves without a swizzle, and the fold
+ * of an unpack's pack cannot see through the vector between them, so the
+ * vector stays, 64-bit. An unpack of a vector's channel is of the value
+ * that channel was made of instead, and the vector goes with its uses. */
+static bool
+gex_wgpu_unpack_through_vec(nir_shader *nir)
+{
+   bool any = false;
+   nir_foreach_function_impl(impl, nir) {
+      bool progress = false;
+      nir_builder b = nir_builder_create(impl);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (alu->op != nir_op_unpack_64_2x32_split_x && alu->op != nir_op_unpack_64_2x32_split_y)
+               continue;
+            nir_alu_instr *vec = nir_src_as_alu(alu->src[0].src);
+            if (!vec || !nir_op_is_vec(vec->op) || vec->def.bit_size != 64)
+               continue;
+            /* A channel at a time, of the values the vector's are. */
+            b.cursor = nir_before_instr(instr);
+            nir_def *parts[NIR_MAX_VEC_COMPONENTS];
+            for (unsigned c = 0; c < alu->def.num_components; ++c) {
+               const nir_alu_src *part = &vec->src[alu->src[0].swizzle[c]];
+               parts[c] = nir_build_alu1(&b, alu->op, nir_channel(&b, part->src.ssa, part->swizzle[0]));
+            }
+            nir_def_replace(&alu->def, nir_vec(&b, parts, alu->def.num_components));
+            progress = true;
+         }
+      }
+      any |= nir_progress(progress, impl, nir_metadata_control_flow);
+   }
+   return any;
+}
+
 /* Interpolation sampling, added to a pre-fragment stage's output struct.
  *
  * WebGPU requires the two stages to declare the same interpolation
@@ -1497,6 +1537,7 @@ gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y,
           * inside the loop rather than before it, so the fold that follows
           * can cancel the two against each other. */
          NIR_PASS(progress, nir, nir_lower_64bit_phis);
+         NIR_PASS(progress, nir, gex_wgpu_unpack_through_vec);
          NIR_PASS(progress, nir, nir_opt_copy_prop);
          NIR_PASS(progress, nir, nir_opt_algebraic);
          NIR_PASS(progress, nir, nir_opt_constant_folding);

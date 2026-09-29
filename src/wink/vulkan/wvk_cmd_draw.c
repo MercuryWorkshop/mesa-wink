@@ -2209,7 +2209,12 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
    /* A point or line is not culled, whichever way its quad's triangles face. */
    if (replay->draw_points || replay->draw_lines)
       k->cull_mode = WGPUCullMode_None;
-   k->unclipped_depth = dyn->rs.depth_clamp_enable;
+   /* WebGPU clamps depth always, and clips it but where it is unclipped:
+    * which Vulkan's depth clamp has, but where VK_EXT_depth_clip_enable
+    * says otherwise. */
+   k->unclipped_depth = !vk_rasterization_state_depth_clip_enable(&dyn->rs) &&
+                        wvk_physical_device_has_feature(wvk_device_physical(wvk_cmd_buffer_device(cmd)),
+                                                        WGPUFeatureName_DepthClipControl);
 
    k->samples = MAX2(replay->rendering.samples, 1);
    k->sample_mask = dyn->ms.sample_mask;
@@ -2404,7 +2409,13 @@ set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
       const bool inverted = v.minDepth > v.maxDepth;
       const float min_depth = CLAMP(MIN2(v.minDepth, v.maxDepth), 0.0f, 1.0f);
       const float max_depth = CLAMP(MAX2(v.minDepth, v.maxDepth), 0.0f, 1.0f);
-      const float depth[2] = { inverted ? -1.0f : 1.0f, inverted ? 1.0f : 0.0f };
+      float depth[2] = { inverted ? -1.0f : 1.0f, inverted ? 1.0f : 0.0f };
+      /* Clip space's z from -w to w (VK_EXT_depth_clip_control): (z + w) / 2
+       * first, WebGPU's being from 0 to w. */
+      if (dyn->vp.depth_clip_negative_one_to_one) {
+         depth[1] += depth[0] * 0.5f;
+         depth[0] *= 0.5f;
+      }
       if (memcmp(st->push + WVK_DRIVER_DEPTH_OFFSET, depth, sizeof(depth))) {
          memcpy(st->push + WVK_DRIVER_DEPTH_OFFSET, depth, sizeof(depth));
          st->push_offset = UINT32_MAX;
@@ -3048,14 +3059,15 @@ triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
 /* A draw of a list the driver made, `indices` its, as the bound index
  * buffer for the draw. */
 static void
-draw_list(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint32_t index_count, WGPUPrimitiveTopology topology,
-          uint32_t instances, int32_t base_vertex, uint32_t first_instance, bool indexed, uint32_t draw_id)
+draw_list_at(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint64_t offset, uint32_t index_count,
+             WGPUPrimitiveTopology topology, uint32_t instances, int32_t base_vertex, uint32_t first_instance,
+             bool indexed, uint32_t draw_id)
 {
    struct wvk_replay *replay = cmd->replay;
    struct wvk_bound_state *st = replay->state;
    const struct wvk_bound_buffer ib = st->ib;
    const VkIndexType type = st->index_type;
-   st->ib = (struct wvk_bound_buffer){ NULL, indices, 0, (uint64_t)index_count * 4 };
+   st->ib = (struct wvk_bound_buffer){ NULL, indices, offset, (uint64_t)index_count * 4 };
    st->index_type = VK_INDEX_TYPE_UINT32;
    replay->list_topology = topology;
    foreach_viewport(cmd) {
@@ -3067,6 +3079,13 @@ draw_list(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint32_t index_count, 
    replay->list_topology = WGPUPrimitiveTopology_Undefined;
    st->ib = ib;
    st->index_type = type;
+}
+
+static void
+draw_list(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint32_t index_count, WGPUPrimitiveTopology topology,
+          uint32_t instances, int32_t base_vertex, uint32_t first_instance, bool indexed, uint32_t draw_id)
+{
+   draw_list_at(cmd, indices, 0, index_count, topology, instances, base_vertex, first_instance, indexed, draw_id);
 }
 
 static void
@@ -3521,7 +3540,7 @@ draw_points(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t c
  * bound as storage (expand_points); of `count` indices, or as many as the
  * indirect draw at `at` in `indirect` says. */
 static void
-draw_point_list(struct wvk_cmd_buffer *cmd, const struct wvk_driver_buffer *list, uint32_t count,
+draw_point_list(struct wvk_cmd_buffer *cmd, const struct wvk_driver_buffer *list, uint32_t start, uint32_t count,
                 WGPUBuffer indirect, uint64_t at, uint32_t draw_id)
 {
    struct wvk_replay *replay = cmd->replay;
@@ -3531,7 +3550,7 @@ draw_point_list(struct wvk_cmd_buffer *cmd, const struct wvk_driver_buffer *list
       return;
    }
    st->index = *list;
-   const uint32_t words[2] = { 0, 4 };
+   const uint32_t words[2] = { start, 4 };
    if (memcmp(st->push + WVK_DRIVER_POINT_INDEX, words, sizeof(words))) {
       memcpy(st->push + WVK_DRIVER_POINT_INDEX, words, sizeof(words));
       st->push_offset = UINT32_MAX;
@@ -3595,6 +3614,14 @@ topology_primitive(VkPrimitiveTopology topology)
    }
 }
 
+/* Whether a draw without a geometry shader, whose primitives are all of
+ * stream 0, has another rasterized: then nothing is. */
+static bool
+rasterizes_other_stream(const struct wvk_cmd_buffer *cmd)
+{
+   return cmd->vk.dynamic_graphics_state.rs.rasterization_stream != 0;
+}
+
 /* The geometry shader a draw has: the pipeline's, or where the stage
  * before it writes cull distances, one that passes its primitives through
  * to cull them (wvk_shader_cull_geometry). */
@@ -3620,13 +3647,14 @@ draw_gs(struct wvk_cmd_buffer *cmd)
    return wvk_shader_cull_geometry(wvk_cmd_buffer_device(cmd), last, input);
 }
 
-/* Transform feedback's capture: the geometry shader's lists walked in
- * order -- invocation after invocation, each's primitives as it made them
- * -- and each primitive's vertices' outputs written to the buffers, at the
- * offsets they are at, as long as the whole primitive fits in every
- * buffer; after the first that does not, none. One invocation: the order
- * is the point. The primitives written and those that would have been
- * are the counters of transform feedback queries. */
+/* Transform feedback's capture, of a vertex stream: the geometry shader's
+ * lists of it walked in order -- invocation after invocation, each's
+ * primitives as it made them -- and each primitive's vertices' outputs
+ * written to the stream's buffers, at the offsets they are at, as long as
+ * the whole primitive fits in every one; after the first that does not,
+ * none of the stream's. One invocation: the order is the point. The
+ * primitives written and those that would have been are the counters of
+ * the stream's transform feedback queries. */
 static const char xfb_wgsl[] =
    "@group(0) @binding(0) var<storage, read> p: array<u32>;\n"
    "@group(0) @binding(1) var<storage, read> records: array<u32>;\n"
@@ -3646,12 +3674,13 @@ static const char xfb_wgsl[] =
    "  var invocations = p[0];\n"
    "  if (p[22] != 0xffffffffu) { invocations = src[p[22]]; }\n"
    "  let per = p[1]; let pv = p[2]; let stride = p[3]; let n = p[4]; let mask = p[5];\n"
+   "  let base = p[23]; let stream = p[24];\n"
    "  var off = array<u32, 4>(state[0], state[1], state[2], state[3]);\n"
-   "  var stopped = state[4] != 0u;\n"
+   "  var stopped = state[4u + stream] != 0u;\n"
    "  var written = 0u; var needed = 0u;\n"
    "  for (var g = 0u; g < invocations; g++) {\n"
    "    for (var k = 0u; k < per; k++) {\n"
-   "      let at = (g * per + k) * pv;\n"
+   "      let at = base + (g * per + k) * pv;\n"
    "      if (indices[at] == 0u) { break; }\n"
    "      needed += 1u;\n"
    "      if (stopped) { continue; }\n"
@@ -3663,9 +3692,10 @@ static const char xfb_wgsl[] =
    "      for (var v = 0u; v < pv; v++) {\n"
    "        let rec = indices[at + v] * stride;\n"
    "        for (var o = 0u; o < n; o++) {\n"
-   "          let w = p[24u + 2u * o];\n"
+   "          let w = p[28u + 2u * o];\n"
    "          let b = w >> 24u;\n"
-   "          let first = (off[b] + v * p[6u + b] + p[25u + 2u * o]) / 4u + p[14u + b];\n"
+   "          if ((mask & (1u << b)) == 0u) { continue; }\n"
+   "          let first = (off[b] + v * p[6u + b] + p[29u + 2u * o]) / 4u + p[14u + b];\n"
    "          for (var c = 0u; c < ((w >> 16u) & 0xffu); c++) {\n"
    "            put(p[18u + b], first + c, records[rec + (w & 0xffu) * 4u + ((w >> 8u) & 0xffu) + c]);\n"
    "          }\n"
@@ -3678,9 +3708,9 @@ static const char xfb_wgsl[] =
    "    }\n"
    "  }\n"
    "  for (var b = 0u; b < 4u; b++) { state[b] = off[b]; }\n"
-   "  state[4] = select(0u, 1u, stopped);\n"
-   "  atomicAdd(&counters[11], written);\n"
-   "  atomicAdd(&counters[12], needed);\n"
+   "  state[4u + stream] = select(0u, 1u, stopped);\n"
+   "  atomicAdd(&counters[11u + 2u * stream], written);\n"
+   "  atomicAdd(&counters[12u + 2u * stream], needed);\n"
    "}\n";
 
 static WGPUComputePipeline
@@ -3706,12 +3736,13 @@ xfb_pipeline(struct wvk_device *dev, WGPUComputePipeline *pipeline, const char *
 
 /* The capture of a draw's primitives, a geometry shader's `gs` (its own or
  * the driver's): of its records and lists, as many invocations as
- * `invocations`, or as word `count_word` of `count` says. Outside any
+ * `invocations`, or as word `count_word` of `count` says, each stream's
+ * lists after `capacity` invocations of the stream's before. Outside any
  * pass, the pass ended for it and begun again. */
 static void
 capture_xfb(struct wvk_cmd_buffer *cmd, const struct wvk_shader *gs, const struct wvk_driver_buffer *records,
-            const struct wvk_driver_buffer *indices, uint32_t invocations, WGPUBuffer count, uint64_t count_size,
-            uint32_t count_word)
+            const struct wvk_driver_buffer *indices, uint32_t invocations, uint64_t capacity, WGPUBuffer count,
+            uint64_t count_size, uint32_t count_word)
 {
    struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
    struct wvk_replay *replay = cmd->replay;
@@ -3719,99 +3750,114 @@ capture_xfb(struct wvk_cmd_buffer *cmd, const struct wvk_shader *gs, const struc
        (replay->pass_layered && replay->pass_layer != replay->pass_first_layer))
       return;
    WGPUComputePipeline pipeline = xfb_pipeline(dev, &dev->xfb_pipeline, xfb_wgsl, "wvk transform feedback");
+   if (!pipeline)
+      return;
    const uint32_t pv = gs->gs_output == MESA_PRIM_TRIANGLE_STRIP ? 3 : gs->gs_output == MESA_PRIM_LINE_STRIP ? 2 : 1;
-   uint32_t params[24 + 2 * WVK_MAX_XFB_OUTPUTS] = { 0 };
-   params[0] = invocations;
-   params[1] = wvk_geometry_indices(gs->gs_output, gs->gs_max_vertices) / pv;
-   params[2] = pv;
-   params[3] = wvk_record_stride(gs->record_vars) / 4;
-   params[4] = gs->xfb_output_count;
-   params[22] = count ? count_word : UINT32_MAX;
-   /* Each buffer bound: one binding a WebGPU buffer, over all the ranges of
-    * it, as writable bindings must not overlap. */
-   WGPUBuffer slots[4] = { NULL };
-   uint64_t slot_start[4] = { 0 }, slot_end[4] = { 0 };
-   uint32_t slot_count = 0;
-   for (uint32_t b = 0; b < 4; ++b) {
-      if (!(gs->xfb_buffers & BITFIELD_BIT(b)) || !replay->xfb_bindings[b].buffer)
-         continue;
-      const uint64_t start = replay->xfb_bindings[b].offset, end = start + replay->xfb_bindings[b].size;
-      uint32_t t = 0;
-      while (t < slot_count && slots[t] != replay->xfb_bindings[b].buffer)
-         ++t;
-      if (t == slot_count) {
-         slots[slot_count] = replay->xfb_bindings[b].buffer;
-         slot_start[slot_count] = start & ~255ull;
-         slot_end[slot_count++] = end;
-      } else {
-         slot_start[t] = MIN2(slot_start[t], start & ~255ull);
-         slot_end[t] = MAX2(slot_end[t], end);
+   const uint32_t per = wvk_geometry_indices(gs->gs_output, gs->gs_max_vertices);
+   bool in_pass = false;
+   for (uint32_t stream = 0; stream < MAX2(gs->gs_streams, 1); ++stream) {
+      uint32_t params[28 + 2 * WVK_MAX_XFB_OUTPUTS] = { 0 };
+      params[0] = invocations;
+      params[1] = per / pv;
+      params[2] = pv;
+      params[3] = wvk_record_stride(gs->record_vars) / 4;
+      params[4] = gs->xfb_output_count;
+      params[22] = count ? count_word : UINT32_MAX;
+      params[23] = (uint32_t)(stream * capacity * per);
+      params[24] = stream;
+      /* Each of the stream's buffers bound: one binding a WebGPU buffer,
+       * over all the ranges of it, as writable bindings must not overlap. */
+      WGPUBuffer slots[4] = { NULL };
+      uint64_t slot_start[4] = { 0 }, slot_end[4] = { 0 };
+      uint32_t slot_count = 0;
+      for (uint32_t b = 0; b < 4; ++b) {
+         if (!(gs->xfb_buffers & BITFIELD_BIT(b)) || gs->xfb_streams[b] != stream || !replay->xfb_bindings[b].buffer)
+            continue;
+         const uint64_t start = replay->xfb_bindings[b].offset, end = start + replay->xfb_bindings[b].size;
+         uint32_t t = 0;
+         while (t < slot_count && slots[t] != replay->xfb_bindings[b].buffer)
+            ++t;
+         if (t == slot_count) {
+            slots[slot_count] = replay->xfb_bindings[b].buffer;
+            slot_start[slot_count] = start & ~255ull;
+            slot_end[slot_count++] = end;
+         } else {
+            slot_start[t] = MIN2(slot_start[t], start & ~255ull);
+            slot_end[t] = MAX2(slot_end[t], end);
+         }
+         params[5] |= BITFIELD_BIT(b);
+         params[6 + b] = gs->xfb_strides[b];
+         params[10 + b] = (uint32_t)replay->xfb_bindings[b].size;
+         params[18 + b] = t;
       }
-      params[5] |= BITFIELD_BIT(b);
-      params[6 + b] = gs->xfb_strides[b];
-      params[10 + b] = (uint32_t)replay->xfb_bindings[b].size;
-      params[18 + b] = t;
-   }
-   for (uint32_t b = 0; b < 4; ++b) {
-      if (params[5] & BITFIELD_BIT(b))
-         params[14 + b] = (uint32_t)((replay->xfb_bindings[b].offset - slot_start[params[18 + b]]) / 4);
-   }
-   for (uint32_t o = 0; o < gs->xfb_output_count; ++o) {
-      const struct wvk_xfb_output *x = &gs->xfb_outputs[o];
-      params[24 + 2 * o] = x->slot | x->component << 8 | x->count << 16 | (uint32_t)x->buffer << 24;
-      params[25 + 2 * o] = x->offset;
-   }
-   if (!params[5] || !pipeline)
-      return;
-   WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Storage, params);
-   WGPUBuffer counters = wvk_replay_counters(replay);
-   static const uint32_t one[4] = { 0 };
-   WGPUBuffer none = count ? NULL : wvk_replay_temp_buffer(dev, replay, sizeof(one), WGPUBufferUsage_Storage, one);
-   if (!params_buffer || !counters || (!count && !none))
-      return;
-   WGPUBindGroupEntry entries[10] = {
-      { .binding = 0, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
-      { .binding = 1, .buffer = records->buffer, .offset = 0, .size = records->size },
-      { .binding = 2, .buffer = indices->buffer, .offset = 0, .size = indices->size },
-      { .binding = 3, .buffer = replay->xfb_state, .offset = 0, .size = 32 },
-      { .binding = 4, .buffer = counters, .offset = 0, .size = WVK_COUNTERS * 4 },
-      { .binding = 5, .buffer = count ? count : none, .offset = 0, .size = count ? align64(count_size, 4) : 16 },
-   };
-   for (uint32_t t = 0; t < 4; ++t) {
-      WGPUBuffer buffer = t < slot_count ? slots[t] : wvk_replay_temp_buffer(dev, replay, 16, WGPUBufferUsage_Storage, NULL);
-      if (!buffer)
-         return;
-      entries[6 + t] = (WGPUBindGroupEntry){
-         .binding = 6 + t, .buffer = buffer, .offset = t < slot_count ? slot_start[t] : 0,
-         .size = t < slot_count ? align64(slot_end[t] - slot_start[t], 4) : 16,
+      if (!params[5])
+         continue;
+      for (uint32_t b = 0; b < 4; ++b) {
+         if (params[5] & BITFIELD_BIT(b))
+            params[14 + b] = (uint32_t)((replay->xfb_bindings[b].offset - slot_start[params[18 + b]]) / 4);
+      }
+      for (uint32_t o = 0; o < gs->xfb_output_count; ++o) {
+         const struct wvk_xfb_output *x = &gs->xfb_outputs[o];
+         params[28 + 2 * o] = x->slot | x->component << 8 | x->count << 16 | (uint32_t)x->buffer << 24;
+         params[29 + 2 * o] = x->offset;
+      }
+      WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Storage, params);
+      WGPUBuffer counters = wvk_replay_counters(replay);
+      static const uint32_t one[4] = { 0 };
+      WGPUBuffer none =
+         count ? NULL : wvk_replay_temp_buffer(dev, replay, sizeof(one), WGPUBufferUsage_Storage, one);
+      if (!params_buffer || !counters || (!count && !none))
+         break;
+      WGPUBindGroupEntry entries[10] = {
+         { .binding = 0, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
+         { .binding = 1, .buffer = records->buffer, .offset = 0, .size = records->size },
+         { .binding = 2, .buffer = indices->buffer, .offset = 0, .size = indices->size },
+         { .binding = 3, .buffer = replay->xfb_state, .offset = 0, .size = 32 },
+         { .binding = 4, .buffer = counters, .offset = 0, .size = WVK_COUNTERS * 4 },
+         { .binding = 5, .buffer = count ? count : none, .offset = 0, .size = count ? align64(count_size, 4) : 16 },
       };
-   }
-   /* What of the buffers is not written is as it was. */
-   for (uint32_t b = 0; b < 4; ++b) {
-      if (params[5] & BITFIELD_BIT(b))
-         wvk_replay_read(replay, replay->xfb_bindings[b].mem, replay->xfb_bindings[b].offset,
-                         replay->xfb_bindings[b].size);
-   }
-   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-   bg.layout = wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
-   bg.entryCount = ARRAY_SIZE(entries);
-   bg.entries = entries;
-   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
-   wgpuBindGroupLayoutRelease(bg.layout);
-   const bool in_pass = replay->pass != NULL;
-   wvk_replay_end_passes(replay);
-   WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
-   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
-   wgpuComputePassEncoderSetPipeline(pass, pipeline);
-   wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
-   wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
-   wgpuComputePassEncoderEnd(pass);
-   wgpuComputePassEncoderRelease(pass);
-   wgpuBindGroupRelease(group);
-   for (uint32_t b = 0; b < 4; ++b) {
-      if (params[5] & BITFIELD_BIT(b))
-         wvk_replay_write(replay, replay->xfb_bindings[b].mem, replay->xfb_bindings[b].offset,
-                          replay->xfb_bindings[b].size);
+      bool bound = true;
+      for (uint32_t t = 0; t < 4; ++t) {
+         WGPUBuffer buffer =
+            t < slot_count ? slots[t] : wvk_replay_temp_buffer(dev, replay, 16, WGPUBufferUsage_Storage, NULL);
+         if (!buffer) {
+            bound = false;
+            break;
+         }
+         entries[6 + t] = (WGPUBindGroupEntry){
+            .binding = 6 + t, .buffer = buffer, .offset = t < slot_count ? slot_start[t] : 0,
+            .size = t < slot_count ? align64(slot_end[t] - slot_start[t], 4) : 16,
+         };
+      }
+      if (!bound)
+         break;
+      /* What of the buffers is not written is as it was. */
+      for (uint32_t b = 0; b < 4; ++b) {
+         if (params[5] & BITFIELD_BIT(b))
+            wvk_replay_read(replay, replay->xfb_bindings[b].mem, replay->xfb_bindings[b].offset,
+                            replay->xfb_bindings[b].size);
+      }
+      WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+      bg.layout = wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
+      bg.entryCount = ARRAY_SIZE(entries);
+      bg.entries = entries;
+      WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+      wgpuBindGroupLayoutRelease(bg.layout);
+      in_pass |= replay->pass != NULL;
+      wvk_replay_end_passes(replay);
+      WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+      WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
+      wgpuComputePassEncoderSetPipeline(pass, pipeline);
+      wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+      wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
+      wgpuComputePassEncoderEnd(pass);
+      wgpuComputePassEncoderRelease(pass);
+      wgpuBindGroupRelease(group);
+      for (uint32_t b = 0; b < 4; ++b) {
+         if (params[5] & BITFIELD_BIT(b))
+            wvk_replay_write(replay, replay->xfb_bindings[b].mem, replay->xfb_bindings[b].offset,
+                             replay->xfb_bindings[b].size);
+      }
    }
    if (in_pass)
       wvk_replay_restart_pass(cmd, replay->pass_layer);
@@ -3873,21 +3919,24 @@ draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t
     * its layer: again, each culling what is not its. */
    if (replay->pass_layered && !replay->pass_multiview && replay->pass_layer && !passthrough->writes_layer)
       return;
-   const uint64_t vertices = (1 + total * gs->gs_max_vertices) * wvk_record_stride(gs->record_vars);
+   /* Each vertex stream's vertices and lists, after the stream's before. */
+   const uint32_t streams = MAX2(gs->gs_streams, 1);
+   const uint64_t vertices = (1 + total * streams * gs->gs_max_vertices) * wvk_record_stride(gs->record_vars);
    const uint64_t indices = total * per;
-   if (records > limit || vertices > limit || indices * 4 > limit || total > UINT32_MAX) {
+   if (records > limit || vertices > limit || indices * streams * 4 > limit || total > UINT32_MAX) {
       mesa_logw_once("wvk: a draw with a geometry shader of more than its buffers can bind");
       return;
    }
    WGPUBuffer capture = wvk_replay_temp_buffer(dev, replay, MAX2(records, 16), WGPUBufferUsage_Storage, NULL);
    WGPUBuffer out = wvk_replay_temp_buffer(dev, replay, vertices, WGPUBufferUsage_Storage, NULL);
-   WGPUBuffer list = wvk_replay_temp_buffer(dev, replay, MAX2(indices * 4, 16),
-                                            WGPUBufferUsage_Storage | WGPUBufferUsage_Index, NULL);
+   const uint64_t list_bytes = MAX2(indices * streams * 4, 16);
+   WGPUBuffer list = wvk_replay_temp_buffer(dev, replay, list_bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_Index,
+                                            NULL);
    if (!capture || !out || !list)
       return;
    st->capture = (struct wvk_driver_buffer){ capture, ++dev->temp_serial | (1ull << 62), 0, MAX2(records, 16) };
    st->gs_vertices = (struct wvk_driver_buffer){ out, ++dev->temp_serial | (1ull << 62), 0, vertices };
-   st->gs_indices = (struct wvk_driver_buffer){ list, ++dev->temp_serial | (1ull << 62), 0, MAX2(indices * 4, 16) };
+   st->gs_indices = (struct wvk_driver_buffer){ list, ++dev->temp_serial | (1ull << 62), 0, list_bytes };
 
    if (!run_vertices(cmd, 3, indexed, first, count, instances, base_vertex, first_instance, draw_id))
       return;
@@ -3897,17 +3946,21 @@ draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t
       st->push_offset = UINT32_MAX;
    }
    dispatch_graphics(cmd, cs, total);
-   capture_xfb(cmd, gs, &st->gs_vertices, &st->gs_indices, (uint32_t)total, NULL, 0, 0);
+   capture_xfb(cmd, gs, &st->gs_vertices, &st->gs_indices, (uint32_t)total, total, NULL, 0, 0);
 
+   /* The rasterized stream's lists, of a stream it emits to. */
+   const uint32_t raster = dyn->rs.rasterization_stream;
+   if (raster >= streams)
+      return;
    struct wvk_shader *draw_vs = st->vs;
    st->vs = passthrough;
    const WGPUPrimitiveTopology primitives = gs->gs_output == MESA_PRIM_TRIANGLE_STRIP ? WGPUPrimitiveTopology_TriangleList
                                             : gs->gs_output == MESA_PRIM_LINE_STRIP  ? WGPUPrimitiveTopology_LineList
                                                                                      : WGPUPrimitiveTopology_PointList;
    if (quads)
-      draw_point_list(cmd, &st->gs_indices, (uint32_t)indices, NULL, 0, draw_id);
+      draw_point_list(cmd, &st->gs_indices, (uint32_t)(raster * indices * 4), (uint32_t)indices, NULL, 0, draw_id);
    else
-      draw_list(cmd, list, (uint32_t)indices, primitives, 1, 0, 0, true, draw_id);
+      draw_list_at(cmd, list, raster * indices * 4, (uint32_t)indices, primitives, 1, 0, 0, true, draw_id);
    st->vs = draw_vs;
 }
 
@@ -4063,7 +4116,7 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    struct wvk_shader *gs = draw_gs(cmd), *gs_cs = NULL, *gs_draw = NULL;
    const uint32_t prim_vertices = output == 0 ? 1 : output == 1 ? 2 : 3;
    uint64_t gs_capacity = 0;
-   uint32_t gs_per = 0;
+   uint32_t gs_per = 0, gs_streams = 1;
    WGPUBuffer gs_out = NULL, gs_list = NULL;
    if (gs) {
       if (mesa_vertices_per_prim(gs->gs_input) != prim_vertices) {
@@ -4078,14 +4131,24 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
          return;
       }
       gs_per = wvk_geometry_indices(gs->gs_output, gs->gs_max_vertices);
+      gs_streams = MAX2(gs->gs_streams, 1);
       const uint64_t gs_stride = wvk_record_stride(gs->record_vars);
+      /* Each vertex stream's vertices and lists, after the stream's before
+       * (lower_geometry, which has the capacity as the draw's total). */
       gs_capacity = MIN3(indices_capacity / prim_vertices * gs->gs_invocations,
-                         limit / (MAX2(gs->gs_max_vertices, 1) * gs_stride) - 1, limit / (MAX2(gs_per, 1) * 4));
-      gs_out = wvk_replay_temp_buffer(dev, replay, (1 + gs_capacity * gs->gs_max_vertices) * gs_stride, storage, NULL);
-      gs_list = wvk_replay_temp_buffer(dev, replay, MAX2(gs_capacity * gs_per * 4, 16),
+                         limit / (gs_streams * MAX2(gs->gs_max_vertices, 1) * gs_stride) - 1,
+                         limit / (gs_streams * MAX2(gs_per, 1) * 4));
+      gs_out = wvk_replay_temp_buffer(dev, replay, (1 + gs_capacity * gs_streams * gs->gs_max_vertices) * gs_stride,
+                                      storage, NULL);
+      gs_list = wvk_replay_temp_buffer(dev, replay, MAX2(gs_capacity * gs_streams * gs_per * 4, 16),
                                        storage | WGPUBufferUsage_Index, NULL);
       if (!gs_out || !gs_list)
          return;
+      const uint32_t geometry[4] = { 0, 1, (uint32_t)gs_capacity, 0 };
+      if (memcmp(st->push + WVK_DRIVER_GEOMETRY, geometry, sizeof(geometry))) {
+         memcpy(st->push + WVK_DRIVER_GEOMETRY, geometry, sizeof(geometry));
+         st->push_offset = UINT32_MAX;
+      }
    }
 
    /* The vertex and control shaders. */
@@ -4149,14 +4212,15 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    else
       wvk_replay_add_stats(replay, counts, counts_bytes, t + 1, prim_vertices,
                            VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
-                              VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT);
+                              VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
+                              BITFIELD_BIT(WVK_COUNTER_PRIMITIVES(0)));
 
    /* The evaluation shader, of as many points as were made, then the draw
     * of their lists -- or of what a geometry shader makes of them, run as
     * compute of as many as its buffers hold. */
    dispatch_graphics_groups(cmd, evaluation, 0, counts, (patches * 4 + 2) * 4);
    WGPUBuffer draw_list = list;
-   uint64_t draw_bytes = MAX2(indices_capacity * 4, 16), draw_command = (patches * 4 + 5) * 4;
+   uint64_t draw_bytes = MAX2(indices_capacity * 4, 16), draw_command = (patches * 4 + 5) * 4, draw_start = 0;
    WGPUPrimitiveTopology topology = output == 0   ? WGPUPrimitiveTopology_PointList
                                     : output == 1 ? WGPUPrimitiveTopology_LineList
                                                   : WGPUPrimitiveTopology_TriangleList;
@@ -4165,13 +4229,22 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
 #define TEMP(b, size) ((struct wvk_driver_buffer){ b, ++dev->temp_serial | (1ull << 62), 0, size })
       st->capture = TEMP(out, (points_capacity + 1) * out_stride);
       st->index = TEMP(list, MAX2(indices_capacity * 4, 16));
-      st->gs_vertices = TEMP(gs_out, (1 + gs_capacity * gs->gs_max_vertices) * gs_stride);
-      st->gs_indices = TEMP(gs_list, MAX2(gs_capacity * gs_per * 4, 16));
+      st->gs_vertices = TEMP(gs_out, (1 + gs_capacity * gs_streams * gs->gs_max_vertices) * gs_stride);
+      st->gs_indices = TEMP(gs_list, MAX2(gs_capacity * gs_streams * gs_per * 4, 16));
 #undef TEMP
       dispatch_graphics_groups(cmd, gs_cs, 0, counts, (patches * 4 + 10) * 4);
-      capture_xfb(cmd, gs, &st->gs_vertices, &st->gs_indices, 0, counts, counts_bytes, (uint32_t)patches * 4 + 13);
+      capture_xfb(cmd, gs, &st->gs_vertices, &st->gs_indices, 0, gs_capacity, counts, counts_bytes,
+                  (uint32_t)patches * 4 + 13);
+      /* The rasterized stream's lists, of a stream it emits to. */
+      const uint32_t raster = dyn->rs.rasterization_stream;
+      if (raster >= gs_streams) {
+         if (in_pass && !replay->pass)
+            wvk_replay_restart_pass(cmd, replay->pass_layer);
+         return;
+      }
       passthrough = gs_draw;
       draw_list = gs_list;
+      draw_start = raster * gs_capacity * gs_per * 4;
       draw_bytes = MAX2(gs_capacity * gs_per * 4, 16);
       draw_command = (patches * 4 + 14) * 4;
       topology = gs->gs_output == MESA_PRIM_TRIANGLE_STRIP ? WGPUPrimitiveTopology_TriangleList
@@ -4180,19 +4253,21 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    }
    if (in_pass && !replay->pass)
       wvk_replay_restart_pass(cmd, replay->pass_layer);
+   if (!gs && rasterizes_other_stream(cmd))
+      return;
    struct wvk_shader *draw_vs = st->vs;
    if (quads) {
       /* Points as quads, six vertices an index, of the second command. */
-      const struct wvk_driver_buffer l = { draw_list, ++dev->temp_serial | (1ull << 62), 0, draw_bytes };
+      const struct wvk_driver_buffer l = { draw_list, ++dev->temp_serial | (1ull << 62), 0, draw_start + draw_bytes };
       st->vs = passthrough;
-      draw_point_list(cmd, &l, 0, counts, (patches * 4 + (gs ? 23 : 19)) * 4, draw_id);
+      draw_point_list(cmd, &l, (uint32_t)draw_start, 0, counts, (patches * 4 + (gs ? 23 : 19)) * 4, draw_id);
       st->vs = draw_vs;
       return;
    }
    const struct wvk_bound_buffer ib = st->ib;
    const VkIndexType type = st->index_type;
    st->vs = passthrough;
-   st->ib = (struct wvk_bound_buffer){ NULL, draw_list, 0, draw_bytes };
+   st->ib = (struct wvk_bound_buffer){ NULL, draw_list, draw_start, draw_bytes };
    st->index_type = VK_INDEX_TYPE_UINT32;
    replay->list_topology = topology;
    foreach_viewport(cmd) {
@@ -4256,6 +4331,7 @@ count_draw(struct wvk_cmd_buffer *cmd, uint32_t count, uint32_t instances)
    } else {
       wvk_replay_count_stat(replay, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT, prims);
       wvk_replay_count_stat(replay, VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT, prims);
+      wvk_replay_count(replay, WVK_COUNTER_PRIMITIVES(0), prims);
    }
 }
 
@@ -4295,6 +4371,10 @@ draw_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertexCount, uint32_t instanceC
       return;
    }
    run_vertex_writes(cmd, false, firstVertex, vertexCount, instanceCount, 0, firstInstance, draw_id);
+   if (rasterizes_other_stream(cmd)) {
+      cmd->replay->draw_points = cmd->replay->draw_lines = false;
+      return;
+   }
    if (cmd->replay->draw_points || cmd->replay->draw_lines) {
       if (cmd->replay->draw_points)
          draw_points(cmd, false, firstVertex, vertexCount, instanceCount, 0, firstInstance, draw_id);
@@ -4351,6 +4431,10 @@ draw_elements_widened(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t 
       return;
    }
    run_vertex_writes(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
+   if (rasterizes_other_stream(cmd)) {
+      cmd->replay->draw_points = cmd->replay->draw_lines = false;
+      return;
+   }
    if (cmd->replay->draw_points || cmd->replay->draw_lines) {
       if (cmd->replay->draw_points)
          draw_points(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
@@ -4469,6 +4553,8 @@ draw_indirect_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_b
          }
       }
    }
+   if (rasterizes_other_stream(cmd))
+      return;
    /* Points or lines as quads, as the host has the draws (draw_indirect). */
    if (replay->draw_points || replay->draw_lines) {
       for (uint32_t i = 0; i < drawCount; ++i) {
@@ -5047,13 +5133,13 @@ wvk_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer, uint32_t firstCoun
 /* A draw of as many vertices as a counter says were captured: its count
  * made into an indirect command on the GPU. */
 static const char xfb_count_wgsl[] =
-   "struct P { counter_offset: u32, stride: u32, instances: u32, first_instance: u32 }\n"
+   "struct P { counter_offset: u32, stride: u32, instances: u32, first_instance: u32, word: u32 }\n"
    "@group(0) @binding(0) var<uniform> p: P;\n"
    "@group(0) @binding(1) var<storage, read> counter: array<u32>;\n"
    "@group(0) @binding(2) var<storage, read_write> command: array<u32>;\n"
    "@compute @workgroup_size(1)\n"
    "fn main() {\n"
-   "  let bytes = counter[0];\n"
+   "  let bytes = counter[p.word];\n"
    "  command[0] = select(0u, (bytes - p.counter_offset) / max(p.stride, 1u), bytes > p.counter_offset);\n"
    "  command[1] = p.instances;\n"
    "  command[2] = 0u;\n"
@@ -5087,7 +5173,11 @@ wvk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t instance
       return;
    }
    WGPUComputePipeline pipeline = xfb_pipeline(dev, &dev->xfb_count_pipeline, xfb_count_wgsl, "wvk counter draw");
-   const uint32_t params[4] = { counterOffset, vertexStride, instanceCount, firstInstance };
+   /* The counter, of a binding at an offset storage buffers can have. */
+   const uint64_t binding = c.offset & ~255ull;
+   const uint64_t binding_size = c.mem ? MIN2(256, c.mem->buffer_size - binding) & ~3ull : 256;
+   const uint32_t params[8] = { counterOffset, vertexStride, instanceCount, firstInstance,
+                                (uint32_t)(c.offset - binding) / 4 };
    WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
    WGPUBuffer command = wvk_replay_temp_buffer(dev, replay, 16, WGPUBufferUsage_Storage | WGPUBufferUsage_Indirect,
                                                NULL);
@@ -5096,7 +5186,7 @@ wvk_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer, uint32_t instance
    wvk_replay_read(replay, c.mem, c.offset, 4);
    const WGPUBindGroupEntry entries[] = {
       { .binding = 0, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
-      { .binding = 1, .buffer = c.buffer, .offset = c.offset & ~255ull, .size = 256 },
+      { .binding = 1, .buffer = c.buffer, .offset = binding, .size = binding_size },
       { .binding = 2, .buffer = command, .offset = 0, .size = 16 },
    };
    WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;

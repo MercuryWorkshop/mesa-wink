@@ -17,12 +17,14 @@ struct wvk_device_memory;
 struct wvk_replay;
 
 /* The statistics of a pipeline statistics query, VkQueryPipelineStatisticFlagBits'
- * bits; and after them the counters of a transform feedback query, the
- * primitives written and those that would have been. */
+ * bits; and after them the counters of each vertex stream's transform
+ * feedback query, the primitives written and those that would have been,
+ * and of its primitives generated query. */
 #define WVK_STATS 11
-#define WVK_COUNTER_XFB_WRITTEN 11
-#define WVK_COUNTER_XFB_NEEDED 12
-#define WVK_COUNTERS 16
+#define WVK_COUNTER_XFB_WRITTEN(stream) (11 + 2 * (stream))
+#define WVK_COUNTER_XFB_NEEDED(stream) (12 + 2 * (stream))
+#define WVK_COUNTER_PRIMITIVES(stream) (19 + (stream))
+#define WVK_COUNTERS 32
 
 /* A query counted as the replay goes (wvk_query.c): its pool and query,
  * the counters it has values of, and where they were at its begin -- the
@@ -87,6 +89,8 @@ bool wvk_cmd_queue_has_occlusion_queries(const struct vk_cmd_queue *queue);
  * `bit`, which the host knows; or, on the GPU and outside a pass, what
  * word `word` of `src` says, divided by `divisor`, of each of `bits`. */
 void wvk_replay_count_stat(struct wvk_replay *replay, VkQueryPipelineStatisticFlagBits bit, uint64_t n);
+/* Or of counter `counter` (WVK_COUNTERS). */
+void wvk_replay_count(struct wvk_replay *replay, uint32_t counter, uint64_t n);
 /* The GPU's counters (WVK_DRIVER_SLOT_STATS), made the first time. */
 WGPUBuffer wvk_replay_counters(struct wvk_replay *replay);
 void wvk_replay_add_stats(struct wvk_replay *replay, WGPUBuffer src, uint64_t src_size, uint32_t word,

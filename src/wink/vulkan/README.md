@@ -60,7 +60,8 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **64-bit floats**, which WGSL has none of, are Mesa's float64.glsl in
   integer arithmetic (built by glslang, where there is one), inlined by
   nir_lower_doubles; and 64-bit integers are pairs of words
-  (nir_lower_int64). Slow, but there.
+  (nir_lower_int64). Slow, but there. A 64-bit varying is its words, flat,
+  at the same locations, which its accesses pack and unpack.
 - **8- and 16-bit values**, which WGSL has no integers of, are 32-bit
   words of their bits (`wvk_nir_small_types.c`): sign-extended where read
   as signed, kept to their bits where made. Half floats of float
@@ -79,20 +80,23 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **8-bit indices** (indexTypeUint8) are widened to 16 bits by a pass of
   the driver's at the first draw after a bind, the restart index 0xFFFF
   where the draw restarts primitives.
-- **Primitives generated queries** count what clipping has, as the
-  pipeline statistics queries do. Counted queries share counters the
-  replay keeps, host and GPU, which each query takes the difference of
-  between its begin and end, so any of them may be active at once.
-- **Transform feedback** (VK_EXT_transform_feedback, stream 0): while it is
-  on, every draw takes the geometry shader path -- one of the driver's
-  that passes primitives through where the pipeline has none -- and a pass
-  after the geometry shader walks its lists in order, writing each whole
-  primitive's captured outputs from the records to the buffers, until one
-  is full. Where each buffer is at is the GPU's, copied from and to the
-  counter buffers at begin and end; the primitives written and needed are
-  counters of transform feedback queries. A draw by a counter's byte count
-  is an indirect draw made on the GPU, but where the draw needs its count
-  on the host.
+- **Primitives generated queries** count each vertex stream's primitives,
+  as the pipeline statistics queries count theirs. Counted queries share
+  counters the replay keeps, host and GPU, which each query takes the
+  difference of between its begin and end, so any of them may be active
+  at once.
+- **Transform feedback** (VK_EXT_transform_feedback, four streams): while
+  it is on, every draw takes the geometry shader path -- one of the
+  driver's that passes primitives through where the pipeline has none --
+  and a pass after the geometry shader walks each stream's lists in order,
+  writing each whole primitive's captured outputs from the records to the
+  stream's buffers, until one is full. Where each buffer is at is the
+  GPU's, copied from and to the counter buffers at begin and end; the
+  primitives written and needed are counters of each stream's transform
+  feedback queries. A draw by a counter's byte count is an indirect draw
+  made on the GPU, but where the draw needs its count on the host (a
+  geometry or tessellation shader's, points' and lines', and fans'),
+  which a counter written in the same submit it does not have yet.
 - **Variable pointers** (variablePointers, variablePointersStorageBuffer):
   a buffer access whose binding a phi or select chooses, which cannot be
   traced back to one, is an access of each buffer of its kind the shader
@@ -180,8 +184,10 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   draw of that list, whose vertex shader is made of the geometry shader's
   outputs and reads the records. gl_PrimitiveID reaches the fragment
   shader as a flat varying; gl_Layer draws in each layer of a pass drawn a
-  layer at a time. Streams but the first go, and indexed strips do not
-  restart their primitives for it. Without one, topologies with adjacency
+  layer at a time. Each vertex stream has vertices and lists of its own,
+  after all invocations' of the streams before; the draw is of the
+  rasterized stream's. Indexed strips do not restart their primitives
+  for it. Without one, topologies with adjacency
   are drawn without the adjacent vertices, as lists the driver makes.
 - **Tessellation** (tessellationShader) is compute too, around a
   tessellator of the same: the D3D11 reference Mesa's tessellator is, in
@@ -321,6 +327,15 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   its parts added, and clears are not counted.
 - **Blits and `vkCmdClearAttachments`** come from the runtime's vk_meta.
   Its passes of several layers are begun again at each.
+- **Host image copies** (hostImageCopy) are the transfer commands of a
+  command buffer of the device's, submitted and waited for: host memory
+  goes through a buffer of host-visible memory, and a memcpy copy's layout
+  is a buffer copy's of the whole subresource, packed.
+- **Depth clip enable and control**: WebGPU clamps depth always, and clips
+  it but where it is unclipped (depthClipEnable); clip space from -w to w
+  is the viewport transform's depth, (z + w) / 2 first.
+- **Pipeline robustness** is WebGPU's, whatever a pipeline asks for; a
+  queue's global priority is medium, the one there is.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
   have to stay.
@@ -433,7 +448,7 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Descriptor indexing's features, each of them, but not
   `VK_EXT_descriptor_indexing`: that asks for 500000 descriptors a stage,
   where WebGPU has a few dozen bindings.
-- 64-bit floats as vertex inputs or varyings: WebGPU has neither.
+- 64-bit floats as vertex inputs: WebGPU has none.
 - Scalar 8-bit division and remainder, and 8-bit specialization
   constants, fail a few CTS cases not yet understood.
 - A return before a barrier, taken by some invocations: WGSL refuses the

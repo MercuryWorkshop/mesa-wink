@@ -455,7 +455,8 @@ wvk_image_linear_supported(const struct wvk_physical_device *pdev, VkFormat form
    const uint32_t caps = wvk_format_caps(pdev, format);
    return type == VK_IMAGE_TYPE_2D && caps &&
           !(caps & (WVK_CAP_COMPRESSED | WVK_CAP_DEPTH | WVK_CAP_STENCIL)) &&
-          !(usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT));
+          !(usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                      VK_IMAGE_USAGE_HOST_TRANSFER_BIT));
 }
 
 uint32_t
@@ -604,6 +605,18 @@ wvk_GetImageSubresourceLayout2KHR(VkDevice device, VkImage _image, const VkImage
 {
    VK_FROM_HANDLE(wvk_image, image, _image);
    pLayout->subresourceLayout = (VkSubresourceLayout){ 0 };
+   /* A host memcpy copy's memory (wvk_host_copy.c): the subresource's
+    * rows, packed, as a buffer copy has them. */
+   VkSubresourceHostMemcpySize *memcpy_size = vk_find_struct(pLayout->pNext, SUBRESOURCE_HOST_MEMCPY_SIZE);
+   if (memcpy_size) {
+      const VkImageSubresource *sub = &pSubresource->imageSubresource;
+      const VkFormat format = vk_format_get_aspect_format(image->vk.format, sub->aspectMask);
+      const struct util_format_description *desc = vk_format_description(format);
+      const VkExtent3D e = wvk_image_aspect_extent(&image->vk, sub->aspectMask, sub->mipLevel);
+      memcpy_size->size = (uint64_t)DIV_ROUND_UP(e.width, desc->block.width) *
+                          DIV_ROUND_UP(e.height, desc->block.height) * DIV_ROUND_UP(e.depth, desc->block.depth) *
+                          (desc->block.bits / 8);
+   }
    if (!image->linear)
       return;
    /* A plane's, where it is in the image's memory. */

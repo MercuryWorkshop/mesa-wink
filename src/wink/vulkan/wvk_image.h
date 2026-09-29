@@ -7,6 +7,7 @@
 
 #include "wvk_private.h"
 
+#include "vk_format.h"
 #include "vk_image.h"
 
 struct wvk_device;
@@ -95,6 +96,20 @@ wvk_image_aspect_plane(VkImageAspectFlags aspect)
    return (aspect & (VK_IMAGE_ASPECT_PLANE_2_BIT | VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT))   ? 2
           : (aspect & (VK_IMAGE_ASPECT_PLANE_1_BIT | VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT)) ? 1
                                                                                              : 0;
+}
+
+/* The extent of an aspect of a level: a multi-planar image's plane's, of
+ * its subsampling, in its texels. */
+static inline VkExtent3D
+wvk_image_aspect_extent(const struct vk_image *image, VkImageAspectFlags aspect, uint32_t level)
+{
+   VkExtent3D e = vk_image_mip_level_extent(image, level);
+   if (vk_format_get_plane_count(image->format) > 1) {
+      const uint32_t p = wvk_image_aspect_plane(aspect);
+      e.width = vk_format_get_plane_width(image->format, p, e.width);
+      e.height = vk_format_get_plane_height(image->format, p, e.height);
+   }
+   return e;
 }
 
 /* What a copy or view of `aspect` is of: a multi-planar image's plane, of

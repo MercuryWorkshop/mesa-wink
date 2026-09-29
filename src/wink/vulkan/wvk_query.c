@@ -372,12 +372,19 @@ wvk_replay_stats(const struct wvk_replay *replay)
 }
 
 void
-wvk_replay_count_stat(struct wvk_replay *replay, VkQueryPipelineStatisticFlagBits bit, uint64_t n)
+wvk_replay_count(struct wvk_replay *replay, uint32_t counter, uint64_t n)
 {
    /* Once for a pass replayed a layer at a time: its draws are the same. */
-   if (!(replay->counter_mask & bit) || (replay->pass_layered && replay->pass_layer != replay->pass_first_layer))
+   if (!(replay->counter_mask & BITFIELD_BIT(counter)) ||
+       (replay->pass_layered && replay->pass_layer != replay->pass_first_layer))
       return;
-   replay->host_counters[util_logbase2(bit)] += n;
+   replay->host_counters[counter] += n;
+}
+
+void
+wvk_replay_count_stat(struct wvk_replay *replay, VkQueryPipelineStatisticFlagBits bit, uint64_t n)
+{
+   wvk_replay_count(replay, util_logbase2(bit), n);
 }
 
 WGPUBuffer
@@ -400,7 +407,7 @@ static const char add_stats_wgsl[] =
    "@compute @workgroup_size(1)\n"
    "fn main() {\n"
    "  let v = src[p.word] / max(p.divisor, 1u);\n"
-   "  for (var i = 0u; i < 16u; i++) {\n"
+   "  for (var i = 0u; i < 32u; i++) {\n"
    "    if ((p.bits & (1u << i)) != 0u) { atomicAdd(&stats[i], v); }\n"
    "  }\n"
    "}\n";
@@ -427,18 +434,19 @@ wvk_replay_add_stats(struct wvk_replay *replay, WGPUBuffer src, uint64_t src_siz
    one_pass(dev, replay, pipeline, entries, ARRAY_SIZE(entries));
 }
 
-/* The counters a query has values of, in the order its values are. */
+/* The counters a query has values of, in the order its values are: of
+ * vertex stream `index`, for a query of one. */
 static uint32_t
-query_counter_mask(const struct wvk_query_pool *pool)
+query_counter_mask(const struct wvk_query_pool *pool, uint32_t index)
 {
+   index = MIN2(index, 3);
    switch (pool->vk.query_type) {
    case VK_QUERY_TYPE_PIPELINE_STATISTICS:
       return pool->vk.pipeline_statistics;
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
-      /* What clipping has. */
-      return VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT;
+      return BITFIELD_BIT(WVK_COUNTER_PRIMITIVES(index));
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
-      return BITFIELD_BIT(WVK_COUNTER_XFB_WRITTEN) | BITFIELD_BIT(WVK_COUNTER_XFB_NEEDED);
+      return BITFIELD_BIT(WVK_COUNTER_XFB_WRITTEN(index)) | BITFIELD_BIT(WVK_COUNTER_XFB_NEEDED(index));
    default:
       return 0;
    }
@@ -455,7 +463,7 @@ update_counter_mask(struct wvk_replay *replay)
 /* A query begun: the counters where they are, the GPU's copied outside a
  * pass, the pass ended for it and begun again. */
 static void
-begin_counters(struct wvk_cmd_buffer *cmd, struct wvk_query_pool *pool, uint32_t query)
+begin_counters(struct wvk_cmd_buffer *cmd, struct wvk_query_pool *pool, uint32_t query, uint32_t index)
 {
    struct wvk_replay *replay = cmd->replay;
    struct wvk_device *dev = replay->dev;
@@ -474,7 +482,8 @@ begin_counters(struct wvk_cmd_buffer *cmd, struct wvk_query_pool *pool, uint32_t
    if (in_pass)
       wvk_replay_restart_pass(cmd, replay->pass_layer);
    struct wvk_counter_query *q = &replay->counter_queries[replay->counter_query_count++];
-   *q = (struct wvk_counter_query){ .pool = pool, .query = query, .mask = query_counter_mask(pool), .begin = begin };
+   *q = (struct wvk_counter_query){ .pool = pool, .query = query, .mask = query_counter_mask(pool, index),
+                                   .begin = begin };
    memcpy(q->host_begin, replay->host_counters, sizeof(q->host_begin));
    update_counter_mask(replay);
 }
@@ -483,7 +492,7 @@ begin_counters(struct wvk_cmd_buffer *cmd, struct wvk_query_pool *pool, uint32_t
  * what the host counted since its begin and what the GPU did, to its
  * values in the pool. */
 static const char finish_stats_wgsl[] =
-   "struct P { words: array<vec4u, 9> }\n"
+   "struct P { words: array<vec4u, 17> }\n"
    "@group(0) @binding(0) var<uniform> p: P;\n"
    "@group(0) @binding(1) var<storage, read> now: array<u32>;\n"
    "@group(0) @binding(2) var<storage, read> begin: array<u32>;\n"
@@ -491,9 +500,9 @@ static const char finish_stats_wgsl[] =
    "fn w(i: u32) -> u32 { return p.words[i / 4u][i % 4u]; }\n"
    "@compute @workgroup_size(1)\n"
    "fn main() {\n"
-   "  let mask = w(32u);\n"
-   "  var at = w(33u);\n"
-   "  for (var i = 0u; i < 16u; i++) {\n"
+   "  let mask = w(64u);\n"
+   "  var at = w(65u);\n"
+   "  for (var i = 0u; i < 32u; i++) {\n"
    "    if ((mask & (1u << i)) == 0u) { continue; }\n"
    "    let gpu = now[i] - begin[i];\n"
    "    let lo = w(2u * i) + gpu;\n"
@@ -520,14 +529,14 @@ end_counters(struct wvk_cmd_buffer *cmd, struct wvk_query_pool *pool, uint32_t q
 
    WGPUComputePipeline pipeline =
       device_pipeline(dev, &dev->finish_stats_pipeline, finish_stats_wgsl, "wvk finish statistics");
-   uint32_t params[36] = { 0 };
+   uint32_t params[68] = { 0 };
    for (uint32_t i = 0; i < WVK_COUNTERS; ++i) {
       const uint64_t delta = replay->host_counters[i] - q.host_begin[i];
       params[2 * i] = (uint32_t)delta;
       params[2 * i + 1] = (uint32_t)(delta >> 32);
    }
-   params[32] = q.mask;
-   params[33] = query * pool->values * 2;
+   params[64] = q.mask;
+   params[65] = query * pool->values * 2;
    WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
    if (!pipeline || !params_buffer)
       return;
@@ -552,8 +561,8 @@ wvk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(wvk_query_pool, pool, queryPool);
    struct wvk_replay *replay = cmd->replay;
-   if (query_counter_mask(pool)) {
-      begin_counters(cmd, pool, query);
+   if (query_counter_mask(pool, index)) {
+      begin_counters(cmd, pool, query, index);
       return;
    }
    if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
@@ -581,7 +590,7 @@ wvk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, 
    struct wvk_replay *replay = cmd->replay;
    if (query < pool->vk.query_count)
       pool->serial[query] = replay->serial;
-   if (query_counter_mask(pool)) {
+   if (query_counter_mask(pool, index)) {
       end_counters(cmd, pool, query);
       return;
    }

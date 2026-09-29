@@ -40,6 +40,12 @@ struct wvk_device {
    /* Blits and vkCmdClearAttachments. */
    struct vk_meta_device meta;
 
+   /* VK_EXT_host_image_copy's copies, recorded one at a time into a
+    * command buffer of this pool (wvk_host_copy.c). */
+   simple_mtx_t host_copy_lock;
+   struct vk_command_pool host_copy_pool;
+   struct wvk_cmd_buffer *host_copy_cmd;
+
    /* WebGPU pipelines and layouts, made at draws and kept. */
    simple_mtx_t cache_lock;
    struct hash_table *bind_group_layouts;   /* struct wvk_bgl */
@@ -137,6 +143,8 @@ VkResult wvk_device_init_pipeline_caches(struct wvk_device *dev);
 void wvk_device_finish_pipeline_caches(struct wvk_device *dev);
 VkResult wvk_device_init_meta(struct wvk_device *dev);
 void wvk_device_finish_meta(struct wvk_device *dev);
+VkResult wvk_device_init_host_copy(struct wvk_device *dev);
+void wvk_device_finish_host_copy(struct wvk_device *dev);
 
 VK_DEFINE_HANDLE_CASTS(wvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
 
