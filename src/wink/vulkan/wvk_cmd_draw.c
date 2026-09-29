@@ -705,7 +705,10 @@ struct wvk_driver_buffer {
 #define WVK_DRAW_WINDOW (256 - 4 + sizeof(VkDrawIndexedIndirectCommand))
 
 struct wvk_bound_state {
+   /* The shaders a draw is of, which are the bound ones, or their variants
+    * for its state (select_draw_shaders). */
    struct wvk_shader *vs, *fs, *cs;
+   struct wvk_shader *bound_vs, *bound_fs;
    struct wvk_bound_set sets[WVK_BIND_POINTS][WVK_MAX_GROUPS];
 
    struct wvk_bound_buffer vb[MESA_VK_MAX_VERTEX_BINDINGS];
@@ -851,8 +854,8 @@ wvk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
    for (uint32_t i = 0; i < stage_count; ++i) {
       struct wvk_shader *shader = wvk_shader_from_vk(shaders[i]);
       switch (stages[i]) {
-      case MESA_SHADER_VERTEX: st->vs = shader; break;
-      case MESA_SHADER_FRAGMENT: st->fs = shader; break;
+      case MESA_SHADER_VERTEX: st->vs = st->bound_vs = shader; break;
+      case MESA_SHADER_FRAGMENT: st->fs = st->bound_fs = shader; break;
       case MESA_SHADER_COMPUTE: st->cs = shader; break;
       default:
          if (shader)
@@ -2585,12 +2588,30 @@ draw_fan_elements(struct wvk_cmd_buffer *cmd, uint32_t first_index, uint32_t ind
 }
 
 /* A draw, the `draw_id`th of a vkCmdDrawMulti*EXT. */
+/* The bound shaders, or their variants for the state the draw has: the
+ * fragment shader for its multisampling, the vertex shader for its vertex
+ * input and for that fragment shader (wvk_shader_draw_variant). */
+static void
+select_draw_shaders(struct wvk_cmd_buffer *cmd)
+{
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   const unsigned samples = replay->rendering.empty && dyn->ms.rasterization_samples
+                               ? dyn->ms.rasterization_samples
+                               : MAX2(replay->rendering.samples, 1);
+   st->fs = wvk_shader_draw_variant(dev, st->bound_fs, NULL, dyn, samples);
+   st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples);
+}
+
 static void
 draw_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,
             uint32_t firstInstance, uint32_t draw_id)
 {
    if (!vertexCount || !instanceCount)
       return;
+   select_draw_shaders(cmd);
    if (draw_polygon_mode(cmd, false, 0, vertexCount, instanceCount, (int32_t)firstVertex, firstInstance, draw_id))
       return;
    if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
@@ -2611,6 +2632,7 @@ draw_elements(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instance
 {
    if (!indexCount || !instanceCount)
       return;
+   select_draw_shaders(cmd);
    if (draw_polygon_mode(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id))
       return;
    if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
@@ -2738,6 +2760,7 @@ draw_indirect(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, VkDevic
 {
    if (!drawCount)
       return;
+   select_draw_shaders(cmd);
    const uint32_t size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
    draw_indirect_bound(cmd, indexed, bound_buffer(cmd, buffer, offset, (uint64_t)(drawCount - 1) * stride + size),
                        drawCount, stride);
@@ -2765,6 +2788,7 @@ draw_indirect_count(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, V
    struct wvk_replay *replay = cmd->replay;
    if (!max_draws)
       return;
+   select_draw_shaders(cmd);
    const uint32_t size = indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
    const uint64_t bytes = (uint64_t)(max_draws - 1) * stride + size;
    const struct wvk_bound_buffer b = bound_buffer(cmd, buffer, offset, bytes);

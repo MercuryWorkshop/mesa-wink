@@ -12,6 +12,7 @@
 #include "vk_shader.h"
 
 struct wvk_device;
+struct vk_dynamic_graphics_state;
 
 /* A resource a shader uses: what its bind group layout entry has to say. */
 enum wvk_binding_kind {
@@ -44,7 +45,35 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 10
+#define WVK_SHADER_BINARY_VERSION 11
+
+/* A generic varying as the WGSL between the stages has it, by location:
+ * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
+ * vertex shader's outputs to be interpolated as the fragment shader's
+ * inputs are, where Vulkan goes by the fragment shader alone. */
+#define WVK_MAX_VARYINGS 32
+#define WVK_VARYING_PRESENT 0x80
+#define WVK_VARYING_FLAT 0x01
+#define WVK_VARYING_LINEAR 0x02
+#define WVK_VARYING_UINT 0x04
+#define WVK_VARYING_SINT 0x08
+
+/* What of the state a shader may be drawn with it was compiled for. A draw
+ * with other state -- a fragment shader it was not linked with, vertex
+ * input it did not know, multisampling set at the draw -- draws a variant
+ * compiled for that (wvk_shader_draw_variant). */
+struct wvk_shader_key {
+   /* Vertex: the fragment shader's inputs its outputs are made to match. */
+   uint8_t fs_inputs[WVK_MAX_VARYINGS];
+   /* Vertex: the attributes it reads itself (pull_divided_attributes),
+    * hashed; 0 for none. */
+   uint64_t pulled;
+   /* Fragment: alpha to one, the coverage it computes from alpha itself,
+    * and the samples it places its sample positions for (0: none). */
+   uint8_t alpha_to_one, by_alpha, samples;
+};
+
+struct wvk_shader_source;
 
 enum wvk_shader_variant {
    /* Vulkan's y points down, WebGPU's up: gl_Position.y negated. */
@@ -99,6 +128,18 @@ struct wvk_shader {
    uint8_t pulled_count;
    /* Compute. */
    uint16_t workgroup_size[3];
+
+   /* What it was compiled for, and from: the NIR and layouts its variants
+    * are compiled from. A variant has no source of its own. */
+   struct wvk_shader_key key;
+   struct wvk_shader_source *source;
+   /* Vertex: its outputs; fragment: its inputs (WVK_VARYING_*). */
+   uint8_t varyings[WVK_MAX_VARYINGS];
+   /* Vertex: the attribute locations it reads, pulled or not. */
+   uint32_t attribs_read;
+   /* Fragment: shades per sample, as its pipeline said; writes its own
+    * sample mask; places sample positions for a number of samples. */
+   bool per_sample, own_mask, uses_samples;
 };
 
 static inline struct wvk_shader *
@@ -108,6 +149,14 @@ wvk_shader_from_vk(struct vk_shader *shader)
 }
 
 extern const struct vk_device_shader_ops wvk_device_shader_ops;
+
+/* The shader, or its variant, for a draw of this state: a vertex shader
+ * for this vertex input and fragment shader (which may be NULL), a
+ * fragment shader for this multisampling at `samples`. The shader itself
+ * where it was compiled for that, or a variant it could not compile. */
+struct wvk_shader *wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader,
+                                           const struct wvk_shader *fs,
+                                           const struct vk_dynamic_graphics_state *dyn, unsigned samples);
 
 /* The physical device's NIR options, which differ from the GL driver's in
  * one thing: Vulkan's InstanceIndex is WebGPU's instance_index. */
