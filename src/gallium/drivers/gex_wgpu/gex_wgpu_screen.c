@@ -43248,6 +43248,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             gex_fail(ctx);
             GEX_DRAW_DROP();
          }
+         /* util_upload_index_buffer copies from the draw's start and
+          * returns the offset *less* the start's bytes, for a driver that
+          * then draws from firstIndex = start. This one draws from zero at
+          * the offset, so the start goes back on. With a start of zero --
+          * every glDrawElements from a client array -- the two agree, which
+          * is how this stayed hidden: the restart split re-issues a client
+          * array's draw as ranges that start past zero, and each read the
+          * indices before its own and drew nothing.
+          * dEQP-GLES3.functional.primitive_restart lost 288 cases to it. */
+         index_upload_offset += draws[0].start * info->index_size;
          uploaded_index_resource = ctx->uploaded_indices;
          index_resource = uploaded_index_resource;
       } else {
