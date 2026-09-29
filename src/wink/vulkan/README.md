@@ -340,8 +340,34 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **Depth clip enable and control**: WebGPU clamps depth always, and clips
   it but where it is unclipped (depthClipEnable); clip space from -w to w
   is the viewport transform's depth, (z + w) / 2 first.
-- **Pipeline robustness** is WebGPU's, whatever a pipeline asks for; a
-  queue's global priority is medium, the one there is.
+- **Pipeline robustness**: robustness 2's bounds (below) where a
+  pipeline's robustness, or the device's features, ask for them, and
+  WebGPU's own otherwise; a queue's global priority is medium, the one
+  there is.
+- **Buffers bounded by their descriptors** (robustBufferAccess2,
+  nullDescriptor): where a pipeline's robustness says so, each word a
+  shader loads, stores or does an atomic on of a uniform or storage
+  buffer is checked against the range its descriptor's record has --
+  zero for a null one -- and one past it is zero, or not written; texel
+  buffers were bounded by their elements already, and read (0, 0, 1) for
+  channels their format has not. Memory has a uniform binding's padding
+  then, as the shader's block may be bigger than what is bound. Null
+  descriptors are the null buffer's, a writable one's of its own. The CTS
+  tests these only of implementations without VK_KHR_portability_subset
+  (WINK_VK_NO_PORTABILITY hides it).
+- **Images bounded by their views** (robustImageAccess2, and null image
+  descriptors): a fetch, load, store or atomic of a texel out of the view,
+  or of a null view, is checked in the shader -- a load reading zero, and
+  alpha one for a format without it; a store or atomic nothing -- as is
+  one of a channel the view's format has not (the record's channels).
+  Storage images only stored to are write-only, which WebGPU has of more
+  formats than read-write. What stays wrong: RG32 storage images both
+  read and written, which WebGPU cannot have.
+- **The provoking vertex** (provokingVertexLast): WebGPU's flat varyings
+  are the first vertex's, so a draw whose provoking vertex is the last is
+  drawn with each primitive's vertices rotated, the last first -- as its
+  own lists of them, the host's or a compute shader's for strips, fans and
+  indexed draws.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
   have to stay.
@@ -437,6 +463,7 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 | `WINK_VK_ABORT_ON_ERROR=1` | abort on a WebGPU validation error, which is a driver bug |
 | `WINK_VK_FALLBACK_ADAPTER=1` | use Dawn's software adapter |
 | `WINK_VK_API_VERSION` | the Vulkan version reported |
+| `WINK_VK_NO_PORTABILITY=1` | hide VK_KHR_portability_subset, for CTS groups that skip on implementations of it (robustness2): testing only |
 | `WINK_VK_VARIANT_LOG=1` | say when a shader variant is compiled for a draw, and why |
 | `GEX_WGPU_SPIRV_DIR=dir` | write every module to `dir/N.spv` before Tint reads it, for one Tint does not come back from |
 | `GEX_WGPU_UNIFORM_LOG=1` | say why a module refused for a barrier in non-uniform control flow could not be made uniform |
@@ -455,6 +482,10 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   `VK_EXT_descriptor_indexing`: that asks for 500000 descriptors a stage,
   where WebGPU has a few dozen bindings.
 - 64-bit floats as vertex inputs: WebGPU has none.
+- RG32 storage images both read and written: WebGPU's read-write storage
+  textures are of one-channel 32-bit formats and tier2's, which RG32 is
+  not. And atomics of 64-bit integers or floats, and of 16-bit floats:
+  WGSL's are of 32-bit words.
 - Scalar 8-bit division and remainder, and 8-bit specialization
   constants, fail a few CTS cases not yet understood.
 - A return before a barrier, taken by some invocations: WGSL refuses the

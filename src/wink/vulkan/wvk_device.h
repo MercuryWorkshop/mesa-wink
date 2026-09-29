@@ -15,10 +15,17 @@
 
 #include "util/hash_table.h"
 #include "util/simple_mtx.h"
+#include "util/u_dynarray.h"
 
 struct wvk_bgl;
 struct wvk_cmd_buffer;
 struct wvk_physical_device;
+
+struct wvk_placeholder {
+   uint64_t key;
+   WGPUTexture texture;
+   WGPUTextureView view;
+};
 
 struct wvk_device {
    struct vk_device vk;
@@ -125,19 +132,19 @@ struct wvk_device {
     * pass reads. */
    WGPURenderPipeline ds_copy_pipelines[2];
    /* What a binding with no descriptor written shows: 1x1 textures of
-    * each kind a bind group layout can want (descriptorBindingPartiallyBound). */
-   struct {
-      uint64_t key;
-      WGPUTexture texture;
-      WGPUTextureView view;
-   } placeholders[16];
-   uint32_t placeholder_count;
+    * each kind a bind group layout can want (descriptorBindingPartiallyBound),
+    * as many kinds as are asked for. */
+   struct util_dynarray placeholders; /* struct wvk_placeholder */
    /* What a pass without attachments renders to. */
    WGPUTexture dummy_attachment;
    VkExtent2D dummy_extent;
    uint32_t dummy_samples;
    /* Bound where a descriptor was never written. */
    WGPUBuffer null_buffer;
+   /* And of a writable storage binding: WebGPU lets no buffer be both
+    * that and read-only in a dispatch, as the null buffer may be. The
+    * shader writes none of it (robustBufferAccess2's bounds). */
+   WGPUBuffer null_storage;
    WGPUSampler null_sampler;
 };
 

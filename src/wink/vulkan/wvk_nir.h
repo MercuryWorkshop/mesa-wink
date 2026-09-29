@@ -28,6 +28,10 @@ bool wvk_nir_lower_view_swizzles(nir_shader *nir, const uint32_t *meta_base);
  * sampling integer textures at all. */
 bool wvk_nir_lower_samplers(nir_shader *nir, const uint32_t *meta_base);
 
+/* Image accesses bounded by their views (robustImageAccess2), and null
+ * views reading and querying zero (nullDescriptor), as records say. */
+bool wvk_nir_lower_robust_images(nir_shader *nir, const uint32_t *meta_base, bool bounds, bool null);
+
 /* Storage images shaders do atomics on, as their image's buffer of
  * texels (wvk_image.h), where their records say. */
 bool wvk_nir_lower_image_atomics(nir_shader *nir, const uint32_t *meta_base);

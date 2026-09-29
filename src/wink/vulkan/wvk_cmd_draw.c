@@ -426,6 +426,7 @@ VkResult
 wvk_device_init_pipeline_caches(struct wvk_device *dev)
 {
    simple_mtx_init(&dev->cache_lock, mtx_plain);
+   util_dynarray_init(&dev->placeholders, NULL);
    dev->bind_group_layouts = _mesa_hash_table_create(NULL, bgl_hash, bgl_equal);
    dev->pipeline_layouts = _mesa_hash_table_create(NULL, layout_hash, layout_equal);
    dev->render_pipelines = _mesa_hash_table_create(NULL, render_hash, render_equal);
@@ -455,6 +456,9 @@ wvk_device_init_pipeline_caches(struct wvk_device *dev)
               WGPUBufferUsage_Index;
    bd.size = 65536;
    dev->null_buffer = wgpuDeviceCreateBuffer(dev->wgpu, &bd);
+   bd.label = wvk_sv("wvk null storage");
+   bd.usage = WGPUBufferUsage_Storage;
+   dev->null_storage = wgpuDeviceCreateBuffer(dev->wgpu, &bd);
    WGPUSamplerDescriptor sd = WGPU_SAMPLER_DESCRIPTOR_INIT;
    dev->null_sampler = wgpuDeviceCreateSampler(dev->wgpu, &sd);
    return VK_SUCCESS;
@@ -565,14 +569,17 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
    }
    if (dev->null_buffer)
       wgpuBufferRelease(dev->null_buffer);
+   if (dev->null_storage)
+      wgpuBufferRelease(dev->null_storage);
    if (dev->null_sampler)
       wgpuSamplerRelease(dev->null_sampler);
    if (dev->dummy_attachment)
       wgpuTextureRelease(dev->dummy_attachment);
-   for (uint32_t i = 0; i < dev->placeholder_count; ++i) {
-      wgpuTextureViewRelease(dev->placeholders[i].view);
-      wgpuTextureRelease(dev->placeholders[i].texture);
+   util_dynarray_foreach(&dev->placeholders, struct wvk_placeholder, p) {
+      wgpuTextureViewRelease(p->view);
+      wgpuTextureRelease(p->texture);
    }
+   util_dynarray_fini(&dev->placeholders);
    simple_mtx_destroy(&dev->cache_lock);
 }
 
@@ -1012,6 +1019,18 @@ push_set(struct wvk_cmd_buffer *cmd, VkShaderStageFlags stages, VkPipelineLayout
    struct wvk_descriptor_set *set = wvk_descriptor_set_create(dev, set_layout);
    if (!set)
       return NULL;
+   /* What the push before of this set wrote, and this one does not, is
+    * as it was. */
+   for (uint32_t bp = 0; bp < WVK_BIND_POINTS; ++bp) {
+      const struct wvk_descriptor_set *prev = cmd->replay->state->sets[bp][index].set;
+      bool pushed = false;
+      util_dynarray_foreach(&cmd->replay->push_sets, struct wvk_descriptor_set *, p)
+         pushed |= *p == prev;
+      if (pushed && prev->layout == set_layout) {
+         wvk_descriptor_set_copy_all(set, prev);
+         break;
+      }
+   }
    util_dynarray_append(&cmd->replay->push_sets, set);
    cmd->replay->state->push_offset = UINT32_MAX;
    for (uint32_t bp = 0; bp < WVK_BIND_POINTS; ++bp) {
@@ -1319,12 +1338,10 @@ placeholder_view_locked(struct wvk_device *dev, const struct wvk_shader_binding 
    const uint64_t key = (uint64_t)b->view_dimension | (uint64_t)b->sample_type << 8 |
                         (uint64_t)b->multisampled << 16 | (uint64_t)storage << 17 |
                         (uint64_t)(storage ? b->format : 0) << 24;
-   for (uint32_t i = 0; i < dev->placeholder_count; ++i) {
-      if (dev->placeholders[i].key == key)
-         return dev->placeholders[i].view;
+   util_dynarray_foreach(&dev->placeholders, struct wvk_placeholder, p) {
+      if (p->key == key)
+         return p->view;
    }
-   if (dev->placeholder_count == ARRAY_SIZE(dev->placeholders))
-      return NULL;
    WGPUTextureFormat format = WGPUTextureFormat_RGBA8Unorm;
    if (storage)
       format = b->format;
@@ -1352,9 +1369,8 @@ placeholder_view_locked(struct wvk_device *dev, const struct wvk_shader_binding 
    WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
    vd.dimension = b->view_dimension;
    WGPUTextureView view = wgpuTextureCreateView(texture, &vd);
-   dev->placeholders[dev->placeholder_count].key = key;
-   dev->placeholders[dev->placeholder_count].texture = texture;
-   dev->placeholders[dev->placeholder_count++].view = view;
+   const struct wvk_placeholder p = { .key = key, .texture = texture, .view = view };
+   util_dynarray_append(&dev->placeholders, p);
    return view;
 }
 
@@ -1543,9 +1559,11 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       case WVK_BINDING_UNIFORM:
       case WVK_BINDING_STORAGE:
       case WVK_BINDING_STORAGE_READ: {
+         /* None, or a null descriptor: the null buffer, as much of it as
+          * a uniform block of the shader's wants. */
          if (!d || !d->buffer) {
-            e->buffer = dev->null_buffer;
-            e->size = 256;
+            e->buffer = b->kind == WVK_BINDING_STORAGE ? dev->null_storage : dev->null_buffer;
+            e->size = CLAMP(align64(b->min_size, 16), 256, 65536);
             break;
          }
          const struct wvk_buffer_swap *swap = replay ? find_buffer_swap(replay, group, b->binding) : NULL;
@@ -2846,7 +2864,8 @@ enum list_mode {
 
 static const char triangles_wgsl[] =
    "struct P { first: u32, wide: u32, count: u32, restart: u32,\n"
-   "           topology: u32, mode: u32, indexed: u32, triangles: u32 }\n"
+   "           topology: u32, mode: u32, indexed: u32, triangles: u32,\n"
+   "           last: u32, pad0: u32, pad1: u32, pad2: u32 }\n"
    "@group(0) @binding(0) var<storage, read> src: array<u32>;\n"
    "@group(0) @binding(1) var<storage, read_write> dst: array<u32>;\n"
    "@group(0) @binding(2) var<uniform> p: P;\n"
@@ -2870,10 +2889,23 @@ static const char triangles_wgsl[] =
    "  }\n"
    "  return vec3u(t + 1u, t + 2u, 0u);\n"
    "}\n"
-   /* A line's ends, of a list and a strip with adjacency. */
+   /* Of the last vertex's flat varyings (VK_EXT_provoking_vertex): a
+    * triangle's corners turned round to begin at its last -- a strip's
+    * third, a fan's second, a list's last -- as WebGPU's are the first's. */
+   "fn provoke(c: vec3u, t: u32) -> vec3u {\n"
+   "  if (p.last == 0u) { return c; }\n"
+   "  if (p.topology == 1u && (t & 1u) != 0u) { return vec3u(c.y, c.z, c.x); }\n"
+   "  if (p.topology == 2u) { return vec3u(c.y, c.z, c.x); }\n"
+   "  return vec3u(c.z, c.x, c.y);\n"
+   "}\n"
+   /* A line's ends, of a list and a strip with adjacency, and of a list
+    * and a strip; the other way round of the last vertex's. */
    "fn ends(t: u32) -> vec2u {\n"
-   "  if (p.topology == 3u) { return vec2u(t * 4u + 1u, t * 4u + 2u); }\n"
-   "  return vec2u(t + 1u, t + 2u);\n"
+   "  var e = vec2u(t + 1u, t + 2u);\n"
+   "  if (p.topology == 3u) { e = vec2u(t * 4u + 1u, t * 4u + 2u); }\n"
+   "  if (p.topology == 7u) { e = vec2u(t * 2u, t * 2u + 1u); }\n"
+   "  if (p.topology == 8u) { e = vec2u(t, t + 1u); }\n"
+   "  return select(e, e.yx, p.last != 0u);\n"
    "}\n"
    "fn emit(slot: u32, v: vec3u) {\n"
    "  if (p.mode == 1u) {\n"
@@ -2899,6 +2931,10 @@ static const char triangles_wgsl[] =
    "    if (n >= 2u) {\n"
    "      var t = vec3u(b, v, a);\n"
    "      if (p.topology == 1u) { t = select(vec3u(a, b, v), vec3u(a, v, b), ((n - 2u) & 1u) != 0u); }\n"
+   /* The new vertex is the last of a strip's and a fan's triangle. */
+   "      if (p.last != 0u) {\n"
+   "        t = select(vec3u(v, a, b), vec3u(v, b, a), p.topology == 1u && ((n - 2u) & 1u) != 0u);\n"
+   "      }\n"
    "      emit(out, t);\n"
    "      last = vec3u(t.z, t.z, t.z);\n"
    "      out++;\n"
@@ -2919,11 +2955,12 @@ static const char triangles_wgsl[] =
    "    let len = i - begin;\n"
    "    if (p.topology == 4u) {\n"
    "      for (var t = 0u; t + 3u < len; t++) {\n"
-   "        dst[out * 2u] = index(begin + t + 1u); dst[out * 2u + 1u] = index(begin + t + 2u); out++;\n"
+   "        let e = select(vec2u(t + 1u, t + 2u), vec2u(t + 2u, t + 1u), p.last != 0u);\n"
+   "        dst[out * 2u] = index(begin + e.x); dst[out * 2u + 1u] = index(begin + e.y); out++;\n"
    "      }\n"
    "    } else if (len >= 6u) {\n"
    "      for (var t = 0u; t < (len - 4u) / 2u; t++) {\n"
-   "        let c = corners(t);\n"
+   "        let c = provoke(corners(t), t);\n"
    "        emit(out, vec3u(index(begin + c.x), index(begin + c.y), index(begin + c.z))); out++;\n"
    "      }\n"
    "    }\n"
@@ -2950,7 +2987,7 @@ static const char triangles_wgsl[] =
    "    dst[t * 2u] = index(e.x); dst[t * 2u + 1u] = index(e.y);\n"
    "    return;\n"
    "  }\n"
-   "  let c = corners(t);\n"
+   "  let c = provoke(corners(t), t);\n"
    "  emit(t, vec3u(index(c.x), index(c.y), index(c.z)));\n"
    "}\n";
 
@@ -2961,6 +2998,8 @@ list_triangles(VkPrimitiveTopology topology, uint32_t count)
 {
    switch (topology) {
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: return count / 3;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return count / 2;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return count >= 2 ? count - 1 : 0;
    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY: return count / 4;
    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY: return count >= 4 ? count - 3 : 0;
    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY: return count / 6;
@@ -2974,7 +3013,7 @@ list_triangles(VkPrimitiveTopology topology, uint32_t count)
  * order: made before the pass goes on. */
 static WGPUBuffer
 triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t count, enum list_mode mode,
-                 uint32_t *index_count)
+                 bool last, uint32_t *index_count)
 {
    struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
    struct wvk_replay *replay = cmd->replay;
@@ -3020,8 +3059,10 @@ triangles_on_gpu(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
                          : topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY      ? 4
                          : topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY   ? 5
                          : topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY  ? 6
+                         : topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST                      ? 7
+                         : topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP                     ? 8
                                                                                            : 2;
-   const uint32_t params[8] = { (uint32_t)(start - base), wide, count, restart, kind, mode, indexed, triangles };
+   const uint32_t params[12] = { (uint32_t)(start - base), wide, count, restart, kind, mode, indexed, triangles, last };
    WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
    if (!out || !params_buffer)
       return NULL;
@@ -3117,10 +3158,28 @@ draw_fan(struct wvk_cmd_buffer *cmd, WGPUBuffer indices, uint32_t triangles, uin
              indexed, draw_id);
 }
 
-/* Of the polygon mode, lines or points; false where it is fill, or the
- * draw not of triangles. */
+/* Whether a draw's flat varyings are its primitives' last vertices'
+ * (VK_EXT_provoking_vertex), which WebGPU's are the first's: its lists
+ * are made to begin at their last vertices (triangles_wgsl's provoke). Of
+ * a fragment shader that has flat varyings only. */
 static bool
-polygon_list(const struct wvk_cmd_buffer *cmd, enum list_mode *mode, WGPUPrimitiveTopology *topology)
+provokes_last(const struct wvk_cmd_buffer *cmd)
+{
+   const struct wvk_bound_state *st = cmd->replay->state;
+   if (cmd->vk.dynamic_graphics_state.rs.provoking_vertex != VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT || !st->fs)
+      return false;
+   for (unsigned i = 0; i < WVK_MAX_VARYINGS; ++i) {
+      if (st->fs->varyings[i] & (WVK_VARYING_FLAT | WVK_VARYING_UINT | WVK_VARYING_SINT))
+         return true;
+   }
+   return false;
+}
+
+/* Of the polygon mode, lines or points; false where it is fill, or the
+ * draw not of triangles. And the lists of filled triangles and of lines
+ * whose last vertices provoke, where `provoking`. */
+static bool
+polygon_list(const struct wvk_cmd_buffer *cmd, enum list_mode *mode, WGPUPrimitiveTopology *topology, bool provoking)
 {
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    const VkPrimitiveTopology t = dyn->ia.primitive_topology;
@@ -3133,6 +3192,20 @@ polygon_list(const struct wvk_cmd_buffer *cmd, enum list_mode *mode, WGPUPrimiti
    }
    const bool adjacent = t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY ||
                          t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
+   if (provoking && dyn->rs.polygon_mode == VK_POLYGON_MODE_FILL && provokes_last(cmd)) {
+      /* Lines, but strips that restart, which the list makes none of. */
+      if (t == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ||
+          (t == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP && !dyn->ia.primitive_restart_enable)) {
+         *mode = LIST_SEGMENTS;
+         *topology = WGPUPrimitiveTopology_LineList;
+         return true;
+      }
+      if (t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST || t == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP) {
+         *mode = LIST_TRIANGLES;
+         *topology = WGPUPrimitiveTopology_TriangleList;
+         return true;
+      }
+   }
    if ((dyn->rs.polygon_mode == VK_POLYGON_MODE_FILL && !adjacent) ||
        (t != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST && t != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP &&
         t != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN && !adjacent))
@@ -3152,10 +3225,10 @@ draw_polygon_mode(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint
 {
    enum list_mode mode;
    WGPUPrimitiveTopology topology;
-   if (!polygon_list(cmd, &mode, &topology))
+   if (!polygon_list(cmd, &mode, &topology, true))
       return false;
    uint32_t index_count = 0;
-   WGPUBuffer indices = triangles_on_gpu(cmd, indexed, first, count, mode, &index_count);
+   WGPUBuffer indices = triangles_on_gpu(cmd, indexed, first, count, mode, provokes_last(cmd), &index_count);
    if (indices)
       draw_list(cmd, indices, index_count, topology, instances, base_vertex, first_instance, indexed, draw_id);
    return true;
@@ -3171,10 +3244,13 @@ draw_fan_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertex_count, uint32_t inst
    uint32_t *list = malloc((size_t)triangles * 12);
    if (!list)
       return;
+   /* Of the last vertex's flat varyings: each triangle from its second
+    * (triangles_wgsl's provoke). */
+   const bool last = provokes_last(cmd);
    for (uint32_t t = 0; t < triangles; ++t) {
-      list[t * 3] = t + 1;
-      list[t * 3 + 1] = t + 2;
-      list[t * 3 + 2] = 0;
+      list[t * 3] = last ? t + 2 : t + 1;
+      list[t * 3 + 1] = last ? 0 : t + 2;
+      list[t * 3 + 2] = last ? t + 1 : 0;
    }
    WGPUBuffer indices = wvk_replay_temp_buffer(wvk_cmd_buffer_device(cmd), cmd->replay, (uint64_t)triangles * 12,
                                                WGPUBufferUsage_Index, list);
@@ -3190,7 +3266,7 @@ draw_fan_elements(struct wvk_cmd_buffer *cmd, uint32_t first_index, uint32_t ind
    if (index_count < 3 || !instances)
       return;
    uint32_t count = 0;
-   WGPUBuffer indices = triangles_on_gpu(cmd, true, first_index, index_count, LIST_TRIANGLES, &count);
+   WGPUBuffer indices = triangles_on_gpu(cmd, true, first_index, index_count, LIST_TRIANGLES, provokes_last(cmd), &count);
    if (indices)
       draw_list(cmd, indices, count, WGPUPrimitiveTopology_TriangleList, instances, vertex_offset, first_instance,
                 true, draw_id);
@@ -4823,7 +4899,7 @@ draw_indirect_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_b
     * host has them, one by one as the lists the driver makes. */
    enum list_mode mode;
    WGPUPrimitiveTopology list;
-   const bool polygon = polygon_list(cmd, &mode, &list);
+   const bool polygon = polygon_list(cmd, &mode, &list, b.mem && b.mem->host);
    if (polygon || cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN) {
       if (!b.mem || !b.mem->host) {
          mesa_logw_once("wvk: an indirect draw of a triangle fan, or not filled, in memory the host has no copy of");

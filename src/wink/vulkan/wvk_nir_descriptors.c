@@ -16,7 +16,9 @@
  * image and sampler is a variable at its (group, binding), and before
  * buffers become words, which the accesses here then do too. The records
  * are in the push binding (WVK_META_OFFSET), each group's where `meta_base`
- * says: the pipeline layout's order.
+ * says: the pipeline layout's order. The buffer accesses made here are
+ * bounded here, by the records, and ACCESS_IN_BOUNDS: not bounded again
+ * as buffers of their own are (robustBufferAccess2).
  */
 #include "wvk_nir.h"
 
@@ -53,7 +55,7 @@ static nir_def *
 load_word(nir_builder *b, nir_def *buffer, nir_def *word, bool writable)
 {
    return nir_load_ssbo(b, 1, 32, buffer, nir_ishl_imm(b, word, 2), .align_mul = 4,
-                        .access = writable ? 0 : ACCESS_NON_WRITEABLE);
+                        .access = ACCESS_IN_BOUNDS | (writable ? 0 : ACCESS_NON_WRITEABLE));
 }
 
 static bool
@@ -133,8 +135,13 @@ texel_fetch(nir_builder *b, const uint32_t *meta, uint32_t group, uint32_t slot,
    const nir_alu_type base = nir_alu_type_get_base_type(dest);
    nir_def *zero = base == nir_type_float ? nir_imm_float(b, 0.0f) : nir_imm_int(b, 0);
    nir_def *one = base == nir_type_float ? nir_imm_float(b, 1.0f) : nir_imm_int(b, 1);
-   /* Before the branch: a phi is first in its block. */
-   nir_def *nothing = nir_imm_zero(b, 4, 32);
+   /* Before the branch, as a phi is first in its block: past the end,
+    * zero, but of a channel the format has not, what the swizzle says
+    * (robustBufferAccess2's (0, 0, 1) for G, B and A). */
+   nir_def *none[4];
+   for (unsigned i = 0; i < 4; ++i)
+      none[i] = nir_bcsel(b, nir_ieq_imm(b, nir_ubitfield_extract_imm(b, f.swizzle, 4 * i, 4), 5), one, zero);
+   nir_def *nothing = nir_vec(b, none, 4);
 
    nir_push_if(b, nir_ult(b, index, f.count));
    nir_def *first_bit = nir_ishl_imm(b, nir_iadd(b, f.start, nir_imul(b, index, f.bytes)), 3);
@@ -242,12 +249,13 @@ texel_store(nir_builder *b, const uint32_t *meta, uint32_t group, uint32_t slot,
       if (eleven && c == 0)
          raw = nir_bcsel(b, is_type(b, &f, WVK_TEXEL_UFLOAT_11_11_10), eleven, raw);
       nir_push_if(b, nir_ieq_imm(b, size, 32));
-      nir_store_ssbo(b, raw, buffer, nir_ishl_imm(b, word, 2), .align_mul = 4);
+      nir_store_ssbo(b, raw, buffer, nir_ishl_imm(b, word, 2), .align_mul = 4, .access = ACCESS_IN_BOUNDS);
       nir_push_else(b, NULL);
       nir_def *mask = nir_ishl(b, nir_iadd_imm(b, nir_ishl(b, nir_imm_int(b, 1), size), -1), offset);
       nir_def *at = nir_ishl_imm(b, word, 2);
-      nir_ssbo_atomic(b, 32, buffer, at, nir_inot(b, mask), .atomic_op = nir_atomic_op_iand);
-      nir_ssbo_atomic(b, 32, buffer, at, nir_iand(b, nir_ishl(b, raw, offset), mask),
+      nir_ssbo_atomic(b, 32, buffer, at, nir_inot(b, mask), .access = ACCESS_IN_BOUNDS,
+                      .atomic_op = nir_atomic_op_iand);
+      nir_ssbo_atomic(b, 32, buffer, at, nir_iand(b, nir_ishl(b, raw, offset), mask), .access = ACCESS_IN_BOUNDS,
                       .atomic_op = nir_atomic_op_ior);
       nir_pop_if(b, NULL);
       nir_pop_if(b, NULL);
@@ -266,10 +274,11 @@ texel_atomic(nir_builder *b, const uint32_t *meta, uint32_t group, uint32_t slot
    nir_def *at = nir_iadd(b, f.start, nir_ishl_imm(b, index, 2));
    nir_def *result;
    if (intr->intrinsic == nir_intrinsic_image_deref_atomic_swap)
-      result = nir_ssbo_atomic_swap(b, 32, buffer, at, intr->src[3].ssa, intr->src[4].ssa,
+      result = nir_ssbo_atomic_swap(b, 32, buffer, at, intr->src[3].ssa, intr->src[4].ssa, .access = ACCESS_IN_BOUNDS,
                                     .atomic_op = nir_intrinsic_atomic_op(intr));
    else
-      result = nir_ssbo_atomic(b, 32, buffer, at, intr->src[3].ssa, .atomic_op = nir_intrinsic_atomic_op(intr));
+      result = nir_ssbo_atomic(b, 32, buffer, at, intr->src[3].ssa, .access = ACCESS_IN_BOUNDS,
+                               .atomic_op = nir_intrinsic_atomic_op(intr));
    nir_pop_if(b, NULL);
    return nir_if_phi(b, result, nothing);
 }
@@ -446,7 +455,7 @@ lower_atomic_image_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
    if (intr->intrinsic == nir_intrinsic_image_deref_store) {
       nir_push_if(b, inside);
-      nir_store_ssbo(b, nir_channel(b, intr->src[3].ssa, 0), buffer, at, .align_mul = 4);
+      nir_store_ssbo(b, nir_channel(b, intr->src[3].ssa, 0), buffer, at, .align_mul = 4, .access = ACCESS_IN_BOUNDS);
       nir_pop_if(b, NULL);
       nir_instr_remove(&intr->instr);
       return true;
@@ -455,12 +464,13 @@ lower_atomic_image_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    nir_push_if(b, inside);
    nir_def *value;
    if (intr->intrinsic == nir_intrinsic_image_deref_load)
-      value = nir_load_ssbo(b, 1, 32, buffer, at, .align_mul = 4);
+      value = nir_load_ssbo(b, 1, 32, buffer, at, .align_mul = 4, .access = ACCESS_IN_BOUNDS);
    else if (intr->intrinsic == nir_intrinsic_image_deref_atomic_swap)
-      value = nir_ssbo_atomic_swap(b, 32, buffer, at, intr->src[3].ssa, intr->src[4].ssa,
+      value = nir_ssbo_atomic_swap(b, 32, buffer, at, intr->src[3].ssa, intr->src[4].ssa, .access = ACCESS_IN_BOUNDS,
                                    .atomic_op = nir_intrinsic_atomic_op(intr));
    else
-      value = nir_ssbo_atomic(b, 32, buffer, at, intr->src[3].ssa, .atomic_op = nir_intrinsic_atomic_op(intr));
+      value = nir_ssbo_atomic(b, 32, buffer, at, intr->src[3].ssa, .access = ACCESS_IN_BOUNDS,
+                              .atomic_op = nir_intrinsic_atomic_op(intr));
    nir_pop_if(b, NULL);
    value = nir_if_phi(b, value, zero);
    if (intr->intrinsic == nir_intrinsic_image_deref_load) {
@@ -1519,4 +1529,223 @@ bool
 wvk_nir_lower_samplers(nir_shader *nir, const uint32_t *meta_base)
 {
    return nir_shader_instructions_pass(nir, lower_sampler_instr, nir_metadata_none, (void *)meta_base);
+}
+
+/* ---------------------------------------------------------------------- */
+/* robustImageAccess2, and null image descriptors (nullDescriptor): an
+ * access past an image view's bounds, or of a null view, reads zero -- of
+ * alpha one where the view's format has none -- and writes nothing; and a
+ * null view's queries are zero. What the format has is the view's record's
+ * channels, which a null view has none of. After the variables are split
+ * and before the views' swizzles, which take a texel so replaced as they
+ * take any. */
+
+struct robust_images {
+   const uint32_t *meta;
+   bool bounds, null;
+};
+
+/* The channels of the view a deref is of, or NULL for no descriptor. */
+static nir_def *
+view_channels(nir_builder *b, const uint32_t *meta, nir_src src, bool storage)
+{
+   uint32_t group, slot;
+   if (!deref_binding(src, &group, &slot))
+      return NULL;
+   return wvk_nir_load_meta(b, meta, group, nir_imm_int(b, slot),
+                            storage ? WVK_META_IMG_CHANNELS : WVK_META_TEX_CHANNELS);
+}
+
+/* Zero, of alpha one where the format has channels and not alpha. */
+static nir_def *
+replaced_texel(nir_builder *b, nir_def *channels, unsigned components, unsigned bit_size, nir_alu_type type)
+{
+   nir_def *zero = nir_imm_zero(b, 1, bit_size);
+   nir_def *one = nir_alu_type_get_base_type(type) == nir_type_float ? nir_imm_floatN_t(b, 1.0, bit_size)
+                                                                     : nir_imm_intN_t(b, 1, bit_size);
+   nir_def *alpha = nir_bcsel(b, nir_iand(b, nir_ine_imm(b, channels, 0), nir_ieq_imm(b, nir_iand_imm(b, channels, 8), 0)),
+                              one, zero);
+   nir_def *c[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < components; ++i)
+      c[i] = i == 3 ? alpha : zero;
+   return nir_vec(b, c, components);
+}
+
+/* The instruction where `valid`, else `otherwise` for its result. */
+static void
+wrap_valid(nir_builder *b, nir_instr *instr, nir_def *valid, nir_def *otherwise)
+{
+   nir_def *def = nir_instr_def(instr);
+   nir_push_if(b, valid);
+   nir_instr *clone = nir_instr_clone(b->shader, instr);
+   nir_builder_instr_insert(b, clone);
+   nir_pop_if(b, NULL);
+   if (def)
+      nir_def_rewrite_uses(def, nir_if_phi(b, nir_instr_def(clone), otherwise));
+   nir_instr_remove(instr);
+}
+
+/* A texture query of `tex`'s texture, at `lod` for a size. */
+static nir_def *
+view_query(nir_builder *b, nir_tex_instr *tex, nir_texop op, nir_def *lod)
+{
+   const int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   nir_tex_instr *q = nir_tex_instr_create(b->shader, lod ? 2 : 1);
+   q->op = op;
+   q->sampler_dim = tex->sampler_dim;
+   q->is_array = tex->is_array;
+   q->dest_type = nir_type_int32;
+   q->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, tex->src[texture].src.ssa);
+   if (lod)
+      q->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, lod);
+   nir_def_init(&q->instr, &q->def, nir_tex_instr_dest_size(q), 32);
+   nir_builder_instr_insert(b, &q->instr);
+   return &q->def;
+}
+
+/* Whether a texel fetch's coordinates are in the view: of its level, in
+ * its layers, of its samples. */
+static nir_def *
+fetch_in_bounds(nir_builder *b, nir_tex_instr *tex)
+{
+   const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int lod_src = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   const int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   const int ms_src = nir_tex_instr_src_index(tex, nir_tex_src_ms_index);
+   if (coord_src < 0)
+      return nir_imm_true(b);
+   nir_def *coord = tex->src[coord_src].src.ssa;
+   nir_def *lod = lod_src >= 0 ? tex->src[lod_src].src.ssa : nir_imm_int(b, 0);
+   if (offset_src >= 0) {
+      nir_def *offset = nir_pad_vector_imm_int(b, tex->src[offset_src].src.ssa, 0, coord->num_components);
+      coord = nir_iadd(b, coord, offset);
+   }
+   /* Of a multisampled texture, which has no levels: its size. */
+   nir_def *size = view_query(b, tex, nir_texop_txs, tex->op == nir_texop_txf_ms ? NULL : lod);
+   nir_def *valid = nir_ball(b, nir_ult(b, coord, nir_trim_vector(b, size, coord->num_components)));
+   if (tex->op == nir_texop_txf) {
+      nir_def *levels = view_query(b, tex, nir_texop_query_levels, NULL);
+      valid = nir_iand(b, valid, nir_ult(b, lod, levels));
+   }
+   if (ms_src >= 0) {
+      nir_def *samples = view_query(b, tex, nir_texop_texture_samples, NULL);
+      valid = nir_iand(b, valid, nir_ult(b, tex->src[ms_src].src.ssa, samples));
+   }
+   return valid;
+}
+
+/* Whether an image access's coordinates are in the view (as
+ * nir_lower_robust_access has it). */
+static nir_def *
+image_in_bounds(nir_builder *b, nir_intrinsic_instr *intr)
+{
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const bool array = nir_intrinsic_image_array(intr);
+   const unsigned coords = nir_image_intrinsic_coord_components(intr);
+   nir_def *coord = nir_trim_vector(b, intr->src[1].ssa, coords);
+   const unsigned size_components = dim == GLSL_SAMPLER_DIM_CUBE && !array ? coords - 1 : coords;
+   nir_def *size = nir_image_deref_size(b, size_components, 32, intr->src[0].ssa, nir_imm_int(b, 0),
+                                        .image_dim = dim, .image_array = array);
+   if (dim == GLSL_SAMPLER_DIM_CUBE) {
+      nir_def *z = array ? nir_imul_imm(b, nir_channel(b, size, 2), 6) : nir_imm_int(b, 6);
+      size = nir_vec3(b, nir_channel(b, size, 0), nir_channel(b, size, 1), z);
+   }
+   nir_def *valid = nir_ball(b, nir_ult(b, coord, size));
+   if (dim == GLSL_SAMPLER_DIM_MS) {
+      nir_def *samples = nir_image_deref_samples(b, 32, intr->src[0].ssa, .image_dim = dim, .image_array = array);
+      valid = nir_iand(b, valid, nir_ult(b, intr->src[2].ssa, samples));
+   }
+   return valid;
+}
+
+static bool
+robust_image_instr(nir_builder *b, nir_instr *instr, const struct robust_images *r)
+{
+   b->cursor = nir_before_instr(instr);
+   if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      const int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+      if (texture < 0 || tex->sampler_dim == GLSL_SAMPLER_DIM_BUF)
+         return false;
+      const bool fetch = tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms;
+      if (!r->null && !(r->bounds && fetch))
+         return false;
+      nir_def *channels = view_channels(b, r->meta, tex->src[texture].src, false);
+      if (!channels)
+         return false;
+      nir_def *valid = r->bounds && fetch ? fetch_in_bounds(b, tex) : nir_imm_true(b);
+      if (r->null)
+         valid = nir_iand(b, valid, nir_ine_imm(b, channels, 0));
+      /* Of a texel: replaced. Of a comparison or a query: zero. */
+      const bool texel = !tex->is_shadow && tex->def.num_components == 4 && tex->op != nir_texop_txs &&
+                         tex->op != nir_texop_query_levels && tex->op != nir_texop_texture_samples &&
+                         tex->op != nir_texop_lod;
+      nir_def *otherwise = texel ? replaced_texel(b, channels, 4, tex->def.bit_size, tex->dest_type)
+                                 : nir_imm_zero(b, tex->def.num_components, tex->def.bit_size);
+      wrap_valid(b, instr, valid, otherwise);
+      return true;
+   }
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+   bool access = false;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_sparse_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+      access = true;
+      break;
+   case nir_intrinsic_image_deref_size:
+   case nir_intrinsic_image_deref_samples:
+   case nir_intrinsic_image_deref_levels:
+      if (!r->null)
+         return false;
+      break;
+   default:
+      return false;
+   }
+   if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF)
+      return false;
+   nir_def *channels = view_channels(b, r->meta, intr->src[0], true);
+   if (!channels)
+      return false;
+   nir_def *valid = access && r->bounds ? image_in_bounds(b, intr) : nir_imm_true(b);
+   if (r->null)
+      valid = nir_iand(b, valid, nir_ine_imm(b, channels, 0));
+   nir_def *otherwise = NULL;
+   if (nir_intrinsic_infos[intr->intrinsic].has_dest) {
+      const bool texel = intr->intrinsic == nir_intrinsic_image_deref_load && intr->def.num_components == 4;
+      otherwise = texel ? replaced_texel(b, channels, 4, intr->def.bit_size, nir_intrinsic_dest_type(intr))
+                        : nir_imm_zero(b, intr->def.num_components, intr->def.bit_size);
+   }
+   wrap_valid(b, instr, valid, otherwise);
+   return true;
+}
+
+bool
+wvk_nir_lower_robust_images(nir_shader *nir, const uint32_t *meta_base, bool bounds, bool null)
+{
+   if (!bounds && !null)
+      return false;
+   const struct robust_images r = { .meta = meta_base, .bounds = bounds, .null = null };
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      /* The instructions first: the ones made here are not to be made
+       * again. */
+      struct util_dynarray instrs;
+      util_dynarray_init(&instrs, NULL);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block)
+            util_dynarray_append(&instrs, instr);
+      }
+      nir_builder b = nir_builder_create(impl);
+      bool changed = false;
+      util_dynarray_foreach(&instrs, nir_instr *, i)
+         changed |= robust_image_instr(&b, *i, &r);
+      util_dynarray_fini(&instrs);
+      progress |= nir_progress(changed, impl, nir_metadata_none);
+   }
+   return progress;
 }

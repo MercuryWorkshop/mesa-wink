@@ -108,6 +108,18 @@ copy_descriptor(struct wvk_descriptor *dst, const struct wvk_descriptor *src, bo
    }
 }
 
+void
+wvk_descriptor_set_copy_all(struct wvk_descriptor_set *dst, const struct wvk_descriptor_set *src)
+{
+   if (dst->layout != src->layout)
+      return;
+   for (uint32_t i = 0; i < dst->layout->descriptor_count; ++i)
+      copy_descriptor(&dst->descriptors[i], &src->descriptors[i], false);
+   if (dst->inline_data && src->inline_data)
+      memcpy(dst->inline_data, src->inline_data, dst->inline_size);
+   wvk_descriptor_set_invalidate(dst);
+}
+
 struct wvk_descriptor_set *
 wvk_descriptor_set_create(struct wvk_device *dev, struct wvk_descriptor_set_layout *layout)
 {
@@ -450,6 +462,13 @@ wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words, u
       case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
          if (d->atomic_image)
             memcpy(record, d->atomic_meta, sizeof(d->atomic_meta));
+         record[WVK_META_IMG_CHANNELS] = d->channels;
+         break;
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+         record[WVK_META_BUF_RANGE] = d->buffer ? (uint32_t)MIN2(d->size, UINT32_MAX) : 0;
          break;
       case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
       case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:

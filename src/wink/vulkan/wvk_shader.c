@@ -567,6 +567,9 @@ wvk_hash_state(struct vk_physical_device *device, const struct vk_graphics_pipel
       };
       _mesa_blake3_update(&ctx, alpha, sizeof(alpha));
    }
+   /* And whether images may be null, which shaders check themselves. */
+   const uint8_t null_images = enabled_features->nullDescriptor;
+   _mesa_blake3_update(&ctx, &null_images, 1);
    _mesa_blake3_final(&ctx, blake3_out);
 }
 
@@ -1521,7 +1524,7 @@ wvk_geometry_streams(const nir_shader *nir)
  * (compile_one). */
 static void
 lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars, bool after_tess, bool stats,
-               unsigned raster_stream)
+               unsigned raster_stream, bool provoking_last)
 {
    const unsigned vertices_in = mesa_vertices_per_prim(nir->info.gs.input_primitive);
    const unsigned streams = wvk_geometry_streams(nir);
@@ -1723,9 +1726,20 @@ lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars, boo
          ids[0] = a;
          ids[1] = nir_bcsel(&b, odd, out, m);
          ids[2] = nir_bcsel(&b, odd, m, out);
+         /* Of the last vertex's flat varyings: from the vertex just
+          * emitted, the triangle's last, round the same way. */
+         if (provoking_last) {
+            ids[0] = out;
+            ids[1] = nir_bcsel(&b, odd, m, a);
+            ids[2] = nir_bcsel(&b, odd, a, m);
+         }
       } else if (per == 2) {
          ids[0] = nir_iadd_imm(&b, out, -1);
          ids[1] = out;
+         if (provoking_last) {
+            ids[0] = out;
+            ids[1] = nir_iadd_imm(&b, out, -1);
+         }
       } else {
          ids[0] = out;
       }
@@ -2144,28 +2158,36 @@ writes_storage_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
 /* A vertex shader's storage writes gone, for the draw: WebGPU's vertex
  * shaders write no storage, and its compute shader has done them before
- * (run_vertices). An atomic gives the value as it is. */
+ * (run_vertices). An atomic gives the value as it is. Those to buffers
+ * first, and to images (`data` non-NULL) once the images the shader
+ * writes have their formats, which they then have as its compute
+ * shader's do (format_storage_images). */
 static bool
 strip_storage_writes_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
+   const bool images = data != NULL;
    b->cursor = nir_before_instr(&intr->instr);
    switch (intr->intrinsic) {
    case nir_intrinsic_store_deref:
-      if (!nir_deref_mode_is(nir_src_as_deref(intr->src[0]), nir_var_mem_ssbo))
+      if (images || !nir_deref_mode_is(nir_src_as_deref(intr->src[0]), nir_var_mem_ssbo))
          return false;
       nir_instr_remove(&intr->instr);
       return true;
    case nir_intrinsic_deref_atomic:
    case nir_intrinsic_deref_atomic_swap:
-      if (!nir_deref_mode_is(nir_src_as_deref(intr->src[0]), nir_var_mem_ssbo))
+      if (images || !nir_deref_mode_is(nir_src_as_deref(intr->src[0]), nir_var_mem_ssbo))
          return false;
       nir_def_replace(&intr->def, nir_load_deref(b, nir_src_as_deref(intr->src[0])));
       return true;
    case nir_intrinsic_image_deref_store:
+      if (!images)
+         return false;
       nir_instr_remove(&intr->instr);
       return true;
    case nir_intrinsic_image_deref_atomic:
    case nir_intrinsic_image_deref_atomic_swap:
+      if (!images)
+         return false;
       nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components, intr->def.bit_size));
       return true;
    default:
@@ -3325,6 +3347,10 @@ struct word_buffers {
    /* Accesses whose binding a variable pointer chooses, which only the
     * index they are given at run time tells (lower_variable_buffers). */
    bool untraced;
+   /* Bounds checked against each descriptor's range (its record's
+    * WVK_META_BUF_RANGE): robustBufferAccess2, or null descriptors. */
+   const uint32_t *meta;
+   bool robust_ubo, robust_ssbo;
 };
 
 /* The binding an index operand of load_ssbo and friends came from:
@@ -3412,6 +3438,8 @@ load_word(nir_builder *b, nir_variable *var, bool ubo, nir_def *word)
    return nir_vector_extract(b, vec, nir_iand_imm(b, word, 3));
 }
 
+static nir_def *lower_word_atomic(nir_builder *b, nir_variable *var, nir_intrinsic_instr *intr, nir_def *first);
+
 /* The access, on the words of buffer (set, binding): its value, or NULL
  * for a store. */
 static nir_def *
@@ -3419,7 +3447,21 @@ lower_word_access(nir_builder *b, struct word_buffers *wb, nir_intrinsic_instr *
                   uint32_t binding)
 {
    nir_variable *var = word_var(b->shader, wb, ubo, set, binding);
+   /* The descriptor's range, where accesses are bounded by it: loads past
+    * it are zero, and stores and atomics none. */
+   nir_def *range = NULL;
+   const bool bounded = nir_intrinsic_has_access(intr) && (nir_intrinsic_access(intr) & ACCESS_IN_BOUNDS);
+   if ((ubo ? wb->robust_ubo : wb->robust_ssbo) && wb->meta && !bounded &&
+       (set != WVK_DRIVER_GROUP || binding < WVK_DRIVER_SLOT_BASE)) {
+      /* From the push binding's words: this pass makes the words of any
+       * load it could make of it. */
+      nir_variable *push = word_var(b->shader, wb, false, WVK_DRIVER_GROUP, WVK_DRIVER_SLOT_PUSH);
+      const uint32_t at = WVK_META_OFFSET / 4 + wb->meta[MIN2(set, 3)] + binding * WVK_META_WORDS + WVK_META_BUF_RANGE;
+      range = load_word(b, push, false, nir_imm_int(b, at));
+   }
    if (intr->intrinsic == nir_intrinsic_get_ssbo_size) {
+      if (range)
+         return range;
       nir_deref_instr *words = nir_build_deref_struct(b, nir_build_deref_var(b, var), 0);
       nir_def *length = nir_deref_buffer_array_length(b, 32, &words->def, .access = ACCESS_NON_WRITEABLE);
       return nir_imul_imm(b, length, 4);
@@ -3430,8 +3472,12 @@ lower_word_access(nir_builder *b, struct word_buffers *wb, nir_intrinsic_instr *
 
    if (intr->intrinsic == nir_intrinsic_load_ubo || intr->intrinsic == nir_intrinsic_load_ssbo) {
       nir_def *comps[NIR_MAX_VEC_COMPONENTS];
-      for (unsigned c = 0; c < intr->def.num_components; ++c)
-         comps[c] = load_word(b, var, ubo, nir_iadd_imm(b, first, c));
+      for (unsigned c = 0; c < intr->def.num_components; ++c) {
+         nir_def *at = nir_iadd_imm(b, first, c);
+         comps[c] = load_word(b, var, ubo, at);
+         if (range)
+            comps[c] = nir_bcsel(b, nir_ult(b, nir_ishl_imm(b, at, 2), range), comps[c], nir_imm_int(b, 0));
+      }
       return nir_vec(b, comps, intr->def.num_components);
    }
 
@@ -3439,13 +3485,32 @@ lower_word_access(nir_builder *b, struct word_buffers *wb, nir_intrinsic_instr *
    if (intr->intrinsic == nir_intrinsic_store_ssbo) {
       nir_def *value = intr->src[0].ssa;
       u_foreach_bit(c, nir_intrinsic_write_mask(intr)) {
-         nir_store_deref(b, nir_build_deref_array(b, words, nir_iadd_imm(b, first, c)),
-                         nir_channel(b, value, c), 0x1);
+         nir_def *at = nir_iadd_imm(b, first, c);
+         if (range)
+            nir_push_if(b, nir_ult(b, nir_ishl_imm(b, at, 2), range));
+         nir_store_deref(b, nir_build_deref_array(b, words, at), nir_channel(b, value, c), 0x1);
+         if (range)
+            nir_pop_if(b, NULL);
       }
       return NULL;
    }
 
-   /* Atomics, on one word. */
+   /* Atomics, on one word; none past the range, which returns zero. */
+   if (range) {
+      nir_def *zero = nir_imm_int(b, 0);
+      nir_push_if(b, nir_ult(b, nir_ishl_imm(b, first, 2), range));
+      nir_def *result = lower_word_atomic(b, var, intr, first);
+      nir_pop_if(b, NULL);
+      return nir_if_phi(b, result, zero);
+   }
+   return lower_word_atomic(b, var, intr, first);
+}
+
+/* An atomic on word `first` of a buffer's words. */
+static nir_def *
+lower_word_atomic(nir_builder *b, nir_variable *var, nir_intrinsic_instr *intr, nir_def *first)
+{
+   nir_deref_instr *words = nir_build_deref_struct(b, nir_build_deref_var(b, var), 0);
    nir_deref_instr *word = nir_build_deref_array(b, words, first);
    const nir_atomic_op op = nir_intrinsic_atomic_op(intr);
    if (op == nir_atomic_op_imin || op == nir_atomic_op_imax) {
@@ -3987,10 +4052,16 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
                        const struct vk_graphics_pipeline_state *state, struct wvk_shader *shader,
                        void *mem_ctx)
 {
+   const struct vk_pipeline_robustness_state *rs = info->robustness;
    struct word_buffers wb = {
       .vars = _mesa_pointer_hash_table_create(mem_ctx),
       .info = info,
       .ubo_sizes = _mesa_pointer_hash_table_create(mem_ctx),
+      .meta = shader->meta_base,
+      .robust_ubo = rs && (rs->uniform_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2 ||
+                           rs->null_uniform_buffer_descriptor),
+      .robust_ssbo = rs && (rs->storage_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2 ||
+                            rs->null_storage_buffer_descriptor),
    };
    NIR_PASS(_, nir, push_constants_to_descriptor);
    /* How big each uniform block is, before its variable goes. */
@@ -4442,6 +4513,9 @@ struct usage {
     * samplers used for comparisons. */
    struct set *sampled;
    struct set *compared;
+   /* Images loaded from, or with atomics: those only stored to are
+    * write-only, which more formats are storage of than read-write. */
+   struct set *loaded;
 };
 
 static void *
@@ -4497,6 +4571,12 @@ gather_usage_instr(nir_builder *b, nir_instr *instr, void *data)
       case nir_intrinsic_image_deref_atomic_swap:
          /* An image never written is read-only, as Tint takes it. */
          note_var_deref(u->written, &intr->src[0]);
+         if (intr->intrinsic != nir_intrinsic_image_deref_store)
+            note_var_deref(u->loaded, &intr->src[0]);
+         return false;
+      case nir_intrinsic_image_deref_load:
+      case nir_intrinsic_image_deref_sparse_load:
+         note_var_deref(u->loaded, &intr->src[0]);
          return false;
       default:
          break;
@@ -4550,6 +4630,7 @@ reflect_bindings(nir_shader *nir, const struct vk_shader_compile_info *info,
    struct usage u = {
       .used = _mesa_pointer_set_create(mem_ctx),
       .written = _mesa_pointer_set_create(mem_ctx),
+      .loaded = _mesa_pointer_set_create(mem_ctx),
       .sampled = _mesa_pointer_set_create(mem_ctx),
       .compared = _mesa_pointer_set_create(mem_ctx),
    };
@@ -4630,6 +4711,8 @@ reflect_bindings(nir_shader *nir, const struct vk_shader_compile_info *info,
             free(bindings);
             return false;
          }
+         if (!_mesa_set_search(u.loaded, k))
+            var->data.access |= ACCESS_NON_READABLE;
          if (var->data.access & ACCESS_NON_WRITEABLE)
             sb->access = WGPUStorageTextureAccess_ReadOnly;
          else if (var->data.access & ACCESS_NON_READABLE)
@@ -4687,6 +4770,8 @@ struct wvk_shader_source {
    struct blob nir;
    VkShaderCreateFlagsEXT flags;
    VkShaderStageFlags next_stage_mask;
+   /* The pipeline's robustness, which its variants are compiled with. */
+   struct vk_pipeline_robustness_state robustness;
    uint32_t set_layout_count;
    struct wvk_descriptor_set_layout *layouts[MESA_VK_MAX_DESCRIPTOR_SETS];
    struct vk_descriptor_set_layout *vk_layouts[MESA_VK_MAX_DESCRIPTOR_SETS];
@@ -4792,6 +4877,8 @@ source_create(const struct vk_shader_compile_info *info)
    nir_serialize(&src->nir, info->nir, false);
    src->flags = info->flags;
    src->next_stage_mask = info->next_stage_mask;
+   if (info->robustness)
+      src->robustness = *info->robustness;
    src->set_layout_count = MIN2(info->set_layout_count, ARRAY_SIZE(src->layouts));
    bool ok = !src->nir.out_of_memory;
    for (uint32_t g = 0; ok && g < src->set_layout_count; ++g) {
@@ -4817,6 +4904,7 @@ source_serialize(const struct wvk_shader_source *src, struct blob *blob)
    blob_write_bytes(blob, src->nir.data, src->nir.size);
    blob_write_uint32(blob, src->flags);
    blob_write_uint32(blob, src->next_stage_mask);
+   blob_write_bytes(blob, &src->robustness, sizeof(src->robustness));
    blob_write_uint32(blob, src->set_layout_count);
    for (uint32_t g = 0; g < src->set_layout_count; ++g) {
       const struct wvk_descriptor_set_layout *l = src->layouts[g];
@@ -4856,6 +4944,7 @@ source_deserialize(struct blob_reader *blob)
       blob_write_bytes(&src->nir, nir, nir_size);
    src->flags = blob_read_uint32(blob);
    src->next_stage_mask = blob_read_uint32(blob);
+   blob_copy_bytes(blob, &src->robustness, sizeof(src->robustness));
    /* Read once: MIN2 would read it twice. */
    const uint32_t set_layout_count = blob_read_uint32(blob);
    src->set_layout_count = MIN2(set_layout_count, ARRAY_SIZE(src->layouts));
@@ -5401,7 +5490,9 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       shader->key.after_tess = records->after_tess;
       shader->key.stats = records->stats;
       shader->key.raster_stream = records->raster_stream;
-      lower_geometry(nir, shader, records->vs_vars, records->after_tess, records->stats, records->raster_stream);
+      shader->key.provoking_last = records->provoking_last;
+      lower_geometry(nir, shader, records->vs_vars, records->after_tess, records->stats, records->raster_stream,
+                     records->provoking_last);
    } else if (records && records->geometry == 2) {
       shader->key.geometry = 2;
    }
@@ -5629,10 +5720,19 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    struct util_dynarray bgra;
    util_dynarray_init(&bgra, mem_ctx);
    format_storage_images(nir, shader, records, &bgra);
+   if (nir->info.stage == MESA_SHADER_VERTEX && shader->writes_storage && shader->key.runs != 1)
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, strip_storage_writes_instr, nir_metadata_control_flow,
+               (void *)1);
    bool retyped = false;
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, match_image_type_instr, nir_metadata_all, &retyped);
    if (retyped)
       nir_fixup_deref_types(nir);
+   /* Out of bounds, and of null views: a texel replaced before the
+    * swizzle takes it apart, as a fetched one is. */
+   const struct vk_pipeline_robustness_state *robustness = info->robustness;
+   NIR_PASS(_, nir, wvk_nir_lower_robust_images, shader->meta_base,
+            robustness && robustness->images == VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2,
+            dev->vk.enabled_features.nullDescriptor);
    /* Swizzles first: a gather's is a gather of another component, which
     * then samples as its own; and the border replaces a texel before the
     * swizzle takes it apart. */
@@ -6100,6 +6200,7 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
       .flags = src->flags,
       .next_stage_mask = src->next_stage_mask,
       .nir = nir,
+      .robustness = &src->robustness,
       .set_layout_count = src->set_layout_count,
       .set_layouts = src->vk_layouts,
    };
@@ -6140,6 +6241,7 @@ wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsig
                             BITFIELD_RANGE(WVK_COUNTER_PRIMITIVES(0), 4))) != 0;
       if (key.stats && gs->gs_streams > 1)
          key.raster_stream = MIN2(dyn->rs.rasterization_stream, 3);
+      key.provoking_last = dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
    } else if (other) {
       memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
       key.primitive_id = other->key.primitive_id;

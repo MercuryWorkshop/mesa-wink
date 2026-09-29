@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 26
+#define WVK_SHADER_BINARY_VERSION 27
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -139,6 +139,9 @@ struct wvk_shader_key {
     * counters (WVK_DRIVER_SLOT_STATS) -- and, of a shader of more than one
     * vertex stream, the stream rasterized, whose clipping counts. */
    uint8_t stats, raster_stream;
+   /* Geometry as compute: its primitives' lists beginning at their last
+    * vertex, whose flat varyings they have (VK_EXT_provoking_vertex). */
+   uint8_t provoking_last;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */

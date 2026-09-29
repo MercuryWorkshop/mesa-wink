@@ -11,6 +11,7 @@
  * knowingly non-conformant and why VK_KHR_portability_subset is exposed.
  */
 #include "wvk_physical_device.h"
+#include "wvk_device_memory.h"
 
 #include "wvk_entrypoints.h"
 #include "wvk_descriptor_set_layout.h"
@@ -112,7 +113,9 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_maintenance6 = true,
       .KHR_maintenance7 = true,
       .KHR_multiview = true,
-      .KHR_portability_subset = true,
+      /* What WebGPU leaves out; hidden for testing what the CTS tests only
+       * of implementations without it (WINK_VK_NO_PORTABILITY). */
+      .KHR_portability_subset = !getenv("WINK_VK_NO_PORTABILITY"),
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
@@ -164,9 +167,12 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_host_query_reset = true,
       .EXT_image_robustness = true,
       .EXT_pipeline_robustness = true,
+      .EXT_robustness2 = true,
+      .KHR_robustness2 = true,
       .EXT_depth_clip_control = true,
       .EXT_host_image_copy = true,
       .EXT_conditional_rendering = true,
+      .EXT_provoking_vertex = true,
       .EXT_depth_clip_enable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
       .KHR_global_priority = true,
       .EXT_global_priority = true,
@@ -399,6 +405,14 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* WebGPU is robust whatever a pipeline asks for: its accesses are
        * WebGPU's, which keeps them in bounds. */
       .pipelineRobustness = true,
+      /* Buffers bounded by their descriptors' ranges, in the shader, and
+       * null ones of no range (wvk_shader.c's lower_word_access); texel
+       * buffers by their elements (wvk_nir_descriptors.c). */
+      .robustBufferAccess2 = true,
+      /* Images bounded by their views, and null ones reading zero, by
+       * the shader too (wvk_nir_descriptors.c). */
+      .robustImageAccess2 = true,
+      .nullDescriptor = true,
       /* The SPIR-V's float modes, which NIR has, and WGSL mostly not. */
       .shaderFloatControls2 = true,
       /* The one priority of the one queue. */
@@ -414,6 +428,11 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
        * of the arguments a pass of the driver's zeroes (wvk_cmd_draw.c). */
       .conditionalRendering = true,
       .inheritedConditionalRendering = true,
+      /* Lists of the draw's primitives, each beginning at its last vertex,
+       * where the fragment shader has flat varyings (wvk_cmd_draw.c); and
+       * a geometry shader's. */
+      .provokingVertexLast = true,
+      .transformFeedbackPreservesProvokingVertex = false,
       .pipelineCreationCacheControl = true,
       .privateData = true,
       /* Subgroups are one invocation, and so are full, and of the size
@@ -447,6 +466,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* The geometry shader's draw is of the rasterized stream's lists,
        * chosen at the draw. */
       .extendedDynamicState3RasterizationStream = true,
+      .extendedDynamicState3ProvokingVertexMode = true,
       .vertexInputDynamicState = true,
       .extendedDynamicState3DepthClampEnable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
       .extendedDynamicState3DepthClipEnable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
@@ -665,6 +685,12 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .transformFeedbackStreamsLinesTriangles = true,
       .transformFeedbackRasterizationStreamSelect = true,
       .transformFeedbackDraw = true,
+      /* VK_EXT_provoking_vertex: the lists are the draw's. */
+      .provokingVertexModePerPipeline = true,
+      .transformFeedbackPreservesTriangleFanProvokingVertex = false,
+      /* VK_EXT_robustness2: a word's bounds. */
+      .robustStorageBufferAccessSizeAlignment = 4,
+      .robustUniformBufferAccessSizeAlignment = 4,
       /* VK_EXT_pipeline_robustness: WebGPU's own, of buffers in bounds
        * and images of VK_EXT_image_robustness. */
       .defaultRobustnessStorageBuffers = VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS,
@@ -745,7 +771,8 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxMultiviewInstanceIndex = UINT32_MAX / 8,
       .protectedNoFault = false,
       .maxPerSetDescriptors = 1024,
-      .maxMemoryAllocationSize = l->maxBufferSize,
+      /* Less the padding memory's buffer has (wvk_device_memory_padding). */
+      .maxMemoryAllocationSize = (l->maxBufferSize - WVK_MEMORY_ROBUST_PADDING) & ~255ull,
 
       /* Vulkan 1.2 */
       .driverID = VK_DRIVER_ID_MESA_VENUS,
@@ -775,7 +802,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxSubgroupSize = 1,
       .maxComputeWorkgroupSubgroups = l->maxComputeInvocationsPerWorkgroup,
       .requiredSubgroupSizeStages = VK_SHADER_STAGE_COMPUTE_BIT,
-      .maxBufferSize = l->maxBufferSize,
+      .maxBufferSize = (l->maxBufferSize - WVK_MEMORY_ROBUST_PADDING) & ~255ull,
       /* A texel buffer starts anywhere: its record says where. */
       .storageTexelBufferOffsetAlignmentBytes = 16,
       .storageTexelBufferOffsetSingleTexelAlignment = true,

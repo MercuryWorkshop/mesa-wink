@@ -25,6 +25,18 @@ is_host_visible(const struct wvk_physical_device *pdev, uint32_t type)
    return pdev->memory_types[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 }
 
+/* 256 bytes, of a block a little past the end; but a whole uniform
+ * binding's where a range smaller than the block is bounded by the
+ * shader, robustBufferAccess2's and null descriptors', or a pipeline's
+ * robustness: the tests of it
+ * declare blocks far bigger than what they bind. */
+uint64_t
+wvk_device_memory_padding(const struct wvk_device *dev)
+{
+   const struct vk_features *f = &dev->vk.enabled_features;
+   return f->robustBufferAccess2 || f->nullDescriptor || f->pipelineRobustness ? WVK_MEMORY_ROBUST_PADDING : 256;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
                    const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMem)
@@ -43,7 +55,7 @@ wvk_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
    if (is_host_visible(pdev, mem->vk.memory_type_index)) {
       /* Zeroed: an application may map and read before writing, and what
        * is uploaded should not be whatever the heap held. */
-      const uint64_t host_size = wvk_memory_buffer_size(mem->vk.size);
+      const uint64_t host_size = wvk_memory_buffer_size(mem->vk.size, wvk_device_memory_padding(dev));
       mem->host = os_malloc_aligned(host_size, 64);
       if (!mem->host) {
          vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
@@ -97,7 +109,7 @@ wvk_device_memory_get_buffer(struct wvk_device *dev, struct wvk_device_memory *m
 {
    if (!mem->buffer) {
       const struct wvk_physical_device *pdev = wvk_device_physical(dev);
-      const uint64_t size = wvk_memory_buffer_size(mem->vk.size);
+      const uint64_t size = wvk_memory_buffer_size(mem->vk.size, wvk_device_memory_padding(dev));
       if (size > pdev->limits.maxBufferSize)
          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "%" PRIu64 " bytes of buffer memory is more than WebGPU's %" PRIu64,

@@ -160,6 +160,10 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* The largest LOD bias a sampler has, which maxSamplerLodBias reports. */
 #define WVK_MAX_SAMPLER_LOD_BIAS 15.0f
 
+/* A uniform or storage buffer's record: its range in bytes, 0 for a null
+ * one -- for robustBufferAccess2's bounds, and nullDescriptor's. */
+#define WVK_META_BUF_RANGE 0
+
 /* A texel buffer's record. */
 #define WVK_META_TEXEL_FORMAT 0    /* enum wvk_texel_type, and bytes a texel << 8 */
 #define WVK_META_TEXEL_COUNT 1     /* elements */
@@ -178,6 +182,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 #define WVK_META_IMG_HEIGHT 4
 #define WVK_META_IMG_LAYERS 5      /* layers, or a 3D image's depth */
 #define WVK_META_IMG_WORDS 6
+/* Of every storage image: which of R, G, B and A its view's format has, a
+ * bit each, none for a null one (as a texture's WVK_META_TEX_CHANNELS). */
+#define WVK_META_IMG_CHANNELS 6
 
 enum wvk_texel_type {
    WVK_TEXEL_UNORM,

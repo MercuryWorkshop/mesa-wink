@@ -46,14 +46,21 @@ void wvk_device_memory_ref(struct wvk_device_memory *mem);
 void wvk_device_memory_unref(struct wvk_device_memory *mem);
 
 /* What the WGPUBuffer, and the host copy, of memory of `size` bytes are:
- * whole words, and 256 bytes more. WebGPU wants a uniform binding to hold
- * all of the shader's block, where Vulkan lets a buffer be only as big as
- * what is read of it; the padding lets a binding reach past the end. */
+ * whole words, and `padding` bytes more (wvk_device_memory_padding).
+ * WebGPU wants a uniform binding to hold all of the shader's block, where
+ * Vulkan lets a buffer be only as big as what is read of it; the padding
+ * lets a binding reach past the end. */
 static inline uint64_t
-wvk_memory_buffer_size(uint64_t size)
+wvk_memory_buffer_size(uint64_t size, uint64_t padding)
 {
-   return align64(MAX2(size, 4), 4) + 256;
+   return align64(MAX2(size, 4), 4) + padding;
 }
+
+/* The most a uniform block reaches past a range bounded by the shader:
+ * WebGPU's usual uniform binding, where a native adapter's may be far
+ * bigger. */
+#define WVK_MEMORY_ROBUST_PADDING 65536
+uint64_t wvk_device_memory_padding(const struct wvk_device *dev);
 
 /* The WGPUBuffer behind buffer memory, made on first use. */
 VkResult wvk_device_memory_get_buffer(struct wvk_device *dev, struct wvk_device_memory *mem,

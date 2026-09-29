@@ -104,6 +104,9 @@ struct wvk_descriptor_pool {
 VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_pool, base, VkDescriptorPool,
                                VK_OBJECT_TYPE_DESCRIPTOR_POOL)
 
+/* Every descriptor of `src`, a set of the same layout, in `dst`. */
+void wvk_descriptor_set_copy_all(struct wvk_descriptor_set *dst, const struct wvk_descriptor_set *src);
+
 /* A set of its own for vkCmdPushDescriptorSet, owned by the caller. */
 struct wvk_descriptor_set *wvk_descriptor_set_create(struct wvk_device *dev,
                                                      struct wvk_descriptor_set_layout *layout);
