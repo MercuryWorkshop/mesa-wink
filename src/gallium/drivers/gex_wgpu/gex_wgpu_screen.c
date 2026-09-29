@@ -25902,7 +25902,16 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
     * The flipping path below is still single-slice: it is a per-row loop, and
     * a slice count would multiply the command count by it for no caller that
     * asks. */
-   if (!gex_dst->texture || !gex_src->texture || dst->format != src->format ||
+   /* The same format, or one differing only in being sRGB: a copy moves
+    * bytes, and WebGPU copies between an sRGB format and its linear twin as
+    * it does between one format and itself. glCopyImageSubData between
+    * SRGB8_ALPHA8 and RGBA8 is the same view class, and was refused. */
+   const bool same_bytes =
+      dst->format == src->format ||
+      (util_format_linear(dst->format) == util_format_linear(src->format) &&
+       gex_wgpu_texture_format(util_format_linear(dst->format)) ==
+          gex_wgpu_texture_format(util_format_linear(src->format)));
+   if (!gex_dst->texture || !gex_src->texture || !same_bytes ||
        box->width <= 0 || (flip_y && box->depth != 1)) {
       fprintf(stderr,
               "gex-wgpu: copy region refused (%s) dst_target=%d src_target=%d "
@@ -25914,7 +25923,7 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
                  : !gex_src->texture
                     ? (src->target == PIPE_BUFFER ? "source is a buffer"
                                                   : "source has no texture")
-                 : dst->format != src->format ? "format mismatch"
+                 : !same_bytes ? "format mismatch"
                  : box->width <= 0 ? "width <= 0"
                                    : "flipping copy of more than one slice",
               (int)dst->target, (int)src->target, (int)dst->format,
