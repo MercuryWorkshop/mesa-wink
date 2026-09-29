@@ -106,6 +106,9 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_separate_depth_stencil_layouts = true,
       .KHR_shader_draw_parameters = true,
+      .KHR_16bit_storage = true,
+      .KHR_8bit_storage = true,
+      .KHR_shader_float16_int8 = true,
       .KHR_shader_float_controls = true,
       .KHR_shader_integer_dot_product = true,
       .KHR_shader_non_semantic_info = true,
@@ -184,6 +187,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .sampleRateShading = true,
       /* 64-bit integers are pairs of words (nir_lower_int64). */
       .shaderInt64 = true,
+      /* 8- and 16-bit integers are words, and so are those in memory,
+       * stored by atomics on their bits (wvk_nir_small_types.c). */
+      .shaderInt16 = true,
       .shaderClipDistance = clip,
       /* Arrays of descriptors are bindings of their own, among which a
        * dynamic index chooses in the shader (wvk_shader.c). */
@@ -194,6 +200,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
 
       /* Vulkan 1.1. A pass of several views is one for each. */
       .shaderDrawParameters = true,
+      .storageBuffer16BitAccess = true,
+      .uniformAndStorageBuffer16BitAccess = true,
+      .storagePushConstant16 = true,
+      .storageInputOutput16 = true,
       .multiview = true,
       /* A draw in each viewport, the vertex shader's gl_ViewportIndex
        * choosing which (wvk_shader.c). */
@@ -239,6 +249,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .descriptorBindingVariableDescriptorCount = true,
       .runtimeDescriptorArray = true,
       .shaderFloat16 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_ShaderF16),
+      .shaderInt8 = true,
+      .storageBuffer8BitAccess = true,
+      .uniformAndStorageBuffer8BitAccess = true,
+      .storagePushConstant8 = true,
       .shaderSubgroupExtendedTypes = true,
       .imagelessFramebuffer = true,
       .uniformBufferStandardLayout = true,

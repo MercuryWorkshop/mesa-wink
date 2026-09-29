@@ -70,6 +70,7 @@ wvk_files = files(
   'wvk_image.c',
   'wvk_instance.c',
   'wvk_nir_descriptors.c',
+  'wvk_nir_small_types.c',
   'wvk_nir_subgroups.c',
   'wvk_physical_device.c',
   'wvk_query.c',

@@ -31,8 +31,16 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   is a binding of its own. The driver's bindings sit at the top of group 3.
 - **Vertex attribute divisors** other than 1 are read by the vertex shader
   itself, from the vertex buffer bound as storage, since WebGPU steps an
-  instance attribute every instance. It is the one piece of pipeline state
-  compiled into shaders.
+  instance attribute every instance; so are attributes of strides not
+  whole words, or at offsets their formats are not aligned to, which
+  WebGPU cannot lay out. It is the one piece of pipeline state compiled
+  into shaders.
+- **8- and 16-bit values**, which WGSL has no integers of, are 32-bit
+  words of their bits (`wvk_nir_small_types.c`): sign-extended where read
+  as signed, kept to their bits where made. Half floats of float
+  operations stay WGSL's f16; words of them, from memory or moves, are
+  packHalf2x16's bits. Memory is words already: a store of less than a
+  word is atomics on its bits, and interpolated half floats are floats.
 - **What WebGPU's objects cannot hold** of descriptors, shaders do
   themselves: each set has a record for each of its bindings, which the
   shader reads at the draw (`wvk_nir_descriptors.c`), from the push binding
@@ -179,9 +187,10 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Descriptor indexing's features, each of them, but not
   `VK_EXT_descriptor_indexing`: that asks for 500000 descriptors a stage,
   where WebGPU has a few dozen bindings.
-- 64-bit integers are pairs of words (nir_lower_int64); 64-bit floats, and
-  16-bit integers, are not there: WGSL has neither, and half floats only
-  outside workgroup memory.
+- 64-bit floats are not there: WGSL has none. 64-bit integers are pairs
+  of words (nir_lower_int64).
+- Scalar 8-bit division and remainder, and 8-bit specialization
+  constants, fail a few CTS cases not yet understood.
 - Device-scope memory ordering between workgroups: WGSL's barriers are
   the workgroup's, and none can be in non-uniform control flow, so a
   memory barrier there is dropped.

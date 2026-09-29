@@ -1221,12 +1221,15 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
                                                              : pdev->limits.maxStorageBufferBindingSize;
          e->buffer = d->buffer;
          e->offset = d->offset;
-         /* Storage bindings are whole words. A uniform buffer binds as much
-          * of the buffer as there is: WebGPU wants all of the shader's
-          * block bound, where Vulkan wants only what is read. */
+         /* Storage bindings are whole words: the last one taken whole, as
+          * shaders read and write words of what is less. A uniform buffer
+          * binds as much of the buffer as there is: WebGPU wants all of the
+          * shader's block bound, where Vulkan wants only what is read. */
          uint64_t size = d->size;
          if (b->kind == WVK_BINDING_UNIFORM && d->mem)
             size = MIN2(MAX2(size, b->min_size), d->mem->buffer_size - d->offset);
+         else if (d->mem)
+            size = MIN2(align64(size, 4), d->mem->buffer_size - d->offset);
          e->size = MIN2(size, max) & ~3ull;
          break;
       }
@@ -1922,7 +1925,7 @@ set_pulled_buffers(struct wvk_device *dev, struct wvk_cmd_buffer *cmd, struct wv
       const uint64_t size = MIN2(whole, pdev->limits.maxStorageBufferBindingSize) & ~3ull;
       const uint64_t offset = MIN2(vb->offset, whole - size) & ~255ull;
       if (vb->offset + vb->size > offset + size)
-         mesa_logw_once("wvk: a vertex buffer with a divisor reaches past what a binding can");
+         mesa_logw_once("wvk: a vertex buffer the shader pulls reaches past what a binding can");
       *d = (struct wvk_driver_buffer){ vb->mem->buffer, vb->mem->serial, (uint32_t)offset, size };
       starts[i] = (uint32_t)(vb->offset - offset);
       wvk_replay_read(replay, vb->mem, vb->offset, vb->size);

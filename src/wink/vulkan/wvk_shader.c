@@ -284,15 +284,19 @@ wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
 
 /* The vertex attributes the shader reads itself: those of instance-rate
  * bindings with a divisor other than 1, since WebGPU steps an instance
- * attribute every instance. */
+ * attribute every instance; and those WebGPU cannot lay out, of a stride
+ * not whole words or at an offset its format is not aligned to. */
 static bool
 is_pulled(const struct vk_vertex_input_state *vi, int location)
 {
    if (!vi || location < 0 || location >= MESA_VK_MAX_VERTEX_ATTRIBUTES ||
        !(vi->attributes_valid & BITFIELD_BIT(location)))
       return false;
-   const struct vk_vertex_binding_state *vb = &vi->bindings[vi->attributes[location].binding];
-   return vb->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE && vb->divisor != 1;
+   const struct vk_vertex_attribute_state *a = &vi->attributes[location];
+   const struct vk_vertex_binding_state *vb = &vi->bindings[a->binding];
+   const uint32_t align = MIN2(vk_format_get_blocksize(a->format), 4);
+   return (vb->input_rate == VK_VERTEX_INPUT_RATE_INSTANCE && vb->divisor != 1) ||
+          (vb->stride % 4) || (align && a->offset % align);
 }
 
 static bool wants_sample_shading(const struct vk_graphics_pipeline_state *state);
@@ -312,7 +316,8 @@ wvk_hash_state(struct vk_physical_device *device, const struct vk_graphics_pipel
             continue;
          const struct vk_vertex_attribute_state *a = &vi->attributes[location];
          const struct vk_vertex_binding_state *vb = &vi->bindings[a->binding];
-         const uint32_t words[] = { location, a->binding, a->format, a->offset, vb->divisor };
+         const uint32_t words[] = { location, a->binding, a->format, a->offset, vb->divisor, vb->stride,
+                                    vb->input_rate };
          _mesa_blake3_update(&ctx, words, sizeof(words));
       }
    }
@@ -1128,22 +1133,29 @@ word_access(nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_size, uint32_t a
             uint32_t align_offset, bool offset_is_const, enum gl_access_qualifier access,
             const void *cb_data)
 {
-   /* Whole words, a vector of them at most. */
+   /* Whole words, a vector of them at most. A store of less than a word,
+    * or not on one, is a word's atomics on its part; of more, the whole
+    * words it has first. */
+   const bool store = intrin == nir_intrinsic_store_ssbo || intrin == nir_intrinsic_store_shared;
+   const uint32_t align = nir_combined_align(align_mul, align_offset);
+   unsigned words = DIV_ROUND_UP(bytes, 4);
+   if (store)
+      words = align < 4 || bytes < 4 ? 1 : bytes / 4;
    return (nir_mem_access_size_align){
-      .num_components = MIN2(DIV_ROUND_UP(bytes, 4), 4),
+      .num_components = MIN2(words, 4),
       .bit_size = 32,
       .align = 4,
       .shift = nir_mem_access_shift_method_scalar,
    };
 }
 
-/* Shared memory: 64-bit accesses as words, which WGSL has no 64-bit types
- * for; the rest as they are, which ntv's shared block takes. */
+/* Shared memory: 64-, 16- and 8-bit accesses as words, which WGSL has no
+ * types for; the rest as they are, which ntv's shared block takes. */
 static nir_mem_access_size_align
 shared_access(nir_intrinsic_op intrin, uint8_t bytes, uint8_t bit_size, uint32_t align_mul, uint32_t align_offset,
               bool offset_is_const, enum gl_access_qualifier access, const void *cb_data)
 {
-   if (bit_size == 64)
+   if (bit_size != 32)
       return word_access(intrin, bytes, bit_size, align_mul, align_offset, offset_is_const, access, cb_data);
    return (nir_mem_access_size_align){
       .num_components = MIN2(bytes / (bit_size / 8), 4),
@@ -1485,10 +1497,15 @@ fetch_attribute(nir_builder *b, const struct vk_vertex_input_state *vi, int loca
 {
    const struct vk_vertex_attribute_state *a = &vi->attributes[location];
    const struct vk_vertex_binding_state *vb = &vi->bindings[a->binding];
-   nir_def *first = nir_load_base_instance(b);
-   nir_def *element = first;
-   if (vb->divisor)
-      element = nir_iadd(b, first, nir_udiv_imm(b, nir_isub(b, nir_load_instance_id(b), first), vb->divisor));
+   nir_def *element;
+   if (vb->input_rate == VK_VERTEX_INPUT_RATE_VERTEX) {
+      element = nir_load_vertex_id(b);
+   } else {
+      nir_def *first = nir_load_base_instance(b);
+      element = first;
+      if (vb->divisor)
+         element = nir_iadd(b, first, nir_udiv_imm(b, nir_isub(b, nir_load_instance_id(b), first), vb->divisor));
+   }
    nir_def *starts = nir_load_ssbo(b, 4, 32, driver_buffer(b, WVK_DRIVER_SLOT_PUSH),
                                    nir_imm_int(b, WVK_DRIVER_PULL_OFFSET), .align_mul = 16,
                                    .access = ACCESS_NON_WRITEABLE);
@@ -1553,8 +1570,8 @@ pull_divided_attributes(nir_shader *nir, const struct vk_graphics_pipeline_state
                continue;
             if (!is_pulled(vi, location))
                continue;
-            if (glsl_get_bit_size(deref->type) != 32) {
-               mesa_logw_once("wvk: a 64-bit attribute with a divisor");
+            if (glsl_get_bit_size(deref->type) == 64) {
+               mesa_logw_once("wvk: a 64-bit attribute the shader pulls");
                continue;
             }
             const uint32_t binding = vi->attributes[location].binding;
@@ -1568,8 +1585,14 @@ pull_divided_attributes(nir_shader *nir, const struct vk_graphics_pipeline_state
             if (slot == shader->pulled_count)
                shader->pulled_bindings[shader->pulled_count++] = binding;
             b.cursor = nir_before_instr(instr);
-            nir_def *value = fetch_attribute(&b, vi, location, slot);
-            nir_def_replace(&intr->def, nir_trim_vector(&b, value, intr->def.num_components));
+            nir_def *value = nir_trim_vector(&b, fetch_attribute(&b, vi, location, slot), intr->def.num_components);
+            /* A 16-bit input, of the 32-bit value. */
+            if (intr->def.bit_size != 32) {
+               const enum glsl_base_type base = glsl_get_base_type(deref->type);
+               value = base == GLSL_TYPE_FLOAT16 ? nir_f2fN(&b, value, intr->def.bit_size)
+                                                 : nir_u2uN(&b, value, intr->def.bit_size);
+            }
+            nir_def_replace(&intr->def, value);
             progress = true;
          }
       }
@@ -1655,9 +1678,12 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_draw_parameters_instr, nir_metadata_control_flow,
                NULL);
    }
+   /* Stores of less than a word, atomics on the bits of it: others may
+    * store to the rest of the word. */
    const nir_lower_mem_access_bit_sizes_options sizes = {
       .callback = word_access,
       .modes = nir_var_mem_ubo | nir_var_mem_ssbo,
+      .may_lower_unaligned_stores_to_atomics = true,
    };
    NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &sizes);
    NIR_PASS(_, nir, nir_opt_constant_folding);
@@ -2411,7 +2437,12 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       }
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
       NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_mem_shared, NULL);
-      const nir_lower_mem_access_bit_sizes_options shared = { .callback = shared_access, .modes = nir_var_mem_shared };
+      /* Stores of less than a word, atomics on the bits of it. */
+      const nir_lower_mem_access_bit_sizes_options shared = {
+         .callback = shared_access,
+         .modes = nir_var_mem_shared,
+         .may_lower_unaligned_stores_to_atomics = true,
+      };
       NIR_PASS(_, nir, nir_lower_mem_access_bit_sizes, &shared);
    }
    /* Varyings WGSL can have: no structs, and a location each. */
@@ -2463,6 +2494,11 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    /* The signed atomics' loops' variables. */
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    optimize(nir);
+   /* What is left of 8 and 16 bits, words: memory is by now. */
+   bool widened = false;
+   NIR_PASS(widened, nir, wvk_nir_widen_small_types);
+   if (widened)
+      optimize(nir);
    /* The combined and arrayed originals, now without a use. */
    hash_table_foreach(state.split, he)
       exec_node_remove(&((nir_variable *)he->key)->node);

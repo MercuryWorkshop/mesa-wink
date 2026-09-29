@@ -35,5 +35,9 @@ bool wvk_nir_lower_image_atomics(nir_shader *nir, const uint32_t *meta_base);
 /* Subgroups of one invocation (wvk_nir_subgroups.c). */
 bool wvk_nir_lower_subgroups(nir_shader *nir);
 
+/* 8- and 16-bit values as 32-bit words, but half floats of float
+ * operations (wvk_nir_small_types.c). */
+bool wvk_nir_widen_small_types(nir_shader *nir);
+
 
 #endif
