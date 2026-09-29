@@ -9,7 +9,10 @@
 #   gl     KHR-GL46 and KHR-Single-GL46
 #
 # WINK_GL_CTS_ROOT is build-gl-cts.sh's, and WINK_LIBRARY the libwink.dylib
-# (default: build/wink-mac's). The expectations are
+# (default: build/wink-mac's). WINK_GL_CTS_TIMEOUT is the seconds a case
+# may take (default 300: gpu_shader_fp64's builtins take up to four minutes
+# on a loaded machine, as their doubles are Mesa's float64.glsl). The
+# expectations are
 # ../../../src/gallium/drivers/gex_wgpu/ci/gex_wgpu-{fails,flakes,skips}.txt.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -28,6 +31,11 @@ OUT=$(cd "$OUT" && pwd)
 
 ARGS='"--deqp-surface-width=256", "--deqp-surface-height=256", "--deqp-surface-type=pbuffer",
   "--deqp-gl-config-name=rgba8888d24s8ms0", "--deqp-visibility=hidden", "--deqp-gl-context-type=wink"'
+# Without the images and shader sources in the logs deqp-runner keeps of
+# failing shards, unless WINK_GL_CTS_IMAGES=1: with them a full run's logs
+# were gigabytes, and filled the disk once.
+[ "${WINK_GL_CTS_IMAGES:-0}" = 1 ] ||
+  ARGS="$ARGS"', "--deqp-log-images=disable", "--deqp-log-shader-sources=disable"'
 M="$BUILD/mustpass"
 case "$SUITE" in
 gles)
@@ -73,4 +81,4 @@ esac
 RUNNER=$(command -v deqp-runner || echo "$HOME/.cargo/bin/deqp-runner")
 exec "$RUNNER" suite --suite "$OUT/suite.toml" --output "$OUT" \
   --baseline "$CI/gex_wgpu-fails.txt" --flakes "$CI/gex_wgpu-flakes.txt" --skips "$CI/gex_wgpu-skips.txt" \
-  --env "DEQP_WINK_LIBRARY=$WINK" "$@"
+  --env "DEQP_WINK_LIBRARY=$WINK" --timeout "${WINK_GL_CTS_TIMEOUT:-300}" "$@"
