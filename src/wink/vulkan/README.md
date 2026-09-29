@@ -164,6 +164,15 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   need, to what a binding holds; patches past that are not drawn. A
   geometry shader after reads the evaluation shader's records by the
   tessellator's lists, its invocations the tessellator's count too.
+- **Cull distances** (shaderCullDistance) are culled where primitives are
+  made into lists: a geometry shader run as compute writes no indices for
+  a primitive whose every vertex has one plane's distance negative. A
+  draw without a geometry shader, whose vertex or evaluation shader writes
+  cull distances, gets one of the driver's that passes each primitive
+  through, made of that shader's outputs. Its draw's vertex shader writes
+  none. The clip and cull distances a fragment shader reads, which
+  WebGPU's have no builtin of, are vec4 varyings at locations it has no
+  inputs at, written by the stage before as well.
 - **A vertex shader's storage writes** (vertexPipelineStoresAndAtomics)
   are a compute shader's: WebGPU's vertex shaders write no storage. A
   draw whose vertex shader writes buffers or images first dispatches the

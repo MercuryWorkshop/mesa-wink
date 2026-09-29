@@ -126,6 +126,11 @@ struct wvk_shader_key {
     * as the flat varying at location primitive_id - 1 (0: none), which the
     * geometry shader's records carry. */
    uint8_t primitive_id;
+   /* Fragment, and the stage before it: the clip and cull distances the
+    * fragment shader reads, which WebGPU's have no builtin of, as vec4
+    * varyings from location clip_varying - 1 (0: none) on, clip_slots of
+    * them, of the components as the clip distances' slots have them. */
+   uint8_t clip_varying, clip_slots;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
@@ -196,6 +201,15 @@ struct wvk_shader {
    /* The generic varyings of the records it writes: a vertex shader
     * capturing its outputs, a geometry shader its vertices. */
    uint8_t record_vars;
+   /* Fragment: the clip and cull distances it reads, in all. */
+   uint8_t clip_inputs;
+   /* Vertex, tessellation evaluation, geometry: the cull distances it
+    * writes, which WebGPU has none of. A draw culls by them in its
+    * geometry shader, and one without has one that only passes its
+    * primitives through (wvk_shader_cull_geometry), of each kind of
+    * primitive, made the first time. */
+   uint8_t cull_distances;
+   struct wvk_shader *cull_gs[5];
    /* Geometry: its input and output primitives (enum mesa_prim), the
     * vertices an invocation emits at most, and its invocations. */
    uint8_t gs_input, gs_output;
@@ -343,6 +357,11 @@ wvk_blend_equation(uint32_t src_c, uint32_t dst_c, uint32_t op_c, uint32_t src_a
 {
    return src_c | dst_c << 5 | op_c << 10 | src_a << 13 | dst_a << 18 | op_a << 23;
 }
+
+/* A geometry shader of `input` primitives that passes each through, for
+ * the cull distances of `last`, a vertex or tessellation evaluation shader
+ * drawn without one; NULL where there is none to be had. */
+struct wvk_shader *wvk_shader_cull_geometry(struct wvk_device *dev, struct wvk_shader *last, unsigned input);
 
 /* The colour attachments of those `written` whose blending the fragment
  * shader does, which WebGPU's cannot: see lower_blend. */

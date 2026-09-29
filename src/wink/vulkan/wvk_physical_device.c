@@ -246,6 +246,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
        * stored by atomics on their bits (wvk_nir_small_types.c). */
       .shaderInt16 = true,
       .shaderClipDistance = clip,
+      /* Culled in a geometry shader run as compute, the draw's or one of
+       * the driver's (wvk_shader_cull_geometry). */
+      .shaderCullDistance = clip,
       /* Arrays of descriptors are bindings of their own, among which a
        * dynamic index chooses in the shader (wvk_shader.c). */
       .shaderUniformBufferArrayDynamicIndexing = true,
@@ -587,7 +590,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .timestampComputeAndGraphics = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TimestampQuery),
       .timestampPeriod = 1.0f,
       .maxClipDistances = clip ? 8 : 0,
-      .maxCullDistances = 0,
+      .maxCullDistances = clip ? 8 : 0,
       .maxCombinedClipAndCullDistances = clip ? 8 : 0,
       .discreteQueuePriorities = 2,
       /* Points are quads of any size (expand_points in wvk_shader.c). */

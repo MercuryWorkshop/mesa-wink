@@ -3391,6 +3391,45 @@ geometry_primitives(VkPrimitiveTopology topology, enum mesa_prim input, uint32_t
    }
 }
 
+/* The primitives of a topology, as a geometry shader takes them. */
+static enum mesa_prim
+topology_primitive(VkPrimitiveTopology topology)
+{
+   switch (topology) {
+   case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return MESA_PRIM_POINTS;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return MESA_PRIM_LINES;
+   case VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY:
+   case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP_WITH_ADJACENCY: return MESA_PRIM_LINES_ADJACENCY;
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY:
+   case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY: return MESA_PRIM_TRIANGLES_ADJACENCY;
+   default: return MESA_PRIM_TRIANGLES;
+   }
+}
+
+/* The geometry shader a draw has: the pipeline's, or where the stage
+ * before it writes cull distances, one that passes its primitives through
+ * to cull them (wvk_shader_cull_geometry). */
+static struct wvk_shader *
+draw_gs(struct wvk_cmd_buffer *cmd)
+{
+   const struct wvk_bound_state *st = cmd->replay->state;
+   if (st->bound_gs)
+      return st->bound_gs;
+   struct wvk_shader *last = st->bound_tes ? st->bound_tes : st->bound_vs;
+   if (!last || !last->cull_distances)
+      return NULL;
+   enum mesa_prim input = topology_primitive(cmd->vk.dynamic_graphics_state.ia.primitive_topology);
+   if (st->bound_tes) {
+      const struct wvk_shader *tcs = st->bound_tcs, *tes = st->bound_tes;
+      const unsigned domain = tes->tess_domain ? tes->tess_domain : tcs ? tcs->tess_domain : 0;
+      input = tes->tess_point_mode || (tcs && tcs->tess_point_mode) ? MESA_PRIM_POINTS
+              : domain == TESS_PRIMITIVE_ISOLINES                     ? MESA_PRIM_LINES
+                                                                      : MESA_PRIM_TRIANGLES;
+   }
+   return wvk_shader_cull_geometry(wvk_cmd_buffer_device(cmd), last, input);
+}
+
 /* A draw with a geometry shader, which WebGPU has no stage of: the vertex
  * shader run as compute, a record a vertex of each instance (key.runs 3);
  * the geometry shader run as compute, an invocation a primitive of each
@@ -3408,8 +3447,8 @@ draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t
    struct wvk_replay *replay = cmd->replay;
    struct wvk_bound_state *st = replay->state;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   struct wvk_shader *gs = st->bound_gs;
-   if (!st->bound_vs || !count || !instances || replay->pass_idle)
+   struct wvk_shader *gs = draw_gs(cmd);
+   if (!gs || !st->bound_vs || !count || !instances || replay->pass_idle)
       return;
    const VkPrimitiveTopology topology = dyn->ia.primitive_topology;
    const uint32_t prims = geometry_primitives(topology, gs->gs_input, count);
@@ -3627,7 +3666,7 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
 
    /* A geometry shader after: of the tessellator's primitives, which its
     * input has to be. */
-   struct wvk_shader *gs = st->bound_gs, *gs_cs = NULL, *gs_draw = NULL;
+   struct wvk_shader *gs = draw_gs(cmd), *gs_cs = NULL, *gs_draw = NULL;
    const uint32_t prim_vertices = output == 0 ? 1 : output == 1 ? 2 : 3;
    uint64_t gs_capacity = 0;
    uint32_t gs_per = 0;
@@ -3762,7 +3801,7 @@ draw_arrays(struct wvk_cmd_buffer *cmd, uint32_t vertexCount, uint32_t instanceC
       draw_tessellated(cmd, false, firstVertex, vertexCount, instanceCount, 0, firstInstance, draw_id);
       return;
    }
-   if (cmd->replay->state->bound_gs) {
+   if (draw_gs(cmd)) {
       draw_geometry(cmd, false, firstVertex, vertexCount, instanceCount, 0, firstInstance, draw_id);
       return;
    }
@@ -3802,7 +3841,7 @@ draw_elements(struct wvk_cmd_buffer *cmd, uint32_t indexCount, uint32_t instance
       draw_tessellated(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
       return;
    }
-   if (cmd->replay->state->bound_gs) {
+   if (draw_gs(cmd)) {
       draw_geometry(cmd, true, firstIndex, indexCount, instanceCount, vertexOffset, firstInstance, draw_id);
       return;
    }
@@ -3882,7 +3921,7 @@ draw_indirect_bound(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_bound_b
       return;
    /* Tessellation and geometry shaders, whose passes need the draws'
     * counts: as the host has the draws. */
-   if (st->bound_tes || st->bound_gs) {
+   if (st->bound_tes || draw_gs(cmd)) {
       if (!b.mem || !b.mem->host) {
          mesa_logw_once("wvk: an indirect draw with tessellation or a geometry shader, in memory the host has no "
                         "copy of");
@@ -4049,7 +4088,7 @@ draw_indirect_count(struct wvk_cmd_buffer *cmd, bool indexed, VkBuffer buffer, V
     * (run_vertex_writes), and for no more than there are. */
    const struct wvk_bound_state *st = replay->state;
    if (cmd->vk.dynamic_graphics_state.ia.primitive_topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN ||
-       (st->bound_vs && st->bound_vs->writes_storage) || st->bound_tes || st->bound_gs) {
+       (st->bound_vs && st->bound_vs->writes_storage) || st->bound_tes || draw_gs(cmd)) {
       uint32_t count = max_draws;
       if (c.mem && c.mem->host)
          memcpy(&count, (const uint8_t *)c.mem->host + c.offset, 4);

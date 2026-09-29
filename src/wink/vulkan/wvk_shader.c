@@ -1262,6 +1262,23 @@ expand_lines(nir_shader *nir)
    nir_progress(true, impl, nir_metadata_none);
 }
 
+/* The variable of the cull distances among `mode`'s: after the clip
+ * distances, in their slots (nir_merge_clip_cull_distance_vars). */
+static nir_variable *
+cull_distance_var(nir_shader *nir, nir_variable_mode mode)
+{
+   if (!nir->info.cull_distance_array_size)
+      return NULL;
+   const unsigned first = nir->info.clip_distance_array_size;
+   nir_foreach_variable_with_modes(var, nir, mode) {
+      if (var->data.compact && var->data.location >= VARYING_SLOT_CLIP_DIST0 &&
+          var->data.location <= VARYING_SLOT_CLIP_DIST1 &&
+          (var->data.location - VARYING_SLOT_CLIP_DIST0) * 4 + var->data.location_frac == first)
+         return var;
+   }
+   return NULL;
+}
+
 /* A varying's slot in a record (WVK_RECORD_BUILTINS), or -1 for one it
  * has not. */
 static int
@@ -1453,6 +1470,9 @@ lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars, boo
    shader->record_vars = record_vars(nir, nir_var_shader_out);
    const uint32_t out_stride = wvk_record_stride(shader->record_vars);
    const unsigned slots = WVK_RECORD_BUILTINS + shader->record_vars;
+   /* Its cull distances, after its clip distances. */
+   const unsigned culls = cull_distance_var(nir, nir_var_shader_out) ? MIN2(nir->info.cull_distance_array_size, 8) : 0;
+   const unsigned first_cull = nir->info.clip_distance_array_size;
 
    NIR_PASS(_, nir, nir_lower_gs_intrinsics,
             nir_lower_gs_intrinsics_per_stream | nir_lower_gs_intrinsics_count_vertices_per_primitive);
@@ -1635,9 +1655,26 @@ lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars, boo
       } else {
          ids[0] = out;
       }
+      /* Not where its every vertex has a cull distance of one plane
+       * negative: culled, as WebGPU has no cull distances. */
+      nir_def *culled = nir_imm_false(&b);
+      for (unsigned c = 0; c < culls; ++c) {
+         nir_def *all = nir_imm_true(&b);
+         for (unsigned v = 0; v < per; ++v) {
+            nir_def *d = nir_load_ssbo(&b, 1, 32, driver_buffer(&b, WVK_DRIVER_SLOT_GS_VERTICES),
+                                       nir_iadd_imm(&b, nir_imul_imm(&b, ids[v], out_stride),
+                                                    (record_slot(VARYING_SLOT_CLIP_DIST0) + (first_cull + c) / 4) * 16 +
+                                                       ((first_cull + c) % 4) * 4),
+                                       .align_mul = 4);
+            all = nir_iand(&b, all, nir_flt_imm(&b, d, 0.0));
+         }
+         culled = nir_ior(&b, culled, all);
+      }
+      nir_push_if(&b, nir_inot(&b, culled));
       nir_store_ssbo(&b, nir_vec(&b, ids, per), driver_buffer(&b, WVK_DRIVER_SLOT_GS_INDICES), at,
                      .write_mask = BITFIELD_MASK(per), .align_mul = 4);
       nir_store_var(&b, made, nir_iadd_imm(&b, n, 1), 0x1);
+      nir_pop_if(&b, NULL);
       nir_pop_if(&b, NULL);
       nir_pop_if(&b, NULL);
       nir_instr_remove(&intr->instr);
@@ -4608,6 +4645,10 @@ wvk_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
                    const VkAllocationCallbacks *pAllocator)
 {
    struct wvk_shader *shader = wvk_shader_from_vk(vk_shader);
+   for (uint32_t i = 0; i < ARRAY_SIZE(shader->cull_gs); ++i) {
+      if (shader->cull_gs[i])
+         wvk_shader_destroy(vk_dev, &shader->cull_gs[i]->vk, NULL);
+   }
    if (shader->source)
       source_destroy(container_of(vk_dev, struct wvk_device, vk), shader->source);
    for (uint32_t i = 0; i < WVK_SHADER_VARIANTS; ++i) {
@@ -4663,6 +4704,108 @@ varyings_match(const struct wvk_shader *vs, const struct wvk_shader *fs)
          return false;
    }
    return true;
+}
+
+/* The clip and cull distances among a stage's variables of `mode`, and
+ * where each starts in the components of their slots. */
+static unsigned
+clip_distance_vars(nir_shader *nir, nir_variable_mode mode, nir_variable **vars, unsigned *starts)
+{
+   unsigned n = 0;
+   nir_foreach_variable_with_modes(var, nir, mode) {
+      if (n < 2 && var->data.compact && var->data.location >= VARYING_SLOT_CLIP_DIST0 &&
+          var->data.location <= VARYING_SLOT_CLIP_DIST1) {
+         vars[n] = var;
+         starts[n++] = (var->data.location - VARYING_SLOT_CLIP_DIST0) * 4 + var->data.location_frac;
+      }
+   }
+   return n;
+}
+
+/* A vertex shader's clip and cull distances also as the fragment shader
+ * reads them (key.clip_varying): at the end, their components as vec4s at
+ * `location` on, where whatever it had there is no output any more. */
+static void
+write_clip_varyings(nir_shader *nir, unsigned location, unsigned slots)
+{
+   nir_variable *vars[2];
+   unsigned starts[2];
+   const unsigned n = clip_distance_vars(nir, nir_var_shader_out, vars, starts);
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location < VARYING_SLOT_VAR0)
+         continue;
+      const unsigned first = var->data.location - VARYING_SLOT_VAR0;
+      if (first < location + slots && location < first + glsl_count_attribute_slots(var->type, false))
+         var->data.mode = nir_var_shader_temp;
+   }
+   nir_fixup_deref_modes(nir);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_lower_returns);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   for (unsigned j = 0; j < slots; ++j) {
+      nir_def *comps[4];
+      for (unsigned c = 0; c < 4; ++c) {
+         const unsigned k = j * 4 + c;
+         comps[c] = nir_imm_float(&b, 0.0f);
+         for (unsigned v = 0; v < n; ++v) {
+            if (k >= starts[v] && k - starts[v] < glsl_get_length(vars[v]->type))
+               comps[c] = nir_load_deref(&b, nir_build_deref_array_imm(&b, nir_build_deref_var(&b, vars[v]),
+                                                                        k - starts[v]));
+         }
+      }
+      nir_variable *out = nir_variable_create(nir, nir_var_shader_out, glsl_vec4_type(), "wvk_clip_distances");
+      out->data.location = VARYING_SLOT_VAR0 + location + j;
+      nir_store_var(&b, out, nir_vec(&b, comps, 4), 0xf);
+   }
+   nir_progress(true, impl, nir_metadata_none);
+}
+
+/* A fragment shader's clip and cull distances read from the vec4s at
+ * `location` on (key.clip_varying), or none there are 0. */
+static void
+read_clip_varyings(nir_shader *nir, bool from, unsigned location, unsigned slots)
+{
+   nir_variable *vars[2];
+   unsigned starts[2];
+   const unsigned n = clip_distance_vars(nir, nir_var_shader_in, vars, starts);
+   if (!n)
+      return;
+   struct set *lower = _mesa_pointer_set_create(NULL);
+   for (unsigned v = 0; v < n; ++v)
+      _mesa_set_add(lower, vars[v]);
+   NIR_PASS(_, nir, nir_lower_indirect_var_derefs_to_if_else_trees, lower);
+   _mesa_set_destroy(lower, NULL);
+   nir_variable *ins[2] = { NULL };
+   for (unsigned j = 0; from && j < slots; ++j) {
+      ins[j] = nir_variable_create(nir, nir_var_shader_in, glsl_vec4_type(), "wvk_clip_distances");
+      ins[j]->data.location = VARYING_SLOT_VAR0 + location + j;
+   }
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_create(impl);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_deref)
+            continue;
+         nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+         nir_variable *var = nir_deref_instr_get_variable(deref);
+         int v = var == vars[0] ? 0 : n > 1 && var == vars[1] ? 1 : -1;
+         if (v < 0 || deref->deref_type != nir_deref_type_array || !nir_src_is_const(deref->arr.index))
+            continue;
+         const unsigned k = starts[v] + nir_src_as_uint(deref->arr.index);
+         b.cursor = nir_before_instr(instr);
+         nir_def *value = k / 4 < slots && ins[k / 4] ? nir_channel(&b, nir_load_var(&b, ins[k / 4]), k % 4)
+                                                       : nir_imm_float(&b, 0.0f);
+         nir_def_replace(&intr->def, value);
+      }
+   }
+   nir_progress(true, impl, nir_metadata_none);
+   NIR_PASS(_, nir, nir_remove_dead_derefs);
+   for (unsigned v = 0; v < n; ++v)
+      exec_node_remove(&vars[v]->node);
 }
 
 /* A vertex shader's outputs made a fragment shader's inputs: interpolated
@@ -4839,6 +4982,17 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
          shader->key.lines = 1;
          expand_lines(nir);
       }
+      /* WebGPU has no cull distances: a draw with them culls in its
+       * geometry shader (lower_geometry), which is the records'. */
+      nir_variable *cull = cull_distance_var(nir, nir_var_shader_out);
+      if (cull) {
+         shader->cull_distances = MIN2(nir->info.cull_distance_array_size, 8);
+         if (!records || !records->runs) {
+            cull->data.mode = nir_var_shader_temp;
+            nir_fixup_deref_modes(nir);
+            NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+         }
+      }
       if (records && records->runs) {
          shader->key.runs = records->runs;
          /* Capturing positions only: the writes are the other's. */
@@ -4872,6 +5026,17 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       nir_shader_intrinsics_pass(nir, point_state_instr, nir_metadata_all, &shader->point_state);
       if (nir_find_variable_with_location(nir, nir_var_shader_in, VARYING_SLOT_PRIMITIVE_ID))
          shader->point_state |= 4;
+      /* Its clip and cull distances: 0, but where a draw has them as
+       * varyings (a variant). */
+      shader->clip_inputs = MIN2(nir->info.clip_distance_array_size + nir->info.cull_distance_array_size, 8);
+      if (shader->clip_inputs) {
+         const bool from = records && records->clip_varying;
+         read_clip_varyings(nir, from, from ? records->clip_varying - 1 : 0, from ? records->clip_slots : 0);
+         if (from) {
+            shader->key.clip_varying = records->clip_varying;
+            shader->key.clip_slots = records->clip_slots;
+         }
+      }
       if (records && records->primitive_id) {
          NIR_PASS(_, nir, lower_fs_primitive_id, records->primitive_id - 1);
          shader->key.primitive_id = records->primitive_id;
@@ -5211,9 +5376,121 @@ geometry_shell(struct wvk_device *dev, struct vk_shader_compile_info *info, cons
       shader->patch_vars = patch_vars(nir, nir_var_shader_out);
    }
    shader->record_vars = record_vars(nir, nir_var_shader_out);
+   if (nir->info.stage != MESA_SHADER_TESS_CTRL && cull_distance_var(nir, nir_var_shader_out))
+      shader->cull_distances = MIN2(nir->info.cull_distance_array_size, 8);
    ralloc_free(nir);
    *shader_out = &shader->vk;
    return VK_SUCCESS;
+}
+
+/* A varying copied, down to its vectors. */
+static void
+copy_varying(nir_builder *b, nir_deref_instr *dst, nir_deref_instr *src)
+{
+   const struct glsl_type *type = dst->type;
+   if (glsl_type_is_vector_or_scalar(type)) {
+      nir_store_deref(b, dst, nir_load_deref(b, src), ~0);
+      return;
+   }
+   for (unsigned i = 0; i < glsl_get_length(type); ++i) {
+      if (glsl_type_is_struct_or_ifc(type))
+         copy_varying(b, nir_build_deref_struct(b, dst, i), nir_build_deref_struct(b, src, i));
+      else
+         copy_varying(b, nir_build_deref_array_imm(b, dst, i), nir_build_deref_array_imm(b, src, i));
+   }
+}
+
+/* A geometry shader that emits the primitive it is given, for the cull
+ * distances of the stage before: of its outputs, in and out. */
+static nir_shader *
+cull_geometry_nir(const nir_shader *last, enum mesa_prim input)
+{
+   static const unsigned lists[5][3] = { { 0 }, { 0, 1 }, { 0, 1, 2 }, { 1, 2 }, { 0, 2, 4 } };
+   unsigned k, emits;
+   enum mesa_prim output;
+   switch (input) {
+   case MESA_PRIM_POINTS: k = 0, emits = 1, output = MESA_PRIM_POINTS; break;
+   case MESA_PRIM_LINES: k = 1, emits = 2, output = MESA_PRIM_LINE_STRIP; break;
+   case MESA_PRIM_TRIANGLES: k = 2, emits = 3, output = MESA_PRIM_TRIANGLE_STRIP; break;
+   case MESA_PRIM_LINES_ADJACENCY: k = 3, emits = 2, output = MESA_PRIM_LINE_STRIP; break;
+   case MESA_PRIM_TRIANGLES_ADJACENCY: k = 4, emits = 3, output = MESA_PRIM_TRIANGLE_STRIP; break;
+   default: return NULL;
+   }
+   const unsigned n = mesa_vertices_per_prim(input);
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY, last->options, "wvk cull distances");
+   nir_shader *gs = b.shader;
+   gs->info.gs.input_primitive = input;
+   gs->info.gs.output_primitive = output;
+   gs->info.gs.vertices_in = n;
+   gs->info.gs.vertices_out = emits;
+   gs->info.gs.invocations = 1;
+   gs->info.gs.active_stream_mask = 1;
+   struct util_dynarray pairs;
+   util_dynarray_init(&pairs, NULL);
+   nir_foreach_shader_out_variable(var, (nir_shader *)last) {
+      nir_variable *out = nir_variable_clone(var, gs);
+      nir_shader_add_variable(gs, out);
+      nir_variable *in = nir_variable_clone(var, gs);
+      in->data.mode = nir_var_shader_in;
+      in->type = glsl_array_type(var->type, n, 0);
+      nir_shader_add_variable(gs, in);
+      util_dynarray_append(&pairs, in);
+      util_dynarray_append(&pairs, out);
+   }
+   nir_variable **vars = pairs.data;
+   const unsigned count = util_dynarray_num_elements(&pairs, nir_variable *) / 2;
+   for (unsigned v = 0; v < emits; ++v) {
+      for (unsigned i = 0; i < count; ++i)
+         copy_varying(&b, nir_build_deref_var(&b, vars[2 * i + 1]),
+                      nir_build_deref_array_imm(&b, nir_build_deref_var(&b, vars[2 * i]), lists[k][v]));
+      nir_emit_vertex(&b, 0);
+   }
+   nir_end_primitive(&b, 0);
+   util_dynarray_fini(&pairs);
+   nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+   gs->info.clip_distance_array_size = last->info.clip_distance_array_size;
+   gs->info.cull_distance_array_size = last->info.cull_distance_array_size;
+   return gs;
+}
+
+struct wvk_shader *
+wvk_shader_cull_geometry(struct wvk_device *dev, struct wvk_shader *last, unsigned input)
+{
+   const int k = input == MESA_PRIM_POINTS            ? 0
+                 : input == MESA_PRIM_LINES           ? 1
+                 : input == MESA_PRIM_TRIANGLES       ? 2
+                 : input == MESA_PRIM_LINES_ADJACENCY ? 3
+                 : input == MESA_PRIM_TRIANGLES_ADJACENCY ? 4
+                                                         : -1;
+   if (k < 0 || !last || !last->source)
+      return NULL;
+   struct wvk_shader_source *src = last->source;
+   simple_mtx_lock(&src->lock);
+   if (!last->cull_gs[k]) {
+      struct blob_reader reader;
+      blob_reader_init(&reader, src->nir.data, src->nir.size);
+      nir_shader *nir = nir_deserialize(NULL, &wvk_device_physical(dev)->nir_options, &reader);
+      nir_shader *gs = nir ? cull_geometry_nir(nir, (enum mesa_prim)input) : NULL;
+      ralloc_free(nir);
+      struct vk_shader_compile_info info = {
+         .stage = MESA_SHADER_GEOMETRY,
+         .nir = gs,
+      };
+      struct wvk_shader_source *gs_src = gs ? source_create(&info) : NULL;
+      struct vk_shader *shell = NULL;
+      if (gs_src && geometry_shell(dev, &info, NULL, &shell) == VK_SUCCESS) {
+         wvk_shader_from_vk(shell)->source = gs_src;
+         last->cull_gs[k] = wvk_shader_from_vk(shell);
+      } else {
+         if (gs_src)
+            source_destroy(dev, gs_src);
+         else
+            ralloc_free(gs);
+         mesa_logw_once("wvk: cull distances, whose geometry shader could not be made");
+      }
+   }
+   simple_mtx_unlock(&src->lock);
+   return last->cull_gs[k];
 }
 
 /* Whether a shader may write a storage image without a format, which its
@@ -5296,9 +5573,13 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
    /* A geometry shader's draw after it: a vertex shader of its outputs. */
    if ((stage == MESA_SHADER_GEOMETRY && key->geometry == 2) || (stage == MESA_SHADER_TESS_EVAL && key->tess == 2)) {
       geometry_vertex_shader(nir, key->primitive_id);
+      if (key->clip_varying)
+         write_clip_varyings(nir, key->clip_varying - 1, key->clip_slots);
       match_fragment_inputs(nir, key->fs_inputs);
    }
    if (stage == MESA_SHADER_VERTEX) {
+      if (key->clip_varying && !key->runs)
+         write_clip_varyings(nir, key->clip_varying - 1, key->clip_slots);
       match_fragment_inputs(nir, key->fs_inputs);
       state.vi = vi;
    } else if (stage == MESA_SHADER_FRAGMENT) {
@@ -5351,6 +5632,8 @@ wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsig
    } else if (other) {
       memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
       key.primitive_id = other->key.primitive_id;
+      key.clip_varying = other->key.clip_varying;
+      key.clip_slots = other->key.clip_slots;
    }
    struct wvk_shader *variant = variant_for(dev, gs, &key, NULL);
    return variant != gs ? variant : NULL;
@@ -5377,6 +5660,8 @@ wvk_shader_tess_variant(struct wvk_device *dev, struct wvk_shader *shader, unsig
    } else if (other) {
       memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
       key.primitive_id = other->key.primitive_id;
+      key.clip_varying = other->key.clip_varying;
+      key.clip_slots = other->key.clip_slots;
    }
    struct wvk_shader *variant = variant_for(dev, shader, &key, NULL);
    return variant != shader ? variant : NULL;
@@ -5433,6 +5718,10 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
          return variant_for(dev, shader, &key, &vi);
       }
       /* Wide lines as quads (expand_lines). */
+      if (other) {
+         key.clip_varying = other->key.clip_varying;
+         key.clip_slots = other->key.clip_slots;
+      }
       if (shape == WVK_DRAW_LINES) {
          key.lines = 1;
          if (other)
@@ -5449,7 +5738,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       }
       key.pulled = pull_key(&vi, shader->attribs_read, points);
       if (records && images && key.pulled == shader->key.pulled && !points && !shader->key.points &&
-          varyings_match(shader, other))
+          !key.clip_varying && varyings_match(shader, other))
          return shader;
       if (other)
          memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
@@ -5466,12 +5755,27 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
                key.primitive_id = i + 1;
          }
       }
+      /* Its clip and cull distances: vec4 varyings at the first
+       * locations it has no input at, in a row. */
+      if (shader->clip_inputs) {
+         const unsigned slots = DIV_ROUND_UP(shader->clip_inputs, 4);
+         for (uint32_t i = 0; i + slots <= WVK_MAX_VARYINGS && !key.clip_varying; ++i) {
+            bool free = true;
+            for (uint32_t j = 0; j < slots; ++j)
+               free &= !shader->varyings[i + j] && i + j + 1 != key.primitive_id;
+            if (free) {
+               key.clip_varying = i + 1;
+               key.clip_slots = slots;
+            }
+         }
+      }
       /* A point's quad: gl_PointCoord at the first location it has no
        * input at, and facing front, as a line's does. */
       if (shape != WVK_DRAW_PRIMITIVES && shader->point_state) {
          key.points = 1;
          for (uint32_t i = 0; points && (shader->point_state & 1) && i < WVK_MAX_VARYINGS && !key.point_coord; ++i) {
-            if (!shader->varyings[i] && i + 1 != key.primitive_id)
+            if (!shader->varyings[i] && i + 1 != key.primitive_id &&
+                (!key.clip_varying || i + 1 < key.clip_varying || i + 1 >= key.clip_varying + key.clip_slots))
                key.point_coord = i + 1;
          }
       }
