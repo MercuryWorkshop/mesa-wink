@@ -79,6 +79,9 @@ struct wvk_device {
    WGPUComputePipeline finish_stats_pipeline;
    WGPUComputePipeline fan_pipeline;
    WGPUComputePipeline uint8_index_pipeline;
+   /* Transform feedback's: capture, and the vertex count of what was. */
+   WGPUComputePipeline xfb_pipeline;
+   WGPUComputePipeline xfb_count_pipeline;
    WGPUComputePipeline draw_count_pipeline;
    /* The tessellator's passes: count, scan, generate (wvk_tessellator.c),
     * and their bind group layout. */

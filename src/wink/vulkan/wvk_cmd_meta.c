@@ -114,6 +114,7 @@ struct wvk_meta_save {
    struct vk_vertex_input_state vi;
    struct vk_sample_locations_state sample_locations;
    void *state;
+   bool xfb_active;
 };
 
 static void
@@ -123,6 +124,9 @@ meta_begin(struct wvk_cmd_buffer *cmd, struct wvk_meta_save *save)
    save->vi = cmd->dynamic_vi;
    save->sample_locations = cmd->dynamic_sample_locations;
    save->state = wvk_replay_save_state(cmd->replay);
+   /* vk_meta's draws are no application's to capture. */
+   save->xfb_active = cmd->replay->xfb_active;
+   cmd->replay->xfb_active = false;
 }
 
 static void
@@ -136,6 +140,7 @@ meta_end(struct wvk_cmd_buffer *cmd, struct wvk_meta_save *save)
    /* Everything is set again at the next draw. */
    BITSET_SET_RANGE(cmd->vk.dynamic_graphics_state.dirty, 0, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX - 1);
    wvk_replay_restore_state(cmd->replay, save->state);
+   cmd->replay->xfb_active = save->xfb_active;
 }
 
 VKAPI_ATTR void VKAPI_CALL

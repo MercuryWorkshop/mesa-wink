@@ -44,8 +44,11 @@ struct wvk_shader_binding {
    uint32_t min_size;
 };
 
+/* The outputs transform feedback captures of a shader, at most. */
+#define WVK_MAX_XFB_OUTPUTS 64
+
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 24
+#define WVK_SHADER_BINARY_VERSION 25
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -207,6 +210,17 @@ struct wvk_shader {
    uint8_t record_vars;
    /* Fragment: the clip and cull distances it reads, in all. */
    uint8_t clip_inputs;
+   /* Vertex, tessellation evaluation, geometry: what transform feedback
+    * captures of its outputs (nir_xfb_info), by the words of their slots
+    * in its records -- the buffers it writes, their strides, and each
+    * output's slot, first component, components, buffer and offset. */
+   uint8_t xfb_buffers;
+   uint16_t xfb_strides[4];
+   uint8_t xfb_output_count;
+   struct wvk_xfb_output {
+      uint8_t slot, component, count, buffer;
+      uint16_t offset;
+   } xfb_outputs[WVK_MAX_XFB_OUTPUTS];
    /* Vertex, tessellation evaluation, geometry: the cull distances it
     * writes, which WebGPU has none of. A draw culls by them in its
     * geometry shader, and one without has one that only passes its

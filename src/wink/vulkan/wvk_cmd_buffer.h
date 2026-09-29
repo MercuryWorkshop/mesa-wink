@@ -159,14 +159,28 @@ struct wvk_replay {
    uint32_t pass_query_first;
    struct util_dynarray pass_queries;   /* struct wvk_pass_query */
    struct wvk_pass_query active_query;
-   /* The active pipeline statistics query: its pool and query, what the
-    * host counts of it by each statistic's bit, and the counters shaders
-    * and the driver's passes add to on the GPU (WVK_DRIVER_SLOT_STATS). */
-   struct wvk_query_pool *stats_pool;
-   uint32_t stats_query, stats_mask;
-   uint64_t stats_host[WVK_STATS];
-   WGPUBuffer stats_buffer;
-   uint64_t stats_serial;
+   /* Queries counted as the replay goes -- pipeline statistics, primitives
+    * generated, transform feedback: what the host counts, the counters
+    * shaders and the driver's passes add to on the GPU
+    * (WVK_DRIVER_SLOT_STATS), each by WVK_COUNTER_* or statistic bit, and
+    * the queries active, with the counters they count between them. */
+   uint64_t host_counters[WVK_COUNTERS];
+   WGPUBuffer counters;
+   uint64_t counters_serial;
+   uint32_t counter_mask;
+   struct wvk_counter_query counter_queries[WVK_COUNTER_QUERIES];
+   uint32_t counter_query_count;
+   /* Transform feedback: the buffers bound for it, whether it is on (but
+    * for vk_meta's draws), and where each buffer is written to next, in
+    * bytes from its binding's offset, with whether it filled up -- on the
+    * GPU, as primitives geometry shaders make decide (wvk_cmd_draw.c). */
+   struct {
+      struct wvk_device_memory *mem;
+      WGPUBuffer buffer;
+      uint64_t offset, size;
+   } xfb_bindings[4];
+   bool xfb_active;
+   WGPUBuffer xfb_state;
    /* Timestamps: a query set of the submit's, and where each is resolved
     * to, 256 bytes apart as resolves want. */
    WGPUQuerySet timestamp_set;

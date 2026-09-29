@@ -36,6 +36,7 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_deref.h"
 #include "compiler/nir/nir_serialize.h"
+#include "compiler/nir/nir_xfb_info.h"
 #include "compiler/spirv/nir_spirv.h"
 #include "util/blob.h"
 #include "util/format/u_format.h"
@@ -1280,6 +1281,36 @@ cull_distance_var(nir_shader *nir, nir_variable_mode mode)
          return var;
    }
    return NULL;
+}
+
+static int record_slot(unsigned location);
+
+/* What transform feedback captures of a stage's outputs, from its
+ * nir_xfb_info: by record slot, where a record has the output. */
+static void
+gather_xfb(struct wvk_shader *shader, const nir_shader *nir)
+{
+   const nir_xfb_info *xfb = nir->xfb_info;
+   shader->xfb_buffers = 0;
+   shader->xfb_output_count = 0;
+   if (!xfb)
+      return;
+   for (unsigned b = 0; b < 4; ++b) {
+      shader->xfb_strides[b] = xfb->buffers[b].stride;
+      /* Stream 0 only: the others are no rasterization's. */
+      if ((xfb->buffers_written & BITFIELD_BIT(b)) && !xfb->buffer_to_stream[b])
+         shader->xfb_buffers |= BITFIELD_BIT(b);
+   }
+   for (unsigned i = 0; i < xfb->output_count && shader->xfb_output_count < WVK_MAX_XFB_OUTPUTS; ++i) {
+      const nir_xfb_output_info *o = &xfb->outputs[i];
+      const int slot = record_slot(o->location);
+      if (slot < 0 || !o->component_mask || !(shader->xfb_buffers & BITFIELD_BIT(o->buffer)))
+         continue;
+      shader->xfb_outputs[shader->xfb_output_count++] = (struct wvk_xfb_output){
+         .slot = slot, .component = ffs(o->component_mask) - 1, .count = util_bitcount(o->component_mask),
+         .buffer = o->buffer, .offset = o->offset,
+      };
+   }
 }
 
 /* A varying's slot in a record (WVK_RECORD_BUILTINS), or -1 for one it
@@ -5093,6 +5124,11 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    if (WVK_META_OFFSET + meta_words * 4 > WVK_PUSH_WINDOW)
       mesa_logw_once("wvk: a pipeline layout of more descriptors than their records have room for");
 
+   /* What transform feedback captures, which the driver's pass does
+    * (capture_xfb): no shader's, nor any compute shader's to have. */
+   if (nir->info.stage == MESA_SHADER_VERTEX)
+      gather_xfb(shader, nir);
+   nir->xfb_info = NULL;
    NIR_PASS(_, nir, lower_push_constants);
    /* Tessellation's stages as compute, for the records of the stage before. */
    unsigned workgroup = 64;
@@ -5554,6 +5590,8 @@ geometry_shell(struct wvk_device *dev, struct vk_shader_compile_info *info, cons
       shader->patch_vars = patch_vars(nir, nir_var_shader_out);
    }
    shader->record_vars = record_vars(nir, nir_var_shader_out);
+   if (nir->info.stage != MESA_SHADER_TESS_CTRL)
+      gather_xfb(shader, nir);
    if (nir->info.stage != MESA_SHADER_TESS_CTRL && cull_distance_var(nir, nir_var_shader_out))
       shader->cull_distances = MIN2(nir->info.cull_distance_array_size, 8);
    /* Points it gives a size, which its draw's are quads of. */
@@ -5629,6 +5667,12 @@ cull_geometry_nir(const nir_shader *last, enum mesa_prim input)
    nir_end_primitive(&b, 0);
    util_dynarray_fini(&pairs);
    nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+   /* What transform feedback captures is the stage before's. */
+   if (last->xfb_info) {
+      const size_t size = nir_xfb_info_size(last->xfb_info->output_count);
+      gs->xfb_info = ralloc_size(gs, size);
+      memcpy(gs->xfb_info, last->xfb_info, size);
+   }
    gs->info.clip_distance_array_size = last->info.clip_distance_array_size;
    gs->info.cull_distance_array_size = last->info.cull_distance_array_size;
    return gs;
@@ -6142,6 +6186,10 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->writes_point_size);
    blob_write_uint8(blob, shader->cull_distances);
    blob_write_uint8(blob, shader->clip_inputs);
+   blob_write_uint8(blob, shader->xfb_buffers);
+   blob_write_bytes(blob, shader->xfb_strides, sizeof(shader->xfb_strides));
+   blob_write_uint8(blob, shader->xfb_output_count);
+   blob_write_bytes(blob, shader->xfb_outputs, shader->xfb_output_count * sizeof(shader->xfb_outputs[0]));
    blob_write_uint8(blob, shader->writes_storage);
    blob_write_uint8(blob, shader->record_vars);
    blob_write_uint8(blob, shader->gs_input);
@@ -6202,6 +6250,12 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const bool writes_point_size = blob_read_uint8(blob);
    const uint8_t cull_distances = blob_read_uint8(blob);
    const uint8_t clip_inputs = blob_read_uint8(blob);
+   const uint8_t xfb_buffers = blob_read_uint8(blob);
+   uint16_t xfb_strides[4];
+   blob_copy_bytes(blob, xfb_strides, sizeof(xfb_strides));
+   const uint8_t xfb_output_count = MIN2(blob_read_uint8(blob), WVK_MAX_XFB_OUTPUTS);
+   struct wvk_xfb_output xfb_outputs[WVK_MAX_XFB_OUTPUTS];
+   blob_copy_bytes(blob, xfb_outputs, xfb_output_count * sizeof(xfb_outputs[0]));
    const bool writes_storage = blob_read_uint8(blob);
    const uint8_t record_vars = blob_read_uint8(blob);
    const uint8_t gs_input = blob_read_uint8(blob);
@@ -6276,6 +6330,10 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->writes_point_size = writes_point_size;
    shader->cull_distances = cull_distances;
    shader->clip_inputs = clip_inputs;
+   shader->xfb_buffers = xfb_buffers;
+   memcpy(shader->xfb_strides, xfb_strides, sizeof(xfb_strides));
+   shader->xfb_output_count = xfb_output_count;
+   memcpy(shader->xfb_outputs, xfb_outputs, xfb_output_count * sizeof(xfb_outputs[0]));
    shader->writes_storage = writes_storage;
    shader->record_vars = record_vars;
    shader->gs_input = gs_input;

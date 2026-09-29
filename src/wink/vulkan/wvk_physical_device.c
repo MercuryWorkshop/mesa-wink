@@ -121,6 +121,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_nested_command_buffer = true,
       .EXT_primitives_generated_query = true,
       .EXT_shader_replicated_composites = true,
+      .EXT_transform_feedback = true,
       .EXT_ycbcr_2plane_444_formats = true,
       .KHR_index_type_uint8 = true,
       .KHR_load_store_op_none = true,
@@ -303,6 +304,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* 8-bit indices widened to 16 by a pass of the driver's
        * (wvk_cmd_draw.c). */
       .indexTypeUint8 = true,
+      /* Of the geometry shader's lists, the driver's where the pipeline
+       * has none, walked by a pass of its (wvk_cmd_draw.c): stream 0. */
+      .transformFeedback = true,
       .primitivesGeneratedQuery = true,
       .primitivesGeneratedQueryWithRasterizerDiscard = true,
       .nestedCommandBuffer = true,
@@ -608,6 +612,17 @@ get_device_properties(const struct wvk_physical_device *pdev,
       /* WebGPU samplers have no LOD bias. */
       /* Vulkan's minimum. WebGPU samplers have no bias: it is ignored. */
       .maxSamplerLodBias = WVK_MAX_SAMPLER_LOD_BIAS,
+      /* VK_EXT_transform_feedback */
+      .maxTransformFeedbackStreams = 1,
+      .maxTransformFeedbackBuffers = 4,
+      .maxTransformFeedbackBufferSize = UINT32_MAX,
+      .maxTransformFeedbackStreamDataSize = 512,
+      .maxTransformFeedbackBufferDataSize = 512,
+      .maxTransformFeedbackBufferDataStride = 2048,
+      .transformFeedbackQueries = true,
+      .transformFeedbackStreamsLinesTriangles = false,
+      .transformFeedbackRasterizationStreamSelect = false,
+      .transformFeedbackDraw = true,
       /* VK_EXT_nested_command_buffer */
       .maxCommandBufferNestingLevel = UINT32_MAX,
       .maxSamplerAnisotropy = 16.0f,

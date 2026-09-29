@@ -54,7 +54,8 @@ wvk_CreateQueryPool(VkDevice _device, const VkQueryPoolCreateInfo *pCreateInfo,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    pool->values = pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS
                      ? MAX2(util_bitcount(pool->vk.pipeline_statistics), 1)
-                     : 1;
+                  : pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT ? 2
+                                                                                    : 1;
 
    pool->serial = calloc(pool->vk.query_count, sizeof(*pool->serial));
    VkResult result = pool->serial ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -367,16 +368,28 @@ one_pass(struct wvk_device *dev, struct wvk_replay *replay, WGPUComputePipeline 
 uint32_t
 wvk_replay_stats(const struct wvk_replay *replay)
 {
-   return replay->stats_pool ? replay->stats_mask : 0;
+   return replay->counter_mask;
 }
 
 void
 wvk_replay_count_stat(struct wvk_replay *replay, VkQueryPipelineStatisticFlagBits bit, uint64_t n)
 {
    /* Once for a pass replayed a layer at a time: its draws are the same. */
-   if (!(wvk_replay_stats(replay) & bit) || (replay->pass_layered && replay->pass_layer != replay->pass_first_layer))
+   if (!(replay->counter_mask & bit) || (replay->pass_layered && replay->pass_layer != replay->pass_first_layer))
       return;
-   replay->stats_host[util_logbase2(bit)] += n;
+   replay->host_counters[util_logbase2(bit)] += n;
+}
+
+WGPUBuffer
+wvk_replay_counters(struct wvk_replay *replay)
+{
+   if (!replay->counters) {
+      static const uint32_t zero[WVK_COUNTERS] = { 0 };
+      replay->counters = wvk_replay_temp_buffer(replay->dev, replay, sizeof(zero),
+                                                WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc, zero);
+      replay->counters_serial = ++replay->dev->temp_serial | (1ull << 62);
+   }
+   return replay->counters;
 }
 
 static const char add_stats_wgsl[] =
@@ -387,7 +400,7 @@ static const char add_stats_wgsl[] =
    "@compute @workgroup_size(1)\n"
    "fn main() {\n"
    "  let v = src[p.word] / max(p.divisor, 1u);\n"
-   "  for (var i = 0u; i < 11u; i++) {\n"
+   "  for (var i = 0u; i < 16u; i++) {\n"
    "    if ((p.bits & (1u << i)) != 0u) { atomicAdd(&stats[i], v); }\n"
    "  }\n"
    "}\n";
@@ -397,95 +410,139 @@ wvk_replay_add_stats(struct wvk_replay *replay, WGPUBuffer src, uint64_t src_siz
                      uint32_t divisor, uint32_t bits)
 {
    struct wvk_device *dev = replay->dev;
-   bits &= wvk_replay_stats(replay);
-   if (!bits || !replay->stats_buffer ||
-       (replay->pass_layered && replay->pass_layer != replay->pass_first_layer))
+   bits &= replay->counter_mask;
+   if (!bits || (replay->pass_layered && replay->pass_layer != replay->pass_first_layer))
       return;
    WGPUComputePipeline pipeline = device_pipeline(dev, &dev->add_stats_pipeline, add_stats_wgsl, "wvk add statistics");
    const uint32_t params[4] = { word, divisor, bits };
    WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
-   if (!pipeline || !params_buffer)
+   WGPUBuffer counters = wvk_replay_counters(replay);
+   if (!pipeline || !params_buffer || !counters)
       return;
    const WGPUBindGroupEntry entries[] = {
       { .binding = 0, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
       { .binding = 1, .buffer = src, .offset = 0, .size = align64(src_size, 4) },
-      { .binding = 2, .buffer = replay->stats_buffer, .offset = 0, .size = 64 },
+      { .binding = 2, .buffer = counters, .offset = 0, .size = WVK_COUNTERS * 4 },
    };
    one_pass(dev, replay, pipeline, entries, ARRAY_SIZE(entries));
 }
 
-static void
-begin_stats(struct wvk_replay *replay, struct wvk_query_pool *pool, uint32_t query)
+/* The counters a query has values of, in the order its values are. */
+static uint32_t
+query_counter_mask(const struct wvk_query_pool *pool)
 {
-   static const uint32_t zero[16] = { 0 };
-   replay->stats_pool = pool;
-   replay->stats_query = query;
-   /* A primitives generated query counts what clipping has. */
-   replay->stats_mask = pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS
-                           ? pool->vk.pipeline_statistics
-                           : VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT;
-   memset(replay->stats_host, 0, sizeof(replay->stats_host));
-   replay->stats_buffer = wvk_replay_temp_buffer(replay->dev, replay, sizeof(zero),
-                                                 WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc, zero);
-   replay->stats_serial = ++replay->dev->temp_serial | (1ull << 62);
+   switch (pool->vk.query_type) {
+   case VK_QUERY_TYPE_PIPELINE_STATISTICS:
+      return pool->vk.pipeline_statistics;
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+      /* What clipping has. */
+      return VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT;
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      return BITFIELD_BIT(WVK_COUNTER_XFB_WRITTEN) | BITFIELD_BIT(WVK_COUNTER_XFB_NEEDED);
+   default:
+      return 0;
+   }
 }
 
-/* A query's results: the host's counts and the GPU's, statistic after
- * statistic in the order of their bits, to its values in the pool. */
+static void
+update_counter_mask(struct wvk_replay *replay)
+{
+   replay->counter_mask = 0;
+   for (uint32_t i = 0; i < replay->counter_query_count; ++i)
+      replay->counter_mask |= replay->counter_queries[i].mask;
+}
+
+/* A query begun: the counters where they are, the GPU's copied outside a
+ * pass, the pass ended for it and begun again. */
+static void
+begin_counters(struct wvk_cmd_buffer *cmd, struct wvk_query_pool *pool, uint32_t query)
+{
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_device *dev = replay->dev;
+   if (replay->counter_query_count == WVK_COUNTER_QUERIES) {
+      mesa_logw_once("wvk: more than %u counted queries at once", WVK_COUNTER_QUERIES);
+      return;
+   }
+   WGPUBuffer counters = wvk_replay_counters(replay);
+   WGPUBuffer begin = wvk_replay_temp_buffer(dev, replay, WVK_COUNTERS * 4,
+                                             WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst, NULL);
+   if (!counters || !begin)
+      return;
+   const bool in_pass = replay->pass != NULL;
+   wvk_replay_end_passes(replay);
+   wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, counters, 0, begin, 0, WVK_COUNTERS * 4);
+   if (in_pass)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+   struct wvk_counter_query *q = &replay->counter_queries[replay->counter_query_count++];
+   *q = (struct wvk_counter_query){ .pool = pool, .query = query, .mask = query_counter_mask(pool), .begin = begin };
+   memcpy(q->host_begin, replay->host_counters, sizeof(q->host_begin));
+   update_counter_mask(replay);
+}
+
+/* A query's results: for each counter it has, in the order of their bits,
+ * what the host counted since its begin and what the GPU did, to its
+ * values in the pool. */
 static const char finish_stats_wgsl[] =
-   "struct P { words: array<vec4u, 7> }\n"
+   "struct P { words: array<vec4u, 9> }\n"
    "@group(0) @binding(0) var<uniform> p: P;\n"
-   "@group(0) @binding(1) var<storage, read> stats: array<u32>;\n"
-   "@group(0) @binding(2) var<storage, read_write> results: array<u32>;\n"
+   "@group(0) @binding(1) var<storage, read> now: array<u32>;\n"
+   "@group(0) @binding(2) var<storage, read> begin: array<u32>;\n"
+   "@group(0) @binding(3) var<storage, read_write> results: array<u32>;\n"
    "fn w(i: u32) -> u32 { return p.words[i / 4u][i % 4u]; }\n"
    "@compute @workgroup_size(1)\n"
    "fn main() {\n"
-   "  let mask = w(22u);\n"
-   "  var at = w(23u);\n"
-   "  for (var i = 0u; i < 11u; i++) {\n"
+   "  let mask = w(32u);\n"
+   "  var at = w(33u);\n"
+   "  for (var i = 0u; i < 16u; i++) {\n"
    "    if ((mask & (1u << i)) == 0u) { continue; }\n"
-   "    let lo = w(2u * i) + stats[i];\n"
+   "    let gpu = now[i] - begin[i];\n"
+   "    let lo = w(2u * i) + gpu;\n"
    "    results[at] = lo;\n"
-   "    results[at + 1u] = w(2u * i + 1u) + select(0u, 1u, lo < stats[i]);\n"
+   "    results[at + 1u] = w(2u * i + 1u) + select(0u, 1u, lo < gpu);\n"
    "    at += 2u;\n"
    "  }\n"
    "}\n";
 
 static void
-end_stats(struct wvk_cmd_buffer *cmd, struct wvk_query_pool *pool, uint32_t query)
+end_counters(struct wvk_cmd_buffer *cmd, struct wvk_query_pool *pool, uint32_t query)
 {
    struct wvk_replay *replay = cmd->replay;
    struct wvk_device *dev = replay->dev;
-   if (replay->stats_pool != pool || replay->stats_query != query || !replay->stats_buffer) {
-      replay->stats_pool = NULL;
+   uint32_t n = 0;
+   while (n < replay->counter_query_count &&
+          (replay->counter_queries[n].pool != pool || replay->counter_queries[n].query != query))
+      ++n;
+   if (n == replay->counter_query_count)
       return;
-   }
+   const struct wvk_counter_query q = replay->counter_queries[n];
+   replay->counter_queries[n] = replay->counter_queries[--replay->counter_query_count];
+   update_counter_mask(replay);
+
    WGPUComputePipeline pipeline =
       device_pipeline(dev, &dev->finish_stats_pipeline, finish_stats_wgsl, "wvk finish statistics");
-   uint32_t params[28] = { 0 };
-   for (uint32_t i = 0; i < WVK_STATS; ++i) {
-      params[2 * i] = (uint32_t)replay->stats_host[i];
-      params[2 * i + 1] = (uint32_t)(replay->stats_host[i] >> 32);
+   uint32_t params[36] = { 0 };
+   for (uint32_t i = 0; i < WVK_COUNTERS; ++i) {
+      const uint64_t delta = replay->host_counters[i] - q.host_begin[i];
+      params[2 * i] = (uint32_t)delta;
+      params[2 * i + 1] = (uint32_t)(delta >> 32);
    }
-   params[22] = replay->stats_mask;
-   params[23] = query * pool->values * 2;
+   params[32] = q.mask;
+   params[33] = query * pool->values * 2;
    WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
-   if (pipeline && params_buffer) {
-      /* Once a pass replayed a layer at a time has had its layers. */
-      const bool in_pass = replay->pass != NULL;
-      wvk_replay_end_passes(replay);
-      const WGPUBindGroupEntry entries[] = {
-         { .binding = 0, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
-         { .binding = 1, .buffer = replay->stats_buffer, .offset = 0, .size = 64 },
-         { .binding = 2, .buffer = pool->buffer, .offset = 0, .size = pool->mem->buffer_size },
-      };
-      one_pass(dev, replay, pipeline, entries, ARRAY_SIZE(entries));
-      wvk_replay_write(replay, pool->mem, (uint64_t)query * pool->values * 8, pool->values * 8);
-      if (in_pass)
-         wvk_replay_restart_pass(cmd, replay->pass_layer);
-   }
-   replay->stats_pool = NULL;
-   replay->stats_buffer = NULL;
+   if (!pipeline || !params_buffer)
+      return;
+   const bool in_pass = replay->pass != NULL;
+   wvk_replay_end_passes(replay);
+   const WGPUBindGroupEntry entries[] = {
+      { .binding = 0, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
+      { .binding = 1, .buffer = replay->counters, .offset = 0, .size = WVK_COUNTERS * 4 },
+      { .binding = 2, .buffer = q.begin, .offset = 0, .size = WVK_COUNTERS * 4 },
+      { .binding = 3, .buffer = pool->buffer, .offset = 0, .size = pool->mem->buffer_size },
+   };
+   one_pass(dev, replay, pipeline, entries, ARRAY_SIZE(entries));
+   wvk_replay_write(replay, pool->mem, (uint64_t)query * pool->values * 8, pool->values * 8);
+   if (in_pass)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -495,9 +552,8 @@ wvk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(wvk_query_pool, pool, queryPool);
    struct wvk_replay *replay = cmd->replay;
-   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS ||
-       pool->vk.query_type == VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT) {
-      begin_stats(replay, pool, query);
+   if (query_counter_mask(pool)) {
+      begin_counters(cmd, pool, query);
       return;
    }
    if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
@@ -525,9 +581,8 @@ wvk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, 
    struct wvk_replay *replay = cmd->replay;
    if (query < pool->vk.query_count)
       pool->serial[query] = replay->serial;
-   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS ||
-       pool->vk.query_type == VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT) {
-      end_stats(cmd, pool, query);
+   if (query_counter_mask(pool)) {
+      end_counters(cmd, pool, query);
       return;
    }
    if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)

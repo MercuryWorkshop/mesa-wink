@@ -80,7 +80,19 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   the driver's at the first draw after a bind, the restart index 0xFFFF
   where the draw restarts primitives.
 - **Primitives generated queries** count what clipping has, as the
-  pipeline statistics queries do.
+  pipeline statistics queries do. Counted queries share counters the
+  replay keeps, host and GPU, which each query takes the difference of
+  between its begin and end, so any of them may be active at once.
+- **Transform feedback** (VK_EXT_transform_feedback, stream 0): while it is
+  on, every draw takes the geometry shader path -- one of the driver's
+  that passes primitives through where the pipeline has none -- and a pass
+  after the geometry shader walks its lists in order, writing each whole
+  primitive's captured outputs from the records to the buffers, until one
+  is full. Where each buffer is at is the GPU's, copied from and to the
+  counter buffers at begin and end; the primitives written and needed are
+  counters of transform feedback queries. A draw by a counter's byte count
+  is an indirect draw made on the GPU, but where the draw needs its count
+  on the host.
 - **Variable pointers** (variablePointers, variablePointersStorageBuffer):
   a buffer access whose binding a phi or select chooses, which cannot be
   traced back to one, is an access of each buffer of its kind the shader
