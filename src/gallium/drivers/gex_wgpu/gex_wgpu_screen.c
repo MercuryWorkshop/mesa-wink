@@ -45331,24 +45331,20 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
          vertex_texture_entries[entry].binding = ctx->vs->sampler_bindings[i];
          vertex_texture_entries[entry].visibility = WGPUShaderStage_Vertex;
-         /* A vertex fetch is never filtered -- there are no derivatives -- so
-          * WebGPU wants the sampler named non-filtering to match.
+         /* The shader's own type, as the fragment stage has it: filtering
+          * for a float texture, non-filtering for an integer one, and a
+          * comparison for a shadow lookup.
           *
-          * Except a *comparison*, which is a binding type of its own and not
-          * a kind of filtering: a shadow lookup or a depth gather in a vertex
-          * shader needs `sampler_comparison`, and naming it non-filtering
-          * made Dawn reject the pipeline --
-          *
-          *   The sampler type in the shader (comparison: 1) doesn't match the
-          *   type in the layout (comparison: 0).
-          *
-          * -- which drops the draw with the render target left at its clear
-          * value, so it reads as a comparison that answered false everywhere
-          * rather than as a draw that never happened. */
-         vertex_texture_entries[entry].sampler.type =
-            ctx->vs->sampler_types[i] == WGPUSamplerBindingType_Comparison
-               ? WGPUSamplerBindingType_Comparison
-               : WGPUSamplerBindingType_NonFiltering;
+          * This used to name every vertex sampler non-filtering, on the
+          * belief that WebGPU has no filtering sampler in the vertex stage.
+          * It has: what the vertex stage lacks is derivatives, so
+          * textureSample is fragment-only, and textureSampleLevel -- which
+          * is every vertex fetch -- filters there like anywhere. The
+          * non-filtering twin is nearest in all three filters, so a vertex
+          * shader's GL_LINEAR read one texel and its LINEAR_MIPMAP_LINEAR
+          * read one level: dEQP's texture.vertex cases, all of them that
+          * filter. */
+         vertex_texture_entries[entry].sampler.type = ctx->vs->sampler_types[i];
       }
    }
    /* The fragment stage's, which may be written. */
@@ -46360,19 +46356,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const unsigned entry = ctx->vs->texture_count + i;
          entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[entry].binding = ctx->vs->sampler_bindings[i];
-         /* The non-filtering twin: the layout above names this binding
-          * non-filtering because WebGPU has no filtering sampler in the
-          * vertex stage, and the application's own sampler may well be
-          * LINEAR. A comparison sampler is the exception, as in the layout
-          * above -- its twin has no comparison and would not match. */
-         const bool comparison =
-            ctx->vs->sampler_types[i] == WGPUSamplerBindingType_Comparison;
+         /* The sampler the layout above names: the application's, or its
+          * non-filtering twin for an integer texture. */
+         const bool nonfiltering =
+            ctx->vs->sampler_types[i] == WGPUSamplerBindingType_NonFiltering;
          entries[entry].sampler = ctx->vertex_samplers[slot]
-            ? (comparison ? ctx->vertex_samplers[slot]->sampler
-                          : ctx->vertex_samplers[slot]->nonfiltering)
-            : gex_wgpu_default_sampler(
-                 screen, comparison ? WGPUSamplerBindingType_Comparison
-                                    : WGPUSamplerBindingType_NonFiltering);
+            ? (nonfiltering ? ctx->vertex_samplers[slot]->nonfiltering
+                            : ctx->vertex_samplers[slot]->sampler)
+            : gex_wgpu_default_sampler(screen, ctx->vs->sampler_types[i]);
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[3];
