@@ -38,7 +38,12 @@
 /* Vulkan 1.3, but for bufferDeviceAddress: WebGPU has no pointers. */
 #define WVK_API_VERSION VK_MAKE_API_VERSION(0, 1, 3, VK_HEADER_VERSION)
 
-#define WVK_MAX_QUEUE_FAMILIES 1
+/* Queue families: everything, and compute and transfer (wvk_queue.h). */
+enum {
+   WVK_QUEUE_FAMILY_ALL,
+   WVK_QUEUE_FAMILY_COMPUTE,
+   WVK_QUEUE_FAMILIES,
+};
 #define WVK_MAX_MEMORY_TYPES 4
 #define WVK_MAX_MEMORY_HEAPS 2
 

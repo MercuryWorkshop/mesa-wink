@@ -118,18 +118,35 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
    if (result != VK_SUCCESS)
       goto fail_replay;
 
-   /* One queue family, with one queue. */
+   /* Two queue families of a queue each: everything, and compute and
+    * transfer. The second's submits are the first's, which always exists
+    * because it is where they go. */
+   const VkDeviceQueueCreateInfo *family_info[WVK_QUEUE_FAMILIES] = { NULL };
    for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; ++i) {
       const VkDeviceQueueCreateInfo *qci = &pCreateInfo->pQueueCreateInfos[i];
-      assert(qci->queueFamilyIndex == 0 && qci->queueCount == 1);
-      result = wvk_queue_init(dev, &dev->queue, qci, 0);
+      assert(qci->queueFamilyIndex < WVK_QUEUE_FAMILIES && qci->queueCount == 1);
+      family_info[qci->queueFamilyIndex] = qci;
+   }
+   const VkDeviceQueueCreateInfo main_info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+      .queueFamilyIndex = WVK_QUEUE_FAMILY_ALL,
+      .queueCount = 1,
+      .pQueuePriorities = (const float[]){ 1.0f },
+   };
+   result = wvk_queue_init(dev, &dev->queue, family_info[WVK_QUEUE_FAMILY_ALL] ? family_info[WVK_QUEUE_FAMILY_ALL] : &main_info, 0);
+   if (result != VK_SUCCESS)
+      goto fail_meta;
+   if (family_info[WVK_QUEUE_FAMILY_COMPUTE]) {
+      result = wvk_compute_queue_init(dev, &dev->compute_queue, family_info[WVK_QUEUE_FAMILY_COMPUTE]);
       if (result != VK_SUCCESS)
-         goto fail_meta;
+         goto fail_queue;
    }
 
    *pDevice = wvk_device_to_handle(dev);
    return VK_SUCCESS;
 
+fail_queue:
+   wvk_queue_finish(dev, &dev->queue);
 fail_meta:
    wvk_device_finish_meta(dev);
 fail_replay:
@@ -153,6 +170,8 @@ wvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (!dev)
       return;
 
+   if (dev->compute_queue.base.device)
+      vk_queue_finish(&dev->compute_queue);
    if (dev->queue.vk.base.device)
       wvk_queue_finish(dev, &dev->queue);
    wvk_device_finish_meta(dev);

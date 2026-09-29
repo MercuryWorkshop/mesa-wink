@@ -54,6 +54,7 @@ dEQP-VK.api.copy_and_blit.copy_commands2.resolve_image.diff_image_size.src_266_2
 dEQP-VK.api.copy_and_blit.copy_commands2.resolve_image.layer_copy_before_resolving.4_bit,Fail
 dEQP-VK.api.copy_and_blit.copy_commands2.resolve_image.whole_array_image.4_bit,Fail
 dEQP-VK.api.copy_and_blit.copy_commands2.resolve_image.whole_array_image_one_region.4_bit,Fail
+dEQP-VK.api.copy_and_blit.copy_commands2.resolve_image.whole_array_image_one_region.4_bit_all_remaining_layers,Fail
 dEQP-VK.api.copy_and_blit.copy_commands2.resolve_image.whole_array_image_one_region.4_bit_not_all_remaining_layers,Fail
 dEQP-VK.api.copy_and_blit.core.depth_stencil_msaa_copy.array_to_array.d24_unorm_s8_uint_D_4_bit,Fail
 dEQP-VK.api.copy_and_blit.core.depth_stencil_msaa_copy.array_to_array.d24_unorm_s8_uint_D_4_bit_bind_offset,Fail
@@ -380,6 +381,7 @@ dEQP-VK.api.copy_and_blit.core.use_after_copy.d24_unorm_s8_uint.general.32x32x2_
 dEQP-VK.api.copy_and_blit.core.use_after_copy.d24_unorm_s8_uint.general.32x32x2_regions_img2img_msaa,Fail
 dEQP-VK.api.copy_and_blit.core.use_after_copy.d24_unorm_s8_uint.transfer_dst_optimal.32x32x2_img2img_msaa,Fail
 dEQP-VK.api.copy_and_blit.core.use_after_copy.d24_unorm_s8_uint.transfer_dst_optimal.32x32x2_regions_img2img_msaa,Fail
+dEQP-VK.api.copy_and_blit.core.use_after_copy.d32_sfloat.general.32x32x2_cq_img2img_msaa,Fail
 dEQP-VK.api.copy_and_blit.core.use_after_copy.d32_sfloat.general.32x32x2_img2img_msaa,Fail
 dEQP-VK.api.copy_and_blit.core.use_after_copy.d32_sfloat.general.32x32x2_regions_img2img_msaa,Fail
 dEQP-VK.api.copy_and_blit.core.use_after_copy.d32_sfloat.transfer_dst_optimal.32x32x2_img2img_msaa,Fail
@@ -587,8 +589,6 @@ dEQP-VK.api.image_clearing.dedicated_allocation.clear_color_image.2d.optimal.rem
 dEQP-VK.api.image_clearing.dedicated_allocation.clear_color_image.2d.optimal.remaining_array_layers.r8g8b8a8_uint_sample_count_4,Fail
 dEQP-VK.api.info.image_format_properties.2d.optimal.r32g32_sfloat,Fail
 dEQP-VK.api.info.image_format_properties.2d.optimal.r32g32b32a32_sfloat,Fail
-dEQP-VK.api.object_management.multithreaded_per_thread_resources.query_pool,Timeout
-dEQP-VK.api.object_management.multithreaded_shared_resources.query_pool,Timeout
 dEQP-VK.binding_model.descriptor_copy.compute.mix_array0,Fail
 dEQP-VK.binding_model.descriptor_copy.compute.mix_array1,Fail
 dEQP-VK.binding_model.descriptor_copy.compute.uniform_texel_buffer_array2,Fail
@@ -2276,6 +2276,7 @@ dEQP-VK.glsl.texture_functions.textureclamp.samplercubeshadow_bias_fragment,Fail
 dEQP-VK.glsl.texture_functions.texturegrad.samplercubeshadow_fragment,Fail
 dEQP-VK.glsl.texture_functions.texturegrad.samplercubeshadow_vertex,Fail
 dEQP-VK.glsl.texture_functions.texturegradclamp.samplercubeshadow_fragment,Fail
+dEQP-VK.glsl.texture_gather.compute.basic.cube.rgba8i.size_npot.mirrored_repeat_clamp_to_edge,Fail
 dEQP-VK.glsl.texture_gather.graphics.basic.cube.rgba8i.base_level.level_1,Fail
 dEQP-VK.glsl.texture_gather.graphics.basic.cube.rgba8i.base_level.level_2,Fail
 dEQP-VK.glsl.texture_gather.graphics.basic.cube.rgba8i.filter_mode.min_nearest_mipmap_nearest_mag_nearest,Fail
@@ -4396,6 +4397,7 @@ dEQP-VK.spirv_assembly.instruction.graphics.opquantize.spec_const_negative_vert,
 dEQP-VK.spirv_assembly.instruction.graphics.opquantize.spec_const_positive_vert,Fail
 dEQP-VK.spirv_assembly.instruction.graphics.opquantize.spec_const_too_small_vert,Fail
 dEQP-VK.ssbo.unsized_array_length.nested_unsized_arrays,Fail
+dEQP-VK.synchronization.op.multi_queue.timeline_semaphore.write_clear_attachments_read_copy_image.image_128x128_s8_uint_concurrent,Fail
 dEQP-VK.synchronization.op.single_queue.barrier.write_clear_attachments_read_copy_image.image_128x128_s8_uint,Fail
 dEQP-VK.synchronization.op.single_queue.barrier.write_clear_depth_stencil_image_read_copy_image.image_128x128_s8_uint,Fail
 dEQP-VK.synchronization.op.single_queue.barrier.write_copy_buffer_to_image_read_copy_image.image_128x128_s8_uint,Fail
@@ -4654,11 +4656,14 @@ dEQP-VK.texture.explicit_lod.2d.sizes.31x55_nearest_linear_mipmap_nearest_repeat
 dEQP-VK.texture.explicit_lod.2d.sizes.57x35_linear_linear_mipmap_linear_repeat,Fail
 dEQP-VK.texture.explicit_lod.2d.sizes.57x35_linear_linear_mipmap_nearest_repeat,Fail
 dEQP-VK.texture.explicit_lod.2d.sizes.57x35_nearest_linear_mipmap_linear_repeat,Fail
+dEQP-VK.texture.explicit_lod.2d.sizes.57x35_nearest_linear_mipmap_linear_repeat_compute,Fail
 dEQP-VK.texture.explicit_lod.2d.sizes.57x35_nearest_linear_mipmap_nearest_repeat,Fail
+dEQP-VK.texture.explicit_lod.2d.sizes.57x35_nearest_linear_mipmap_nearest_repeat_compute,Fail
 dEQP-VK.texture.filtering.2d.combinations.linear_mipmap_linear.linear.clamp_to_border.clamp_to_border,Fail
 dEQP-VK.texture.filtering.2d.combinations.linear_mipmap_linear.linear.clamp_to_border.clamp_to_edge,Fail
 dEQP-VK.texture.filtering.2d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirror_clamp_to_edge,Fail
 dEQP-VK.texture.filtering.2d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirrored_repeat,Fail
+dEQP-VK.texture.filtering.2d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirrored_repeat_compute,Fail
 dEQP-VK.texture.filtering.2d.combinations.linear_mipmap_linear.linear.clamp_to_border.repeat,Fail
 dEQP-VK.texture.filtering.2d.combinations.linear_mipmap_linear.linear.clamp_to_edge.clamp_to_border,Fail
 dEQP-VK.texture.filtering.2d.combinations.linear_mipmap_linear.linear.mirror_clamp_to_edge.clamp_to_border,Fail
@@ -4694,10 +4699,14 @@ dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.clam
 dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.clamp_to_border.mirror_clamp_to_edge,Fail
 dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.clamp_to_border.mirrored_repeat,Fail
 dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.clamp_to_border.repeat,Fail
+dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.clamp_to_border.repeat_compute,Fail
 dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.clamp_to_edge.clamp_to_border,Fail
+dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.clamp_to_edge.clamp_to_border_compute,Fail
 dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.mirror_clamp_to_edge.clamp_to_border,Fail
+dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.mirror_clamp_to_edge.clamp_to_border_compute,Fail
 dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.mirrored_repeat.clamp_to_border,Fail
 dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.repeat.clamp_to_border,Fail
+dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.linear.repeat.clamp_to_border_compute,Fail
 dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.nearest.clamp_to_border.clamp_to_border,Fail
 dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.nearest.clamp_to_border.clamp_to_edge,Fail
 dEQP-VK.texture.filtering.2d_array.combinations.linear_mipmap_linear.nearest.clamp_to_border.mirror_clamp_to_edge,Fail
@@ -4717,13 +4726,16 @@ dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_b
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.clamp_to_edge.mirror_clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.clamp_to_edge.mirrored_repeat,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.clamp_to_edge.repeat,Fail
+dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.clamp_to_edge.repeat_compute,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirror_clamp_to_edge.clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirror_clamp_to_edge.mirror_clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirror_clamp_to_edge.mirrored_repeat,Fail
+dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirror_clamp_to_edge.mirrored_repeat_compute,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirror_clamp_to_edge.repeat,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirrored_repeat.clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirrored_repeat.mirror_clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirrored_repeat.mirrored_repeat,Fail
+dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirrored_repeat.mirrored_repeat_compute,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.mirrored_repeat.repeat,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.repeat.clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_border.repeat.mirror_clamp_to_edge,Fail
@@ -4732,6 +4744,7 @@ dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_b
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_edge.clamp_to_border.clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_edge.clamp_to_border.mirror_clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_edge.clamp_to_border.mirrored_repeat,Fail
+dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_edge.clamp_to_border.mirrored_repeat_compute,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.clamp_to_edge.clamp_to_border.repeat,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.mirror_clamp_to_edge.clamp_to_border.clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.linear.mirror_clamp_to_edge.clamp_to_border.mirror_clamp_to_edge,Fail
@@ -4749,6 +4762,7 @@ dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.clamp_to_border.mirror_clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.clamp_to_border.mirrored_repeat,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.clamp_to_border.repeat,Fail
+dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.clamp_to_border.repeat_compute,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.clamp_to_edge.clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.clamp_to_edge.mirror_clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.clamp_to_edge.mirrored_repeat,Fail
@@ -4756,6 +4770,7 @@ dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.mirror_clamp_to_edge.clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.mirror_clamp_to_edge.mirror_clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.mirror_clamp_to_edge.mirrored_repeat,Fail
+dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.mirror_clamp_to_edge.mirrored_repeat_compute,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.mirror_clamp_to_edge.repeat,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.mirrored_repeat.clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_border.mirrored_repeat.mirror_clamp_to_edge,Fail
@@ -4771,6 +4786,7 @@ dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.clamp_to_edge.clamp_to_border.repeat,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.mirror_clamp_to_edge.clamp_to_border.clamp_to_edge,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.mirror_clamp_to_edge.clamp_to_border.mirror_clamp_to_edge,Fail
+dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.mirror_clamp_to_edge.clamp_to_border.mirror_clamp_to_edge_compute,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.mirror_clamp_to_edge.clamp_to_border.mirrored_repeat,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.mirror_clamp_to_edge.clamp_to_border.repeat,Fail
 dEQP-VK.texture.filtering.3d.combinations.linear_mipmap_linear.nearest.mirrored_repeat.clamp_to_border.clamp_to_edge,Fail
@@ -4804,6 +4820,7 @@ dEQP-VK.texture.filtering_anisotropy.mipmap.anisotropy_2.mag_linear_min_nearest_
 dEQP-VK.texture.filtering_anisotropy.mipmap.anisotropy_2.mag_linear_min_nearest_mipmap_nearest,Fail
 dEQP-VK.texture.filtering_anisotropy.mipmap.anisotropy_4.mag_linear_min_linear_mipmap_nearest,Fail
 dEQP-VK.texture.filtering_anisotropy.mipmap.anisotropy_4.mag_linear_min_nearest_mipmap_linear,Fail
+dEQP-VK.texture.filtering_anisotropy.mipmap.anisotropy_4.mag_linear_min_nearest_mipmap_linear_compute,Fail
 dEQP-VK.texture.filtering_anisotropy.mipmap.anisotropy_4.mag_linear_min_nearest_mipmap_nearest,Fail
 dEQP-VK.texture.filtering_anisotropy.mipmap.anisotropy_8.mag_linear_min_linear_mipmap_nearest,Fail
 dEQP-VK.texture.filtering_anisotropy.mipmap.anisotropy_8.mag_linear_min_nearest_mipmap_linear,Fail

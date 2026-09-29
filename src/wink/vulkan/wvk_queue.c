@@ -214,26 +214,39 @@ wvk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
    /* Waits need nothing: submits are deferred until what they wait for is
     * pending, and pending means earlier on this in-order queue. */
 
+   simple_mtx_lock(&queue->submit_lock);
    uint64_t serial;
    VkResult result = wvk_queue_reserve(queue, &serial);
-   if (result != VK_SUCCESS)
-      return result;
-   result = wvk_cmd_buffers_submit(dev, queue, submit->command_buffers,
-                                   submit->command_buffer_count, serial);
-   if (result != VK_SUCCESS)
-      return result;
+   if (result == VK_SUCCESS)
+      result = wvk_cmd_buffers_submit(dev, queue, submit->command_buffers,
+                                      submit->command_buffer_count, serial);
 
-   for (uint32_t i = 0; i < submit->signal_count; ++i) {
+   for (uint32_t i = 0; result == VK_SUCCESS && i < submit->signal_count; ++i) {
       struct vk_sync *sync = submit->signals[i].sync;
-      if (wvk_sync_is_wvk(sync)) {
+      if (wvk_sync_is_wvk(sync))
          wvk_sync_set_pending(sync, serial);
-      } else {
+      else
          result = vk_sync_signal(&dev->vk, sync, submit->signals[i].signal_value);
-         if (result != VK_SUCCESS)
-            return result;
-      }
    }
-   return VK_SUCCESS;
+   simple_mtx_unlock(&queue->submit_lock);
+   return result;
+}
+
+static VkResult
+wvk_compute_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
+{
+   struct wvk_device *dev = (struct wvk_device *)vk_queue->base.device;
+   return wvk_queue_submit(&dev->queue.vk, submit);
+}
+
+VkResult
+wvk_compute_queue_init(struct wvk_device *dev, struct vk_queue *queue,
+                       const VkDeviceQueueCreateInfo *create_info)
+{
+   VkResult result = vk_queue_init(queue, &dev->vk, create_info, 0);
+   if (result == VK_SUCCESS)
+      queue->driver_submit = wvk_compute_queue_submit;
+   return result;
 }
 
 VkResult
@@ -245,6 +258,7 @@ wvk_queue_init(struct wvk_device *dev, struct wvk_queue *queue,
       return result;
 
    simple_mtx_init(&queue->lock, mtx_plain);
+   simple_mtx_init(&queue->submit_lock, mtx_plain);
    queue->wgpu = wgpuDeviceGetQueue(dev->wgpu);
    queue->vk.driver_submit = wvk_queue_submit;
    return VK_SUCCESS;
@@ -260,5 +274,6 @@ wvk_queue_finish(struct wvk_device *dev, struct wvk_queue *queue)
    if (queue->wgpu)
       wgpuQueueRelease(queue->wgpu);
    simple_mtx_destroy(&queue->lock);
+   simple_mtx_destroy(&queue->submit_lock);
    vk_queue_finish(&queue->vk);
 }

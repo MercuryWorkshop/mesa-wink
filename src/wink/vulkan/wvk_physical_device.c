@@ -51,6 +51,12 @@ static const WGPUFeatureName wanted_features[] = {
    WGPUFeatureName_Float32Blendable,
    WGPUFeatureName_ClipDistances,
    WGPUFeatureName_DualSourceBlending,
+#ifndef __EMSCRIPTEN__
+   /* Native Dawn is only safe to call from several threads with this, and
+    * Vulkan lets them all: queues of two families, and creating while
+    * submitting. A browser's device is its thread's alone. */
+   WGPUFeatureName_ImplicitDeviceSynchronization,
+#endif
 };
 
 bool
@@ -764,16 +770,23 @@ wvk_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
    VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyProperties2, out, pQueueFamilyProperties,
                           pQueueFamilyPropertyCount);
 
-   /* One WebGPU queue, which does everything, in order. */
-   vk_outarray_append_typed(VkQueueFamilyProperties2, &out, p) {
-      p->queueFamilyProperties = (VkQueueFamilyProperties){
-         .queueFlags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
-         .queueCount = 1,
-         .timestampValidBits = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TimestampQuery) ? 64 : 0,
-         .minImageTransferGranularity = { 1, 1, 1 },
-      };
-      vk_foreach_struct(stype, ext, p->pNext) {
-         vk_debug_ignored_stype(stype);
+   /* One WebGPU queue, which does everything, in order; and a family of
+    * compute and transfer, whose queue is that one too (wvk_queue.h). */
+   static const VkQueueFlags flags[WVK_QUEUE_FAMILIES] = {
+      [WVK_QUEUE_FAMILY_ALL] = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+      [WVK_QUEUE_FAMILY_COMPUTE] = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+   };
+   for (uint32_t f = 0; f < WVK_QUEUE_FAMILIES; ++f) {
+      vk_outarray_append_typed(VkQueueFamilyProperties2, &out, p) {
+         p->queueFamilyProperties = (VkQueueFamilyProperties){
+            .queueFlags = flags[f],
+            .queueCount = 1,
+            .timestampValidBits = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TimestampQuery) ? 64 : 0,
+            .minImageTransferGranularity = { 1, 1, 1 },
+         };
+         vk_foreach_struct(stype, ext, p->pNext) {
+            vk_debug_ignored_stype(stype);
+         }
       }
    }
 }

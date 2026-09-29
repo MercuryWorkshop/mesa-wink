@@ -30,6 +30,8 @@ struct wvk_device {
 
    WGPUDevice wgpu;
    struct wvk_queue queue;
+   /* The compute family's, when one was asked for (wvk_queue.h). */
+   struct vk_queue compute_queue;
 
    /* What submits replay into; submits to the one queue are serialized. */
    struct vk_command_pool replay_pool;

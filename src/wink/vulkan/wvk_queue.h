@@ -48,6 +48,9 @@ struct wvk_queue {
    /* Submits are the application's to serialize, but waits are not: any
     * thread may wait on a fence or a semaphore, and waiting retires. */
    simple_mtx_t lock;
+   /* And submits to the compute family's queue, which is this one too
+    * (wvk_compute_queue_init), are the application's on another queue. */
+   simple_mtx_t submit_lock;
 
    uint64_t submitted;
    uint64_t completed;
@@ -72,6 +75,11 @@ wvk_queue_completed(struct wvk_queue *queue)
 VkResult wvk_queue_init(struct wvk_device *dev, struct wvk_queue *queue,
                         const VkDeviceQueueCreateInfo *create_info, uint32_t index);
 void wvk_queue_finish(struct wvk_device *dev, struct wvk_queue *queue);
+
+/* The compute family's queue: another vk_queue, whose submits go to the
+ * device's queue -- WebGPU's one, which runs everything in order. */
+VkResult wvk_compute_queue_init(struct wvk_device *dev, struct vk_queue *queue,
+                                const VkDeviceQueueCreateInfo *create_info);
 
 /* Wait until another submit finishes: VK_SUCCESS once one did, VK_TIMEOUT
  * at abs_timeout_ns, VK_NOT_READY if nothing is outstanding. */
