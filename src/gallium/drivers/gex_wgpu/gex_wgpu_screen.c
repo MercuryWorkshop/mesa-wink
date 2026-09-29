@@ -2218,6 +2218,10 @@ struct gex_wgpu_context {
    struct gex_wgpu_rasterizer *rasterizer;
    struct pipe_depth_stencil_alpha_state *dsa;
    struct pipe_stencil_ref stencil_ref;
+   /* Which faces the draw being recorded is of: 0 both, 1 front, 2 back.
+    * A draw whose two faces have different stencil masks or references is
+    * drawn once for each (gex_wgpu_stencil_faces_differ). */
+   uint8_t stencil_face;
    struct pipe_blend_state *blend;
    struct pipe_blend_color blend_color;
    struct gex_wgpu_vertex_elements *vertex_elements;
@@ -15683,6 +15687,32 @@ gex_wgpu_delete_rasterizer_state(struct pipe_context *pipe, void *state)
    FREE(state);
 }
 
+/* Whether the faces of a two-sided stencil state have masks or references
+ * that differ. WebGPU has one of each for both faces, where GL and Gallium
+ * have a pair; a draw with both faces showing is drawn once for each. */
+static bool
+gex_wgpu_stencil_faces_differ(const struct gex_wgpu_context *ctx)
+{
+   const struct pipe_depth_stencil_alpha_state *dsa = ctx->dsa;
+   return dsa && dsa->stencil[0].enabled && dsa->stencil[1].enabled &&
+          (dsa->stencil[0].valuemask != dsa->stencil[1].valuemask ||
+           dsa->stencil[0].writemask != dsa->stencil[1].writemask ||
+           ctx->stencil_ref.ref_value[0] != ctx->stencil_ref.ref_value[1]);
+}
+
+/* Whether the draw being recorded shows back faces only, so that WebGPU's
+ * stencil masks and reference should be the back face's: its half of a
+ * draw split by face, or all of a draw that culls the front. */
+static bool
+gex_wgpu_stencil_back_drawn(const struct gex_wgpu_context *ctx)
+{
+   if (!ctx->dsa || !ctx->dsa->stencil[1].enabled)
+      return false;
+   if (ctx->stencil_face)
+      return ctx->stencil_face == 2;
+   return ctx->rasterizer && ctx->rasterizer->cull_face == PIPE_FACE_FRONT;
+}
+
 /* True when a stencil face's func and ops are ones WebGPU can name. */
 static bool
 gex_wgpu_stencil_face_ok(const struct pipe_stencil_state *face)
@@ -15711,8 +15741,9 @@ gex_wgpu_create_dsa_state(struct pipe_context *pipe,
     * feature was that glEnable(GL_STENCIL_TEST) was on.
     *
     * Two-sided stencil is served now rather than refused: WebGPU has separate
-    * stencilFront and stencilBack, so the only part of GL's two-sided state
-    * it cannot express is a per-face mask, and that is what is checked here. */
+    * stencilFront and stencilBack, and a mask or reference of each face,
+    * where it has one for both, is served by drawing each face on its own
+    * (gex_wgpu_draw_vbo). */
    const bool two_sided = state->stencil[1].enabled;
    const char *why =
       state->alpha_enabled                              ? "alpha test"
@@ -15724,11 +15755,6 @@ gex_wgpu_create_dsa_state(struct pipe_context *pipe,
          !gex_wgpu_stencil_face_ok(&state->stencil[0])) ? "front stencil op"
       : (two_sided &&
          !gex_wgpu_stencil_face_ok(&state->stencil[1])) ? "back stencil op"
-      /* One read mask and one write mask for both faces is all WebGPU has. */
-      : (two_sided &&
-         (state->stencil[0].valuemask != state->stencil[1].valuemask ||
-          state->stencil[0].writemask != state->stencil[1].writemask))
-                                                        ? "per-face stencil mask"
                                                         : NULL;
    if (why) {
       static bool said;
@@ -41750,9 +41776,34 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
     * one free to try. */
    if (expanded_divisors)
       ctx->divisor_expansion_active = true;
+   /* A face at a time, where the faces' stencil masks or references differ
+    * and both are drawn: filled triangles, nothing culled. Not where the
+    * draw would do something twice that counts -- capture primitives, or
+    * run a geometry or tessellation stage, which are dispatches of their
+    * own -- or makes lines of its polygons, whose facing the unfilled
+    * rewrite decides. Those keep the front face's masks, as before. */
+   const bool split_faces =
+      ctx->draw_depth == 0 && info && ctx->depth &&
+      util_format_has_stencil(util_format_description(ctx->depth->format)) &&
+      gex_wgpu_stencil_faces_differ(ctx) &&
+      u_reduced_prim(info->mode) == MESA_PRIM_TRIANGLES &&
+      (!ctx->rasterizer ||
+       (ctx->rasterizer->cull_face == PIPE_FACE_NONE &&
+        ctx->rasterizer->fill_front == PIPE_POLYGON_MODE_FILL &&
+        ctx->rasterizer->fill_back == PIPE_POLYGON_MODE_FILL)) &&
+      !ctx->so_target_count && !ctx->gs && !ctx->tes;
    ctx->draw_depth++;
-   gex_wgpu_draw_vbo_inner(pipe, info, drawid_offset, indirect, draws,
-                           num_draws);
+   if (split_faces) {
+      for (uint8_t face = 1; face <= 2; ++face) {
+         ctx->stencil_face = face;
+         gex_wgpu_draw_vbo_inner(pipe, info, drawid_offset, indirect, draws,
+                                 num_draws);
+      }
+      ctx->stencil_face = 0;
+   } else {
+      gex_wgpu_draw_vbo_inner(pipe, info, drawid_offset, indirect, draws,
+                              num_draws);
+   }
    ctx->draw_depth--;
    if (expanded_divisors) {
       ctx->divisor_expansion_active = false;
@@ -44096,6 +44147,11 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * most of them -- would lose half its particles to their winding. */
    if (ctx->point_expand.active)
       pipeline_desc.primitive.cullMode = WGPUCullMode_None;
+   /* One face of a draw drawn a face at a time: the other culled. */
+   if (ctx->stencil_face == 1)
+      pipeline_desc.primitive.cullMode = WGPUCullMode_Back;
+   else if (ctx->stencil_face == 2)
+      pipeline_desc.primitive.cullMode = WGPUCullMode_Front;
    /* Must equal the attachments' sample count, or WebGPU rejects the pipeline
     * with "attachment state ... not compatible". This was hardcoded to one. */
    pipeline_desc.multisample.count = MAX2(1, ctx->fb_samples);
@@ -44189,10 +44245,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             rear.passOp = gex_wgpu_stencil_operation(back->zpass_op);
          }
          depth_state.stencilBack = rear;
+         /* WebGPU's one pair of masks is the face being drawn's. */
+         const struct pipe_stencil_state *masks =
+            gex_wgpu_stencil_back_drawn(ctx) ? back : stencil;
          depth_state.stencilReadMask = stencil_enabled
-            ? stencil->valuemask : 0xff;
+            ? masks->valuemask : 0xff;
          depth_state.stencilWriteMask = stencil_enabled
-            ? stencil->writemask : 0;
+            ? masks->writemask : 0;
       }
       pipeline_desc.depthStencil = &depth_state;
    }
@@ -46352,7 +46411,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           util_format_has_stencil(
              util_format_description(ctx->depth->format)))
          wgpuRenderPassEncoderSetStencilReference(
-            pass, ctx->stencil_ref.ref_value[0]);
+            pass, ctx->stencil_ref.ref_value[gex_wgpu_stencil_back_drawn(ctx)]);
       if (uses_blend_constant) {
          const WGPUColor blend_color = {
             ctx->blend_color.color[0], ctx->blend_color.color[1],
