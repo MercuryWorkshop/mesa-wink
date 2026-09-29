@@ -12711,6 +12711,56 @@ gex_wgpu_neutralise_cull_distances(nir_shader *nir)
    return wrote;
 }
 
+
+/* The generic location a fragment shader's gl_Layer is read from.
+ *
+ * WGSL has no layer builtin, and a fragment shader that reads gl_Layer
+ * reached Tint as SPIR-V's Layer input and was refused -- "unknown SPIR-V
+ * builtin: 9". st/mesa's own PBO upload into an array or 3D texture is
+ * such a shader, drawn through a geometry shader that routes each layer,
+ * so every one of those uploads was lost. The read becomes an ordinary flat
+ * varying here, which the geometry passthrough writes from the layer it
+ * routed (gex_wgpu_gs_passthrough_nir); with nothing producing it it reads
+ * zero, which is the layer of anything not rendered layered. */
+#define GEX_WGPU_LAYER_VARYING (VARYING_SLOT_VAR0 + 14)
+
+static bool
+gex_wgpu_lower_fs_layer_input(nir_shader *nir)
+{
+   if (nir->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+   bool progress = false;
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+      if (var->data.location == VARYING_SLOT_LAYER) {
+         var->data.location = GEX_WGPU_LAYER_VARYING;
+         var->data.interpolation = INTERP_MODE_FLAT;
+         progress = true;
+      }
+   }
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_input)
+               continue;
+            nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+            if (sem.location != VARYING_SLOT_LAYER)
+               continue;
+            sem.location = GEX_WGPU_LAYER_VARYING;
+            nir_intrinsic_set_io_semantics(intr, sem);
+            progress = true;
+         }
+      }
+   }
+   if (progress) {
+      nir->info.inputs_read &= ~VARYING_BIT_LAYER;
+      nir->info.inputs_read |= BITFIELD64_BIT(GEX_WGPU_LAYER_VARYING);
+   }
+   return progress;
+}
+
 static struct gex_wgpu_shader *
 gex_wgpu_create_shader_state(struct pipe_context *pipe,
                              const struct pipe_shader_state *state,
@@ -12726,6 +12776,8 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    nir_shader *nir = state->type == PIPE_SHADER_IR_NIR ? state->ir.nir
       : state->type == PIPE_SHADER_IR_TGSI
       ? tgsi_to_nir(state->tokens, pipe->screen, false) : NULL;
+   if (nir)
+      (void)gex_wgpu_lower_fs_layer_input(nir);
    /* The two stages are compiled to separate WGSL modules, and WGSL requires
     * a varying's interpolation to match on both sides of the pipeline. TGSI
     * declares interpolation only on the fragment side, so a vertex output and
@@ -29149,6 +29201,38 @@ gex_wgpu_gs_passthrough_nir(struct pipe_context *pipe,
       } else {
          nir_store_var(&b, out, value, 0xf);
       }
+   }
+   /* The layer each primitive was routed to, for a fragment shader that
+    * reads gl_Layer (gex_wgpu_lower_fs_layer_input). The builtin slot is
+    * skipped above -- WGSL has no layer output either -- so it goes out at
+    * that generic location instead, unless an output of the shader's own is
+    * already there. */
+   int layer_slot = -1;
+   bool layer_location_taken = false;
+   for (unsigned i = 0; i < outputs->count; ++i) {
+      if (outputs->location[i] == VARYING_SLOT_LAYER)
+         layer_slot = (int)i;
+      if (outputs->location[i] == GEX_WGPU_LAYER_VARYING)
+         layer_location_taken = true;
+   }
+   if (layer_slot >= 0 && !layer_location_taken) {
+      nir_def *value;
+      if (storage) {
+         value = gex_wgpu_load_varying(
+            &b, records, nir_iadd_imm(&b, record_byte, layer_slot * 16), 4);
+      } else {
+         nir_variable *in = nir_variable_create(
+            b.shader, nir_var_shader_in, glsl_vec4_type(), "gex_gs_layer_in");
+         in->data.location = VERT_ATTRIB_GENERIC0 + layer_slot;
+         in->data.driver_location = element_of[layer_slot];
+         value = nir_load_var(&b, in);
+      }
+      nir_variable *out = nir_variable_create(
+         b.shader, nir_var_shader_out, glsl_int_type(), "gex_gs_layer");
+      out->data.location = GEX_WGPU_LAYER_VARYING;
+      out->data.driver_location = outputs->count;
+      out->data.interpolation = INTERP_MODE_FLAT;
+      nir_store_var(&b, out, nir_channel(&b, value, 0), 0x1);
    }
    nir_shader_gather_info(b.shader, nir_shader_get_entrypoint(b.shader));
    return b.shader;
