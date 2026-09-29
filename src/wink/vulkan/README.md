@@ -164,6 +164,22 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   need, to what a binding holds; patches past that are not drawn. A
   geometry shader after reads the evaluation shader's records by the
   tessellator's lists, its invocations the tessellator's count too.
+- **Points a geometry or evaluation shader gives a size**
+  (shaderTessellationAndGeometryPointSize) are quads, as the vertex
+  shader's are: the draw after it, of six vertices an index, reads its
+  records by the list, bound as storage; after tessellation, an indirect
+  draw the tessellator writes the count of.
+- **Pipeline statistics queries** (pipelineStatisticsQuery) are the
+  driver's counts. The host knows most of each direct draw's from its
+  counts and topology: its vertices and primitives, vertex shader
+  invocations, a geometry shader's invocations, the control shader's
+  patches, what clipping has without either, and a dispatch's invocations.
+  An indirect command's come from the host's copy of it. The GPU counts
+  the rest into a buffer of the query's: fragment shader invocations, by
+  an atomic at each invocation's start; a geometry shader's primitives, as
+  it makes its lists; and what the tessellator made, by a pass of the
+  driver's. At the end of the query, a pass adds the two into the pool's
+  memory. A pass replayed a layer at a time counts once.
 - **Cull distances** (shaderCullDistance) are culled where primitives are
   made into lists: a geometry shader run as compute writes no indices for
   a primitive whose every vertex has one plane's distance negative. A
@@ -390,8 +406,10 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - An attribute larger than its binding's dynamic stride, which WebGPU
   cannot describe. Strips of 16-bit indices with primitive restart off
   still restart at 0xFFFF, as WebGPU's always do.
-- Precise occlusion queries: WebGPU's count is exact on some backends
-  only.
+- Precise occlusion queries: WebGPU's occlusion queries are boolean on
+  Dawn's Metal and D3D12 backends, and not precise on Vulkan.
+- Pipeline statistics of indirect draws and dispatches in memory the host
+  has no copy of, which are not counted.
 - Subgroups are one invocation each: Tint reads no subgroup operations from
   SPIR-V. Every operation but the quad ones is there, trivially.
 - Blend states whose colour factors use both CONSTANT_COLOR and

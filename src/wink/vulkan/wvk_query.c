@@ -14,6 +14,13 @@
  * each is an empty compute pass's beginning -- a render pass ended for it,
  * and begun again after -- resolved and copied to the pool's memory then,
  * in nanoseconds.
+ *
+ * Pipeline statistics, which WebGPU has none of, are the driver's counts:
+ * what the host knows of each draw and dispatch (wvk_cmd_draw.c), and what
+ * it cannot, added up on the GPU in a buffer of the query's -- fragment
+ * shader invocations and a geometry shader's primitives by the shaders
+ * themselves, what the tessellator made and indirect commands by passes of
+ * the driver's. At the end, a pass adds the two into the pool's memory.
  */
 #include "wvk_query.h"
 
@@ -45,15 +52,16 @@ wvk_CreateQueryPool(VkDevice _device, const VkQueryPoolCreateInfo *pCreateInfo,
    struct wvk_query_pool *pool = vk_query_pool_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*pool));
    if (!pool)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
-   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS)
-      mesa_logw_once("wvk: pipeline statistics queries are not supported; they read zero");
+   pool->values = pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS
+                     ? MAX2(util_bitcount(pool->vk.pipeline_statistics), 1)
+                     : 1;
 
    pool->serial = calloc(pool->vk.query_count, sizeof(*pool->serial));
    VkResult result = pool->serial ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
    if (result == VK_SUCCESS)
       result = wvk_AllocateMemory(_device, &(VkMemoryAllocateInfo){
          .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-         .allocationSize = align64((uint64_t)pool->vk.query_count * 8, 256),
+         .allocationSize = align64((uint64_t)pool->vk.query_count * pool->values * 8, 256),
          .memoryTypeIndex = WVK_MEMORY_READBACK,
       }, NULL, &pool->memory);
    if (result == VK_SUCCESS) {
@@ -88,7 +96,7 @@ reset_queries(struct wvk_query_pool *pool, uint32_t first, uint32_t count)
 {
    for (uint32_t q = first; q < first + count && q < pool->vk.query_count; ++q) {
       pool->serial[q] = 0;
-      ((uint64_t *)pool->mem->host)[q] = 0;
+      memset((uint64_t *)pool->mem->host + (uint64_t)q * pool->values, 0, pool->values * 8);
    }
 }
 
@@ -139,14 +147,15 @@ wvk_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t firstQ
       }
       const bool available = query_available(queue, pool, q);
       uint8_t *dst = (uint8_t *)pData + i * stride;
-      if (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)) {
-         const uint64_t value = available ? ((const uint64_t *)pool->mem->host)[q] : 0;
-         write_result(dst, is64, value);
+      const uint32_t size = is64 ? 8 : 4;
+      for (uint32_t v = 0; v < pool->values && (available || (flags & VK_QUERY_RESULT_PARTIAL_BIT)); ++v) {
+         const uint64_t value = available ? ((const uint64_t *)pool->mem->host)[(uint64_t)q * pool->values + v] : 0;
+         write_result(dst + v * size, is64, value);
       }
       if (!available)
          result = VK_NOT_READY;
       if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
-         write_result(dst + (is64 ? 8 : 4), is64, available);
+         write_result(dst + pool->values * size, is64, available);
    }
    return result;
 }
@@ -311,6 +320,170 @@ wvk_replay_finish_queries(struct wvk_replay *replay)
    util_dynarray_fini(&replay->pass_queries);
 }
 
+/* A compute pipeline of the device's, made the first time. */
+static WGPUComputePipeline
+device_pipeline(struct wvk_device *dev, WGPUComputePipeline *pipeline, const char *wgsl, const char *label)
+{
+   simple_mtx_lock(&dev->cache_lock);
+   if (!*pipeline) {
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(wgsl);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      sm.label = wvk_sv(label);
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+      desc.label = wvk_sv(label);
+      desc.compute.module = module;
+      desc.compute.entryPoint = wvk_sv("main");
+      *pipeline = wgpuDeviceCreateComputePipeline(dev->wgpu, &desc);
+      wgpuShaderModuleRelease(module);
+   }
+   simple_mtx_unlock(&dev->cache_lock);
+   return *pipeline;
+}
+
+/* One invocation's pass of `pipeline`, of `entries` for its group. */
+static void
+one_pass(struct wvk_device *dev, struct wvk_replay *replay, WGPUComputePipeline pipeline,
+         const WGPUBindGroupEntry *entries, uint32_t count)
+{
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
+   bg.entryCount = count;
+   bg.entries = entries;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bg.layout);
+   WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
+   wgpuComputePassEncoderSetPipeline(pass, pipeline);
+   wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
+   wgpuComputePassEncoderEnd(pass);
+   wgpuComputePassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+}
+
+uint32_t
+wvk_replay_stats(const struct wvk_replay *replay)
+{
+   return replay->stats_pool ? replay->stats_pool->vk.pipeline_statistics : 0;
+}
+
+void
+wvk_replay_count_stat(struct wvk_replay *replay, VkQueryPipelineStatisticFlagBits bit, uint64_t n)
+{
+   /* Once for a pass replayed a layer at a time: its draws are the same. */
+   if (!(wvk_replay_stats(replay) & bit) || (replay->pass_layered && replay->pass_layer != replay->pass_first_layer))
+      return;
+   replay->stats_host[util_logbase2(bit)] += n;
+}
+
+static const char add_stats_wgsl[] =
+   "struct P { word: u32, divisor: u32, bits: u32, pad: u32 }\n"
+   "@group(0) @binding(0) var<uniform> p: P;\n"
+   "@group(0) @binding(1) var<storage, read> src: array<u32>;\n"
+   "@group(0) @binding(2) var<storage, read_write> stats: array<atomic<u32>>;\n"
+   "@compute @workgroup_size(1)\n"
+   "fn main() {\n"
+   "  let v = src[p.word] / max(p.divisor, 1u);\n"
+   "  for (var i = 0u; i < 11u; i++) {\n"
+   "    if ((p.bits & (1u << i)) != 0u) { atomicAdd(&stats[i], v); }\n"
+   "  }\n"
+   "}\n";
+
+void
+wvk_replay_add_stats(struct wvk_replay *replay, WGPUBuffer src, uint64_t src_size, uint32_t word,
+                     uint32_t divisor, uint32_t bits)
+{
+   struct wvk_device *dev = replay->dev;
+   bits &= wvk_replay_stats(replay);
+   if (!bits || !replay->stats_buffer ||
+       (replay->pass_layered && replay->pass_layer != replay->pass_first_layer))
+      return;
+   WGPUComputePipeline pipeline = device_pipeline(dev, &dev->add_stats_pipeline, add_stats_wgsl, "wvk add statistics");
+   const uint32_t params[4] = { word, divisor, bits };
+   WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
+   if (!pipeline || !params_buffer)
+      return;
+   const WGPUBindGroupEntry entries[] = {
+      { .binding = 0, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
+      { .binding = 1, .buffer = src, .offset = 0, .size = align64(src_size, 4) },
+      { .binding = 2, .buffer = replay->stats_buffer, .offset = 0, .size = 64 },
+   };
+   one_pass(dev, replay, pipeline, entries, ARRAY_SIZE(entries));
+}
+
+static void
+begin_stats(struct wvk_replay *replay, struct wvk_query_pool *pool, uint32_t query)
+{
+   static const uint32_t zero[16] = { 0 };
+   replay->stats_pool = pool;
+   replay->stats_query = query;
+   memset(replay->stats_host, 0, sizeof(replay->stats_host));
+   replay->stats_buffer = wvk_replay_temp_buffer(replay->dev, replay, sizeof(zero),
+                                                 WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc, zero);
+   replay->stats_serial = ++replay->dev->temp_serial | (1ull << 62);
+}
+
+/* A query's results: the host's counts and the GPU's, statistic after
+ * statistic in the order of their bits, to its values in the pool. */
+static const char finish_stats_wgsl[] =
+   "struct P { words: array<vec4u, 7> }\n"
+   "@group(0) @binding(0) var<uniform> p: P;\n"
+   "@group(0) @binding(1) var<storage, read> stats: array<u32>;\n"
+   "@group(0) @binding(2) var<storage, read_write> results: array<u32>;\n"
+   "fn w(i: u32) -> u32 { return p.words[i / 4u][i % 4u]; }\n"
+   "@compute @workgroup_size(1)\n"
+   "fn main() {\n"
+   "  let mask = w(22u);\n"
+   "  var at = w(23u);\n"
+   "  for (var i = 0u; i < 11u; i++) {\n"
+   "    if ((mask & (1u << i)) == 0u) { continue; }\n"
+   "    let lo = w(2u * i) + stats[i];\n"
+   "    results[at] = lo;\n"
+   "    results[at + 1u] = w(2u * i + 1u) + select(0u, 1u, lo < stats[i]);\n"
+   "    at += 2u;\n"
+   "  }\n"
+   "}\n";
+
+static void
+end_stats(struct wvk_cmd_buffer *cmd, struct wvk_query_pool *pool, uint32_t query)
+{
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_device *dev = replay->dev;
+   if (replay->stats_pool != pool || replay->stats_query != query || !replay->stats_buffer) {
+      replay->stats_pool = NULL;
+      return;
+   }
+   WGPUComputePipeline pipeline =
+      device_pipeline(dev, &dev->finish_stats_pipeline, finish_stats_wgsl, "wvk finish statistics");
+   uint32_t params[28] = { 0 };
+   for (uint32_t i = 0; i < WVK_STATS; ++i) {
+      params[2 * i] = (uint32_t)replay->stats_host[i];
+      params[2 * i + 1] = (uint32_t)(replay->stats_host[i] >> 32);
+   }
+   params[22] = pool->vk.pipeline_statistics;
+   params[23] = query * pool->values * 2;
+   WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
+   if (pipeline && params_buffer) {
+      /* Once a pass replayed a layer at a time has had its layers. */
+      const bool in_pass = replay->pass != NULL;
+      wvk_replay_end_passes(replay);
+      const WGPUBindGroupEntry entries[] = {
+         { .binding = 0, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
+         { .binding = 1, .buffer = replay->stats_buffer, .offset = 0, .size = 64 },
+         { .binding = 2, .buffer = pool->buffer, .offset = 0, .size = pool->mem->buffer_size },
+      };
+      one_pass(dev, replay, pipeline, entries, ARRAY_SIZE(entries));
+      wvk_replay_write(replay, pool->mem, (uint64_t)query * pool->values * 8, pool->values * 8);
+      if (in_pass)
+         wvk_replay_restart_pass(cmd, replay->pass_layer);
+   }
+   replay->stats_pool = NULL;
+   replay->stats_buffer = NULL;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint32_t query,
                             VkQueryControlFlags flags, uint32_t index)
@@ -318,6 +491,10 @@ wvk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(wvk_query_pool, pool, queryPool);
    struct wvk_replay *replay = cmd->replay;
+   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
+      begin_stats(replay, pool, query);
+      return;
+   }
    if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
       return;
    if (!replay->pass || !replay->query_set) {
@@ -343,6 +520,10 @@ wvk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, 
    struct wvk_replay *replay = cmd->replay;
    if (query < pool->vk.query_count)
       pool->serial[query] = replay->serial;
+   if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
+      end_stats(cmd, pool, query);
+      return;
+   }
    if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
       return;
    if (replay->active_query.pool == pool && replay->active_query.slot != UINT32_MAX && replay->pass &&
@@ -425,7 +606,7 @@ wvk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stag
  * compute shader, as WebGPU copies only bytes. Whether a query is
  * available there is known now, on the host: replay is in queue order. */
 static const char copy_results_wgsl[] =
-   "struct Params { first: u32, count: u32, stride: u32, flags: u32, dst_word: u32 }\n"
+   "struct Params { first: u32, count: u32, stride: u32, flags: u32, dst_word: u32, values: u32 }\n"
    "@group(0) @binding(0) var<storage, read> results: array<u32>;\n"
    "@group(0) @binding(1) var<storage, read> avail: array<u32>;\n"
    "@group(0) @binding(2) var<storage, read_write> dst: array<u32>;\n"
@@ -440,14 +621,19 @@ static const char copy_results_wgsl[] =
    "  let a = avail[i] != 0u;\n"
    "  let w = p.dst_word + (i * p.stride) / 4u;\n"
    "  let q = p.first + i;\n"
-   "  let lo = results[2u * q];\n"
-   "  let hi = results[2u * q + 1u];\n"
-   "  if (a || partial) {\n"
-   "    if (is64) { dst[w] = select(0u, lo, a); dst[w + 1u] = select(0u, hi, a); }\n"
-   "    else { dst[w] = select(0u, select(0xffffffffu, lo, hi == 0u), a); }\n"
+   "  let size = select(1u, 2u, is64);\n"
+   "  for (var v = 0u; v < p.values; v++) {\n"
+   "    let lo = results[2u * (q * p.values + v)];\n"
+   "    let hi = results[2u * (q * p.values + v) + 1u];\n"
+   "    let at = w + v * size;\n"
+   "    if (a || partial) {\n"
+   "      if (is64) { dst[at] = select(0u, lo, a); dst[at + 1u] = select(0u, hi, a); }\n"
+   "      else { dst[at] = select(0u, select(0xffffffffu, lo, hi == 0u), a); }\n"
+   "    }\n"
    "  }\n"
+   "  let av = w + p.values * size;\n"
    "  if (with_avail) {\n"
-   "    if (is64) { dst[w + 2u] = u32(a); dst[w + 3u] = 0u; } else { dst[w + 1u] = u32(a); }\n"
+   "    if (is64) { dst[av] = u32(a); dst[av + 1u] = 0u; } else { dst[av] = u32(a); }\n"
    "  }\n"
    "}\n";
 
@@ -505,9 +691,9 @@ wvk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool
    const uint64_t base = start & ~255ull;
    const uint32_t result_size = (flags & VK_QUERY_RESULT_64_BIT) ? 8 : 4;
    const uint64_t end = start + (queryCount - 1) * stride + result_size *
-                        ((flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ? 2 : 1);
+                        (pool->values + ((flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ? 1 : 0));
    const uint32_t params[8] = {
-      firstQuery, queryCount, (uint32_t)stride, flags, (uint32_t)((start - base) / 4),
+      firstQuery, queryCount, (uint32_t)stride, flags, (uint32_t)((start - base) / 4), pool->values,
    };
    WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params),
                                                      WGPUBufferUsage_Uniform, params);

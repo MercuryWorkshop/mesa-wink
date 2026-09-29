@@ -1459,7 +1459,7 @@ primitive_vertex(nir_builder *b, nir_def *topology, nir_def *prim, nir_def *j, n
  * Streams but the first are dropped. Compute's stage after its buffers are
  * words (compile_one). */
 static void
-lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars, bool after_tess)
+lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars, bool after_tess, bool stats)
 {
    const unsigned vertices_in = mesa_vertices_per_prim(nir->info.gs.input_primitive);
    const unsigned max_vertices = nir->info.gs.vertices_out;
@@ -1680,6 +1680,22 @@ lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars, boo
       nir_instr_remove(&intr->instr);
    }
    util_dynarray_fini(&emits);
+   /* Its primitives, for the pipeline statistics query: what it made, and
+    * what clipping has of them. */
+   if (stats) {
+      b.cursor = nir_after_impl(impl);
+      nir_def *n = nir_load_var(&b, made);
+      nir_push_if(&b, nir_ine_imm(&b, n, 0));
+      const VkQueryPipelineStatisticFlagBits bits[] = {
+         VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_PRIMITIVES_BIT,
+         VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT,
+         VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT,
+      };
+      for (unsigned i = 0; i < ARRAY_SIZE(bits); ++i)
+         nir_ssbo_atomic(&b, 32, driver_buffer(&b, WVK_DRIVER_SLOT_STATS), nir_imm_int(&b, util_logbase2(bits[i]) * 4),
+                         n, .atomic_op = nir_atomic_op_iadd);
+      nir_pop_if(&b, NULL);
+   }
    nir_progress(true, impl, nir_metadata_none);
    nir_foreach_variable_with_modes_safe(var, nir, nir_var_shader_in | nir_var_shader_out)
       exec_node_remove(&var->node);
@@ -4949,7 +4965,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       shader->key.geometry = 1;
       shader->key.vs_vars = records->vs_vars;
       shader->key.after_tess = records->after_tess;
-      lower_geometry(nir, shader, records->vs_vars, records->after_tess);
+      shader->key.stats = records->stats;
+      lower_geometry(nir, shader, records->vs_vars, records->after_tess, records->stats);
    } else if (records && records->geometry == 2) {
       shader->key.geometry = 2;
    }
@@ -5026,6 +5043,17 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       nir_shader_intrinsics_pass(nir, point_state_instr, nir_metadata_all, &shader->point_state);
       if (nir_find_variable_with_location(nir, nir_var_shader_in, VARYING_SLOT_PRIMITIVE_ID))
          shader->point_state |= 4;
+      /* Its invocations, for the pipeline statistics query, first thing:
+       * a helper's add is none. */
+      if (records && records->stats) {
+         nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+         nir_builder b = nir_builder_at(nir_before_impl(impl));
+         nir_ssbo_atomic(&b, 32, driver_buffer(&b, WVK_DRIVER_SLOT_STATS),
+                         nir_imm_int(&b, util_logbase2(VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT) * 4),
+                         nir_imm_int(&b, 1), .atomic_op = nir_atomic_op_iadd);
+         nir_progress(true, impl, nir_metadata_none);
+         shader->key.stats = 1;
+      }
       /* Its clip and cull distances: 0, but where a draw has them as
        * varyings (a variant). */
       shader->clip_inputs = MIN2(nir->info.clip_distance_array_size + nir->info.cull_distance_array_size, 8);
@@ -5378,6 +5406,9 @@ geometry_shell(struct wvk_device *dev, struct vk_shader_compile_info *info, cons
    shader->record_vars = record_vars(nir, nir_var_shader_out);
    if (nir->info.stage != MESA_SHADER_TESS_CTRL && cull_distance_var(nir, nir_var_shader_out))
       shader->cull_distances = MIN2(nir->info.cull_distance_array_size, 8);
+   /* Points it gives a size, which its draw's are quads of. */
+   shader->writes_point_size = nir->info.stage != MESA_SHADER_TESS_CTRL &&
+                               nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_PSIZ);
    ralloc_free(nir);
    *shader_out = &shader->vk;
    return VK_SUCCESS;
@@ -5613,7 +5644,7 @@ static struct wvk_shader *variant_for(struct wvk_device *dev, struct wvk_shader 
 struct wvk_shader *
 wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsigned kind, unsigned vs_vars,
                             const struct wvk_shader *other, const struct vk_dynamic_graphics_state *dyn,
-                            bool after_tess)
+                            bool after_tess, bool points, uint32_t stats)
 {
    (void)dyn;
    if (!gs || !gs->source)
@@ -5629,11 +5660,19 @@ wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsig
    if (kind == 1) {
       key.vs_vars = vs_vars;
       key.after_tess = after_tess;
+      key.stats = (stats & (VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_PRIMITIVES_BIT |
+                            VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
+                            VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT)) != 0;
    } else if (other) {
       memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
       key.primitive_id = other->key.primitive_id;
       key.clip_varying = other->key.clip_varying;
       key.clip_slots = other->key.clip_slots;
+   }
+   /* Points as quads of the size it gives them (expand_points). */
+   if (kind == 2 && points) {
+      key.points = 1;
+      key.point_coord = other ? other->key.point_coord : 0;
    }
    struct wvk_shader *variant = variant_for(dev, gs, &key, NULL);
    return variant != gs ? variant : NULL;
@@ -5641,7 +5680,7 @@ wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsig
 
 struct wvk_shader *
 wvk_shader_tess_variant(struct wvk_device *dev, struct wvk_shader *shader, unsigned kind, unsigned vs_vars,
-                        unsigned patch_vars, unsigned patch_vertices, const struct wvk_shader *other)
+                        unsigned patch_vars, unsigned patch_vertices, const struct wvk_shader *other, bool points)
 {
    if (!shader || !shader->source)
       return NULL;
@@ -5662,6 +5701,10 @@ wvk_shader_tess_variant(struct wvk_device *dev, struct wvk_shader *shader, unsig
       key.primitive_id = other->key.primitive_id;
       key.clip_varying = other->key.clip_varying;
       key.clip_slots = other->key.clip_slots;
+   }
+   if (kind == 2 && points) {
+      key.points = 1;
+      key.point_coord = other ? other->key.point_coord : 0;
    }
    struct wvk_shader *variant = variant_for(dev, shader, &key, NULL);
    return variant != shader ? variant : NULL;
@@ -5687,7 +5730,7 @@ struct wvk_shader *
 wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_shader *other,
                         const struct vk_dynamic_graphics_state *dyn, unsigned samples, bool has_depth,
                         const VkFormat *color_formats, const VkFormat *image_formats, enum wvk_draw_shape shape,
-                        unsigned runs)
+                        unsigned runs, uint32_t stats)
 {
    bool points = shape == WVK_DRAW_POINTS;
    if (!shader || !shader->source)
@@ -5747,6 +5790,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       key.by_alpha = dyn->ms.alpha_to_coverage_enable && (key.alpha_to_one || shader->own_mask || samples <= 1);
       key.samples = shader->uses_samples || key.by_alpha ? samples : 0;
       key.no_depth = shader->source_writes_depth && !has_depth;
+      key.stats = (stats & VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT) != 0;
       /* After a geometry shader: gl_PrimitiveID a varying, at the first
        * location it has no input at. */
       if (other && other->vk.stage == MESA_SHADER_GEOMETRY && (shader->point_state & 4)) {
@@ -5924,6 +5968,8 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->logic_op_reads);
    blob_write_uint8(blob, shader->reads_depth_bounds);
    blob_write_uint8(blob, shader->writes_point_size);
+   blob_write_uint8(blob, shader->cull_distances);
+   blob_write_uint8(blob, shader->clip_inputs);
    blob_write_uint8(blob, shader->writes_storage);
    blob_write_uint8(blob, shader->record_vars);
    blob_write_uint8(blob, shader->gs_input);
@@ -5982,6 +6028,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const uint8_t logic_op_reads = blob_read_uint8(blob);
    const bool reads_depth_bounds = blob_read_uint8(blob);
    const bool writes_point_size = blob_read_uint8(blob);
+   const uint8_t cull_distances = blob_read_uint8(blob);
+   const uint8_t clip_inputs = blob_read_uint8(blob);
    const bool writes_storage = blob_read_uint8(blob);
    const uint8_t record_vars = blob_read_uint8(blob);
    const uint8_t gs_input = blob_read_uint8(blob);
@@ -6054,6 +6102,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->logic_op_reads = logic_op_reads;
    shader->reads_depth_bounds = reads_depth_bounds;
    shader->writes_point_size = writes_point_size;
+   shader->cull_distances = cull_distances;
+   shader->clip_inputs = clip_inputs;
    shader->writes_storage = writes_storage;
    shader->record_vars = record_vars;
    shader->gs_input = gs_input;

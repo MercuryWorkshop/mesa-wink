@@ -16,9 +16,16 @@ struct wvk_device;
 struct wvk_device_memory;
 struct wvk_replay;
 
+/* The statistics of a pipeline statistics query, VkQueryPipelineStatisticFlagBits'
+ * bits. */
+#define WVK_STATS 11
+
 struct wvk_query_pool {
    struct vk_query_pool vk;
-   /* The results, 8 bytes a query: host-visible, so a submit that wrote
+   /* How many values a query has: one, but a statistics query's, one for
+    * each statistic it counts. */
+   uint32_t values;
+   /* The results, 8 bytes a value: host-visible, so a submit that wrote
     * them reads them back. */
    VkDeviceMemory memory;
    struct wvk_device_memory *mem;
@@ -59,6 +66,15 @@ void wvk_replay_resume_query(struct wvk_replay *replay);
 /* Whether a command buffer has occlusion queries, and so its passes need
  * the submit's query set. */
 bool wvk_cmd_queue_has_occlusion_queries(const struct vk_cmd_queue *queue);
+
+/* Counts of the active pipeline statistics query: `n` of the statistic
+ * `bit`, which the host knows; or, on the GPU and outside a pass, what
+ * word `word` of `src` says, divided by `divisor`, of each of `bits`. */
+void wvk_replay_count_stat(struct wvk_replay *replay, VkQueryPipelineStatisticFlagBits bit, uint64_t n);
+void wvk_replay_add_stats(struct wvk_replay *replay, WGPUBuffer src, uint64_t src_size, uint32_t word,
+                          uint32_t divisor, uint32_t bits);
+/* The statistics the active query counts, 0 for none. */
+uint32_t wvk_replay_stats(const struct wvk_replay *replay);
 
 /* For a pass about to begin: the query set it counts in, or NULL. */
 WGPUQuerySet wvk_replay_query_set(struct wvk_device *dev, struct wvk_replay *replay);

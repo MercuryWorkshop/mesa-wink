@@ -206,6 +206,11 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Points of the size the vertex shader gives them: quads, a variant
        * of the shader moving six vertices to a point's corners. */
       .largePoints = true,
+      /* And those a geometry or evaluation shader gives a size: its draw's
+       * vertex shader, of its records, draws them so. */
+      .shaderTessellationAndGeometryPointSize = true,
+      /* The driver's counts, the host's and the shaders' (wvk_query.c). */
+      .pipelineStatisticsQuery = true,
       /* As compute, before a draw of what it emits (draw_geometry). */
       .geometryShader = true,
       /* As compute, around a tessellator of the same (draw_tessellated). */

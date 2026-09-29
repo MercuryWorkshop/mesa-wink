@@ -281,6 +281,7 @@ replay_queue(struct wvk_replay *replay, struct vk_cmd_queue *queue, VkCommandBuf
       }
       execute_range(run, it, commandBuffer, disp);
       struct list_head *after = end->next;
+      replay->pass_first_layer = ffs(layers) - 1;
       u_foreach_bit(layer, layers) {
          replay->pass_layered = true;
          replay->pass_multiview = multiview;

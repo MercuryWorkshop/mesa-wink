@@ -45,7 +45,7 @@ struct wvk_shader_binding {
 };
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 22
+#define WVK_SHADER_BINARY_VERSION 23
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -131,6 +131,10 @@ struct wvk_shader_key {
     * varyings from location clip_varying - 1 (0: none) on, clip_slots of
     * them, of the components as the clip distances' slots have them. */
    uint8_t clip_varying, clip_slots;
+   /* Fragment: counting its invocations; geometry as compute: its
+    * primitives -- for the active pipeline statistics query, in its
+    * counters (WVK_DRIVER_SLOT_STATS). */
+   uint8_t stats;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
@@ -287,15 +291,16 @@ extern const struct vk_device_shader_ops wvk_device_shader_ops;
  * formats of the views bound where it has storage images without one
  * (`image_formats`, as for wvk_shader_dispatch_variant); and for points
  * or lines drawn as quads. Or with `runs`, the vertex shader's compute
- * shader doing its storage writes or capturing positions (key.runs). The
- * shader itself
+ * shader doing its storage writes or capturing positions (key.runs). A
+ * fragment shader's counts its invocations where `stats`, the active
+ * pipeline statistics query's, has them. The shader itself
  * where it was compiled for that, or a variant it could not compile. */
 struct wvk_shader *wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader,
                                            const struct wvk_shader *other,
                                            const struct vk_dynamic_graphics_state *dyn, unsigned samples,
                                            bool has_depth, const VkFormat *color_formats,
                                            const VkFormat *image_formats, enum wvk_draw_shape shape,
-                                           unsigned runs);
+                                           unsigned runs, uint32_t stats);
 
 /* The shader, or its variant for the formats of the views bound where it
  * has storage images without one (wvk_shader::unformatted; 0 for one not
@@ -305,18 +310,22 @@ struct wvk_shader *wvk_shader_dispatch_variant(struct wvk_device *dev, struct wv
 
 /* A geometry shader's variant (key.geometry): as compute for a vertex
  * shader whose records have `vs_vars` generic varyings (1), or the vertex
- * shader of the draw after it, with `other` the fragment shader (2). */
+ * shader of the draw after it, with `other` the fragment shader, drawing
+ * `points` as quads (2). The first counts its primitives where `stats`,
+ * the active pipeline statistics query's, has them or clipping's. */
 struct wvk_shader *wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsigned kind,
                                                unsigned vs_vars, const struct wvk_shader *other,
-                                               const struct vk_dynamic_graphics_state *dyn, bool after_tess);
+                                               const struct vk_dynamic_graphics_state *dyn, bool after_tess,
+                                               bool points, uint32_t stats);
 
 /* A tessellation shader's variant (key.tess): as compute, for records of
  * the stage before with `vs_vars` generic varyings a vertex and
  * `patch_vars` patch varyings a patch (1); or the evaluation shader's draw
- * after it, with `other` the fragment shader (2). */
+ * after it, with `other` the fragment shader, drawing `points` as quads
+ * (2). */
 struct wvk_shader *wvk_shader_tess_variant(struct wvk_device *dev, struct wvk_shader *shader, unsigned kind,
                                            unsigned vs_vars, unsigned patch_vars, unsigned patch_vertices,
-                                           const struct wvk_shader *other);
+                                           const struct wvk_shader *other, bool points);
 
 /* A patch's record: the outer and inner levels, a slot each, then its
  * patch varyings. */

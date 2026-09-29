@@ -98,6 +98,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 #define WVK_DRIVER_SLOT_TESS_PATCHES (WVK_DRIVER_SLOT_GS_INDICES + 2)
 #define WVK_DRIVER_SLOT_TESS_POINTS (WVK_DRIVER_SLOT_GS_INDICES + 3)
 #define WVK_DRIVER_SLOT_TESS_COUNTS (WVK_DRIVER_SLOT_GS_INDICES + 4)
+/* The counters of the active pipeline statistics query that shaders add
+ * to, a word a statistic by its bit (wvk_query.c). */
+#define WVK_DRIVER_SLOT_STATS (WVK_DRIVER_SLOT_GS_INDICES + 5)
 
 #define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
 
@@ -234,6 +237,7 @@ struct wvk_driver_key {
    uint64_t capture;
    uint64_t gs_vertices, gs_indices;
    uint64_t tess[4];
+   uint64_t stats;
 };
 
 static inline bool

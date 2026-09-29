@@ -73,6 +73,10 @@ struct wvk_device {
     * between buffer layouts, and depth out of a texture. */
    WGPUComputePipeline copy_query_pipeline;
    WGPUComputePipeline add_query_pipeline;
+   /* Pipeline statistics: counts added on the GPU, and a query's results
+    * made of the host's and those at its end (wvk_query.c). */
+   WGPUComputePipeline add_stats_pipeline;
+   WGPUComputePipeline finish_stats_pipeline;
    WGPUComputePipeline fan_pipeline;
    WGPUComputePipeline draw_count_pipeline;
    /* The tessellator's passes: count, scan, generate (wvk_tessellator.c),

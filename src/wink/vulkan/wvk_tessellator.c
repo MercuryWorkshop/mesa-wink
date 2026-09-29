@@ -30,7 +30,8 @@ const char wvk_tessellator_wgsl[] =
     * totals and the indirect commands of the passes after:
     * [4 * patches] points, indices, dispatch x, y, z, then the indexed
     * draw's five; then a geometry shader's dispatch x, y, z, its
-    * invocations, and its draw's five. */
+    * invocations, and its draw's five; then the draws of points as quads,
+    * the tessellator's and the geometry shader's, four each. */
    "@group(0) @binding(2) var<storage, read_write> counts: array<u32>;\n"
    "@group(0) @binding(3) var<storage, read_write> points: array<vec4f>;\n"
    "@group(0) @binding(4) var<storage, read_write> indices: array<u32>;\n"
@@ -823,6 +824,11 @@ const char wvk_tessellator_wgsl[] =
    "  counts[t + 7u] = 0u;\n"
    "  counts[t + 8u] = 0u;\n"
    "  counts[t + 9u] = 0u;\n"
+   /* The draws of points as quads, six vertices each (expand_points). */
+   "  counts[t + 19u] = indices_at * 6u;\n"
+   "  counts[t + 20u] = 1u;\n"
+   "  counts[t + 21u] = 0u;\n"
+   "  counts[t + 22u] = 0u;\n"
    "  if (p.gs_vertices_in != 0u) {\n"
    "    let invocations = min(indices_at / p.gs_vertices_in * p.gs_invocations, p.gs_capacity);\n"
    "    let gs_groups = (invocations + 63u) / 64u;\n"
@@ -835,6 +841,10 @@ const char wvk_tessellator_wgsl[] =
    "    counts[t + 16u] = 0u;\n"
    "    counts[t + 17u] = 0u;\n"
    "    counts[t + 18u] = 0u;\n"
+   "    counts[t + 23u] = invocations * p.gs_indices * 6u;\n"
+   "    counts[t + 24u] = 1u;\n"
+   "    counts[t + 25u] = 0u;\n"
+   "    counts[t + 26u] = 0u;\n"
    "  }\n"
    "}\n"
    "@compute @workgroup_size(64)\n"

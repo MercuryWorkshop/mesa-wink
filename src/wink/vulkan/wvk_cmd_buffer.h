@@ -82,7 +82,7 @@ struct wvk_replay {
     * (wvk_cmd_buffer.c): which one this is, and whether they are views. */
    bool pass_layered;
    bool pass_multiview;
-   uint32_t pass_layer;
+   uint32_t pass_layer, pass_first_layer;
    /* A subpass whose views are not this one's: it neither clears nor
     * draws. */
    bool pass_idle;
@@ -159,6 +159,14 @@ struct wvk_replay {
    uint32_t pass_query_first;
    struct util_dynarray pass_queries;   /* struct wvk_pass_query */
    struct wvk_pass_query active_query;
+   /* The active pipeline statistics query: its pool and query, what the
+    * host counts of it by each statistic's bit, and the counters shaders
+    * and the driver's passes add to on the GPU (WVK_DRIVER_SLOT_STATS). */
+   struct wvk_query_pool *stats_pool;
+   uint32_t stats_query;
+   uint64_t stats_host[WVK_STATS];
+   WGPUBuffer stats_buffer;
+   uint64_t stats_serial;
    /* Timestamps: a query set of the submit's, and where each is resolved
     * to, 256 bytes apart as resolves want. */
    WGPUQuerySet timestamp_set;
