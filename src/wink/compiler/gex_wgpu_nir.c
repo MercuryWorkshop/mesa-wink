@@ -890,6 +890,73 @@ gex_wgpu_wgsl_add_output_sampling(char *wgsl, const uint8_t *sampling,
    return out;
 }
 
+/* Tint's SPIR-V reader writes a value used once where its use is, so a
+ * chain of them in a block is one expression, as deep as the chain --
+ * deeper than Dawn's WGSL parser goes, for long ones. A value deep in
+ * such a chain is read through select(x, x, true), which uses it twice
+ * and so makes it a `let`, and is x whatever its type. */
+#define GEX_WGPU_MAX_EXPRESSION_DEPTH 16
+
+static unsigned
+expression_depth(struct hash_table *depth, nir_def *def, nir_block *block)
+{
+   if (list_is_singular(&def->uses) && nir_def_instr(def)->block == block) {
+      struct hash_entry *he = _mesa_hash_table_search(depth, def);
+      return he ? (unsigned)(uintptr_t)he->data : 0;
+   }
+   return 0;
+}
+
+static bool
+gex_wgpu_break_deep_expressions(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      struct hash_table *depth = _mesa_pointer_hash_table_create(NULL);
+      nir_builder b = nir_builder_create(impl);
+      bool changed = false;
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            nir_def *def = NULL;
+            unsigned d = 0;
+            if (instr->type == nir_instr_type_alu) {
+               nir_alu_instr *alu = nir_instr_as_alu(instr);
+               def = &alu->def;
+               for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; ++i)
+                  d = MAX2(d, expression_depth(depth, alu->src[i].src.ssa, block));
+            } else if (instr->type == nir_instr_type_intrinsic &&
+                       nir_intrinsic_infos[nir_instr_as_intrinsic(instr)->intrinsic].has_dest) {
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               def = &intr->def;
+               for (unsigned i = 0; i < nir_intrinsic_infos[intr->intrinsic].num_srcs; ++i)
+                  d = MAX2(d, expression_depth(depth, intr->src[i].ssa, block));
+            } else if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               def = &tex->def;
+               for (unsigned i = 0; i < tex->num_srcs; ++i)
+                  d = MAX2(d, expression_depth(depth, tex->src[i].src.ssa, block));
+            }
+            if (!def)
+               continue;
+            ++d;
+            if (d > GEX_WGPU_MAX_EXPRESSION_DEPTH && list_is_singular(&def->uses) &&
+                !nir_def_used_by_if(def)) {
+               b.cursor = nir_after_instr(instr);
+               nir_def *named = nir_bcsel(&b, nir_imm_true(&b), def, def);
+               nir_def_rewrite_uses_after(def, named);
+               /* Both reads of it are the select's, which is shallow. */
+               d = 1;
+               changed = true;
+            }
+            _mesa_hash_table_insert(depth, def, (void *)(uintptr_t)d);
+         }
+      }
+      _mesa_hash_table_destroy(depth, NULL);
+      progress |= nir_progress(changed, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 char *
 gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y,
                      bool clip_halfz, struct gex_wgpu_wgsl_info *out,
@@ -1428,6 +1495,7 @@ gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y,
     * this file added earlier is scaled too. */
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, gex_wgpu_scale_shared_offset,
             nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, gex_wgpu_break_deep_expressions);
    struct spirv_shader *spirv = nir_to_spirv(nir, &info);
    /* Kept before the free: the dump below wants it, and reading it back off
     * the freed shader is what printed "stage=4294967264". Harmless in effect
