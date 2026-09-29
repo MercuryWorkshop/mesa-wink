@@ -3422,8 +3422,8 @@ draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t
    }
    const uint64_t records = (uint64_t)count * instances * wvk_record_stride(vs->record_vars);
    /* The geometry shader's, and the draw's. */
-   struct wvk_shader *cs = wvk_shader_geometry_variant(dev, gs, 1, vs->record_vars, NULL, dyn);
-   struct wvk_shader *passthrough = wvk_shader_geometry_variant(dev, gs, 2, 0, st->fs, dyn);
+   struct wvk_shader *cs = wvk_shader_geometry_variant(dev, gs, 1, vs->record_vars, NULL, dyn, false);
+   struct wvk_shader *passthrough = wvk_shader_geometry_variant(dev, gs, 2, 0, st->fs, dyn, false);
    if (!cs || !passthrough) {
       mesa_logw_once("wvk: a geometry shader that could not be made compute");
       return;
@@ -3535,10 +3535,6 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    struct wvk_shader *tcs = st->bound_tcs, *tes = st->bound_tes;
    if (!st->bound_vs || !tcs || !tes || !count || !instances || replay->pass_idle)
       return;
-   if (st->bound_gs) {
-      mesa_logw_once("wvk: a geometry shader after tessellation, which is not drawn");
-      return;
-   }
    const uint32_t vertices_in = dyn->ts.patch_control_points;
    const uint32_t per_instance = vertices_in ? count / vertices_in : 0;
    const uint64_t patches = (uint64_t)per_instance * instances;
@@ -3569,10 +3565,11 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
       mesa_logw_once("wvk: a vertex shader before tessellation, which could not be made a compute shader");
       return;
    }
-   struct wvk_shader *control = wvk_shader_tess_variant(dev, tcs, 1, vs->record_vars, 0, NULL);
+   struct wvk_shader *control = wvk_shader_tess_variant(dev, tcs, 1, vs->record_vars, 0, 0, NULL);
    struct wvk_shader *evaluation =
-      control ? wvk_shader_tess_variant(dev, tes, 1, control->record_vars, control->patch_vars, NULL) : NULL;
-   struct wvk_shader *passthrough = wvk_shader_tess_variant(dev, tes, 2, 0, 0, st->fs);
+      control ? wvk_shader_tess_variant(dev, tes, 1, control->record_vars, control->patch_vars, vertices_out, NULL)
+              : NULL;
+   struct wvk_shader *passthrough = wvk_shader_tess_variant(dev, tes, 2, 0, 0, 0, st->fs);
    if (!control || !evaluation || !passthrough || !tessellator_pipelines(dev)) {
       mesa_logw_once("wvk: tessellation shaders that could not be made compute");
       return;
@@ -3590,7 +3587,7 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    const uint64_t points_capacity = MIN3(patches * WVK_TESS_MAX_POINTS, MIN2(limit / out_stride, limit / 16) - 1,
                                          1u << 22);
    const uint64_t indices_capacity = MIN3(patches * WVK_TESS_MAX_INDICES, limit / 4, 1u << 24);
-   const uint64_t counts_bytes = (patches * 4 + 10) * 4;
+   const uint64_t counts_bytes = (patches * 4 + 20) * 4;
    if (records > limit || control_bytes > limit || patch_bytes > limit) {
       mesa_logw_once("wvk: a tessellated draw of more than its buffers can bind");
       return;
@@ -3615,6 +3612,35 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    st->gs_vertices = TEMP(out, (points_capacity + 1) * out_stride);
 #undef TEMP
 
+   /* A geometry shader after: of the tessellator's primitives, which its
+    * input has to be. */
+   struct wvk_shader *gs = st->bound_gs, *gs_cs = NULL, *gs_draw = NULL;
+   const uint32_t prim_vertices = output == 0 ? 1 : output == 1 ? 2 : 3;
+   uint64_t gs_capacity = 0;
+   uint32_t gs_per = 0;
+   WGPUBuffer gs_out = NULL, gs_list = NULL;
+   if (gs) {
+      if (mesa_vertices_per_prim(gs->gs_input) != prim_vertices) {
+         mesa_logw_once("wvk: a geometry shader of other primitives than tessellation makes");
+         return;
+      }
+      gs_cs = wvk_shader_geometry_variant(dev, gs, 1, evaluation->record_vars, NULL, dyn, true);
+      gs_draw = wvk_shader_geometry_variant(dev, gs, 2, 0, st->fs, dyn, false);
+      if (!gs_cs || !gs_draw) {
+         mesa_logw_once("wvk: a geometry shader after tessellation that could not be made compute");
+         return;
+      }
+      gs_per = wvk_geometry_indices(gs->gs_output, gs->gs_max_vertices);
+      const uint64_t gs_stride = wvk_record_stride(gs->record_vars);
+      gs_capacity = MIN3(indices_capacity / prim_vertices * gs->gs_invocations,
+                         limit / (MAX2(gs->gs_max_vertices, 1) * gs_stride) - 1, limit / (MAX2(gs_per, 1) * 4));
+      gs_out = wvk_replay_temp_buffer(dev, replay, (1 + gs_capacity * gs->gs_max_vertices) * gs_stride, storage, NULL);
+      gs_list = wvk_replay_temp_buffer(dev, replay, MAX2(gs_capacity * gs_per * 4, 16),
+                                       storage | WGPUBufferUsage_Index, NULL);
+      if (!gs_out || !gs_list)
+         return;
+   }
+
    /* The vertex and control shaders. */
    if (!run_vertices(cmd, 3, indexed, first, count, instances, base_vertex, first_instance, draw_id))
       return;
@@ -3626,9 +3652,10 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
    dispatch_graphics_groups(cmd, control, patches, NULL, 0);
 
    /* The tessellator. */
-   const uint32_t params[8] = { (uint32_t)patches, tess_domain, partitioning, output,
-                                wvk_patch_stride(control->patch_vars) / 4, (uint32_t)points_capacity,
-                                (uint32_t)indices_capacity, 0 };
+   const uint32_t params[12] = { (uint32_t)patches, tess_domain, partitioning, output,
+                                 wvk_patch_stride(control->patch_vars) / 4, (uint32_t)points_capacity,
+                                 (uint32_t)indices_capacity, 0,
+                                 gs ? prim_vertices : 0, gs ? gs->gs_invocations : 0, (uint32_t)gs_capacity, gs_per };
    WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
    if (!params_buffer)
       return;
@@ -3663,24 +3690,45 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
       wgpuBindGroupRelease(group);
 
    /* The evaluation shader, of as many points as were made, then the draw
-    * of their lists. */
+    * of their lists -- or of what a geometry shader makes of them, run as
+    * compute of as many as its buffers hold. */
    dispatch_graphics_groups(cmd, evaluation, 0, counts, (patches * 4 + 2) * 4);
+   WGPUBuffer draw_list = list;
+   uint64_t draw_bytes = MAX2(indices_capacity * 4, 16), draw_command = (patches * 4 + 5) * 4;
+   WGPUPrimitiveTopology topology = output == 0   ? WGPUPrimitiveTopology_PointList
+                                    : output == 1 ? WGPUPrimitiveTopology_LineList
+                                                  : WGPUPrimitiveTopology_TriangleList;
+   if (gs) {
+      const uint64_t gs_stride = wvk_record_stride(gs->record_vars);
+#define TEMP(b, size) ((struct wvk_driver_buffer){ b, ++dev->temp_serial | (1ull << 62), 0, size })
+      st->capture = TEMP(out, (points_capacity + 1) * out_stride);
+      st->index = TEMP(list, MAX2(indices_capacity * 4, 16));
+      st->gs_vertices = TEMP(gs_out, (1 + gs_capacity * gs->gs_max_vertices) * gs_stride);
+      st->gs_indices = TEMP(gs_list, MAX2(gs_capacity * gs_per * 4, 16));
+#undef TEMP
+      dispatch_graphics_groups(cmd, gs_cs, 0, counts, (patches * 4 + 10) * 4);
+      passthrough = gs_draw;
+      draw_list = gs_list;
+      draw_bytes = MAX2(gs_capacity * gs_per * 4, 16);
+      draw_command = (patches * 4 + 14) * 4;
+      topology = gs->gs_output == MESA_PRIM_TRIANGLE_STRIP ? WGPUPrimitiveTopology_TriangleList
+                 : gs->gs_output == MESA_PRIM_LINE_STRIP  ? WGPUPrimitiveTopology_LineList
+                                                          : WGPUPrimitiveTopology_PointList;
+   }
    if (in_pass && !replay->pass)
       wvk_replay_restart_pass(cmd, replay->pass_layer);
    struct wvk_shader *draw_vs = st->vs;
    const struct wvk_bound_buffer ib = st->ib;
    const VkIndexType type = st->index_type;
    st->vs = passthrough;
-   st->ib = (struct wvk_bound_buffer){ NULL, list, 0, MAX2(indices_capacity * 4, 16) };
+   st->ib = (struct wvk_bound_buffer){ NULL, draw_list, 0, draw_bytes };
    st->index_type = VK_INDEX_TYPE_UINT32;
-   replay->list_topology = output == 0   ? WGPUPrimitiveTopology_PointList
-                           : output == 1 ? WGPUPrimitiveTopology_LineList
-                                         : WGPUPrimitiveTopology_TriangleList;
+   replay->list_topology = topology;
    foreach_viewport(cmd) {
       set_draw_parameters(st, NULL, 0, true, 0, 0, draw_id);
       if (!flush_draw(cmd, true))
          continue;
-      wgpuRenderPassEncoderDrawIndexedIndirect(replay->pass, counts, (patches * 4 + 5) * 4);
+      wgpuRenderPassEncoderDrawIndexedIndirect(replay->pass, counts, draw_command);
    }
    replay->list_topology = WGPUPrimitiveTopology_Undefined;
    st->ib = ib;

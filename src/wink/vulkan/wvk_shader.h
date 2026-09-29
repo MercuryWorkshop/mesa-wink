@@ -111,11 +111,17 @@ struct wvk_shader_key {
     * (1); or the vertex shader of the draw after, reading those (2). And
     * the generic varyings the vertex shader's records have (vs_vars). */
    uint8_t geometry, vs_vars;
+   /* Geometry: after tessellation, its inputs the evaluation shader's
+    * records by the tessellator's lists, as many as it made. */
+   uint8_t after_tess;
    /* Tessellation: the control or evaluation shader as compute (1), reading
     * the records of the stage before, of vs_vars generic varyings a vertex
     * and patch_vars patch varyings a patch; or the vertex shader of the draw
     * after the evaluation shader, reading its records (2). */
    uint8_t tess, patch_vars;
+   /* Tessellation evaluation: the control shader's output patch size,
+    * which gl_PatchVerticesIn is and its records go by. */
+   uint8_t patch_vertices;
    /* Fragment, and the vertex shader after a geometry shader: gl_PrimitiveID
     * as the flat varying at location primitive_id - 1 (0: none), which the
     * geometry shader's records carry. */
@@ -281,14 +287,15 @@ struct wvk_shader *wvk_shader_dispatch_variant(struct wvk_device *dev, struct wv
  * shader of the draw after it, with `other` the fragment shader (2). */
 struct wvk_shader *wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsigned kind,
                                                unsigned vs_vars, const struct wvk_shader *other,
-                                               const struct vk_dynamic_graphics_state *dyn);
+                                               const struct vk_dynamic_graphics_state *dyn, bool after_tess);
 
 /* A tessellation shader's variant (key.tess): as compute, for records of
  * the stage before with `vs_vars` generic varyings a vertex and
  * `patch_vars` patch varyings a patch (1); or the evaluation shader's draw
  * after it, with `other` the fragment shader (2). */
 struct wvk_shader *wvk_shader_tess_variant(struct wvk_device *dev, struct wvk_shader *shader, unsigned kind,
-                                           unsigned vs_vars, unsigned patch_vars, const struct wvk_shader *other);
+                                           unsigned vs_vars, unsigned patch_vars, unsigned patch_vertices,
+                                           const struct wvk_shader *other);
 
 /* A patch's record: the outer and inner levels, a slot each, then its
  * patch varyings. */

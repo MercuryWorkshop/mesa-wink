@@ -153,8 +153,9 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   runs an invocation a point, as many as were made (an indirect dispatch),
   writing records the draw after reads, an indexed indirect draw of the
   tessellator's lists. Buffers are as big as a patch at level 64 would
-  need, to what a binding holds; patches past that are not drawn. Not with
-  a geometry shader after.
+  need, to what a binding holds; patches past that are not drawn. A
+  geometry shader after reads the evaluation shader's records by the
+  tessellator's lists, its invocations the tessellator's count too.
 - **A vertex shader's storage writes** (vertexPipelineStoresAndAtomics)
   are a compute shader's: WebGPU's vertex shaders write no storage. A
   draw whose vertex shader writes buffers or images first dispatches the

@@ -1223,8 +1223,9 @@ primitive_vertex(nir_builder *b, nir_def *topology, nir_def *prim, nir_def *j, n
  * Streams but the first are dropped. Compute's stage after its buffers are
  * words (compile_one). */
 static void
-lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars)
+lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars, bool after_tess)
 {
+   const unsigned vertices_in = mesa_vertices_per_prim(nir->info.gs.input_primitive);
    const unsigned max_vertices = nir->info.gs.vertices_out;
    const unsigned invocations = MAX2(nir->info.gs.invocations, 1);
    const unsigned output = nir->info.gs.output_primitive;
@@ -1257,11 +1258,23 @@ lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars)
                                 .access = ACCESS_NON_WRITEABLE);
    nir_def *count = nir_channel(&b, geo, 0), *prims = nir_umax(&b, nir_channel(&b, geo, 1), nir_imm_int(&b, 1));
    nir_def *topology = nir_channel(&b, geo, 3);
+   nir_def *total = nir_channel(&b, geo, 2);
    nir_def *invocation = nir_umod_imm(&b, g, invocations);
    nir_def *primitive = nir_udiv_imm(&b, g, invocations);
    nir_def *prim = nir_umod(&b, primitive, prims);
    nir_def *instance = nir_udiv(&b, primitive, prims);
    nir_def *vertex_base = nir_imul(&b, instance, count);
+   /* After tessellation, as many as the tessellator made, of its lists
+    * (wvk_tessellator.c's scan): every primitive of every instance. */
+   if (after_tess) {
+      nir_def *tess = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                    nir_imm_int(&b, WVK_DRIVER_TESS), .align_mul = 16,
+                                    .access = ACCESS_NON_WRITEABLE);
+      total = nir_load_ssbo(&b, 1, 32, driver_buffer(&b, WVK_DRIVER_SLOT_TESS_COUNTS),
+                            nir_iadd_imm(&b, nir_ishl_imm(&b, nir_channel(&b, tess, 3), 4), 13 * 4),
+                            .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+      prim = primitive;
+   }
    /* The vertex it writes next is the first of its own. */
    nir_def *first_out = nir_iadd_imm(&b, nir_imul_imm(&b, g, max_vertices), 1);
    nir_def *first_index = nir_imul_imm(&b, g, indices);
@@ -1278,7 +1291,7 @@ lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars)
    nir_store_ssbo(&b, nir_imm_vec4(&b, 2.0f, 2.0f, 2.0f, 1.0f), driver_buffer(&b, WVK_DRIVER_SLOT_GS_VERTICES),
                   nir_imm_int(&b, 0), .write_mask = 0xf, .align_mul = 16);
    nir_pop_if(&b, NULL);
-   nir_if *run_if = nir_push_if(&b, nir_ult(&b, g, nir_channel(&b, geo, 2)));
+   nir_if *run_if = nir_push_if(&b, nir_ult(&b, g, total));
    nir_cf_reinsert(&body, b.cursor);
    nir_pop_if(&b, run_if);
 
@@ -1293,9 +1306,17 @@ lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars)
          b.cursor = nir_before_instr(instr);
          switch (intr->intrinsic) {
          case nir_intrinsic_load_per_vertex_input: {
-            nir_def *vertex = primitive_vertex(&b, topology, prim, intr->src[0].ssa, prims);
-            nir_def *base = nir_imul_imm(&b, nir_iadd(&b, vertex_base, vertex), in_stride);
-            record_access(&b, intr, WVK_DRIVER_SLOT_CAPTURE, base, false);
+            nir_def *slot;
+            if (after_tess) {
+               /* The vertex the tessellator's list names, a record of the
+                * evaluation shader's. */
+               nir_def *at = nir_iadd(&b, nir_imul_imm(&b, prim, vertices_in), intr->src[0].ssa);
+               slot = nir_load_ssbo(&b, 1, 32, driver_buffer(&b, WVK_DRIVER_SLOT_INDEX), nir_ishl_imm(&b, at, 2),
+                                    .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+            } else {
+               slot = nir_iadd(&b, vertex_base, primitive_vertex(&b, topology, prim, intr->src[0].ssa, prims));
+            }
+            record_access(&b, intr, WVK_DRIVER_SLOT_CAPTURE, nir_imul_imm(&b, slot, in_stride), false);
             break;
          }
          case nir_intrinsic_load_input:
@@ -1526,7 +1547,8 @@ lower_tcs(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars)
  * at the point's vertex of the draw after, slot 0 being the one unwritten
  * indices name. */
 static void
-lower_tes(nir_shader *nir, struct wvk_shader *shader, unsigned tcs_vars, unsigned tcs_patch_vars)
+lower_tes(nir_shader *nir, struct wvk_shader *shader, unsigned tcs_vars, unsigned tcs_patch_vars,
+          unsigned patch_vertices)
 {
    const unsigned domain = nir->info.tess._primitive_mode;
    shader->record_vars = record_vars(nir, nir_var_shader_out);
@@ -1548,7 +1570,7 @@ lower_tes(nir_shader *nir, struct wvk_shader *shader, unsigned tcs_vars, unsigne
    nir_def *tess = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH), nir_imm_int(&b, WVK_DRIVER_TESS),
                                  .align_mul = 16, .access = ACCESS_NON_WRITEABLE);
    nir_def *per_instance = nir_umax(&b, nir_channel(&b, tess, 1), nir_imm_int(&b, 1));
-   nir_def *vertices = nir_channel(&b, tess, 2);
+   nir_def *vertices = nir_imm_int(&b, MAX2(patch_vertices, 1));
    /* The points the tessellator made, after each patch's counts and
     * where they go. */
    nir_def *total = nir_load_ssbo(&b, 1, 32, driver_buffer(&b, WVK_DRIVER_SLOT_TESS_COUNTS),
@@ -4555,7 +4577,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       shader->key.tess = 1;
       shader->key.vs_vars = records->vs_vars;
       shader->key.patch_vars = records->patch_vars;
-      lower_tes(nir, shader, records->vs_vars, records->patch_vars);
+      shader->key.patch_vertices = records->patch_vertices;
+      lower_tes(nir, shader, records->vs_vars, records->patch_vars, records->patch_vertices);
    } else if (records && records->tess == 2) {
       shader->key.tess = 2;
    }
@@ -4563,7 +4586,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    if (nir->info.stage == MESA_SHADER_GEOMETRY && records && records->geometry == 1) {
       shader->key.geometry = 1;
       shader->key.vs_vars = records->vs_vars;
-      lower_geometry(nir, shader, records->vs_vars);
+      shader->key.after_tess = records->after_tess;
+      lower_geometry(nir, shader, records->vs_vars, records->after_tess);
    } else if (records && records->geometry == 2) {
       shader->key.geometry = 2;
    }
@@ -5082,7 +5106,8 @@ static struct wvk_shader *variant_for(struct wvk_device *dev, struct wvk_shader 
 
 struct wvk_shader *
 wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsigned kind, unsigned vs_vars,
-                            const struct wvk_shader *other, const struct vk_dynamic_graphics_state *dyn)
+                            const struct wvk_shader *other, const struct vk_dynamic_graphics_state *dyn,
+                            bool after_tess)
 {
    (void)dyn;
    if (!gs || !gs->source)
@@ -5097,6 +5122,7 @@ wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsig
    key.geometry = kind;
    if (kind == 1) {
       key.vs_vars = vs_vars;
+      key.after_tess = after_tess;
    } else if (other) {
       memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
       key.primitive_id = other->key.primitive_id;
@@ -5107,7 +5133,7 @@ wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsig
 
 struct wvk_shader *
 wvk_shader_tess_variant(struct wvk_device *dev, struct wvk_shader *shader, unsigned kind, unsigned vs_vars,
-                        unsigned patch_vars, const struct wvk_shader *other)
+                        unsigned patch_vars, unsigned patch_vertices, const struct wvk_shader *other)
 {
    if (!shader || !shader->source)
       return NULL;
@@ -5122,6 +5148,7 @@ wvk_shader_tess_variant(struct wvk_device *dev, struct wvk_shader *shader, unsig
    if (kind == 1) {
       key.vs_vars = vs_vars;
       key.patch_vars = patch_vars;
+      key.patch_vertices = patch_vertices;
    } else if (other) {
       memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
       key.primitive_id = other->key.primitive_id;

@@ -18,14 +18,19 @@ const char wvk_tessellator_wgsl[] =
     * counterclockwise), where a patch's levels are in `levels` (a record of
     * 16-byte slots: outer, then inner), and how many points and indices the
     * buffers hold. */
+   /* And for a geometry shader after it: its input primitives' vertices,
+    * its invocations a primitive, as many invocations as its buffers hold,
+    * and the indices an invocation writes. */
    "struct P { patches: u32, domain: u32, partitioning: u32, output: u32,\n"
-   "           record_words: u32, points_capacity: u32, indices_capacity: u32, pad: u32 }\n"
+   "           record_words: u32, points_capacity: u32, indices_capacity: u32, pad: u32,\n"
+   "           gs_vertices_in: u32, gs_invocations: u32, gs_capacity: u32, gs_indices: u32 }\n"
    "@group(0) @binding(0) var<uniform> p: P;\n"
    "@group(0) @binding(1) var<storage, read> levels: array<u32>;\n"
    /* Each patch's points and indices, then where they start, then the
     * totals and the indirect commands of the passes after:
     * [4 * patches] points, indices, dispatch x, y, z, then the indexed
-    * draw's five. */
+    * draw's five; then a geometry shader's dispatch x, y, z, its
+    * invocations, and its draw's five. */
    "@group(0) @binding(2) var<storage, read_write> counts: array<u32>;\n"
    "@group(0) @binding(3) var<storage, read_write> points: array<vec4f>;\n"
    "@group(0) @binding(4) var<storage, read_write> indices: array<u32>;\n"
@@ -818,6 +823,19 @@ const char wvk_tessellator_wgsl[] =
    "  counts[t + 7u] = 0u;\n"
    "  counts[t + 8u] = 0u;\n"
    "  counts[t + 9u] = 0u;\n"
+   "  if (p.gs_vertices_in != 0u) {\n"
+   "    let invocations = min(indices_at / p.gs_vertices_in * p.gs_invocations, p.gs_capacity);\n"
+   "    let gs_groups = (invocations + 63u) / 64u;\n"
+   "    counts[t + 10u] = min(gs_groups, 65535u);\n"
+   "    counts[t + 11u] = max((gs_groups + 65534u) / 65535u, 1u);\n"
+   "    counts[t + 12u] = 1u;\n"
+   "    counts[t + 13u] = invocations;\n"
+   "    counts[t + 14u] = invocations * p.gs_indices;\n"
+   "    counts[t + 15u] = 1u;\n"
+   "    counts[t + 16u] = 0u;\n"
+   "    counts[t + 17u] = 0u;\n"
+   "    counts[t + 18u] = 0u;\n"
+   "  }\n"
    "}\n"
    "@compute @workgroup_size(64)\n"
    "fn generate(@builtin(global_invocation_id) id: vec3u) {\n"
