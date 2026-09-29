@@ -35,6 +35,7 @@
 
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_builtin_builder.h"
 #include "compiler/nir/nir_deref.h"
 #include "compiler/nir/nir_serialize.h"
 #include "compiler/nir/nir_xfb_info.h"
@@ -202,13 +203,46 @@ lower_quantize_instr(nir_builder *b, nir_instr *instr, void *data)
 
 /* Helper invocations, which WGSL has no builtin for: those outside the
  * primitive cover no samples, and the shader knows which it demoted. */
-/* A gather's offset that is not a constant, which WGSL's are. */
+/* A sampling at an explicit LOD at an offset not constant: the offset,
+ * in texels of the level the LOD is of, moved into the coordinates --
+ * which nir_lower_tex would scale by level 0's. */
 static bool
-dynamic_gather_offset(const nir_instr *instr, const void *data)
+lower_lod_offset_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   const int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   const int lod_src = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (tex->op != nir_texop_txl || offset_src < 0 || lod_src < 0 || coord_src < 0 ||
+       nir_src_is_const(tex->src[offset_src].src) || tex->sampler_dim == GLSL_SAMPLER_DIM_RECT ||
+       tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   const unsigned dims = tex->coord_components - tex->is_array;
+   nir_def *level = nir_imax(b, nir_f2i32(b, nir_ffloor(b, tex->src[lod_src].src.ssa)), nir_imm_int(b, 0));
+   nir_def *size = nir_build_texture_query(b, tex, nir_texop_txs, tex->coord_components, nir_type_int32, false, false);
+   nir_tex_instr_add_src(nir_instr_as_tex(nir_def_instr(size)), nir_tex_src_lod, level);
+   nir_def *offset = nir_i2f32(b, nir_trim_vector(b, tex->src[offset_src].src.ssa, dims));
+   nir_def *moved = nir_fmul(b, offset, nir_frcp(b, nir_i2f32(b, nir_trim_vector(b, size, dims))));
+   nir_def *coord = tex->src[coord_src].src.ssa;
+   nir_def *c[4];
+   for (unsigned i = 0; i < coord->num_components; ++i)
+      c[i] = i < dims ? nir_fadd(b, nir_channel(b, coord, i), nir_channel(b, moved, i)) : nir_channel(b, coord, i);
+   nir_src_rewrite(&tex->src[coord_src].src, nir_vec(b, c, coord->num_components));
+   nir_tex_instr_remove_src(tex, offset_src);
+   return true;
+}
+
+/* An offset that is not a constant, which WGSL's are: a gather's, and
+ * since VK_KHR_maintenance8 any sampling's or fetch's. */
+static bool
+dynamic_offset(const nir_instr *instr, const void *data)
 {
    const nir_tex_instr *tex = nir_instr_as_tex(instr);
    const int i = nir_tex_instr_src_index(tex, nir_tex_src_offset);
-   return tex->op == nir_texop_tg4 && i >= 0 && !nir_src_is_const(tex->src[i].src);
+   return i >= 0 && !nir_src_is_const(tex->src[i].src);
 }
 
 static bool
@@ -5918,13 +5952,16 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    /* Projection divided out first: the samplers' lowering takes the
     * coordinates as they are. And a gather at offsets WGSL has none of --
     * four, or one not constant -- is gathers each at one, or at the
-    * coordinates moved. */
-   const nir_lower_tex_options txp = {
-      .lower_txp = ~0u,
-      .lower_tg4_offsets = true,
-      .lower_offset_filter = dynamic_gather_offset,
-   };
+    * coordinates moved; as is any sampling or fetch at an offset not
+    * constant (VK_KHR_maintenance8). */
+   const nir_lower_tex_options txp = { .lower_txp = ~0u };
    NIR_PASS(_, nir, nir_lower_tex, &txp);
+   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_lod_offset_instr, nir_metadata_control_flow, NULL);
+   const nir_lower_tex_options offsets = {
+      .lower_tg4_offsets = true,
+      .lower_offset_filter = dynamic_offset,
+   };
+   NIR_PASS(_, nir, nir_lower_tex, &offsets);
    NIR_PASS(_, nir, wvk_nir_lower_samplers, shader->meta_base);
    NIR_PASS(_, nir, lower_1d_images);
    NIR_PASS(_, nir, lower_ms_arrays);

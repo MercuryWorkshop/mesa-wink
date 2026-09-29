@@ -393,6 +393,13 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   drawn with each primitive's vertices rotated, the last first -- as its
   own lists of them, the host's or a compute shader's for strips, fans and
   indexed draws.
+- **VK_KHR_maintenance8 and 9**: an offset not constant, which WGSL's
+  are, is the coordinates moved -- by the texels of the level of an
+  explicit LOD; OpSMod is the remainder made of the divisor's sign;
+  copies between a depth or stencil aspect and a colour image go through
+  a buffer as the aspect's buffer copies do, and depth24's unorm comes
+  back from its float as the one that made it. Events, barriers and
+  queue family ownership are nothing to one in-order queue.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
   have to stay.

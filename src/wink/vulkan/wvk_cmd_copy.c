@@ -276,9 +276,18 @@ static const char depth_out_wgsl[] =
    "    let shift = (b % 4u) * 8u;\n"
    "    atomicAnd(&dst[b / 4u], ~(0xffffu << shift));\n"
    "    atomicOr(&dst[b / 4u], v << shift);\n"
-   "  } else {\n"
-   "    let v = select(bitcast<u32>(d), u32(round(clamp(d, 0.0, 1.0) * 16777215.0)), p.kind == 1u);\n"
+   "  } else if (p.kind == 1u) {\n"
+   /* Depth24 as the unorm depth_in made this float of, which rounding the
+    * product can be one off from: the neighbour that makes it, if one. */
+   "    let c = clamp(d, 0.0, 1.0);\n"
+   "    var v = u32(round(c * 16777215.0));\n"
+   "    if (f32(v) / 16777215.0 != c) {\n"
+   "      if (v > 0u && f32(v - 1u) / 16777215.0 == c) { v = v - 1u; }\n"
+   "      else if (v < 16777215u && f32(v + 1u) / 16777215.0 == c) { v = v + 1u; }\n"
+   "    }\n"
    "    atomicStore(&dst[(at + id.x * 4u) / 4u], v);\n"
+   "  } else {\n"
+   "    atomicStore(&dst[(at + id.x * 4u) / 4u], bitcast<u32>(d));\n"
    "  }\n"
    "}\n";
 
@@ -1337,6 +1346,33 @@ wvk_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyIm
       dext.width = DIV_ROUND_UP(dext.width, util_format_get_blockwidth(sf)) * util_format_get_blockwidth(df);
       dext.height = DIV_ROUND_UP(dext.height, util_format_get_blockheight(sf)) * util_format_get_blockheight(df);
       image_region(dst, &r->dstSubresource, r->dstOffset, dext, &d, &dsize);
+      /* Between a depth or stencil aspect and a colour image of its texels'
+       * size (VK_KHR_maintenance8): through a buffer as the aspect's copies
+       * to and from buffers have it. */
+      if (is_ds_aspect(r->srcSubresource.aspectMask) != is_ds_aspect(r->dstSubresource.aspectMask)) {
+         const bool from_ds = is_ds_aspect(r->srcSubresource.aspectMask);
+         const VkImageAspectFlags aspect = from_ds ? r->srcSubresource.aspectMask : r->dstSubresource.aspectMask;
+         struct copy_layout l = buffer_layout((from_ds ? src : dst)->vk.format, aspect, 0, 0, r->extent);
+         l.row_bytes = align(l.row_bytes, 256);
+         const uint64_t bytes = (uint64_t)size.depthOrArrayLayers * l.rows_per_image * l.row_bytes;
+         WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay, align64(bytes, 4),
+                                                  WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst |
+                                                     WGPUBufferUsage_Storage,
+                                                  NULL);
+         if (!temp)
+            continue;
+         WGPUTexelCopyTextureInfo sa = s, da = d;
+         if (from_ds) {
+            sa.aspect = wvk_aspect(aspect);
+            copy_ds_to_buffer(dev, replay, src, aspect, &sa, size, temp, 0, &l);
+            copy_color(dev, replay, dst, true, temp, 0, &l, &d, dsize);
+         } else {
+            copy_color(dev, replay, src, false, temp, 0, &l, &s, size);
+            da.aspect = wvk_aspect(aspect);
+            copy_buffer_to_ds(dev, replay, dst, aspect, &da, dsize, temp, 0, &l);
+         }
+         continue;
+      }
       /* Depth and stencil otherwise through a buffer, an aspect at a
        * time, as a buffer holds them. */
       if (is_ds_aspect(r->srcSubresource.aspectMask) && !whole_ds_copy(src, dst, r)) {

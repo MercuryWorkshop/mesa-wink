@@ -624,6 +624,29 @@ gex_wgpu_lower_mul_high_instr(nir_builder *b, nir_instr *instr, void *data)
    return true;
 }
 
+/* A signed modulo, of the divisor's sign: SPIR-V's OpSMod, which Tint
+ * reads as WGSL's %, the remainder, of the dividend's -- the same but
+ * where they differ in sign and it is not 0, when it is the divisor more
+ * (VK_KHR_maintenance8 has negative operands defined). */
+static bool
+gex_wgpu_lower_imod_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   (void)data;
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   nir_alu_instr *alu = nir_instr_as_alu(instr);
+   if (alu->op != nir_op_imod || alu->def.bit_size != 32)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *x = nir_ssa_for_alu_src(b, alu, 0);
+   nir_def *y = nir_ssa_for_alu_src(b, alu, 1);
+   nir_def *r = nir_irem(b, x, y);
+   nir_def *zero = nir_imm_zero(b, r->num_components, 32);
+   nir_def *differ = nir_iand(b, nir_ine(b, r, zero), nir_ine(b, nir_ilt(b, r, zero), nir_ilt(b, y, zero)));
+   nir_def_replace(&alu->def, nir_bcsel(b, differ, nir_iadd(b, r, y), r));
+   return true;
+}
+
 /* ntv's shared block is an array of uints, which Tint makes atomic<u32>:
  * SMin and SMax on it come out as WGSL's atomicMin and atomicMax on a
  * u32, which compare unsigned. So a signed minimum or maximum is swapped
@@ -1501,6 +1524,8 @@ gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y,
     * st does the same before its own call. */
    NIR_PASS(_, nir, nir_shader_instructions_pass, gex_wgpu_lower_mul_high_instr,
             nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_shader_instructions_pass, gex_wgpu_lower_imod_instr,
+            nir_metadata_control_flow, NULL);
    if (nir->options->lower_int64_options && gex_wgpu_has_64_bit(nir)) {
       /* A 64-bit *local variable* is not an operation and no ALU lowering
        * touches it: it reaches the emitter as OpTypePointer Function %ulong
@@ -1525,6 +1550,8 @@ gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y,
       NIR_PASS(_, nir, nir_lower_alu_to_scalar, gex_wgpu_is_64_bit_alu, NULL);
       NIR_PASS(_, nir, nir_lower_int64);
       NIR_PASS(_, nir, nir_shader_instructions_pass, gex_wgpu_lower_mul_high_instr,
+               nir_metadata_control_flow, NULL);
+      NIR_PASS(_, nir, nir_shader_instructions_pass, gex_wgpu_lower_imod_instr,
                nir_metadata_control_flow, NULL);
       NIR_PASS(_, nir, gex_wgpu_split_64bit_undef);
       /* The lowering *represents* its results with pack_64_2x32_split and

@@ -113,6 +113,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_maintenance5 = true,
       .KHR_maintenance6 = true,
       .KHR_maintenance7 = true,
+      .KHR_maintenance8 = true,
+      .KHR_maintenance9 = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -571,6 +573,14 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Secondaries and commands of the pass's own in one pass: all are
        * the primary's commands, replayed in order (vk_cmd_queue). */
       .maintenance7 = true,
+      /* Offsets not constant are the coordinates moved (wvk_shader.c);
+       * copies between depth or stencil and colour go through the
+       * texture copies' shaders where WebGPU's own will not; SPIR-V's
+       * remainders are NIR's already; and barriers are in order. */
+      .maintenance8 = true,
+      /* Events and barriers of one in-order queue; and a device of no
+       * queues has its own, which nothing submits to. */
+      .maintenance9 = true,
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,
@@ -925,6 +935,10 @@ get_device_properties(const struct wvk_physical_device *pdev,
        * depth/stencil attachment whole. */
       .robustFragmentShadingRateAttachmentAccess = false,
       .separateDepthStencilAttachmentAccess = false,
+      /* VK_KHR_maintenance9: no sparse images; and WebGPU fills in what a
+       * vertex format has not with 0, and alpha 1. */
+      .image2DViewOf3DSparse = false,
+      .defaultVertexAttributeValue = VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ONE_KHR,
       .maxDescriptorSetTotalUniformBuffersDynamic = l->maxDynamicUniformBuffersPerPipelineLayout,
       .maxDescriptorSetTotalStorageBuffersDynamic = l->maxDynamicStorageBuffersPerPipelineLayout,
       .maxDescriptorSetTotalBuffersDynamic =
@@ -1141,6 +1155,13 @@ wvk_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice,
                VkQueueFamilyGlobalPriorityPropertiesKHR *prio = ext;
                prio->priorityCount = 1;
                prio->priorities[0] = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR;
+               break;
+            }
+            case VK_STRUCTURE_TYPE_QUEUE_FAMILY_OWNERSHIP_TRANSFER_PROPERTIES_KHR: {
+               /* Both families' submits are one queue's: an image is the
+                * same to either (VK_KHR_maintenance9). */
+               VkQueueFamilyOwnershipTransferPropertiesKHR *own = ext;
+               own->optimalImageTransferToQueueFamilies = BITFIELD_MASK(WVK_QUEUE_FAMILIES);
                break;
             }
             default:
