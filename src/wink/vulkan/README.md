@@ -156,6 +156,25 @@ dEQP-VK: `test/build-cts.sh` builds it, and `test/run-cts.sh OUT GROUP...`
 runs mustpass groups (`api`, `draw`, `texture`, …) with deqp-runner.
 Anything after `--` goes to deqp-runner, such as `--fraction 25`.
 
+The expectations come from a full run: `ci/wvk-fails.txt` and
+`ci/wvk-flakes.txt`. OUT's `failures.csv` lists only what changed.
+The full run of 2026-09-28 took 1 h 50 min on an Apple M4, with 7 jobs:
+
+- 2,443,884 cases; 313,069 ran, and 2,130,815 were unsupported;
+- 98.5% of what ran passed;
+- 4,799 failed, 9 crashed and 2 timed out.
+
+The biggest failing families:
+
+| failures | family |
+| --- | --- |
+| 1,371 | `descriptorset_random` (more than 10 storage buffers per stage) |
+| 466 | `image.mutable` |
+| 441 | `copy_and_blit` |
+| 300 | `memory_model.message_passing` |
+| 292 | `pipeline.monolithic`, mostly blending |
+| 252 | `spirv_assembly` |
+
 Minecraft: `test/run-minecraft.py INSTANCE [--world NAME] [--capture N]
 [--seconds S]` runs a Prism Launcher instance offline, on this build's ICD
 through brew's loader, with `--graphicsBackend vulkan`. It uses a scratch game

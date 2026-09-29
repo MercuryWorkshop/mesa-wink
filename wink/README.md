@@ -338,7 +338,30 @@ pbuffers Mesa CI runs with.
 
 **Runs.** The suites are the ones Mesa CI runs for llvmpipe, with the same
 256x256 `rgba8888d24s8ms0` surface, plus KHR-GLES32 and the 4.6 lists. The
-expectations are `src/gallium/drivers/gex_wgpu/ci/gex_wgpu-*.txt`.
+expectations are `src/gallium/drivers/gex_wgpu/ci/gex_wgpu-*.txt`, so a run's
+`failures.csv` lists only what changed.
+
+**Results (full runs, 2026-09-28, Apple M4).** Pass counts include
+warnings and flakes.
+
+| suite | cases | run | pass | fail, crash, timeout |
+| --- | --- | --- | --- | --- |
+| GL ES (dEQP + KHR) | 112,212 | 111,069 | 92.9% | 7,935 |
+| GL 4.6 (KHR) | 31,062 | 20,298 | 98.6% | 295 |
+
+Where GL ES fails most:
+
+- stencil operations, on FBOs as well as the default framebuffer;
+- blending;
+- texture filtering;
+- 32-bit `copy_image`;
+- transform feedback arrays;
+- fixed-point and unsigned fragment outputs.
+
+Desktop GL's skips are extensions wink does not have: subgroups, sparse
+textures, fragment shading rate and mesh shaders. Some of the fp64 builtin
+tests take close to the 60-second limit, because their shaders are software
+doubles.
 
 ## Symbol checks
 

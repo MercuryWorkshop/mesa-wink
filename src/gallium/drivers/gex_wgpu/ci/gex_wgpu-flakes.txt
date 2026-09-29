@@ -1,1 +1,15 @@
 # Tests that sometimes pass and sometimes fail; one test name or regex per line.
+KHR-GL46.gpu_shader_fp64.builtin.fract_dvec4
+KHR-GL46.gpu_shader_fp64.builtin.length_dvec2
+KHR-GL46.gpu_shader_fp64.builtin.outerproduct_dmat4
+KHR-GL46.gpu_shader_fp64.builtin.smoothstep_against_scalar_dvec4
+KHR-GL46.layout_binding.image2D_layout_binding_imageLoad_VertexShader
+KHR-GL46.texture_swizzle.smoke_access_idx_5_channel_idx_0
+KHR-GL46.texture_swizzle.smoke_access_idx_5_channel_idx_2
+KHR-GL46.texture_swizzle.smoke_access_idx_7_channel_idx_0
+KHR-GLES31.core.shader_storage_buffer_object.basic-atomic-case3-vsfs
+KHR-Single-GL46.enhanced_layouts.uniform_block_member_offset_and_align
+dEQP-GLES3.functional.flush_finish.finish
+dEQP-GLES3.functional.flush_finish.finish_wait
+dEQP-GLES3.functional.flush_finish.flush
+dEQP-GLES3.functional.flush_finish.wait

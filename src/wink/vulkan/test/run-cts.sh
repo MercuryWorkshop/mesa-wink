@@ -8,8 +8,9 @@
 # of them (pipeline, image).
 # WVK_CTS_ROOT is build-cts.sh's (default ~/.cache/mesa-wink/vk-cts), and
 # WVK_MESA_BUILD the Mesa build with the driver (default build/wvk-native).
-# OUT gets deqp-runner's results.csv and failures.csv. WVK_CTS_TIMEOUT is
-# the per-test timeout in seconds (default 60).
+# OUT gets deqp-runner's results.csv, and failures.csv: what differs from
+# ../ci/wvk-fails.txt, the full run's failures. WVK_CTS_TIMEOUT is the
+# per-test timeout in seconds (default 60).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 MESA=$(cd "$HERE/../../../.." && pwd)
@@ -43,5 +44,6 @@ ENVS=(--env "VK_DRIVER_FILES=$ICD" --env "MESA_LOG_LEVEL=${MESA_LOG_LEVEL:-error
 
 cd "$DEQP"
 exec "$RUNNER" run --deqp ./deqp-vk --caselist "$OUT/caselist.txt" --output "$OUT" \
-  --skips "$HERE/../ci/wvk-skips.txt" "${ENVS[@]}" --timeout "${WVK_CTS_TIMEOUT:-60}" "$@" \
+  --skips "$HERE/../ci/wvk-skips.txt" --baseline "$HERE/../ci/wvk-fails.txt" \
+  --flakes "$HERE/../ci/wvk-flakes.txt" "${ENVS[@]}" --timeout "${WVK_CTS_TIMEOUT:-60}" "$@" \
   -- --deqp-log-images=disable --deqp-log-shader-sources=disable
