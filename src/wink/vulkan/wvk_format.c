@@ -163,11 +163,30 @@ static const struct wvk_format formats[VK_FORMAT_ASTC_12x12_SRGB_BLOCK + 1] = {
 #undef ASTC
 };
 
+/* Extensions' formats, past the core ones: packed ones, as the core's are
+ * (VK_EXT_4444_formats, VK_KHR_maintenance5). */
+static const struct {
+   VkFormat vk;
+   struct wvk_format format;
+} extension_formats[] = {
+   { VK_FORMAT_A4R4G4B4_UNORM_PACK16,
+     { .texture = TF(RGBA8Unorm), .caps = SAMPLE_F | RT_FULL | WVK_CAP_PACKED16 } },
+   { VK_FORMAT_A4B4G4R4_UNORM_PACK16,
+     { .texture = TF(RGBA8Unorm), .caps = SAMPLE_F | RT_FULL | WVK_CAP_PACKED16 } },
+   { VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR,
+     { .texture = TF(RGBA8Unorm), .caps = SAMPLE_F | RT_FULL | WVK_CAP_PACKED16 } },
+};
+
 const struct wvk_format *
 wvk_format_get(VkFormat format)
 {
-   if ((unsigned)format >= ARRAY_SIZE(formats))
+   if ((unsigned)format >= ARRAY_SIZE(formats)) {
+      for (unsigned i = 0; i < ARRAY_SIZE(extension_formats); ++i) {
+         if (extension_formats[i].vk == format)
+            return &extension_formats[i].format;
+      }
       return NULL;
+   }
    const struct wvk_format *f = &formats[format];
    if (f->texture == WGPUTextureFormat_Undefined && !f->vertex)
       return NULL;

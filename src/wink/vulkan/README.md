@@ -82,7 +82,8 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   A compressed image whose size is not whole blocks is sampled from a
   shadow of its own size, decoded from it by a pass when sampled after a
   write.
-- **16-bit packed formats** (565, 4444, 5551, 1555), which WebGPU does not
+- **16-bit packed formats** (565, 4444, 5551, 1555, and the extension ones:
+  `VK_EXT_4444_formats`, maintenance5's A1B5G5R5), which WebGPU does not
   have, are RGBA8 textures. Copies to and from buffers are a shader's,
   which packs and unpacks the texels; a format without alpha keeps its
   texture's at one. Blending is at 8 bits, not the format's.

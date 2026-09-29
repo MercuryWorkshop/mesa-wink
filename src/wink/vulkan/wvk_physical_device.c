@@ -99,6 +99,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
       .KHR_maintenance4 = true,
+      .KHR_maintenance5 = true,
+      .KHR_maintenance6 = true,
       .KHR_multiview = true,
       .KHR_portability_subset = true,
       .KHR_push_descriptor = true,
@@ -125,6 +127,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_uniform_buffer_standard_layout = true,
       .KHR_vulkan_memory_model = true,
       .KHR_zero_initialize_workgroup_memory = true,
+      .EXT_4444_formats = true,
       .EXT_border_color_swizzle = true,
       .EXT_custom_border_color = true,
       .EXT_extended_dynamic_state = true,
@@ -319,6 +322,12 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* VK_KHR_vertex_attribute_divisor */
       .vertexAttributeInstanceRateDivisor = true,
       .vertexAttributeInstanceRateZeroDivisor = true,
+
+      .maintenance5 = true,
+      .maintenance6 = true,
+      /* VK_EXT_4444_formats: packed, as the core's are (wvk_format.c). */
+      .formatA4R4G4B4 = true,
+      .formatA4B4G4R4 = true,
 
       /* VK_KHR_portability_subset: what WebGPU leaves out */
       .constantAlphaColorBlendFactors = true,
@@ -579,6 +588,21 @@ get_device_properties(const struct wvk_physical_device *pdev,
 
       /* VK_KHR_portability_subset */
       .minVertexInputBindingStrideAlignment = 4,
+
+      /* VK_KHR_maintenance5. Points are a pixel, whatever PointSize says;
+       * a depth or stencil view's missing channels are 0, and its alpha 1
+       * (wvk_image.c). */
+      .earlyFragmentMultisampleCoverageAfterSampleCounting = true,
+      .earlyFragmentSampleMaskTestBeforeSampleCounting = true,
+      .depthStencilSwizzleOneSupport = true,
+      .polygonModePointSize = false,
+      .nonStrictSinglePixelWideLinesUseParallelogram = false,
+      .nonStrictWideLinesUseParallelogram = false,
+
+      /* VK_KHR_maintenance6 */
+      .blockTexelViewCompatibleMultipleLayers = false,
+      .maxCombinedImageSamplerDescriptorCount = 3,
+      .fragmentShadingRateClampCombinerInputs = false,
    };
 
    /* "wink on Apple M2 (Metal)": what the device is, and what it is on. */

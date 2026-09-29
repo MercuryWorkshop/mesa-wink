@@ -503,6 +503,27 @@ wvk_GetImageSubresourceLayout2KHR(VkDevice device, VkImage _image, const VkImage
    };
 }
 
+/* The layout an image of pInfo's would have (VK_KHR_maintenance5), which
+ * is the one wvk_GetImageSubresourceLayout2KHR reports once it is made. */
+VKAPI_ATTR void VKAPI_CALL
+wvk_GetDeviceImageSubresourceLayoutKHR(VkDevice device, const VkDeviceImageSubresourceInfoKHR *pInfo,
+                                       VkSubresourceLayout2KHR *pLayout)
+{
+   const VkImageCreateInfo *ci = pInfo->pCreateInfo;
+   pLayout->subresourceLayout = (VkSubresourceLayout){ 0 };
+   if (ci->tiling != VK_IMAGE_TILING_LINEAR)
+      return;
+   const uint32_t pitch = wvk_image_linear_pitch(ci->format, ci->extent.width);
+   const uint64_t size = (uint64_t)pitch * ci->extent.height;
+   pLayout->subresourceLayout = (VkSubresourceLayout){
+      .offset = 0,
+      .size = size,
+      .rowPitch = pitch,
+      .arrayPitch = size,
+      .depthPitch = size,
+   };
+}
+
 /* ---------------------------------------------------------------------- */
 /* Views */
 
