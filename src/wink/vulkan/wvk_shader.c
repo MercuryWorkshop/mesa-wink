@@ -47,6 +47,10 @@
 
 #include <stdlib.h>
 
+#ifdef WVK_HAVE_FLOAT64
+#include "wvk_float64_spv.h"
+#endif
+
 
 void
 wvk_init_nir_options(nir_shader_compiler_options *options)
@@ -244,6 +248,179 @@ lower_helper_invocations(nir_shader *nir)
    return nir_progress(true, impl, nir_metadata_none);
 }
 
+/* 64-bit floats, which WGSL has none of: Mesa's library of them in
+ * integer arithmetic (float64.glsl), made once. Its 64-bit integers are
+ * pairs of words later, as the shader's are. */
+static const nir_shader *
+float64_library(struct wvk_physical_device *pdev)
+{
+#ifdef WVK_HAVE_FLOAT64
+   simple_mtx_lock(&pdev->float64_lock);
+   if (!pdev->float64) {
+      const struct spirv_capabilities caps = {
+         .Addresses = true, .Float64 = true, .Int8 = true, .Int16 = true, .Int64 = true, .Shader = true,
+      };
+      const struct spirv_to_nir_options options = {
+         .capabilities = &caps,
+         .environment = NIR_SPIRV_VULKAN,
+         .create_library = true,
+      };
+      nir_shader *nir = spirv_to_nir(wvk_float64_spv_source, sizeof(wvk_float64_spv_source) / 4, NULL,
+                                     MESA_SHADER_VERTEX, "main", &options, &pdev->nir_options);
+      if (nir) {
+         NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_function_temp);
+         NIR_PASS(_, nir, nir_lower_returns);
+         NIR_PASS(_, nir, nir_inline_functions);
+         nir_sweep(nir);
+      }
+      pdev->float64 = nir;
+   }
+   simple_mtx_unlock(&pdev->float64_lock);
+   return pdev->float64;
+#else
+   (void)pdev;
+   return NULL;
+#endif
+}
+
+/* Operations of 64-bit floats, a component at a time, which the library's
+ * functions are of. */
+static bool
+is_float64_alu(const nir_instr *instr, const void *data)
+{
+   if (instr->type != nir_instr_type_alu)
+      return false;
+   const nir_alu_instr *alu = nir_instr_as_alu(instr);
+   const nir_op_info *info = &nir_op_infos[alu->op];
+   if (alu->def.bit_size == 64 && nir_alu_type_get_base_type(info->output_type) == nir_type_float)
+      return true;
+   for (unsigned i = 0; i < info->num_inputs; ++i) {
+      if (alu->src[i].src.ssa->bit_size == 64 &&
+          nir_alu_type_get_base_type(info->input_types[i]) == nir_type_float)
+         return true;
+   }
+   return false;
+}
+
+/* The library's parameters are 64-bit integers, which the calls' double
+ * variables are read as through casts, and vars_to_ssa leaves a variable
+ * that is cast alone: the variables of the integers they are read as. */
+static bool
+retype_cast_params(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr_safe(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *cast = nir_instr_as_deref(instr);
+            if (cast->deref_type != nir_deref_type_cast || !nir_deref_mode_is(cast, nir_var_function_temp))
+               continue;
+            nir_deref_instr *parent = nir_deref_instr_parent(cast);
+            if (!parent || parent->deref_type != nir_deref_type_var ||
+                glsl_get_bit_size(parent->type) != glsl_get_bit_size(cast->type) ||
+                glsl_get_components(parent->type) != glsl_get_components(cast->type) ||
+                !glsl_type_is_vector_or_scalar(cast->type))
+               continue;
+            parent->var->type = cast->type;
+            progress = true;
+         }
+      }
+   }
+   if (!progress)
+      return false;
+   nir_fixup_deref_types(nir);
+   /* The casts are of the type they cast to now. */
+   NIR_PASS(_, nir, nir_opt_deref);
+   return true;
+}
+
+/* Conversions between half and double floats, by way of floats: the
+ * library's are of floats and doubles alone. */
+static bool
+half_double_conversion_instr(nir_builder *b, nir_alu_instr *alu, void *data)
+{
+   if (!nir_op_infos[alu->op].is_conversion ||
+       nir_alu_type_get_base_type(nir_op_infos[alu->op].input_types[0]) != nir_type_float ||
+       nir_alu_type_get_base_type(nir_op_infos[alu->op].output_type) != nir_type_float)
+      return false;
+   const unsigned from = alu->src[0].src.ssa->bit_size, to = alu->def.bit_size;
+   if (!((from == 16 && to == 64) || (from == 64 && to == 16)))
+      return false;
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *x = nir_mov_alu(b, alu->src[0], alu->def.num_components);
+   if (alu->op == nir_op_f2f16_rtz) {
+      /* Toward zero, which by way of a float would round twice: the
+       * double's bits truncated. */
+      nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+      for (unsigned i = 0; i < x->num_components; ++i) {
+         nir_def *hi = nir_unpack_64_2x32_split_y(b, nir_channel(b, x, i));
+         nir_def *lo = nir_unpack_64_2x32_split_x(b, nir_channel(b, x, i));
+         nir_def *sign = nir_iand_imm(b, nir_ushr_imm(b, hi, 16), 0x8000);
+         nir_def *exp = nir_iand_imm(b, nir_ushr_imm(b, hi, 20), 0x7ff);
+         nir_def *mant = nir_iand_imm(b, hi, 0xfffff);
+         nir_def *e = nir_iadd_imm(b, exp, 15 - 1023);
+         nir_def *normal = nir_ior(b, nir_ishl_imm(b, e, 10), nir_ushr_imm(b, mant, 10));
+         /* Below the least normal: the mantissa, its 1 with it, shifted. */
+         nir_def *shift = nir_isub_imm(b, 1, e);
+         nir_def *sub = nir_bcsel(b, nir_ilt_imm(b, shift, 12),
+                                  nir_ushr(b, nir_ior_imm(b, nir_ushr_imm(b, mant, 10), 0x400), shift), nir_imm_int(b, 0));
+         nir_def *nan = nir_ine_imm(b, nir_ior(b, mant, lo), 0);
+         nir_def *h = nir_bcsel(b, nir_ieq_imm(b, exp, 0x7ff), nir_bcsel(b, nan, nir_imm_int(b, 0x7e00), nir_imm_int(b, 0x7c00)),
+                      nir_bcsel(b, nir_ige_imm(b, e, 31), nir_imm_int(b, 0x7bff),
+                      nir_bcsel(b, nir_ige_imm(b, e, 1), normal, sub)));
+         comps[i] = nir_u2u16(b, nir_ior(b, sign, h));
+      }
+      nir_def_replace(&alu->def, nir_vec(b, comps, x->num_components));
+      return true;
+   }
+   nir_def *f = nir_f2f32(b, x);
+   nir_def_replace(&alu->def, to == 64 ? nir_f2f64(b, f) : nir_f2f16(b, f));
+   return true;
+}
+
+static void
+lower_float64(struct wvk_physical_device *pdev, nir_shader *nir)
+{
+   /* Variables of them the shader no longer uses, which the emitter would
+    * still declare. */
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp | nir_var_shader_temp, NULL);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   if (!(nir->info.bit_sizes_float & 64))
+      return;
+   const nir_shader *library = float64_library(pdev);
+   if (!library) {
+      mesa_loge("wvk: a shader of 64-bit floats, without Mesa's library of them");
+      return;
+   }
+   /* Variables of them indexed dynamically, which vars_to_ssa leaves:
+    * values, chosen among. */
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_function_temp, UINT32_MAX);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_shader_alu_pass, half_double_conversion_instr, nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_lower_flrp, 64, false);
+   NIR_PASS(_, nir, nir_lower_alu_to_scalar, is_float64_alu, NULL);
+   /* Every operation: those the library has no function of, in terms of
+    * those it has. */
+   const nir_lower_doubles_options all = (nir_lower_doubles_options)(
+      nir_lower_drcp | nir_lower_dsqrt | nir_lower_drsq | nir_lower_dtrunc | nir_lower_dfloor | nir_lower_dceil |
+      nir_lower_dfract | nir_lower_dround_even | nir_lower_dmod | nir_lower_dsub | nir_lower_ddiv |
+      nir_lower_dsign | nir_lower_dminmax | nir_lower_dsat | nir_lower_fp64_full_software);
+   NIR_PASS(_, nir, nir_lower_doubles, library, all);
+   bool conversions = false;
+   NIR_PASS(conversions, nir, nir_lower_int64_float_conversions);
+   if (conversions) {
+      NIR_PASS(_, nir, nir_opt_algebraic);
+      NIR_PASS(_, nir, nir_lower_doubles, library, all);
+   }
+   /* The calls' parameters: values, and their variables gone, which the
+    * emitter would declare of types WGSL has not. */
+   NIR_PASS(_, nir, retype_cast_params);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp | nir_var_shader_temp, NULL);
+}
+
 static void
 wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
                    const struct vk_pipeline_robustness_state *rs)
@@ -263,6 +440,7 @@ wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   lower_float64(container_of(vk_pdev, struct wvk_physical_device, vk), nir);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_device_index_instr, nir_metadata_control_flow, NULL);
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, wvk_nir_lower_subgroups);
@@ -2499,6 +2677,9 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    NIR_PASS(widened, nir, wvk_nir_widen_small_types);
    if (widened)
       optimize(nir);
+   /* And what the optimizations made of 64-bit floats since: a subtraction
+    * an addition of the negation, say. */
+   lower_float64(wvk_device_physical(dev), nir);
    /* The combined and arrayed originals, now without a use. */
    hash_table_foreach(state.split, he)
       exec_node_remove(&((nir_variable *)he->key)->node);

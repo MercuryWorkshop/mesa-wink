@@ -46,6 +46,10 @@ struct wvk_physical_device {
    const struct vk_sync_type *sync_types[3];
 
    nir_shader_compiler_options nir_options;
+   /* Mesa's 64-bit floats in integer arithmetic, made when a shader first
+    * has any (wvk_shader.c). */
+   simple_mtx_t float64_lock;
+   nir_shader *float64;
 };
 
 VK_DEFINE_HANDLE_CASTS(wvk_physical_device, vk.base, VkPhysicalDevice,

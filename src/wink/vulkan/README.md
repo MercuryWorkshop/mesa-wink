@@ -35,6 +35,10 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   whole words, or at offsets their formats are not aligned to, which
   WebGPU cannot lay out. It is the one piece of pipeline state compiled
   into shaders.
+- **64-bit floats**, which WGSL has none of, are Mesa's float64.glsl in
+  integer arithmetic (built by glslang, where there is one), inlined by
+  nir_lower_doubles; and 64-bit integers are pairs of words
+  (nir_lower_int64). Slow, but there.
 - **8- and 16-bit values**, which WGSL has no integers of, are 32-bit
   words of their bits (`wvk_nir_small_types.c`): sign-extended where read
   as signed, kept to their bits where made. Half floats of float
@@ -194,8 +198,7 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Descriptor indexing's features, each of them, but not
   `VK_EXT_descriptor_indexing`: that asks for 500000 descriptors a stage,
   where WebGPU has a few dozen bindings.
-- 64-bit floats are not there: WGSL has none. 64-bit integers are pairs
-  of words (nir_lower_int64).
+- 64-bit floats as vertex inputs or varyings: WebGPU has neither.
 - Scalar 8-bit division and remainder, and 8-bit specialization
   constants, fail a few CTS cases not yet understood.
 - Device-scope memory ordering between workgroups: WGSL's barriers are

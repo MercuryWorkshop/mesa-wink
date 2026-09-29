@@ -188,6 +188,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .sampleRateShading = true,
       /* 64-bit integers are pairs of words (nir_lower_int64). */
       .shaderInt64 = true,
+#ifdef WVK_HAVE_FLOAT64
+      /* In integers, of Mesa's float64.glsl (wvk_shader.c). */
+      .shaderFloat64 = true,
+#endif
       /* 8- and 16-bit integers are words, and so are those in memory,
        * stored by atomics on their bits (wvk_nir_small_types.c). */
       .shaderInt16 = true,
@@ -682,6 +686,7 @@ wvk_enumerate_physical_devices(struct vk_instance *_instance)
    struct vk_properties properties;
    get_device_properties(pdev, instance, &properties);
    wvk_init_nir_options(&pdev->nir_options);
+   simple_mtx_init(&pdev->float64_lock, mtx_plain);
 
    VkResult result = vk_physical_device_init(&pdev->vk, &instance->vk, &extensions,
                                              &features, &properties, &dispatch_table);
@@ -708,6 +713,8 @@ void
 wvk_physical_device_destroy(struct vk_physical_device *vk_pdev)
 {
    struct wvk_physical_device *pdev = container_of(vk_pdev, struct wvk_physical_device, vk);
+   ralloc_free(pdev->float64);
+   simple_mtx_destroy(&pdev->float64_lock);
    vk_physical_device_finish(&pdev->vk);
    wgpuAdapterInfoFreeMembers(pdev->info);
    wgpuAdapterRelease(pdev->adapter);

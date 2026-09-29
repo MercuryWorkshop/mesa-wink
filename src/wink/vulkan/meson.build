@@ -87,9 +87,30 @@ else
   wvk_files += files('wvk_platform_native.c')
 endif
 
+# 64-bit floats, which WGSL has none of: Mesa's library of them, built by
+# glslang where there is one (wvk_shader.c).
+wvk_float64 = []
+if prog_glslang.found()
+  wvk_float64 = custom_target(
+    'wvk_float64_spv.h',
+    input : [glsl2spirv, float64_glsl_file],
+    output : 'wvk_float64_spv.h',
+    command : [
+      prog_python, '@INPUT@', '@OUTPUT@',
+      prog_glslang,
+      '--vn', 'wvk_float64_spv_source',
+      '--glsl-version', '450',
+      '-Olib',
+      glslang_depfile,
+    ],
+    depfile : 'wvk_float64_spv.h.d',
+  )
+  wvk_c_args += '-DWVK_HAVE_FLOAT64'
+endif
+
 libwvk = static_library(
   'wvk',
-  [wvk_files, wvk_entrypoints, wvk_dispatch_trampolines, sha1_h],
+  [wvk_files, wvk_entrypoints, wvk_dispatch_trampolines, sha1_h, wvk_float64],
   include_directories : [inc_include, inc_src, wvk_webgpu_include],
   dependencies : [
     idep_mesautil,
