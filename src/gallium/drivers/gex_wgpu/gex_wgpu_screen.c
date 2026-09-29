@@ -3098,6 +3098,11 @@ struct gex_wgpu_capture_layout {
     * from a dvec4, and the capture needs it to know how many words to read
     * and how many doubles to build. */
    uint8_t doubles[PIPE_MAX_ATTRIBS];
+   /* The slot whose binding an element reads through, plus one; zero for
+    * its own. Slots holding one buffer share a binding, since each covers
+    * the whole buffer and the slot's offset is a parameter of its own --
+    * and a compute stage has ten storage buffers to spend. */
+   uint8_t alias[PIPE_MAX_ATTRIBS];
 };
 
 /* A geometry shader, which runs as a compute pass.
@@ -10910,6 +10915,45 @@ gex_wgpu_capture_vb_var(nir_shader *nir, struct gex_wgpu_capture *state,
    return state->vb[slot];
 }
 
+/* The vertex buffers a capture still reads, once the outputs it does not
+ * record are gone.
+ *
+ * A buffer is declared when the vertex shader first reads an attribute from
+ * it, which is before anything knows which outputs are captured; the reads
+ * that fed the rest die with them, and the declarations stayed. They are
+ * bindings all the same, and a compute stage has ten storage buffers: a
+ * vertex shader of eight attributes captured three of them, and the eight
+ * buffers, three targets, the parameters and the index table came to
+ * thirteen, so the capture recorded nothing. That is most of
+ * dEQP-GLES3.functional.transform_feedback's array and array_element
+ * cases. */
+static void
+gex_wgpu_capture_drop_unread_vbs(nir_shader *nir, struct gex_wgpu_capture *state)
+{
+   unsigned read = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_deref)
+               continue;
+            nir_deref_instr *deref = nir_instr_as_deref(instr);
+            if (deref->deref_type != nir_deref_type_var)
+               continue;
+            for (unsigned slot = 0; slot < GEX_WGPU_MAX_VERTEX_BUFFERS; ++slot)
+               if (state->vb[slot] == deref->var)
+                  read |= 1u << slot;
+         }
+      }
+   }
+   for (unsigned slot = 0; slot < GEX_WGPU_MAX_VERTEX_BUFFERS; ++slot) {
+      if (!state->vb[slot] || (read & (1u << slot)))
+         continue;
+      exec_node_remove(&state->vb[slot]->node);
+      state->vb[slot] = NULL;
+      state->vb_mask &= ~(1u << slot);
+   }
+}
+
 /* How one vertex format's components sit in the words loaded from the vertex
  * buffer, and what turns them into the value the shader reads.
  *
@@ -11206,7 +11250,8 @@ gex_wgpu_capture_fetch(nir_builder *b, struct gex_wgpu_capture *state,
                            pack.conv == GEX_CAPTURE_SINT);
 
    const unsigned slot = layout->buffer[element];
-   nir_variable *buffer = gex_wgpu_capture_vb_var(b->shader, state, slot);
+   nir_variable *buffer = gex_wgpu_capture_vb_var(
+      b->shader, state, layout->alias[element] ? layout->alias[element] - 1u : slot);
    if (!buffer)
       return zero;
 
@@ -11381,6 +11426,32 @@ gex_wgpu_capture_builtin(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+/* The varying slot a store writes, counted from its variable's: an array
+ * element's, a matrix column's, a struct member's. -1 where an index is not
+ * constant, which the indirect lowering before the capture leaves none of. */
+static int
+gex_wgpu_deref_slot_offset(nir_deref_instr *deref)
+{
+   int slots = 0;
+   for (nir_deref_instr *d = deref; d && d->deref_type != nir_deref_type_var;
+        d = nir_deref_instr_parent(d)) {
+      if (d->deref_type == nir_deref_type_array) {
+         if (!nir_src_is_const(d->arr.index))
+            return -1;
+         slots += (int)(nir_src_as_uint(d->arr.index) *
+                        glsl_count_attribute_slots(d->type, false));
+      } else if (d->deref_type == nir_deref_type_struct) {
+         const struct glsl_type *parent = nir_deref_instr_parent(d)->type;
+         for (unsigned i = 0; i < d->strct.index; ++i)
+            slots += (int)glsl_count_attribute_slots(
+               glsl_get_struct_field(parent, i), false);
+      } else {
+         return -1;
+      }
+   }
+   return slots;
+}
+
 /* Emit the capture stores for one write to a captured output variable. */
 static bool
 gex_wgpu_capture_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
@@ -11405,14 +11476,33 @@ gex_wgpu_capture_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
     * and because a single-varying capture has nothing to collide with, it
     * looked correct everywhere else. */
    const unsigned frac = var->data.location_frac;
+   /* The components this store writes, not the ones its value has. The
+    * linker packs varyings into shared slots, and a store to one of them
+    * writes its own components and names the rest with a write mask; taking
+    * every component made each store capture its neighbours' too, as
+    * whatever its value held there, and the last store to the slot won.
+    * dEQP's array_element cases pack v_varA[1] and v_varB[0] into one slot
+    * and lost both. */
+   const unsigned write_mask = nir_intrinsic_write_mask(intr);
    const unsigned var_mask =
-      (unsigned)BITFIELD_MASK(value->num_components) << frac;
+      (unsigned)(BITFIELD_MASK(value->num_components) & write_mask) << frac;
+
+   /* The slot of the element written, not the variable's first. A varying
+    * array or matrix spans a slot per element, and nir_xfb_info names each
+    * captured one by its own: v[1] of an array at 32 is location 33. Matching
+    * the variable's location captured element zero wherever it was stored
+    * and every other element nowhere, which is transform_feedback's
+    * array_element and array cases -- 324 of them -- and its matrices. */
+   const int slot_offset = gex_wgpu_deref_slot_offset(deref);
+   if (slot_offset < 0)
+      return false;
+   const unsigned location = var->data.location + (unsigned)slot_offset;
 
    const nir_xfb_info *xfb = b->shader->xfb_info;
    bool captured = false;
    for (unsigned o = 0; o < xfb->output_count; ++o) {
       const nir_xfb_output_info *out = &xfb->outputs[o];
-      if (out->location != var->data.location)
+      if (out->location != location)
          continue;
       if (!(out->component_mask & var_mask))
          continue;
@@ -11453,7 +11543,8 @@ gex_wgpu_capture_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          const unsigned component = frac + c;
          if (component > 3)
             break;
-         if (!(out->component_mask & (1u << component)))
+         if (!(write_mask & (1u << c)) ||
+             !(out->component_mask & (1u << component)))
             continue;
          const unsigned rank =
             util_bitcount(out->component_mask & BITFIELD_MASK(component));
@@ -27638,9 +27729,13 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
     * storage block wanted the same dispatch for its side effects. That shader
     * has no outputs to record; it wants the pass run for the stores it
     * already contains, and nothing added. */
-   if (nir->xfb_info && nir->xfb_info->output_count)
+   if (nir->xfb_info && nir->xfb_info->output_count) {
+      /* Every captured element named by a constant index, so the store
+       * above can tell which slot it writes. */
+      NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees, nir_var_shader_out, UINT32_MAX);
       nir_shader_intrinsics_pass(nir, gex_wgpu_capture_store,
                                  nir_metadata_control_flow, &state);
+   }
    nir_shader_intrinsics_pass(nir, gex_wgpu_capture_drop_output,
                               nir_metadata_control_flow, &state);
    /* The same draw-parameter lowering the varying variant takes, and for the
@@ -27732,6 +27827,7 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
       nir, nir_var_shader_in | nir_var_shader_out | nir_var_system_value, NULL);
    nir_fixup_deref_types(nir);
    NIR_PASS(_, nir, nir_opt_dce);
+   gex_wgpu_capture_drop_unread_vbs(nir, &state);
 
    /* The packed lowering shader-create deferred, done here against what the
     * image units actually carry. It has to run before the textures are
@@ -28183,6 +28279,7 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_opt_dce);
+   gex_wgpu_capture_drop_unread_vbs(nir, &state);
 
    struct gex_wgpu_varying_variant *variant =
       CALLOC_STRUCT(gex_wgpu_varying_variant);
@@ -31796,6 +31893,21 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
             ? ctx->vs->double_inputs[i] : 0;
          layout.divisor[i] = ve->instance_divisor;
       }
+      /* Attributes of one buffer through one binding: dEQP's feedback cases
+       * give each attribute its own slot of the same buffer, and eight of
+       * them with the capture's own bindings were past the ten a compute
+       * stage has. */
+      for (unsigned i = 0; i < layout.count; ++i) {
+         const unsigned slot = layout.buffer[i];
+         if (slot >= ctx->vertex_buffer_count || !ctx->vertex_buffers[slot])
+            continue;
+         for (unsigned c = 0; c < slot; ++c) {
+            if (ctx->vertex_buffers[c] == ctx->vertex_buffers[slot]) {
+               layout.alias[i] = (uint8_t)(c + 1);
+               break;
+            }
+         }
+      }
    }
 
    struct gex_wgpu_capture_variant *variant =
@@ -31958,12 +32070,16 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       ++count;
    }
 
+   /* Every slot's offset, bound or not: an element read through another
+    * slot's binding still takes its own slot's offset. */
+   for (unsigned i = 0; i < GEX_WGPU_MAX_VERTEX_BUFFERS &&
+                        i < ctx->vertex_buffer_count; ++i)
+      params[GEX_WGPU_PARAM_VB_OFFSET + i] = ctx->vertex_buffer_offsets[i];
    for (unsigned i = 0; i < GEX_WGPU_MAX_VERTEX_BUFFERS; ++i) {
       if (!(variant->vb_mask & (1u << i)))
          continue;
       if (i >= ctx->vertex_buffer_count || !ctx->vertex_buffers[i])
          GEX_CAPTURE_LIMIT("a vertex buffer the capture reads is unbound");
-      params[GEX_WGPU_PARAM_VB_OFFSET + i] = ctx->vertex_buffer_offsets[i];
       entries[count] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
       entries[count].binding = variant->vb_bindings[i];
       entries[count].visibility = WGPUShaderStage_Compute;
@@ -42083,6 +42199,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    const bool downstream_primitives =
       ctx->tcs || ctx->tes || ctx->gs ||
       (info && info->mode == MESA_PRIM_PATCHES);
+   /* Whether the capture below has already run for this draw, on the
+    * application's own vertices, ahead of a rewrite that then declined. */
+   bool captured_early = false;
    if (!no_pv && !ctx->failed && !ctx->provoking_rewritten && info && draws &&
        num_draws == 1 && !indirect && ctx->fs && ctx->rasterizer &&
        !ctx->rasterizer->flatshade_first && !unfilled_draw_pending &&
@@ -42112,10 +42231,20 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       if (ctx->vs && ctx->vs->raster_invalid && num_draws == 1 && !indirect &&
           gex_wgpu_atomic_replay_draw(pipe, info, drawid_offset, &draws[0]))
          GEX_DRAW_DROP();
-      if (ctx->vs && ctx->vs->writes_storage && ctx->vs->capture_nir)
+      /* Transform feedback too, for its own reason: it records the
+       * application's primitives in the application's vertex order, and the
+       * rewrite turns each one so GL's provoking vertex comes first. Integer
+       * varyings are flat, so every integer capture of lines or triangles
+       * came back rotated -- 240 of dEQP-GLES3.functional.transform_feedback
+       * -- while floats, which take no rewrite, were right. */
+      const bool capture_here =
+         ctx->vs && ctx->vs->capture_nir &&
+         (ctx->vs->writes_storage || ctx->so_target_count);
+      if (capture_here)
          (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
       if (gex_wgpu_draw_provoking_last(pipe, info, drawid_offset, &draws[0]))
          GEX_DRAW_DROP();
+      captured_early = capture_here;
    }
 
    /* glPolygonMode with the faces set differently -- GL_LINE in front and
@@ -42981,11 +43110,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* ...and a vertex shader that writes a storage block of its own needs the
     * same dispatch even with no feedback bound: that pass is where its stores
     * actually happen, the rasterising copy having had them stripped. */
-   /* Transform feedback is exempt from the replay skip: it records
-    * *primitives*, so the assembled list is exactly what it should see. Only
-    * the plain side-effect dispatch has to avoid running twice. */
-   if ((ctx->so_target_count ||
-        (ctx->vs->writes_storage && !ctx->provoking_rewritten)) &&
+   /* Not in a provoking-vertex replay, feedback included: its list has each
+    * primitive turned to put the provoking vertex first, which is not the
+    * order GL records, and the capture already ran on the draw as issued.
+    * Nor where it ran ahead of a rewrite that declined. */
+   if (!captured_early && !ctx->provoking_rewritten &&
+       (ctx->so_target_count || ctx->vs->writes_storage) &&
        ctx->vs->capture_nir)
       (void)gex_wgpu_capture_dispatch(ctx, info, &draws[0]);
    if (discard)
