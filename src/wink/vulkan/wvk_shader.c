@@ -5872,18 +5872,21 @@ split_io_structs(nir_shader *nir)
  * which Vulkan allows: every user varying is a vec4 on either side. A
  * location shared among components of several variables stays. */
 static bool
-pad_io_var(nir_shader *nir, nir_variable *var)
+pad_io_var(nir_shader *nir, nir_variable *var, unsigned size)
 {
    const struct glsl_type *old = glsl_without_array(var->type);
-   if (!glsl_type_is_vector_or_scalar(old) || glsl_get_vector_elements(old) == 4 ||
-       glsl_get_bit_size(old) != 32 || var->data.location_frac)
+   /* Nor a framebuffer fetch's, which is its attachment's components
+    * (wvk_nir_fetch.c). */
+   if (!glsl_type_is_vector_or_scalar(old) || glsl_get_vector_elements(old) == size ||
+       glsl_get_bit_size(old) != 32 || var->data.location_frac ||
+       (var->data.mode == nir_var_shader_in && var->data.fb_fetch_output))
       return false;
    nir_foreach_variable_with_modes(other, nir, var->data.mode) {
       if (other != var && other->data.location == var->data.location)
          return false;
    }
    /* Of every array level it has. */
-   var->type = glsl_type_wrap_in_arrays(glsl_vector_type(glsl_get_base_type(old), 4), var->type);
+   var->type = glsl_type_wrap_in_arrays(glsl_vector_type(glsl_get_base_type(old), size), var->type);
    nir_foreach_function_impl(impl, nir) {
       nir_builder b = nir_builder_create(impl);
       nir_foreach_block(block, impl) {
@@ -5900,26 +5903,28 @@ pad_io_var(nir_shader *nir, nir_variable *var)
                 !glsl_type_is_vector_or_scalar(nir_src_as_deref(intr->src[0])->type))
                continue;
             if (load) {
-               /* What was read: the components it had. */
+               /* What was read: the components it had, zero past those
+                * there are. */
                const unsigned n = intr->def.num_components;
                b.cursor = nir_after_instr(instr);
-               intr->num_components = 4;
-               intr->def.num_components = 4;
-               nir_def *trimmed = nir_trim_vector(&b, &intr->def, n);
-               nir_def_rewrite_uses_after(&intr->def, trimmed);
+               intr->num_components = size;
+               intr->def.num_components = size;
+               nir_def *read = n <= size ? nir_trim_vector(&b, &intr->def, n) : nir_pad_vector_imm_int(&b, &intr->def, 0, n);
+               nir_def_rewrite_uses_after(&intr->def, read);
                continue;
             }
             /* What is written: the components it wrote, the rest zero. */
             b.cursor = nir_before_instr(instr);
             nir_def *value = intr->src[1].ssa;
             nir_def *comps[4];
-            for (unsigned c = 0; c < 4; ++c)
+            for (unsigned c = 0; c < size; ++c)
                comps[c] = c < value->num_components ? nir_channel(&b, value, c)
                                                     : nir_imm_zero(&b, 1, value->bit_size);
-            nir_src_rewrite(&intr->src[1], nir_vec(&b, comps, 4));
-            intr->num_components = 4;
-            nir_intrinsic_set_write_mask(intr, nir_intrinsic_write_mask(intr) |
-                                                  (0xf & ~BITFIELD_MASK(value->num_components)));
+            nir_src_rewrite(&intr->src[1], nir_vec(&b, comps, size));
+            intr->num_components = size;
+            nir_intrinsic_set_write_mask(intr, (nir_intrinsic_write_mask(intr) |
+                                                (0xf & ~BITFIELD_MASK(value->num_components))) &
+                                                  BITFIELD_MASK(size));
          }
       }
    }
@@ -5927,20 +5932,23 @@ pad_io_var(nir_shader *nir, nir_variable *var)
 }
 
 static bool
-pad_io_vectors(nir_shader *nir)
+pad_io_vectors(nir_shader *nir, const uint32_t *fetch_format)
 {
    bool progress = false;
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      /* An attachment's the shader fetches, which Metal has the output
+       * of as the input: its format's components (wvk_nir_fetch.c). */
       nir_foreach_shader_out_variable(var, nir) {
+         const unsigned rt = var->data.location - FRAG_RESULT_DATA0;
          if (var->data.location >= FRAG_RESULT_DATA0)
-            progress |= pad_io_var(nir, var);
+            progress |= pad_io_var(nir, var, rt < 8 && fetch_format[rt] ? wvk_nir_fetch_components(fetch_format[rt]) : 4);
       }
    }
    if (nir->info.stage == MESA_SHADER_VERTEX || nir->info.stage == MESA_SHADER_FRAGMENT) {
       const nir_variable_mode mode = nir->info.stage == MESA_SHADER_VERTEX ? nir_var_shader_out : nir_var_shader_in;
       nir_foreach_variable_with_modes(var, nir, mode) {
          if (var->data.location >= VARYING_SLOT_VAR0 && var->data.location <= VARYING_SLOT_VAR31)
-            progress |= pad_io_var(nir, var);
+            progress |= pad_io_var(nir, var, 4);
       }
    }
    if (progress)
@@ -6542,7 +6550,8 @@ record_varyings(nir_shader *nir, nir_variable_mode mode, uint8_t out[WVK_MAX_VAR
 {
    memset(out, 0, WVK_MAX_VARYINGS);
    nir_foreach_variable_with_modes(var, nir, mode) {
-      if (var->data.location < VARYING_SLOT_VAR0)
+      /* A framebuffer fetch's is no stage's before (wvk_nir_fetch.c). */
+      if (var->data.location < VARYING_SLOT_VAR0 || (mode == nir_var_shader_in && var->data.fb_fetch_output))
          continue;
       const unsigned first = var->data.location - VARYING_SLOT_VAR0;
       const unsigned slots = glsl_count_attribute_slots(var->type, false);
@@ -7126,6 +7135,17 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       shader->key.color_remapped = 1;
       memcpy(shader->key.color_map, records->color_map, sizeof(records->color_map));
    }
+   /* Colour attachments read as they are, by framebuffer fetch: where the
+    * draw's are (key.fetch_format); tile image reads of others are zero. */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      NIR_PASS(_, nir, wvk_nir_lower_framebuffer_fetch, records ? records->fetch_format : NULL,
+               records ? records->fetch_input : NULL, records && records->color_remapped ? records->color_map : NULL,
+               &shader->tile_reads, &shader->input_reads);
+      if (records) {
+         memcpy(shader->key.fetch_format, records->fetch_format, sizeof(records->fetch_format));
+         memcpy(shader->key.fetch_input, records->fetch_input, sizeof(records->fetch_input));
+      }
+   }
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       const struct vk_multisample_state *ms = pipeline_state ? pipeline_state->ms : NULL;
       bool own_mask = false;
@@ -7358,7 +7378,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    NIR_PASS(_, nir, wvk_nir_lower_samplers, shader->meta_base);
    NIR_PASS(_, nir, lower_1d_images);
    NIR_PASS(_, nir, lower_ms_arrays);
-   NIR_PASS(_, nir, pad_io_vectors);
+   NIR_PASS(_, nir, pad_io_vectors, shader->key.fetch_format);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, demote_to_terminate_instr, nir_metadata_all, NULL);
    NIR_PASS(_, nir, wvk_nir_lower_image_atomics, shader->meta_base);
    NIR_PASS(_, nir, wvk_nir_lower_texel_buffers, shader->meta_base);
@@ -8122,6 +8142,26 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
                outputs |= BITFIELD_BIT(i);
          }
       }
+      /* The colour attachments it reads as they are, where the device
+       * fetches from the framebuffer: those at the locations of its tile
+       * image reads, and those the input attachment map has of the input
+       * attachments it reads -- the pass's own, which the texture of a
+       * copy made before the draw would be else. */
+      memset(key.fetch_format, 0, sizeof(key.fetch_format));
+      memset(key.fetch_input, 0, sizeof(key.fetch_input));
+      if (color_formats && (shader->tile_reads || shader->input_reads) &&
+          wvk_physical_device_has_feature(wvk_device_physical(dev), WGPUFeatureName_FramebufferFetch)) {
+         for (uint32_t i = 0; i < 8; ++i) {
+            const uint32_t location = key.color_remapped ? key.color_map[i] : i;
+            const uint8_t input = dyn->ial.color_map[i];
+            const bool tile = location < 8 && (shader->tile_reads & BITFIELD_BIT(location));
+            const bool read = input < 8 && (shader->input_reads & BITFIELD_BIT(input));
+            if (color_formats[i] && (tile || read) && wvk_nir_fetchable(wvk_device_physical(dev), color_formats[i])) {
+               key.fetch_format[i] = color_formats[i];
+               key.fetch_input[i] = read ? input + 1 : 0;
+            }
+         }
+      }
       /* After a vertex shader alone, WebGPU's primitive_index where the
        * device has it -- two triangles a point's or line's quad. Not after
        * a tessellation evaluation shader, whose primitives are its
@@ -8276,7 +8316,7 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
       /* A variant that failed is kept as none, not tried at every draw. */
       if (getenv("WINK_VK_VARIANT_LOG")) {
          const struct wvk_shader_key *own = &shader->key;
-         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
                  _mesa_shader_stage_to_string(shader->vk.stage), shader->id,
                  key.pulled != own->pulled ? " vertex input" : "",
                  memcmp(key.fs_inputs, own->fs_inputs, sizeof(key.fs_inputs)) ? " varyings" : "",
@@ -8297,7 +8337,10 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
                  key.color_remapped != own->color_remapped ||
                        memcmp(key.color_map, own->color_map, sizeof(key.color_map))
                     ? " attachment locations" : "",
-                 key.non_seamless != own->non_seamless ? " non-seamless cubes" : "");
+                 key.non_seamless != own->non_seamless ? " non-seamless cubes" : "",
+                 memcmp(key.fetch_format, own->fetch_format, sizeof(key.fetch_format)) ||
+                       memcmp(key.fetch_input, own->fetch_input, sizeof(key.fetch_input))
+                    ? " framebuffer fetch" : "");
       }
       variant = compile_variant(dev, shader, &key, vi);
       if (!variant)

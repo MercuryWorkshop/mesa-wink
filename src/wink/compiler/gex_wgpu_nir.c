@@ -83,12 +83,27 @@ gex_wgpu_pad_color_output(nir_shader *nir, nir_variable *var)
    return true;
 }
 
+/* Whether the fragment shader reads the output's attachment as it is --
+ * an input wink_color_N, which the WGSL makes @color(N) -- where Metal
+ * wants the output of the input's type, which is the attachment's. */
+static bool
+gex_wgpu_fetched_output(nir_shader *nir, const nir_variable *out)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
+      unsigned rt;
+      if (var->data.fb_fetch_output && var->name && sscanf(var->name, "wink_color_%u", &rt) == 1 &&
+          out->data.location == FRAG_RESULT_DATA0 + rt)
+         return true;
+   }
+   return false;
+}
+
 static bool
 gex_wgpu_pad_color_outputs(nir_shader *nir)
 {
    bool progress = false;
    nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
-      if (var->data.location >= FRAG_RESULT_DATA0)
+      if (var->data.location >= FRAG_RESULT_DATA0 && !gex_wgpu_fetched_output(nir, var))
          progress |= gex_wgpu_pad_color_output(nir, var);
    }
    if (progress)

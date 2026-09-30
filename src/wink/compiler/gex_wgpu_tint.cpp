@@ -231,6 +231,63 @@ private:
    std::vector<std::pair<const ast::BlockStatement *, const ast::BreakIfStatement *>> break_ifs_;
 };
 
+/* A fragment shader's colour attachments read as they are, which SPIR-V
+ * has no way of saying that Tint reads: the inputs named wink_color_N, at
+ * whatever location, made @color(N) (chromium_experimental_framebuffer_fetch),
+ * without the interpolation that is a location's. */
+bool
+color_input(const std::string &name, uint32_t *index)
+{
+   static const char prefix[] = "wink_color_";
+   const size_t at = name.find(prefix);
+   if (at == std::string::npos || at + sizeof(prefix) - 1 >= name.size())
+      return false;
+   const char digit = name[at + sizeof(prefix) - 1];
+   if (digit < '0' || digit > '7')
+      return false;
+   *index = digit - '0';
+   return true;
+}
+
+/* An invalid Program where nothing needed it. */
+Program
+fetch_colors(const Program &src)
+{
+   ProgramBuilder b;
+   program::CloneContext ctx(&b, &src, true);
+   bool any = false;
+   auto rewrite = [&](const std::string &name, const auto &attributes) {
+      uint32_t index;
+      if (!color_input(name, &index))
+         return;
+      for (const ast::Attribute *attr : attributes) {
+         if (attr->Is<ast::LocationAttribute>()) {
+            ctx.Replace(attr, b.Color(core::u32(index)));
+            any = true;
+         } else if (attr->Is<ast::InterpolateAttribute>()) {
+            ctx.Remove(attributes, attr);
+         }
+      }
+   };
+   for (const ast::Function *fn : src.AST().Functions()) {
+      if (!fn->IsEntryPoint() || fn->PipelineStage() != ast::PipelineStage::kFragment)
+         continue;
+      for (const ast::Parameter *param : fn->params)
+         rewrite(param->name->symbol.Name(), param->attributes);
+   }
+   for (const ast::TypeDecl *decl : src.AST().TypeDecls()) {
+      if (const ast::Struct *s = decl->As<ast::Struct>()) {
+         for (const ast::StructMember *member : s->members)
+            rewrite(member->name->symbol.Name(), member->attributes);
+      }
+   }
+   if (!any)
+      return Program{};
+   b.Enable(wgsl::Extension::kChromiumExperimentalFramebufferFetch);
+   ctx.Clone();
+   return resolver::Resolve(b, wgsl::AllowedFeatures::Everything());
+}
+
 /* Whether the SPIR-V reader refused a builtin it has none of. */
 bool
 unknown_builtin(const diag::List &diagnostics)
@@ -395,6 +452,13 @@ gex_wgpu_spirv_to_wgsl(const uint32_t *words, size_t word_count,
       return nullptr;
    }
 
+   {
+      tint::Program fetched = fetch_colors(program);
+      if (fetched.IsValid())
+         program = std::move(fetched);
+      else if (!fetched.Diagnostics().IsEmpty())
+         fprintf(stderr, "gex-wgpu: framebuffer fetch not made: %s\n", fetched.Diagnostics().Str().c_str());
+   }
    auto generated = tint::wgsl::writer::Generate(program, {});
    if (generated != tint::Success) {
       set_error(error_out, "Tint WGSL generation failed: " +

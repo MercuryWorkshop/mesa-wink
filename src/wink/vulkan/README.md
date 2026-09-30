@@ -167,6 +167,18 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   other locations than their own have a fragment shader variant whose
   outputs are moved to them, WebGPU's targets being the pass's
   attachments in order, and an output no attachment is at is gone.
+- **Colour attachments read as they are** -- tile images
+  (VK_EXT_shader_tile_image, colour only), and input attachments that
+  are colour attachments of their own subpass or rendering, by the input
+  attachment map, in rasterization order
+  (VK_EXT_rasterization_order_attachment_access) -- are Dawn's framebuffer
+  fetch, where the device has it (a tiler's Metal): no copy. The fragment
+  shader's variant for the attachments' formats has an input for each,
+  named `wink_color_N`, which the WGSL makes `@color(N)`, of as many
+  components as the attachment's WebGPU format and its output to that
+  attachment of as many, since Metal wants the two of one type. A
+  multisampled one is read at the invocation's own sample, which is all
+  a fetch has. Not depth or stencil, which Metal fetches none of.
 - **Logic ops** are the fragment shader's: WebGPU has no colour state
   for them. A draw with one on gets a variant that takes each output to
   its attachment format's integers (unorm, snorm, uint and sint, at the

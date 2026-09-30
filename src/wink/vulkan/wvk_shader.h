@@ -212,6 +212,11 @@ struct wvk_shader_key {
    /* Fragment: the discard rectangle test, of the rectangles the driver's
     * data has (WVK_DRIVER_DISCARD). */
    uint8_t discard_rects;
+   /* Fragment: the colour attachments it reads as they are, by framebuffer
+    * fetch (wvk_nir_fetch.c): each one's format (0: none), and the input
+    * attachment index + 1 that reads it (0: its tile image reads alone). */
+   uint32_t fetch_format[8];
+   uint8_t fetch_input[8];
    /* The format of each storage image the shader has none for, which
     * WGSL's must have: the VkFormat of the view bound there, in the order
     * of wvk_shader::unformatted. */
@@ -252,6 +257,11 @@ struct wvk_shader {
    /* Fragment: whether it reads the depth attachment's copy for the depth
     * bounds test. */
    bool reads_depth_bounds;
+   /* Fragment: the colour locations it reads of tile images, and the
+    * input attachments it reads (at its own sample, where multisampled),
+    * a bit each: what it may read by framebuffer fetch
+    * (key.fetch_format). */
+   uint8_t tile_reads, input_reads;
    /* Vertex: writes PointSize, and so draws points as quads. Fragment:
     * reads gl_PointCoord (1) or gl_FrontFacing (2), which a point's quad
     * has not; or gl_PrimitiveID (4), which the draw after a geometry

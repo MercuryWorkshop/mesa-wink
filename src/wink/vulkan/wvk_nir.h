@@ -8,6 +8,7 @@
 #define WVK_NIR_H
 
 #include "compiler/nir/nir.h"
+#include "vulkan/vulkan_core.h"
 
 struct nir_builder;
 
@@ -24,6 +25,19 @@ bool wvk_nir_lower_cooperative_matrix(nir_shader *nir);
 /* bfloat16's and 8-bit floats' conversions to and from 32-bit floats, as
  * integer arithmetic of their bits (wvk_nir_minifloats.c). */
 bool wvk_nir_lower_minifloats(nir_shader *nir);
+
+/* Tile image reads, and reads of input attachments that are the pass's
+ * colour attachments, as framebuffer fetches of the attachments whose
+ * formats `formats` has (wvk_nir_fetch.c): which locations the shader
+ * reads of tile images, and which input attachments, gathered too. */
+bool wvk_nir_lower_framebuffer_fetch(nir_shader *nir, const uint32_t *formats, const uint8_t *inputs,
+                                     const uint8_t *color_map, uint8_t *tile_reads, uint8_t *input_reads);
+/* Whether an attachment of the format can be read so. */
+struct wvk_physical_device;
+bool wvk_nir_fetchable(const struct wvk_physical_device *pdev, VkFormat format);
+/* The components a fetch of an attachment of the format is, and the
+ * shader's output to it. */
+unsigned wvk_nir_fetch_components(VkFormat format);
 
 /* 64-bit atomics on buffers and shared memory, as 32-bit accesses under a
  * lock (wvk_nir_atomic64.c): after their explicit io. */

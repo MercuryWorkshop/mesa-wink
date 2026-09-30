@@ -56,6 +56,9 @@ static const WGPUFeatureName wanted_features[] = {
    WGPUFeatureName_DualSourceBlending,
    /* gl_PrimitiveID of a fragment shader without a geometry shader. */
    WGPUFeatureName_PrimitiveIndex,
+   /* Attachments read as they are: tile images, and input attachments
+    * in rasterization order (wvk_nir_fetch.c). */
+   WGPUFeatureName_FramebufferFetch,
    /* More storage formats, and the 16-bit normalized ones (wvk_format.c). */
    WGPUFeatureName_TextureFormatsTier1,
    WGPUFeatureName_TextureFormatsTier2,
@@ -250,6 +253,11 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_primitive_topology_list_restart = true,
       .KHR_line_rasterization = true,
       .KHR_dynamic_rendering_local_read = true,
+      .EXT_shader_tile_image = wvk_physical_device_has_feature(pdev, WGPUFeatureName_FramebufferFetch),
+      .EXT_rasterization_order_attachment_access =
+         wvk_physical_device_has_feature(pdev, WGPUFeatureName_FramebufferFetch),
+      .ARM_rasterization_order_attachment_access =
+         wvk_physical_device_has_feature(pdev, WGPUFeatureName_FramebufferFetch),
       .EXT_line_rasterization = true,
       .EXT_depth_clip_enable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
       .KHR_global_priority = true,
@@ -281,6 +289,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
    const bool etc2 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureCompressionETC2);
    const bool astc = wvk_physical_device_has_feature(pdev, WGPUFeatureName_TextureCompressionASTC);
    const bool clip = wvk_physical_device_has_feature(pdev, WGPUFeatureName_ClipDistances);
+   const bool fetch = wvk_physical_device_has_feature(pdev, WGPUFeatureName_FramebufferFetch);
 
    *f = (struct vk_features){
       /* Vulkan 1.0. WebGPU bounds-checks every access. */
@@ -715,6 +724,11 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Of the geometry shader's lists, which a draw whose fragment shader
        * reads them goes through (wvk_shader.c's geometry_vertex_shader). */
       .fragmentShaderBarycentric = true,
+      /* Colour attachments by framebuffer fetch, in rasterization order
+       * on a tiler (wvk_nir_fetch.c); not depth or stencil, which Metal
+       * fetches none of. */
+      .shaderTileImageColorReadAccess = fetch,
+      .rasterizationOrderColorAttachmentAccess = fetch,
       /* Every descriptor is one struct, whose binding's WebGPU binding the
        * shader's use of it types (wvk_descriptor_set.c). */
       .mutableDescriptorType = true,
@@ -953,6 +967,11 @@ get_device_properties(const struct wvk_physical_device *pdev,
       /* VK_KHR_fragment_shader_barycentric: a strip's triangles are the
        * geometry shader's, whose order is its provoking vertex's. */
       .triStripVertexOrderIndependentOfProvokingVertex = false,
+      /* VK_EXT_shader_tile_image: Metal's programmable blending, of the
+       * invocation's own sample. */
+      .shaderTileImageCoherentReadAccelerated = true,
+      .shaderTileImageReadSampleFromPixelRateInvocation = false,
+      .shaderTileImageReadFromHelperInvocation = false,
       /* VK_KHR_line_rasterization: the quads' corners are the vertex
        * shader's positions moved, as precise as the rest. */
       .lineSubPixelPrecisionBits = 4,
