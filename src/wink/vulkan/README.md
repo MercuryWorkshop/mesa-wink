@@ -347,6 +347,13 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **Arrays of descriptors** are bindings of their own. A dynamic or
   non-uniform index chooses among them in the shader: reads from each,
   selected; writes only where the index is.
+- **Mutable descriptors** (mutableDescriptorType): every descriptor is one
+  struct already, and a binding's WebGPU binding is of the kind the
+  shader's use of it says. A mutable one keeps the type written or copied
+  there last, whose record it has. Not aliased: one WebGPU binding an
+  element, which two variables of different kinds cannot share -- which
+  only descriptor indexing's arrays, which WebGPU has too few bindings
+  for, need.
 - **Triangle fans** are the lists of their triangles, each in the order
   Vulkan's fan has it: a list the host makes, or for a draw by index one a
   compute shader makes of the application's indices, restarting where

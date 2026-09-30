@@ -24,6 +24,9 @@ struct vk_descriptor_update_template;
  * copies of what else it needs: what it names may be destroyed while it
  * is in a set, unused, and a bind group of an array still has it. */
 struct wvk_descriptor {
+   /* Of a mutable binding (VK_EXT_mutable_descriptor_type), the type of
+    * descriptor written there last; 0 for none. */
+   VkDescriptorType mutable_type;
    /* Buffers: a range of the memory's WGPUBuffer, never VK_WHOLE_SIZE. */
    struct wvk_device_memory *mem;
    WGPUBuffer buffer;

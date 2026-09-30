@@ -146,6 +146,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_shader_fma = true,
       .KHR_shader_untyped_pointers = true,
       .KHR_fragment_shader_barycentric = true,
+      .EXT_mutable_descriptor_type = true,
+      .VALVE_mutable_descriptor_type = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -659,6 +661,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Of the geometry shader's lists, which a draw whose fragment shader
        * reads them goes through (wvk_shader.c's geometry_vertex_shader). */
       .fragmentShaderBarycentric = true,
+      /* Every descriptor is one struct, whose binding's WebGPU binding the
+       * shader's use of it types (wvk_descriptor_set.c). */
+      .mutableDescriptorType = true,
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,

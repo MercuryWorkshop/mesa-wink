@@ -259,8 +259,13 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
       const bool integer_cube = view && (view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE ||
                                          view->vk.view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) &&
                                 vk_format_is_int(view->vk.view_format);
+      /* Only a cube's storage image: a 2D view of an image that may be an
+       * input attachment has an array too, which its shaders do not. */
+      const bool cube = view && (view->view_desc.dimension == WGPUTextureViewDimension_Cube ||
+                                 view->view_desc.dimension == WGPUTextureViewDimension_CubeArray);
       if (view && view->array_view &&
-          (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT || integer_cube)) {
+          ((type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && cube) || type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+           integer_cube)) {
          wgpu = view->array_view;
          desc = &view->array_desc;
       }
@@ -319,13 +324,27 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
       set_sampler(d, wvk_sampler_from_handle(info->sampler));
 }
 
+/* The type of descriptor in a binding: its layout's, or of a mutable one
+ * what was written there. */
+static VkDescriptorType
+descriptor_type(const struct wvk_descriptor_set_binding_layout *bl, const struct wvk_descriptor *d)
+{
+   return bl->type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT ? d->mutable_type : bl->type;
+}
+
 static void
 write_one(struct wvk_device *dev, struct wvk_descriptor_set *set, uint32_t binding,
-          uint32_t element, const VkDescriptorImageInfo *image,
+          uint32_t element, VkDescriptorType type, const VkDescriptorImageInfo *image,
           const VkDescriptorBufferInfo *buffer, const VkBufferView *texel)
 {
-   const struct wvk_descriptor_set_binding_layout *bl = &set->layout->bindings[binding];
-   struct wvk_descriptor *d = &set->descriptors[bl->descriptor_index + element];
+   const struct wvk_descriptor_set_binding_layout *layout_bl = &set->layout->bindings[binding];
+   struct wvk_descriptor *d = &set->descriptors[layout_bl->descriptor_index + element];
+   /* A mutable binding's is the write's type, until it is written again. */
+   struct wvk_descriptor_set_binding_layout typed = *layout_bl;
+   const bool is_mutable = layout_bl->type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT;
+   if (is_mutable)
+      typed.type = type;
+   const struct wvk_descriptor_set_binding_layout *bl = &typed;
    switch (bl->type) {
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
@@ -361,6 +380,8 @@ write_one(struct wvk_device *dev, struct wvk_descriptor_set *set, uint32_t bindi
                      vk_DescriptorType_to_str(bl->type));
       break;
    }
+   if (is_mutable)
+      d->mutable_type = type;
 }
 
 /* A write runs on into the following bindings when it has more
@@ -415,7 +436,7 @@ wvk_descriptor_set_write(struct wvk_device *dev, struct wvk_descriptor_set *set,
    }
    uint32_t binding = write->dstBinding, element = write->dstArrayElement;
    for (uint32_t i = 0; i < write->descriptorCount && binding < set->layout->binding_count; ++i) {
-      write_one(dev, set, binding, element,
+      write_one(dev, set, binding, element, write->descriptorType,
                 write->pImageInfo ? &write->pImageInfo[i] : NULL,
                 write->pBufferInfo ? &write->pBufferInfo[i] : NULL,
                 write->pTexelBufferView ? &write->pTexelBufferView[i] : NULL);
@@ -440,7 +461,7 @@ wvk_descriptor_set_write_template(struct wvk_device *dev, struct wvk_descriptor_
       uint32_t binding = entry->binding, element = entry->array_element;
       for (uint32_t j = 0; j < entry->array_count && binding < set->layout->binding_count; ++j) {
          const void *src = (const uint8_t *)data + entry->offset + j * entry->stride;
-         write_one(dev, set, binding, element, src, src, src);
+         write_one(dev, set, binding, element, entry->type, src, src, src);
          next_element(set->layout, &binding, &element);
       }
    }
@@ -458,7 +479,7 @@ wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words, u
       const struct wvk_descriptor_set_binding_layout *bl = &layout->bindings[slot->binding];
       const struct wvk_descriptor *d = &set->descriptors[wvk_slot_descriptor_index(bl, slot)];
       uint32_t *record = words + s * WVK_META_WORDS;
-      switch (bl->type) {
+      switch (descriptor_type(bl, d)) {
       case VK_DESCRIPTOR_TYPE_SAMPLER:
          memcpy(record, d->sampler_meta, sizeof(d->sampler_meta));
          break;
@@ -541,6 +562,10 @@ wvk_UpdateDescriptorSets(VkDevice _device, uint32_t descriptorWriteCount,
          const struct wvk_descriptor *s = &src->descriptors[sbl->descriptor_index + se];
          struct wvk_descriptor *d = &dst->descriptors[dbl->descriptor_index + de];
          copy_descriptor(d, s, dbl->immutable_samplers != NULL);
+         /* Into a mutable binding: of the source's type, which its layout
+          * may say. */
+         if (dbl->type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT)
+            d->mutable_type = descriptor_type(sbl, s);
          /* And its planes'. */
          for (uint32_t p = 1; p < MIN2(sbl->planes, dbl->planes); ++p)
             copy_descriptor(&dst->descriptors[dbl->plane_descriptor_index + (p - 1) * dbl->count + de],

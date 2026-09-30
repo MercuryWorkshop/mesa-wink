@@ -954,7 +954,9 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
          view->array_desc = desc;
       }
       if ((view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) && desc.mipLevelCount > 1) {
-         view->storage_desc = view->array_view ? view->array_desc : view->view_desc;
+         const bool cube = view->view_desc.dimension == WGPUTextureViewDimension_Cube ||
+                           view->view_desc.dimension == WGPUTextureViewDimension_CubeArray;
+         view->storage_desc = cube && view->array_view ? view->array_desc : view->view_desc;
          view->storage_desc.mipLevelCount = 1;
          view->storage_view = wgpuTextureCreateView(texture, &view->storage_desc);
       }
