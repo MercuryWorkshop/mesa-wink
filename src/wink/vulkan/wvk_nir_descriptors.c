@@ -1186,7 +1186,9 @@ lower_float_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uin
                               nir_ieq_imm(b, address_mode(b, flags, i), VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER));
       nir_def *two = nir_iand(b, nir_iand(b, flag(b, flags, WVK_SAMPLER_EMULATE), flag(b, flags, WVK_SAMPLER_MIP_LINEAR)),
                               nir_iand(b, any_border, nir_flt(b, nir_imm_float(b, 0.0f), lambda)));
-      two = nir_iand(b, two, nir_inot(b, flag(b, flags, WVK_SAMPLER_UNNORMALIZED)));
+      /* Of linear minification: nearest's one sample is exact already. */
+      two = nir_iand(b, two, nir_iand(b, flag(b, flags, WVK_SAMPLER_MIN_LINEAR),
+                                      nir_inot(b, flag(b, flags, WVK_SAMPLER_UNNORMALIZED))));
       nir_def *later = nir_undef(b, result->num_components, result->bit_size);
       nir_def_rewrite_uses(result, later);
       nir_push_if(b, two);

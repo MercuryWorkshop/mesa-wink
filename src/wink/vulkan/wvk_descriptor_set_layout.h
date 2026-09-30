@@ -83,7 +83,7 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
  * share with set 3 if a pipeline layout has one. */
 #define WVK_DRIVER_GROUP 3
 /* Below WebGPU's thousand bindings a group, with room for all of them. */
-#define WVK_DRIVER_SLOT_BASE 970
+#define WVK_DRIVER_SLOT_BASE 960
 #define WVK_DRIVER_SLOT_PUSH (WVK_DRIVER_SLOT_BASE + 0)
 /* The draw's parameters (BaseVertex, BaseInstance): the push buffer again
  * for a direct draw, the indirect buffer for an indirect one. */
@@ -127,6 +127,12 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* The pass's shading rate attachment, a 2D view of its first layer, which
  * fragment shaders fetch their rates of (wvk_nir_fsr.c). */
 #define WVK_DRIVER_SLOT_FSR (WVK_DRIVER_SLOT_GS_INDICES + 7)
+/* Storage and texel buffers of a stage of more of them than WebGPU binds,
+ * each merged into the binding of the whole WGPUBuffer it is part of
+ * (wvk_shader_key.merge_binding): read and written at their records'
+ * offsets in it, WVK_META_BUF_BASE. */
+#define WVK_DRIVER_SLOT_MERGED (WVK_DRIVER_SLOT_GS_INDICES + 8)
+#define WVK_MAX_MERGED_BUFFERS 4
 
 #define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
 
@@ -179,6 +185,10 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* A uniform or storage buffer's record: its range in bytes, 0 for a null
  * one -- for robustBufferAccess2's bounds, and nullDescriptor's. */
 #define WVK_META_BUF_RANGE 0
+/* A uniform, storage or texel buffer's record: where it is in its
+ * WGPUBuffer, with a dynamic offset in it, which a merged binding
+ * (WVK_DRIVER_SLOT_MERGED) reads it at. */
+#define WVK_META_BUF_BASE 7
 
 /* A texel buffer's record. */
 #define WVK_META_TEXEL_FORMAT 0    /* enum wvk_texel_type, and bytes a texel << 8 */

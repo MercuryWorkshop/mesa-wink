@@ -143,7 +143,9 @@ wvk_descriptor_set_create(struct wvk_device *dev, struct wvk_descriptor_set_layo
       set->inline_data = calloc(1, set->inline_size);
       WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
       bd.label = wvk_sv("wvk inline uniform blocks");
-      bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+      /* Storage too: merged with others where a stage has more uniform
+       * buffers than WebGPU binds (WVK_DRIVER_SLOT_MERGED). */
+      bd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
       bd.size = set->inline_size;
       set->inline_buffer = wgpuDeviceCreateBuffer(dev->wgpu, &bd);
       if (!set->inline_data || !set->inline_buffer) {
@@ -511,6 +513,11 @@ wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words, u
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
          record[WVK_META_BUF_RANGE] = d->buffer ? (uint32_t)MIN2(d->size, UINT32_MAX) : 0;
+         record[WVK_META_BUF_BASE] = d->buffer ? (uint32_t)d->offset : 0;
+         break;
+      case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
+         record[WVK_META_BUF_RANGE] = d->buffer ? (uint32_t)MIN2(d->size, UINT32_MAX) : 0;
+         record[WVK_META_BUF_BASE] = d->buffer ? (uint32_t)d->offset : 0;
          break;
       case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
       case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
@@ -518,6 +525,7 @@ wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words, u
          if (d->buffer && wvk_texel_buffer_format(d->texel_format, record)) {
             record[WVK_META_TEXEL_COUNT] = d->texel_elements;
             record[WVK_META_TEXEL_START] = d->texel_start;
+            record[WVK_META_BUF_BASE] = (uint32_t)d->offset;
          }
          break;
       default:

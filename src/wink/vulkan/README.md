@@ -36,7 +36,8 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   itself, from the vertex buffer bound as storage, since WebGPU steps an
   instance attribute every instance; so are attributes of strides not
   whole words, or at offsets their formats are not aligned to, which
-  WebGPU cannot lay out.
+  WebGPU cannot lay out, and 64-bit ones, each channel two words, which
+  it has no formats of.
 - **Shaders are compiled for some of the state they're drawn with.** What
   they depend on:
   - the vertex input they pull;
@@ -227,7 +228,9 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **Advanced blending** (VK_EXT_blend_operation_advanced) is blended the
   same way, by NIR's equations (`nir_color_blend_advanced`), all of the
   operations, premultiplied or not, with each overlap, on up to 8
-  attachments; not on a multisampled pass. Not coherent: primitives of one draw that overlap see the
+  attachments; not on a multisampled pass. Its divisions are made exact
+  by a step from their remainder, as Metal's are: equations branch on
+  where the quotient is, which a GPU's reciprocal misses by an ulp. Not coherent: primitives of one draw that overlap see the
   attachment as it was before the draw, as the extension allows without
   advancedBlendCoherentOperations.
 - **The depth bounds test** is the fragment shader's too. It tests the
@@ -407,6 +410,20 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   a draw or dispatch reads of a buffer it writes, it reads from a copy
   made before it; and a draw at odds with what its pass used before
   begins the pass again.
+- **Buffers merged into their WGPUBuffers' bindings.** A stage of more
+  storage buffers than WebGPU binds (10, the driver's own among them, and
+  texel buffers too), or of more uniform buffers (12, inline uniform
+  blocks among them), or that writes two storage or texel buffers of one
+  WGPUBuffer -- which WebGPU refuses where their ranges meet, and Vulkan
+  lets them -- has a variant with each of its storage, texel and uniform
+  buffers read and written through the binding of all of the WGPUBuffer
+  it is of (`WVK_DRIVER_SLOT_MERGED`, four of them), at where its record
+  says it is, dynamic offset added (`WVK_META_BUF_BASE`). The mapping is
+  of every buffer the draw's sets have, alike for all its stages. A stage
+  run as compute beside the driver's buffers -- mesh and task shaders --
+  merges always. The driver's own buffers past WebGPU's 8 dynamic storage
+  buffers a pipeline layout are bound at their offsets, in a bind group of
+  the draw's.
 - **Arrays of descriptors** are bindings of their own. A dynamic or
   non-uniform index chooses among them in the shader: reads from each,
   selected; writes only where the index is.
@@ -692,15 +709,15 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Depth clamp clamps to [0, 1], not to the viewport's depth range: Dawn on
   Metal clamps at the near and far planes. A narrow or inverted range with
   depth clamp is off where geometry is past it.
-- WebGPU has 10 storage buffers a stage in browsers, and texel buffers are
-  storage buffers, beyond what Vulkan counts as such; so are storage images
-  a shader does atomics on.
+- Storage images a shader does atomics on are storage buffers of their
+  own, which no merge makes fewer of: past WebGPU's 10 a stage with the
+  rest, the pipeline is invalid. And geometry and tessellation shaders'
+  buffers are not merged.
 - Vulkan 1.3 is reported, but for `bufferDeviceAddress`: WebGPU has no
   pointers.
 - Descriptor indexing's features, each of them, but not
   `VK_EXT_descriptor_indexing`: that asks for 500000 descriptors a stage,
   where WebGPU has a few dozen bindings.
-- 64-bit floats as vertex inputs: WebGPU has none.
 - Line rasterization modes, stipples and widths of lines with adjacency,
   which are WebGPU's one-pixel lines; and Bresenham's lines on a
   multisampled pass, whose quads cover samples, not whole pixels.
@@ -745,7 +762,10 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   rather than of its planes' views.
 - Images bound to the same memory share nothing but it: an optimal image's
   texels are its texture's, so aliasing images see each other's writes only
-  through copies (YCbCr's memory_alias cases among them).
+  through copies -- but for images of VK_IMAGE_CREATE_ALIAS_BIT bound where
+  another is (or a plane of one), of the same layout, which are one
+  texture: of another format of as many bytes a texel, viewed through the
+  aliases of the image's format. Not of packed 16-bit formats.
 - Multisampled array images are a texture for each layer, since WebGPU
   has no multisampled arrays: attachments, clears, copies and resolves
   (vk_meta's, for formats WebGPU does not resolve, a layer at a time) are

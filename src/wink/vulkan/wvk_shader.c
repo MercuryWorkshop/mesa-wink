@@ -982,6 +982,30 @@ blend_clamp(nir_builder *b, nir_def *v, const struct util_format_description *d)
    return v;
 }
 
+/* Each fdiv after `from`, up to `to`, of one block: q = a / b, then
+ * q + (a - q * b) / b, one Newton step, which rounds it correctly where
+ * the first quotient was within an ulp. */
+static void
+exact_divisions(nir_instr *from, nir_instr *to)
+{
+   if (from->block != to->block)
+      return;
+   for (nir_instr *instr = nir_instr_next(from); instr && instr != nir_instr_next(to); instr = nir_instr_next(instr)) {
+      if (instr->type != nir_instr_type_alu || nir_instr_as_alu(instr)->op != nir_op_fdiv)
+         continue;
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+      nir_builder e = nir_builder_at(nir_after_instr(instr));
+      nir_def *n = nir_ssa_for_alu_src(&e, alu, 0), *d = nir_ssa_for_alu_src(&e, alu, 1);
+      nir_def *q = &alu->def;
+      nir_def *r = nir_ffma(&e, nir_fneg(&e, q), d, n);
+      nir_def *better = nir_ffma(&e, r, nir_frcp(&e, d), q);
+      /* Where the first was not a number, or its divisor 0, as it was. */
+      better = nir_bcsel(&e, nir_feq(&e, better, better), better, q);
+      nir_def_rewrite_uses_after(q, better);
+      instr = nir_def_instr(better);
+   }
+}
+
 static nir_def *
 blend_apply(nir_builder *b, uint32_t eq, VkFormat format, nir_def *s, nir_def *s1, nir_def *d, nir_def *k)
 {
@@ -1000,7 +1024,15 @@ blend_apply(nir_builder *b, uint32_t eq, VkFormat format, nir_def *s, nir_def *s
          .dst_premultiplied = (eq >> 7) & 1,
          .overlap = (enum pipe_blend_overlap_mode)((eq >> 8) & 3),
       };
-      return nir_color_blend_advanced(b, &rt, s, d);
+      /* Its divisions correctly rounded: an equation's branches are chosen
+       * by where the quotient is -- premultiplied colour over alpha against
+       * 1 -- which a GPU's reciprocal misses by an ulp. So each quotient is
+       * made again from its remainder, as Metal's division is exact. */
+      nir_def *mark = nir_undef(b, 1, 32);
+      nir_def *blended = nir_color_blend_advanced(b, &rt, s, d);
+      exact_divisions(nir_def_instr(mark), nir_def_instr(blended));
+      nir_instr_remove(nir_def_instr(mark));
+      return blended;
    }
    nir_def *out[4];
    for (unsigned c = 0; c < 4; ++c) {
@@ -4711,6 +4743,81 @@ driver_layer(nir_builder *b, unsigned which)
    return nir_channel(b, words, which);
 }
 
+/* 16-bit generic varyings as 32-bit ones, which WGSL's are anyway: so
+ * that those packed in one location, a component each, can be one vector
+ * of it (nir_opt_vectorize_io_vars, which has only 32-bit ones). Each load
+ * narrowed and each store widened. */
+static const struct glsl_type *
+widened_io_type(const struct glsl_type *type)
+{
+   if (glsl_type_is_array(type))
+      return glsl_array_type(widened_io_type(glsl_get_array_element(type)), glsl_get_length(type),
+                             glsl_get_explicit_stride(type));
+   switch (glsl_get_base_type(type)) {
+   case GLSL_TYPE_FLOAT16:
+      return glsl_vector_type(GLSL_TYPE_FLOAT, glsl_get_vector_elements(type));
+   case GLSL_TYPE_INT16:
+      return glsl_vector_type(GLSL_TYPE_INT, glsl_get_vector_elements(type));
+   case GLSL_TYPE_UINT16:
+      return glsl_vector_type(GLSL_TYPE_UINT, glsl_get_vector_elements(type));
+   default:
+      return type;
+   }
+}
+
+static bool
+widen_small_io_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_deref && intr->intrinsic != nir_intrinsic_store_deref &&
+       intr->intrinsic != nir_intrinsic_interp_deref_at_centroid && intr->intrinsic != nir_intrinsic_interp_deref_at_sample &&
+       intr->intrinsic != nir_intrinsic_interp_deref_at_offset)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   if (!nir_deref_mode_is_one_of(deref, nir_var_shader_in | nir_var_shader_out))
+      return false;
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   if (!var || !_mesa_set_search(data, var))
+      return false;
+   const enum glsl_base_type base = glsl_get_base_type(glsl_without_array(var->type));
+   if (intr->intrinsic == nir_intrinsic_store_deref) {
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *value = intr->src[1].ssa;
+      if (value->bit_size != 16)
+         return false;
+      value = base == GLSL_TYPE_FLOAT ? nir_f2f32(b, value) : base == GLSL_TYPE_INT ? nir_i2i32(b, value) : nir_u2u32(b, value);
+      nir_src_rewrite(&intr->src[1], value);
+      return true;
+   }
+   if (intr->def.bit_size != 16)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   intr->def.bit_size = 32;
+   nir_def *narrow = base == GLSL_TYPE_FLOAT ? nir_f2f16(b, &intr->def) : nir_u2u16(b, &intr->def);
+   nir_def_rewrite_uses_after(&intr->def, narrow);
+   return true;
+}
+
+static bool
+widen_small_io_vars(nir_shader *nir)
+{
+   struct set *widened = _mesa_pointer_set_create(NULL);
+   nir_foreach_variable_with_modes(var, nir, nir_var_shader_in | nir_var_shader_out) {
+      if (var->data.location < VARYING_SLOT_VAR0 || glsl_get_bit_size(glsl_without_array(var->type)) != 16 ||
+          (nir->info.stage == MESA_SHADER_VERTEX && var->data.mode == nir_var_shader_in) ||
+          (nir->info.stage == MESA_SHADER_FRAGMENT && var->data.mode == nir_var_shader_out))
+         continue;
+      var->type = widened_io_type(var->type);
+      _mesa_set_add(widened, var);
+   }
+   const bool any = widened->entries > 0;
+   if (any) {
+      nir_fixup_deref_types(nir);
+      nir_shader_intrinsics_pass(nir, widen_small_io_instr, nir_metadata_control_flow, widened);
+   }
+   _mesa_set_destroy(widened, NULL);
+   return any;
+}
+
 /* gl_Layer and gl_ViewportIndex from a vertex shader. WebGPU renders one
  * layer and one viewport: a pass of several layers is one per layer, and
  * a vertex of another layer than the pass's goes out of the clip volume
@@ -4910,7 +5017,20 @@ struct word_buffers {
     * WVK_META_BUF_RANGE): robustBufferAccess2, or null descriptors. */
    const uint32_t *meta;
    bool robust_ubo, robust_ssbo;
+   /* The shader's key: which buffers are merged (merge_binding). */
+   const struct wvk_shader_key *key;
 };
+
+/* The merged binding of a storage or texel buffer (set, binding), or -1. */
+static int
+merged_slot(const struct wvk_shader_key *key, uint32_t set, uint32_t binding)
+{
+   for (uint32_t i = 0; key && i < key->merge_count; ++i) {
+      if (key->merge_binding[i] == (set << 10 | binding))
+         return key->merge_slot[i] - 1;
+   }
+   return -1;
+}
 
 /* The binding an index operand of load_ssbo and friends came from:
  * vulkan_resource_index, through load_vulkan_descriptor; and for a
@@ -5005,13 +5125,29 @@ static nir_def *
 lower_word_access(nir_builder *b, struct word_buffers *wb, nir_intrinsic_instr *intr, bool ubo, uint32_t set,
                   uint32_t binding)
 {
-   nir_variable *var = word_var(b->shader, wb, ubo, set, binding);
+   /* A buffer merged into its WGPUBuffer's binding: the words of that,
+    * from where its record says it is. */
+   const int merged = set == WVK_DRIVER_GROUP && binding >= WVK_DRIVER_SLOT_BASE ? -1
+                                                                                : merged_slot(wb->key, set, binding);
+   /* A merged uniform buffer is read as storage, of words. */
+   if (merged >= 0)
+      ubo = false;
+   nir_variable *var = merged >= 0 ? word_var(b->shader, wb, false, WVK_DRIVER_GROUP, WVK_DRIVER_SLOT_MERGED + merged)
+                                   : word_var(b->shader, wb, ubo, set, binding);
+   nir_def *base_word = NULL;
+   if (merged >= 0) {
+      nir_variable *push = word_var(b->shader, wb, false, WVK_DRIVER_GROUP, WVK_DRIVER_SLOT_PUSH);
+      const uint32_t at = WVK_META_OFFSET / 4 + wb->meta[MIN2(set, 3)] + binding * WVK_META_WORDS + WVK_META_BUF_BASE;
+      base_word = nir_ushr_imm(b, load_word(b, push, false, nir_imm_int(b, at)), 2);
+   }
    /* The descriptor's range, where accesses are bounded by it: loads past
-    * it are zero, and stores and atomics none. */
+    * it are zero, and stores and atomics none. The size of a merged one is
+    * its record's too. */
    nir_def *range = NULL;
    const bool bounded = nir_intrinsic_has_access(intr) && (nir_intrinsic_access(intr) & ACCESS_IN_BOUNDS);
-   if ((ubo ? wb->robust_ubo : wb->robust_ssbo) && wb->meta && !bounded &&
-       (set != WVK_DRIVER_GROUP || binding < WVK_DRIVER_SLOT_BASE)) {
+   if ((((ubo ? wb->robust_ubo : wb->robust_ssbo) && !bounded) ||
+        (merged >= 0 && intr->intrinsic == nir_intrinsic_get_ssbo_size)) &&
+       wb->meta && (set != WVK_DRIVER_GROUP || binding < WVK_DRIVER_SLOT_BASE)) {
       /* From the push binding's words: this pass makes the words of any
        * load it could make of it. */
       nir_variable *push = word_var(b->shader, wb, false, WVK_DRIVER_GROUP, WVK_DRIVER_SLOT_PUSH);
@@ -5028,6 +5164,11 @@ lower_word_access(nir_builder *b, struct word_buffers *wb, nir_intrinsic_instr *
 
    const int offset_src = intr->intrinsic == nir_intrinsic_store_ssbo ? 2 : 1;
    nir_def *first = nir_ushr_imm(b, intr->src[offset_src].ssa, 2);
+   /* Bounds are of the buffer's own words; its merged binding's are after
+    * its base. */
+   nir_def *own_first = first;
+   if (base_word)
+      first = nir_iadd(b, first, base_word);
 
    if (intr->intrinsic == nir_intrinsic_load_ubo || intr->intrinsic == nir_intrinsic_load_ssbo) {
       nir_def *comps[NIR_MAX_VEC_COMPONENTS];
@@ -5035,7 +5176,8 @@ lower_word_access(nir_builder *b, struct word_buffers *wb, nir_intrinsic_instr *
          nir_def *at = nir_iadd_imm(b, first, c);
          comps[c] = load_word(b, var, ubo, at);
          if (range)
-            comps[c] = nir_bcsel(b, nir_ult(b, nir_ishl_imm(b, at, 2), range), comps[c], nir_imm_int(b, 0));
+            comps[c] = nir_bcsel(b, nir_ult(b, nir_ishl_imm(b, nir_iadd_imm(b, own_first, c), 2), range), comps[c],
+                                 nir_imm_int(b, 0));
       }
       return nir_vec(b, comps, intr->def.num_components);
    }
@@ -5046,7 +5188,7 @@ lower_word_access(nir_builder *b, struct word_buffers *wb, nir_intrinsic_instr *
       u_foreach_bit(c, nir_intrinsic_write_mask(intr)) {
          nir_def *at = nir_iadd_imm(b, first, c);
          if (range)
-            nir_push_if(b, nir_ult(b, nir_ishl_imm(b, at, 2), range));
+            nir_push_if(b, nir_ult(b, nir_ishl_imm(b, nir_iadd_imm(b, own_first, c), 2), range));
          nir_store_deref(b, nir_build_deref_array(b, words, at), nir_channel(b, value, c), 0x1);
          if (range)
             nir_pop_if(b, NULL);
@@ -5057,7 +5199,7 @@ lower_word_access(nir_builder *b, struct word_buffers *wb, nir_intrinsic_instr *
    /* Atomics, on one word; none past the range, which returns zero. */
    if (range) {
       nir_def *zero = nir_imm_int(b, 0);
-      nir_push_if(b, nir_ult(b, nir_ishl_imm(b, first, 2), range));
+      nir_push_if(b, nir_ult(b, nir_ishl_imm(b, own_first, 2), range));
       nir_def *result = lower_word_atomic(b, var, intr, first);
       nir_pop_if(b, NULL);
       return nir_if_phi(b, result, zero);
@@ -5730,6 +5872,7 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
    struct word_buffers wb = {
       .vars = _mesa_pointer_hash_table_create(mem_ctx),
       .info = info,
+      .key = &shader->key,
       .ubo_sizes = _mesa_pointer_hash_table_create(mem_ctx),
       .meta = shader->meta_base,
       .robust_ubo = rs && (rs->uniform_buffers == VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_2 ||
@@ -6352,7 +6495,9 @@ reflect_bindings(nir_shader *nir, const struct vk_shader_compile_info *info,
             sb->kind = WVK_BINDING_STORAGE_READ;
          }
          if (var->data.descriptor_set == WVK_DRIVER_GROUP && var->data.binding >= WVK_DRIVER_SLOT_BASE) {
-            sb->dynamic = true;
+            /* A merged binding is all of a WGPUBuffer, bound at the draw. */
+            sb->dynamic = var->data.binding < WVK_DRIVER_SLOT_MERGED ||
+                          var->data.binding >= WVK_DRIVER_SLOT_MERGED + WVK_MAX_MERGED_BUFFERS;
             shader->uses_push_constants |= var->data.binding == WVK_DRIVER_SLOT_PUSH;
             shader->uses_draw_parameters |= var->data.binding == WVK_DRIVER_SLOT_DRAW;
          } else {
@@ -7318,6 +7463,12 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    }
    memcpy(shader->key.meta_base, shader->meta_base, sizeof(shader->meta_base));
    shader->key.meta_words = shader->meta_words;
+   /* Buffers merged into their WGPUBuffers' bindings (lower_word_access). */
+   if (records) {
+      shader->key.merge_count = records->merge_count;
+      memcpy(shader->key.merge_slot, records->merge_slot, sizeof(shader->key.merge_slot));
+      memcpy(shader->key.merge_binding, records->merge_binding, sizeof(shader->key.merge_binding));
+   }
    if (WVK_META_OFFSET + meta_words * 4 > WVK_PUSH_WINDOW)
       mesa_logw_once("wvk: a pipeline layout of more descriptors than their records have room for");
 
@@ -7698,6 +7849,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
             var->data.interpolation = INTERP_MODE_FLAT;
       }
    }
+   NIR_PASS(_, nir, widen_small_io_vars);
    NIR_PASS(_, nir, nir_opt_vectorize_io_vars,
             nir->info.stage == MESA_SHADER_VERTEX ? nir_var_shader_out
             : nir->info.stage == MESA_SHADER_FRAGMENT ? nir_var_shader_in : 0);
@@ -8203,6 +8355,24 @@ static void compile_digest(struct wvk_device *dev, const struct vk_shader_compil
 static struct wvk_shader *cached_variant(struct wvk_device *dev, const blake3_hash digest);
 static void cache_variant(struct wvk_device *dev, const blake3_hash digest, const struct wvk_shader *variant);
 
+/* Whether a shader has as many storage and texel buffers as WebGPU binds
+ * at most a stage, with the driver's: a dispatch may merge them into the
+ * bindings of their WGPUBuffers (wvk_shader_key.merge_binding), in a
+ * variant of its source. */
+static bool
+many_buffers(const nir_shader *nir)
+{
+   unsigned count = 0;
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ssbo | nir_var_uniform | nir_var_image) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      if (var->data.mode == nir_var_mem_ssbo ||
+          ((glsl_type_is_texture(type) || glsl_type_is_image(type) || glsl_type_is_sampler(type)) &&
+           glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_BUF))
+         count += MAX2(glsl_get_aoa_size(var->type), 1);
+   }
+   return count >= 7;
+}
+
 static VkResult
 wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_compile_info *infos,
             const struct vk_graphics_pipeline_state *state, const struct vk_features *enabled_features,
@@ -8227,6 +8397,7 @@ wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_co
            infos[i].stage == MESA_SHADER_GEOMETRY || infos[i].stage == MESA_SHADER_TESS_CTRL ||
            infos[i].stage == MESA_SHADER_TESS_EVAL || infos[i].stage == MESA_SHADER_MESH ||
            infos[i].stage == MESA_SHADER_TASK || has_unformatted_images(infos[i].nir) ||
+           many_buffers(infos[i].nir) ||
            (dev->vk.enabled_features.nonSeamlessCubeMap && has_float_cubes(infos[i].nir)) ||
            ((dev->vk.enabled_features.image2DViewOf3D || dev->vk.enabled_features.sampler2DViewOf3D) &&
             has_flat_views(infos[i].nir))) &&
@@ -8393,6 +8564,8 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
 
 static struct wvk_shader *variant_for(struct wvk_device *dev, struct wvk_shader *shader,
                                       const struct wvk_shader_key *key, const struct vk_vertex_input_state *vi);
+static bool key_image_formats(const struct wvk_shader *shader, const struct wvk_bound_views *views,
+                              struct wvk_shader_key *key);
 
 struct wvk_shader *
 wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsigned kind, unsigned vs_vars,
@@ -8480,12 +8653,16 @@ wvk_shader_tess_variant(struct wvk_device *dev, struct wvk_shader *shader, unsig
 
 struct wvk_shader *
 wvk_shader_mesh_variant(struct wvk_device *dev, struct wvk_shader *shader, unsigned kind, bool after_task,
-                        const struct wvk_shader *other, const struct vk_dynamic_graphics_state *dyn, uint32_t stats)
+                        const struct wvk_shader *other, const struct vk_dynamic_graphics_state *dyn, uint32_t stats,
+                        const struct wvk_bound_views *views)
 {
    if (!shader || !shader->source)
       return NULL;
    struct wvk_shader_key key;
    memset(&key, 0, sizeof(key));
+   /* The descriptors bound, as a draw's shaders' variants have them. */
+   if (views)
+      key_image_formats(shader, views, &key);
    for (uint32_t g = 0; g < 4; ++g) {
       key.meta_base[g] = key.meta_words;
       const int32_t words = MAX2(shader->set_words[g], other ? other->set_words[g] : -1);
@@ -8549,6 +8726,19 @@ key_image_formats(const struct wvk_shader *shader, const struct wvk_bound_views 
    /* And whether a view bound has a minimum LOD. */
    key->min_lods = views ? views->min_lods : shader->key.min_lods;
    same &= key->min_lods == shader->key.min_lods;
+   /* And its buffers merged into their WGPUBuffers' bindings. */
+   if (views) {
+      key->merge_count = views->merge_count;
+      memcpy(key->merge_slot, views->merge_slot, sizeof(key->merge_slot));
+      memcpy(key->merge_binding, views->merge_binding, sizeof(key->merge_binding));
+   } else {
+      key->merge_count = shader->key.merge_count;
+      memcpy(key->merge_slot, shader->key.merge_slot, sizeof(key->merge_slot));
+      memcpy(key->merge_binding, shader->key.merge_binding, sizeof(key->merge_binding));
+   }
+   same &= key->merge_count == shader->key.merge_count &&
+           !memcmp(key->merge_slot, shader->key.merge_slot, sizeof(key->merge_slot)) &&
+           !memcmp(key->merge_binding, shader->key.merge_binding, sizeof(key->merge_binding));
    return same;
 }
 

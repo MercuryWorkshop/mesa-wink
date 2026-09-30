@@ -248,6 +248,29 @@ get_layout(struct wvk_device *dev, struct wvk_shader *const *shaders, uint32_t s
       }
    }
 
+   /* WebGPU's dynamic storage buffers a layout, of which the
+    * application's sets take what Vulkan let it have: past that, the
+    * driver's buffers but the push data are bound at their offsets, in a
+    * bind group made at each draw (baked_driver_offsets). */
+   const WGPULimits *limits = &wvk_device_physical(dev)->limits;
+   uint32_t dynamic_storage = 0;
+   for (uint32_t g = 0; g < group_count; ++g) {
+      for (uint32_t i = 0; entries[g] && i < counts[g]; ++i) {
+         const struct wvk_shader_binding *b = &entries[g][i].b;
+         dynamic_storage += b->dynamic && (b->kind == WVK_BINDING_STORAGE || b->kind == WVK_BINDING_STORAGE_READ);
+      }
+   }
+   for (uint32_t i = counts[WVK_DRIVER_GROUP]; entries[WVK_DRIVER_GROUP] && i-- > 0 &&
+                                               dynamic_storage > limits->maxDynamicStorageBuffersPerPipelineLayout;) {
+      struct wvk_shader_binding *b = &entries[WVK_DRIVER_GROUP][i].b;
+      if (!b->dynamic || b->binding < WVK_DRIVER_SLOT_BASE || b->binding == WVK_DRIVER_SLOT_PUSH ||
+          b->binding == WVK_DRIVER_SLOT_DRAW || b->binding == WVK_DRIVER_SLOT_LOCKS ||
+          (b->kind != WVK_BINDING_STORAGE && b->kind != WVK_BINDING_STORAGE_READ))
+         continue;
+      b->dynamic = false;
+      --dynamic_storage;
+   }
+
    struct wvk_layout key = { .group_count = group_count };
    bool ok = true;
    for (uint32_t g = 0; g < group_count && ok; ++g) {
@@ -480,6 +503,7 @@ wvk_device_init_pipeline_caches(struct wvk_device *dev)
 {
    simple_mtx_init(&dev->cache_lock, mtx_plain);
    util_dynarray_init(&dev->placeholders, NULL);
+   util_dynarray_init(&dev->bound_aliases, NULL);
    dev->bind_group_layouts = _mesa_hash_table_create(NULL, bgl_hash, bgl_equal);
    dev->pipeline_layouts = _mesa_hash_table_create(NULL, layout_hash, layout_equal);
    dev->render_pipelines = _mesa_hash_table_create(NULL, render_hash, render_equal);
@@ -661,6 +685,7 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuTextureRelease(p->texture);
    }
    util_dynarray_fini(&dev->placeholders);
+   util_dynarray_fini(&dev->bound_aliases);
    simple_mtx_destroy(&dev->cache_lock);
 }
 
@@ -920,6 +945,10 @@ struct wvk_bound_state {
    /* The active pipeline statistics query's counters, which shaders add
     * to (wvk_query.c). */
    struct wvk_driver_buffer stats;
+   /* The WGPUBuffers storage and texel buffers are merged into the
+    * bindings of (WVK_DRIVER_SLOT_MERGED), of the draw's sets. */
+   struct wvk_driver_buffer merged[WVK_MAX_MERGED_BUFFERS];
+   struct wvk_device_memory *merged_mem[WVK_MAX_MERGED_BUFFERS];
    /* The last draw's pipeline layout. */
    struct wvk_layout *graphics_layout;
 
@@ -1208,6 +1237,12 @@ wvk_CmdBindIndexBuffer2(VkCommandBuffer commandBuffer, VkBuffer buffer, VkDevice
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    struct wvk_bound_state *st = cmd->replay->state;
    st->ib = bound_buffer(cmd, buffer, offset, size);
+   /* None, of nullDescriptor (VK_KHR_maintenance6): every index 0, which
+    * the null buffer's zeros are, as far as they go. */
+   if (buffer == VK_NULL_HANDLE) {
+      struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+      st->ib = (struct wvk_bound_buffer){ .buffer = dev->null_buffer, .size = 65536, .serial = UINT64_MAX - 1 };
+   }
    st->index_type = indexType;
    st->ib16_valid = false;
 }
@@ -1407,6 +1442,8 @@ driver_binding_buffer(const struct wvk_bound_state *st, uint32_t binding)
       return &st->tess[binding - WVK_DRIVER_SLOT_TESS_VERTICES];
    if (binding == WVK_DRIVER_SLOT_STATS)
       return &st->stats;
+   if (binding >= WVK_DRIVER_SLOT_MERGED && binding < WVK_DRIVER_SLOT_MERGED + WVK_MAX_MERGED_BUFFERS)
+      return &st->merged[binding - WVK_DRIVER_SLOT_MERGED];
    return NULL;
 }
 
@@ -1645,6 +1682,9 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
          if (d && d->buffer) {
             e->buffer = d->buffer;
             e->size = d->size;
+            /* Not dynamic, past WebGPU's count of those: where it is. */
+            if (!b->dynamic)
+               e->offset = d->offset;
          } else if (b->binding >= WVK_DRIVER_SLOT_VERTEX) {
             e->buffer = dev->null_buffer;
             e->size = 256;
@@ -1985,6 +2025,22 @@ snapshot_feedback(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout)
       wvk_replay_restart_pass(cmd, replay->pass_layer);
 }
 
+/* Whether the driver's group binds a buffer of its own at its offset,
+ * past WebGPU's count of dynamic ones (get_layout): its bind group is the
+ * draw's. */
+static bool
+baked_driver_offsets(const struct wvk_bgl *bgl)
+{
+   for (uint32_t i = 0; i < bgl->count; ++i) {
+      const struct wvk_shader_binding *b = &bgl->entries[i].b;
+      if (b->binding >= WVK_DRIVER_SLOT_BASE && !b->dynamic &&
+          (b->kind == WVK_BINDING_STORAGE || b->kind == WVK_BINDING_STORAGE_READ) &&
+          b->binding != WVK_DRIVER_SLOT_LOCKS)
+         return true;
+   }
+   return false;
+}
+
 /* A set's bind group for this layout: kept in the set until it changes. */
 static WGPUBindGroup
 get_bind_group(struct wvk_device *dev, struct wvk_bgl *bgl, struct wvk_descriptor_set *set, uint32_t group,
@@ -2054,8 +2110,22 @@ push_offset(struct wvk_device *dev, struct wvk_replay *replay, uint32_t bind_poi
    for (uint32_t g = 0; shader && g < WVK_MAX_GROUPS; ++g) {
       const struct wvk_descriptor_set *set = st->sets[bind_point][g].set;
       const uint32_t end = g + 1 < WVK_MAX_GROUPS ? shader->meta_base[g + 1] : shader->meta_words;
-      if (set && shader->meta_base[g] < meta_words)
-         wvk_descriptor_set_meta(set, records + shader->meta_base[g], MIN2(end, meta_words) - shader->meta_base[g]);
+      if (set && shader->meta_base[g] < meta_words) {
+         const uint32_t words = MIN2(end, meta_words) - shader->meta_base[g];
+         wvk_descriptor_set_meta(set, records + shader->meta_base[g], words);
+         /* Where a dynamic buffer is, as the bind's offset moves it. */
+         const struct wvk_bound_set *bound = &st->sets[bind_point][g];
+         for (uint32_t slot = 0; slot < set->layout->slot_count && (slot + 1) * WVK_META_WORDS <= words; ++slot) {
+            const struct wvk_descriptor_slot *ds = &set->layout->slots[slot];
+            const struct wvk_descriptor_set_binding_layout *bl = &set->layout->bindings[ds->binding];
+            if (bl->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC &&
+                bl->type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)
+               continue;
+            const uint32_t index = bl->dynamic_index + ds->element;
+            if (index < WVK_MAX_DYNAMIC)
+               records[shader->meta_base[g] + slot * WVK_META_WORDS + WVK_META_BUF_BASE] += bound->dynamic_offsets[index];
+         }
+      }
    }
    st->push_offset = offset;
    st->push_bind_point = bind_point;
@@ -2073,6 +2143,46 @@ struct buffer_use {
    bool write;
 };
 
+static uint32_t merge_buffers(const struct wvk_bound_state *st, uint32_t bind_point, WGPUBuffer *buffers,
+                              struct wvk_device_memory **mems);
+static void upload_inline_blocks(struct wvk_device *dev, struct wvk_descriptor_set *set);
+
+/* The WGPUBuffers the layout's merged bindings are of (bound_merges), all
+ * of each, as far as a binding can be. */
+static void
+fill_merged(struct wvk_device *dev, struct wvk_bound_state *st, uint32_t bind_point, const struct wvk_layout *layout)
+{
+   memset(st->merged, 0, sizeof(st->merged));
+   memset(st->merged_mem, 0, sizeof(st->merged_mem));
+   if (layout->group_count <= WVK_DRIVER_GROUP)
+      return;
+   const struct wvk_bgl *bgl = layout->groups[WVK_DRIVER_GROUP];
+   bool any = false;
+   for (uint32_t i = 0; i < bgl->count; ++i) {
+      const uint32_t binding = bgl->entries[i].b.binding;
+      any |= binding >= WVK_DRIVER_SLOT_MERGED && binding < WVK_DRIVER_SLOT_MERGED + WVK_MAX_MERGED_BUFFERS;
+   }
+   if (!any)
+      return;
+   WGPUBuffer buffers[WVK_MAX_MERGED_BUFFERS];
+   const uint32_t n = merge_buffers(st, bind_point, buffers, st->merged_mem);
+   const uint64_t max = wvk_device_physical(dev)->limits.maxStorageBufferBindingSize;
+   /* Inline uniform blocks reach their buffer with their set's bind
+    * group, which a set of merged bindings alone has none of. */
+   for (uint32_t g = 0; g < WVK_MAX_GROUPS; ++g) {
+      if (st->sets[bind_point][g].set)
+         upload_inline_blocks(dev, st->sets[bind_point][g].set);
+   }
+   for (uint32_t i = 0; i < n; ++i) {
+      const uint64_t size = st->merged_mem[i] ? st->merged_mem[i]->buffer_size : wgpuBufferGetSize(buffers[i]);
+      st->merged[i] = (struct wvk_driver_buffer){
+         .buffer = buffers[i],
+         .serial = st->merged_mem[i] ? st->merged_mem[i]->serial : 0,
+         .size = MIN2(size, max) & ~3ull,
+      };
+   }
+}
+
 static uint32_t
 gather_buffer_uses(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_layout *layout,
                    uint32_t bind_point, struct buffer_use *out, uint32_t max)
@@ -2080,6 +2190,20 @@ gather_buffer_uses(struct wvk_device *dev, struct wvk_replay *replay, const stru
    const struct wvk_physical_device *pdev = wvk_device_physical(dev);
    struct wvk_bound_state *st = replay->state;
    uint32_t n = 0;
+   fill_merged(dev, st, bind_point, layout);
+   /* The merged bindings, all of their WGPUBuffers. */
+   if (layout->group_count > WVK_DRIVER_GROUP) {
+      const struct wvk_bgl *bgl = layout->groups[WVK_DRIVER_GROUP];
+      for (uint32_t i = 0; i < bgl->count && n < max; ++i) {
+         const struct wvk_shader_binding *b = &bgl->entries[i].b;
+         if (b->binding < WVK_DRIVER_SLOT_MERGED || b->binding >= WVK_DRIVER_SLOT_MERGED + WVK_MAX_MERGED_BUFFERS)
+            continue;
+         const struct wvk_driver_buffer *m = &st->merged[b->binding - WVK_DRIVER_SLOT_MERGED];
+         if (m->buffer)
+            out[n++] = (struct buffer_use){ WVK_DRIVER_GROUP, b->binding, m->buffer, 0, m->size,
+                                            b->kind == WVK_BINDING_STORAGE };
+      }
+   }
    for (uint32_t g = 0; g < layout->group_count; ++g) {
       const struct wvk_bgl *bgl = layout->groups[g];
       const struct wvk_bound_set *bound = &st->sets[bind_point][g];
@@ -2169,6 +2293,7 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
             bool driver_only)
 {
    struct wvk_bound_state *st = replay->state;
+   fill_merged(dev, st, bind_point, layout);
    /* The statistics query's counters, where one is active. */
    st->stats = replay->counters
                   ? (struct wvk_driver_buffer){ replay->counters, replay->counters_serial, 0, WVK_COUNTERS * 4 }
@@ -2199,8 +2324,9 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
          swapped |= s->group == g;
       /* And the driver's group of a draw whose logic op reads copies of
        * the attachments, which are new at every draw. */
-      const bool logic_op = pass && g == WVK_DRIVER_GROUP && st->fs &&
-                            (st->fs->logic_op_reads || st->fs->reads_depth_bounds || st->fs->key.fsr_attachment);
+      const bool logic_op = (pass && g == WVK_DRIVER_GROUP && st->fs &&
+                             (st->fs->logic_op_reads || st->fs->reads_depth_bounds || st->fs->key.fsr_attachment)) ||
+                            (g == WVK_DRIVER_GROUP && baked_driver_offsets(bgl));
       const bool reads_copies = swapped || logic_op ||
                                 (pass && replay->snapshots.size && bgl->count && bound->set &&
                                  reads_snapshot(replay, bgl, bound->set));
@@ -2222,6 +2348,18 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
       uint32_t offset_count = 0;
       for (uint32_t i = 0; i < bgl->count; ++i) {
          const struct wvk_shader_binding *b = &bgl->entries[i].b;
+         if (g == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_MERGED &&
+             b->binding < WVK_DRIVER_SLOT_MERGED + WVK_MAX_MERGED_BUFFERS) {
+            /* A merged binding reads and writes where its buffers are. */
+            const uint32_t m = b->binding - WVK_DRIVER_SLOT_MERGED;
+            if (st->merged_mem[m]) {
+               const struct wvk_descriptor all = {
+                  .mem = st->merged_mem[m], .buffer = st->merged[m].buffer, .size = st->merged[m].size,
+               };
+               note_buffer(replay, &all, b->kind == WVK_BINDING_STORAGE);
+            }
+            continue;
+         }
          if (g == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
             if (b->dynamic && offset_count < WVK_MAX_DYNAMIC) {
                /* The draw binding is the push buffer unless it is not. */
@@ -3572,13 +3710,134 @@ has_min_lod(const struct wvk_descriptor *d)
    return d->view && d->min_lod > 0.0f;
 }
 
+static bool
+is_merged_type(VkDescriptorType type)
+{
+   return type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
+          type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER ||
+          type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC ||
+          type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+}
+
+/* The WGPUBuffers of the storage and texel buffers bound at `bind_point`,
+ * in the order the sets have them: each one's merged binding, alike for
+ * every stage of the draw. Their memory in `mems`. */
+static uint32_t
+merge_buffers(const struct wvk_bound_state *st, uint32_t bind_point, WGPUBuffer *buffers,
+              struct wvk_device_memory **mems)
+{
+   uint32_t n = 0;
+   for (uint32_t g = 0; g < WVK_MAX_GROUPS; ++g) {
+      const struct wvk_descriptor_set *set = st->sets[bind_point][g].set;
+      for (uint32_t slot = 0; set && slot < set->layout->slot_count; ++slot) {
+         const struct wvk_descriptor_slot *ds = &set->layout->slots[slot];
+         if (!is_merged_type(set->layout->bindings[ds->binding].type))
+            continue;
+         bool sampler;
+         uint32_t dynamic_index;
+         const struct wvk_descriptor *d = slot_descriptor(set, slot, &sampler, &dynamic_index);
+         /* Of memory, or a set's inline uniform blocks, which are none. */
+         if (!d || !d->buffer)
+            continue;
+         uint32_t i = 0;
+         while (i < n && buffers[i] != d->buffer)
+            ++i;
+         if (i == n && n < WVK_MAX_MERGED_BUFFERS) {
+            buffers[n] = d->buffer;
+            mems[n++] = d->mem;
+         }
+      }
+   }
+   return n;
+}
+
+/* The merges of a stage of more storage and texel buffers than WebGPU
+ * binds -- with the driver's own, and a few for its stage's passes -- as
+ * wvk_shader_key has them: each of its buffers bound into the binding of
+ * its WGPUBuffer, if every one of them can be. */
 static void
-bound_views(const struct wvk_bound_state *st, uint32_t bind_point, const struct wvk_shader *shader,
-            struct wvk_bound_views *views)
+bound_merges(const struct wvk_device *dev, const struct wvk_bound_state *st, uint32_t bind_point,
+             const struct wvk_shader *shader, struct wvk_bound_views *views)
+{
+   const WGPULimits *limits = &wvk_device_physical(dev)->limits;
+   uint32_t storage = 0, uniform = 0;
+   for (uint32_t i = 0; i < shader->binding_count; ++i) {
+      const struct wvk_shader_binding *b = &shader->bindings[i];
+      storage += b->kind == WVK_BINDING_STORAGE || b->kind == WVK_BINDING_STORAGE_READ;
+      uniform += b->kind == WVK_BINDING_UNIFORM;
+   }
+   /* Or of two storage or texel buffers of one WGPUBuffer that it writes,
+    * which WebGPU lets no stage have where their ranges meet, and Vulkan
+    * does: any two bound, of a shader that writes -- a vertex shader's
+    * writes are its compute run's, which its own bindings do not show. */
+   bool writes = shader->vk.stage == MESA_SHADER_VERTEX && shader->writes_storage;
+   for (uint32_t i = 0; i < shader->binding_count; ++i)
+      writes |= shader->bindings[i].kind == WVK_BINDING_STORAGE;
+   bool aliased = false;
+   if (writes) {
+      WGPUBuffer written[64];
+      uint32_t count = 0;
+      for (uint32_t g = 0; g < WVK_MAX_GROUPS && !aliased; ++g) {
+         const struct wvk_descriptor_set *set = st->sets[bind_point][g].set;
+         for (uint32_t slot = 0; set && slot < set->layout->slot_count && !aliased; ++slot) {
+            const VkDescriptorType type = set->layout->bindings[set->layout->slots[slot].binding].type;
+            if (type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && type != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC &&
+                type != VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)
+               continue;
+            bool sampler;
+            uint32_t dynamic_index;
+            const struct wvk_descriptor *d = slot_descriptor(set, slot, &sampler, &dynamic_index);
+            if (!d || !d->buffer)
+               continue;
+            for (uint32_t i = 0; i < count && !aliased; ++i)
+               aliased = written[i] == d->buffer;
+            if (count < ARRAY_SIZE(written))
+               written[count++] = d->buffer;
+         }
+      }
+   }
+   /* A stage run as compute with the driver's buffers besides -- mesh,
+    * task, geometry and tessellation -- whose own bindings are its
+    * variants', not its shell's: its buffers merged, always. */
+   const bool shell = shader->vk.stage == MESA_SHADER_MESH || shader->vk.stage == MESA_SHADER_TASK ||
+                      shader->vk.stage == MESA_SHADER_GEOMETRY || shader->vk.stage == MESA_SHADER_TESS_CTRL ||
+                      shader->vk.stage == MESA_SHADER_TESS_EVAL;
+   if (!shell && !aliased && storage + 2 <= limits->maxStorageBuffersPerShaderStage &&
+       uniform <= limits->maxUniformBuffersPerShaderStage)
+      return;
+   /* Every buffer of the draw's sets, whichever of them the shader has. */
+   WGPUBuffer buffers[WVK_MAX_MERGED_BUFFERS];
+   struct wvk_device_memory *mems[WVK_MAX_MERGED_BUFFERS];
+   const uint32_t n = merge_buffers(st, bind_point, buffers, mems);
+   uint32_t count = 0;
+   for (uint32_t g = 0; g < WVK_MAX_GROUPS; ++g) {
+      const struct wvk_descriptor_set *set = st->sets[bind_point][g].set;
+      for (uint32_t slot = 0; set && slot < set->layout->slot_count && slot < 1024; ++slot) {
+         if (!is_merged_type(set->layout->bindings[set->layout->slots[slot].binding].type))
+            continue;
+         bool sampler;
+         uint32_t dynamic_index;
+         const struct wvk_descriptor *d = slot_descriptor(set, slot, &sampler, &dynamic_index);
+         uint32_t m = 0;
+         while (d && m < n && buffers[m] != d->buffer)
+            ++m;
+         if (!d || !d->buffer || m == n || count == WVK_MAX_MERGES)
+            continue;
+         views->merge_binding[count] = g << 10 | slot;
+         views->merge_slot[count++] = m + 1;
+      }
+   }
+   views->merge_count = count;
+}
+
+static void
+bound_views(const struct wvk_device *dev, const struct wvk_bound_state *st, uint32_t bind_point,
+            const struct wvk_shader *shader, struct wvk_bound_views *views)
 {
    memset(views, 0, sizeof(*views));
    if (!shader)
       return;
+   bound_merges(dev, st, bind_point, shader, views);
    for (uint32_t i = 0; i < shader->unformatted_count; ++i) {
       const struct wvk_descriptor *d = bound_descriptor(st, bind_point, shader->unformatted[i]);
       if (d && d->view)
@@ -3617,8 +3876,8 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
       color_formats[i] = view ? view->vk.view_format : VK_FORMAT_UNDEFINED;
    }
    struct wvk_bound_views fs_images, vs_images;
-   bound_views(st, WVK_BIND_GRAPHICS, st->bound_fs, &fs_images);
-   bound_views(st, WVK_BIND_GRAPHICS, st->bound_vs, &vs_images);
+   bound_views(wvk_cmd_buffer_device(cmd), st, WVK_BIND_GRAPHICS, st->bound_fs, &fs_images);
+   bound_views(wvk_cmd_buffer_device(cmd), st, WVK_BIND_GRAPHICS, st->bound_vs, &vs_images);
    /* And the pass's shading rate attachment's texel size. */
    const VkExtent2D texel = replay->rendering.fsr_texel;
    fs_images.fsr_attachment =
@@ -3868,7 +4127,7 @@ run_vertices(struct wvk_cmd_buffer *cmd, unsigned runs, bool indexed, uint32_t f
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    const uint64_t total = (uint64_t)count * instances;
    struct wvk_bound_views images;
-   bound_views(st, WVK_BIND_GRAPHICS, st->bound_vs, &images);
+   bound_views(wvk_cmd_buffer_device(cmd), st, WVK_BIND_GRAPHICS, st->bound_vs, &images);
    struct wvk_shader *cs =
       wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, 1, false, NULL, &images, WVK_DRAW_PRIMITIVES, runs, 0);
    if (!cs || cs->vk.stage != MESA_SHADER_COMPUTE)
@@ -4411,7 +4670,7 @@ draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t
 
    /* The vertex shader's records. */
    struct wvk_bound_views images;
-   bound_views(st, WVK_BIND_GRAPHICS, st->bound_vs, &images);
+   bound_views(wvk_cmd_buffer_device(cmd), st, WVK_BIND_GRAPHICS, st->bound_vs, &images);
    struct wvk_shader *vs =
       wvk_shader_draw_variant(dev, st->bound_vs, NULL, dyn, 1, false, NULL, &images, WVK_DRAW_PRIMITIVES, 3, 0);
    if (!vs || vs->vk.stage != MESA_SHADER_COMPUTE) {
@@ -4663,9 +4922,13 @@ draw_mesh(struct wvk_cmd_buffer *cmd, uint32_t gx, uint32_t gy, uint32_t gz, WGP
    select_draw_shaders(cmd);
    replay->draw_mesh = replay->draw_points = false;
    const uint32_t stats = wvk_replay_stats(replay);
-   struct wvk_shader *mesh_cs = wvk_shader_mesh_variant(dev, mesh, 1, task != NULL, NULL, dyn, stats);
-   struct wvk_shader *mesh_vs = wvk_shader_mesh_variant(dev, mesh, 2, false, st->fs, dyn, 0);
-   struct wvk_shader *task_cs = task ? wvk_shader_mesh_variant(dev, task, 1, false, NULL, dyn, stats) : NULL;
+   struct wvk_bound_views mesh_views, task_views;
+   bound_views(dev, st, WVK_BIND_GRAPHICS, mesh, &mesh_views);
+   bound_views(dev, st, WVK_BIND_GRAPHICS, task, &task_views);
+   struct wvk_shader *mesh_cs = wvk_shader_mesh_variant(dev, mesh, 1, task != NULL, NULL, dyn, stats, &mesh_views);
+   struct wvk_shader *mesh_vs = wvk_shader_mesh_variant(dev, mesh, 2, false, st->fs, dyn, 0, &mesh_views);
+   struct wvk_shader *task_cs =
+      task ? wvk_shader_mesh_variant(dev, task, 1, false, NULL, dyn, stats, &task_views) : NULL;
    if (!mesh_cs || !mesh_vs || (task && !task_cs) || !mesh_pipelines(dev)) {
       mesa_logw_once("wvk: mesh or task shaders that could not be made compute");
       return;
@@ -4967,7 +5230,7 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
 
    /* The stages' compute shaders, and the draw's. */
    struct wvk_bound_views images;
-   bound_views(st, WVK_BIND_GRAPHICS, st->bound_vs, &images);
+   bound_views(wvk_cmd_buffer_device(cmd), st, WVK_BIND_GRAPHICS, st->bound_vs, &images);
    struct wvk_shader *vs =
       wvk_shader_draw_variant(dev, st->bound_vs, NULL, dyn, 1, false, NULL, &images, WVK_DRAW_PRIMITIVES, 3, 0);
    if (!vs || vs->vk.stage != MESA_SHADER_COMPUTE) {
@@ -6199,7 +6462,7 @@ flush_dispatch(struct wvk_cmd_buffer *cmd, struct wvk_bound_buffer *indirect)
    struct wvk_bound_state *st = replay->state;
    /* Or its variant for the formats of storage images it has none for. */
    struct wvk_bound_views images;
-   bound_views(st, WVK_BIND_COMPUTE, st->bound_cs, &images);
+   bound_views(wvk_cmd_buffer_device(cmd), st, WVK_BIND_COMPUTE, st->bound_cs, &images);
    st->cs = wvk_shader_dispatch_variant(dev, st->bound_cs, &images);
    if (!st->cs) {
       mesa_logw_once("wvk: a dispatch without a compute shader");

@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 40
+#define WVK_SHADER_BINARY_VERSION 41
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -81,6 +81,8 @@ enum wvk_draw_shape {
 
 /* Storage images without a format a shader is compiled for the views of. */
 #define WVK_MAX_UNFORMATTED_IMAGES 8
+/* Buffers of a stage merged into bindings of their WGPUBuffers, at most. */
+#define WVK_MAX_MERGES 48
 /* Cubes and the samplers a shader samples them with, which a non-seamless
  * sampler (VK_EXT_non_seamless_cube_map) has a variant sample a face at a
  * time. */
@@ -208,6 +210,13 @@ struct wvk_shader_key {
    /* Which of wvk_shader::flat_views have a 2D view of a 3D image bound: a
     * bit each, the 3D texture or image the view is of, at its slice. */
    uint8_t views_3d;
+   /* Storage and texel buffers merged into the bindings of the WGPUBuffers
+    * they are of, where the stage has more of them than WebGPU binds
+    * (WVK_DRIVER_SLOT_MERGED): each one's set << 10 | binding, and its
+    * merged binding + 1, of merge_count of them. */
+   uint8_t merge_count;
+   uint8_t merge_slot[WVK_MAX_MERGES];
+   uint16_t merge_binding[WVK_MAX_MERGES];
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
@@ -444,6 +453,11 @@ extern const struct vk_device_shader_ops wvk_device_shader_ops;
  * samplings a non-seamless sampler does (wvk_shader::cube_samples). */
 struct wvk_bound_views {
    VkFormat image_formats[WVK_MAX_UNFORMATTED_IMAGES];
+   /* Of a stage of more storage and texel buffers than WebGPU binds: the
+    * merged bindings of its buffers, as wvk_shader_key has them. */
+   uint8_t merge_count;
+   uint8_t merge_slot[WVK_MAX_MERGES];
+   uint16_t merge_binding[WVK_MAX_MERGES];
    /* Of a fragment shader's draw: its pass's shading rate attachment's
     * texel size, as key.fsr_attachment. */
    uint8_t fsr_attachment;
@@ -496,7 +510,8 @@ struct wvk_shader *wvk_shader_geometry_variant(struct wvk_device *dev, struct wv
  * the active queries', has them. */
 struct wvk_shader *wvk_shader_mesh_variant(struct wvk_device *dev, struct wvk_shader *shader, unsigned kind,
                                            bool after_task, const struct wvk_shader *other,
-                                           const struct vk_dynamic_graphics_state *dyn, uint32_t stats);
+                                           const struct vk_dynamic_graphics_state *dyn, uint32_t stats,
+                                           const struct wvk_bound_views *views);
 
 /* Whether a mesh shader's draw draws its points as quads (largePoints):
  * where it gives them a size, and they are rasterized (not `discard`). */
