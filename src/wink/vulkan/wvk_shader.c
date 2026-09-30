@@ -5473,7 +5473,8 @@ instance_element(nir_builder *b)
  * firstInstance) / divisor, or firstInstance for a divisor of 0, from
  * where the draw's range of the buffer starts in the binding. */
 static nir_def *
-fetch_attribute(nir_builder *b, const struct vk_vertex_input_state *vi, int location, uint32_t slot)
+fetch_attribute_wide(nir_builder *b, const struct vk_vertex_input_state *vi, int location, uint32_t slot,
+                     unsigned wide_out)
 {
    const struct vk_vertex_attribute_state *a = &vi->attributes[location];
    const struct vk_vertex_binding_state *vb = &vi->bindings[a->binding];
@@ -5505,6 +5506,26 @@ fetch_attribute(nir_builder *b, const struct vk_vertex_input_state *vi, int loca
                              .access = ACCESS_NON_WRITEABLE);
    }
    nir_def *address = nir_iadd(b, start, nir_iadd_imm(b, nir_imul(b, element, stride), a->offset));
+   if (wide_out) {
+      /* Each 64-bit channel, its two words joined; the last one's missing
+       * channels 0, and a fourth 1, as a narrower format's. */
+      const struct util_format_description *d = vk_format_description(a->format);
+      nir_def *out[4];
+      for (unsigned c = 0; c < wide_out; ++c) {
+         if (c < d->nr_channels) {
+            nir_def *at = nir_iand_imm(b, nir_iadd_imm(b, address, d->channel[c].shift / 8), ~3);
+            nir_def *lo = nir_load_ssbo(b, 1, 32, driver_buffer(b, WVK_DRIVER_SLOT_VERTEX + slot), at,
+                                        .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+            nir_def *hi = nir_load_ssbo(b, 1, 32, driver_buffer(b, WVK_DRIVER_SLOT_VERTEX + slot),
+                                        nir_iadd_imm(b, at, 4), .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+            out[c] = nir_pack_64_2x32_split(b, lo, hi);
+         } else {
+            const bool is_float = d->channel[0].type == UTIL_FORMAT_TYPE_FLOAT;
+            out[c] = c == 3 ? (is_float ? nir_imm_double(b, 1.0) : nir_imm_int64(b, 1)) : nir_imm_int64(b, 0);
+         }
+      }
+      return nir_vec(b, out, wide_out);
+   }
 
    const struct util_format_description *desc = vk_format_description(a->format);
    nir_def *channels[4];
@@ -5531,13 +5552,48 @@ fetch_attribute(nir_builder *b, const struct vk_vertex_input_state *vi, int loca
    return nir_vec(b, out, 4);
 }
 
+static nir_def *
+fetch_attribute(nir_builder *b, const struct vk_vertex_input_state *vi, int location, uint32_t slot)
+{
+   return fetch_attribute_wide(b, vi, location, slot, 0);
+}
+
+/* An attribute of 64-bit channels, as `components` 64-bit values. */
+static nir_def *
+fetch_attribute_64(nir_builder *b, const struct vk_vertex_input_state *vi, int location, uint32_t slot,
+                   unsigned components)
+{
+   return fetch_attribute_wide(b, vi, location, slot, components);
+}
+
+static bool
+zero_wide_input_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_deref || intr->def.bit_size != 64 ||
+       !nir_deref_mode_is(nir_src_as_deref(intr->src[0]), nir_var_shader_in))
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components, 64));
+   return true;
+}
+
 static bool
 pull_divided_attributes(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
                         struct wvk_shader *shader)
 {
    const struct vk_vertex_input_state *vi = state ? state->vi : NULL;
-   if (nir->info.stage != MESA_SHADER_VERTEX || !vi)
+   if (nir->info.stage != MESA_SHADER_VERTEX)
       return false;
+   /* Compiled apart, the vertex input unknown: 64-bit attributes, which
+    * WebGPU has no formats of, read zero, and a draw pulls them in a
+    * variant (pull_key) -- WGSL has no 64-bit inputs to leave them. */
+   if (!vi) {
+      if (!nir_shader_intrinsics_pass(nir, zero_wide_input_instr, nir_metadata_control_flow, NULL))
+         return false;
+      nir_remove_dead_derefs(nir);
+      nir_remove_dead_variables(nir, nir_var_shader_in, NULL);
+      return true;
+   }
    bool progress = false;
    nir_foreach_function_impl(impl, nir) {
       nir_builder b = nir_builder_create(impl);
@@ -5551,11 +5607,13 @@ pull_divided_attributes(nir_shader *nir, const struct vk_graphics_pipeline_state
             nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
             if (!nir_deref_mode_is(deref, nir_var_shader_in))
                continue;
-            /* A location of a matrix or an array is an element of it. */
+            /* A location of a matrix or an array is an element of it --
+             * two a dvec3 or dvec4 column, which Vulkan counts as GL's
+             * vertex inputs do not. */
             nir_variable *var = nir_deref_instr_get_variable(deref);
             int location = var->data.location - VERT_ATTRIB_GENERIC0;
             if (deref->deref_type == nir_deref_type_array && nir_src_is_const(deref->arr.index))
-               location += nir_src_as_uint(deref->arr.index);
+               location += nir_src_as_uint(deref->arr.index) * glsl_count_attribute_slots(deref->type, false);
             else if (deref->deref_type != nir_deref_type_var)
                continue;
             /* One the draw has no attribute at (vertexAttributeRobustness):
@@ -5572,10 +5630,12 @@ pull_divided_attributes(nir_shader *nir, const struct vk_graphics_pipeline_state
                progress = true;
                continue;
             }
-            if (!pulls(shader, vi, location, shader->key.points || shader->key.runs || shader->key.lines))
+                     if (!pulls(shader, vi, location, shader->key.points || shader->key.runs || shader->key.lines))
                continue;
-            if (glsl_get_bit_size(deref->type) == 64) {
-               mesa_logw_once("wvk: a 64-bit attribute the shader pulls");
+            const bool wide = vk_format_description(vi->attributes[location].format)->channel[0].size == 64;
+            if ((glsl_get_bit_size(deref->type) == 64) != wide) {
+               mesa_logw_once("wvk: an attribute of 64-bit %s read as %u-bit", wide ? "channels" : "values",
+                              glsl_get_bit_size(deref->type));
                continue;
             }
             const uint32_t binding = vi->attributes[location].binding;
@@ -5589,6 +5649,11 @@ pull_divided_attributes(nir_shader *nir, const struct vk_graphics_pipeline_state
             if (slot == shader->pulled_count)
                shader->pulled_bindings[shader->pulled_count++] = binding;
             b.cursor = nir_before_instr(instr);
+            if (wide) {
+               nir_def_replace(&intr->def, fetch_attribute_64(&b, vi, location, slot, intr->def.num_components));
+               progress = true;
+               continue;
+            }
             nir_def *value = nir_trim_vector(&b, fetch_attribute(&b, vi, location, slot), intr->def.num_components);
             /* A 16-bit input, of the 32-bit value. */
             if (intr->def.bit_size != 32) {

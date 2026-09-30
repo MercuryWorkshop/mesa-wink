@@ -252,12 +252,26 @@ wvk_format_vertex_pullable(VkFormat format)
     * words: neither is a vertex format. Nor is none. */
    /* A8B8G8R8's packed words are RGBA8's bytes, which is its description. */
    const bool abgr8 = format >= VK_FORMAT_A8B8G8R8_UNORM_PACK32 && format <= VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+   /* Nor do the 64-bit ones come back from their pipe formats, which are
+    * theirs alone. */
+   const bool wide = format >= VK_FORMAT_R64_UINT && format <= VK_FORMAT_R64G64B64A64_SFLOAT;
    if (format == VK_FORMAT_UNDEFINED || vk_format_get_ycbcr_info(format) ||
-       (!abgr8 && vk_format_from_pipe_format(vk_format_to_pipe_format(format)) != format))
+       (!abgr8 && !wide && vk_format_from_pipe_format(vk_format_to_pipe_format(format)) != format))
       return false;
    const struct util_format_description *d = vk_format_description(format);
    if (!d || d->layout != UTIL_FORMAT_LAYOUT_PLAIN || d->colorspace != UTIL_FORMAT_COLORSPACE_RGB ||
-       d->block.bits > 128 || d->block.width != 1 || d->block.height != 1)
+       d->block.bits > 256 || d->block.width != 1 || d->block.height != 1)
+      return false;
+   /* 64-bit channels, which WebGPU has no vertex formats of, are each two
+    * whole words, which the shader joins (wvk_shader.c). */
+   if (d->channel[0].size == 64) {
+      for (unsigned c = 0; c < d->nr_channels; ++c) {
+         if (d->channel[c].size != 64 || d->channel[c].shift % 32)
+            return false;
+      }
+      return true;
+   }
+   if (d->block.bits > 128)
       return false;
    for (unsigned c = 0; c < d->nr_channels; ++c) {
       const struct util_format_channel_description *ch = &d->channel[c];
