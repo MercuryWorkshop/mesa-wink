@@ -442,6 +442,19 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   memory are words already; copies of memory become loads and stores
   while they are still derefs. Pointers only compared (OpPtrEqual) are of
   the buffer each is of, as variable ones are.
+- **Barycentric coordinates and inputs of each vertex**
+  (fragmentShaderBarycentric), which WGSL has neither of, are the geometry
+  shader's: a draw whose fragment shader reads them goes through one --
+  the driver's pass-through where the pipeline has none, whose primitives'
+  vertices are in the order they are rasterized in. The vertex shader
+  after it draws its lists a vertex each, pulling its index from them:
+  its corner of the primitive is its coordinate, a vec3 varying of each
+  kind read, and the primitive's vertices' records are flat uvec4
+  varyings of each slot read, which the fragment shader makes its inputs
+  of each vertex of. Not of mesh shaders, which there are none of; and a
+  line list's segments of the last provoking vertex are drawn from their
+  end, whose flat varyings they have, which may cover an end's pixel
+  otherwise.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
   have to stay.

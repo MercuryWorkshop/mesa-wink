@@ -1636,11 +1636,35 @@ record_access(nir_builder *b, nir_intrinsic_instr *intr, uint32_t binding, nir_d
 
 /* The draw's vertex, 0 its first, that is vertex `j` of the geometry
  * shader's input primitive `prim`, for the draw's topology (a
- * VkPrimitiveTopology), as Vulkan's primitive assembly has it. */
+ * VkPrimitiveTopology), as Vulkan's primitive assembly has it. Or, for the
+ * driver's geometry shader of a draw without one (wvk_shader_cull_geometry),
+ * in the order the primitive is rasterized in, which its fragments'
+ * barycentric coordinates are of: round by one, the provoking vertex where
+ * it was, for a strip's odd triangles and a fan's where the provoking
+ * vertex is the last, and a strip with adjacency's odd ones where it is the
+ * first. */
 static nir_def *
-primitive_vertex(nir_builder *b, nir_def *topology, nir_def *prim, nir_def *j, nir_def *prims)
+primitive_vertex(nir_builder *b, nir_def *topology, nir_def *prim, nir_def *j, nir_def *prims, bool raster_order,
+                 bool provoking_last)
 {
    nir_def *odd = nir_ine_imm(b, nir_iand_imm(b, prim, 1), 0);
+   if (raster_order) {
+      /* Of a triangle's vertices (a, b, c): (c, a, b). */
+      nir_def *round = nir_bcsel(b, nir_ieq_imm(b, j, 0), nir_imm_int(b, 2), nir_iadd_imm(b, j, -1));
+      nir_def *is_strip = nir_ieq_imm(b, topology, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP);
+      nir_def *is_fan = nir_ieq_imm(b, topology, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN);
+      nir_def *is_adj = nir_ieq_imm(b, topology, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY);
+      if (provoking_last) {
+         nir_def *turn = nir_ior(b, nir_iand(b, is_strip, odd), is_fan);
+         j = nir_bcsel(b, turn, round, j);
+      } else {
+         /* Its triangle is vertices 0, 2 and 4: (2, 4, 0) of them. */
+         nir_def *pair = nir_ushr_imm(b, j, 1);
+         nir_def *turned = nir_bcsel(b, nir_ieq_imm(b, pair, 2), nir_imm_int(b, 0), nir_iadd_imm(b, pair, 1));
+         nir_def *adj_j = nir_iadd(b, nir_ishl_imm(b, turned, 1), nir_iand_imm(b, j, 1));
+         j = nir_bcsel(b, nir_iand(b, is_adj, odd), adj_j, j);
+      }
+   }
    /* A strip's triangle: i, i + 1, i + 2, or i, i + 2, i + 1 where odd. */
    nir_def *strip = nir_iadd(b, prim, nir_bcsel(b, nir_iand(b, odd, nir_ine_imm(b, j, 0)), nir_isub_imm(b, 3, j), j));
    /* A fan's: i + 1, i + 2, 0. */
@@ -1814,7 +1838,8 @@ lower_geometry(nir_shader *nir, struct wvk_shader *shader, unsigned vs_vars, boo
                slot = nir_load_ssbo(&b, 1, 32, driver_buffer(&b, WVK_DRIVER_SLOT_INDEX), nir_ishl_imm(&b, at, 2),
                                     .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
             } else {
-               slot = nir_iadd(&b, vertex_base, primitive_vertex(&b, topology, prim, intr->src[0].ssa, prims));
+               slot = nir_iadd(&b, vertex_base, primitive_vertex(&b, topology, prim, intr->src[0].ssa, prims,
+                                                                 nir->info.internal, provoking_last));
             }
             record_access(&b, intr, WVK_DRIVER_SLOT_CAPTURE, nir_imul_imm(&b, slot, in_stride), false);
             break;
@@ -2272,10 +2297,20 @@ static bool split_io_structs(nir_shader *nir);
 
 /* The vertex shader of the draw after a geometry shader run as compute
  * (key.geometry 2), made of the geometry shader's source: its outputs,
- * each of the record lower_geometry wrote of the vertex vertex_index names. */
+ * each of the record lower_geometry wrote of the vertex vertex_index names.
+ * Where the fragment shader reads barycentric coordinates or inputs of each
+ * vertex (key.bary, key.per_vertex), vertex_index is where in the lists
+ * the vertex is, whose index it pulls (wvk_cmd_draw.c's draw_pulled_list):
+ * its corner of the primitive is its coordinate, and the primitive's
+ * vertices' records the inputs, a flat uvec4 of each slot. */
 static void
-geometry_vertex_shader(nir_shader *nir, unsigned primitive_id, unsigned raster_stream)
+geometry_vertex_shader(nir_shader *nir, const struct wvk_shader_key *key)
 {
+   const unsigned primitive_id = key->primitive_id, raster_stream = key->raster_stream;
+   const enum mesa_prim output = nir->info.stage == MESA_SHADER_GEOMETRY ? nir->info.gs.output_primitive
+                                                                          : MESA_PRIM_TRIANGLE_STRIP;
+   const unsigned corners = output == MESA_PRIM_TRIANGLE_STRIP ? 3 : output == MESA_PRIM_LINE_STRIP ? 2 : 1;
+   const bool pulled = (key->bary || key->per_vertex) && !key->points && corners > 1;
    NIR_PASS(_, nir, split_io_structs);
    /* Of the rasterized stream's varyings, where the streams' share
     * locations: the others' are transform feedback's alone. */
@@ -2302,10 +2337,78 @@ geometry_vertex_shader(nir_shader *nir, unsigned primitive_id, unsigned raster_s
       pos->data.location = VARYING_SLOT_POS;
    }
    nir_builder b = nir_builder_at(nir_before_impl(impl));
-   nir_def *base = nir_imul_imm(&b, nir_load_vertex_id(&b), stride);
+   nir_def *position = nir_load_vertex_id(&b), *record = position, *corner = nir_imm_int(&b, 0);
+   nir_def *start = NULL, *size = NULL, *restarts;
+   if (pulled) {
+      nir_def *words = nir_load_ssbo(&b, 2, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                     nir_imm_int(&b, WVK_DRIVER_POINT_INDEX), .align_mul = 8,
+                                     .access = ACCESS_NON_WRITEABLE);
+      start = nir_channel(&b, words, 0);
+      size = nir_channel(&b, words, 1);
+      corner = nir_umod_imm(&b, position, corners);
+      record = load_index(&b, start, size, position, &restarts);
+   }
+   /* Lists that begin at their last vertex (lower_geometry's
+    * provoking_last) have the primitive's vertices round by one. */
+   nir_def *vertex = corner;
+   if (pulled && key->provoking_last)
+      vertex = nir_umod_imm(&b, nir_iadd_imm(&b, corner, corners - 1), corners);
+   nir_def *base = nir_imul_imm(&b, record, stride);
+   /* Of its generic varyings those the fragment shader reads: the others'
+    * locations are for what else it reads, and transform feedback's
+    * capture is of the records. */
+   nir_foreach_shader_out_variable_safe(var, nir) {
+      if (var->data.location < VARYING_SLOT_VAR0 || var->data.location == VARYING_SLOT_PRIMITIVE_ID)
+         continue;
+      const unsigned first = var->data.location - VARYING_SLOT_VAR0;
+      const unsigned slots = glsl_count_attribute_slots(var->type, false);
+      bool read = false;
+      for (unsigned i = 0; i < slots && first + i < WVK_MAX_VARYINGS; ++i)
+         read |= key->fs_inputs[first + i] != 0;
+      if (!read)
+         exec_node_remove(&var->node);
+   }
    nir_foreach_shader_out_variable(var, nir)
       load_record_into(&b, nir_build_deref_var(&b, var), var->type, var->data.location, var->data.location_frac,
                        var->data.compact, WVK_DRIVER_SLOT_GS_VERTICES, base);
+   /* The coordinates, perspective and linear: 1 at its corner. */
+   for (unsigned m = 0, at = key->bary; key->bary && m < 2; ++m) {
+      if (!(key->bary_uses & BITFIELD_BIT(m)))
+         continue;
+      nir_variable *var = nir_variable_create(nir, nir_var_shader_out, glsl_vec_type(3), "wvk_bary");
+      var->data.location = VARYING_SLOT_VAR0 + at++ - 1;
+      var->data.interpolation = m ? INTERP_MODE_NOPERSPECTIVE : INTERP_MODE_SMOOTH;
+      nir_def *c[3];
+      for (unsigned i = 0; i < 3; ++i)
+         c[i] = nir_b2f32(&b, nir_ieq_imm(&b, vertex, i));
+      nir_store_var(&b, var, nir_vec(&b, c, 3), 0x7);
+   }
+   /* The primitive's vertices' slots, the last again for a segment's
+    * third; a point's are all its own. */
+   const unsigned count = util_bitcount(key->per_vertex_mask);
+   for (unsigned v = 0; key->per_vertex && v < 3; ++v) {
+      nir_def *at = record;
+      if (pulled) {
+         const unsigned own = MIN2(v, corners - 1);
+         at = load_index(&b, start, size,
+                         nir_iadd_imm(&b, nir_isub(&b, position, corner),
+                                      key->provoking_last ? (own + 1) % corners : own),
+                         &restarts);
+      }
+      nir_def *from = nir_imul_imm(&b, at, stride);
+      u_foreach_bit(i, key->per_vertex_mask) {
+         nir_variable *var = nir_variable_create(nir, nir_var_shader_out, glsl_uvec4_type(), "wvk_per_vertex");
+         var->data.location =
+            VARYING_SLOT_VAR0 + key->per_vertex - 1 + v * count + util_bitcount(key->per_vertex_mask & BITFIELD_MASK(i));
+         var->data.interpolation = INTERP_MODE_FLAT;
+         const int slot = record_slot(VARYING_SLOT_VAR0 + i);
+         nir_def *words = slot < 0 ? nir_imm_zero(&b, 4, 32)
+                                   : nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_GS_VERTICES),
+                                                   nir_iadd_imm(&b, from, slot * 16), .align_mul = 16,
+                                                   .access = ACCESS_NON_WRITEABLE);
+         nir_store_var(&b, var, words, 0xf);
+      }
+   }
    /* gl_PrimitiveID, which a vertex shader has no builtin of: a flat
     * varying, where the fragment shader reads it (lower_fs_primitive_id). */
    nir_variable *id = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_PRIMITIVE_ID);
@@ -2626,6 +2729,190 @@ lower_fs_primitive_id(nir_shader *nir, unsigned location)
       }
    }
    return nir_progress(true, impl, nir_metadata_control_flow);
+}
+
+/* Barycentric coordinates and each vertex's inputs
+ * (VK_KHR_fragment_shader_barycentric), which WGSL has neither of: what a
+ * fragment shader reads of them -- bit 0 perspective coordinates, bit 1
+ * linear ones; and the generic slots of its inputs of each vertex. */
+static void
+gather_barycentrics(nir_shader *nir, uint8_t *uses, uint32_t *per_vertex)
+{
+   *uses = 0;
+   *per_vertex = 0;
+   nir_foreach_shader_in_variable(var, nir) {
+      if (!var->data.per_vertex || var->data.location < VARYING_SLOT_VAR0 || !glsl_type_is_array(var->type))
+         continue;
+      const unsigned first = var->data.location - VARYING_SLOT_VAR0;
+      const unsigned slots = glsl_count_attribute_slots(glsl_get_array_element(var->type), false);
+      for (unsigned i = 0; i < slots && first + i < WVK_MAX_VARYINGS; ++i)
+         *per_vertex |= BITFIELD_BIT(first + i);
+   }
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_barycentric_coord_pixel:
+            case nir_intrinsic_load_barycentric_coord_centroid:
+            case nir_intrinsic_load_barycentric_coord_sample:
+            case nir_intrinsic_load_barycentric_coord_at_sample:
+            case nir_intrinsic_load_barycentric_coord_at_offset:
+               *uses |= nir_intrinsic_interp_mode(intr) == INTERP_MODE_NOPERSPECTIVE ? 2 : 1;
+               break;
+            default:
+               break;
+            }
+         }
+      }
+   }
+}
+
+/* A value of `type` at generic slot `slot`, component `frac`, of the words
+ * of flat uvec4 inputs, a slot each (NULL: zero). */
+static void
+store_from_slots(nir_builder *b, nir_deref_instr *deref, const struct glsl_type *type, unsigned slot, unsigned frac,
+                 nir_variable *const *slots)
+{
+   if (glsl_type_is_struct_or_ifc(type)) {
+      unsigned at = slot;
+      for (unsigned f = 0; f < glsl_get_length(type); ++f) {
+         const struct glsl_type *field = glsl_get_struct_field(type, f);
+         store_from_slots(b, nir_build_deref_struct(b, deref, f), field, at, 0, slots);
+         at += glsl_count_attribute_slots(field, false);
+      }
+      return;
+   }
+   if (glsl_type_is_array(type) || glsl_type_is_matrix(type)) {
+      const struct glsl_type *element = glsl_type_is_array(type) ? glsl_get_array_element(type)
+                                                                 : glsl_get_column_type(type);
+      const unsigned n = glsl_type_is_array(type) ? glsl_get_length(type) : glsl_get_matrix_columns(type);
+      const unsigned per = glsl_count_attribute_slots(element, false);
+      for (unsigned e = 0; e < n; ++e)
+         store_from_slots(b, nir_build_deref_array_imm(b, deref, e), element, slot + e * per, frac, slots);
+      return;
+   }
+   if (!glsl_type_is_vector_or_scalar(type))
+      return;
+   const unsigned n = glsl_get_vector_elements(type);
+   const unsigned bits = glsl_get_bit_size(type);
+   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned c = 0; c < n; ++c) {
+      /* 64-bit ones two words each, two a slot. */
+      const unsigned word = bits == 64 ? (frac / 2 + c) * 2 : frac + c;
+      const unsigned s = slot + word / 4;
+      nir_variable *var = s < WVK_MAX_VARYINGS ? slots[s] : NULL;
+      nir_def *words = var ? nir_load_var(b, var) : nir_imm_zero(b, 4, 32);
+      if (bits == 64)
+         comps[c] = nir_pack_64_2x32_split(b, nir_channel(b, words, word % 4), nir_channel(b, words, word % 4 + 1));
+      else if (bits == 16)
+         comps[c] = glsl_get_base_type(type) == GLSL_TYPE_FLOAT16 ? nir_f2f16(b, nir_channel(b, words, word % 4))
+                                                                  : nir_u2u16(b, nir_channel(b, words, word % 4));
+      else
+         comps[c] = nir_channel(b, words, word % 4);
+   }
+   nir_def *value = nir_vec(b, comps, n);
+   if (glsl_type_is_boolean(type))
+      value = nir_ine_imm(b, value, 0);
+   nir_store_deref(b, deref, value, BITFIELD_MASK(n));
+}
+
+/* The coordinates as vec3 varyings from location bary - 1 on, perspective
+ * then linear, of those it reads; and each vertex's inputs as flat uvec4
+ * varyings from per_vertex - 1 on, the slots of `mask` of the first vertex,
+ * then the second's, then the third's -- which the vertex shader after a
+ * geometry shader writes of the primitive's records
+ * (geometry_vertex_shader). Without them, zero. */
+static bool
+lower_fs_barycentrics(nir_shader *nir, uint8_t uses, uint32_t mask, unsigned bary, unsigned per_vertex)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_variable *coord[2] = { NULL, NULL };
+   for (unsigned m = 0, at = bary; bary && m < 2; ++m) {
+      if (!(uses & BITFIELD_BIT(m)))
+         continue;
+      coord[m] = nir_variable_create(nir, nir_var_shader_in, glsl_vec_type(3), m ? "wvk_bary_linear" : "wvk_bary");
+      coord[m]->data.location = VARYING_SLOT_VAR0 + at++ - 1;
+      coord[m]->data.interpolation = m ? INTERP_MODE_NOPERSPECTIVE : INTERP_MODE_SMOOTH;
+   }
+   nir_variable *slots[3][WVK_MAX_VARYINGS];
+   memset(slots, 0, sizeof(slots));
+   const unsigned count = util_bitcount(mask);
+   if (per_vertex) {
+      u_foreach_bit(i, mask) {
+         const unsigned index = util_bitcount(mask & BITFIELD_MASK(i));
+         for (unsigned v = 0; v < 3; ++v) {
+            nir_variable *var = nir_variable_create(nir, nir_var_shader_in, glsl_uvec4_type(), "wvk_per_vertex");
+            var->data.location = VARYING_SLOT_VAR0 + per_vertex - 1 + v * count + index;
+            var->data.interpolation = INTERP_MODE_FLAT;
+            slots[v][i] = var;
+         }
+      }
+   }
+   /* Each input of each vertex a local of its array, filled at the start. */
+   nir_foreach_shader_in_variable_safe(var, nir) {
+      if (!var->data.per_vertex)
+         continue;
+      nir_variable *local = nir_local_variable_create(impl, var->type, "wvk_vertices");
+      if (var->data.location >= VARYING_SLOT_VAR0 && glsl_type_is_array(var->type)) {
+         const struct glsl_type *element = glsl_get_array_element(var->type);
+         for (unsigned v = 0; v < MIN2(glsl_get_length(var->type), 3); ++v)
+            store_from_slots(&b, nir_build_deref_array_imm(&b, nir_build_deref_var(&b, local), v), element,
+                             var->data.location - VARYING_SLOT_VAR0, var->data.location_frac, slots[v]);
+      }
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_deref && nir_instr_as_deref(instr)->deref_type == nir_deref_type_var &&
+                nir_instr_as_deref(instr)->var == var)
+               nir_instr_as_deref(instr)->var = local;
+         }
+      }
+      exec_node_remove(&var->node);
+   }
+   nir_fixup_deref_modes(nir);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_barycentric_coord_pixel &&
+             intr->intrinsic != nir_intrinsic_load_barycentric_coord_centroid &&
+             intr->intrinsic != nir_intrinsic_load_barycentric_coord_sample &&
+             intr->intrinsic != nir_intrinsic_load_barycentric_coord_at_sample &&
+             intr->intrinsic != nir_intrinsic_load_barycentric_coord_at_offset)
+            continue;
+         b.cursor = nir_before_instr(instr);
+         nir_variable *var = coord[nir_intrinsic_interp_mode(intr) == INTERP_MODE_NOPERSPECTIVE];
+         nir_def *value;
+         if (!var) {
+            value = nir_imm_zero(&b, 3, 32);
+         } else {
+            nir_deref_instr *deref = nir_build_deref_var(&b, var);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_barycentric_coord_centroid:
+               value = nir_interp_deref_at_centroid(&b, 3, 32, &deref->def);
+               break;
+            case nir_intrinsic_load_barycentric_coord_sample:
+               value = nir_interp_deref_at_sample(&b, 3, 32, &deref->def, nir_load_sample_id(&b));
+               break;
+            case nir_intrinsic_load_barycentric_coord_at_sample:
+               value = nir_interp_deref_at_sample(&b, 3, 32, &deref->def, intr->src[0].ssa);
+               break;
+            case nir_intrinsic_load_barycentric_coord_at_offset:
+               value = nir_interp_deref_at_offset(&b, 3, 32, &deref->def, intr->src[0].ssa);
+               break;
+            default:
+               value = nir_load_deref(&b, deref);
+               break;
+            }
+         }
+         nir_def_replace(&intr->def, value);
+      }
+   }
+   return nir_progress(true, impl, nir_metadata_none);
 }
 
 /* Sample shading, which WebGPU does where a fragment shader reads its
@@ -5949,6 +6236,23 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    if (WVK_META_OFFSET + meta_words * 4 > WVK_PUSH_WINDOW)
       mesa_logw_once("wvk: a pipeline layout of more descriptors than their records have room for");
 
+   /* A fragment shader's barycentric coordinates and inputs of each
+    * vertex: zero, but where the draw goes through a geometry shader,
+    * which has them -- first, as the inputs of each vertex are arrays of a
+    * vertex each, of any type. */
+   if (stage == MESA_SHADER_FRAGMENT) {
+      gather_barycentrics(nir, &shader->bary_uses, &shader->per_vertex_mask);
+      if (shader->bary_uses || shader->per_vertex_mask) {
+         const bool placed = records && (records->bary || records->per_vertex);
+         NIR_PASS(_, nir, lower_fs_barycentrics, shader->bary_uses, shader->per_vertex_mask,
+                  placed ? records->bary : 0, placed ? records->per_vertex : 0);
+         if (placed) {
+            shader->key.bary = records->bary;
+            shader->key.per_vertex = records->per_vertex;
+         }
+      }
+   }
+
    /* Varyings of a location each, and none 64-bit. */
    if (stage != MESA_SHADER_COMPUTE) {
       NIR_PASS(_, nir, split_io_structs);
@@ -5996,6 +6300,12 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
                      records->provoking_last);
    } else if (records && records->geometry == 2) {
       shader->key.geometry = 2;
+      /* Which its draw pulls its indices for (draw_pulled_list). */
+      shader->key.bary = records->bary;
+      shader->key.bary_uses = records->bary_uses;
+      shader->key.per_vertex = records->per_vertex;
+      shader->key.per_vertex_mask = records->per_vertex_mask;
+      shader->key.provoking_last = records->provoking_last;
    }
    /* Where varyings are sampled is the fragment shader's alone: at the
     * centre, as far as WebGPU's matching of the stages goes. */
@@ -6526,6 +6836,9 @@ cull_geometry_nir(const nir_shader *last, enum mesa_prim input)
    const unsigned n = mesa_vertices_per_prim(input);
    nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY, last->options, "wvk cull distances");
    nir_shader *gs = b.shader;
+   /* The driver's: its primitives' vertices in their rasterization order
+    * (primitive_vertex). */
+   gs->info.internal = true;
    gs->info.gs.input_primitive = input;
    gs->info.gs.output_primitive = output;
    gs->info.gs.vertices_in = n;
@@ -6738,7 +7051,7 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
    struct vk_graphics_pipeline_state state = { 0 };
    /* A geometry shader's draw after it: a vertex shader of its outputs. */
    if ((stage == MESA_SHADER_GEOMETRY && key->geometry == 2) || (stage == MESA_SHADER_TESS_EVAL && key->tess == 2)) {
-      geometry_vertex_shader(nir, key->primitive_id, key->raster_stream);
+      geometry_vertex_shader(nir, key);
       if (key->clip_varying)
          write_clip_varyings(nir, key->clip_varying - 1, key->clip_slots);
       match_fragment_inputs(nir, key->fs_inputs);
@@ -6808,6 +7121,14 @@ wvk_shader_geometry_variant(struct wvk_device *dev, struct wvk_shader *gs, unsig
       key.primitive_id = other->key.primitive_id;
       key.clip_varying = other->key.clip_varying;
       key.clip_slots = other->key.clip_slots;
+      /* And what the fragment shader reads of the primitive's vertices. */
+      key.bary = other->key.bary;
+      key.bary_uses = other->key.bary ? other->bary_uses : 0;
+      key.per_vertex = other->key.per_vertex;
+      key.per_vertex_mask = other->key.per_vertex ? other->per_vertex_mask : 0;
+      /* Whose lists begin at their last vertex then (lower_geometry). */
+      if (key.bary || key.per_vertex)
+         key.provoking_last = dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
    }
    /* The draw's varyings, of the stream it rasterizes. */
    if (kind == 2 && gs->gs_streams > 1)
@@ -6999,6 +7320,31 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
          if (!shader->varyings[i] && i + 1 != key.primitive_id && i + 1 != key.point_coord &&
              (!key.clip_varying || i + 1 < key.clip_varying || i + 1 >= key.clip_varying + key.clip_slots))
             key.line_coord = i + 1;
+      }
+      /* Its barycentric coordinates and inputs of each vertex: at the first
+       * locations free after those, in a row each. */
+      if (shader->bary_uses || shader->per_vertex_mask) {
+         /* Not where it reads each vertex's inputs from, which the vertex
+          * shader writes as it is. */
+         uint32_t taken = shader->per_vertex_mask;
+         for (uint32_t i = 0; i < WVK_MAX_VARYINGS; ++i) {
+            if (shader->varyings[i] || i + 1 == key.primitive_id || i + 1 == key.point_coord ||
+                i + 1 == key.line_coord ||
+                (key.clip_varying && i + 1 >= key.clip_varying && i + 1 < key.clip_varying + key.clip_slots))
+               taken |= BITFIELD_BIT(i);
+         }
+         const unsigned runs[2] = { util_bitcount(shader->bary_uses), 3 * util_bitcount(shader->per_vertex_mask) };
+         uint8_t *at[2] = { &key.bary, &key.per_vertex };
+         for (unsigned r = 0; r < 2; ++r) {
+            for (uint32_t i = 0; runs[r] && i + runs[r] <= WVK_MAX_VARYINGS && !*at[r]; ++i) {
+               if (!(taken & BITFIELD_RANGE(i, runs[r]))) {
+                  *at[r] = i + 1;
+                  taken |= BITFIELD_RANGE(i, runs[r]);
+               }
+            }
+         }
+         if ((shader->bary_uses && !key.bary) || (shader->per_vertex_mask && !key.per_vertex))
+            mesa_logw_once("wvk: barycentric coordinates or inputs of each vertex past the varyings there are");
       }
       /* The logic op, where it changes anything: COPY is the output as it
        * is. On a single-sampled pass, whose attachments are copied texel
@@ -7210,6 +7556,8 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->uses_samples);
    blob_write_uint8(blob, shader->source_writes_depth);
    blob_write_uint8(blob, shader->strict_math);
+   blob_write_uint8(blob, shader->bary_uses);
+   blob_write_uint32(blob, shader->per_vertex_mask);
    blob_write_uint8(blob, shader->source != NULL);
    if (shader->source)
       source_serialize(shader->source, blob);
@@ -7295,6 +7643,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const bool uses_samples = blob_read_uint8(blob);
    const bool source_writes_depth = blob_read_uint8(blob);
    const bool strict_math = blob_read_uint8(blob);
+   const uint8_t bary_uses = blob_read_uint8(blob);
+   const uint32_t per_vertex_mask = blob_read_uint32(blob);
    struct wvk_shader_source *source = blob_read_uint8(blob) ? source_deserialize(blob) : NULL;
    /* A geometry or tessellation shader is its source alone (geometry_shell). */
    const bool shell = stage == MESA_SHADER_GEOMETRY || stage == MESA_SHADER_TESS_CTRL ||
@@ -7373,6 +7723,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->uses_samples = uses_samples;
    shader->source_writes_depth = source_writes_depth;
    shader->strict_math = strict_math;
+   shader->bary_uses = bary_uses;
+   shader->per_vertex_mask = per_vertex_mask;
    shader->source = source;
    VkResult result = shader->bindings ? VK_SUCCESS : vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    for (uint32_t i = 0; result == VK_SUCCESS && i < WVK_SHADER_VARIANTS; ++i) {

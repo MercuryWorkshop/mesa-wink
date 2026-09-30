@@ -3836,6 +3836,46 @@ draw_point_list(struct wvk_cmd_buffer *cmd, const struct wvk_driver_buffer *list
    replay->list_topology = WGPUPrimitiveTopology_Undefined;
 }
 
+/* A geometry shader's lists drawn a vertex each, which pulls its index
+ * from them itself (geometry_vertex_shader), for the barycentric
+ * coordinates of its corner and its primitive's other vertices: `count`
+ * from `start`, or as the indexed draw at `at` of `indirect` has them --
+ * its first four words, whose first index and base vertex are 0, a draw's. */
+static void
+draw_pulled_list(struct wvk_cmd_buffer *cmd, const struct wvk_driver_buffer *list, uint32_t start, uint32_t count,
+                 WGPUPrimitiveTopology topology, WGPUBuffer indirect, uint64_t at, uint32_t draw_id)
+{
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   st->index = *list;
+   const uint32_t words[2] = { start, 4 };
+   if (memcmp(st->push + WVK_DRIVER_POINT_INDEX, words, sizeof(words))) {
+      memcpy(st->push + WVK_DRIVER_POINT_INDEX, words, sizeof(words));
+      st->push_offset = UINT32_MAX;
+   }
+   replay->list_topology = topology;
+   if (replay->cond_gpu) {
+      struct wvk_bound_buffer b;
+      const struct wvk_bound_buffer src = { NULL, indirect, at, 16, ++wvk_cmd_buffer_device(cmd)->temp_serial };
+      if (indirect ? conditional_args(cmd, NULL, &src, 1, 4, 16, &b)
+                   : conditional_args(cmd, (const uint32_t[4]){ count, 1, 0, 0 }, NULL, 1, 4, 16, &b)) {
+         indirect = b.buffer;
+         at = 0;
+      }
+   }
+   foreach_viewport(cmd) {
+      set_draw_parameters(st, NULL, 0, true, 0, 0, draw_id);
+      if (!flush_draw(cmd, false)) {
+         continue;
+      }
+      if (indirect)
+         wgpuRenderPassEncoderDrawIndirect(replay->pass, indirect, at);
+      else
+         wgpuRenderPassEncoderDraw(replay->pass, count, 1, 0, 0);
+   }
+   replay->list_topology = WGPUPrimitiveTopology_Undefined;
+}
+
 /* The primitives of `count` vertices of a topology, an instance, as a
  * geometry shader takes them; 0 for a topology it does not take them of. */
 static uint32_t
@@ -3901,8 +3941,11 @@ draw_gs(struct wvk_cmd_buffer *cmd)
       return st->bound_gs;
    struct wvk_shader *last = st->bound_tes ? st->bound_tes : st->bound_vs;
    /* Or that transform feedback captures, where the geometry shader's lists
-    * are what it writes (capture_xfb). */
-   if (!last || (!last->cull_distances && !(cmd->replay->xfb_active && last->xfb_buffers)))
+    * are what it writes (capture_xfb); or whose fragment shader reads
+    * barycentric coordinates or inputs of each vertex, which the vertex
+    * shader after one has of its lists (geometry_vertex_shader). */
+   const bool bary = st->bound_fs && (st->bound_fs->bary_uses || st->bound_fs->per_vertex_mask);
+   if (!last || (!last->cull_distances && !(cmd->replay->xfb_active && last->xfb_buffers) && !bary))
       return NULL;
    enum mesa_prim input = topology_primitive(cmd->vk.dynamic_graphics_state.ia.primitive_topology);
    if (st->bound_tes) {
@@ -4240,6 +4283,9 @@ draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t
                                                                                      : WGPUPrimitiveTopology_PointList;
    if (quads)
       draw_point_list(cmd, &st->gs_indices, (uint32_t)(raster * indices * 4), (uint32_t)indices, NULL, 0, draw_id);
+   else if (passthrough->key.bary || passthrough->key.per_vertex)
+      draw_pulled_list(cmd, &st->gs_indices, (uint32_t)(raster * indices * 4), (uint32_t)indices, primitives, NULL, 0,
+                       draw_id);
    else
       draw_list_at(cmd, list, raster * indices * 4, (uint32_t)indices, primitives, 1, 0, 0, true, draw_id,
                    UINT64_MAX);
@@ -4543,6 +4589,13 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
       const struct wvk_driver_buffer l = { draw_list, ++dev->temp_serial | (1ull << 62), 0, draw_start + draw_bytes };
       st->vs = passthrough;
       draw_point_list(cmd, &l, (uint32_t)draw_start, 0, counts, (patches * 4 + (gs ? 23 : 19)) * 4, draw_id);
+      st->vs = draw_vs;
+      return;
+   }
+   if (passthrough->key.bary || passthrough->key.per_vertex) {
+      const struct wvk_driver_buffer l = { draw_list, ++dev->temp_serial | (1ull << 62), 0, draw_start + draw_bytes };
+      st->vs = passthrough;
+      draw_pulled_list(cmd, &l, (uint32_t)draw_start, 0, topology, counts, draw_command, draw_id);
       st->vs = draw_vs;
       return;
    }

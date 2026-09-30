@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 31
+#define WVK_SHADER_BINARY_VERSION 32
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -156,6 +156,17 @@ struct wvk_shader_key {
     * location line_coord - 1 (0: none), which the vertex shader writes and
     * the fragment shader stipples and covers by (expand_lines). */
    uint8_t line_coord;
+   /* Fragment, and the vertex shader after a geometry shader: the
+    * barycentric coordinates the fragment shader reads (bary_uses: 1
+    * perspective ones, 2 linear), as vec3 varyings from location bary - 1
+    * on (0: none); and its inputs of each vertex, the generic slots of
+    * per_vertex_mask, as flat uvec4 varyings from location per_vertex - 1
+    * on, the first vertex's, then the second's and the third's
+    * (VK_KHR_fragment_shader_barycentric). The vertex shader pulls its
+    * index from the geometry shader's lists then, to know its primitive's
+    * others. */
+   uint8_t bary, bary_uses, per_vertex;
+   uint32_t per_vertex_mask;
    /* Fragment: its colour outputs moved to the attachments whose
     * locations they are (dynamicRenderingLocalRead): attachment i's the
     * output at location color_map[i], none for MESA_VK_ATTACHMENT_UNUSED;
@@ -337,6 +348,10 @@ struct wvk_shader {
     * controls 2 without AllowContract): its modules are compiled with
     * Dawn's strict math, where Metal fuses a multiply and an add else. */
    bool strict_math;
+   /* Fragment: the barycentric coordinates it reads, and its inputs of each
+    * vertex (key.bary_uses and key.per_vertex_mask). */
+   uint8_t bary_uses;
+   uint32_t per_vertex_mask;
 };
 
 static inline struct wvk_shader *

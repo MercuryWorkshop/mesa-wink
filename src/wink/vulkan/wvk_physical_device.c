@@ -145,6 +145,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_debug_marker = true,
       .KHR_shader_fma = true,
       .KHR_shader_untyped_pointers = true,
+      .KHR_fragment_shader_barycentric = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -655,6 +656,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .shaderFmaFloat32 = true,
       /* Buffers and workgroup memory are words anyway (wvk_shader.c). */
       .shaderUntypedPointers = true,
+      /* Of the geometry shader's lists, which a draw whose fragment shader
+       * reads them goes through (wvk_shader.c's geometry_vertex_shader). */
+      .fragmentShaderBarycentric = true,
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,
@@ -853,6 +857,9 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .advancedBlendNonPremultipliedDstColor = true,
       .advancedBlendCorrelatedOverlap = true,
       .advancedBlendAllOperations = true,
+      /* VK_KHR_fragment_shader_barycentric: a strip's triangles are the
+       * geometry shader's, whose order is its provoking vertex's. */
+      .triStripVertexOrderIndependentOfProvokingVertex = false,
       /* VK_KHR_line_rasterization: the quads' corners are the vertex
        * shader's positions moved, as precise as the rest. */
       .lineSubPixelPrecisionBits = 4,
