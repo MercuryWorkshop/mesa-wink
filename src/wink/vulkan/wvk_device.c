@@ -121,12 +121,20 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
    if (result != VK_SUCCESS)
       goto fail_host_copy;
 
-   /* The one global priority there is (VK_KHR_global_priority). */
+   /* The one global priority there is (VK_KHR_global_priority): another
+    * is not one of those the query has, or without it, a lower one is
+    * this one and a higher one is not permitted. */
    for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; ++i) {
       const VkDeviceQueueGlobalPriorityCreateInfoKHR *prio =
          vk_find_struct_const(pCreateInfo->pQueueCreateInfos[i].pNext, DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR);
-      if (prio && prio->globalPriority != VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR) {
+      if (!prio || prio->globalPriority == VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR)
+         continue;
+      if (dev->vk.enabled_features.globalPriorityQuery) {
          result = vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
+         goto fail_host_copy_init;
+      }
+      if (prio->globalPriority > VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR) {
+         result = vk_error(dev, VK_ERROR_NOT_PERMITTED_KHR);
          goto fail_host_copy_init;
       }
    }
