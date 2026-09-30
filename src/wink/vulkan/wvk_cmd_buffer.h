@@ -245,6 +245,10 @@ void wvk_cmd_meta_resolve_image(struct wvk_cmd_buffer *cmd, const VkResolveImage
 void wvk_cmd_meta_clear_color_image(struct wvk_cmd_buffer *cmd, struct wvk_image *image, const VkClearColorValue *color,
                                     uint32_t range_count, const VkImageSubresourceRange *ranges);
 void wvk_cmd_meta_resolve_rendering(struct wvk_cmd_buffer *cmd, const VkRenderingInfo *info);
+/* A single-sampled view's `layers` from `layer` into every sample of a
+ * multisampled one's (VK_EXT_multisampled_render_to_single_sampled). */
+void wvk_cmd_meta_unresolve(struct wvk_cmd_buffer *cmd, struct wvk_image_view *from, struct wvk_image_view *to,
+                            VkImageAspectFlags aspects, uint32_t layer, uint32_t layers);
 
 /* A view of an R8 texture at least `extent`, for a pass without
  * attachments. The caller releases it. */

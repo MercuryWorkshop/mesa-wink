@@ -250,8 +250,10 @@ wvk_format_vertex_pullable(VkFormat format)
    /* A YCbCr format is one of its planes, or of its chroma pairs, to the
     * description, and a padded one (R12X4 and the like) the format of its
     * words: neither is a vertex format. Nor is none. */
+   /* A8B8G8R8's packed words are RGBA8's bytes, which is its description. */
+   const bool abgr8 = format >= VK_FORMAT_A8B8G8R8_UNORM_PACK32 && format <= VK_FORMAT_A8B8G8R8_SRGB_PACK32;
    if (format == VK_FORMAT_UNDEFINED || vk_format_get_ycbcr_info(format) ||
-       vk_format_from_pipe_format(vk_format_to_pipe_format(format)) != format)
+       (!abgr8 && vk_format_from_pipe_format(vk_format_to_pipe_format(format)) != format))
       return false;
    const struct util_format_description *d = vk_format_description(format);
    if (!d || d->layout != UTIL_FORMAT_LAYOUT_PLAIN || d->colorspace != UTIL_FORMAT_COLORSPACE_RGB ||

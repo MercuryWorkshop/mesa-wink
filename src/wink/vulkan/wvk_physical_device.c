@@ -164,6 +164,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_mesh_shader = wvk_physical_device_meshes(pdev),
       .EXT_discard_rectangles = true,
       .EXT_ycbcr_image_arrays = true,
+      .EXT_multisampled_render_to_single_sampled = true,
+      .EXT_legacy_vertex_attributes = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -201,6 +203,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_spirv_1_4 = true,
       .KHR_storage_buffer_storage_class = true,
       .KHR_swapchain = true,
+      .KHR_swapchain_maintenance1 = true,
+      .EXT_swapchain_maintenance1 = true,
       .KHR_synchronization2 = true,
       .KHR_timeline_semaphore = true,
       .KHR_uniform_buffer_standard_layout = true,
@@ -372,6 +376,15 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .samplerYcbcrConversion = true,
       /* VK_EXT_ycbcr_image_arrays */
       .ycbcrImageArrays = true,
+      /* To multisampled images of the attachments', resolved into them
+       * (wvk_cmd_render.c). */
+      .multisampledRenderToSingleSampled = true,
+      /* Unaligned attributes, and of other types than the shader's: which
+       * the vertex shader reads itself (wvk_shader.c's mismatched). */
+      .legacyVertexAttributes = true,
+      /* Present fences, modes of each present, and images released
+       * (wvk_wsi.c); the images made with the swapchain, deferred or not. */
+      .swapchainMaintenance1 = true,
       /* A buffer a pointer's phi or select chooses: each access one on
        * every buffer it may be, by the index (wvk_shader.c). */
       .variablePointersStorageBuffer = true,
@@ -1094,6 +1107,8 @@ get_device_properties(const struct wvk_physical_device *pdev,
        * own; Metal's resolves of sRGB average linear values, and vk_meta's
        * the encoded ones where told to. */
       .rgba4OpaqueBlackSwizzled = false,
+      /* VK_EXT_legacy_vertex_attributes: those the shader reads itself. */
+      .nativeUnalignedPerformance = false,
       .resolveSrgbFormatAppliesTransferFunction = true,
       .resolveSrgbFormatSupportsTransferFunctionControl = true,
       .maxDescriptorSetTotalUniformBuffersDynamic = l->maxDynamicUniformBuffersPerPipelineLayout,
@@ -1493,6 +1508,13 @@ wvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat
          p->bufferFeatures = buffer;
          break;
       }
+      case VK_STRUCTURE_TYPE_SUBPASS_RESOLVE_PERFORMANCE_QUERY_EXT: {
+         /* A pass rendering it multisampled has an image of its own, and
+          * a resolve at its end, and a draw to fill it at its start. */
+         VkSubpassResolvePerformanceQueryEXT *q = ext;
+         q->optimal = VK_FALSE;
+         break;
+      }
       default:
          vk_debug_ignored_stype(stype);
          break;
@@ -1613,6 +1635,11 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    } else if (info->flags & VK_IMAGE_CREATE_DISJOINT_BIT) {
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    }
+   /* Rendered multisampled, to an image of its own of the format: which
+    * WebGPU has to be able to multisample. */
+   if ((info->flags & VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) &&
+       (info->type != VK_IMAGE_TYPE_2D || !(caps & WVK_CAP_MSAA)))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
    VkSampleCountFlags samples = VK_SAMPLE_COUNT_1_BIT;
    if (info->type == VK_IMAGE_TYPE_2D && (caps & WVK_CAP_MSAA) &&
        !(info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&

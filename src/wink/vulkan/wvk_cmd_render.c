@@ -110,12 +110,101 @@ note_attachment(struct wvk_replay *replay, struct wvk_image_view *view)
    };
 }
 
+/* A pass that renders its single-sampled attachments multisampled
+ * (VK_EXT_multisampled_render_to_single_sampled): to multisampled views of
+ * theirs (wvk_image_view_msrtss), resolved into them at its end -- as the
+ * attachment says, or averaged, or sample 0's -- and filled from them at
+ * its start, all of each, where it loads or the render area is less than
+ * all of it: WebGPU resolves all of an attachment. Into `out` and `atts`,
+ * or the pass as it is. */
+static const VkRenderingInfo *
+msrtss_rendering(struct wvk_cmd_buffer *cmd, const VkRenderingInfo *info, bool resuming, VkRenderingInfo *out,
+                 VkRenderingAttachmentInfo *atts)
+{
+   const VkMultisampledRenderToSingleSampledInfoEXT *ms =
+      vk_find_struct_const(info->pNext, MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT);
+   if (!ms || !ms->multisampledRenderToSingleSampledEnable || ms->rasterizationSamples <= 1)
+      return info;
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_replay *replay = cmd->replay;
+   const uint32_t n = MIN2(info->colorAttachmentCount, 8);
+   *out = *info;
+   for (uint32_t i = 0; i < n; ++i)
+      atts[i] = info->pColorAttachments[i];
+   out->pColorAttachments = atts;
+   if (info->pDepthAttachment) {
+      atts[8] = *info->pDepthAttachment;
+      out->pDepthAttachment = &atts[8];
+   }
+   if (info->pStencilAttachment) {
+      atts[9] = *info->pStencilAttachment;
+      out->pStencilAttachment = &atts[9];
+   }
+   /* A pass replayed a layer at a time fills the layer it is at, in
+    * vk_meta's passes, which are not the replay's. */
+   const bool layered = replay->pass_layered, multiview = replay->pass_multiview;
+   const uint32_t layer = replay->pass_layer;
+   replay->pass_layered = replay->pass_multiview = false;
+   replay->pass_layer = 0;
+   struct wvk_image_view *depth_view = NULL, *depth_ms = NULL;
+   for (uint32_t a = 0; a < 10; ++a) {
+      if ((a < 8 && a >= n) || (a == 8 && !info->pDepthAttachment) || (a == 9 && !info->pStencilAttachment))
+         continue;
+      VkRenderingAttachmentInfo *att = &atts[a];
+      VK_FROM_HANDLE(wvk_image_view, view, att->imageView);
+      if (!view || view->vk.image->samples != VK_SAMPLE_COUNT_1_BIT || view->vk.image->image_type == VK_IMAGE_TYPE_3D)
+         continue;
+      /* Depth and stencil one image, as they are one attachment. */
+      struct wvk_image_view *mv = a == 9 && depth_view && depth_view->vk.image == view->vk.image ? depth_ms
+                                  : wvk_image_view_msrtss(dev, view, ms->rasterizationSamples);
+      if (!mv)
+         continue;
+      if (a == 8) {
+         depth_view = view;
+         depth_ms = mv;
+      }
+      const VkImageAspectFlags aspect = a < 8 ? VK_IMAGE_ASPECT_COLOR_BIT
+                                        : a == 8 ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                 : VK_IMAGE_ASPECT_STENCIL_BIT;
+      const bool filled = !resuming && (att->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD || !area_covers(&info->renderArea, view));
+      if (filled) {
+         wvk_cmd_meta_unresolve(cmd, view, mv, aspect, layered ? layer : 0, layered ? 1 : view->vk.layer_count);
+         if (att->loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR)
+            att->loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      }
+      /* Not resolved into where it is not to be written. */
+      const bool read_only = a >= 8 && vk_image_layout_is_read_only(att->imageLayout, aspect);
+      VkResolveModeFlagBits mode = att->resolveMode;
+      if (mode == VK_RESOLVE_MODE_NONE)
+         mode = a < 8 && !vk_format_is_int(view->vk.view_format) ? VK_RESOLVE_MODE_AVERAGE_BIT
+                                                                  : VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+      if (read_only || att->storeOp == VK_ATTACHMENT_STORE_OP_NONE)
+         mode = VK_RESOLVE_MODE_NONE;
+      att->imageView = wvk_image_view_to_handle(mv);
+      att->resolveMode = mode;
+      att->resolveImageView = mode != VK_RESOLVE_MODE_NONE ? wvk_image_view_to_handle(view) : VK_NULL_HANDLE;
+      att->resolveImageLayout = att->imageLayout;
+   }
+   replay->pass_layered = layered;
+   replay->pass_multiview = multiview;
+   replay->pass_layer = layer;
+   return out;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRenderingInfo)
 {
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    struct wvk_replay *replay = cmd->replay;
    const VkRenderingInfo *info = pRenderingInfo;
+   /* The application's, of multisampled views of its single-sampled
+    * attachments: which a pass begun again has already. */
+   VkRenderingInfo msrtss_info;
+   VkRenderingAttachmentInfo msrtss_atts[10];
+   if (info != &replay->pass_copy.info) {
+      wvk_replay_end_passes(replay);
+      info = msrtss_rendering(cmd, info, info->flags & VK_RENDERING_RESUMING_BIT, &msrtss_info, msrtss_atts);
+   }
    replay->pass_idle = replay->pass_layered && replay->pass_multiview && info->viewMask &&
                        !(info->viewMask & BITFIELD_BIT(replay->pass_layer));
    /* An idle subpass keeps the layer as it was. */

@@ -534,11 +534,29 @@ is_pulled(const struct vk_vertex_input_state *vi, int location)
 /* Whether a vertex shader reads the attribute at `location` itself: where
  * WebGPU cannot, or for points drawn as quads (`all`, expand_points) every
  * one the shader can. */
+/* Whether the attribute at `location` is of another numeric type than the
+ * shader reads it as (legacyVertexAttributes): WebGPU's vertex formats have
+ * to be of the shader's, so the shader reads it itself -- the bits of its
+ * value as its format makes it, as the type it reads. Not of 64-bit ones. */
 static bool
-pulls(const struct vk_vertex_input_state *vi, int location, bool all)
+mismatched(const struct wvk_shader *shader, const struct vk_vertex_input_state *vi, int location)
+{
+   if (!shader || !vi || location < 0 || location >= 32 || !(vi->attributes_valid & BITFIELD_BIT(location)))
+      return false;
+   const enum pipe_format format = vk_format_to_pipe_format(vi->attributes[location].format);
+   const struct util_format_description *desc = util_format_description(format);
+   if (!desc || desc->channel[0].size == 64)
+      return false;
+   return util_format_is_pure_sint(format) != !!(shader->attribs_sint & BITFIELD_BIT(location)) ||
+          util_format_is_pure_uint(format) != !!(shader->attribs_uint & BITFIELD_BIT(location));
+}
+
+static bool
+pulls(const struct wvk_shader *shader, const struct vk_vertex_input_state *vi, int location, bool all)
 {
    if (!all)
-      return is_pulled(vi, location);
+      return is_pulled(vi, location) || (mismatched(shader, vi, location) &&
+                                         wvk_format_vertex_pullable(vi->attributes[location].format));
    return vi && location >= 0 && location < MESA_VK_MAX_VERTEX_ATTRIBUTES &&
           (vi->attributes_valid & BITFIELD_BIT(location)) &&
           wvk_format_vertex_pullable(vi->attributes[location].format);
@@ -548,8 +566,9 @@ pulls(const struct vk_vertex_input_state *vi, int location, bool all)
  * hashed: 0 for none (wvk_shader_key.pulled). A stride is only what makes
  * an attribute pulled, the draw giving its value. */
 static uint64_t
-pull_key(const struct vk_vertex_input_state *vi, uint32_t read, bool all)
+pull_key(const struct wvk_shader *shader, const struct vk_vertex_input_state *vi, bool all)
 {
+   const uint32_t read = shader->attribs_read;
    if (!vi)
       return 0;
    struct mesa_blake3 ctx;
@@ -563,7 +582,7 @@ pull_key(const struct vk_vertex_input_state *vi, uint32_t read, bool all)
       any = true;
    }
    u_foreach_bit(location, vi->attributes_valid & read) {
-      if (!pulls(vi, location, all))
+      if (!pulls(shader, vi, location, all))
          continue;
       const struct vk_vertex_attribute_state *a = &vi->attributes[location];
       const struct vk_vertex_binding_state *vb = &vi->bindings[a->binding];
@@ -5262,19 +5281,27 @@ lower_draw_parameters_instr(nir_builder *b, nir_intrinsic_instr *intr, void *dat
 }
 
 /* One channel of a vertex attribute, as its format has it, from the
- * attribute's first byte in the pulled binding. Vulkan aligns attributes
- * to their components, or to the whole of a packed format, so no channel
- * straddles two words. */
+ * attribute's first byte in the pulled binding. A channel of more than a
+ * byte may straddle two words -- at an offset or of a stride its
+ * components are not aligned to, or in a buffer bound at one
+ * (legacyVertexAttributes) -- and is of the two joined. */
 static nir_def *
 fetch_channel(nir_builder *b, nir_def *address, const struct util_format_description *desc, unsigned c,
               uint32_t slot)
 {
    const struct util_format_channel_description *ch = &desc->channel[c];
    nir_def *bit = nir_iadd_imm(b, nir_ishl_imm(b, address, 3), ch->shift);
-   nir_def *word = nir_load_ssbo(b, 1, 32, driver_buffer(b, WVK_DRIVER_SLOT_VERTEX + slot),
-                                 nir_ishl_imm(b, nir_ushr_imm(b, bit, 5), 2), .align_mul = 4,
+   nir_def *at = nir_ishl_imm(b, nir_ushr_imm(b, bit, 5), 2);
+   nir_def *word = nir_load_ssbo(b, 1, 32, driver_buffer(b, WVK_DRIVER_SLOT_VERTEX + slot), at, .align_mul = 4,
                                  .access = ACCESS_NON_WRITEABLE);
    nir_def *shift = nir_iand_imm(b, bit, 31);
+   if (ch->size > 8) {
+      nir_def *next = nir_load_ssbo(b, 1, 32, driver_buffer(b, WVK_DRIVER_SLOT_VERTEX + slot), nir_iadd_imm(b, at, 4),
+                                    .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+      word = nir_bcsel(b, nir_ieq_imm(b, shift, 0), word,
+                       nir_ior(b, nir_ushr(b, word, shift), nir_ishl(b, next, nir_isub(b, nir_imm_int(b, 32), shift))));
+      shift = nir_imm_int(b, 0);
+   }
    const bool is_signed = ch->type == UTIL_FORMAT_TYPE_SIGNED;
    nir_def *bits = ch->size == 32 ? word
                    : is_signed    ? nir_ibitfield_extract(b, word, shift, nir_imm_int(b, ch->size))
@@ -5421,7 +5448,7 @@ pull_divided_attributes(nir_shader *nir, const struct vk_graphics_pipeline_state
                progress = true;
                continue;
             }
-            if (!pulls(vi, location, shader->key.points || shader->key.runs || shader->key.lines))
+            if (!pulls(shader, vi, location, shader->key.points || shader->key.runs || shader->key.lines))
                continue;
             if (glsl_get_bit_size(deref->type) == 64) {
                mesa_logw_once("wvk: a 64-bit attribute the shader pulls");
@@ -7043,8 +7070,14 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       nir_foreach_shader_in_variable(var, nir) {
          const int first = var->data.location - VERT_ATTRIB_GENERIC0;
          const unsigned slots = glsl_count_attribute_slots(var->type, true);
-         for (unsigned i = 0; first >= 0 && i < slots && first + i < 32; ++i)
+         const enum glsl_base_type base = glsl_get_base_type(glsl_without_array_or_matrix(var->type));
+         for (unsigned i = 0; first >= 0 && i < slots && first + i < 32; ++i) {
             shader->attribs_read |= BITFIELD_BIT(first + i);
+            if (base == GLSL_TYPE_INT || base == GLSL_TYPE_INT16 || base == GLSL_TYPE_INT8)
+               shader->attribs_sint |= BITFIELD_BIT(first + i);
+            else if (base == GLSL_TYPE_UINT || base == GLSL_TYPE_UINT16 || base == GLSL_TYPE_UINT8)
+               shader->attribs_uint |= BITFIELD_BIT(first + i);
+         }
       }
       /* A draw of points as quads (expand_points) pulls every attribute. */
       shader->writes_point_size = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_PSIZ);
@@ -7082,7 +7115,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       } else if (shader->writes_storage) {
          NIR_PASS(_, nir, nir_shader_intrinsics_pass, strip_storage_writes_instr, nir_metadata_control_flow, NULL);
       }
-      shader->key.pulled = pull_key(pipeline_state ? pipeline_state->vi : NULL, shader->attribs_read,
+      shader->key.pulled = pull_key(shader, pipeline_state ? pipeline_state->vi : NULL,
                                     shader->key.points || shader->key.runs || shader->key.lines);
    }
    if (nir->info.stage == MESA_SHADER_FRAGMENT && records && records->color_remapped) {
@@ -8030,7 +8063,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
        * attribute itself (run_vertices). */
       if (runs) {
          key.runs = runs;
-         key.pulled = pull_key(&vi, shader->attribs_read, true);
+         key.pulled = pull_key(shader, &vi, true);
          return variant_for(dev, shader, &key, &vi);
       }
       /* Wide lines as quads (expand_lines). */
@@ -8043,7 +8076,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
          key.line_coord = other ? other->key.line_coord : 0;
          if (other)
             memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
-         key.pulled = pull_key(&vi, shader->attribs_read, true);
+         key.pulled = pull_key(shader, &vi, true);
          return variant_for(dev, shader, &key, &vi);
       }
       /* Points as quads where it gives them a size, and gl_PointCoord where
@@ -8053,7 +8086,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
          key.points = 1;
          key.point_coord = other ? other->key.point_coord : 0;
       }
-      key.pulled = pull_key(&vi, shader->attribs_read, points);
+      key.pulled = pull_key(shader, &vi, points);
       if (records && images && key.pulled == shader->key.pulled && !points && !shader->key.points &&
           !key.clip_varying && varyings_match(shader, other))
          return shader;
@@ -8364,6 +8397,8 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_bytes(blob, &shader->key, sizeof(shader->key));
    blob_write_bytes(blob, shader->varyings, sizeof(shader->varyings));
    blob_write_uint32(blob, shader->attribs_read);
+   blob_write_uint32(blob, shader->attribs_sint);
+   blob_write_uint32(blob, shader->attribs_uint);
    blob_write_bytes(blob, shader->set_words, sizeof(shader->set_words));
    blob_write_uint8(blob, shader->per_sample);
    blob_write_uint8(blob, shader->own_mask);
@@ -8455,6 +8490,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    uint8_t varyings[WVK_MAX_VARYINGS];
    blob_copy_bytes(blob, varyings, sizeof(varyings));
    const uint32_t attribs_read = blob_read_uint32(blob);
+   const uint32_t attribs_sint = blob_read_uint32(blob);
+   const uint32_t attribs_uint = blob_read_uint32(blob);
    int32_t set_words[4];
    blob_copy_bytes(blob, set_words, sizeof(set_words));
    const bool per_sample = blob_read_uint8(blob);
@@ -8541,6 +8578,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->key = key;
    memcpy(shader->varyings, varyings, sizeof(varyings));
    shader->attribs_read = attribs_read;
+   shader->attribs_sint = attribs_sint;
+   shader->attribs_uint = attribs_uint;
    memcpy(shader->set_words, set_words, sizeof(set_words));
    shader->per_sample = per_sample;
    shader->own_mask = own_mask;

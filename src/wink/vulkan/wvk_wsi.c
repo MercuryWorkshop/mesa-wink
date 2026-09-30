@@ -389,10 +389,53 @@ wvk_GetPhysicalDeviceSurfaceCapabilities2KHR(VkPhysicalDevice physicalDevice,
                                              const VkPhysicalDeviceSurfaceInfo2KHR *pSurfaceInfo,
                                              VkSurfaceCapabilities2KHR *pSurfaceCapabilities)
 {
-   vk_foreach_struct(stype, ext, pSurfaceCapabilities->pNext)
-      vk_debug_ignored_stype(stype);
-   return wvk_GetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, pSurfaceInfo->surface,
-                                                      &pSurfaceCapabilities->surfaceCapabilities);
+   VkResult result = wvk_GetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, pSurfaceInfo->surface,
+                                                                 &pSurfaceCapabilities->surfaceCapabilities);
+   if (result != VK_SUCCESS)
+      return result;
+   const VkSurfaceCapabilitiesKHR *caps = &pSurfaceCapabilities->surfaceCapabilities;
+   vk_foreach_struct(stype, ext, pSurfaceCapabilities->pNext) {
+      switch (stype) {
+      case VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_KHR: {
+         /* The image is copied as it is: no scaling, nor gravity. */
+         VkSurfacePresentScalingCapabilitiesKHR *s = ext;
+         s->supportedPresentScaling = 0;
+         s->supportedPresentGravityX = 0;
+         s->supportedPresentGravityY = 0;
+         s->minScaledImageExtent = caps->minImageExtent;
+         s->maxScaledImageExtent = caps->maxImageExtent;
+         break;
+      }
+      case VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_KHR: {
+         /* Every mode the surface has, the one asked of first: a present of
+          * another reconfigures it (VK_KHR_swapchain_maintenance1). */
+         VkSurfacePresentModeCompatibilityKHR *c = ext;
+         VkPresentModeKHR all[8];
+         uint32_t count = ARRAY_SIZE(all);
+         result = wvk_GetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, pSurfaceInfo->surface, &count, all);
+         if (result < 0)
+            return result;
+         result = VK_SUCCESS;
+         const VkSurfacePresentModeKHR *asked = vk_find_struct_const(pSurfaceInfo->pNext, SURFACE_PRESENT_MODE_KHR);
+         for (uint32_t m = 1; asked && m < count; ++m) {
+            if (all[m] == asked->presentMode) {
+               all[m] = all[0];
+               all[0] = asked->presentMode;
+            }
+         }
+         if (c->pPresentModes) {
+            count = MIN2(count, c->presentModeCount);
+            memcpy(c->pPresentModes, all, count * sizeof(*all));
+         }
+         c->presentModeCount = count;
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(stype);
+         break;
+      }
+   }
+   return result;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -461,6 +504,7 @@ wvk_GetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice physicalDevice, VkS
       /* Presenting to nothing never waits. */
       static const VkPresentModeKHR headless[] = {
          VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR,
+         VK_PRESENT_MODE_FIFO_RELAXED_KHR,
       };
       for (size_t i = 0; i < ARRAY_SIZE(headless); ++i)
          vk_outarray_append_typed(VkPresentModeKHR, &out, m) *m = headless[i];
@@ -504,6 +548,22 @@ wvk_GetDeviceGroupSurfacePresentModesKHR(VkDevice device, VkSurfaceKHR surface,
 {
    *pModes = VK_DEVICE_GROUP_PRESENT_MODE_LOCAL_BIT_KHR;
    return VK_SUCCESS;
+}
+
+/* The surface configured for the swapchain: its size, its format and how
+ * it presents. */
+static void
+configure_surface(struct wvk_device *dev, struct wvk_swapchain *sc)
+{
+   WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
+   config.device = dev->wgpu;
+   config.format = sc->surface_format;
+   config.usage = WGPUTextureUsage_CopyDst;
+   config.width = sc->extent.width;
+   config.height = sc->extent.height;
+   config.alphaMode = sc->alpha;
+   config.presentMode = wgpu_present_mode(sc->present_mode);
+   wgpuSurfaceConfigure(sc->surface->wgpu, &config);
 }
 
 static void
@@ -551,6 +611,8 @@ wvk_CreateSwapchainKHR(VkDevice _device, const VkSwapchainCreateInfoKHR *pCreate
    sc->surface_format = surface_format;
    sc->fifo = pCreateInfo->presentMode == VK_PRESENT_MODE_FIFO_KHR ||
               pCreateInfo->presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+   sc->present_mode = pCreateInfo->presentMode;
+   sc->alpha = wgpu_alpha_mode(pCreateInfo->compositeAlpha);
 
    VkImageFormatListCreateInfo format_list = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
@@ -586,17 +648,8 @@ wvk_CreateSwapchainKHR(VkDevice _device, const VkSwapchainCreateInfoKHR *pCreate
       sc->image_count = i + 1;
    }
 
-   if (surface->wgpu) {
-      WGPUSurfaceConfiguration config = WGPU_SURFACE_CONFIGURATION_INIT;
-      config.device = dev->wgpu;
-      config.format = surface_format;
-      config.usage = WGPUTextureUsage_CopyDst;
-      config.width = sc->extent.width;
-      config.height = sc->extent.height;
-      config.alphaMode = wgpu_alpha_mode(pCreateInfo->compositeAlpha);
-      config.presentMode = wgpu_present_mode(pCreateInfo->presentMode);
-      wgpuSurfaceConfigure(surface->wgpu, &config);
-   }
+   if (surface->wgpu)
+      configure_surface(dev, sc);
 
    /* What the old swapchain has acquired can still be presented; it just
     * cannot acquire any more. */
@@ -687,6 +740,18 @@ wvk_AcquireNextImage2KHR(VkDevice _device, const VkAcquireNextImageInfoKHR *pAcq
 
    *pImageIndex = index;
    return swapchain_suboptimal(sc) ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
+}
+
+/* Images acquired and not presented, given back (VK_KHR_swapchain_maintenance1). */
+VKAPI_ATTR VkResult VKAPI_CALL
+wvk_ReleaseSwapchainImagesKHR(VkDevice device, const VkReleaseSwapchainImagesInfoKHR *pReleaseInfo)
+{
+   VK_FROM_HANDLE(wvk_swapchain, sc, pReleaseInfo->swapchain);
+   for (uint32_t i = 0; i < pReleaseInfo->imageIndexCount; ++i) {
+      if (pReleaseInfo->pImageIndices[i] < sc->image_count)
+         sc->acquired[pReleaseInfo->pImageIndices[i]] = false;
+   }
+   return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -843,6 +908,12 @@ wvk_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
    if (result != VK_SUCCESS)
       return result;
 
+   /* Of VK_KHR_swapchain_maintenance1: each swapchain's present mode, and
+    * the fence each signals once its image may be used again. */
+   const VkSwapchainPresentModeInfoKHR *modes = vk_find_struct_const(pPresentInfo->pNext, SWAPCHAIN_PRESENT_MODE_INFO_KHR);
+   const VkSwapchainPresentFenceInfoKHR *fences =
+      vk_find_struct_const(pPresentInfo->pNext, SWAPCHAIN_PRESENT_FENCE_INFO_KHR);
+
    STACK_ARRAY(WGPUSurfaceTexture, textures, count);
    STACK_ARRAY(VkResult, results, count);
    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(dev->wgpu, NULL);
@@ -853,6 +924,13 @@ wvk_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
       struct wvk_surface *surface = sc->surface;
 
       sc->acquired[index] = false;
+      if (modes && i < modes->swapchainCount && modes->pPresentModes[i] != sc->present_mode) {
+         sc->present_mode = modes->pPresentModes[i];
+         sc->fifo = sc->present_mode == VK_PRESENT_MODE_FIFO_KHR ||
+                    sc->present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+         if (surface->wgpu && surface->swapchain == sc)
+            configure_surface(dev, sc);
+      }
       maybe_capture(dev, sc, image);
       textures[i] = (WGPUSurfaceTexture)WGPU_SURFACE_TEXTURE_INIT;
       results[i] = swapchain_suboptimal(sc) ? VK_SUBOPTIMAL_KHR : VK_SUCCESS;
@@ -917,6 +995,15 @@ wvk_QueuePresentKHR(VkQueue _queue, const VkPresentInfoKHR *pPresentInfo)
    }
    STACK_ARRAY_FINISH(results);
    STACK_ARRAY_FINISH(textures);
+
+   /* The images are copied from by the submit just made: a fence is done
+    * when it is, as an empty submit after it is. */
+   for (uint32_t i = 0; fences && i < MIN2(fences->swapchainCount, count); ++i) {
+      if (!fences->pFences[i])
+         continue;
+      const VkResult signal = dev->vk.dispatch_table.QueueSubmit2(_queue, 0, NULL, fences->pFences[i]);
+      result = worse(result, signal);
+   }
 
    bool fifo = false;
    for (uint32_t i = 0; i < count; ++i) {

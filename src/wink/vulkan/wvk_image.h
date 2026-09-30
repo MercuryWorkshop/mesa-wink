@@ -252,9 +252,20 @@ struct wvk_image_view {
     * to: WVK_META_TEX_SWIZZLE; and those its format has. */
    uint32_t swizzle;
    uint32_t channels;
+   /* A single-sampled one rendered to multisampled
+    * (VK_EXT_multisampled_render_to_single_sampled): a view of an image of
+    * its own, of its level and layers, made the first time and gone with it
+    * (wvk_image_view_msrtss). */
+   struct wvk_image_view *msrtss;
+   struct wvk_image *msrtss_image;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_image_view, vk.base, VkImageView, VK_OBJECT_TYPE_IMAGE_VIEW)
+
+/* The multisampled view of `samples` a single-sampled view is rendered to
+ * (VK_EXT_multisampled_render_to_single_sampled), or NULL. */
+struct wvk_image_view *wvk_image_view_msrtss(struct wvk_device *dev, struct wvk_image_view *view,
+                                             VkSampleCountFlagBits samples);
 
 static inline struct wvk_image *
 wvk_image_view_image(const struct wvk_image_view *view)

@@ -73,6 +73,10 @@ struct wvk_swapchain {
    bool retired;
    /* Presents wait for the display, which in a browser is ours to do. */
    bool fifo;
+   /* How the surface is configured to present, which a present may change
+    * (VK_KHR_swapchain_maintenance1), and to composite. */
+   VkPresentModeKHR present_mode;
+   WGPUCompositeAlphaMode alpha;
 
    VkExtent2D extent;
    VkFormat format;

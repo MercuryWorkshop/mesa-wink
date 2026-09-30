@@ -434,6 +434,16 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   a buffer as the aspect's buffer copies do, and depth24's unorm comes
   back from its float as the one that made it. Events, barriers and
   queue family ownership are nothing to one in-order queue.
+- **Rendering single-sampled attachments multisampled**
+  (VK_EXT_multisampled_render_to_single_sampled): a pass that does has
+  each such attachment's view a multisampled image of its own, of the
+  view's level and layers, which it renders to instead, and which is
+  resolved into the view at its end -- averaged, or as the attachment
+  says -- and filled from the view first, every sample alike (vk_meta's
+  blit, which the runtime lets write a multisampled image), where the pass
+  loads or its render area is less than all of it: WebGPU's resolves are
+  of all of an attachment. Of 4 samples, which is all WebGPU has, and of
+  formats WebGPU multisamples.
 - **VK_KHR_maintenance10**: a resolve of another mode, or of an sRGB
   format's encoded values -- WebGPU's average the linear ones -- is
   vk_meta's, of vkCmdResolveImage2 or of a pass whose attachment says so;
@@ -500,6 +510,17 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
   have to stay.
+  A present may change the swapchain's present mode, which reconfigures
+  the surface, and signal a fence once its image may be used again, which
+  is an empty submit after the copy's; images acquired and not presented
+  may be released (VK_KHR_swapchain_maintenance1). Every mode is
+  compatible with every other; nothing is scaled.
+- **Legacy vertex attributes** (legacyVertexAttributes): attributes at
+  offsets or of strides their components are not aligned to, or of
+  another numeric type than the shader reads, are the vertex shader's to
+  read itself, as those WebGPU cannot lay out are -- a channel that
+  straddles two words of both, and the bits of the value its format makes
+  as the type the shader reads.
 
 ## Building and testing, natively
 

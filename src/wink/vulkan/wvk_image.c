@@ -985,7 +985,70 @@ wvk_DestroyImageView(VkDevice _device, VkImageView _view, const VkAllocationCall
       wgpuTextureViewRelease(view->array_view);
    if (view->storage_view)
       wgpuTextureViewRelease(view->storage_view);
+   if (view->msrtss) {
+      wvk_DestroyImageView(_device, wvk_image_view_to_handle(view->msrtss), NULL);
+      wvk_DestroyImage(_device, wvk_image_to_handle(view->msrtss_image), NULL);
+   }
    vk_image_view_destroy(&dev->vk, pAllocator, &view->vk);
+}
+
+/* Of the views' multisampled images: replays of submits to either queue
+ * family may make one at once. */
+static simple_mtx_t msrtss_lock = SIMPLE_MTX_INITIALIZER;
+
+struct wvk_image_view *
+wvk_image_view_msrtss(struct wvk_device *dev, struct wvk_image_view *view, VkSampleCountFlagBits samples)
+{
+   simple_mtx_lock(&msrtss_lock);
+   struct wvk_image_view *ms = view->msrtss;
+   if (ms && ms->vk.image->samples == samples) {
+      simple_mtx_unlock(&msrtss_lock);
+      return ms;
+   }
+   /* Of another count: gone, the submits it was in having their own
+    * references to its textures. */
+   const VkDevice device = wvk_device_to_handle(dev);
+   if (ms) {
+      wvk_DestroyImageView(device, wvk_image_view_to_handle(ms), NULL);
+      wvk_DestroyImage(device, wvk_image_to_handle(view->msrtss_image), NULL);
+      view->msrtss = NULL;
+      view->msrtss_image = NULL;
+      ms = NULL;
+   }
+   const bool color = view->vk.aspects & VK_IMAGE_ASPECT_COLOR_BIT;
+   const VkImageCreateInfo ci = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+      .imageType = VK_IMAGE_TYPE_2D,
+      .format = view->vk.view_format,
+      .extent = { view->vk.extent.width, view->vk.extent.height, 1 },
+      .mipLevels = 1,
+      .arrayLayers = view->vk.layer_count,
+      .samples = samples,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = (color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) |
+               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+   };
+   VkImage image;
+   if (wvk_CreateImage(device, &ci, NULL, &image) == VK_SUCCESS) {
+      const VkImageViewCreateInfo vci = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .image = image,
+         .viewType = view->vk.layer_count > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+         .format = view->vk.view_format,
+         .subresourceRange = { view->vk.aspects, 0, 1, 0, view->vk.layer_count },
+      };
+      VkImageView handle;
+      if (wvk_CreateImageView(device, &vci, NULL, &handle) == VK_SUCCESS) {
+         ms = wvk_image_view_from_handle(handle);
+         view->msrtss = ms;
+         view->msrtss_image = wvk_image_from_handle(image);
+      } else {
+         wvk_DestroyImage(device, image, NULL);
+      }
+   }
+   simple_mtx_unlock(&msrtss_lock);
+   return ms;
 }
 
 WGPUTextureView

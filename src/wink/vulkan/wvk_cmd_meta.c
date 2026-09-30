@@ -227,6 +227,26 @@ wvk_cmd_meta_clear_color_image(struct wvk_cmd_buffer *cmd, struct wvk_image *ima
 }
 
 void
+wvk_cmd_meta_unresolve(struct wvk_cmd_buffer *cmd, struct wvk_image_view *from, struct wvk_image_view *to,
+                       VkImageAspectFlags aspects, uint32_t layer, uint32_t layers)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   struct wvk_meta_save save;
+   const VkOffset3D end = { (int32_t)to->vk.extent.width, (int32_t)to->vk.extent.height, 1 };
+   const VkImageBlit2 region = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+      .srcSubresource = { aspects, from->vk.base_mip_level, from->vk.base_array_layer + layer, layers },
+      .srcOffsets = { { 0, 0, 0 }, end },
+      .dstSubresource = { aspects, 0, layer, layers },
+      .dstOffsets = { { 0, 0, 0 }, end },
+   };
+   meta_begin(cmd, &save);
+   vk_meta_blit_image(&cmd->vk, &dev->meta, from->vk.image, from->vk.view_format, VK_IMAGE_LAYOUT_GENERAL,
+                      to->vk.image, to->vk.view_format, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
+   meta_end(cmd, &save);
+}
+
+void
 wvk_cmd_meta_resolve_rendering(struct wvk_cmd_buffer *cmd, const VkRenderingInfo *info)
 {
    struct wvk_device *dev = wvk_cmd_buffer_device(cmd);

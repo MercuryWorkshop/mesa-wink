@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 36
+#define WVK_SHADER_BINARY_VERSION 37
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -349,8 +349,10 @@ struct wvk_shader {
    struct wvk_shader_source *source;
    /* Vertex: its outputs; fragment: its inputs (WVK_VARYING_*). */
    uint8_t varyings[WVK_MAX_VARYINGS];
-   /* Vertex: the attribute locations it reads, pulled or not. */
+   /* Vertex: the attribute locations it reads, pulled or not; and those it
+    * reads as signed or unsigned integers. */
    uint32_t attribs_read;
+   uint32_t attribs_sint, attribs_uint;
    /* The words of records of each set in its own layout, -1 for a set the
     * layout does not have. */
    int32_t set_words[4];
