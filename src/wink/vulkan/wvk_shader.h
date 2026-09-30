@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 35
+#define WVK_SHADER_BINARY_VERSION 36
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -367,8 +367,9 @@ struct wvk_shader {
    uint8_t bary_uses;
    uint32_t per_vertex_mask;
    /* Mesh: the vertices and primitives a workgroup may output, of which
-    * type (enum mesa_prim), and the generic varyings a primitive's record
-    * has (a vertex's are record_vars). Task and mesh: the payload's bytes. */
+    * type (enum mesa_prim), and the slots a primitive's record has, and a
+    * vertex's (record_vars, of a mesh shader), packed (mesh_slots). Task
+    * and mesh: the payload's bytes. */
    uint16_t mesh_vertices, mesh_primitives;
    uint8_t mesh_primitive, prim_vars;
    uint16_t payload_size;
@@ -435,6 +436,14 @@ struct wvk_shader *wvk_shader_mesh_variant(struct wvk_device *dev, struct wvk_sh
                                            bool after_task, const struct wvk_shader *other,
                                            const struct vk_dynamic_graphics_state *dyn, uint32_t stats);
 
+/* Whether a mesh shader's draw draws its points as quads (largePoints):
+ * where it gives them a size, and they are rasterized (not `discard`). */
+static inline bool
+wvk_shader_mesh_quads(const struct wvk_shader *mesh, bool discard)
+{
+   return mesh->mesh_primitive == MESA_PRIM_POINTS && mesh->writes_point_size && !discard;
+}
+
 /* A tessellation shader's variant (key.tess): as compute, for records of
  * the stage before with `vs_vars` generic varyings a vertex and
  * `patch_vars` patch varyings a patch (1); or the evaluation shader's draw
@@ -464,13 +473,13 @@ wvk_record_stride(unsigned vars)
 }
 
 /* A mesh workgroup's primitives' block: the vertices and primitives it
- * output (SetMeshOutputsEXT), in 16 bytes, then a record a primitive -- its
- * indices at slot 0, whether it is culled at slot 1, the rest as a vertex's
- * record has them. */
+ * output (SetMeshOutputsEXT), in 16 bytes, then a record a primitive of
+ * `prim_slots` slots -- its indices at slot 0, whether it is culled at
+ * slot 1, then the rest it writes, packed (wvk_shader.c's mesh_slots). */
 static inline uint32_t
-wvk_mesh_block(unsigned primitives, unsigned prim_vars)
+wvk_mesh_block(unsigned primitives, unsigned prim_slots)
 {
-   return 16 + primitives * wvk_record_stride(prim_vars);
+   return 16 + primitives * 16 * prim_slots;
 }
 
 /* A task workgroup's payload, in the payloads' buffer. */
@@ -481,15 +490,20 @@ wvk_payload_stride(unsigned size)
 }
 
 /* The words of a mesh draw's header (wvk_cmd_draw.c's draw_mesh): the
- * workgroups of its first stage, three; their total; their dispatch;
- * then the mesh workgroups' dispatch, and their total; then the draw. */
+ * workgroups of its first stage, three; their total; their dispatch; the
+ * first of the mesh workgroups of the round; the round's dispatch of
+ * them, and their total; the round's draw; and of every round, the mesh
+ * workgroups, and the first of the next round's. */
 #define WVK_MESH_FIRST 0
 #define WVK_MESH_FIRST_TOTAL 3
 #define WVK_MESH_FIRST_DISPATCH 4
+#define WVK_MESH_BASE 7
 #define WVK_MESH_DISPATCH 8
 #define WVK_MESH_TOTAL 11
 #define WVK_MESH_DRAW 12
-#define WVK_MESH_HEADER_WORDS 16
+#define WVK_MESH_ALL 16
+#define WVK_MESH_NEXT 17
+#define WVK_MESH_HEADER_WORDS 20
 
 /* How many indices a geometry shader's invocation writes of its output
  * primitives, as lists: three a triangle of a strip, two a segment, one a

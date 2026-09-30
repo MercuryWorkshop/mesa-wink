@@ -466,12 +466,18 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   a scan of the launches, which each mesh workgroup finds its task
   workgroup and grid in; the mesh shader, a workgroup a mesh workgroup,
   writing a record of each vertex and of each primitive, its indices and
-  whether it is culled, its outputs' counts first; and a draw of every
-  primitive each may have made, a vertex a corner, whose vertex shader
-  reads those -- those not made, or culled, out of sight. Each pass's
-  dispatch the one before's. The buffers are the submit's, 64 MB each at
-  most, which may be fewer workgroups than a draw of GPU-made counts has.
-  Not multiview, nor of shading rates.
+  whether it is culled, its outputs' counts first -- of the slots it
+  writes, packed, the first invocation's counts and launches the
+  workgroup's; and a draw of every primitive each may have made, a vertex
+  a corner, whose vertex shader reads those -- those not made, or culled,
+  or culled by their cull distances, out of sight; points of a size are
+  quads, as a vertex shader's are. Each pass's dispatch the one before's.
+  The buffers are the submit's, 64 MB each at most: the mesh workgroups are
+  in rounds of as many as they hold, a round's mesh shader and draw after
+  the one before's -- as many rounds as a draw's workgroups take, or
+  eight, where only the GPU knows how many it has. Not multiview, nor of
+  shading rates; a line list whose lines meet on a pixel's edge colors it
+  as Metal does.
 - **Barycentric coordinates and inputs of each vertex**
   (fragmentShaderBarycentric), which WGSL has neither of, are the geometry
   shader's: a draw whose fragment shader reads them goes through one --

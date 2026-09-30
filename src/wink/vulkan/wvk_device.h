@@ -107,7 +107,7 @@ struct wvk_device {
    WGPUBindGroupLayout tess_bgl;
    /* A mesh draw's passes: its setup, and the task workgroups' launches'
     * scan (wvk_cmd_draw.c's draw_mesh), and their bind group layout. */
-   WGPUComputePipeline mesh_pipelines[2];
+   WGPUComputePipeline mesh_pipelines[3];
    WGPUBindGroupLayout mesh_bgl;
    /* The fragment shader of a draw that has none, for its discard
     * rectangle test (wvk_cmd_draw.c). */

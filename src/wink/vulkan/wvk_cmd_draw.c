@@ -4402,14 +4402,15 @@ draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t
 /* A mesh draw's passes (draw_mesh). The setup: the draw's workgroups, of
  * its command or its indirect arguments -- none where a count or a
  * predicate says so -- as many as the buffers hold, and the dispatch of
- * them; and without a task shader, the mesh shader's and the draw's. The
- * scan: after a task shader, where each task workgroup's launch starts in
- * the mesh workgroups, and theirs and the draw's. */
+ * them; and without a task shader, the mesh workgroups. The scan: after a
+ * task shader, where each task workgroup's launch starts in the mesh
+ * workgroups, and theirs. The round: the next of the mesh workgroups, as
+ * many as the buffers hold, their dispatch and the draw of them. */
 static const char mesh_wgsl[] =
    "struct P { g: vec3u, indirect: u32,\n"
    "           first_capacity: u32, mesh_capacity: u32, corners: u32, task: u32,\n"
    "           counted: u32, count_limit: u32, draw_index: u32, cond: u32,\n"
-   "           args_word: u32, count_word: u32, cond_word: u32, pad: u32 }\n"
+   "           args_word: u32, count_word: u32, cond_word: u32, all_capacity: u32 }\n"
    "@group(0) @binding(0) var<uniform> p: P;\n"
    "@group(0) @binding(1) var<storage, read> args: array<u32>;\n"
    "@group(0) @binding(2) var<storage, read_write> header: array<u32>;\n"
@@ -4429,13 +4430,8 @@ static const char mesh_wgsl[] =
    "  return min(a * b, cap);\n"
    "}\n"
    "fn mesh_totals(total: u32) {\n"
-   "  let m = min(total, p.mesh_capacity);\n"
-   "  split(m, " WVK_STR(WVK_MESH_DISPATCH) "u);\n"
-   "  header[" WVK_STR(WVK_MESH_TOTAL) "u] = m;\n"
-   "  header[" WVK_STR(WVK_MESH_DRAW) "u] = m * p.corners;\n"
-   "  header[" WVK_STR(WVK_MESH_DRAW) "u + 1u] = 1u;\n"
-   "  header[" WVK_STR(WVK_MESH_DRAW) "u + 2u] = 0u;\n"
-   "  header[" WVK_STR(WVK_MESH_DRAW) "u + 3u] = 0u;\n"
+   "  header[" WVK_STR(WVK_MESH_ALL) "u] = min(total, p.all_capacity);\n"
+   "  header[" WVK_STR(WVK_MESH_NEXT) "u] = 0u;\n"
    "}\n"
    "@compute @workgroup_size(1) fn setup() {\n"
    "  var g = p.g;\n"
@@ -4452,12 +4448,24 @@ static const char mesh_wgsl[] =
    "  let tasks = header[" WVK_STR(WVK_MESH_FIRST_TOTAL) "u];\n"
    "  var sum = 0u;\n"
    "  for (var t = 0u; t < tasks; t++) {\n"
-   "    let n = mul_capped(mul_capped(launches[4u * t], launches[4u * t + 1u], p.mesh_capacity),\n"
-   "                       launches[4u * t + 2u], p.mesh_capacity);\n"
+   "    let n = mul_capped(mul_capped(launches[4u * t], launches[4u * t + 1u], p.all_capacity),\n"
+   "                       launches[4u * t + 2u], p.all_capacity);\n"
    "    launches[4u * t + 3u] = sum;\n"
-   "    sum = min(sum + n, p.mesh_capacity);\n"
+   "    sum = min(sum + n, p.all_capacity);\n"
    "  }\n"
    "  mesh_totals(sum);\n"
+   "}\n"
+   "@compute @workgroup_size(1) fn round() {\n"
+   "  let base = header[" WVK_STR(WVK_MESH_NEXT) "u];\n"
+   "  let m = min(header[" WVK_STR(WVK_MESH_ALL) "u] - base, p.mesh_capacity);\n"
+   "  header[" WVK_STR(WVK_MESH_BASE) "u] = base;\n"
+   "  header[" WVK_STR(WVK_MESH_NEXT) "u] = base + m;\n"
+   "  split(m, " WVK_STR(WVK_MESH_DISPATCH) "u);\n"
+   "  header[" WVK_STR(WVK_MESH_TOTAL) "u] = m;\n"
+   "  header[" WVK_STR(WVK_MESH_DRAW) "u] = m * p.corners;\n"
+   "  header[" WVK_STR(WVK_MESH_DRAW) "u + 1u] = 1u;\n"
+   "  header[" WVK_STR(WVK_MESH_DRAW) "u + 2u] = 0u;\n"
+   "  header[" WVK_STR(WVK_MESH_DRAW) "u + 3u] = 0u;\n"
    "}\n";
 
 /* The mesh passes, made the first time. */
@@ -4490,8 +4498,8 @@ mesh_pipelines(struct wvk_device *dev)
       sm.nextInChain = &source.chain;
       sm.label = wvk_sv("wvk mesh");
       WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
-      static const char *const entries[2] = { "setup", "scan" };
-      for (uint32_t i = 0; i < 2; ++i) {
+      static const char *const entries[3] = { "setup", "scan", "round" };
+      for (uint32_t i = 0; i < 3; ++i) {
          WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
          desc.label = wvk_sv("wvk mesh");
          desc.layout = layout;
@@ -4503,12 +4511,20 @@ mesh_pipelines(struct wvk_device *dev)
       wgpuPipelineLayoutRelease(layout);
    }
    simple_mtx_unlock(&dev->cache_lock);
-   return dev->mesh_bgl && dev->mesh_pipelines[0] && dev->mesh_pipelines[1];
+   return dev->mesh_bgl && dev->mesh_pipelines[0] && dev->mesh_pipelines[1] && dev->mesh_pipelines[2];
 }
 
 /* How big each of a mesh draw's buffers may be: what a submit's mesh
  * draws share, which WebGPU keeps until the GPU is done with them. */
 #define WVK_MESH_BUDGET (64ull << 20)
+
+/* The rounds of a mesh draw whose mesh workgroups only the GPU knows the
+ * number of -- after a task shader, or of indirect arguments -- each as
+ * many as the buffers hold, at most as many as maxMeshWorkGroupTotalCount
+ * takes: a round is a render pass ended and begun again, and the rounds of
+ * fewer than there are, passes of nothing. And the most of any draw's. */
+#define WVK_MESH_ROUNDS 8
+#define WVK_MESH_MAX_ROUNDS 1024
 
 /* A mesh draw's buffer `i` of at least `size` bytes: the submit's, made
  * bigger where it has to be. */
@@ -4554,9 +4570,12 @@ draw_mesh(struct wvk_cmd_buffer *cmd, uint32_t gx, uint32_t gy, uint32_t gz, WGP
       return;
    if (!indirect && (!gx || !gy || !gz))
       return;
+   /* Points of a size, as quads (expand_points): six vertices a point. */
+   const bool quads = wvk_shader_mesh_quads(mesh, discard);
    replay->draw_mesh = true;
+   replay->draw_points = quads;
    select_draw_shaders(cmd);
-   replay->draw_mesh = false;
+   replay->draw_mesh = replay->draw_points = false;
    const uint32_t stats = wvk_replay_stats(replay);
    struct wvk_shader *mesh_cs = wvk_shader_mesh_variant(dev, mesh, 1, task != NULL, NULL, dyn, stats);
    struct wvk_shader *mesh_vs = wvk_shader_mesh_variant(dev, mesh, 2, false, st->fs, dyn, 0);
@@ -4566,26 +4585,35 @@ draw_mesh(struct wvk_cmd_buffer *cmd, uint32_t gx, uint32_t gy, uint32_t gz, WGP
       return;
    }
 
-   /* The buffers, of as many workgroups as the draw has, or as fit. */
+   /* The buffers, of as many workgroups as the draw has, or as fit; the
+    * mesh workgroups' of a round of them, as many rounds as they take. */
    const uint64_t limit = MIN2(pdev->limits.maxStorageBufferBindingSize, WVK_MESH_BUDGET);
-   const uint64_t vertex_bytes = MAX2((uint64_t)mesh->mesh_vertices * wvk_record_stride(mesh->record_vars), 16);
+   const uint64_t vertex_bytes = MAX2((uint64_t)mesh->mesh_vertices * 16 * mesh->record_vars, 16);
    const uint64_t prim_bytes = wvk_mesh_block(mesh->mesh_primitives, mesh->prim_vars);
-   const uint32_t corners = mesh->mesh_primitive == MESA_PRIM_POINTS ? 1 : mesh->mesh_primitive == MESA_PRIM_LINES ? 2 : 3;
+   const uint32_t corners = quads                                    ? 6
+                            : mesh->mesh_primitive == MESA_PRIM_POINTS ? 1
+                            : mesh->mesh_primitive == MESA_PRIM_LINES  ? 2
+                                                                       : 3;
    const uint64_t direct = (uint64_t)gx * gy * gz;
    uint64_t mesh_capacity = MIN3(limit / vertex_bytes, limit / prim_bytes,
                                  UINT32_MAX / MAX2((uint64_t)mesh->mesh_primitives * corners, 1));
    const uint32_t payload = wvk_payload_stride(MAX2(task ? task->payload_size : 0, mesh->payload_size));
    uint64_t task_capacity = 0;
+   uint32_t rounds = (uint32_t)MIN2(DIV_ROUND_UP(1ull << 22, mesh_capacity), WVK_MESH_ROUNDS);
    if (task) {
       task_capacity = MIN3(indirect ? 65536 : direct, limit / payload, limit / 16);
       if (!indirect && direct > task_capacity)
          mesa_logw_once("wvk: a mesh draw of more task workgroups than its buffers hold, drawn as many as they do");
    } else if (!indirect) {
-      if (direct > mesh_capacity)
-         mesa_logw_once("wvk: a mesh draw of more workgroups than its buffers hold, drawn as many as they do");
       mesh_capacity = MIN2(mesh_capacity, direct);
+      rounds = DIV_ROUND_UP(direct, mesh_capacity);
+      if (rounds > WVK_MESH_MAX_ROUNDS) {
+         mesa_logw_once("wvk: a mesh draw of more workgroups than its rounds hold, drawn as many as they do");
+         rounds = WVK_MESH_MAX_ROUNDS;
+      }
    }
-   const uint64_t first_capacity = task ? task_capacity : mesh_capacity;
+   const uint64_t all_capacity = MIN2(mesh_capacity * rounds, UINT32_MAX);
+   const uint64_t first_capacity = task ? task_capacity : all_capacity;
    const WGPUBufferUsage storage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
    WGPUBuffer header = mesh_scratch(dev, replay, 0, WVK_MESH_HEADER_WORDS * 4,
                                     WGPUBufferUsage_Storage | WGPUBufferUsage_Indirect, &st->tess[3]);
@@ -4616,7 +4644,8 @@ draw_mesh(struct wvk_cmd_buffer *cmd, uint32_t gx, uint32_t gy, uint32_t gz, WGP
                                  mesh->mesh_primitives * corners, task != NULL,
                                  count != NULL, count_limit, draw_id, cond ? (replay->cond.inverted ? 2 : 1) : 0,
                                  (uint32_t)((at - args_at) / 4), (uint32_t)((count_at - count_base) / 4),
-                                 cond ? (uint32_t)((replay->cond.offset - cond_base) / 4) : 0, 0 };
+                                 cond ? (uint32_t)((replay->cond.offset - cond_base) / 4) : 0,
+                                 (uint32_t)all_capacity };
    WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
    if (!params_buffer)
       return;
@@ -4661,28 +4690,42 @@ draw_mesh(struct wvk_cmd_buffer *cmd, uint32_t gx, uint32_t gy, uint32_t gz, WGP
       wgpuComputePassEncoderEnd(pass);
       wgpuComputePassEncoderRelease(pass);
    }
-   wgpuBindGroupRelease(group);
-   /* The mesh shader. */
-   dispatch_graphics_groups(cmd, mesh_cs, 0, header, WVK_MESH_DISPATCH * 4);
 
-   /* The draw: every primitive each mesh workgroup may have made. */
-   if (in_pass && !replay->pass)
-      wvk_replay_restart_pass(cmd, replay->pass_layer);
-   if (!replay->pass || discard)
-      return;
-   struct wvk_shader *draw_vs = st->vs;
-   st->vs = mesh_vs;
-   replay->list_topology = corners == 1 ? WGPUPrimitiveTopology_PointList
-                           : corners == 2 ? WGPUPrimitiveTopology_LineList
-                                          : WGPUPrimitiveTopology_TriangleList;
-   foreach_viewport(cmd) {
-      set_draw_parameters(st, NULL, 0, false, 0, 0, draw_id);
-      if (!flush_draw(cmd, false))
+   for (uint32_t r = 0; r < rounds; ++r) {
+      /* The round's mesh workgroups, and the mesh shader of them. */
+      wvk_replay_end_passes(replay);
+      pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &cpd);
+      wgpuComputePassEncoderSetPipeline(pass, dev->mesh_pipelines[2]);
+      wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+      wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
+      wgpuComputePassEncoderEnd(pass);
+      wgpuComputePassEncoderRelease(pass);
+      dispatch_graphics_groups(cmd, mesh_cs, 0, header, WVK_MESH_DISPATCH * 4);
+
+      /* The draw: every primitive each mesh workgroup may have made. */
+      if (in_pass && !replay->pass)
+         wvk_replay_restart_pass(cmd, replay->pass_layer);
+      if (!replay->pass || discard)
          continue;
-      wgpuRenderPassEncoderDrawIndirect(replay->pass, header, WVK_MESH_DRAW * 4);
+      struct wvk_shader *draw_vs = st->vs;
+      st->vs = mesh_vs;
+      replay->list_topology = corners == 1   ? WGPUPrimitiveTopology_PointList
+                              : corners == 2 ? WGPUPrimitiveTopology_LineList
+                                             : WGPUPrimitiveTopology_TriangleList;
+      replay->draw_points = quads;
+      if (!quads || bind_index_storage(cmd, false)) {
+         foreach_viewport(cmd) {
+            set_draw_parameters(st, NULL, 0, false, 0, 0, draw_id);
+            if (!flush_draw(cmd, false))
+               continue;
+            wgpuRenderPassEncoderDrawIndirect(replay->pass, header, WVK_MESH_DRAW * 4);
+         }
+      }
+      replay->draw_points = false;
+      replay->list_topology = WGPUPrimitiveTopology_Undefined;
+      st->vs = draw_vs;
    }
-   replay->list_topology = WGPUPrimitiveTopology_Undefined;
-   st->vs = draw_vs;
+   wgpuBindGroupRelease(group);
 }
 
 VKAPI_ATTR void VKAPI_CALL

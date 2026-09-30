@@ -1527,6 +1527,16 @@ record_slot(unsigned location)
    }
 }
 
+/* Slot `slot` of a record, of the packed ones of `slots` (mesh_slots), or
+ * -1; all of them, as they are, for no `slots`. */
+static int
+packed_slot(uint64_t slots, int slot)
+{
+   if (!slots || slot < 0)
+      return slot;
+   return slot < 64 && (slots & BITFIELD64_BIT(slot)) ? (int)util_bitcount64(slots & BITFIELD64_MASK(slot)) : -1;
+}
+
 /* How many generic varyings a record of these variables has: to the last
  * slot of theirs. */
 static unsigned
@@ -2248,15 +2258,16 @@ lower_tes(nir_shader *nir, struct wvk_shader *shader, unsigned tcs_vars, unsigne
 }
 
 /* A record's slots of a variable, from binding `binding` at `base`, into
- * the variable (geometry_vertex_shader): as nir_lower_io lays it out. */
+ * the variable (geometry_vertex_shader): as nir_lower_io lays it out, of
+ * the packed slots of `slots` (packed_slot). */
 static void
 load_record_into(nir_builder *b, nir_deref_instr *deref, const struct glsl_type *type, unsigned location,
-                 unsigned frac, bool compact, uint32_t binding, nir_def *base)
+                 unsigned frac, bool compact, uint32_t binding, nir_def *base, uint64_t slots)
 {
    if (compact) {
       for (unsigned e = 0; e < glsl_get_length(type); ++e) {
          const unsigned total = frac + e;
-         const int slot = record_slot(location + total / 4);
+         const int slot = packed_slot(slots, record_slot(location + total / 4));
          if (slot < 0)
             continue;
          nir_def *word = nir_load_ssbo(b, 1, 32, driver_buffer(b, binding),
@@ -2270,7 +2281,7 @@ load_record_into(nir_builder *b, nir_deref_instr *deref, const struct glsl_type 
       unsigned at = location;
       for (unsigned f = 0; f < glsl_get_length(type); ++f) {
          const struct glsl_type *field = glsl_get_struct_field(type, f);
-         load_record_into(b, nir_build_deref_struct(b, deref, f), field, at, 0, false, binding, base);
+         load_record_into(b, nir_build_deref_struct(b, deref, f), field, at, 0, false, binding, base, slots);
          at += glsl_count_vec4_slots(field, false, true);
       }
       return;
@@ -2282,7 +2293,7 @@ load_record_into(nir_builder *b, nir_deref_instr *deref, const struct glsl_type 
       const unsigned per = glsl_count_vec4_slots(element, false, true);
       for (unsigned e = 0; e < n; ++e)
          load_record_into(b, nir_build_deref_array_imm(b, deref, e), element, location + e * per, frac, false,
-                          binding, base);
+                          binding, base, slots);
       return;
    }
    if (glsl_type_is_vector_or_scalar(type) && glsl_get_bit_size(type) == 64) {
@@ -2291,7 +2302,7 @@ load_record_into(nir_builder *b, nir_deref_instr *deref, const struct glsl_type 
       const unsigned n = glsl_get_vector_elements(type);
       for (unsigned c = 0; c < n; ++c) {
          const unsigned at = frac / 2 + c;
-         const int slot = record_slot(location + at / 2);
+         const int slot = packed_slot(slots, record_slot(location + at / 2));
          out[c] = slot < 0 ? nir_imm_int64(b, 0)
                            : nir_pack_64_2x32(b, nir_load_ssbo(b, 2, 32, driver_buffer(b, binding),
                                                                nir_iadd_imm(b, base, slot * 16 + (at % 2) * 8),
@@ -2300,7 +2311,7 @@ load_record_into(nir_builder *b, nir_deref_instr *deref, const struct glsl_type 
       nir_store_deref(b, deref, nir_vec(b, out, n), BITFIELD_MASK(n));
       return;
    }
-   const int slot = record_slot(location);
+   const int slot = packed_slot(slots, record_slot(location));
    if (slot < 0 || !glsl_type_is_vector_or_scalar(type))
       return;
    const unsigned n = glsl_get_vector_elements(type);
@@ -2388,7 +2399,7 @@ geometry_vertex_shader(nir_shader *nir, const struct wvk_shader_key *key)
    }
    nir_foreach_shader_out_variable(var, nir)
       load_record_into(&b, nir_build_deref_var(&b, var), var->type, var->data.location, var->data.location_frac,
-                       var->data.compact, WVK_DRIVER_SLOT_GS_VERTICES, base);
+                       var->data.compact, WVK_DRIVER_SLOT_GS_VERTICES, base, 0);
    /* The coordinates, perspective and linear: 1 at its corner. */
    for (unsigned m = 0, at = key->bary; key->bary && m < 2; ++m) {
       if (!(key->bary_uses & BITFIELD_BIT(m)))
@@ -2444,22 +2455,6 @@ geometry_vertex_shader(nir_shader *nir, const struct wvk_shader_key *key)
  * of, as compute; and the vertex shader of the draw of what a mesh shader
  * made (wvk_cmd_draw.c's draw_mesh). */
 
-/* How many generic varyings a mesh shader's vertex, or primitive, record
- * has. */
-static unsigned
-mesh_vars(nir_shader *nir, bool per_primitive)
-{
-   unsigned vars = 0;
-   nir_foreach_shader_out_variable(var, nir) {
-      if (var->data.per_primitive != per_primitive || var->data.location < VARYING_SLOT_VAR0 ||
-          var->data.location >= VARYING_SLOT_VAR0 + 32 || !glsl_type_is_array(var->type))
-         continue;
-      vars = MAX2(vars, var->data.location - VARYING_SLOT_VAR0 +
-                           glsl_count_vec4_slots(glsl_get_array_element(var->type), false, true));
-   }
-   return MIN2(vars, 32);
-}
-
 /* A primitive's slot in its record (wvk_mesh_block), or -1. */
 static int
 primitive_slot(unsigned location)
@@ -2471,6 +2466,29 @@ primitive_slot(unsigned location)
    case VARYING_SLOT_PSIZ: return -1;
    default: return record_slot(location);
    }
+}
+
+/* The slots of a record (record_slot), or a primitive's (primitive_slot),
+ * that a mesh shader's vertices, or primitives, have: a bit each, of those
+ * it writes -- a vertex's position, and a primitive's indices and cull,
+ * whatever it does -- which its records have, packed (packed_slot). */
+static uint64_t
+mesh_slots(nir_shader *nir, bool per_primitive)
+{
+   uint64_t slots = per_primitive ? 0x3 : 0x1;
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.per_primitive != per_primitive || !glsl_type_is_array(var->type))
+         continue;
+      const struct glsl_type *element = glsl_get_array_element(var->type);
+      const unsigned n = var->data.compact ? DIV_ROUND_UP(var->data.location_frac + glsl_get_length(element), 4)
+                                           : glsl_count_vec4_slots(element, false, true);
+      for (unsigned i = 0; i < n; ++i) {
+         const int slot = per_primitive ? primitive_slot(var->data.location + i) : record_slot(var->data.location + i);
+         if (slot >= 0 && slot < 64)
+            slots |= BITFIELD64_BIT(slot);
+      }
+   }
+   return slots;
 }
 
 /* A task payload's word at `offset`, bytes from `base` in the payloads'
@@ -2503,13 +2521,18 @@ load_payload(nir_builder *b, nir_def *base, nir_def *offset, unsigned components
 }
 
 /* The workgroup of a mesh or task shader run as compute: its index in
- * the dispatch, rows of 65535 (dispatch_graphics_groups). */
+ * the dispatch, rows of 65535 (dispatch_graphics_groups), as wide as the
+ * header's `dispatch` says. Not the number of workgroups, which Tint has
+ * as a private variable and whose uniformity it cannot see: a barrier
+ * under this index's test would have it broadcast through workgroup
+ * storage, of which the shader may use all there is. */
 static nir_def *
-mesh_group_index(nir_builder *b)
+mesh_group_index(nir_builder *b, unsigned dispatch)
 {
    nir_def *wg = nir_load_workgroup_id(b);
-   nir_def *groups = nir_load_num_workgroups(b);
-   return nir_iadd(b, nir_channel(b, wg, 0), nir_imul(b, nir_channel(b, wg, 1), nir_channel(b, groups, 0)));
+   nir_def *width = nir_load_ssbo(b, 1, 32, driver_buffer(b, WVK_DRIVER_SLOT_TESS_COUNTS), nir_imm_int(b, dispatch * 4),
+                                  .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+   return nir_iadd(b, nir_channel(b, wg, 0), nir_imul(b, nir_channel(b, wg, 1), width));
 }
 
 /* A word of a mesh draw's header, which its passes read. */
@@ -2584,16 +2607,19 @@ lower_mesh(nir_shader *nir, struct wvk_shader *shader, bool after_task, bool sta
 {
    const unsigned max_vertices = nir->info.mesh.max_vertices_out;
    const unsigned max_primitives = nir->info.mesh.max_primitives_out;
-   shader->record_vars = mesh_vars(nir, false);
-   shader->prim_vars = mesh_vars(nir, true);
-   const uint32_t vertex_stride = wvk_record_stride(shader->record_vars);
-   const uint32_t prim_stride = wvk_record_stride(shader->prim_vars);
+   const uint64_t vertex_slots = mesh_slots(nir, false), prim_slots = mesh_slots(nir, true);
+   shader->record_vars = util_bitcount64(vertex_slots);
+   shader->prim_vars = util_bitcount64(prim_slots);
+   const uint32_t vertex_stride = 16 * shader->record_vars;
+   const uint32_t prim_stride = 16 * shader->prim_vars;
    const uint32_t block = wvk_mesh_block(max_primitives, shader->prim_vars);
 
    /* The payload's size is its layout's. */
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_task_payload, glsl_get_natural_size_align_bytes);
    const uint32_t payload = wvk_payload_stride(nir->info.task_payload_size);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_task_payload, nir_address_format_32bit_offset);
+   /* A halt, which ntv has none of, is a return of the one function. */
+   NIR_PASS(_, nir, nir_lower_halt_to_return);
    NIR_PASS(_, nir, nir_lower_returns);
    /* A component of an output's vector, which lower_io would have none of:
     * a store of it, or of the vector with it. */
@@ -2626,7 +2652,8 @@ lower_mesh(nir_shader *nir, struct wvk_shader *shader, bool after_task, bool sta
          case nir_intrinsic_store_per_vertex_output: {
             nir_def *vertex = intr->src[intr->intrinsic == nir_intrinsic_store_per_vertex_output ? 1 : 0].ssa;
             nir_def *at = nir_iadd(&b, nir_imul_imm(&b, nir_load_var(&b, group), max_vertices), vertex);
-            record_access(&b, intr, WVK_DRIVER_SLOT_GS_VERTICES, nir_imul_imm(&b, at, vertex_stride), false);
+            record_access_slot(&b, intr, WVK_DRIVER_SLOT_GS_VERTICES, nir_imul_imm(&b, at, vertex_stride),
+                               packed_slot(vertex_slots, record_slot(nir_intrinsic_io_semantics(intr).location)));
             break;
          }
          case nir_intrinsic_load_per_primitive_output:
@@ -2635,7 +2662,7 @@ lower_mesh(nir_shader *nir, struct wvk_shader *shader, bool after_task, bool sta
             nir_def *base = nir_iadd(&b, nir_imul_imm(&b, nir_load_var(&b, group), block),
                                      nir_iadd_imm(&b, nir_imul_imm(&b, prim, prim_stride), 16));
             record_access_slot(&b, intr, WVK_DRIVER_SLOT_GS_INDICES, base,
-                               primitive_slot(nir_intrinsic_io_semantics(intr).location));
+                               packed_slot(prim_slots, primitive_slot(nir_intrinsic_io_semantics(intr).location)));
             break;
          }
          case nir_intrinsic_load_output:
@@ -2645,9 +2672,12 @@ lower_mesh(nir_shader *nir, struct wvk_shader *shader, bool after_task, bool sta
             nir_instr_remove(instr);
             break;
          case nir_intrinsic_set_vertex_and_primitive_count: {
+            /* The first invocation's counts are the workgroup's. */
             nir_def *counts = nir_vec2(&b, intr->src[0].ssa, intr->src[1].ssa);
+            nir_push_if(&b, nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0));
             nir_store_ssbo(&b, counts, driver_buffer(&b, WVK_DRIVER_SLOT_GS_INDICES),
                            nir_imul_imm(&b, nir_load_var(&b, group), block), .write_mask = 0x3, .align_mul = 8);
+            nir_pop_if(&b, NULL);
             nir_store_var(&b, made, intr->src[1].ssa, 0x1);
             nir_instr_remove(instr);
             break;
@@ -2662,12 +2692,14 @@ lower_mesh(nir_shader *nir, struct wvk_shader *shader, bool after_task, bool sta
       }
    }
 
-   /* The start: which mesh workgroup, of which task workgroup's grid. */
+   /* The start: which mesh workgroup, of which task workgroup's grid. Its
+    * records are the round's (draw_mesh). */
    nir_cf_list body;
    nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
    b.cursor = nir_before_impl(impl);
-   nir_def *m = mesh_group_index(&b);
-   nir_store_var(&b, group, m, 0x1);
+   nir_def *local = mesh_group_index(&b, WVK_MESH_DISPATCH);
+   nir_store_var(&b, group, local, 0x1);
+   nir_def *m = nir_iadd(&b, local, mesh_header(&b, WVK_MESH_BASE, 1));
    nir_store_var(&b, made, nir_imm_int(&b, 0), 0x1);
    nir_def *total = mesh_header(&b, WVK_MESH_TOTAL, 1);
    if (after_task) {
@@ -2703,7 +2735,7 @@ lower_mesh(nir_shader *nir, struct wvk_shader *shader, bool after_task, bool sta
       nir_store_var(&b, id, unflatten_group(&b, m, dims), 0x7);
       nir_store_var(&b, payload_base, nir_imm_int(&b, 0), 0x1);
    }
-   nir_if *run_if = nir_push_if(&b, nir_ult(&b, m, total));
+   nir_if *run_if = nir_push_if(&b, nir_ult(&b, local, total));
    {
       /* Its block's counts and culls none, until it says otherwise: the
        * buffers are the submit's mesh draws', which the last left as they
@@ -2711,7 +2743,7 @@ lower_mesh(nir_shader *nir, struct wvk_shader *shader, bool after_task, bool sta
       const unsigned invocations = MAX2(nir->info.workgroup_size[0] * nir->info.workgroup_size[1] *
                                            nir->info.workgroup_size[2], 1);
       nir_def *index = nir_load_local_invocation_index(&b);
-      nir_def *at = nir_imul_imm(&b, m, block);
+      nir_def *at = nir_imul_imm(&b, local, block);
       nir_push_if(&b, nir_ieq_imm(&b, index, 0));
       nir_store_ssbo(&b, nir_imm_zero(&b, 2, 32), driver_buffer(&b, WVK_DRIVER_SLOT_GS_INDICES), at, .write_mask = 0x3,
                      .align_mul = 8);
@@ -2768,6 +2800,9 @@ lower_task(nir_shader *nir, struct wvk_shader *shader, bool stats)
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_task_payload, glsl_get_natural_size_align_bytes);
    const uint32_t payload = wvk_payload_stride(nir->info.task_payload_size);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_task_payload, nir_address_format_32bit_offset);
+   /* EmitMeshTasksEXT ends the invocation: a halt after it, which is a
+    * return of the one function, the rest of the body not run. */
+   NIR_PASS(_, nir, nir_lower_halt_to_return);
    NIR_PASS(_, nir, nir_lower_returns);
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
@@ -2853,9 +2888,12 @@ lower_task(nir_shader *nir, struct wvk_shader *shader, bool stats)
                                                  intr->src[2].ssa, .atomic_op = nir_intrinsic_atomic_op(intr)));
             break;
          case nir_intrinsic_launch_mesh_workgroups: {
+            /* The first invocation's grid is the workgroup's. */
             nir_def *dims = intr->src[0].ssa;
+            nir_push_if(&b, nir_ieq_imm(&b, nir_load_local_invocation_index(&b), 0));
             nir_store_ssbo(&b, dims, driver_buffer(&b, WVK_DRIVER_SLOT_TESS_PATCHES),
                            nir_ishl_imm(&b, nir_load_var(&b, group), 4), .write_mask = 0x7, .align_mul = 16);
+            nir_pop_if(&b, NULL);
             nir_instr_remove(instr);
             break;
          }
@@ -2867,7 +2905,7 @@ lower_task(nir_shader *nir, struct wvk_shader *shader, bool stats)
    nir_cf_list body;
    nir_cf_extract(&body, nir_before_impl(impl), nir_after_impl(impl));
    b.cursor = nir_before_impl(impl);
-   nir_def *t = mesh_group_index(&b);
+   nir_def *t = mesh_group_index(&b, WVK_MESH_FIRST_DISPATCH);
    nir_store_var(&b, group, t, 0x1);
    nir_def *dims = mesh_header(&b, WVK_MESH_FIRST, 3);
    nir_store_var(&b, count, dims, 0x7);
@@ -2899,10 +2937,13 @@ mesh_vertex_shader(nir_shader *nir, const struct wvk_shader_key *key)
    const unsigned corners = nir->info.mesh.primitive_type == MESA_PRIM_POINTS  ? 1
                             : nir->info.mesh.primitive_type == MESA_PRIM_LINES ? 2
                                                                                : 3;
-   const unsigned record_vars_n = mesh_vars(nir, false), prim_vars_n = mesh_vars(nir, true);
-   const uint32_t vertex_stride = wvk_record_stride(record_vars_n);
-   const uint32_t prim_stride = wvk_record_stride(prim_vars_n);
-   const uint32_t block = wvk_mesh_block(max_primitives, prim_vars_n);
+   const uint64_t slots[2] = { mesh_slots(nir, false), mesh_slots(nir, true) };
+   const uint32_t vertex_stride = 16 * util_bitcount64(slots[0]);
+   const uint32_t prim_stride = 16 * util_bitcount64(slots[1]);
+   const uint32_t block = wvk_mesh_block(max_primitives, util_bitcount64(slots[1]));
+   /* Its cull distances, after its clip distances. */
+   const unsigned culls = cull_distance_var(nir, nir_var_shader_out) ? MIN2(nir->info.cull_distance_array_size, 8) : 0;
+   const unsigned first_cull = nir->info.clip_distance_array_size;
 
    /* Its outputs, a vertex's or a primitive's: not arrays. A primitive's
     * are flat. */
@@ -2967,6 +3008,24 @@ mesh_vertex_shader(nir_shader *nir, const struct wvk_shader_key *key)
    nir_def *valid = nir_iand(&b, nir_ult(&b, local, nir_channel(&b, made, 1)), nir_ieq_imm(&b, culled, 0));
    for (unsigned c = 0; c < corners; ++c)
       valid = nir_iand(&b, valid, nir_ult(&b, nir_channel(&b, indices, c), nir_channel(&b, made, 0)));
+   /* Culled by a distance every corner's is negative of: WebGPU has no
+    * cull distances. */
+   for (unsigned i = 0; i < culls; ++i) {
+      const unsigned at = first_cull + i;
+      const int slot = packed_slot(slots[0], record_slot(VARYING_SLOT_CLIP_DIST0 + at / 4));
+      if (slot < 0)
+         continue;
+      nir_def *outside = nir_imm_true(&b);
+      for (unsigned c = 0; c < corners; ++c) {
+         nir_def *corner_at = nir_iadd(&b, nir_imul_imm(&b, m, max_vertices),
+                                       nir_umin(&b, nir_channel(&b, indices, c), nir_imm_int(&b, max_vertices - 1)));
+         nir_def *d = nir_load_ssbo(&b, 1, 32, driver_buffer(&b, WVK_DRIVER_SLOT_GS_VERTICES),
+                                    nir_iadd_imm(&b, nir_imul_imm(&b, corner_at, vertex_stride), slot * 16 + (at % 4) * 4),
+                                    .align_mul = 4, .access = ACCESS_NON_WRITEABLE);
+         outside = nir_iand(&b, outside, nir_flt_imm(&b, d, 0.0));
+      }
+      valid = nir_iand(&b, valid, nir_inot(&b, outside));
+   }
    nir_def *vertex_base =
       nir_imul_imm(&b, nir_iadd(&b, nir_imul_imm(&b, m, max_vertices), nir_umin(&b, own, nir_imm_int(&b, max_vertices - 1))),
                    vertex_stride);
@@ -2975,7 +3034,7 @@ mesh_vertex_shader(nir_shader *nir, const struct wvk_shader_key *key)
          nir_variable *var = *v;
          load_record_into(&b, nir_build_deref_var(&b, var), var->type, var->data.location, var->data.location_frac,
                           var->data.compact, k ? WVK_DRIVER_SLOT_GS_INDICES : WVK_DRIVER_SLOT_GS_VERTICES,
-                          k ? record : vertex_base);
+                          k ? record : vertex_base, slots[k]);
       }
       util_dynarray_fini(&outs[k]);
    }
@@ -7454,8 +7513,9 @@ geometry_shell(struct wvk_device *dev, struct vk_shader_compile_info *info, cons
          shader->mesh_vertices = nir->info.mesh.max_vertices_out;
          shader->mesh_primitives = nir->info.mesh.max_primitives_out;
          shader->mesh_primitive = nir->info.mesh.primitive_type;
-         shader->record_vars = mesh_vars(nir, false);
-         shader->prim_vars = mesh_vars(nir, true);
+         shader->record_vars = util_bitcount64(mesh_slots(nir, false));
+         shader->prim_vars = util_bitcount64(mesh_slots(nir, true));
+         shader->writes_point_size = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_PSIZ);
       }
       /* The payload's size, of its layout (lower_task, lower_mesh). */
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_task_payload, glsl_get_natural_size_align_bytes);
@@ -7908,6 +7968,11 @@ wvk_shader_mesh_variant(struct wvk_device *dev, struct wvk_shader *shader, unsig
          key.clip_slots = other->key.clip_slots;
       }
       key.provoking_last = dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+      /* Points as quads of the size it gives them (expand_points). */
+      if (wvk_shader_mesh_quads(shader, dyn->rs.rasterizer_discard_enable)) {
+         key.points = 1;
+         key.point_coord = other ? other->key.point_coord : 0;
+      }
    }
    struct wvk_shader *variant = variant_for(dev, shader, &key, NULL);
    return variant != shader ? variant : NULL;
