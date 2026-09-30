@@ -176,6 +176,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   logic op's is, by the attachment's equation, clamped as normalized
   formats are. Dual-source blending works the same way. WebGPU blends the
   others with the real constant. Not on a multisampled pass either.
+- **Advanced blending** (VK_EXT_blend_operation_advanced) is blended the
+  same way, by NIR's equations (`nir_color_blend_advanced`), all of the
+  operations, premultiplied or not, with each overlap, on up to 8
+  attachments; not on a multisampled pass. Not coherent: primitives of one draw that overlap see the
+  attachment as it was before the draw, as the extension allows without
+  advancedBlendCoherentOperations.
 - **The depth bounds test** is the fragment shader's too. It tests the
   depth the attachment holds, so a draw with it on gets a variant that
   reads a copy of the depth attachment (R32Float, made before the draw)

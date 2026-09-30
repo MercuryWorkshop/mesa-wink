@@ -2264,7 +2264,7 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
        * blending off while one is on, whether or not it applies. And none
        * where the fragment shader blends (lower_blend). */
       k->color[i].blend = a->blend_enable && written && !dyn->cb.logic_op_enable &&
-                          !(st->fs->key.blend_mask & BITFIELD_BIT(i));
+                          !(st->fs->key.blend_mask & BITFIELD_BIT(i)) && a->color_blend_op < VK_BLEND_OP_ZERO_EXT;
       if (k->color[i].blend) {
          k->color[i].src_c = blend_factor(a->src_color_blend_factor);
          k->color[i].dst_c = blend_factor(a->dst_color_blend_factor);

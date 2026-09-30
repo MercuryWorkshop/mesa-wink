@@ -33,10 +33,13 @@
 
 #include "gex_wgpu_nir.h"
 
+#include "vk_blend.h"
+
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_builtin_builder.h"
 #include "compiler/nir/nir_deref.h"
+#include "compiler/nir/nir_lower_blend.h"
 #include "compiler/nir/nir_serialize.h"
 #include "compiler/nir/nir_xfb_info.h"
 #include "compiler/spirv/nir_spirv.h"
@@ -951,6 +954,18 @@ blend_apply(nir_builder *b, uint32_t eq, VkFormat format, nir_def *s, nir_def *s
    s1 = blend_clamp(b, s1, desc);
    d = blend_clamp(b, d, desc);
    k = blend_clamp(b, k, desc);
+   /* An advanced equation: NIR's (nir_lower_blend). */
+   if (eq & WVK_BLEND_ADVANCED) {
+      const nir_lower_blend_rt rt = {
+         .format = vk_format_to_pipe_format(format),
+         .advanced_blend = 1,
+         .blend_mode = (enum pipe_advanced_blend_mode)(eq & 63),
+         .src_premultiplied = (eq >> 6) & 1,
+         .dst_premultiplied = (eq >> 7) & 1,
+         .overlap = (enum pipe_blend_overlap_mode)((eq >> 8) & 3),
+      };
+      return nir_color_blend_advanced(b, &rt, s, d);
+   }
    nir_def *out[4];
    for (unsigned c = 0; c < 4; ++c) {
       const uint32_t e = c == 3 ? eq >> 13 : eq;
@@ -6945,21 +6960,33 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
        * op: every attachment whose colour factors use CONSTANT_ALPHA
        * where another's (or its own) use CONSTANT_COLOR, which WebGPU's
        * one blend constant cannot both be. */
-      const uint32_t blends = color_formats && !dyn->cb.logic_op_enable
-                                 ? wvk_shader_blend_mask(dyn, outputs & dyn->cb.color_write_enables)
-                                 : 0;
+      /* And every advanced one (VK_EXT_blend_operation_advanced). */
+      uint32_t advanced = 0;
+      for (uint32_t i = 0; color_formats && !dyn->cb.logic_op_enable && i < MIN2(dyn->cb.attachment_count, 8); ++i) {
+         const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
+         if (a->blend_enable && a->write_mask && (outputs & dyn->cb.color_write_enables & BITFIELD_BIT(i)) &&
+             a->color_blend_op >= VK_BLEND_OP_ZERO_EXT)
+            advanced |= BITFIELD_BIT(i);
+      }
+      const uint32_t blends = (color_formats && !dyn->cb.logic_op_enable
+                                  ? wvk_shader_blend_mask(dyn, outputs & dyn->cb.color_write_enables)
+                                  : 0) |
+                              advanced;
       if (blends && samples > 1) {
-         mesa_logw_once("wvk: colour blend factors with both CONSTANT_COLOR and CONSTANT_ALPHA on a multisampled "
-                        "pass, which is not done");
+         mesa_logw_once("wvk: colour blend factors with both CONSTANT_COLOR and CONSTANT_ALPHA, or advanced "
+                        "blending, on a multisampled pass, which is not done");
       } else {
          u_foreach_bit(i, blends) {
             const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
             if (!color_formats[i])
                continue;
             key.blend_mask |= BITFIELD_BIT(i);
-            key.blend_equation[i] = wvk_blend_equation(a->src_color_blend_factor, a->dst_color_blend_factor,
-                                                       a->color_blend_op, a->src_alpha_blend_factor,
-                                                       a->dst_alpha_blend_factor, a->alpha_blend_op);
+            key.blend_equation[i] =
+               (advanced & BITFIELD_BIT(i))
+                  ? wvk_blend_advanced(vk_advanced_blend_op_to_pipe(a->color_blend_op), a->src_premultiplied,
+                                       a->dst_premultiplied, vk_blend_overlap_to_pipe(a->blend_overlap))
+                  : wvk_blend_equation(a->src_color_blend_factor, a->dst_color_blend_factor, a->color_blend_op,
+                                       a->src_alpha_blend_factor, a->dst_alpha_blend_factor, a->alpha_blend_op);
             key.logic_format[i] = color_formats[i];
          }
       }

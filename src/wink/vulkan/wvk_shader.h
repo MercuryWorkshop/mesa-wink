@@ -436,6 +436,18 @@ wvk_blend_equation(uint32_t src_c, uint32_t dst_c, uint32_t op_c, uint32_t src_a
    return src_c | dst_c << 5 | op_c << 10 | src_a << 13 | dst_a << 18 | op_a << 23;
 }
 
+/* Or an advanced one (VK_EXT_blend_operation_advanced): its mode, enum
+ * pipe_advanced_blend_mode, whether the source and destination are
+ * premultiplied, and the overlap, enum pipe_blend_overlap_mode. */
+#define WVK_BLEND_ADVANCED (1u << 31)
+
+static inline uint32_t
+wvk_blend_advanced(uint32_t mode, bool src_premultiplied, bool dst_premultiplied, uint32_t overlap)
+{
+   return WVK_BLEND_ADVANCED | mode | (uint32_t)src_premultiplied << 6 | (uint32_t)dst_premultiplied << 7 |
+          overlap << 8;
+}
+
 /* A geometry shader of `input` primitives that passes each through, for
  * the cull distances of `last`, a vertex or tessellation evaluation shader
  * drawn without one; NULL where there is none to be had. */

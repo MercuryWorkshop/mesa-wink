@@ -126,6 +126,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_non_seamless_cube_map = true,
       .EXT_image_2d_view_of_3d = true,
       .EXT_image_sliced_view_of_3d = true,
+      .EXT_blend_operation_advanced = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -552,6 +553,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .extendedDynamicState3RasterizationStream = true,
       .extendedDynamicState3ProvokingVertexMode = true,
       .extendedDynamicState3LineRasterizationMode = true,
+      .extendedDynamicState3ColorBlendAdvanced = true,
       .extendedDynamicState3LineStippleEnable = true,
       .vertexInputDynamicState = true,
       .extendedDynamicState3DepthClampEnable = wvk_physical_device_has_feature(pdev, WGPUFeatureName_DepthClipControl),
@@ -616,6 +618,9 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .image2DViewOf3D = true,
       .sampler2DViewOf3D = true,
       .imageSlicedViewOf3D = true,
+      /* The fragment shader's, against a copy of the attachment made before
+       * each draw (lower_blend): within a draw, not coherent. */
+      .advancedBlendCoherentOperations = false,
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,
@@ -806,6 +811,14 @@ get_device_properties(const struct wvk_physical_device *pdev,
       /* VK_EXT_provoking_vertex: the lists are the draw's. */
       .provokingVertexModePerPipeline = true,
       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
+      /* VK_EXT_blend_operation_advanced: the fragment shader's, of every
+       * attachment, NIR's equations. */
+      .advancedBlendMaxColorAttachments = 8,
+      .advancedBlendIndependentBlend = true,
+      .advancedBlendNonPremultipliedSrcColor = true,
+      .advancedBlendNonPremultipliedDstColor = true,
+      .advancedBlendCorrelatedOverlap = true,
+      .advancedBlendAllOperations = true,
       /* VK_KHR_line_rasterization: the quads' corners are the vertex
        * shader's positions moved, as precise as the rest. */
       .lineSubPixelPrecisionBits = 4,

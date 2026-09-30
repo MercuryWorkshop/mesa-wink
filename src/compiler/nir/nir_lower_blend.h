@@ -77,6 +77,11 @@ nir_color_blend(nir_builder *b, nir_def *src0, nir_def *src1, nir_def *dst,
 nir_def *
 nir_color_mask(nir_builder *b, nir_def *src, nir_def *dst, unsigned mask);
 
+/* The advanced blend of rt (rt->advanced_blend's mode, premultiplication and
+ * overlap) of src over dst. */
+nir_def *
+nir_color_blend_advanced(nir_builder *b, const nir_lower_blend_rt *rt, nir_def *src, nir_def *dst);
+
 bool nir_lower_blend(nir_shader *shader,
                      const nir_lower_blend_options *options);
 
