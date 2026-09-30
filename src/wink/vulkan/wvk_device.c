@@ -103,6 +103,11 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
    result = wvk_device_init_pipeline_caches(dev);
    if (result != VK_SUCCESS)
       goto fail_device;
+   /* Pipelines of shaders alike share their compiles while they are, of
+    * the runtime's cache of weak references: without a pipeline cache of
+    * the application's, each pipeline compiled its own. */
+   const struct vk_pipeline_cache_create_info mem_cache = { .weak_ref = true };
+   dev->vk.mem_cache = vk_pipeline_cache_create(&dev->vk, &mem_cache, NULL);
 
    const VkCommandPoolCreateInfo pool_info = {
       .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -182,6 +187,8 @@ fail_replay:
 fail_pool:
    vk_command_pool_finish(&dev->replay_pool);
 fail_caches:
+   if (dev->vk.mem_cache)
+      vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
    wvk_device_finish_pipeline_caches(dev);
 fail_device:
    wgpuDeviceRelease(dev->wgpu);
@@ -204,6 +211,9 @@ wvk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       wvk_queue_finish(dev, &dev->queue);
    wvk_device_finish_host_copy(dev);
    wvk_device_finish_meta(dev);
+   /* After vk_meta's pipelines, the last of what it has. */
+   if (dev->vk.mem_cache)
+      vk_pipeline_cache_destroy(dev->vk.mem_cache, NULL);
    wvk_cmd_buffer_ops.destroy(&dev->replay_cmd->vk);
    vk_command_pool_finish(&dev->replay_pool);
    wvk_device_finish_pipeline_caches(dev);
