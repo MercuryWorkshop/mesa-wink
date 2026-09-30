@@ -20,6 +20,8 @@ struct wvk_replay;
  * view of a compressed image a texel a block, at one level. */
 struct wvk_image_alias {
    WGPUTextureFormat format;
+   /* The view format it is of, which a packed one's texels are. */
+   VkFormat vk_format;
    WGPUTexture texture;
    /* Of a multisampled array, a texture of each layer, as the image has
     * (layer_textures), of which `texture` is the first. */
@@ -63,6 +65,9 @@ struct wvk_image {
    WGPUTextureFormat format;
    WGPUTextureDimension dimension;
    WGPUTextureUsage usage;
+   /* What its texture's texels are of, if not its format: another image's,
+    * of VK_IMAGE_CREATE_ALIAS_BIT, whose texture it is. */
+   VkFormat texture_format;
 
    /* A linear image has no texture: it is its memory, rows `pitch` bytes
     * apart -- 256-aligned, so copies to and from textures are one WebGPU
@@ -242,6 +247,21 @@ WGPUTexture wvk_image_snapshot_ms(struct wvk_device *dev, struct wvk_replay *rep
  * `to`, bit for bit (wvk_image_copy_ms_bits): both formats' texels are
  * words a shader packs and unpacks. */
 bool wvk_ms_bits_format(WGPUTextureFormat format);
+
+/* Level `level` of the image's texture `from` into its texture `to`, where
+ * either is of a packed 16-bit format -- RGBA8, whose texels a shader
+ * unpacks and packs -- through a buffer of their bits (wvk_cmd_copy.c). */
+void wvk_image_copy_packed(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+                           uint32_t from, uint32_t to, uint32_t level);
+
+/* The Vulkan format of the image's texture `t`. */
+static inline VkFormat
+wvk_image_texture_format(const struct wvk_image *image, uint32_t t)
+{
+   if (t == WVK_IMAGE_TEXTURE || t == WVK_IMAGE_SHADOW)
+      return image->texture_format ? image->texture_format : image->vk.format;
+   return image->aliases[t - 1].vk_format;
+}
 
 /* Every sample of a multisampled image's texture `from` into its texture
  * `to`, the one's bits as the other's format, every layer: a pass writing

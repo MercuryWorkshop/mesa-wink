@@ -392,6 +392,16 @@ wvk_image_make_current(struct wvk_device *dev, struct wvk_replay *replay, struct
          image->valid[l] |= BITFIELD_BIT(t);
          continue;
       }
+      /* Of a packed format, the texels' bits through a buffer. */
+      {
+         const struct wvk_format *fs = wvk_format_get(wvk_image_texture_format(image, image->owner[l]));
+         const struct wvk_format *ft = wvk_format_get(wvk_image_texture_format(image, t));
+         if ((fs && (fs->caps & WVK_CAP_PACKED16)) || (ft && (ft->caps & WVK_CAP_PACKED16))) {
+            wvk_image_copy_packed(dev, replay, image, image->owner[l], t, l);
+            image->valid[l] |= BITFIELD_BIT(t);
+            continue;
+         }
+      }
       /* A multisampled one's samples are moved by a pass. */
       if (image->vk.samples > 1) {
          wvk_image_copy_ms_bits(dev, replay, image, image->owner[l], t);
@@ -582,6 +592,25 @@ wvk_GetDeviceImageSparseMemoryRequirements(VkDevice device, const VkDeviceImageM
  * Vulkan says the two alias, so they are one texture. An optimal image's
  * texels are its texture's, not its memory's, and any other image bound
  * there sees them only through copies. */
+/* The WebGPU uses of an image's texture that its Vulkan uses need. */
+static WGPUTextureUsage
+needed_usage(const struct wvk_image *image)
+{
+   const VkImageUsageFlags u = image->vk.usage;
+   WGPUTextureUsage w = 0;
+   if (u & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT))
+      w |= WGPUTextureUsage_TextureBinding;
+   if (u & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
+      w |= WGPUTextureUsage_RenderAttachment;
+   if (u & VK_IMAGE_USAGE_STORAGE_BIT)
+      w |= WGPUTextureUsage_StorageBinding;
+   if (u & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+      w |= WGPUTextureUsage_CopySrc;
+   if (u & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+      w |= WGPUTextureUsage_CopyDst;
+   return w & image->usage;
+}
+
 static void
 bind_alias(struct wvk_device *dev, struct wvk_image *image, struct wvk_device_memory *mem, uint64_t offset)
 {
@@ -591,11 +620,19 @@ bind_alias(struct wvk_device *dev, struct wvk_image *image, struct wvk_device_me
    simple_mtx_lock(&dev->cache_lock);
    util_dynarray_foreach(&dev->bound_aliases, struct wvk_bound_alias, a) {
       const struct wvk_image *other = a->image;
-      const bool same = other->format == image->format || other->format == srgb_twin(image->format);
+      /* The same texture format, of texels of as many bytes -- packed
+       * formats' being RGBA8 textures of two. */
+      const bool same = (other->format == image->format || other->format == srgb_twin(image->format)) &&
+                        util_format_get_blocksize(vk_format_to_pipe_format(image->vk.format)) ==
+                           util_format_get_blocksize(vk_format_to_pipe_format(other->vk.format));
       const struct wvk_format *mine = wvk_format_get(image->vk.format), *theirs = wvk_format_get(other->vk.format);
       /* Of other formats, of texels of as many bytes, and nothing packed:
        * views of the image's own format are aliases of the texture's. */
-      const bool bits = mine && theirs && !((mine->caps | theirs->caps) & WVK_CAP_PACKED16) &&
+      /* A packed one's texels are RGBA8, which only 2-byte formats'
+       * are kept of, by a shader (wvk_image_copy_packed). */
+      const bool packed = mine && theirs && ((mine->caps | theirs->caps) & WVK_CAP_PACKED16);
+      const bool bits = mine && theirs &&
+                        (!packed || util_format_get_blocksize(vk_format_to_pipe_format(image->vk.format)) == 2) &&
                         !vk_format_is_compressed(image->vk.format) && !vk_format_is_compressed(other->vk.format) &&
                         image->vk.samples == 1 && !(image->vk.aspects & ~VK_IMAGE_ASPECT_COLOR_BIT) &&
                         util_format_get_blocksize(vk_format_to_pipe_format(image->vk.format)) ==
@@ -606,8 +643,9 @@ bind_alias(struct wvk_device *dev, struct wvk_image *image, struct wvk_device_me
           wgpuTextureGetWidth(other->texture) != wgpuTextureGetWidth(image->texture) ||
           wgpuTextureGetHeight(other->texture) != wgpuTextureGetHeight(image->texture) ||
           wgpuTextureGetDepthOrArrayLayers(other->texture) != wgpuTextureGetDepthOrArrayLayers(image->texture) ||
-          /* Views of another format are of aliases, which copies fill. */
-          (same ? (image->usage & ~other->usage)
+          /* What its own uses need of the texture; views of another
+           * format are of aliases, which copies fill. */
+          (same ? (needed_usage(image) & ~other->usage)
                 : (~other->usage & (WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst))))
          continue;
       wgpuTextureAddRef(other->texture);
@@ -617,6 +655,7 @@ bind_alias(struct wvk_device *dev, struct wvk_image *image, struct wvk_device_me
          /* What is in the texture is the other image's: views of this
           * one's format copy it first. */
          image->format = other->format;
+         image->texture_format = wvk_image_texture_format(other, WVK_IMAGE_TEXTURE);
          if (!image->tracked)
             p_atomic_inc(&dev->tracked_images);
          image->tracked = true;
@@ -816,8 +855,11 @@ image_alias(struct wvk_device *dev, struct wvk_image *image, const struct wvk_im
    uint32_t t = WVK_IMAGE_TEXTURE;
    simple_mtx_lock(&dev->cache_lock);
    for (uint32_t i = 0; i < image->alias_count; ++i) {
+      /* Packed formats all share RGBA8: of the same one, then. */
+      const struct wvk_format *pf = wvk_format_get(vf);
       if ((image->aliases[i].format == format || (twin && image->aliases[i].format == twin)) &&
-          image->aliases[i].first_level == first) {
+          image->aliases[i].first_level == first &&
+          (!pf || !(pf->caps & WVK_CAP_PACKED16) || image->aliases[i].vk_format == vf)) {
          t = i + 1;
          goto out;
       }
@@ -831,6 +873,9 @@ image_alias(struct wvk_device *dev, struct wvk_image *image, const struct wvk_im
     * keep the image's textures alike. */
    if (image->vk.samples > 1)
       usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_RenderAttachment;
+   /* A packed format's, which a shader unpacks into (wvk_image_copy_packed). */
+   if (caps & WVK_CAP_PACKED16)
+      usage |= WGPUTextureUsage_StorageBinding | WGPUTextureUsage_TextureBinding;
    if (caps & WVK_CAP_SAMPLE)
       usage |= WGPUTextureUsage_TextureBinding;
    if (caps & WVK_CAP_RENDER)
@@ -881,6 +926,7 @@ image_alias(struct wvk_device *dev, struct wvk_image *image, const struct wvk_im
       goto out;
    struct wvk_image_alias *alias = &image->aliases[image->alias_count];
    alias->format = format;
+   alias->vk_format = vf;
    alias->texture = texture;
    alias->layer_textures = layers;
    alias->first_level = first;
@@ -913,11 +959,14 @@ needs_alias(const struct wvk_physical_device *pdev, const struct wvk_image *imag
         (wvk_format_caps(pdev, view->vk.view_format) & (WVK_CAP_MSAA | WVK_CAP_SAMPLE)) !=
            (WVK_CAP_MSAA | WVK_CAP_SAMPLE)))
       return false;
-   /* Packed formats' texels are RGBA8, whose bytes are not theirs; and a
-    * compressed view is its own format or its twin. */
+   /* Packed formats' texels are RGBA8, whose bytes are not theirs: kept
+    * by a shader that packs and unpacks them (wvk_image_copy_packed), of
+    * one sample. And a compressed view is its own format or its twin. */
    const struct wvk_format *a = wvk_format_get(image->vk.format), *b = wvk_format_get(view->vk.view_format);
-   return a && b && !(a->caps & WVK_CAP_PACKED16) && !(b->caps & WVK_CAP_PACKED16) &&
-          !vk_format_is_compressed(view->vk.view_format) &&
+   if (a && b && ((a->caps | b->caps) & WVK_CAP_PACKED16) &&
+       (image->vk.samples > 1 || image->dimension == WGPUTextureDimension_3D))
+      return false;
+   return a && b && !vk_format_is_compressed(view->vk.view_format) &&
           util_format_get_blocksize(vk_format_to_pipe_format(image->vk.format)) ==
              util_format_get_blocksize(vk_format_to_pipe_format(view->vk.view_format));
 }

@@ -522,18 +522,33 @@ is_packed16(const struct wvk_image *image)
 /* A region of a packed image, as image_region has it, to or from a
  * buffer laid out as `l` says. */
 static void
+convert_packed16_texture(struct wvk_device *dev, struct wvk_replay *replay, WGPUTexture texture_of, VkFormat format,
+                         bool is_3d, uint32_t layers, bool to_texture, WGPUBuffer buffer, uint64_t offset,
+                         const struct copy_layout *l, const WGPUTexelCopyTextureInfo *tex, WGPUExtent3D size);
+
+static void
 convert_packed16(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image,
                  bool to_texture, WGPUBuffer buffer, uint64_t offset, const struct copy_layout *l,
                  const WGPUTexelCopyTextureInfo *tex, WGPUExtent3D size)
 {
-   const bool is_3d = image->dimension == WGPUTextureDimension_3D;
+   convert_packed16_texture(dev, replay, image->texture, image->vk.format,
+                            image->dimension == WGPUTextureDimension_3D, image->vk.array_layers, to_texture, buffer,
+                            offset, l, tex, size);
+}
+
+/* The same of any texture of a packed format's, RGBA8. */
+static void
+convert_packed16_texture(struct wvk_device *dev, struct wvk_replay *replay, WGPUTexture texture_of, VkFormat format,
+                         bool is_3d, uint32_t layers, bool to_texture, WGPUBuffer buffer, uint64_t offset,
+                         const struct copy_layout *l, const WGPUTexelCopyTextureInfo *tex, WGPUExtent3D size)
+{
    const unsigned which = (to_texture ? 0 : 2) + (is_3d ? 1 : 0);
    WGPUComputePipeline pipeline =
       copy_pipeline(dev, &dev->packed16_pipelines[which], packed16_wgsl[which], "wvk packed16");
    if (!pipeline || !size.width || !size.height || !size.depthOrArrayLayers)
       return;
    /* The texture's channels, where the format has them. */
-   const struct util_format_description *desc = vk_format_description(image->vk.format);
+   const struct util_format_description *desc = vk_format_description(format);
    uint32_t sizes = 0, shifts = 0;
    for (unsigned c = 0; c < 4; ++c) {
       const unsigned sw = desc->swizzle[c];
@@ -547,8 +562,8 @@ convert_packed16(struct wvk_device *dev, struct wvk_replay *replay, const struct
    vd.dimension = is_3d ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2DArray;
    vd.baseMipLevel = tex->mipLevel;
    vd.mipLevelCount = 1;
-   vd.arrayLayerCount = is_3d ? 1 : image->vk.array_layers;
-   WGPUTextureView view = wgpuTextureCreateView(image->texture, &vd);
+   vd.arrayLayerCount = is_3d ? 1 : layers;
+   WGPUTextureView view = wgpuTextureCreateView(texture_of, &vd);
    if (!view)
       return;
    util_dynarray_append(&replay->views, view);
@@ -577,6 +592,54 @@ copy_color(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_i
       convert_packed16(dev, replay, image, to_texture, buffer, offset, l, tex, size);
    else
       copy_buffer_texture(replay, to_texture, buffer, offset, l, tex, size);
+}
+
+static bool
+is_packed16_format(VkFormat format)
+{
+   const struct wvk_format *f = wvk_format_get(format);
+   return f && (f->caps & WVK_CAP_PACKED16);
+}
+
+void
+wvk_image_copy_packed(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image, uint32_t from,
+                      uint32_t to, uint32_t level)
+{
+   uint32_t from_level, to_level;
+   WGPUTexture src = wvk_image_texture(image, from, &from_level);
+   WGPUTexture dst = wvk_image_texture(image, to, &to_level);
+   const VkFormat src_format = wvk_image_texture_format(image, from), dst_format = wvk_image_texture_format(image, to);
+   if (!src || !dst)
+      return;
+   const bool is_3d = image->dimension == WGPUTextureDimension_3D;
+   const VkExtent3D e = vk_image_mip_level_extent(&image->vk, level);
+   const WGPUExtent3D size = { e.width, image->vk.image_type == VK_IMAGE_TYPE_1D ? 1 : e.height,
+                               is_3d ? e.depth : image->vk.array_layers };
+   /* Their bits: two bytes a texel, as both formats have them. */
+   const struct copy_layout l = { 1, 1, 2, align(size.width * 2, 256), size.height };
+   WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay, (uint64_t)l.row_bytes * size.height * size.depthOrArrayLayers,
+                                            WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst | WGPUBufferUsage_Storage,
+                                            NULL);
+   if (!temp)
+      return;
+   wvk_replay_end_passes(replay);
+   WGPUTexelCopyTextureInfo tex = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+   tex.texture = src;
+   tex.mipLevel = level - from_level;
+   if (is_packed16_format(src_format))
+      convert_packed16_texture(dev, replay, src, src_format, is_3d, image->vk.array_layers, false, temp, 0, &l, &tex,
+                               size);
+   else
+      copy_buffer_texture(replay, false, temp, 0, &l, &tex, size);
+   wvk_replay_end_passes(replay);
+   tex.texture = dst;
+   tex.mipLevel = level - to_level;
+   if (is_packed16_format(dst_format))
+      convert_packed16_texture(dev, replay, dst, dst_format, is_3d, image->vk.array_layers, true, temp, 0, &l, &tex,
+                               size);
+   else
+      copy_buffer_texture(replay, true, temp, 0, &l, &tex, size);
+   wvk_replay_end_passes(replay);
 }
 
 /* Where texel (x, y) of a linear image is in its memory. */
