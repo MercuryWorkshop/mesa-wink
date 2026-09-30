@@ -238,8 +238,9 @@ execute_range(struct list_head *first, struct list_head *end, VkCommandBuffer co
    end->prev = last;
 }
 
-/* The layers a render pass renders, a bit each, if more than one: its
- * views, or its layers. A pass that suspends or resumes, into another
+/* The layers a render pass renders, if more than one: its views, a bit
+ * each, or how many layers it has -- a framebuffer may have more than a
+ * mask holds. A pass that suspends or resumes, into another
  * command buffer, is one pass. A render pass object's are those of all
  * its subpasses, or its framebuffer's; `end` is what ends it. */
 static uint32_t
@@ -259,7 +260,7 @@ pass_layers(const struct vk_cmd_queue_entry *cmd, bool *multiview, enum vk_cmd_t
          *multiview = true;
          return pass->view_mask;
       }
-      return framebuffer->layers > 1 ? BITFIELD_MASK(MIN2(framebuffer->layers, 32)) : 0;
+      return framebuffer->layers > 1 ? framebuffer->layers : 0;
    }
    if (cmd->type != VK_CMD_BEGIN_RENDERING)
       return 0;
@@ -272,7 +273,7 @@ pass_layers(const struct vk_cmd_queue_entry *cmd, bool *multiview, enum vk_cmd_t
       *multiview = true;
       return info->viewMask;
    }
-   return info->layerCount > 1 ? BITFIELD_MASK(MIN2(info->layerCount, 32)) : 0;
+   return info->layerCount > 1 ? info->layerCount : 0;
 }
 
 static VkRenderingFlags
@@ -423,8 +424,11 @@ replay_queue(struct wvk_replay *replay, struct wvk_cmd_buffer *rcmd, struct vk_c
       struct chain_state *state = part_count > 1 ? malloc(sizeof(*state)) : NULL;
       if (state)
          save_chain_state(rcmd, state);
-      replay->pass_first_layer = ffs(layers) - 1;
-      u_foreach_bit(layer, layers) {
+      replay->pass_first_layer = multiview ? ffs(layers) - 1 : 0;
+      const uint32_t last_layer = multiview ? util_last_bit(layers) : layers;
+      for (uint32_t layer = replay->pass_first_layer; layer < last_layer; ++layer) {
+         if (multiview && !(layers & BITFIELD_BIT(layer)))
+            continue;
          if (state && layer != replay->pass_first_layer)
             restore_chain_state(rcmd, state);
          replay->pass_layered = true;
@@ -451,6 +455,21 @@ replay_queue(struct wvk_replay *replay, struct wvk_cmd_buffer *rcmd, struct vk_c
    }
    execute_range(run, head, commandBuffer, disp);
    return cb + 1;
+}
+
+/* Replay only (recording enqueues it): a secondary command buffer's
+ * commands, with a render pass of several layers begun in it run once for
+ * each, as a primary's are. */
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t commandBufferCount,
+                       const VkCommandBuffer *pCommandBuffers)
+{
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   for (uint32_t i = 0; i < commandBufferCount; ++i) {
+      VK_FROM_HANDLE(vk_command_buffer, secondary, pCommandBuffers[i]);
+      struct list_head *next;
+      replay_queue(cmd->replay, cmd, &secondary, 1, 0, secondary->cmd_queue.cmds.next, &next);
+   }
 }
 
 VkResult
