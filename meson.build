@@ -444,6 +444,11 @@ if host_machine.system() == 'darwin'
   #macOS seems to need beta extensions to build for now:
   with_vulkan_beta = true
 endif
+# The wink driver is a portability subset implementation on every host,
+# and VK_KHR_portability_subset is a beta extension.
+if with_wink_vk
+  with_vulkan_beta = true
+endif
 if with_vulkan_beta
   pre_args += '-DVK_ENABLE_BETA_EXTENSIONS'
 endif

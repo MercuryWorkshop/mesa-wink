@@ -1,0 +1,16 @@
+diff --git a/src/dawn/native/vulkan/TextureVk.cpp b/src/dawn/native/vulkan/TextureVk.cpp
+index 6923248153..0d202bf384 100644
+--- a/src/dawn/native/vulkan/TextureVk.cpp
++++ b/src/dawn/native/vulkan/TextureVk.cpp
+@@ -1090,8 +1090,10 @@ MaybeError Texture::ClearTexture(CommandRecordingContext* recordingContext,
+     imageRange.levelCount = 1;
+     imageRange.layerCount = 1;
+ 
++    // A 3D texture has no 2D views to render to, and its slices are not layers: it is cleared
++    // with vkCmdClearColorImage, as a texture that is no attachment is.
+     if ((GetInternalUsage() & wgpu::TextureUsage::RenderAttachment) && GetFormat().IsColor() &&
+-        !GetFormat().IsMultiPlanar()) {
++        !GetFormat().IsMultiPlanar() && GetDimension() != wgpu::TextureDimension::e3D) {
+         TransitionUsageNow(recordingContext, wgpu::TextureUsage::RenderAttachment,
+                            wgpu::ShaderStage::None, range);
+ 

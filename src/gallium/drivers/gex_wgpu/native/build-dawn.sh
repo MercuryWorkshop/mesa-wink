@@ -14,6 +14,8 @@
 # against and the Tint it links are one tree. Linux builds Dawn's Vulkan
 # backend; macOS its Metal one.
 set -euo pipefail
+# Before any cd: BASH_SOURCE may be relative.
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT="${GEX_DAWN_ROOT:-$HOME/.cache/gex-wgpu-dawn}"
 SRC="${GEX_DAWN_SRC:-$ROOT/dawn}"
 BUILD="$ROOT/build"
@@ -46,9 +48,16 @@ fi
 # which the Vulkan driver asks for where a shader says not to, is not to.
 # And a command buffer Metal fails (a GPU hang or fault) loses the device,
 # where Dawn said nothing -- and the system ignored all the process's work
-# after it.
-PATCHES="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)/wink/patches"
-for PATCH in "$PATCHES/dawn-metal-strict-math-contract.patch" "$PATCHES/dawn-metal-command-buffer-errors.patch"; do
+# after it. On Vulkan, which has no limit of the bytes a sample of the
+# colour attachments takes, Dawn reported WebGPU's default of 32, too few
+# for 8 RGBA8 attachments; and it zeroed a renderable 3D texture by
+# rendering to a 2D view of it, which WebGPU has none of. Tint's SPIR-V
+# reader takes the tier1 storage formats, as wink's wasm Tint does.
+PATCHES="$HERE/../../../../../wink/patches"
+for PATCH in "$PATCHES/dawn-metal-strict-math-contract.patch" "$PATCHES/dawn-metal-command-buffer-errors.patch" \
+             "$PATCHES/dawn-vulkan-color-attachment-bytes.patch" \
+             "$PATCHES/dawn-vulkan-clear-3d-texture.patch" \
+             "$PATCHES/tint-spirv-reader-texel-formats.patch"; do
   if git -C "$SRC" apply --check "$PATCH" 2>/dev/null; then
     echo "[dawn] applying $(basename "$PATCH")"
     git -C "$SRC" apply "$PATCH"

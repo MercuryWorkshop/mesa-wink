@@ -1322,6 +1322,15 @@ wvk_enumerate_physical_devices(struct vk_instance *_instance)
       mesa_logw("wvk: the adapter reports no limits");
       pdev->limits = (WGPULimits)WGPU_LIMITS_INIT;
    }
+   /* Vulkan has no limit of colour attachments' bytes per sample, so as
+    * many attachments as it says are to be had of any format: WebGPU
+    * counts an RGBA8 attachment 8 bytes, and 16 at most of the formats
+    * it renders to but a few 32-bit four-channel ones. Not below Vulkan's
+    * minimum of 4, which a device of 32 bytes (WebGPU's default, and what
+    * Dawn reports on Vulkan) has only of the smaller formats. */
+   pdev->limits.maxColorAttachments =
+      MIN2(pdev->limits.maxColorAttachments,
+           MAX2(pdev->limits.maxColorAttachmentBytesPerSample / 8, 4));
    for (size_t i = 0; i < ARRAY_SIZE(wanted_features); ++i) {
       if (wgpuAdapterHasFeature(adapter, wanted_features[i]) &&
           pdev->feature_count < ARRAY_SIZE(pdev->features))

@@ -1,0 +1,15 @@
+diff --git a/src/dawn/native/vulkan/PhysicalDeviceVk.cpp b/src/dawn/native/vulkan/PhysicalDeviceVk.cpp
+index d582776e6c..07d0c4a86d 100644
+--- a/src/dawn/native/vulkan/PhysicalDeviceVk.cpp
++++ b/src/dawn/native/vulkan/PhysicalDeviceVk.cpp
+@@ -787,6 +787,10 @@ MaybeError PhysicalDevice::InitializeSupportedLimitsInternal(wgpu::FeatureLevel
+             std::min(baseLimits.v1.maxStorageBuffersPerShaderStage + extraResources,
+                      vkLimits.maxPerStageDescriptorStorageBuffers);
+     }
++    // Vulkan has no limit of the bytes a sample of the color attachments takes: each of them may
++    // be of the widest format there is to render to.
++    limits->v1.maxColorAttachmentBytesPerSample =
++        std::max(limits->v1.maxColorAttachmentBytesPerSample, limits->v1.maxColorAttachments * 16u);
+     limits->compat.maxStorageTexturesInFragmentStage = limits->v1.maxStorageTexturesPerShaderStage;
+     limits->compat.maxStorageBuffersInFragmentStage = limits->v1.maxStorageBuffersPerShaderStage;
+     limits->compat.maxStorageTexturesInVertexStage = limits->v1.maxStorageTexturesPerShaderStage;

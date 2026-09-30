@@ -8,6 +8,7 @@
 #include "wvk_platform.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 struct request {
    bool done;
@@ -51,10 +52,54 @@ wait_for(WGPUInstance instance, WGPUFuture future, const struct request *r)
    }
 }
 
+#if !defined(__EMSCRIPTEN__) && !defined(__APPLE__)
+/* Dawn's Vulkan backend goes through the same loader the application does,
+ * with the same environment: VK_DRIVER_FILES that names wink alone would
+ * give Dawn wink, and wink Dawn, forever. While Dawn looks for its adapter,
+ * the loader sees the host's drivers -- WINK_VK_HOST_DRIVER_FILES, or its
+ * default search -- and never wink's. The loader reads these at each
+ * vkCreateInstance, which Dawn's adapter discovery is. */
+static const char *const loader_vars[] = {
+   "VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES",
+   "VK_LOADER_DRIVERS_SELECT", "VK_LOADER_DRIVERS_DISABLE",
+};
+#define LOADER_VARS ARRAY_SIZE(loader_vars)
+
+static void
+host_loader_env(char *saved[LOADER_VARS])
+{
+   for (unsigned i = 0; i < LOADER_VARS; i++) {
+      const char *v = getenv(loader_vars[i]);
+      saved[i] = v ? strdup(v) : NULL;
+      unsetenv(loader_vars[i]);
+   }
+   const char *host = getenv("WINK_VK_HOST_DRIVER_FILES");
+   if (host && *host)
+      setenv("VK_DRIVER_FILES", host, 1);
+   setenv("VK_LOADER_DRIVERS_DISABLE", "*wink*", 1);
+}
+
+static void
+restore_loader_env(char *saved[LOADER_VARS])
+{
+   for (unsigned i = 0; i < LOADER_VARS; i++) {
+      if (saved[i])
+         setenv(loader_vars[i], saved[i], 1);
+      else
+         unsetenv(loader_vars[i]);
+      free(saved[i]);
+   }
+}
+#endif
+
 WGPUAdapter
 wvk_platform_request_adapter(WGPUInstance instance)
 {
    struct request r = { 0 };
+#if !defined(__EMSCRIPTEN__) && !defined(__APPLE__)
+   char *saved[LOADER_VARS];
+   host_loader_env(saved);
+#endif
    WGPURequestAdapterOptions options = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
    options.powerPreference = WGPUPowerPreference_HighPerformance;
    /* Dawn's software adapter, for telling a bad command stream from a
@@ -66,6 +111,9 @@ wvk_platform_request_adapter(WGPUInstance instance)
    cb.callback = on_adapter;
    cb.userdata1 = &r;
    wait_for(instance, wgpuInstanceRequestAdapter(instance, &options, cb), &r);
+#if !defined(__EMSCRIPTEN__) && !defined(__APPLE__)
+   restore_loader_env(saved);
+#endif
    return r.adapter;
 }
 
