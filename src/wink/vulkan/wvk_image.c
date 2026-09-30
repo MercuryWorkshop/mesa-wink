@@ -297,6 +297,8 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    return VK_SUCCESS;
 }
 
+static void unbind_alias(struct wvk_device *dev, struct wvk_image *image);
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks *pAllocator)
 {
@@ -306,6 +308,7 @@ wvk_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks *
       return;
    for (uint32_t p = 0; p < image->plane_count; ++p)
       wvk_DestroyImage(_device, wvk_image_to_handle(image->planes[p]), pAllocator);
+   unbind_alias(dev, image);
    /* Swapchain images belong to the surface. Released, not destroyed:
     * views of it in descriptors, which may outlive it unused, still have
     * it, and it goes with the last of them. */
@@ -574,6 +577,76 @@ wvk_GetDeviceImageSparseMemoryRequirements(VkDevice device, const VkDeviceImageM
    *pSparseMemoryRequirementCount = 0;
 }
 
+/* An image of VK_IMAGE_CREATE_ALIAS_BIT bound where another such image
+ * is -- or a plane of one, whose planes are images -- of the same layout:
+ * Vulkan says the two alias, so they are one texture. An optimal image's
+ * texels are its texture's, not its memory's, and any other image bound
+ * there sees them only through copies. */
+static void
+bind_alias(struct wvk_device *dev, struct wvk_image *image, struct wvk_device_memory *mem, uint64_t offset)
+{
+   if (!(image->vk.create_flags & VK_IMAGE_CREATE_ALIAS_BIT) || !image->texture || image->linear ||
+       image->layer_textures || image->shadow || image->atomic_buffer || !mem)
+      return;
+   simple_mtx_lock(&dev->cache_lock);
+   util_dynarray_foreach(&dev->bound_aliases, struct wvk_bound_alias, a) {
+      const struct wvk_image *other = a->image;
+      const bool same = other->format == image->format || other->format == srgb_twin(image->format);
+      const struct wvk_format *mine = wvk_format_get(image->vk.format), *theirs = wvk_format_get(other->vk.format);
+      /* Of other formats, of texels of as many bytes, and nothing packed:
+       * views of the image's own format are aliases of the texture's. */
+      const bool bits = mine && theirs && !((mine->caps | theirs->caps) & WVK_CAP_PACKED16) &&
+                        !vk_format_is_compressed(image->vk.format) && !vk_format_is_compressed(other->vk.format) &&
+                        image->vk.samples == 1 && !(image->vk.aspects & ~VK_IMAGE_ASPECT_COLOR_BIT) &&
+                        util_format_get_blocksize(vk_format_to_pipe_format(image->vk.format)) ==
+                           util_format_get_blocksize(vk_format_to_pipe_format(other->vk.format));
+      if (a->mem != mem || a->offset != offset || other == image || !other->texture || (!same && !bits) ||
+          other->dimension != image->dimension || other->vk.samples != image->vk.samples ||
+          other->vk.mip_levels != image->vk.mip_levels || other->vk.array_layers != image->vk.array_layers ||
+          wgpuTextureGetWidth(other->texture) != wgpuTextureGetWidth(image->texture) ||
+          wgpuTextureGetHeight(other->texture) != wgpuTextureGetHeight(image->texture) ||
+          wgpuTextureGetDepthOrArrayLayers(other->texture) != wgpuTextureGetDepthOrArrayLayers(image->texture) ||
+          /* Views of another format are of aliases, which copies fill. */
+          (same ? (image->usage & ~other->usage)
+                : (~other->usage & (WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst))))
+         continue;
+      wgpuTextureAddRef(other->texture);
+      wgpuTextureRelease(image->texture);
+      image->texture = other->texture;
+      if (!same) {
+         /* What is in the texture is the other image's: views of this
+          * one's format copy it first. */
+         image->format = other->format;
+         if (!image->tracked)
+            p_atomic_inc(&dev->tracked_images);
+         image->tracked = true;
+         for (uint32_t l = 0; l < ARRAY_SIZE(image->valid); ++l) {
+            image->valid[l] = BITFIELD_BIT(WVK_IMAGE_TEXTURE);
+            image->owner[l] = WVK_IMAGE_TEXTURE;
+         }
+      }
+      break;
+   }
+   const struct wvk_bound_alias entry = { image, mem, offset };
+   util_dynarray_append(&dev->bound_aliases, entry);
+   simple_mtx_unlock(&dev->cache_lock);
+}
+
+static void
+unbind_alias(struct wvk_device *dev, struct wvk_image *image)
+{
+   if (!(image->vk.create_flags & VK_IMAGE_CREATE_ALIAS_BIT))
+      return;
+   simple_mtx_lock(&dev->cache_lock);
+   util_dynarray_foreach(&dev->bound_aliases, struct wvk_bound_alias, a) {
+      if (a->image == image) {
+         *a = util_dynarray_pop(&dev->bound_aliases, struct wvk_bound_alias);
+         break;
+      }
+   }
+   simple_mtx_unlock(&dev->cache_lock);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindImageMemoryInfo *pBindInfos)
 {
@@ -609,6 +682,7 @@ wvk_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindImage
       }
       image->mem = mem;
       image->offset = pBindInfos[i].memoryOffset;
+      bind_alias(dev, image, mem, pBindInfos[i].memoryOffset);
       /* A linear image is its memory's buffer. */
       if (image->linear && mem) {
          WGPUBuffer buffer;

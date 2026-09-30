@@ -156,6 +156,10 @@ struct wvk_device {
     * each kind a bind group layout can want (descriptorBindingPartiallyBound),
     * as many kinds as are asked for. */
    struct util_dynarray placeholders; /* struct wvk_placeholder */
+   /* Images of VK_IMAGE_CREATE_ALIAS_BIT bound to memory, which another
+    * such image bound where one is, of the same layout, is an alias of
+    * (wvk_BindImageMemory2): struct wvk_bound_alias, under cache_lock. */
+   struct util_dynarray bound_aliases;
    /* What a pass without attachments renders to. */
    WGPUTexture dummy_attachment;
    VkExtent2D dummy_extent;

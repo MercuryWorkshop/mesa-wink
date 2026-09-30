@@ -92,6 +92,12 @@ struct wvk_image {
    uint64_t plane_offset[3];
 };
 
+struct wvk_bound_alias {
+   struct wvk_image *image;
+   const struct wvk_device_memory *mem;
+   uint64_t offset;
+};
+
 /* The plane an aspect names, of a multi-planar image. */
 static inline uint32_t
 wvk_image_aspect_plane(VkImageAspectFlags aspect)
