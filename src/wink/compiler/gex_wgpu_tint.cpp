@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "src/tint/api/tint.h"
+#include "src/tint/lang/core/ir/module.h"
 #include "src/tint/lang/spirv/reader/reader.h"
 #include "src/tint/lang/wgsl/program/clone_context.h"
 #include "src/tint/lang/wgsl/program/program_builder.h"
@@ -230,6 +231,18 @@ private:
    std::vector<std::pair<const ast::BlockStatement *, const ast::BreakIfStatement *>> break_ifs_;
 };
 
+/* Whether the SPIR-V reader refused a builtin it has none of. */
+bool
+unknown_builtin(const diag::List &diagnostics)
+{
+   for (const diag::Diagnostic &d : diagnostics) {
+      if (d.severity == diag::Severity::Error &&
+          d.message.Plain().find("unknown SPIR-V builtin") != std::string::npos)
+         return true;
+   }
+   return false;
+}
+
 /* Whether every error is the uniformity analysis refusing a barrier. */
 bool
 only_barrier_uniformity(const diag::List &diagnostics)
@@ -319,7 +332,26 @@ gex_wgpu_spirv_to_wgsl(const uint32_t *words, size_t word_count,
    options.allow_non_uniform_derivatives = true;
    options.allowed_features = tint::wgsl::AllowedFeatures::Everything();
    tint::Program program = tint::spirv::reader::Read(spirv, options);
+   /* A builtin the AST reader has none of -- PrimitiveId, which is WGSL's
+    * primitive_index -- and the IR reader has: its module, as a program. */
+   if (!program.IsValid() && unknown_builtin(program.Diagnostics())) {
+      auto ir = tint::spirv::reader::ReadIR(spirv, options);
+      if (ir == tint::Success) {
+         tint::wgsl::writer::Options writer_options;
+         writer_options.allow_non_uniform_derivatives = true;
+         writer_options.allowed_features = tint::wgsl::AllowedFeatures::Everything();
+         auto from_ir = tint::wgsl::writer::ProgramFromIR(ir.Get(), writer_options);
+         if (from_ir == tint::Success)
+            program = std::move(from_ir.Get());
+         else if (getenv("GEX_WGPU_UNIFORM_LOG"))
+            fprintf(stderr, "gex-wgpu: the IR reader's module not a program: %s\n", from_ir.Failure().reason.c_str());
+      } else if (getenv("GEX_WGPU_UNIFORM_LOG")) {
+         fprintf(stderr, "gex-wgpu: the IR reader refused it too: %s\n", ir.Failure().reason.c_str());
+      }
+   }
    if (!program.IsValid() && only_barrier_uniformity(program.Diagnostics())) {
+      if (getenv("GEX_WGPU_UNIFORM_LOG"))
+         fprintf(stderr, "gex-wgpu: barriers made uniform, for: %s\n", program.Diagnostics().Str().c_str());
       std::string why;
       tint::Program rewritten = make_barriers_uniform(program, &why);
       if (rewritten.IsValid())

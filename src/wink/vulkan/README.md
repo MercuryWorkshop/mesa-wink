@@ -236,7 +236,11 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   after all invocations' of the streams before; the draw is of the
   rasterized stream's. Indexed strips do not restart their primitives
   for it. Without one, topologies with adjacency
-  are drawn without the adjacent vertices, as lists the driver makes.
+  are drawn without the adjacent vertices, as lists the driver makes; and
+  gl_PrimitiveID of a fragment shader after a vertex shader is WebGPU's
+  primitive_index, where the device has it -- half of it, of a point's or
+  line's quad -- which Tint's IR reader has for SPIR-V's PrimitiveId, and
+  its AST reader not. After tessellation, it is 0.
 - **Tessellation** (tessellationShader) is compute too, around a
   tessellator of the same: the D3D11 reference Mesa's tessellator is, in
   WGSL (wvk_tessellator.c), an invocation a patch. The vertex shader run

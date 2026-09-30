@@ -3256,6 +3256,37 @@ point_state_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return false;
 }
 
+/* gl_PrimitiveID of a fragment shader after a vertex shader: WebGPU's
+ * primitive_index -- which ntv's PrimitiveId input is to Tint -- and of a
+ * point's or line's quad, whose triangles are two a primitive, half of it
+ * (`quads`). */
+static bool
+native_fs_primitive_id(nir_shader *nir, bool quads)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_variable *var = nir_find_variable_with_location(nir, nir_var_shader_in, VARYING_SLOT_PRIMITIVE_ID);
+   nir_variable *index = nir_variable_create(nir, nir_var_shader_in, glsl_uint_type(), "wvk_primitive_index");
+   index->data.location = VARYING_SLOT_PRIMITIVE_ID;
+   index->data.interpolation = INTERP_MODE_FLAT;
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *id = nir_load_var(&b, index);
+   if (quads)
+      id = nir_ushr_imm(&b, id, 1);
+   if (var) {
+      var->data.mode = nir_var_shader_temp;
+      nir_fixup_deref_modes(nir);
+      nir_store_var(&b, var, id, 0x1);
+   }
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_primitive_id)
+            nir_def_replace(&nir_instr_as_intrinsic(instr)->def, id);
+      }
+   }
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 /* gl_PrimitiveID as 0, where no geometry shader gives it. */
 static bool
 zero_fs_primitive_id(nir_shader *nir)
@@ -7048,7 +7079,12 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       } else if (shader->point_state & 4) {
          /* WebGPU's fragment shaders have no primitive ID: 0, but after a
           * geometry shader, which gives it (a variant). */
-         NIR_PASS(_, nir, zero_fs_primitive_id);
+         if (records && records->primitive_index) {
+            NIR_PASS(_, nir, native_fs_primitive_id, records->primitive_index == 2);
+            shader->key.primitive_index = records->primitive_index;
+         } else {
+            NIR_PASS(_, nir, zero_fs_primitive_id);
+         }
       }
       if (records && records->points) {
          NIR_PASS(_, nir, lower_point_fs, records->point_coord);
@@ -7984,6 +8020,13 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
                outputs |= BITFIELD_BIT(i);
          }
       }
+      /* After a vertex shader alone, WebGPU's primitive_index where the
+       * device has it -- two triangles a point's or line's quad. Not after
+       * a tessellation evaluation shader, whose primitives are its
+       * patches'. */
+      if ((!other || other->vk.stage == MESA_SHADER_VERTEX) && (shader->point_state & 4) &&
+          wvk_physical_device_has_feature(wvk_device_physical(dev), WGPUFeatureName_PrimitiveIndex))
+         key.primitive_index = shape != WVK_DRAW_PRIMITIVES ? 2 : 1;
       /* After a geometry shader: gl_PrimitiveID a varying, at the first
        * location it has no input at. */
       if (other && (other->vk.stage == MESA_SHADER_GEOMETRY || other->vk.stage == MESA_SHADER_MESH) &&

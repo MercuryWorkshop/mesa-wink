@@ -54,6 +54,8 @@ static const WGPUFeatureName wanted_features[] = {
    WGPUFeatureName_Float32Blendable,
    WGPUFeatureName_ClipDistances,
    WGPUFeatureName_DualSourceBlending,
+   /* gl_PrimitiveID of a fragment shader without a geometry shader. */
+   WGPUFeatureName_PrimitiveIndex,
    /* More storage formats, and the 16-bit normalized ones (wvk_format.c). */
    WGPUFeatureName_TextureFormatsTier1,
    WGPUFeatureName_TextureFormatsTier2,

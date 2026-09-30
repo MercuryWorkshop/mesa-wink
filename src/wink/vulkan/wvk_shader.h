@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 34
+#define WVK_SHADER_BINARY_VERSION 35
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -138,6 +138,10 @@ struct wvk_shader_key {
     * as the flat varying at location primitive_id - 1 (0: none), which the
     * geometry shader's records carry. */
    uint8_t primitive_id;
+   /* Fragment, where nothing gives gl_PrimitiveID otherwise, after a
+    * vertex shader: WebGPU's primitive_index (1), or half of it, of a
+    * point's or line's quad (2). */
+   uint8_t primitive_index;
    /* Fragment, and the stage before it: the clip and cull distances the
     * fragment shader reads, which WebGPU's have no builtin of, as vec4
     * varyings from location clip_varying - 1 (0: none) on, clip_slots of
