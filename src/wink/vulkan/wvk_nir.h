@@ -31,6 +31,9 @@ bool wvk_nir_lower_samplers(nir_shader *nir, const uint32_t *meta_base);
 /* Image accesses bounded by their views (robustImageAccess2), and null
  * views reading and querying zero (nullDescriptor), as records say. */
 bool wvk_nir_lower_robust_images(nir_shader *nir, const uint32_t *meta_base, bool bounds, bool null);
+/* A view's minimum LOD, where the device has them (VK_EXT_image_view_min_lod):
+ * before the samplers' lowering. */
+bool wvk_nir_lower_view_min_lod(nir_shader *nir, const uint32_t *meta_base);
 
 /* Storage images shaders do atomics on, as their image's buffer of
  * texels (wvk_image.h), where their records say. */

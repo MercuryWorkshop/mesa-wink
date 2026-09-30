@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 28
+#define WVK_SHADER_BINARY_VERSION 29
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -81,6 +81,10 @@ enum wvk_draw_shape {
 
 /* Storage images without a format a shader is compiled for the views of. */
 #define WVK_MAX_UNFORMATTED_IMAGES 8
+/* Cubes and the samplers a shader samples them with, which a non-seamless
+ * sampler (VK_EXT_non_seamless_cube_map) has a variant sample a face at a
+ * time. */
+#define WVK_MAX_CUBE_SAMPLES 8
 
 struct wvk_shader_key {
    /* Vertex: the fragment shader's inputs its outputs are made to match. */
@@ -155,6 +159,9 @@ struct wvk_shader_key {
     * where color_remapped, else each at its own. */
    uint8_t color_remapped;
    uint8_t color_map[8];
+   /* Which of wvk_shader::cube_samples a non-seamless sampler samples: a
+    * bit each, their cubes the 2D arrays of their faces. */
+   uint8_t non_seamless;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
@@ -266,6 +273,12 @@ struct wvk_shader {
     * a variant for (key.image_format). */
    uint8_t unformatted_count;
    uint16_t unformatted[WVK_MAX_UNFORMATTED_IMAGES];
+   /* Its samplings of float cubes, as the set and slot of the cube and of
+    * the sampler (set << 10 | slot, the cube's in the low 16 bits), whose
+    * samplers a draw or dispatch compiles a variant for (key.non_seamless),
+    * where the device has non-seamless cubes. */
+   uint8_t cube_sample_count;
+   uint32_t cube_samples[WVK_MAX_CUBE_SAMPLES];
    /* Fragment: writes gl_FragDepth, discards. */
    bool writes_depth;
    /* The push constants read, as a storage buffer at the driver's
@@ -319,13 +332,21 @@ wvk_shader_from_vk(struct vk_shader *shader)
 
 extern const struct vk_device_shader_ops wvk_device_shader_ops;
 
+/* What of a draw's or dispatch's descriptors a shader's variant is of: the
+ * formats of the views bound where it has storage images without one
+ * (wvk_shader::unformatted; 0 for one not bound), and which of its cube
+ * samplings a non-seamless sampler does (wvk_shader::cube_samples). */
+struct wvk_bound_views {
+   VkFormat image_formats[WVK_MAX_UNFORMATTED_IMAGES];
+   uint8_t non_seamless;
+};
+
 /* The shader, or its variant, for a draw of this state: a vertex shader
  * for this vertex input and fragment shader (which may be NULL), a
  * fragment shader for this multisampling at `samples`, a pass with or
  * without a depth attachment, and the logic op for these colour formats;
  * either for the records of both its and `other`'s layouts, and the
- * formats of the views bound where it has storage images without one
- * (`image_formats`, as for wvk_shader_dispatch_variant); and for points
+ * descriptors bound (`views`, as for wvk_shader_dispatch_variant); and for points
  * or lines drawn as quads. Or with `runs`, the vertex shader's compute
  * shader doing its storage writes or capturing positions (key.runs). A
  * fragment shader's counts its invocations where `stats`, the active
@@ -335,14 +356,12 @@ struct wvk_shader *wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_sh
                                            const struct wvk_shader *other,
                                            const struct vk_dynamic_graphics_state *dyn, unsigned samples,
                                            bool has_depth, const VkFormat *color_formats,
-                                           const VkFormat *image_formats, enum wvk_draw_shape shape,
+                                           const struct wvk_bound_views *views, enum wvk_draw_shape shape,
                                            unsigned runs, uint32_t stats);
 
-/* The shader, or its variant for the formats of the views bound where it
- * has storage images without one (wvk_shader::unformatted; 0 for one not
- * bound). */
+/* The shader, or its variant for the descriptors bound (`views`). */
 struct wvk_shader *wvk_shader_dispatch_variant(struct wvk_device *dev, struct wvk_shader *shader,
-                                               const VkFormat *image_formats);
+                                               const struct wvk_bound_views *views);
 
 /* A geometry shader's variant (key.geometry): as compute for a vertex
  * shader whose records have `vs_vars` generic varyings (1), or the vertex

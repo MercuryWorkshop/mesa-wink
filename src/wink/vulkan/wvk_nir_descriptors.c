@@ -1469,6 +1469,51 @@ lower_shadow_explicit(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, 
    return true;
 }
 
+/* A cube a non-seamless sampler samples (VK_EXT_non_seamless_cube_map),
+ * which the variant has as the 2D array of its faces (wvk_shader.c's
+ * face_cubes): the face the direction selects on its own, at the LOD the
+ * cube's derivatives give -- without the sampler's bias, which what
+ * follows adds -- and from there on a 2D array's sample, wrapped as the
+ * sampler says. */
+static void
+face_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
+{
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_idx < 0)
+      return;
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   nir_def *lod = NULL;
+   if (tex->op != nir_texop_tg4)
+      lod = nir_fsub(b, sample_lambda_raw(b, meta, tex, group, slot, coord, 3),
+                     sampler_word(b, meta, group, slot, WVK_META_SAMPLER_BIAS));
+   nir_def *face, *s, *t;
+   cube_face(b, coord, &face, &s, &t);
+   nir_def *layer = face;
+   if (tex->is_array) {
+      /* The cube, of those there are, and its face. */
+      nir_def *cubes = nir_udiv_imm(b, nir_channel(b, &texture_query(b, tex, nir_texop_txs, nir_imm_int(b, 0))->def, 2), 6);
+      nir_def *index = nir_imin(b, nir_imax(b, nir_f2i32(b, nir_fround_even(b, nir_channel(b, coord, 3))), nir_imm_int(b, 0)),
+                                nir_iadd_imm(b, cubes, -1));
+      layer = nir_iadd(b, face, nir_imul_imm(b, index, 6));
+   }
+   layer = nir_i2f32(b, layer);
+   nir_src_rewrite(&tex->src[coord_idx].src, nir_vec3(b, s, t, layer));
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->is_array = true;
+   tex->coord_components = 3;
+   if (!lod)
+      return;
+   const nir_tex_src_type gone[] = { nir_tex_src_bias, nir_tex_src_ddx, nir_tex_src_ddy, nir_tex_src_lod };
+   for (unsigned i = 0; i < ARRAY_SIZE(gone); ++i) {
+      const int idx = nir_tex_instr_src_index(tex, gone[i]);
+      if (idx >= 0)
+         nir_tex_instr_remove_src(tex, idx);
+   }
+   tex->op = nir_texop_txl;
+   nir_tex_instr_add_src(tex, nir_tex_src_lod, lod);
+}
+
 static bool
 lower_sampler_instr(nir_builder *b, nir_instr *instr, void *data)
 {
@@ -1493,6 +1538,11 @@ lower_sampler_instr(nir_builder *b, nir_instr *instr, void *data)
       return false;
    if (tex->op == nir_texop_lod)
       return lower_query_lod(b, meta, tex, group, slot);
+   const int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE && texture >= 0 &&
+       (tex->is_shadow || nir_alu_type_get_base_type(tex->dest_type) == nir_type_float) &&
+       glsl_get_sampler_dim(glsl_without_array(nir_src_as_deref(tex->src[texture].src)->type)) == GLSL_SAMPLER_DIM_2D)
+      face_sample(b, meta, tex, group, slot);
    lower_min_lod(b, meta, tex, group, slot);
    /* WGSL compares at level 0 or with implicit derivatives, and without a
     * bias: the rest by hand. */
@@ -1744,6 +1794,77 @@ wvk_nir_lower_robust_images(nir_shader *nir, const uint32_t *meta_base, bool bou
       bool changed = false;
       util_dynarray_foreach(&instrs, nir_instr *, i)
          changed |= robust_image_instr(&b, *i, &r);
+      util_dynarray_fini(&instrs);
+      progress |= nir_progress(changed, impl, nir_metadata_none);
+   }
+   return progress;
+}
+
+/* ---------------------------------------------------------------------- */
+/* A view's minimum LOD (VK_EXT_image_view_min_lod): of a view that has
+ * one, a sampling's LOD is at least it -- the sample's MinLod raised to it,
+ * which the samplers' lowering then does (lower_min_lod) -- and a fetch
+ * below its level reads zero. A view without one samples as before, which
+ * the record says at the draw. Before the samplers' lowering. */
+
+static bool
+view_min_lod_instr(nir_builder *b, nir_tex_instr *tex, const uint32_t *meta)
+{
+   const bool fetch = tex->op == nir_texop_txf;
+   if (tex->op != nir_texop_tex && tex->op != nir_texop_txb && tex->op != nir_texop_txl &&
+       tex->op != nir_texop_txd && !fetch)
+      return false;
+   const int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   uint32_t group, slot;
+   if (texture < 0 || tex->sampler_dim == GLSL_SAMPLER_DIM_BUF || !deref_binding(tex->src[texture].src, &group, &slot))
+      return false;
+   b->cursor = nir_before_instr(&tex->instr);
+   nir_def *min = wvk_nir_load_meta(b, meta, group, nir_imm_int(b, slot), WVK_META_TEX_MIN_LOD);
+   if (fetch) {
+      const int lod = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+      nir_def *level = lod >= 0 ? tex->src[lod].src.ssa : nir_imm_int(b, 0);
+      wrap_valid(b, &tex->instr, nir_ige(b, level, nir_f2i32(b, nir_ffloor(b, min))),
+                 nir_imm_zero(b, tex->def.num_components, tex->def.bit_size));
+      return true;
+   }
+   nir_push_if(b, nir_flt_imm(b, nir_fneg(b, min), 0.0));
+   /* With its own MinLod, the greater. */
+   const int own = nir_tex_instr_src_index(tex, nir_tex_src_min_lod);
+   nir_def *floor = own >= 0 ? nir_fmax(b, tex->src[own].src.ssa, min) : min;
+   nir_tex_instr *raised = nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
+   nir_builder_instr_insert(b, &raised->instr);
+   if (own >= 0)
+      nir_src_rewrite(&raised->src[own].src, floor);
+   else
+      nir_tex_instr_add_src(raised, nir_tex_src_min_lod, floor);
+   nir_push_else(b, NULL);
+   nir_instr *plain = nir_instr_clone(b->shader, &tex->instr);
+   nir_builder_instr_insert(b, plain);
+   nir_pop_if(b, NULL);
+   nir_def_rewrite_uses(&tex->def, nir_if_phi(b, &raised->def, nir_instr_def(plain)));
+   nir_instr_remove(&tex->instr);
+   return true;
+}
+
+bool
+wvk_nir_lower_view_min_lod(nir_shader *nir, const uint32_t *meta_base)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      /* The instructions first: the ones made here are not to be made
+       * again. */
+      struct util_dynarray instrs;
+      util_dynarray_init(&instrs, NULL);
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex)
+               util_dynarray_append(&instrs, instr);
+         }
+      }
+      nir_builder b = nir_builder_create(impl);
+      bool changed = false;
+      util_dynarray_foreach(&instrs, nir_instr *, i)
+         changed |= view_min_lod_instr(&b, nir_instr_as_tex(*i), meta_base);
       util_dynarray_fini(&instrs);
       progress |= nir_progress(changed, impl, nir_metadata_none);
    }

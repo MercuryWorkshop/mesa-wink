@@ -121,7 +121,13 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   is the 2D array of its faces, the face chosen as Vulkan chooses it.
   Comparisons WGSL cannot make -- with gradients, a bias, or at a LOD
   other than 0 -- fetch and compare each texel of the filter by hand, and
-  textureQueryLod is worked out from the sampler's record.
+  textureQueryLod is worked out from the sampler's record. A view's
+  minimum LOD (minLod) is its record's: where it has one, a sample's LOD
+  is raised to it as a MinLod operand's is, and a fetch below its level
+  reads zero. A cube a non-seamless sampler samples (nonSeamlessCubeMap)
+  is, in a variant keyed on the samplers bound, the 2D array of its faces:
+  the face the direction selects, at the LOD the cube's derivatives give,
+  wrapped as the sampler says.
 - **Image atomics**, which WGSL does not have, are on a storage buffer of
   the image's texels. A 32-bit integer storage image has one besides its
   texture, and a shader that does atomics on it uses it for everything.

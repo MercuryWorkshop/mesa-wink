@@ -76,6 +76,8 @@ clear_descriptor(struct wvk_descriptor *d, bool keep_sampler)
       wgpuBufferRelease(d->buffer);
    if (d->view)
       wgpuTextureViewRelease(d->view);
+   if (d->cube_faces)
+      wgpuTextureViewRelease(d->cube_faces);
    struct wvk_descriptor kept = { 0 };
    if (keep_sampler) {
       kept.sampler = d->sampler;
@@ -99,6 +101,8 @@ copy_descriptor(struct wvk_descriptor *dst, const struct wvk_descriptor *src, bo
       wgpuBufferAddRef(dst->buffer);
    if (dst->view)
       wgpuTextureViewAddRef(dst->view);
+   if (dst->cube_faces)
+      wgpuTextureViewAddRef(dst->cube_faces);
    if (keep_sampler) {
       dst->sampler = kept.sampler;
       dst->sampler_type = kept.sampler_type;
@@ -273,9 +277,16 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
          d->view_desc.label = (WGPUStringView)WGPU_STRING_VIEW_INIT;
          d->view = wgpu;
          wgpuTextureViewAddRef(d->view);
+         if (wgpu != view->array_view && view->array_view &&
+             (view->view_desc.dimension == WGPUTextureViewDimension_Cube ||
+              view->view_desc.dimension == WGPUTextureViewDimension_CubeArray)) {
+            d->cube_faces = view->array_view;
+            wgpuTextureViewAddRef(d->cube_faces);
+         }
          d->view_format = view->vk.view_format;
          d->swizzle = view->swizzle;
          d->channels = view->channels;
+         d->min_lod = MAX2(view->vk.min_lod - (float)view->vk.base_mip_level, 0.0f);
       }
       struct wvk_image *image = view ? wvk_image_view_image(view) : NULL;
       if (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && image && image->atomic_buffer &&
@@ -452,12 +463,14 @@ wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words, u
          } else {
             record[WVK_META_TEX_SWIZZLE] = d->swizzle;
             record[WVK_META_TEX_CHANNELS] = d->channels;
+            memcpy(&record[WVK_META_TEX_MIN_LOD], &d->min_lod, 4);
          }
          break;
       case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
       case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
          record[WVK_META_TEX_SWIZZLE] = d->swizzle;
          record[WVK_META_TEX_CHANNELS] = d->channels;
+         memcpy(&record[WVK_META_TEX_MIN_LOD], &d->min_lod, 4);
          break;
       case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
          if (d->atomic_image)

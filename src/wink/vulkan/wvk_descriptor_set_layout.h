@@ -136,6 +136,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
  * its format has, a bit each, which a border colour is made into. */
 #define WVK_META_TEX_SWIZZLE 0
 #define WVK_META_TEX_CHANNELS 1
+/* And the view's minimum LOD above its base level, a float, 0 for none
+ * (VK_EXT_image_view_min_lod). */
+#define WVK_META_TEX_MIN_LOD 2
 
 /* A sampler's record. */
 #define WVK_META_SAMPLER_FLAGS 0
@@ -157,6 +160,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* A min or max reduction (samplerFilterMinmax), which the shader does. */
 #define WVK_SAMPLER_REDUCE_MIN (1u << 18)
 #define WVK_SAMPLER_REDUCE_MAX (1u << 19)
+/* Cubes sampled a face at a time (VK_EXT_non_seamless_cube_map), which a
+ * shader's variant does (wvk_shader_draw_variant's views). */
+#define WVK_SAMPLER_NON_SEAMLESS (1u << 20)
 /* The largest LOD bias a sampler has, which maxSamplerLodBias reports. */
 #define WVK_MAX_SAMPLER_LOD_BIAS 15.0f
 

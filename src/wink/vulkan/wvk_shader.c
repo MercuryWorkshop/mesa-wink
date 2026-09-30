@@ -607,9 +607,12 @@ wvk_hash_state(struct vk_physical_device *device, const struct vk_graphics_pipel
       };
       _mesa_blake3_update(&ctx, alpha, sizeof(alpha));
    }
-   /* And whether images may be null, which shaders check themselves. */
-   const uint8_t null_images = enabled_features->nullDescriptor;
-   _mesa_blake3_update(&ctx, &null_images, 1);
+   /* And whether images may be null, which shaders check themselves;
+    * whether views may have minimum LODs, which they clamp to; and whether
+    * cubes may be non-seamless, which they keep their cubes' samplers for. */
+   const uint8_t checked[3] = { enabled_features->nullDescriptor, enabled_features->minLod,
+                                enabled_features->nonSeamlessCubeMap };
+   _mesa_blake3_update(&ctx, checked, sizeof(checked));
    _mesa_blake3_final(&ctx, blake3_out);
 }
 
@@ -3181,6 +3184,58 @@ integer_cube_query_instr(nir_builder *b, nir_instr *instr, void *data)
    nir_def_rewrite_uses(placeholder, nir_trim_vector(b, size, n));
    nir_instr_remove(nir_def_instr(placeholder));
    return true;
+}
+
+/* The float cubes a shader samples and the samplers it samples them with
+ * (wvk_shader::cube_samples), where the device has non-seamless cubes; and
+ * of a variant for non-seamless ones (key.non_seamless), each such cube
+ * the 2D array of its faces, as an integer cube is, which the samplers'
+ * lowering samples a face at a time. After the variables are split. */
+static void
+face_cubes(nir_shader *nir, struct wvk_shader *shader, uint8_t non_seamless)
+{
+   shader->cube_sample_count = 0;
+   struct set *faced = _mesa_pointer_set_create(NULL);
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            const int t = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+            const int s = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+            if (tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE || t < 0 || s < 0)
+               continue;
+            nir_variable *texture = nir_deref_instr_get_variable(nir_src_as_deref(tex->src[t].src));
+            nir_variable *sampler = nir_deref_instr_get_variable(nir_src_as_deref(tex->src[s].src));
+            if (!texture || !sampler || glsl_type_is_array(texture->type) ||
+                glsl_get_sampler_dim(texture->type) != GLSL_SAMPLER_DIM_CUBE ||
+                glsl_get_sampler_result_type(texture->type) != GLSL_TYPE_FLOAT)
+               continue;
+            const uint32_t pair = (texture->data.descriptor_set << 10 | texture->data.binding) |
+                                  (sampler->data.descriptor_set << 10 | sampler->data.binding) << 16;
+            unsigned i = 0;
+            while (i < shader->cube_sample_count && shader->cube_samples[i] != pair)
+               ++i;
+            if (i == shader->cube_sample_count) {
+               if (i == WVK_MAX_CUBE_SAMPLES) {
+                  mesa_logw_once("wvk: more samplings of cubes than %u, which sample seamlessly", WVK_MAX_CUBE_SAMPLES);
+                  continue;
+               }
+               shader->cube_samples[shader->cube_sample_count++] = pair;
+            }
+            if (non_seamless & BITFIELD_BIT(i))
+               _mesa_set_add(faced, texture);
+         }
+      }
+   }
+   set_foreach(faced, entry) {
+      nir_variable *var = (nir_variable *)entry->key;
+      var->type = glsl_texture_type(GLSL_SAMPLER_DIM_2D, true, GLSL_TYPE_FLOAT);
+   }
+   if (faced->entries)
+      nir_fixup_deref_types(nir);
+   _mesa_set_destroy(faced, NULL);
 }
 
 static bool
@@ -5949,6 +6004,10 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    split_buffer_vars(nir, &state);
    /* Writes by a dynamic index are ladders of ifs. */
    NIR_PASS(_, nir, nir_shader_instructions_pass, rewrite_resource_instr, nir_metadata_none, &state);
+   if (dev->vk.enabled_features.nonSeamlessCubeMap) {
+      shader->key.non_seamless = records ? records->non_seamless : 0;
+      face_cubes(nir, shader, shader->key.non_seamless);
+   }
    NIR_PASS(_, nir, nir_shader_instructions_pass, integer_cube_query_instr, nir_metadata_control_flow, NULL);
    struct util_dynarray bgra;
    util_dynarray_init(&bgra, mem_ctx);
@@ -5983,6 +6042,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       .lower_offset_filter = dynamic_offset,
    };
    NIR_PASS(_, nir, nir_lower_tex, &offsets);
+   if (dev->vk.enabled_features.minLod)
+      NIR_PASS(_, nir, wvk_nir_lower_view_min_lod, shader->meta_base);
    NIR_PASS(_, nir, wvk_nir_lower_samplers, shader->meta_base);
    NIR_PASS(_, nir, lower_1d_images);
    NIR_PASS(_, nir, lower_ms_arrays);
@@ -6324,6 +6385,20 @@ has_unformatted_images(const nir_shader *nir)
    return false;
 }
 
+/* Whether a shader has float cubes, which a non-seamless sampler would
+ * have a variant sample (key.non_seamless). */
+static bool
+has_float_cubes(const nir_shader *nir)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      if ((glsl_type_is_sampler(type) || glsl_type_is_texture(type)) &&
+          glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_CUBE && glsl_get_sampler_result_type(type) == GLSL_TYPE_FLOAT)
+         return true;
+   }
+   return false;
+}
+
 /* The YCbCr conversion of an immutable sampler of the layout's, which
  * sampling through is a sample of each plane (nir_vk_lower_ycbcr_tex). */
 static const struct vk_ycbcr_conversion_state *
@@ -6365,7 +6440,8 @@ wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_co
        * storage images it has none for. */
       if ((infos[i].stage == MESA_SHADER_VERTEX || infos[i].stage == MESA_SHADER_FRAGMENT ||
            infos[i].stage == MESA_SHADER_GEOMETRY || infos[i].stage == MESA_SHADER_TESS_CTRL ||
-           infos[i].stage == MESA_SHADER_TESS_EVAL || has_unformatted_images(infos[i].nir)) &&
+           infos[i].stage == MESA_SHADER_TESS_EVAL || has_unformatted_images(infos[i].nir) ||
+           (dev->vk.enabled_features.nonSeamlessCubeMap && has_float_cubes(infos[i].nir))) &&
           i < ARRAY_SIZE(sources))
          sources[i] = source_create(&infos[i]);
    }
@@ -6530,24 +6606,27 @@ wvk_shader_tess_variant(struct wvk_device *dev, struct wvk_shader *shader, unsig
 
 
 /* The formats of the views bound where the shader has storage images
- * without one into `key`, the shader's own where none is bound. Whether
- * they are the shader's. */
+ * without one into `key`, the shader's own where none is bound; and which
+ * of its cubes non-seamless samplers sample. Whether they are the shader's. */
 static bool
-key_image_formats(const struct wvk_shader *shader, const VkFormat *image_formats, struct wvk_shader_key *key)
+key_image_formats(const struct wvk_shader *shader, const struct wvk_bound_views *views, struct wvk_shader_key *key)
 {
    bool same = true;
    for (uint32_t i = 0; i < shader->unformatted_count; ++i) {
-      const uint32_t f = image_formats && image_formats[i] ? image_formats[i] : shader->key.image_format[i];
+      const uint32_t f = views && views->image_formats[i] ? views->image_formats[i] : shader->key.image_format[i];
       key->image_format[i] = f;
       same &= f == shader->key.image_format[i];
    }
+   /* And the cubes non-seamless samplers sample. */
+   key->non_seamless = views ? views->non_seamless : shader->key.non_seamless;
+   same &= key->non_seamless == shader->key.non_seamless;
    return same;
 }
 
 struct wvk_shader *
 wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_shader *other,
                         const struct vk_dynamic_graphics_state *dyn, unsigned samples, bool has_depth,
-                        const VkFormat *color_formats, const VkFormat *image_formats, enum wvk_draw_shape shape,
+                        const VkFormat *color_formats, const struct wvk_bound_views *views, enum wvk_draw_shape shape,
                         unsigned runs, uint32_t stats)
 {
    bool points = shape == WVK_DRAW_POINTS;
@@ -6556,7 +6635,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
 
    struct wvk_shader_key key;
    memset(&key, 0, sizeof(key));
-   const bool images = key_image_formats(shader, image_formats, &key);
+   const bool images = key_image_formats(shader, views, &key);
    /* The records: every set either stage's layout has, in order. */
    for (uint32_t g = 0; g < 4; ++g) {
       key.meta_base[g] = key.meta_words;
@@ -6737,7 +6816,7 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
       /* A variant that failed is kept as none, not tried at every draw. */
       if (getenv("WINK_VK_VARIANT_LOG")) {
          const struct wvk_shader_key *own = &shader->key;
-         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s%s%s\n",
+         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
                  _mesa_shader_stage_to_string(shader->vk.stage), shader->id,
                  key.pulled != own->pulled ? " vertex input" : "",
                  memcmp(key.fs_inputs, own->fs_inputs, sizeof(key.fs_inputs)) ? " varyings" : "",
@@ -6756,7 +6835,8 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
                  key.line_coord != own->line_coord ? " line fragments" : "",
                  key.color_remapped != own->color_remapped ||
                        memcmp(key.color_map, own->color_map, sizeof(key.color_map))
-                    ? " attachment locations" : "");
+                    ? " attachment locations" : "",
+                 key.non_seamless != own->non_seamless ? " non-seamless cubes" : "");
       }
       variant = compile_variant(dev, shader, &key, vi);
       if (!variant)
@@ -6775,12 +6855,12 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
 }
 
 struct wvk_shader *
-wvk_shader_dispatch_variant(struct wvk_device *dev, struct wvk_shader *shader, const VkFormat *image_formats)
+wvk_shader_dispatch_variant(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_bound_views *views)
 {
-   if (!shader || !shader->source || !shader->unformatted_count)
+   if (!shader || !shader->source || (!shader->unformatted_count && !shader->cube_sample_count))
       return shader;
    struct wvk_shader_key key = shader->key;
-   if (key_image_formats(shader, image_formats, &key))
+   if (key_image_formats(shader, views, &key))
       return shader;
    return variant_for(dev, shader, &key, NULL);
 }
@@ -6841,6 +6921,8 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->point_state);
    blob_write_uint8(blob, shader->unformatted_count);
    blob_write_bytes(blob, shader->unformatted, sizeof(shader->unformatted));
+   blob_write_uint8(blob, shader->cube_sample_count);
+   blob_write_bytes(blob, shader->cube_samples, sizeof(shader->cube_samples));
    blob_write_uint8(blob, shader->writes_depth);
    blob_write_uint8(blob, shader->uses_push_constants);
    blob_write_uint8(blob, shader->uses_draw_parameters);
@@ -6913,6 +6995,9 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const uint8_t unformatted_count = blob_read_uint8(blob);
    uint16_t unformatted[WVK_MAX_UNFORMATTED_IMAGES];
    blob_copy_bytes(blob, unformatted, sizeof(unformatted));
+   const uint8_t cube_sample_count = blob_read_uint8(blob);
+   uint32_t cube_samples[WVK_MAX_CUBE_SAMPLES];
+   blob_copy_bytes(blob, cube_samples, sizeof(cube_samples));
    const bool writes_depth = blob_read_uint8(blob);
    const bool uses_push_constants = blob_read_uint8(blob);
    const bool uses_draw_parameters = blob_read_uint8(blob);
@@ -6992,6 +7077,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->point_state = point_state;
    shader->unformatted_count = MIN2(unformatted_count, WVK_MAX_UNFORMATTED_IMAGES);
    memcpy(shader->unformatted, unformatted, sizeof(unformatted));
+   shader->cube_sample_count = MIN2(cube_sample_count, WVK_MAX_CUBE_SAMPLES);
+   memcpy(shader->cube_samples, cube_samples, sizeof(cube_samples));
    shader->writes_depth = writes_depth;
    shader->uses_push_constants = uses_push_constants;
    shader->uses_draw_parameters = uses_draw_parameters;

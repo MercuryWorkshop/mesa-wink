@@ -122,6 +122,8 @@ wvk_CreateSampler(VkDevice _device, const VkSamplerCreateInfo *pCreateInfo,
       flags |= WVK_SAMPLER_REDUCE_MIN;
    else if (sampler->vk.reduction_mode == VK_SAMPLER_REDUCTION_MODE_MAX)
       flags |= WVK_SAMPLER_REDUCE_MAX;
+   if (pCreateInfo->flags & VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT)
+      flags |= WVK_SAMPLER_NON_SEAMLESS;
    sampler->meta[WVK_META_SAMPLER_FLAGS] = flags;
    memcpy(&sampler->meta[WVK_META_SAMPLER_BIAS], &info->mipLodBias, 4);
    memcpy(&sampler->meta[WVK_META_SAMPLER_MIN_LOD], &info->minLod, 4);

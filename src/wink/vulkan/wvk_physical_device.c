@@ -122,6 +122,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_workgroup_memory_explicit_layout = true,
       .EXT_vertex_attribute_robustness = true,
       .EXT_shader_module_identifier = true,
+      .EXT_image_view_min_lod = true,
+      .EXT_non_seamless_cube_map = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -600,6 +602,12 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .vertexAttributeRobustness = true,
       /* The runtime's, pipelines of them found in its caches. */
       .shaderModuleIdentifier = true,
+      /* The view's record's, which a sampling's LOD is raised to and a
+       * fetch below reads zero (wvk_nir_descriptors.c). */
+      .minLod = true,
+      /* A variant samples such a cube as the 2D array of its faces, a
+       * face at a time (wvk_shader.c's face_cubes). */
+      .nonSeamlessCubeMap = true,
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,

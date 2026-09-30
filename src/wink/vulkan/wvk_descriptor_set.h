@@ -33,6 +33,9 @@ struct wvk_descriptor {
     * and the image and how the view was made, for when a pass renders to
     * the image as it reads it. */
    WGPUTextureView view;
+   /* Of a cube, the 2D array of its faces too, which a shader's variant
+    * samples for a non-seamless sampler (key.non_seamless). */
+   WGPUTextureView cube_faces;
    struct wvk_image *view_image;
    WGPUTextureViewDescriptor view_desc;
    /* Which of the image's textures the view is of, and its levels. */
@@ -42,6 +45,8 @@ struct wvk_descriptor {
    VkFormat view_format;
    uint32_t swizzle;
    uint32_t channels;
+   /* The view's minimum LOD above its base level (WVK_META_TEX_MIN_LOD). */
+   float min_lod;
    /* Samplers: the sampler, what a bind group layout says of it, and its
     * record. */
    WGPUSampler sampler;

@@ -1586,6 +1586,9 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       case WVK_BINDING_TEXTURE:
       case WVK_BINDING_STORAGE_TEXTURE:
          e->textureView = d && d->view ? d->view : placeholder_view(dev, b);
+         /* A cube a variant samples a face at a time (key.non_seamless). */
+         if (d && d->cube_faces && b->view_dimension == WGPUTextureViewDimension_2DArray)
+            e->textureView = d->cube_faces;
          if (replay && b->kind == WVK_BINDING_TEXTURE) {
             const struct wvk_texture_swap *swap = find_texture_swap(replay, group, b->binding);
             if (swap) {
@@ -3386,24 +3389,35 @@ draw_fan_elements(struct wvk_cmd_buffer *cmd, uint32_t first_index, uint32_t ind
 /* The bound shaders, or their variants for the state the draw has: the
  * fragment shader for its multisampling, the vertex shader for its vertex
  * input and for that fragment shader (wvk_shader_draw_variant). */
-/* The formats of the views bound where a shader has storage images
- * without one (wvk_shader::unformatted), which its variant is of; 0 where
- * none is. */
-static void
-unformatted_image_formats(const struct wvk_bound_state *st, uint32_t bind_point, const struct wvk_shader *shader,
-                          VkFormat formats[WVK_MAX_UNFORMATTED_IMAGES])
+/* What of the descriptors bound a shader's variant is of (struct
+ * wvk_bound_views): the formats of the views where it has storage images
+ * without one (wvk_shader::unformatted), 0 where none is; and which of its
+ * cube samplings are of non-seamless samplers (wvk_shader::cube_samples). */
+static const struct wvk_descriptor *
+bound_descriptor(const struct wvk_bound_state *st, uint32_t bind_point, uint32_t at)
 {
-   for (uint32_t i = 0; i < WVK_MAX_UNFORMATTED_IMAGES; ++i) {
-      formats[i] = VK_FORMAT_UNDEFINED;
-      if (!shader || i >= shader->unformatted_count)
-         continue;
-      const uint32_t set = shader->unformatted[i] >> 10, slot = shader->unformatted[i] & 0x3ff;
-      bool sampler;
-      uint32_t dynamic_index;
-      const struct wvk_descriptor *d =
-         set < WVK_MAX_GROUPS ? slot_descriptor(st->sets[bind_point][set].set, slot, &sampler, &dynamic_index) : NULL;
+   const uint32_t set = at >> 10, slot = at & 0x3ff;
+   bool sampler;
+   uint32_t dynamic_index;
+   return set < WVK_MAX_GROUPS ? slot_descriptor(st->sets[bind_point][set].set, slot, &sampler, &dynamic_index) : NULL;
+}
+
+static void
+bound_views(const struct wvk_bound_state *st, uint32_t bind_point, const struct wvk_shader *shader,
+            struct wvk_bound_views *views)
+{
+   memset(views, 0, sizeof(*views));
+   if (!shader)
+      return;
+   for (uint32_t i = 0; i < shader->unformatted_count; ++i) {
+      const struct wvk_descriptor *d = bound_descriptor(st, bind_point, shader->unformatted[i]);
       if (d && d->view)
-         formats[i] = d->view_format;
+         views->image_formats[i] = d->view_format;
+   }
+   for (uint32_t i = 0; i < shader->cube_sample_count; ++i) {
+      const struct wvk_descriptor *d = bound_descriptor(st, bind_point, shader->cube_samples[i] >> 16);
+      if (d && (d->sampler_meta[WVK_META_SAMPLER_FLAGS] & WVK_SAMPLER_NON_SEAMLESS))
+         views->non_seamless |= BITFIELD_BIT(i);
    }
 }
 
@@ -3425,18 +3439,18 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
       const struct wvk_image_view *view = replay->rendering.color[i];
       color_formats[i] = view ? view->vk.view_format : VK_FORMAT_UNDEFINED;
    }
-   VkFormat fs_images[WVK_MAX_UNFORMATTED_IMAGES], vs_images[WVK_MAX_UNFORMATTED_IMAGES];
-   unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_fs, fs_images);
-   unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_vs, vs_images);
+   struct wvk_bound_views fs_images, vs_images;
+   bound_views(st, WVK_BIND_GRAPHICS, st->bound_fs, &fs_images);
+   bound_views(st, WVK_BIND_GRAPHICS, st->bound_vs, &vs_images);
    const enum wvk_draw_shape shape = replay->draw_points  ? WVK_DRAW_POINTS
                                      : replay->draw_lines ? (lines_placed(cmd) ? WVK_DRAW_LINES_PLACED : WVK_DRAW_LINES)
                                                           : WVK_DRAW_PRIMITIVES;
    /* After a geometry or tessellation evaluation shader, whose outputs the
     * fragment shader reads. */
    const struct wvk_shader *before = st->bound_gs ? st->bound_gs : st->bound_tes ? st->bound_tes : st->bound_vs;
-   st->fs = wvk_shader_draw_variant(dev, st->bound_fs, before, dyn, samples, has_depth, color_formats, fs_images,
+   st->fs = wvk_shader_draw_variant(dev, st->bound_fs, before, dyn, samples, has_depth, color_formats, &fs_images,
                                     shape, 0, wvk_replay_stats(replay));
-   st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats, vs_images,
+   st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats, &vs_images,
                                     shape, 0, 0);
    /* No fragment shader to do the depth bounds test: the driver's. */
    if (!st->fs && dyn->ds.depth.bounds_test.enable && has_depth && samples <= 1)
@@ -3664,10 +3678,10 @@ run_vertices(struct wvk_cmd_buffer *cmd, unsigned runs, bool indexed, uint32_t f
    struct wvk_bound_state *st = replay->state;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    const uint64_t total = (uint64_t)count * instances;
-   VkFormat images[WVK_MAX_UNFORMATTED_IMAGES];
-   unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_vs, images);
+   struct wvk_bound_views images;
+   bound_views(st, WVK_BIND_GRAPHICS, st->bound_vs, &images);
    struct wvk_shader *cs =
-      wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, 1, false, NULL, images, WVK_DRAW_PRIMITIVES, runs, 0);
+      wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, 1, false, NULL, &images, WVK_DRAW_PRIMITIVES, runs, 0);
    if (!cs || cs->vk.stage != MESA_SHADER_COMPUTE)
       return false;
    if (!bind_index_storage(cmd, indexed))
@@ -4157,10 +4171,10 @@ draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t
    const uint64_t limit = pdev->limits.maxStorageBufferBindingSize;
 
    /* The vertex shader's records. */
-   VkFormat images[WVK_MAX_UNFORMATTED_IMAGES];
-   unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_vs, images);
+   struct wvk_bound_views images;
+   bound_views(st, WVK_BIND_GRAPHICS, st->bound_vs, &images);
    struct wvk_shader *vs =
-      wvk_shader_draw_variant(dev, st->bound_vs, NULL, dyn, 1, false, NULL, images, WVK_DRAW_PRIMITIVES, 3, 0);
+      wvk_shader_draw_variant(dev, st->bound_vs, NULL, dyn, 1, false, NULL, &images, WVK_DRAW_PRIMITIVES, 3, 0);
    if (!vs || vs->vk.stage != MESA_SHADER_COMPUTE) {
       mesa_logw_once("wvk: a vertex shader before a geometry shader, which could not be made a compute shader");
       return;
@@ -4316,10 +4330,10 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
                                                                            : 0;
 
    /* The stages' compute shaders, and the draw's. */
-   VkFormat images[WVK_MAX_UNFORMATTED_IMAGES];
-   unformatted_image_formats(st, WVK_BIND_GRAPHICS, st->bound_vs, images);
+   struct wvk_bound_views images;
+   bound_views(st, WVK_BIND_GRAPHICS, st->bound_vs, &images);
    struct wvk_shader *vs =
-      wvk_shader_draw_variant(dev, st->bound_vs, NULL, dyn, 1, false, NULL, images, WVK_DRAW_PRIMITIVES, 3, 0);
+      wvk_shader_draw_variant(dev, st->bound_vs, NULL, dyn, 1, false, NULL, &images, WVK_DRAW_PRIMITIVES, 3, 0);
    if (!vs || vs->vk.stage != MESA_SHADER_COMPUTE) {
       mesa_logw_once("wvk: a vertex shader before tessellation, which could not be made a compute shader");
       return;
@@ -5541,9 +5555,9 @@ flush_dispatch(struct wvk_cmd_buffer *cmd, struct wvk_bound_buffer *indirect)
    struct wvk_replay *replay = cmd->replay;
    struct wvk_bound_state *st = replay->state;
    /* Or its variant for the formats of storage images it has none for. */
-   VkFormat images[WVK_MAX_UNFORMATTED_IMAGES];
-   unformatted_image_formats(st, WVK_BIND_COMPUTE, st->bound_cs, images);
-   st->cs = wvk_shader_dispatch_variant(dev, st->bound_cs, images);
+   struct wvk_bound_views images;
+   bound_views(st, WVK_BIND_COMPUTE, st->bound_cs, &images);
+   st->cs = wvk_shader_dispatch_variant(dev, st->bound_cs, &images);
    if (!st->cs) {
       mesa_logw_once("wvk: a dispatch without a compute shader");
       return NULL;
