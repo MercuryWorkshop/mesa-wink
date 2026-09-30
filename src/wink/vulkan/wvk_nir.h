@@ -21,6 +21,10 @@ nir_def *wvk_nir_load_meta(struct nir_builder *b, const uint32_t *meta, uint32_t
  * (wvk_nir_cmat.c): before variable copies are lowered. */
 bool wvk_nir_lower_cooperative_matrix(nir_shader *nir);
 
+/* bfloat16's and 8-bit floats' conversions to and from 32-bit floats, as
+ * integer arithmetic of their bits (wvk_nir_minifloats.c). */
+bool wvk_nir_lower_minifloats(nir_shader *nir);
+
 /* Texel buffers as storage buffers, their format as their records say. */
 bool wvk_nir_lower_texel_buffers(nir_shader *nir, const uint32_t *meta_base);
 

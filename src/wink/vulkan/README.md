@@ -466,6 +466,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   pipeline's identifier (pipelinePropertiesIdentifier) is of its shaders'
   cache keys. The subgroup ballot and vote of the EXT extensions are the
   KHR ones, of subgroups of one.
+- **bfloat16 and 8-bit floats** (VK_KHR_shader_bfloat16,
+  VK_EXT_shader_float8): their bits, which a shader only converts to and
+  from 32-bit floats outside cooperative matrices -- integer arithmetic
+  (wvk_nir_minifloats.c), rounding to nearest even as Mesa's own do --
+  and cooperative matrices of them do their arithmetic in 32-bit floats,
+  rounding once. Not dot products of bfloat16.
 - **Cooperative matrices** (VK_KHR_cooperative_matrix), of a subgroup
   that is one invocation: all of a matrix is that invocation's, an array
   of its elements row by row (wvk_nir_cmat.c), and each operation is of

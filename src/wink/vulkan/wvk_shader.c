@@ -483,6 +483,7 @@ wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    }
    NIR_PASS(_, nir, nir_lower_variable_initializers, ~nir_var_function_temp);
    NIR_PASS(_, nir, wvk_nir_lower_cooperative_matrix);
+   NIR_PASS(_, nir, wvk_nir_lower_minifloats);
    /* Copies of memory (OpCopyMemory of untyped pointers, and sized ones):
     * of the variable, where the types agree, else loads and stores -- while
     * they are still derefs, before any access is lowered to an offset. */

@@ -132,6 +132,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_maintenance9 = true,
       .KHR_maintenance10 = true,
       .KHR_cooperative_matrix = true,
+      .KHR_shader_bfloat16 = true,
+      .EXT_shader_float8 = true,
       .KHR_pipeline_executable_properties = true,
       .EXT_depth_clamp_zero_one = true,
       .KHR_depth_clamp_zero_one = true,
@@ -390,6 +392,13 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
        * (wvk_nir_cmat.c); its loads are the buffers' own, robust or not. */
       .cooperativeMatrix = true,
       .cooperativeMatrixRobustBufferAccess = true,
+      /* bfloat16 and 8-bit floats, as their bits, converted through
+       * 32-bit floats (wvk_nir_minifloats.c); in cooperative matrices
+       * too. */
+      .shaderBFloat16Type = true,
+      .shaderBFloat16CooperativeMatrix = true,
+      .shaderFloat8 = true,
+      .shaderFloat8CooperativeMatrix = true,
       /* A buffer a pointer's phi or select chooses: each access one on
        * every buffer it may be, by the index (wvk_shader.c). */
       .variablePointersStorageBuffer = true,
@@ -1725,7 +1734,8 @@ wvk_GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice,
  * 8x8x8: of 16- and 32-bit floats, into either; of 8-, 16- and 32-bit
  * integers, of either signedness, into 32 bits -- or into their own size,
  * unsigned: the CTS has signed ones of 8 and 16 bits wrong -- and the 8-bit
- * ones saturating too. */
+ * ones saturating too; and of bfloat16 and 8-bit floats into 32-bit
+ * floats, or into their own kind or 16-bit ones. */
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
                                                     VkCooperativeMatrixPropertiesKHR *pProperties)
@@ -1734,6 +1744,9 @@ wvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDev
 #define F32 VK_COMPONENT_TYPE_FLOAT32_KHR
 #define U8 VK_COMPONENT_TYPE_UINT8_KHR
 #define S8 VK_COMPONENT_TYPE_SINT8_KHR
+#define BF16 VK_COMPONENT_TYPE_BFLOAT16_KHR
+#define E4M3 VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT
+#define E5M2 VK_COMPONENT_TYPE_FLOAT8_E5M2_EXT
 #define U16 VK_COMPONENT_TYPE_UINT16_KHR
 #define S16 VK_COMPONENT_TYPE_SINT16_KHR
 #define U32 VK_COMPONENT_TYPE_UINT32_KHR
@@ -1745,11 +1758,16 @@ wvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDev
       { U16, U16, U32, U32, 0 },
       { S16, S16, S32, S32, 0 }, { U32, U32, U32, U32, 0 }, { S32, S32, S32, S32, 0 },
       { U8, U8, U32, U32, 1 },   { S8, S8, S32, S32, 1 },
+      { BF16, BF16, F32, F32, 0 }, { BF16, BF16, BF16, BF16, 0 }, { E4M3, E4M3, F32, F32, 0 },
+      { E5M2, E5M2, F32, F32, 0 }, { E4M3, E4M3, F16, F16, 0 },   { E5M2, E5M2, F16, F16, 0 },
    };
 #undef F16
 #undef F32
 #undef U8
 #undef S8
+#undef BF16
+#undef E4M3
+#undef E5M2
 #undef U16
 #undef S16
 #undef U32

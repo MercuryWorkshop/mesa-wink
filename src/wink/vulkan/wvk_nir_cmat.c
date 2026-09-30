@@ -69,11 +69,66 @@ store_element(nir_builder *b, nir_deref_instr *array, nir_def *i, nir_def *value
    nir_store_deref(b, nir_build_deref_array(b, array, i), value, 0x1);
 }
 
-/* A value of `from` as `to`, of the signedness given of each. */
+/* bfloat16 and the 8-bit floats: bits NIR converts through 32-bit floats
+ * (wvk_nir_minifloats.c), and does arithmetic of as those. */
+static bool
+is_minifloat(enum glsl_base_type type)
+{
+   return type == GLSL_TYPE_BFLOAT16 || type == GLSL_TYPE_FLOAT_E4M3FN || type == GLSL_TYPE_FLOAT_E5M2;
+}
+
+static nir_def *
+minifloat_to_float(nir_builder *b, nir_def *value, enum glsl_base_type type)
+{
+   switch (type) {
+   case GLSL_TYPE_BFLOAT16: return nir_bf2f(b, value);
+   case GLSL_TYPE_FLOAT_E4M3FN: return nir_e4m3fn2f(b, value);
+   default: return nir_e5m22f(b, value);
+   }
+}
+
+static nir_def *
+float_to_minifloat(nir_builder *b, nir_def *value, enum glsl_base_type type, bool saturate)
+{
+   switch (type) {
+   case GLSL_TYPE_BFLOAT16: return nir_f2bf(b, value);
+   case GLSL_TYPE_FLOAT_E4M3FN: return saturate ? nir_f2e4m3fn_sat(b, value) : nir_f2e4m3fn(b, value);
+   default: return saturate ? nir_f2e5m2_sat(b, value) : nir_f2e5m2(b, value);
+   }
+}
+
+/* The element type arithmetic is done in: a minifloat's, 32-bit floats. */
+static enum glsl_base_type
+arithmetic_type(enum glsl_base_type type)
+{
+   return is_minifloat(type) ? GLSL_TYPE_FLOAT : type;
+}
+
+/* A value of `from` as `to`, of the signedness given of each; a minifloat
+ * through a 32-bit float, held at its range where `saturate`. */
+static nir_def *
+convert_sat(nir_builder *b, nir_def *value, enum glsl_base_type from, bool from_signed, enum glsl_base_type to,
+            bool to_signed, bool saturate);
+
 static nir_def *
 convert(nir_builder *b, nir_def *value, enum glsl_base_type from, bool from_signed, enum glsl_base_type to,
         bool to_signed)
 {
+   return convert_sat(b, value, from, from_signed, to, to_signed, false);
+}
+
+static nir_def *
+convert_sat(nir_builder *b, nir_def *value, enum glsl_base_type from, bool from_signed, enum glsl_base_type to,
+            bool to_signed, bool saturate)
+{
+   if (from == to)
+      return value;
+   if (is_minifloat(from)) {
+      value = minifloat_to_float(b, value, from);
+      from = GLSL_TYPE_FLOAT;
+   }
+   if (is_minifloat(to))
+      return float_to_minifloat(b, convert(b, value, from, from_signed, GLSL_TYPE_FLOAT, false), to, saturate);
    from = glsl_apply_signedness_to_base_type(from, from_signed);
    to = glsl_apply_signedness_to_base_type(to, to_signed);
    const nir_alu_type src = nir_get_nir_type_for_glsl_base_type(from);
@@ -128,22 +183,24 @@ lower_elementwise(nir_builder *b, struct hash_table *map, nir_intrinsic_instr *i
    nir_deref_instr *other = intr->intrinsic == nir_intrinsic_cmat_binary_op ? as_array(b, map, intr->src[2]) : NULL;
    const nir_op op = nir_intrinsic_alu_op(intr);
 
+   /* A minifloat's of its 32-bit float, and rounded back. */
+   const enum glsl_base_type type = d.element_type, as = arithmetic_type(type);
    for (unsigned e = 0; e < elements(&d); ++e) {
       nir_def *i = nir_imm_int(b, e);
-      nir_def *x = load_element(b, a, i);
+      nir_def *x = convert(b, load_element(b, a, i), type, true, as, true);
       nir_def *value;
       switch (intr->intrinsic) {
       case nir_intrinsic_cmat_unary_op:
          value = nir_build_alu1(b, op, x);
          break;
       case nir_intrinsic_cmat_binary_op:
-         value = nir_build_alu2(b, op, x, load_element(b, other, i));
+         value = nir_build_alu2(b, op, x, convert(b, load_element(b, other, i), type, true, as, true));
          break;
       default:
-         value = nir_build_alu2(b, op, x, intr->src[2].ssa);
+         value = nir_build_alu2(b, op, x, convert(b, intr->src[2].ssa, type, true, as, true));
          break;
       }
-      store_element(b, dst, i, value);
+      store_element(b, dst, i, convert(b, value, as, true, type, true));
    }
    b->fp_math_ctrl = nir_fp_fast_math;
    nir_instr_remove(&intr->instr);
@@ -163,8 +220,9 @@ lower_convert(nir_builder *b, struct hash_table *map, nir_intrinsic_instr *intr)
 
    for (unsigned e = 0; e < elements(&dd); ++e) {
       const unsigned from = transpose ? (e % dd.cols) * sd.cols + e / dd.cols : e;
-      nir_def *value = convert(b, load_element(b, src, nir_imm_int(b, from)), sd.element_type,
-                               sign & NIR_CMAT_A_SIGNED, dd.element_type, sign & NIR_CMAT_RESULT_SIGNED);
+      nir_def *value = convert_sat(b, load_element(b, src, nir_imm_int(b, from)), sd.element_type,
+                                   sign & NIR_CMAT_A_SIGNED, dd.element_type, sign & NIR_CMAT_RESULT_SIGNED,
+                                   nir_intrinsic_saturate(intr));
       store_element(b, dst, nir_imm_int(b, e), value);
    }
    b->fp_math_ctrl = nir_fp_fast_math;
@@ -213,21 +271,23 @@ lower_muladd(nir_builder *b, struct hash_table *map, nir_intrinsic_instr *intr)
    const bool integer = glsl_base_type_is_integer(rd.element_type);
    const bool result_signed = sign & NIR_CMAT_RESULT_SIGNED;
    const bool saturate = integer && nir_intrinsic_saturate(intr);
+   /* A minifloat result is of the sum in 32-bit floats, rounded once. */
+   const enum glsl_base_type acc_type = arithmetic_type(rd.element_type);
    for (unsigned e = 0; e < elements(&rd); ++e) {
       const unsigned row = e / rd.cols, col = e % rd.cols;
       nir_def *addend = convert(b, load_element(b, c, nir_imm_int(b, e)), cd.element_type, sign & NIR_CMAT_C_SIGNED,
-                                rd.element_type, result_signed);
+                                acc_type, result_signed);
       nir_def *acc = saturate ? nir_imm_intN_t(b, 0, addend->bit_size) : addend;
       for (unsigned k = 0; k < ad.cols; ++k) {
          nir_def *x = load_element(b, a, nir_imm_int(b, row * ad.cols + k));
          nir_def *y = load_element(b, bm, nir_imm_int(b, k * bd.cols + col));
-         x = convert(b, x, ad.element_type, sign & NIR_CMAT_A_SIGNED, rd.element_type, result_signed);
-         y = convert(b, y, bd.element_type, sign & NIR_CMAT_B_SIGNED, rd.element_type, result_signed);
+         x = convert(b, x, ad.element_type, sign & NIR_CMAT_A_SIGNED, acc_type, result_signed);
+         y = convert(b, y, bd.element_type, sign & NIR_CMAT_B_SIGNED, acc_type, result_signed);
          acc = integer ? nir_iadd(b, acc, nir_imul(b, x, y)) : nir_ffma(b, x, y, acc);
       }
       if (saturate)
          acc = add_saturated(b, acc, addend, result_signed);
-      store_element(b, dst, nir_imm_int(b, e), acc);
+      store_element(b, dst, nir_imm_int(b, e), convert(b, acc, acc_type, result_signed, rd.element_type, result_signed));
    }
    nir_instr_remove(&intr->instr);
 }

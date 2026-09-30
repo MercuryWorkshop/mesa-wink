@@ -72,6 +72,7 @@ wvk_files = files(
   'wvk_instance.c',
   'wvk_nir_cmat.c',
   'wvk_nir_descriptors.c',
+  'wvk_nir_minifloats.c',
   'wvk_nir_small_types.c',
   'wvk_nir_subgroups.c',
   'wvk_physical_device.c',
