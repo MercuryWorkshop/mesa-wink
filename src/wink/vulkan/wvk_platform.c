@@ -55,13 +55,17 @@ wait_for(WGPUInstance instance, WGPUFuture future, const struct request *r)
 #if !defined(__EMSCRIPTEN__) && !defined(__APPLE__)
 /* Dawn's Vulkan backend goes through the same loader the application does,
  * with the same environment: VK_DRIVER_FILES that names wink alone would
- * give Dawn wink, and wink Dawn, forever. While Dawn looks for its adapter,
+ * give Dawn wink, and wink Dawn, forever; and the application's layers
+ * would be Dawn's. While Dawn looks for its adapter,
  * the loader sees the host's drivers -- WINK_VK_HOST_DRIVER_FILES, or its
  * default search -- and never wink's. The loader reads these at each
  * vkCreateInstance, which Dawn's adapter discovery is. */
 static const char *const loader_vars[] = {
    "VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES",
    "VK_LOADER_DRIVERS_SELECT", "VK_LOADER_DRIVERS_DISABLE",
+   /* Nor the application's layers: a capture layer (gfxreconstruct)
+    * would record Dawn's calls into the application's file too. */
+   "VK_INSTANCE_LAYERS", "VK_LOADER_LAYERS_ENABLE", "VK_LAYER_PATH", "VK_ADD_LAYER_PATH",
 };
 #define LOADER_VARS ARRAY_SIZE(loader_vars)
 
