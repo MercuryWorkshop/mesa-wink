@@ -56,7 +56,11 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   from the source and cached (`wvk_shader_draw_variant`) -- by the
   device too, serialized, of a digest of the source and what it is a
   variant for, so that the variants of another shader alike, of another
-  pipeline, are made of that and have its render pipelines.
+  pipeline, are made of that and have its render pipelines. A pipeline's
+  own shaders are kept so too, by a digest of all their compile reads --
+  the source, the NIR as linked, push constants, immutable samplers'
+  conversions and the pipeline state wvk_hash_state names -- not by the
+  runtime's cache of weak references, whose hits were a matter of timing.
   `WINK_VK_VARIANT_LOG=1` says when one is made, why, and how long it
   took.
   Monolithic pipelines' shaders are compiled for their draws and have no
