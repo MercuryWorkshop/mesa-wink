@@ -4818,6 +4818,62 @@ widen_small_io_vars(nir_shader *nir)
    return any;
 }
 
+/* Loops with no way out -- an application's while (true) behind a
+ * condition never met, which Vulkan runs as it is -- that WGSL, and Tint's
+ * SPIR-V reader, have no structure for: one, after 2^32 iterations, which
+ * no loop that is ever left sees. */
+static bool
+exit_endless_loops_in(nir_builder *b, struct exec_list *list)
+{
+   bool progress = false;
+   foreach_list_typed(nir_cf_node, node, node, list) {
+      switch (node->type) {
+      case nir_cf_node_if: {
+         nir_if *nif = nir_cf_node_as_if(node);
+         progress |= exit_endless_loops_in(b, &nif->then_list);
+         progress |= exit_endless_loops_in(b, &nif->else_list);
+         break;
+      }
+      case nir_cf_node_loop: {
+         nir_loop *loop = nir_cf_node_as_loop(node);
+         progress |= exit_endless_loops_in(b, &loop->body);
+         nir_block *after = nir_cf_node_as_block(nir_cf_node_next(node));
+         if (nir_block_num_preds(after))
+            break;
+         nir_variable *count = nir_local_variable_create(b->impl, glsl_uint_type(), "wvk_endless");
+         b->cursor = nir_before_cf_node(node);
+         nir_store_var(b, count, nir_imm_int(b, 0), 0x1);
+         b->cursor = nir_after_phis(nir_loop_first_block(loop));
+         nir_def *n = nir_load_var(b, count);
+         nir_push_if(b, nir_ieq_imm(b, n, 0xffffffff));
+         nir_jump(b, nir_jump_break);
+         nir_pop_if(b, NULL);
+         nir_store_var(b, count, nir_iadd_imm(b, n, 1), 0x1);
+         progress = true;
+         break;
+      }
+      default:
+         break;
+      }
+   }
+   return progress;
+}
+
+static bool
+exit_endless_loops(nir_shader *nir)
+{
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      const bool here = exit_endless_loops_in(&b, &impl->body);
+      nir_progress(here, impl, nir_metadata_none);
+      progress |= here;
+   }
+   if (progress)
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   return progress;
+}
+
 /* gl_Layer and gl_ViewportIndex from a vertex shader. WebGPU renders one
  * layer and one viewport: a pass of several layers is one per layer, and
  * a vertex of another layer than the pass's goes out of the clip volume
@@ -8012,6 +8068,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    else if (stage == MESA_SHADER_FRAGMENT)
       record_varyings(nir, nir_var_shader_in, shader->varyings);
 
+   NIR_PASS(_, nir, exit_endless_loops);
    if (getenv("WINK_VK_DUMP_NIR"))
       nir_print_shader(nir, stderr);
 
