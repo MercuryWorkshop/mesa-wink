@@ -181,13 +181,15 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       wusage |= WGPUTextureUsage_StorageBinding;
    image->usage = wusage;
 
+   /* Its sRGB or linear twin, whether or not it may be viewed as another
+    * format: vk_meta resolves an sRGB format's encoded values by it
+    * (VK_KHR_maintenance10), and Metal reinterprets either as the other
+    * without a texture of its own. */
    WGPUTextureFormat view_formats[1];
    size_t view_format_count = 0;
-   if (pCreateInfo->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
-      const WGPUTextureFormat twin = srgb_twin(format->texture);
-      if (twin != WGPUTextureFormat_Undefined)
-         view_formats[view_format_count++] = twin;
-   }
+   const WGPUTextureFormat twin = srgb_twin(format->texture);
+   if (twin != WGPUTextureFormat_Undefined)
+      view_formats[view_format_count++] = twin;
 
    WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
    desc.label = wvk_sv("VkImage");
@@ -341,11 +343,9 @@ wvk_image_snapshot(WGPUDevice device, const struct wvk_image *image, uint32_t t,
                                wgpuTextureGetDepthOrArrayLayers(texture) };
    desc.format = wgpuTextureGetFormat(texture);
    desc.mipLevelCount = wgpuTextureGetMipLevelCount(texture);
-   if ((image->vk.create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) || t != WVK_IMAGE_TEXTURE) {
-      view_formats[0] = srgb_twin(desc.format);
-      desc.viewFormatCount = view_formats[0] != WGPUTextureFormat_Undefined;
-      desc.viewFormats = view_formats;
-   }
+   view_formats[0] = srgb_twin(desc.format);
+   desc.viewFormatCount = view_formats[0] != WGPUTextureFormat_Undefined;
+   desc.viewFormats = view_formats;
    WGPUTexture copy = wgpuDeviceCreateTexture(device, &desc);
    if (!copy)
       return NULL;

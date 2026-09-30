@@ -72,6 +72,8 @@ struct wvk_replay {
          VkRenderingInfo info;
          VkRenderingAttachmentInfo colors[8];
          VkRenderingAttachmentInfo depth, stencil;
+         /* The colors' flags (VK_KHR_maintenance10), which they chain. */
+         VkRenderingAttachmentFlagsInfoKHR flags[8];
       } resolve;
    } rendering;
 

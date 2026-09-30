@@ -130,6 +130,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_maintenance7 = true,
       .KHR_maintenance8 = true,
       .KHR_maintenance9 = true,
+      .KHR_maintenance10 = true,
       .KHR_pipeline_executable_properties = true,
       .EXT_depth_clamp_zero_one = true,
       .KHR_depth_clamp_zero_one = true,
@@ -632,6 +633,11 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Events and barriers of one in-order queue; and a device of no
        * queues has its own, which nothing submits to. */
       .maintenance9 = true,
+      /* vk_meta's resolves of the modes and transfer functions it is
+       * told (VkResolveImageModeInfoKHR, VkRenderingAttachmentFlagsInfoKHR),
+       * and depth and stencil copied on either queue family: they are one
+       * WebGPU queue. */
+      .maintenance10 = true,
       /* A shader's WGSL (wvk_shader.c). */
       .pipelineExecutableInfo = true,
       /* Dawn clamps to [0, 1] whatever the viewport's range. */
@@ -1084,6 +1090,12 @@ get_device_properties(const struct wvk_physical_device *pdev,
        * vertex format has not with 0, and alpha 1. */
       .image2DViewOf3DSparse = false,
       .defaultVertexAttributeValue = VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ONE_KHR,
+      /* VK_KHR_maintenance10: the 4-bit formats' opaque black is their
+       * own; Metal's resolves of sRGB average linear values, and vk_meta's
+       * the encoded ones where told to. */
+      .rgba4OpaqueBlackSwizzled = false,
+      .resolveSrgbFormatAppliesTransferFunction = true,
+      .resolveSrgbFormatSupportsTransferFunctionControl = true,
       .maxDescriptorSetTotalUniformBuffersDynamic = l->maxDynamicUniformBuffersPerPipelineLayout,
       .maxDescriptorSetTotalStorageBuffersDynamic = l->maxDynamicStorageBuffersPerPipelineLayout,
       .maxDescriptorSetTotalBuffersDynamic =
@@ -1416,6 +1428,13 @@ optimal_features(const struct wvk_physical_device *pdev, VkFormat format)
     * do the host's, which are those transfers (wvk_host_copy.c). */
    f |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
         VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
+   /* On any queue family: they are all one WebGPU queue, whose render
+    * passes copy what WebGPU will not (VK_KHR_maintenance10). */
+   if (caps & WVK_CAP_DEPTH)
+      f |= VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_COMPUTE_QUEUE_BIT_KHR | VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
+   if (caps & WVK_CAP_STENCIL)
+      f |= VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_COMPUTE_QUEUE_BIT_KHR |
+           VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_TRANSFER_QUEUE_BIT_KHR;
    return f;
 }
 

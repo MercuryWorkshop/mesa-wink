@@ -1599,7 +1599,9 @@ wvk_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer, VkImage _image, VkI
 
 /* A resolve is a render pass that loads the multisampled image and
  * resolves into the other -- of whole subresources of a format it can
- * average, which is all WebGPU resolves. The rest are vk_meta's draws. */
+ * average, which is all WebGPU resolves, and of sRGB ones their linear
+ * values. The rest are vk_meta's draws, and those of other modes, or of
+ * sRGB's encoded values (VkResolveImageModeInfoKHR). */
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *pResolveImageInfo)
 {
@@ -1607,6 +1609,10 @@ wvk_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *p
    VK_FROM_HANDLE(wvk_image, src, pResolveImageInfo->srcImage);
    VK_FROM_HANDLE(wvk_image, dst, pResolveImageInfo->dstImage);
    struct wvk_replay *replay = cmd->replay;
+   const VkResolveImageModeInfoKHR *mode = vk_find_struct_const(pResolveImageInfo->pNext, RESOLVE_IMAGE_MODE_INFO_KHR);
+   const bool averaged = !mode || (mode->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT &&
+                                   !((mode->flags & VK_RESOLVE_IMAGE_SKIP_TRANSFER_FUNCTION_BIT_KHR) &&
+                                     vk_format_is_srgb(dst->vk.format)));
 
    wvk_replay_end_passes(replay);
    for (uint32_t i = 0; i < pResolveImageInfo->regionCount; ++i) {
@@ -1617,7 +1623,8 @@ wvk_CmdResolveImage2(VkCommandBuffer commandBuffer, const VkResolveImageInfo2 *p
       const VkExtent3D full = vk_image_mip_level_extent(&dst->vk, r->dstSubresource.mipLevel);
       const struct wvk_physical_device *pdev = wvk_device_physical(wvk_cmd_buffer_device(cmd));
       const VkExtent3D src_full = vk_image_mip_level_extent(&src->vk, r->srcSubresource.mipLevel);
-      if (r->srcOffset.x || r->srcOffset.y || r->dstOffset.x || r->dstOffset.y ||
+      if (!averaged || dst->vk.image_type == VK_IMAGE_TYPE_3D || r->srcOffset.x || r->srcOffset.y ||
+          r->dstOffset.x || r->dstOffset.y ||
           r->extent.width != full.width || r->extent.height != full.height || src->format != dst->format ||
           src_full.width != full.width || src_full.height != full.height ||
           !(wvk_format_caps(pdev, dst->vk.format) & WVK_CAP_RESOLVE)) {

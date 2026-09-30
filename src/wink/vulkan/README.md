@@ -434,6 +434,11 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   a buffer as the aspect's buffer copies do, and depth24's unorm comes
   back from its float as the one that made it. Events, barriers and
   queue family ownership are nothing to one in-order queue.
+- **VK_KHR_maintenance10**: a resolve of another mode, or of an sRGB
+  format's encoded values -- WebGPU's average the linear ones -- is
+  vk_meta's, of vkCmdResolveImage2 or of a pass whose attachment says so;
+  depth and stencil copy on the compute family, which is the one WebGPU
+  queue too.
 - **Smaller ones**: a pipeline's executables (pipelineExecutableInfo)
   are its shaders' WGSL, which is what there is to show; depth clamps to
   [0, 1] as Dawn does anyway (depthClampZeroOne); workgroup memory of an

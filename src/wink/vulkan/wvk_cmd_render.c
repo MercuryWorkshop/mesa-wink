@@ -16,6 +16,7 @@
 #include "wvk_image.h"
 
 #include "vk_format.h"
+#include "vk_render_pass.h"
 
 #include <float.h>
 #include <math.h>
@@ -199,13 +200,22 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       colors[i].clearValue = wvk_clear_color(view->vk.format, &att->clearValue.color);
       if (att->resolveMode != VK_RESOLVE_MODE_NONE && att->resolveImageView) {
          VK_FROM_HANDLE(wvk_image_view, resolve, att->resolveImageView);
-         /* WebGPU averages, and only formats that can be. */
-         if (att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT &&
-             (wvk_format_caps(pdev, resolve->vk.format) & WVK_CAP_RESOLVE)) {
+         /* WebGPU averages, and only formats that can be -- sRGB ones'
+          * linear values, not their encoded ones where the attachment says
+          * so (VK_KHR_maintenance10). */
+         const VkRenderingAttachmentFlagsKHR flags = vk_get_rendering_attachment_flags(att);
+         if (att->resolveMode == VK_RESOLVE_MODE_AVERAGE_BIT && resolve->vk.image->image_type != VK_IMAGE_TYPE_3D &&
+             (wvk_format_caps(pdev, resolve->vk.format) & WVK_CAP_RESOLVE) &&
+             !((flags & VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR) &&
+               vk_format_is_srgb(resolve->vk.format))) {
             colors[i].resolveTarget = attachment_view(replay, resolve, WGPUTextureAspect_All);
          } else {
             replay->rendering.resolve.colors[i] = *att;
-            replay->rendering.resolve.colors[i].pNext = NULL;
+            replay->rendering.resolve.flags[i] = (VkRenderingAttachmentFlagsInfoKHR){
+               .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
+               .flags = flags,
+            };
+            replay->rendering.resolve.colors[i].pNext = flags ? &replay->rendering.resolve.flags[i] : NULL;
             replay->rendering.resolve.pending = true;
          }
       }
@@ -358,6 +368,14 @@ wvk_replay_restart_pass(struct wvk_cmd_buffer *cmd, uint32_t layer)
    replay->rendering.resolve.pending |= pending;
    /* The pass is still the one begun, not this copy of it. */
    replay->pass_info = begun;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdEndRendering2KHR(VkCommandBuffer commandBuffer, const VkRenderingEndInfoKHR *pRenderingEndInfo)
+{
+   /* What it may chain is of fragment density maps, which there are none
+    * of. */
+   wvk_CmdEndRendering(commandBuffer);
 }
 
 VKAPI_ATTR void VKAPI_CALL
