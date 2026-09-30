@@ -935,7 +935,9 @@ blend_factor_value(nir_builder *b, VkBlendFactor f, unsigned c, nir_def *s, nir_
 }
 
 /* Each component clamped as a normalized attachment's are, before
- * blending: its values and its factors. */
+ * blending: its values, and the factors are of those -- not clamped
+ * themselves, where a signed one's 1 - x is up to 2, as the CTS's
+ * reference and the hardware have it. */
 static nir_def *
 blend_clamp(nir_builder *b, nir_def *v, const struct util_format_description *d)
 {
@@ -979,8 +981,8 @@ blend_apply(nir_builder *b, uint32_t eq, VkFormat format, nir_def *s, nir_def *s
          out[c] = nir_fmax(b, sc, dc);
          continue;
       }
-      nir_def *sf = blend_clamp(b, blend_factor_value(b, (VkBlendFactor)(e & 31), c, s, s1, d, k), desc);
-      nir_def *df = blend_clamp(b, blend_factor_value(b, (VkBlendFactor)((e >> 5) & 31), c, s, s1, d, k), desc);
+      nir_def *sf = blend_factor_value(b, (VkBlendFactor)(e & 31), c, s, s1, d, k);
+      nir_def *df = blend_factor_value(b, (VkBlendFactor)((e >> 5) & 31), c, s, s1, d, k);
       nir_def *st = nir_fmul(b, sc, sf), *dt = nir_fmul(b, dc, df);
       out[c] = op == VK_BLEND_OP_SUBTRACT           ? nir_fsub(b, st, dt)
                : op == VK_BLEND_OP_REVERSE_SUBTRACT ? nir_fsub(b, dt, st)
@@ -1118,7 +1120,10 @@ wvk_shader_blend_mask(const struct vk_dynamic_graphics_state *dyn, uint32_t writ
    uint32_t alpha = 0, color = 0;
    for (uint32_t i = 0; i < MIN2(dyn->cb.attachment_count, 8); ++i) {
       const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
-      if (!a->blend_enable || !(written & BITFIELD_BIT(i)) || !a->write_mask)
+      /* MIN and MAX take no factors, nor do advanced equations. */
+      if (!a->blend_enable || !(written & BITFIELD_BIT(i)) || !a->write_mask ||
+          a->color_blend_op == VK_BLEND_OP_MIN || a->color_blend_op == VK_BLEND_OP_MAX ||
+          a->color_blend_op >= VK_BLEND_OP_ZERO_EXT)
          continue;
       if (is_constant_alpha_factor(a->src_color_blend_factor) || is_constant_alpha_factor(a->dst_color_blend_factor))
          alpha |= BITFIELD_BIT(i);

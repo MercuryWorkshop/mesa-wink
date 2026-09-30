@@ -2520,7 +2520,8 @@ blend_constant(struct wvk_bound_state *st, const struct vk_dynamic_graphics_stat
    bool alpha = false;
    for (uint32_t i = 0; i < MIN2(color_count, dyn->cb.attachment_count); ++i) {
       const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
-      if (a->blend_enable)
+      /* MIN and MAX take no factors. */
+      if (a->blend_enable && a->color_blend_op != VK_BLEND_OP_MIN && a->color_blend_op != VK_BLEND_OP_MAX)
          alpha |= is_constant_alpha(a->src_color_blend_factor) || is_constant_alpha(a->dst_color_blend_factor);
    }
    const uint32_t written = st->fs ? st->fs->io_mask & dyn->cb.color_write_enables : 0;
