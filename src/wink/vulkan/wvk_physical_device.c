@@ -131,6 +131,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_maintenance8 = true,
       .KHR_maintenance9 = true,
       .KHR_maintenance10 = true,
+      .KHR_cooperative_matrix = true,
       .KHR_pipeline_executable_properties = true,
       .EXT_depth_clamp_zero_one = true,
       .KHR_depth_clamp_zero_one = true,
@@ -385,6 +386,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Present fences, modes of each present, and images released
        * (wvk_wsi.c); the images made with the swapchain, deferred or not. */
       .swapchainMaintenance1 = true,
+      /* Of a subgroup of one invocation, which holds all of a matrix
+       * (wvk_nir_cmat.c); its loads are the buffers' own, robust or not. */
+      .cooperativeMatrix = true,
+      .cooperativeMatrixRobustBufferAccess = true,
       /* A buffer a pointer's phi or select chooses: each access one on
        * every buffer it may be, by the index (wvk_shader.c). */
       .variablePointersStorageBuffer = true,
@@ -1107,6 +1112,8 @@ get_device_properties(const struct wvk_physical_device *pdev,
        * own; Metal's resolves of sRGB average linear values, and vk_meta's
        * the encoded ones where told to. */
       .rgba4OpaqueBlackSwizzled = false,
+      /* VK_KHR_cooperative_matrix */
+      .cooperativeMatrixSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT,
       /* VK_EXT_legacy_vertex_attributes: those the shader reads itself. */
       .nativeUnalignedPerformance = false,
       .resolveSrgbFormatAppliesTransferFunction = true,
@@ -1712,4 +1719,57 @@ wvk_GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice,
                                               VkExternalBufferProperties *pExternalBufferProperties)
 {
    pExternalBufferProperties->externalMemoryProperties = (VkExternalMemoryProperties){ 0 };
+}
+
+/* The matrices a subgroup of one invocation multiplies (wvk_nir_cmat.c),
+ * 8x8x8: of 16- and 32-bit floats, into either; of 8-, 16- and 32-bit
+ * integers, of either signedness, into 32 bits -- or into their own size,
+ * unsigned: the CTS has signed ones of 8 and 16 bits wrong -- and the 8-bit
+ * ones saturating too. */
+VKAPI_ATTR VkResult VKAPI_CALL
+wvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
+                                                    VkCooperativeMatrixPropertiesKHR *pProperties)
+{
+#define F16 VK_COMPONENT_TYPE_FLOAT16_KHR
+#define F32 VK_COMPONENT_TYPE_FLOAT32_KHR
+#define U8 VK_COMPONENT_TYPE_UINT8_KHR
+#define S8 VK_COMPONENT_TYPE_SINT8_KHR
+#define U16 VK_COMPONENT_TYPE_UINT16_KHR
+#define S16 VK_COMPONENT_TYPE_SINT16_KHR
+#define U32 VK_COMPONENT_TYPE_UINT32_KHR
+#define S32 VK_COMPONENT_TYPE_SINT32_KHR
+   static const VkComponentTypeKHR types[][5] = {
+      { F16, F16, F16, F16, 0 }, { F16, F16, F32, F32, 0 }, { F32, F32, F32, F32, 0 },
+      { U8, U8, U32, U32, 0 },   { S8, S8, S32, S32, 0 },   { U8, U8, S32, S32, 0 },
+      { S8, S8, U32, U32, 0 },   { U8, U8, U8, U8, 0 },     { U16, U16, U16, U16, 0 },
+      { U16, U16, U32, U32, 0 },
+      { S16, S16, S32, S32, 0 }, { U32, U32, U32, U32, 0 }, { S32, S32, S32, S32, 0 },
+      { U8, U8, U32, U32, 1 },   { S8, S8, S32, S32, 1 },
+   };
+#undef F16
+#undef F32
+#undef U8
+#undef S8
+#undef U16
+#undef S16
+#undef U32
+#undef S32
+   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixPropertiesKHR, out, pProperties, pPropertyCount);
+   for (uint32_t i = 0; i < ARRAY_SIZE(types); ++i) {
+      vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p) {
+         *p = (VkCooperativeMatrixPropertiesKHR){
+            .sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR,
+            .MSize = 8,
+            .NSize = 8,
+            .KSize = 8,
+            .AType = types[i][0],
+            .BType = types[i][1],
+            .CType = types[i][2],
+            .ResultType = types[i][3],
+            .saturatingAccumulation = types[i][4],
+            .scope = VK_SCOPE_SUBGROUP_KHR,
+         };
+      }
+   }
+   return vk_outarray_status(&out);
 }

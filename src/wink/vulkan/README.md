@@ -463,6 +463,15 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   pipeline's identifier (pipelinePropertiesIdentifier) is of its shaders'
   cache keys. The subgroup ballot and vote of the EXT extensions are the
   KHR ones, of subgroups of one.
+- **Cooperative matrices** (VK_KHR_cooperative_matrix), of a subgroup
+  that is one invocation: all of a matrix is that invocation's, an array
+  of its elements row by row (wvk_nir_cmat.c), and each operation is of
+  each element in turn, unrolled -- a multiply-add each element's dot
+  product, and C added saturating where the operation says. 8x8x8, of
+  16- and 32-bit floats and 8-, 16- and 32-bit integers.
+  Loops of the operations over the arrays come out wrong on Metal but for
+  32-bit floats, which is why they are unrolled, and why the matrices are
+  small.
 - **FMA and contraction** (VK_KHR_shader_fma): OpFmaKHR is WGSL's fma,
   which Metal's is, fused -- for 16- and 32-bit floats; 64-bit ones are
   software that multiplies and then adds. A shader with a float operation
