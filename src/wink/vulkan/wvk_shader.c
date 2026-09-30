@@ -3280,6 +3280,35 @@ zero_fs_primitive_id(nir_shader *nir)
    return nir_progress(true, impl, nir_metadata_none);
 }
 
+/* The discard rectangle test (VK_EXT_discard_rectangles), first thing: a
+ * fragment outside every rectangle, or with exclusive ones in one, goes.
+ * Of the rectangles the driver's data has (WVK_DRIVER_DISCARD). */
+static bool
+lower_discard_rects(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_def *fc = nir_load_frag_coord(&b);
+   nir_def *x = nir_f2i32(&b, nir_ffloor(&b, nir_channel(&b, fc, 0)));
+   nir_def *y = nir_f2i32(&b, nir_ffloor(&b, nir_channel(&b, fc, 1)));
+   nir_def *head = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH), nir_imm_int(&b, WVK_DRIVER_DISCARD),
+                                 .align_mul = 16, .access = ACCESS_NON_WRITEABLE);
+   nir_def *count = nir_channel(&b, head, 0);
+   nir_def *inside = nir_imm_false(&b);
+   for (unsigned i = 0; i < WVK_MAX_DISCARD_RECTANGLES; ++i) {
+      nir_def *r = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                 nir_imm_int(&b, WVK_DRIVER_DISCARD + 16 + 16 * i), .align_mul = 16,
+                                 .access = ACCESS_NON_WRITEABLE);
+      nir_def *in = nir_iand(&b, nir_ilt(&b, nir_imm_int(&b, i), count),
+                             nir_iand(&b, nir_iand(&b, nir_ige(&b, x, nir_channel(&b, r, 0)), nir_ige(&b, y, nir_channel(&b, r, 1))),
+                                      nir_iand(&b, nir_ilt(&b, x, nir_channel(&b, r, 2)), nir_ilt(&b, y, nir_channel(&b, r, 3)))));
+      inside = nir_ior(&b, inside, in);
+   }
+   nir_def *exclusive = nir_ine_imm(&b, nir_channel(&b, head, 1), 0);
+   nir_terminate_if(&b, nir_bcsel(&b, exclusive, inside, nir_inot(&b, inside)));
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 /* gl_PrimitiveID of a fragment shader after a geometry shader: the flat
  * varying at `location`, which the draw's vertex shader has of the
  * geometry shader's records (geometry_vertex_shader). */
@@ -7030,7 +7059,12 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
          NIR_PASS(_, nir, lower_line_fs, records->line_coord);
          shader->key.line_coord = records->line_coord;
       }
-      /* A draw's depth bounds test and logic op, for its variant. */
+      /* A draw's discard rectangle test, depth bounds test and logic op,
+       * for its variant. */
+      if (records && records->discard_rects) {
+         NIR_PASS(_, nir, lower_discard_rects);
+         shader->key.discard_rects = 1;
+      }
       if (records && records->depth_bounds) {
          NIR_PASS(_, nir, lower_depth_bounds);
          shader->reads_depth_bounds = true;
@@ -8065,6 +8099,8 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
             key.logic_format[i] = color_formats[i];
          }
       }
+      /* The discard rectangle test, of the rectangles the draw's data has. */
+      key.discard_rects = dyn->dr.enable;
       /* The depth bounds test, where there is depth to test: against a
        * copy of a single-sampled attachment, texel for texel. */
       if (dyn->ds.depth.bounds_test.enable && has_depth) {
@@ -8095,7 +8131,7 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
       /* A variant that failed is kept as none, not tried at every draw. */
       if (getenv("WINK_VK_VARIANT_LOG")) {
          const struct wvk_shader_key *own = &shader->key;
-         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
                  _mesa_shader_stage_to_string(shader->vk.stage), shader->id,
                  key.pulled != own->pulled ? " vertex input" : "",
                  memcmp(key.fs_inputs, own->fs_inputs, sizeof(key.fs_inputs)) ? " varyings" : "",
@@ -8107,6 +8143,7 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
                  key.logic_op != own->logic_op || memcmp(key.logic_format, own->logic_format, sizeof(key.logic_format))
                     ? " logic op" : "",
                  key.depth_bounds != own->depth_bounds ? " depth bounds" : "",
+                 key.discard_rects != own->discard_rects ? " discard rectangles" : "",
                  key.blend_mask != own->blend_mask ||
                        memcmp(key.blend_equation, own->blend_equation, sizeof(key.blend_equation))
                     ? " blending" : "",

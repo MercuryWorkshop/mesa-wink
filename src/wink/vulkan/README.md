@@ -190,6 +190,11 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   test is, or at the start where it asks for early tests; a draw without a
   fragment shader gets the driver's own, which is the test alone. Not on a
   multisampled pass, which says so.
+- **Discard rectangles** (VK_EXT_discard_rectangles), eight of them, are
+  the fragment shader's first thing: a draw with them on gets a variant
+  that leaves a fragment outside every rectangle, or inside one of
+  exclusive ones, of those the driver's push data has; a draw without a
+  fragment shader gets the driver's own, which is the test alone.
 - **Points of any size** (largePoints) are quads: WebGPU's points are a
   pixel. A draw of a point list whose vertex shader writes PointSize is a
   triangle list of six vertices a point, drawn with a variant of the

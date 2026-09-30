@@ -241,7 +241,10 @@ enum wvk_texel_type {
  *   - for tessellation run as compute: the draw's vertices an instance,
  *     its patches an instance, a patch's vertices, and its patches in
  *     all, 4 uints;
- *   - the blend constants, 4 floats, for blending the fragment shader does. */
+ *   - the blend constants, 4 floats, for blending the fragment shader does;
+ *   - the discard rectangles (VK_EXT_discard_rectangles), which the
+ *     fragment shader tests: how many, and whether they are exclusive, 4
+ *     uints; then each's corners, x0, y0, x1, y1, 4 ints, 8 of them. */
 #define WVK_PUSH_SIZE 128
 #define WVK_DRIVER_DATA_OFFSET WVK_PUSH_SIZE
 #define WVK_DRIVER_DRAW_OFFSET (WVK_DRIVER_DATA_OFFSET + 16)
@@ -261,7 +264,9 @@ enum wvk_texel_type {
 #define WVK_DRIVER_PULL_MORE (WVK_DRIVER_DATA_OFFSET + 192)
 #define WVK_DRIVER_TESS (WVK_DRIVER_DATA_OFFSET + 208)
 #define WVK_DRIVER_BLEND (WVK_DRIVER_DATA_OFFSET + 224)
-#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 240)
+#define WVK_DRIVER_DISCARD (WVK_DRIVER_DATA_OFFSET + 240)
+#define WVK_MAX_DISCARD_RECTANGLES 8
+#define WVK_PUSH_DATA_SIZE (WVK_PUSH_SIZE + 240 + 16 + 16 * WVK_MAX_DISCARD_RECTANGLES)
 #define WVK_META_OFFSET WVK_PUSH_DATA_SIZE
 /* How much of the push buffer the push binding shows: its data, and as
  * many records as that leaves room for. */

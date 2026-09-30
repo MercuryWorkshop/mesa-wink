@@ -109,6 +109,9 @@ struct wvk_device {
     * scan (wvk_cmd_draw.c's draw_mesh), and their bind group layout. */
    WGPUComputePipeline mesh_pipelines[2];
    WGPUBindGroupLayout mesh_bgl;
+   /* The fragment shader of a draw that has none, for its discard
+    * rectangle test (wvk_cmd_draw.c). */
+   struct wvk_shader *discard_fs;
    /* Serials for the driver's own indirect buffers, above any memory's. */
    uint64_t temp_serial;
    WGPUComputePipeline repack_pipeline;

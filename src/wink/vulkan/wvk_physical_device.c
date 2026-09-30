@@ -159,6 +159,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_mutable_descriptor_type = true,
       .VALVE_mutable_descriptor_type = true,
       .EXT_mesh_shader = wvk_physical_device_meshes(pdev),
+      .EXT_discard_rectangles = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -878,6 +879,8 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .advancedBlendNonPremultipliedDstColor = true,
       .advancedBlendCorrelatedOverlap = true,
       .advancedBlendAllOperations = true,
+      /* VK_EXT_discard_rectangles: the fragment shader's test. */
+      .maxDiscardRectangles = WVK_MAX_DISCARD_RECTANGLES,
       /* VK_EXT_mesh_shader: the least of each. Payloads and outputs are
        * in buffers; shared memory is workgroup memory, of which WebGPU has
        * to have the 32 KiB a task shader may. */

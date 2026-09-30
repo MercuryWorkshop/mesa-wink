@@ -366,6 +366,59 @@ compute_equal(const void *a, const void *b)
 }
 
 
+/* The fragment shader of a draw that has none, with the discard rectangle
+ * test on: the test (wvk_shader.c's lower_discard_rects), of the
+ * rectangles the driver's data has. */
+static struct wvk_shader *
+create_discard_fs(struct wvk_device *dev)
+{
+   char wgsl[1200];
+   snprintf(wgsl, sizeof(wgsl),
+            "struct WvkPush { words: array<u32> }\n"
+            "@group(%u) @binding(%u) var<storage, read> wvk_push: WvkPush;\n"
+            "@fragment fn main(@builtin(position) pos: vec4f) {\n"
+            "  let x = i32(floor(pos.x));\n"
+            "  let y = i32(floor(pos.y));\n"
+            "  let count = wvk_push.words[%uu];\n"
+            "  var inside = false;\n"
+            "  for (var i = 0u; i < min(count, %uu); i++) {\n"
+            "    let at = %uu + 4u * i;\n"
+            "    let r = vec4i(bitcast<i32>(wvk_push.words[at]), bitcast<i32>(wvk_push.words[at + 1u]),\n"
+            "                  bitcast<i32>(wvk_push.words[at + 2u]), bitcast<i32>(wvk_push.words[at + 3u]));\n"
+            "    inside = inside || (x >= r.x && y >= r.y && x < r.z && y < r.w);\n"
+            "  }\n"
+            "  if (inside == (wvk_push.words[%uu] != 0u)) { discard; }\n"
+            "}\n",
+            WVK_DRIVER_GROUP, WVK_DRIVER_SLOT_PUSH, WVK_DRIVER_DISCARD / 4, WVK_MAX_DISCARD_RECTANGLES,
+            WVK_DRIVER_DISCARD / 4 + 4, WVK_DRIVER_DISCARD / 4 + 1);
+   struct wvk_shader *fs = calloc(1, sizeof(*fs));
+   struct wvk_shader_binding *bindings = calloc(1, sizeof(*bindings));
+   if (!fs || !bindings) {
+      free(fs);
+      free(bindings);
+      return NULL;
+   }
+   bindings[0] = (struct wvk_shader_binding){
+      .group = WVK_DRIVER_GROUP,
+      .kind = WVK_BINDING_STORAGE_READ,
+      .binding = WVK_DRIVER_SLOT_PUSH,
+      .dynamic = true,
+   };
+   fs->vk.stage = MESA_SHADER_FRAGMENT;
+   fs->id = p_atomic_inc_return(&dev->next_shader_id);
+   fs->bindings = bindings;
+   fs->binding_count = 1;
+   fs->key.discard_rects = 1;
+   fs->uses_push_constants = true;
+   WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+   source.code = wvk_sv(wgsl);
+   WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+   sm.nextInChain = &source.chain;
+   sm.label = wvk_sv("wvk discard rectangles fragment");
+   fs->module[0] = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+   return fs;
+}
+
 /* The fragment shader of a draw that has none, with the depth bounds test
  * on: WebGPU draws depth without a fragment stage, and the test is the
  * fragment shader's (wvk_shader.c's lower_depth_bounds). Its bindings are
@@ -449,6 +502,7 @@ wvk_device_init_pipeline_caches(struct wvk_device *dev)
    sm.label = wvk_sv("wvk empty fragment");
    dev->empty_fragment = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
    dev->depth_bounds_fs = create_depth_bounds_fs(dev);
+   dev->discard_fs = create_discard_fs(dev);
 
    WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
    bd.label = wvk_sv("wvk null buffer");
@@ -505,6 +559,12 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuBindGroupRelease(dev->empty_bind_group);
    if (dev->empty_fragment)
       wgpuShaderModuleRelease(dev->empty_fragment);
+   if (dev->discard_fs) {
+      if (dev->discard_fs->module[0])
+         wgpuShaderModuleRelease(dev->discard_fs->module[0]);
+      free(dev->discard_fs->bindings);
+      free(dev->discard_fs);
+   }
    if (dev->depth_bounds_fs) {
       if (dev->depth_bounds_fs->module[0])
          wgpuShaderModuleRelease(dev->depth_bounds_fs->module[0]);
@@ -2606,6 +2666,32 @@ snapshot_logic_op(struct wvk_cmd_buffer *cmd)
    wvk_replay_restart_pass(cmd, replay->pass_layer);
 }
 
+/* What a draw's discard rectangle test reads: the rectangles, as corners,
+ * in the driver's data. */
+static void
+prepare_discard_rects(struct wvk_cmd_buffer *cmd)
+{
+   struct wvk_bound_state *st = cmd->replay->state;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   if (!st->fs || !st->fs->key.discard_rects)
+      return;
+   int32_t words[4 + 4 * WVK_MAX_DISCARD_RECTANGLES] = { 0 };
+   const uint32_t count = MIN2(dyn->dr.rectangle_count, WVK_MAX_DISCARD_RECTANGLES);
+   words[0] = (int32_t)count;
+   words[1] = dyn->dr.mode == VK_DISCARD_RECTANGLE_MODE_EXCLUSIVE_EXT;
+   for (uint32_t i = 0; i < count; ++i) {
+      const VkRect2D *r = &dyn->dr.rectangles[i];
+      words[4 + 4 * i] = r->offset.x;
+      words[5 + 4 * i] = r->offset.y;
+      words[6 + 4 * i] = (int32_t)MIN2((int64_t)r->offset.x + r->extent.width, INT32_MAX);
+      words[7 + 4 * i] = (int32_t)MIN2((int64_t)r->offset.y + r->extent.height, INT32_MAX);
+   }
+   if (memcmp(st->push + WVK_DRIVER_DISCARD, words, sizeof(words))) {
+      memcpy(st->push + WVK_DRIVER_DISCARD, words, sizeof(words));
+      st->push_offset = UINT32_MAX;
+   }
+}
+
 /* What a draw's depth bounds test reads: a copy of the depth the
  * attachment holds, in R32Float, made before the draw with the pass begun
  * again after; and the bounds, in the driver's data. */
@@ -2693,6 +2779,7 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    snapshot_feedback(cmd, p->layout);
    snapshot_logic_op(cmd);
    prepare_depth_bounds(cmd);
+   prepare_discard_rects(cmd);
 
    /* A render pass is one usage scope: what the draw reads of buffers it
     * writes, copies; and a draw at odds with what the pass used before, a
@@ -3472,9 +3559,12 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
                                     shape, 0, wvk_replay_stats(replay));
    st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats, &vs_images,
                                     shape, 0, 0);
-   /* No fragment shader to do the depth bounds test: the driver's. */
+   /* No fragment shader to do the depth bounds test: the driver's. And the
+    * discard rectangle test. */
    if (!st->fs && dyn->ds.depth.bounds_test.enable && has_depth && samples <= 1)
       st->fs = dev->depth_bounds_fs;
+   else if (!st->fs && dyn->dr.enable)
+      st->fs = dev->discard_fs;
 }
 
 /* Whether a draw's points are quads of the size the vertex shader gives

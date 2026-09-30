@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 33
+#define WVK_SHADER_BINARY_VERSION 34
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -205,6 +205,9 @@ struct wvk_shader_key {
    /* Fragment: the depth bounds test, against a copy of the depth
     * attachment at WVK_DRIVER_SLOT_DEPTH_BOUNDS. */
    uint32_t depth_bounds;
+   /* Fragment: the discard rectangle test, of the rectangles the driver's
+    * data has (WVK_DRIVER_DISCARD). */
+   uint8_t discard_rects;
    /* The format of each storage image the shader has none for, which
     * WGSL's must have: the VkFormat of the view bound there, in the order
     * of wvk_shader::unformatted. */
