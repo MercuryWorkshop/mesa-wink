@@ -113,6 +113,10 @@ wvk_replay_end_passes(struct wvk_replay *replay)
       wgpuComputePassEncoderRelease(replay->compute);
       replay->compute = NULL;
    }
+   /* Scratch buffers had again, zeroed before what uses them. */
+   util_dynarray_foreach(&replay->scratch_clears, struct wvk_scratch_clear, clear)
+      wgpuCommandEncoderClearBuffer(replay->encoder, clear->buffer, 0, clear->size);
+   util_dynarray_clear(&replay->scratch_clears);
 }
 
 static void
@@ -356,6 +360,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_fini(&replay.buffer_swaps);
    util_dynarray_fini(&replay.texture_swaps);
    util_dynarray_fini(&replay.pass_buffers);
+   util_dynarray_fini(&replay.scratch_clears);
    rcmd->replay = NULL;
    /* What the replay itself recorded is of no further use. */
    vk_command_buffer_reset(&rcmd->vk);

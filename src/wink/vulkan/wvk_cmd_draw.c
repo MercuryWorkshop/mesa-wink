@@ -4302,6 +4302,9 @@ capture_xfb(struct wvk_cmd_buffer *cmd, const struct wvk_shader *gs, const struc
  * (key.geometry 1); then a draw of that list, whose vertex shader reads
  * the vertices (key.geometry 2). Primitives restarting in an indexed
  * strip are not: the strip goes on. */
+static WGPUBuffer scratch(struct wvk_device *dev, struct wvk_replay *replay, unsigned i, uint64_t size,
+                          WGPUBufferUsage usage, bool clear, struct wvk_driver_buffer *bound);
+
 static void
 draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t count, uint32_t instances,
               int32_t base_vertex, uint32_t first_instance, uint32_t draw_id)
@@ -4358,16 +4361,16 @@ draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t
       mesa_logw_once("wvk: a draw with a geometry shader of more than its buffers can bind");
       return;
    }
-   WGPUBuffer capture = wvk_replay_temp_buffer(dev, replay, MAX2(records, 16), WGPUBufferUsage_Storage, NULL);
-   WGPUBuffer out = wvk_replay_temp_buffer(dev, replay, vertices, WGPUBufferUsage_Storage, NULL);
+   /* The submit's, draw after draw (scratch). */
    const uint64_t list_bytes = MAX2(indices * streams * 4, 16);
-   WGPUBuffer list = wvk_replay_temp_buffer(dev, replay, list_bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_Index,
-                                            NULL);
+   WGPUBuffer capture = scratch(dev, replay, WVK_SCRATCH_GEOMETRY + 0, records, WGPUBufferUsage_Storage, true,
+                                &st->capture);
+   WGPUBuffer out = scratch(dev, replay, WVK_SCRATCH_GEOMETRY + 1, vertices, WGPUBufferUsage_Storage, true,
+                            &st->gs_vertices);
+   WGPUBuffer list = scratch(dev, replay, WVK_SCRATCH_GEOMETRY + 2, list_bytes,
+                             WGPUBufferUsage_Storage | WGPUBufferUsage_Index, true, &st->gs_indices);
    if (!capture || !out || !list)
       return;
-   st->capture = (struct wvk_driver_buffer){ capture, ++dev->temp_serial | (1ull << 62), 0, MAX2(records, 16) };
-   st->gs_vertices = (struct wvk_driver_buffer){ out, ++dev->temp_serial | (1ull << 62), 0, vertices };
-   st->gs_indices = (struct wvk_driver_buffer){ list, ++dev->temp_serial | (1ull << 62), 0, list_bytes };
 
    if (!run_vertices(cmd, 3, indexed, first, count, instances, base_vertex, first_instance, draw_id))
       return;
@@ -4526,22 +4529,26 @@ mesh_pipelines(struct wvk_device *dev)
 #define WVK_MESH_ROUNDS 8
 #define WVK_MESH_MAX_ROUNDS 1024
 
-/* A mesh draw's buffer `i` of at least `size` bytes: the submit's, made
- * bigger where it has to be. */
+/* A draw's buffer of slot `i` (wvk_replay::scratch), of at least `size`
+ * bytes: the submit's, made bigger where it has to be -- and where it is
+ * not, zeroed as a new one is (`clear`), before the next pass. Bound whole
+ * where `bound` is. */
 static WGPUBuffer
-mesh_scratch(struct wvk_device *dev, struct wvk_replay *replay, unsigned i, uint64_t size, WGPUBufferUsage usage,
-             struct wvk_driver_buffer *bound)
+scratch(struct wvk_device *dev, struct wvk_replay *replay, unsigned i, uint64_t size, WGPUBufferUsage usage, bool clear,
+        struct wvk_driver_buffer *bound)
 {
    size = align64(MAX2(size, 16), 16);
-   if (replay->mesh_scratch[i].size < size) {
-      replay->mesh_scratch[i].buffer = wvk_replay_temp_buffer(dev, replay, size, usage, NULL);
-      replay->mesh_scratch[i].size = replay->mesh_scratch[i].buffer ? size : 0;
-      replay->mesh_scratch[i].serial = ++dev->temp_serial | (1ull << 62);
+   if (replay->scratch[i].size < size) {
+      replay->scratch[i].buffer = wvk_replay_temp_buffer(dev, replay, size, usage | WGPUBufferUsage_CopyDst, NULL);
+      replay->scratch[i].size = replay->scratch[i].buffer ? size : 0;
+      replay->scratch[i].serial = ++dev->temp_serial | (1ull << 62);
+   } else if (clear) {
+      util_dynarray_append(&replay->scratch_clears, ((struct wvk_scratch_clear){ replay->scratch[i].buffer, size }));
    }
    if (bound)
-      *bound = (struct wvk_driver_buffer){ replay->mesh_scratch[i].buffer, replay->mesh_scratch[i].serial, 0,
-                                           replay->mesh_scratch[i].size };
-   return replay->mesh_scratch[i].buffer;
+      *bound = (struct wvk_driver_buffer){ replay->scratch[i].buffer, replay->scratch[i].serial, 0,
+                                           replay->scratch[i].size };
+   return replay->scratch[i].buffer;
 }
 
 /* A mesh draw (VK_EXT_mesh_shader), which WebGPU has no stages of: the
@@ -4615,13 +4622,17 @@ draw_mesh(struct wvk_cmd_buffer *cmd, uint32_t gx, uint32_t gy, uint32_t gz, WGP
    const uint64_t all_capacity = MIN2(mesh_capacity * rounds, UINT32_MAX);
    const uint64_t first_capacity = task ? task_capacity : all_capacity;
    const WGPUBufferUsage storage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
-   WGPUBuffer header = mesh_scratch(dev, replay, 0, WVK_MESH_HEADER_WORDS * 4,
-                                    WGPUBufferUsage_Storage | WGPUBufferUsage_Indirect, &st->tess[3]);
-   WGPUBuffer launches = mesh_scratch(dev, replay, 1, task_capacity * 16, storage, &st->tess[1]);
-   WGPUBuffer payloads = mesh_scratch(dev, replay, 2, MAX2(task_capacity, 1) * payload, storage, &st->capture);
-   WGPUBuffer vertices = mesh_scratch(dev, replay, 3, mesh_capacity * vertex_bytes, storage, &st->gs_vertices);
-   WGPUBuffer prims = mesh_scratch(dev, replay, 4, mesh_capacity * prim_bytes, storage, &st->gs_indices);
-   WGPUBuffer dummy = mesh_scratch(dev, replay, 5, 16, WGPUBufferUsage_Storage, NULL);
+   WGPUBuffer header = scratch(dev, replay, WVK_SCRATCH_MESH + 0, WVK_MESH_HEADER_WORDS * 4,
+                               WGPUBufferUsage_Storage | WGPUBufferUsage_Indirect, false, &st->tess[3]);
+   WGPUBuffer launches = scratch(dev, replay, WVK_SCRATCH_MESH + 1, task_capacity * 16, storage, false,
+                                 &st->tess[1]);
+   WGPUBuffer payloads = scratch(dev, replay, WVK_SCRATCH_MESH + 2, MAX2(task_capacity, 1) * payload, storage,
+                                 false, &st->capture);
+   WGPUBuffer vertices = scratch(dev, replay, WVK_SCRATCH_MESH + 3, mesh_capacity * vertex_bytes, storage,
+                                 false, &st->gs_vertices);
+   WGPUBuffer prims = scratch(dev, replay, WVK_SCRATCH_MESH + 4, mesh_capacity * prim_bytes, storage, false,
+                              &st->gs_indices);
+   WGPUBuffer dummy = scratch(dev, replay, WVK_SCRATCH_MESH + 5, 16, WGPUBufferUsage_Storage, false, NULL);
    if (!header || !launches || !payloads || !vertices || !prims || !dummy)
       return;
 
@@ -4827,6 +4838,11 @@ tessellator_pipelines(struct wvk_device *dev)
    return dev->tess_bgl && dev->tess_pipelines[0] && dev->tess_pipelines[1] && dev->tess_pipelines[2];
 }
 
+/* How big each of a tessellated draw's buffers may be (draw_tessellated):
+ * the submit's (scratch), each a worst case, which a binding's whole would
+ * make gigabytes of. */
+#define WVK_TESS_BUDGET (256ull << 20)
+
 /* A tessellated draw, which WebGPU has no stages of: the vertex shader run
  * as compute, a record a vertex (key.runs 3); the control shader run as
  * compute, a workgroup a patch, writing records of its vertices and patches
@@ -4893,39 +4909,39 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
       return;
 
    /* The buffers: what each stage writes, and the tessellator's, as much as
-    * a binding can hold of them. */
+    * a binding can hold of them -- and of what the tessellator and a
+    * geometry shader after it may make, sized for the most the levels
+    * allow, as much as WVK_TESS_BUDGET of each: a draw of more is drawn as
+    * far as they hold, which the tessellator stops at. */
    const uint64_t limit = pdev->limits.maxStorageBufferBindingSize;
+   const uint64_t budget = MIN2(limit, WVK_TESS_BUDGET);
    const uint32_t out_stride = wvk_record_stride(evaluation->record_vars);
    const uint64_t records = (uint64_t)count * instances * wvk_record_stride(vs->record_vars);
    const uint64_t control_bytes = patches * vertices_out * wvk_record_stride(control->record_vars);
    const uint64_t patch_bytes = patches * wvk_patch_stride(control->patch_vars);
-   const uint64_t points_capacity = MIN3(patches * WVK_TESS_MAX_POINTS, MIN2(limit / out_stride, limit / 16) - 1,
+   const uint64_t points_capacity = MIN3(patches * WVK_TESS_MAX_POINTS, MIN2(budget / out_stride, budget / 16) - 1,
                                          1u << 22);
-   const uint64_t indices_capacity = MIN3(patches * WVK_TESS_MAX_INDICES, limit / 4, 1u << 24);
+   const uint64_t indices_capacity = MIN3(patches * WVK_TESS_MAX_INDICES, budget / 4, 1u << 24);
    const uint64_t counts_bytes = (patches * 4 + 28) * 4;
    if (records > limit || control_bytes > limit || patch_bytes > limit) {
       mesa_logw_once("wvk: a tessellated draw of more than its buffers can bind");
       return;
    }
+   /* The submit's, draw after draw: each a worst case, which new ones for
+    * each would have the submit hold all of at once. */
    const WGPUBufferUsage storage = WGPUBufferUsage_Storage;
-   WGPUBuffer capture = wvk_replay_temp_buffer(dev, replay, MAX2(records, 16), storage, NULL);
-   WGPUBuffer control_out = wvk_replay_temp_buffer(dev, replay, MAX2(control_bytes, 16), storage, NULL);
-   WGPUBuffer patch_out = wvk_replay_temp_buffer(dev, replay, MAX2(patch_bytes, 16), storage, NULL);
-   WGPUBuffer points = wvk_replay_temp_buffer(dev, replay, points_capacity * 16, storage, NULL);
-   WGPUBuffer counts = wvk_replay_temp_buffer(dev, replay, counts_bytes, storage | WGPUBufferUsage_Indirect, NULL);
-   WGPUBuffer list = wvk_replay_temp_buffer(dev, replay, MAX2(indices_capacity * 4, 16),
-                                            storage | WGPUBufferUsage_Index, NULL);
-   WGPUBuffer out = wvk_replay_temp_buffer(dev, replay, (points_capacity + 1) * out_stride, storage, NULL);
+   const WGPUBufferUsage indexed_storage = storage | WGPUBufferUsage_Index;
+   WGPUBuffer capture = scratch(dev, replay, WVK_SCRATCH_TESS + 0, records, storage, true, &st->capture);
+   WGPUBuffer control_out = scratch(dev, replay, WVK_SCRATCH_TESS + 1, control_bytes, storage, true, &st->tess[0]);
+   WGPUBuffer patch_out = scratch(dev, replay, WVK_SCRATCH_TESS + 2, patch_bytes, storage, true, &st->tess[1]);
+   WGPUBuffer points = scratch(dev, replay, WVK_SCRATCH_TESS + 3, points_capacity * 16, storage, true, &st->tess[2]);
+   WGPUBuffer counts = scratch(dev, replay, WVK_SCRATCH_TESS + 4, counts_bytes, storage | WGPUBufferUsage_Indirect,
+                               true, &st->tess[3]);
+   WGPUBuffer list = scratch(dev, replay, WVK_SCRATCH_TESS + 5, indices_capacity * 4, indexed_storage, true, NULL);
+   WGPUBuffer out = scratch(dev, replay, WVK_SCRATCH_TESS + 6, (points_capacity + 1) * out_stride, storage, true,
+                            &st->gs_vertices);
    if (!capture || !control_out || !patch_out || !points || !counts || !list || !out)
       return;
-#define TEMP(b, size) ((struct wvk_driver_buffer){ b, ++dev->temp_serial | (1ull << 62), 0, size })
-   st->capture = TEMP(capture, MAX2(records, 16));
-   st->tess[0] = TEMP(control_out, MAX2(control_bytes, 16));
-   st->tess[1] = TEMP(patch_out, MAX2(patch_bytes, 16));
-   st->tess[2] = TEMP(points, points_capacity * 16);
-   st->tess[3] = TEMP(counts, counts_bytes);
-   st->gs_vertices = TEMP(out, (points_capacity + 1) * out_stride);
-#undef TEMP
 
    /* A geometry shader after: of the tessellator's primitives, which its
     * input has to be. */
@@ -4952,12 +4968,12 @@ draw_tessellated(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint3
       /* Each vertex stream's vertices and lists, after the stream's before
        * (lower_geometry, which has the capacity as the draw's total). */
       gs_capacity = MIN3(indices_capacity / prim_vertices * gs->gs_invocations,
-                         limit / (gs_streams * MAX2(gs->gs_max_vertices, 1) * gs_stride) - 1,
-                         limit / (gs_streams * MAX2(gs_per, 1) * 4));
-      gs_out = wvk_replay_temp_buffer(dev, replay, (1 + gs_capacity * gs_streams * gs->gs_max_vertices) * gs_stride,
-                                      storage, NULL);
-      gs_list = wvk_replay_temp_buffer(dev, replay, MAX2(gs_capacity * gs_streams * gs_per * 4, 16),
-                                       storage | WGPUBufferUsage_Index, NULL);
+                         budget / (gs_streams * MAX2(gs->gs_max_vertices, 1) * gs_stride) - 1,
+                         budget / (gs_streams * MAX2(gs_per, 1) * 4));
+      gs_out = scratch(dev, replay, WVK_SCRATCH_TESS + 7, (1 + gs_capacity * gs_streams * gs->gs_max_vertices) * gs_stride,
+                       storage, true, NULL);
+      gs_list = scratch(dev, replay, WVK_SCRATCH_TESS + 8, gs_capacity * gs_streams * gs_per * 4, indexed_storage, true,
+                        NULL);
       if (!gs_out || !gs_list)
          return;
       const uint32_t geometry[4] = { 0, 1, (uint32_t)gs_capacity, 0 };

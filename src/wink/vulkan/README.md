@@ -251,9 +251,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   runs an invocation a point, as many as were made (an indirect dispatch),
   writing records the draw after reads, an indexed indirect draw of the
   tessellator's lists. Buffers are as big as a patch at level 64 would
-  need, to what a binding holds; patches past that are not drawn. A
-  geometry shader after reads the evaluation shader's records by the
-  tessellator's lists, its invocations the tessellator's count too.
+  need, to 256 MB each; patches past that are not drawn. A geometry
+  shader after reads the evaluation shader's records by the tessellator's
+  lists, its invocations the tessellator's count too. The buffers of
+  these draws, and of mesh and geometry shader draws, are the submit's,
+  each draw's again after the one before -- zeroed, as new ones would be
+  -- so a submit holds one draw's worth, not all of theirs.
 - **Points a geometry or evaluation shader gives a size**
   (shaderTessellationAndGeometryPointSize) are quads, as the vertex
   shader's are: the draw after it, of six vertices an index, reads its

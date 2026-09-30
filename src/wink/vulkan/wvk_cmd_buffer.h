@@ -30,6 +30,21 @@ struct wvk_mem_range {
 
 /* What one submit becomes: one WGPUCommandEncoder, the host memory it
  * touches, and what to release once it has run. */
+/* The slots of a replay's scratch buffers (wvk_replay::scratch): of a
+ * mesh draw's, a tessellated draw's (and its geometry shader's), and a
+ * geometry shader draw's. */
+enum wvk_scratch_slot {
+   WVK_SCRATCH_MESH = 0,
+   WVK_SCRATCH_TESS = WVK_SCRATCH_MESH + 6,
+   WVK_SCRATCH_GEOMETRY = WVK_SCRATCH_TESS + 9,
+   WVK_SCRATCH_SLOTS = WVK_SCRATCH_GEOMETRY + 3,
+};
+
+struct wvk_scratch_clear {
+   WGPUBuffer buffer;
+   uint64_t size;
+};
+
 struct wvk_replay {
    WGPUCommandEncoder encoder;
    WGPURenderPassEncoder pass;
@@ -177,13 +192,17 @@ struct wvk_replay {
    uint64_t host_counters[WVK_COUNTERS];
    WGPUBuffer counters;
    uint64_t counters_serial;
-   /* A mesh draw's buffers (wvk_cmd_draw.c's draw_mesh): one of each for
-    * the submit's mesh draws, which are one after another on the GPU,
-    * made bigger for a draw that needs more. */
+   /* The buffers of draws that run stages as compute -- mesh, tessellated
+    * and geometry shader draws (wvk_cmd_draw.c's scratch) -- a slot each:
+    * one of each for the submit's draws, which are one after another on
+    * the GPU, made bigger for a draw that needs more. And those a draw has
+    * again, to be zeroed where the next pass is ended, as a new buffer
+    * starts. */
    struct {
       WGPUBuffer buffer;
       uint64_t size, serial;
-   } mesh_scratch[6];
+   } scratch[WVK_SCRATCH_SLOTS];
+   struct util_dynarray scratch_clears;
    uint32_t counter_mask;
    struct wvk_counter_query counter_queries[WVK_COUNTER_QUERIES];
    uint32_t counter_query_count;
