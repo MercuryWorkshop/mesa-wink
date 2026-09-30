@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 30
+#define WVK_SHADER_BINARY_VERSION 31
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -333,6 +333,10 @@ struct wvk_shader {
     * sample mask; places sample positions for a number of samples; writes
     * depth, before it was dropped. */
    bool per_sample, own_mask, uses_samples, source_writes_depth;
+   /* Of a float operation not to be contracted (NoContraction, or float
+    * controls 2 without AllowContract): its modules are compiled with
+    * Dawn's strict math, where Metal fuses a multiply and an add else. */
+   bool strict_math;
 };
 
 static inline struct wvk_shader *

@@ -58,6 +58,9 @@ needed for `--test`. Everything else goes into a cache (default
   (`src/gallium/drivers/gex_wgpu/native/build-dawn.sh`) is the same revision,
   built from the same patched source; natively, Dawn's Metal backend offers
   the tiers only with its `allow_unsafe_apis` toggle, which both drivers set.
+  It also has `patches/dawn-metal-strict-math-contract.patch`: Metal's safe
+  math mode still fuses a multiply and an add, and the Vulkan driver asks
+  for strict math where a shader says not to.
 * A Python venv with mako, pyyaml and packaging, plus meson if the host's is
   older than 1.4.
 

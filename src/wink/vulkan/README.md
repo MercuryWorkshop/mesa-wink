@@ -431,6 +431,13 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   pipeline's identifier (pipelinePropertiesIdentifier) is of its shaders'
   cache keys. The subgroup ballot and vote of the EXT extensions are the
   KHR ones, of subgroups of one.
+- **FMA and contraction** (VK_KHR_shader_fma): OpFmaKHR is WGSL's fma,
+  which Metal's is, fused -- for 16- and 32-bit floats; 64-bit ones are
+  software that multiplies and then adds. A shader with a float operation
+  not to be contracted (NoContraction, or float controls 2 without
+  AllowContract) is compiled with Dawn's strict math, natively, where
+  Metal would fuse its multiply and add otherwise
+  (`wink/patches/dawn-metal-strict-math-contract.patch`).
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
   have to stay.

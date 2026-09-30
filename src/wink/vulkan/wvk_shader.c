@@ -5197,13 +5197,39 @@ reflect_bindings(nir_shader *nir, const struct vk_shader_compile_info *info,
    return true;
 }
 
+/* Whether a float operation is not to be contracted. */
+static bool
+has_no_contract(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_alu)
+               continue;
+            const nir_alu_instr *alu = nir_instr_as_alu(instr);
+            if (nir_alu_instr_no_contract(alu) && nir_op_infos[alu->op].output_type == nir_type_float)
+               return true;
+         }
+      }
+   }
+   return false;
+}
+
 static VkResult
-make_module(struct wvk_device *dev, const char *wgsl, const char *label, WGPUShaderModule *out)
+make_module(struct wvk_device *dev, const char *wgsl, const char *label, bool strict, WGPUShaderModule *out)
 {
    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
    source.code = wvk_sv(wgsl);
    WGPUShaderModuleDescriptor desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
    desc.nextInChain = &source.chain;
+#ifndef __EMSCRIPTEN__
+   /* Dawn's, natively: Metal's safe math mode, which contracts nothing. */
+   WGPUShaderModuleCompilationOptions options = WGPU_SHADER_MODULE_COMPILATION_OPTIONS_INIT;
+   if (strict && wvk_physical_device_has_feature(wvk_device_physical(dev), WGPUFeatureName_ShaderModuleCompilationOptions)) {
+      options.strictMath = true;
+      source.chain.next = &options.chain;
+   }
+#endif
    desc.label = wvk_sv(label);
    *out = wgpuDeviceCreateShaderModule(dev->wgpu, &desc);
    return *out ? VK_SUCCESS : vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -6308,6 +6334,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    if (getenv("WINK_VK_DUMP_NIR"))
       nir_print_shader(nir, stderr);
 
+   shader->strict_math = has_no_contract(nir);
+
    /* A vertex shader twice: as Vulkan's y needs, and flipped back for a
     * viewport of negative height. */
    nir_shader *unflipped = stage == MESA_SHADER_VERTEX ? nir_shader_clone(NULL, nir) : NULL;
@@ -6342,7 +6370,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       fprintf(stderr, "wvk: %s WGSL:\n%s\n", wi.label, shader->wgsl[WVK_SHADER_FLIPPED]);
 
    for (uint32_t i = 0; i < WVK_SHADER_VARIANTS; ++i) {
-      if (shader->wgsl[i] && (result = make_module(dev, shader->wgsl[i], wi.label, &shader->module[i])))
+      if (shader->wgsl[i] && (result = make_module(dev, shader->wgsl[i], wi.label, shader->strict_math,
+                                                   &shader->module[i])))
          goto fail;
    }
 
@@ -7154,6 +7183,7 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->own_mask);
    blob_write_uint8(blob, shader->uses_samples);
    blob_write_uint8(blob, shader->source_writes_depth);
+   blob_write_uint8(blob, shader->strict_math);
    blob_write_uint8(blob, shader->source != NULL);
    if (shader->source)
       source_serialize(shader->source, blob);
@@ -7238,6 +7268,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const bool own_mask = blob_read_uint8(blob);
    const bool uses_samples = blob_read_uint8(blob);
    const bool source_writes_depth = blob_read_uint8(blob);
+   const bool strict_math = blob_read_uint8(blob);
    struct wvk_shader_source *source = blob_read_uint8(blob) ? source_deserialize(blob) : NULL;
    /* A geometry or tessellation shader is its source alone (geometry_shell). */
    const bool shell = stage == MESA_SHADER_GEOMETRY || stage == MESA_SHADER_TESS_CTRL ||
@@ -7315,11 +7346,12 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->own_mask = own_mask;
    shader->uses_samples = uses_samples;
    shader->source_writes_depth = source_writes_depth;
+   shader->strict_math = strict_math;
    shader->source = source;
    VkResult result = shader->bindings ? VK_SUCCESS : vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    for (uint32_t i = 0; result == VK_SUCCESS && i < WVK_SHADER_VARIANTS; ++i) {
       if (shader->wgsl[i])
-         result = make_module(dev, shader->wgsl[i], "cached", &shader->module[i]);
+         result = make_module(dev, shader->wgsl[i], "cached", shader->strict_math, &shader->module[i]);
    }
    if (result != VK_SUCCESS) {
       wvk_shader_destroy(vk_dev, &shader->vk, pAllocator);

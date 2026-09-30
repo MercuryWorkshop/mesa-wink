@@ -58,6 +58,8 @@ static const WGPUFeatureName wanted_features[] = {
    WGPUFeatureName_TextureFormatsTier1,
    WGPUFeatureName_TextureFormatsTier2,
 #ifndef __EMSCRIPTEN__
+   /* Strict math, for what is not to be contracted (wvk_shader.c). */
+   WGPUFeatureName_ShaderModuleCompilationOptions,
    /* Native Dawn is only safe to call from several threads with this, and
     * Vulkan lets them all: queues of two families, and creating while
     * submitting. A browser's device is its thread's alone. */
@@ -141,6 +143,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_image_compression_control = true,
       .EXT_legacy_dithering = true,
       .EXT_debug_marker = true,
+      .KHR_shader_fma = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -645,6 +648,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .imageCompressionControl = true,
       /* Nothing is dithered, which legacy dithering allows. */
       .legacyDithering = true,
+      /* WGSL's fma, which Metal's is: fused. Not of 64-bit floats, whose
+       * software multiplies and then adds. */
+      .shaderFmaFloat16 = wvk_physical_device_has_feature(pdev, WGPUFeatureName_ShaderF16),
+      .shaderFmaFloat32 = true,
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,

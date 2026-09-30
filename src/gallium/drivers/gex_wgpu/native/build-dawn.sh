@@ -42,6 +42,14 @@ if [ ! -f third_party/abseil-cpp/CMakeLists.txt ] || [ -z "${GEX_DAWN_SRC:-}" ];
     || python3 tools/fetch_dawn_dependencies.py
 fi
 
+# Metal's safe math still fuses a multiply and an add, which strict math,
+# which the Vulkan driver asks for where a shader says not to, is not to.
+PATCH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)/wink/patches/dawn-metal-strict-math-contract.patch"
+if git -C "$SRC" apply --check "$PATCH" 2>/dev/null; then
+  echo "[dawn] applying $(basename "$PATCH")"
+  git -C "$SRC" apply "$PATCH"
+fi
+
 case "$(uname -s)" in
   Darwin) BACKENDS=(-DDAWN_ENABLE_METAL=ON -DDAWN_ENABLE_VULKAN=OFF -DDAWN_USE_X11=OFF -DDAWN_USE_WAYLAND=OFF) ;;
   *)      BACKENDS=(-DDAWN_ENABLE_VULKAN=ON) ;;
