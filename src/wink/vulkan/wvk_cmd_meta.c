@@ -115,6 +115,10 @@ struct wvk_meta_save {
    struct vk_sample_locations_state sample_locations;
    void *state;
    bool xfb_active, cond_active;
+   /* The stages the runtime has of a pipeline bound: vk_meta's pipeline
+    * is not the application's, whose shader objects a bind of others
+    * would unbind for it else. */
+   VkShaderStageFlags pipeline_stages;
 };
 
 static void
@@ -124,6 +128,7 @@ meta_begin(struct wvk_cmd_buffer *cmd, struct wvk_meta_save *save)
    save->vi = cmd->dynamic_vi;
    save->sample_locations = cmd->dynamic_sample_locations;
    save->state = wvk_replay_save_state(cmd->replay);
+   save->pipeline_stages = cmd->vk.pipeline_shader_stages;
    /* vk_meta's draws are no application's to capture. */
    save->xfb_active = cmd->replay->xfb_active;
    cmd->replay->xfb_active = false;
@@ -143,6 +148,7 @@ meta_end(struct wvk_cmd_buffer *cmd, struct wvk_meta_save *save)
    /* Everything is set again at the next draw. */
    BITSET_SET_RANGE(cmd->vk.dynamic_graphics_state.dirty, 0, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX - 1);
    wvk_replay_restore_state(cmd->replay, save->state);
+   cmd->vk.pipeline_shader_stages = save->pipeline_stages;
    cmd->replay->xfb_active = save->xfb_active;
    cmd->replay->cond.active = save->cond_active;
 }
