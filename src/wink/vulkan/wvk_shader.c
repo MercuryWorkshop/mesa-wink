@@ -3067,6 +3067,39 @@ mesh_vertex_shader(nir_shader *nir, const struct wvk_shader_key *key)
       }
       util_dynarray_fini(&outs[k]);
    }
+   /* What the fragment shader reads of the primitive's vertices
+    * (key.bary, key.per_vertex), as geometry_vertex_shader writes them:
+    * the coordinates, perspective and linear, 1 at the vertex's corner;
+    * and the vertices' slots, in the primitive's order, the last again for
+    * a segment's third, a point's all its own. */
+   for (unsigned k = 0, loc = key->bary; key->bary && k < 2; ++k) {
+      if (!(key->bary_uses & BITFIELD_BIT(k)))
+         continue;
+      nir_variable *var = nir_variable_create(nir, nir_var_shader_out, glsl_vec_type(3), "wvk_bary");
+      var->data.location = VARYING_SLOT_VAR0 + loc++ - 1;
+      var->data.interpolation = k ? INTERP_MODE_NOPERSPECTIVE : INTERP_MODE_SMOOTH;
+      nir_def *c[3];
+      for (unsigned i = 0; i < 3; ++i)
+         c[i] = nir_b2f32(&b, nir_ieq_imm(&b, vertex, i));
+      nir_store_var(&b, var, nir_vec(&b, c, 3), 0x7);
+   }
+   const unsigned per_vertex_count = util_bitcount(key->per_vertex_mask);
+   for (unsigned v = 0; key->per_vertex && v < 3; ++v) {
+      nir_def *index = nir_umin(&b, nir_channel(&b, indices, MIN2(v, corners - 1)), nir_imm_int(&b, max_vertices - 1));
+      nir_def *from = nir_imul_imm(&b, nir_iadd(&b, nir_imul_imm(&b, m, max_vertices), index), vertex_stride);
+      u_foreach_bit(i, key->per_vertex_mask) {
+         nir_variable *var = nir_variable_create(nir, nir_var_shader_out, glsl_uvec4_type(), "wvk_per_vertex");
+         var->data.location = VARYING_SLOT_VAR0 + key->per_vertex - 1 + v * per_vertex_count +
+                              util_bitcount(key->per_vertex_mask & BITFIELD_MASK(i));
+         var->data.interpolation = INTERP_MODE_FLAT;
+         const int slot = packed_slot(slots[0], record_slot(VARYING_SLOT_VAR0 + i));
+         nir_def *words = slot < 0 ? nir_imm_zero(&b, 4, 32)
+                                   : nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_GS_VERTICES),
+                                                   nir_iadd_imm(&b, from, slot * 16), .align_mul = 16,
+                                                   .access = ACCESS_NON_WRITEABLE);
+         nir_store_var(&b, var, words, 0xf);
+      }
+   }
    /* gl_PrimitiveID, which a vertex shader has no builtin of: a flat
     * varying, where the fragment shader reads it (lower_fs_primitive_id). */
    nir_variable *id = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_PRIMITIVE_ID);
@@ -8409,6 +8442,11 @@ wvk_shader_mesh_variant(struct wvk_device *dev, struct wvk_shader *shader, unsig
          key.primitive_id = other->key.primitive_id;
          key.clip_varying = other->key.clip_varying;
          key.clip_slots = other->key.clip_slots;
+         /* And what the fragment shader reads of the primitive's vertices. */
+         key.bary = other->key.bary;
+         key.bary_uses = other->key.bary ? other->bary_uses : 0;
+         key.per_vertex = other->key.per_vertex;
+         key.per_vertex_mask = other->key.per_vertex ? other->per_vertex_mask : 0;
       }
       key.provoking_last = dyn->rs.provoking_vertex == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
       /* Points as quads of the size it gives them (expand_points). */
