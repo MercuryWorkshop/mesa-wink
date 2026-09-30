@@ -445,6 +445,8 @@ query_counter_mask(const struct wvk_query_pool *pool, uint32_t index)
       return pool->vk.pipeline_statistics;
    case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
       return BITFIELD_BIT(WVK_COUNTER_PRIMITIVES(index));
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
+      return BITFIELD_BIT(WVK_COUNTER_MESH_PRIMITIVES);
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
       return BITFIELD_BIT(WVK_COUNTER_XFB_WRITTEN(index)) | BITFIELD_BIT(WVK_COUNTER_XFB_NEEDED(index));
    default:

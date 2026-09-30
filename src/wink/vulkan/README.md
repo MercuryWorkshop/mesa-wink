@@ -449,6 +449,20 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   memory are words already; copies of memory become loads and stores
   while they are still derefs. Pointers only compared (OpPtrEqual) are of
   the buffer each is of, as variable ones are.
+- **Mesh and task shaders** (meshShader, taskShader, meshShaderQueries),
+  which WebGPU has no stages of, are compute, in passes of a draw: a
+  setup, of the draw's workgroups -- its command's or its indirect
+  arguments', none where a count or the predicate says so; a task shader,
+  a workgroup a task workgroup, writing its payload and launch to buffers;
+  a scan of the launches, which each mesh workgroup finds its task
+  workgroup and grid in; the mesh shader, a workgroup a mesh workgroup,
+  writing a record of each vertex and of each primitive, its indices and
+  whether it is culled, its outputs' counts first; and a draw of every
+  primitive each may have made, a vertex a corner, whose vertex shader
+  reads those -- those not made, or culled, out of sight. Each pass's
+  dispatch the one before's. The buffers are the submit's, 64 MB each at
+  most, which may be fewer workgroups than a draw of GPU-made counts has.
+  Not multiview, nor of shading rates.
 - **Barycentric coordinates and inputs of each vertex**
   (fragmentShaderBarycentric), which WGSL has neither of, are the geometry
   shader's: a draw whose fragment shader reads them goes through one --

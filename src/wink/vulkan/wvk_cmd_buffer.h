@@ -129,6 +129,9 @@ struct wvk_replay {
    bool draw_points;
    /* And of wide lines as quads, six vertices a segment (wideLines). */
    bool draw_lines;
+   /* A draw of mesh shaders, whose fragment shader is after the mesh
+    * shader (wvk_cmd_draw.c's draw_mesh). */
+   bool draw_mesh;
    /* Images with atomics whose buffer of texels is the image now, until
     * the next barrier (wvk_replay_sync_atomic_images). */
    struct util_dynarray atomic_images; /* struct wvk_image * */
@@ -172,6 +175,13 @@ struct wvk_replay {
    uint64_t host_counters[WVK_COUNTERS];
    WGPUBuffer counters;
    uint64_t counters_serial;
+   /* A mesh draw's buffers (wvk_cmd_draw.c's draw_mesh): one of each for
+    * the submit's mesh draws, which are one after another on the GPU,
+    * made bigger for a draw that needs more. */
+   struct {
+      WGPUBuffer buffer;
+      uint64_t size, serial;
+   } mesh_scratch[6];
    uint32_t counter_mask;
    struct wvk_counter_query counter_queries[WVK_COUNTER_QUERIES];
    uint32_t counter_query_count;

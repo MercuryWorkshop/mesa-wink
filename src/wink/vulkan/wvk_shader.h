@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 32
+#define WVK_SHADER_BINARY_VERSION 33
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -167,6 +167,13 @@ struct wvk_shader_key {
     * others. */
    uint8_t bary, bary_uses, per_vertex;
    uint32_t per_vertex_mask;
+   /* Mesh: as compute (1), a workgroup a mesh workgroup of the draw,
+    * writing a record of each of its vertices and primitives -- of a task
+    * shader's launches where after_task; or the vertex shader of the draw
+    * after (2), a vertex a corner of a primitive, reading those. Task: as
+    * compute (task 1), a workgroup a task workgroup, writing its payload
+    * and the mesh workgroups it launches (wvk_cmd_draw.c's draw_mesh). */
+   uint8_t mesh, after_task, task;
    /* Fragment: its colour outputs moved to the attachments whose
     * locations they are (dynamicRenderingLocalRead): attachment i's the
     * output at location color_map[i], none for MESA_VK_ATTACHMENT_UNUSED;
@@ -352,6 +359,12 @@ struct wvk_shader {
     * vertex (key.bary_uses and key.per_vertex_mask). */
    uint8_t bary_uses;
    uint32_t per_vertex_mask;
+   /* Mesh: the vertices and primitives a workgroup may output, of which
+    * type (enum mesa_prim), and the generic varyings a primitive's record
+    * has (a vertex's are record_vars). Task and mesh: the payload's bytes. */
+   uint16_t mesh_vertices, mesh_primitives;
+   uint8_t mesh_primitive, prim_vars;
+   uint16_t payload_size;
 };
 
 static inline struct wvk_shader *
@@ -406,6 +419,15 @@ struct wvk_shader *wvk_shader_geometry_variant(struct wvk_device *dev, struct wv
                                                const struct vk_dynamic_graphics_state *dyn, bool after_tess,
                                                bool points, uint32_t stats);
 
+/* A mesh or task shader's variant: a mesh shader as compute, of a task
+ * shader's launches where `after_task` (1), or the vertex shader of the
+ * draw after it, with `other` the fragment shader (2); a task shader as
+ * compute (1). Counting their invocations and primitives where `stats`,
+ * the active queries', has them. */
+struct wvk_shader *wvk_shader_mesh_variant(struct wvk_device *dev, struct wvk_shader *shader, unsigned kind,
+                                           bool after_task, const struct wvk_shader *other,
+                                           const struct vk_dynamic_graphics_state *dyn, uint32_t stats);
+
 /* A tessellation shader's variant (key.tess): as compute, for records of
  * the stage before with `vs_vars` generic varyings a vertex and
  * `patch_vars` patch varyings a patch (1); or the evaluation shader's draw
@@ -433,6 +455,34 @@ wvk_record_stride(unsigned vars)
 {
    return 16 * (WVK_RECORD_BUILTINS + vars);
 }
+
+/* A mesh workgroup's primitives' block: the vertices and primitives it
+ * output (SetMeshOutputsEXT), in 16 bytes, then a record a primitive -- its
+ * indices at slot 0, whether it is culled at slot 1, the rest as a vertex's
+ * record has them. */
+static inline uint32_t
+wvk_mesh_block(unsigned primitives, unsigned prim_vars)
+{
+   return 16 + primitives * wvk_record_stride(prim_vars);
+}
+
+/* A task workgroup's payload, in the payloads' buffer. */
+static inline uint32_t
+wvk_payload_stride(unsigned size)
+{
+   return MAX2((size + 15) & ~15u, 16);
+}
+
+/* The words of a mesh draw's header (wvk_cmd_draw.c's draw_mesh): the
+ * workgroups of its first stage, three; their total; their dispatch;
+ * then the mesh workgroups' dispatch, and their total; then the draw. */
+#define WVK_MESH_FIRST 0
+#define WVK_MESH_FIRST_TOTAL 3
+#define WVK_MESH_FIRST_DISPATCH 4
+#define WVK_MESH_DISPATCH 8
+#define WVK_MESH_TOTAL 11
+#define WVK_MESH_DRAW 12
+#define WVK_MESH_HEADER_WORDS 16
 
 /* How many indices a geometry shader's invocation writes of its output
  * primitives, as lists: three a triangle of a strip, two a segment, one a

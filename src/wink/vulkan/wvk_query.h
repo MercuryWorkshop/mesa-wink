@@ -17,13 +17,15 @@ struct wvk_device_memory;
 struct wvk_replay;
 
 /* The statistics of a pipeline statistics query, VkQueryPipelineStatisticFlagBits'
- * bits; and after them the counters of each vertex stream's transform
- * feedback query, the primitives written and those that would have been,
- * and of its primitives generated query. */
-#define WVK_STATS 11
-#define WVK_COUNTER_XFB_WRITTEN(stream) (11 + 2 * (stream))
-#define WVK_COUNTER_XFB_NEEDED(stream) (12 + 2 * (stream))
-#define WVK_COUNTER_PRIMITIVES(stream) (19 + (stream))
+ * bits, the task and mesh shaders' invocations too; and after them the
+ * counters of each vertex stream's transform feedback query, the
+ * primitives written and those that would have been, and of its primitives
+ * generated query; and of the mesh primitives generated query. */
+#define WVK_STATS 13
+#define WVK_COUNTER_XFB_WRITTEN(stream) (13 + 2 * (stream))
+#define WVK_COUNTER_XFB_NEEDED(stream) (14 + 2 * (stream))
+#define WVK_COUNTER_PRIMITIVES(stream) (21 + (stream))
+#define WVK_COUNTER_MESH_PRIMITIVES 25
 #define WVK_COUNTERS 32
 
 /* A query counted as the replay goes (wvk_query.c): its pool and query,

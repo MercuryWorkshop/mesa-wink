@@ -90,6 +90,16 @@ api_version(void)
    return WVK_API_VERSION;
 }
 
+/* Whether the device can run mesh and task shaders as compute: of
+ * VK_EXT_mesh_shader's least workgroups and shared memory. */
+static bool
+wvk_physical_device_meshes(const struct wvk_physical_device *pdev)
+{
+   const WGPULimits *l = &pdev->limits;
+   return l->maxComputeWorkgroupStorageSize >= 32768 && l->maxComputeInvocationsPerWorkgroup >= 128 &&
+          l->maxComputeWorkgroupSizeX >= 128 && l->maxComputeWorkgroupSizeY >= 128 && l->maxComputeWorkgroupSizeZ >= 128;
+}
+
 static void
 get_device_extensions(const struct wvk_physical_device *pdev,
                       struct vk_device_extension_table *ext)
@@ -148,6 +158,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .KHR_fragment_shader_barycentric = true,
       .EXT_mutable_descriptor_type = true,
       .VALVE_mutable_descriptor_type = true,
+      .EXT_mesh_shader = wvk_physical_device_meshes(pdev),
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -664,6 +675,11 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Every descriptor is one struct, whose binding's WebGPU binding the
        * shader's use of it types (wvk_descriptor_set.c). */
       .mutableDescriptorType = true,
+      /* As compute, and the draw of what they made (wvk_cmd_draw.c's
+       * draw_mesh). */
+      .taskShader = wvk_physical_device_meshes(pdev),
+      .meshShader = wvk_physical_device_meshes(pdev),
+      .meshShaderQueries = wvk_physical_device_meshes(pdev),
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,
@@ -862,6 +878,33 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .advancedBlendNonPremultipliedDstColor = true,
       .advancedBlendCorrelatedOverlap = true,
       .advancedBlendAllOperations = true,
+      /* VK_EXT_mesh_shader: the least of each. Payloads and outputs are
+       * in buffers; shared memory is workgroup memory, of which WebGPU has
+       * to have the 32 KiB a task shader may. */
+      .maxTaskWorkGroupTotalCount = 1u << 22,
+      .maxTaskWorkGroupCount = { 65535, 65535, 65535 },
+      .maxTaskWorkGroupInvocations = 128,
+      .maxTaskWorkGroupSize = { 128, 128, 128 },
+      .maxTaskPayloadSize = 16384,
+      .maxTaskSharedMemorySize = 32768,
+      .maxTaskPayloadAndSharedMemorySize = 32768,
+      .maxMeshWorkGroupTotalCount = 1u << 22,
+      .maxMeshWorkGroupCount = { 65535, 65535, 65535 },
+      .maxMeshWorkGroupInvocations = 128,
+      .maxMeshWorkGroupSize = { 128, 128, 128 },
+      .maxMeshSharedMemorySize = 28672,
+      .maxMeshPayloadAndSharedMemorySize = 28672,
+      .maxMeshOutputMemorySize = 32768,
+      .maxMeshPayloadAndOutputMemorySize = 48128,
+      .maxMeshOutputComponents = 128,
+      .maxMeshOutputVertices = 256,
+      .maxMeshOutputPrimitives = 256,
+      .maxMeshOutputLayers = 8,
+      .maxMeshMultiviewViewCount = 1,
+      .meshOutputPerVertexGranularity = 1,
+      .meshOutputPerPrimitiveGranularity = 1,
+      .maxPreferredTaskWorkGroupInvocations = 64,
+      .maxPreferredMeshWorkGroupInvocations = 64,
       /* VK_KHR_fragment_shader_barycentric: a strip's triangles are the
        * geometry shader's, whose order is its provoking vertex's. */
       .triStripVertexOrderIndependentOfProvokingVertex = false,

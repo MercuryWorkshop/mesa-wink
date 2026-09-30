@@ -541,6 +541,12 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
    }
    if (dev->tess_bgl)
       wgpuBindGroupLayoutRelease(dev->tess_bgl);
+   for (uint32_t i = 0; i < ARRAY_SIZE(dev->mesh_pipelines); ++i) {
+      if (dev->mesh_pipelines[i])
+         wgpuComputePipelineRelease(dev->mesh_pipelines[i]);
+   }
+   if (dev->mesh_bgl)
+      wgpuBindGroupLayoutRelease(dev->mesh_bgl);
    if (dev->repack_pipeline)
       wgpuComputePipelineRelease(dev->repack_pipeline);
    for (uint32_t i = 0; i < ARRAY_SIZE(dev->packed16_pipelines); ++i) {
@@ -802,6 +808,8 @@ struct wvk_bound_state {
    /* A geometry shader, and tessellation shaders, whose variants run as
     * compute (draw_geometry, draw_tessellated). */
    struct wvk_shader *bound_gs, *bound_tcs, *bound_tes;
+   /* Task and mesh shaders, which run as compute too (draw_mesh). */
+   struct wvk_shader *bound_task, *bound_mesh;
    struct wvk_bound_set sets[WVK_BIND_POINTS][WVK_MAX_GROUPS];
 
    struct wvk_bound_buffer vb[MESA_VK_MAX_VERTEX_BINDINGS];
@@ -970,6 +978,8 @@ wvk_cmd_bind_shaders(struct vk_command_buffer *vk_cmd, uint32_t stage_count,
       case MESA_SHADER_GEOMETRY: st->bound_gs = shader; break;
       case MESA_SHADER_TESS_CTRL: st->bound_tcs = shader; break;
       case MESA_SHADER_TESS_EVAL: st->bound_tes = shader; break;
+      case MESA_SHADER_TASK: st->bound_task = shader; break;
+      case MESA_SHADER_MESH: st->bound_mesh = shader; break;
       default:
          if (shader)
             mesa_logw_once("wvk: %s shaders are not supported", _mesa_shader_stage_to_string(stages[i]));
@@ -3454,7 +3464,10 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
                                                           : WVK_DRAW_PRIMITIVES;
    /* After a geometry or tessellation evaluation shader, whose outputs the
     * fragment shader reads. */
-   const struct wvk_shader *before = st->bound_gs ? st->bound_gs : st->bound_tes ? st->bound_tes : st->bound_vs;
+   const struct wvk_shader *before = replay->draw_mesh ? st->bound_mesh
+                                     : st->bound_gs  ? st->bound_gs
+                                     : st->bound_tes ? st->bound_tes
+                                                     : st->bound_vs;
    st->fs = wvk_shader_draw_variant(dev, st->bound_fs, before, dyn, samples, has_depth, color_formats, &fs_images,
                                     shape, 0, wvk_replay_stats(replay));
    st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats, &vs_images,
@@ -3966,6 +3979,10 @@ draw_gs(struct wvk_cmd_buffer *cmd)
  * none of the stream's. One invocation: the order is the point. The
  * primitives written and those that would have been are the counters of
  * the stream's transform feedback queries. */
+/* A macro's value, in WGSL. */
+#define WVK_STR2(x) #x
+#define WVK_STR(x) WVK_STR2(x)
+
 static const char xfb_wgsl[] =
    "@group(0) @binding(0) var<storage, read> p: array<u32>;\n"
    "@group(0) @binding(1) var<storage, read> records: array<u32>;\n"
@@ -4021,8 +4038,8 @@ static const char xfb_wgsl[] =
    "  }\n"
    "  for (var b = 0u; b < 4u; b++) { state[b] = off[b]; }\n"
    "  state[4u + stream] = select(0u, 1u, stopped);\n"
-   "  atomicAdd(&counters[11u + 2u * stream], written);\n"
-   "  atomicAdd(&counters[12u + 2u * stream], needed);\n"
+   "  atomicAdd(&counters[" WVK_STR(WVK_COUNTER_XFB_WRITTEN(0)) " + 2u * stream], written);\n"
+   "  atomicAdd(&counters[" WVK_STR(WVK_COUNTER_XFB_NEEDED(0)) " + 2u * stream], needed);\n"
    "}\n";
 
 static WGPUComputePipeline
@@ -4290,6 +4307,344 @@ draw_geometry(struct wvk_cmd_buffer *cmd, bool indexed, uint32_t first, uint32_t
       draw_list_at(cmd, list, raster * indices * 4, (uint32_t)indices, primitives, 1, 0, 0, true, draw_id,
                    UINT64_MAX);
    st->vs = draw_vs;
+}
+
+/* A mesh draw's passes (draw_mesh). The setup: the draw's workgroups, of
+ * its command or its indirect arguments -- none where a count or a
+ * predicate says so -- as many as the buffers hold, and the dispatch of
+ * them; and without a task shader, the mesh shader's and the draw's. The
+ * scan: after a task shader, where each task workgroup's launch starts in
+ * the mesh workgroups, and theirs and the draw's. */
+static const char mesh_wgsl[] =
+   "struct P { g: vec3u, indirect: u32,\n"
+   "           first_capacity: u32, mesh_capacity: u32, corners: u32, task: u32,\n"
+   "           counted: u32, count_limit: u32, draw_index: u32, cond: u32,\n"
+   "           args_word: u32, count_word: u32, cond_word: u32, pad: u32 }\n"
+   "@group(0) @binding(0) var<uniform> p: P;\n"
+   "@group(0) @binding(1) var<storage, read> args: array<u32>;\n"
+   "@group(0) @binding(2) var<storage, read_write> header: array<u32>;\n"
+   "@group(0) @binding(3) var<storage, read_write> launches: array<u32>;\n"
+   "@group(0) @binding(4) var<storage, read> count: array<u32>;\n"
+   "@group(0) @binding(5) var<storage, read> predicate: array<u32>;\n"
+   "\n"
+   "fn split(total: u32, at: u32) {\n"
+   "  let x = min(total, 65535u);\n"
+   "  header[at] = x;\n"
+   "  header[at + 1u] = select(0u, (total + x - 1u) / max(x, 1u), x != 0u);\n"
+   "  header[at + 2u] = 1u;\n"
+   "}\n"
+   "fn mul_capped(a: u32, b: u32, cap: u32) -> u32 {\n"
+   "  if (a == 0u || b == 0u) { return 0u; }\n"
+   "  if (a > cap / b) { return cap; }\n"
+   "  return min(a * b, cap);\n"
+   "}\n"
+   "fn mesh_totals(total: u32) {\n"
+   "  let m = min(total, p.mesh_capacity);\n"
+   "  split(m, " WVK_STR(WVK_MESH_DISPATCH) "u);\n"
+   "  header[" WVK_STR(WVK_MESH_TOTAL) "u] = m;\n"
+   "  header[" WVK_STR(WVK_MESH_DRAW) "u] = m * p.corners;\n"
+   "  header[" WVK_STR(WVK_MESH_DRAW) "u + 1u] = 1u;\n"
+   "  header[" WVK_STR(WVK_MESH_DRAW) "u + 2u] = 0u;\n"
+   "  header[" WVK_STR(WVK_MESH_DRAW) "u + 3u] = 0u;\n"
+   "}\n"
+   "@compute @workgroup_size(1) fn setup() {\n"
+   "  var g = p.g;\n"
+   "  if (p.indirect != 0u) { g = vec3u(args[p.args_word], args[p.args_word + 1u], args[p.args_word + 2u]); }\n"
+   "  if (p.counted != 0u && p.draw_index >= min(count[p.count_word], p.count_limit)) { g = vec3u(0u); }\n"
+   "  if (p.cond != 0u && (predicate[p.cond_word] != 0u) == (p.cond == 2u)) { g = vec3u(0u); }\n"
+   "  let total = mul_capped(mul_capped(g.x, g.y, p.first_capacity), g.z, p.first_capacity);\n"
+   "  header[0] = g.x; header[1] = g.y; header[2] = g.z;\n"
+   "  header[" WVK_STR(WVK_MESH_FIRST_TOTAL) "u] = total;\n"
+   "  split(total, " WVK_STR(WVK_MESH_FIRST_DISPATCH) "u);\n"
+   "  if (p.task == 0u) { mesh_totals(total); }\n"
+   "}\n"
+   "@compute @workgroup_size(1) fn scan() {\n"
+   "  let tasks = header[" WVK_STR(WVK_MESH_FIRST_TOTAL) "u];\n"
+   "  var sum = 0u;\n"
+   "  for (var t = 0u; t < tasks; t++) {\n"
+   "    let n = mul_capped(mul_capped(launches[4u * t], launches[4u * t + 1u], p.mesh_capacity),\n"
+   "                       launches[4u * t + 2u], p.mesh_capacity);\n"
+   "    launches[4u * t + 3u] = sum;\n"
+   "    sum = min(sum + n, p.mesh_capacity);\n"
+   "  }\n"
+   "  mesh_totals(sum);\n"
+   "}\n";
+
+/* The mesh passes, made the first time. */
+static bool
+mesh_pipelines(struct wvk_device *dev)
+{
+   simple_mtx_lock(&dev->cache_lock);
+   if (!dev->mesh_bgl) {
+      WGPUBindGroupLayoutEntry e[6];
+      for (uint32_t i = 0; i < 6; ++i) {
+         e[i] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+         e[i].binding = i;
+         e[i].visibility = WGPUShaderStage_Compute;
+         e[i].buffer.type = i == 0                  ? WGPUBufferBindingType_Uniform
+                            : i == 2 || i == 3      ? WGPUBufferBindingType_Storage
+                                                    : WGPUBufferBindingType_ReadOnlyStorage;
+      }
+      WGPUBindGroupLayoutDescriptor bd = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+      bd.label = wvk_sv("wvk mesh");
+      bd.entryCount = 6;
+      bd.entries = e;
+      dev->mesh_bgl = wgpuDeviceCreateBindGroupLayout(dev->wgpu, &bd);
+      WGPUPipelineLayoutDescriptor pd = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+      pd.bindGroupLayoutCount = 1;
+      pd.bindGroupLayouts = &dev->mesh_bgl;
+      WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(dev->wgpu, &pd);
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(mesh_wgsl);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      sm.label = wvk_sv("wvk mesh");
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      static const char *const entries[2] = { "setup", "scan" };
+      for (uint32_t i = 0; i < 2; ++i) {
+         WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+         desc.label = wvk_sv("wvk mesh");
+         desc.layout = layout;
+         desc.compute.module = module;
+         desc.compute.entryPoint = wvk_sv(entries[i]);
+         dev->mesh_pipelines[i] = wgpuDeviceCreateComputePipeline(dev->wgpu, &desc);
+      }
+      wgpuShaderModuleRelease(module);
+      wgpuPipelineLayoutRelease(layout);
+   }
+   simple_mtx_unlock(&dev->cache_lock);
+   return dev->mesh_bgl && dev->mesh_pipelines[0] && dev->mesh_pipelines[1];
+}
+
+/* How big each of a mesh draw's buffers may be: what a submit's mesh
+ * draws share, which WebGPU keeps until the GPU is done with them. */
+#define WVK_MESH_BUDGET (64ull << 20)
+
+/* A mesh draw's buffer `i` of at least `size` bytes: the submit's, made
+ * bigger where it has to be. */
+static WGPUBuffer
+mesh_scratch(struct wvk_device *dev, struct wvk_replay *replay, unsigned i, uint64_t size, WGPUBufferUsage usage,
+             struct wvk_driver_buffer *bound)
+{
+   size = align64(MAX2(size, 16), 16);
+   if (replay->mesh_scratch[i].size < size) {
+      replay->mesh_scratch[i].buffer = wvk_replay_temp_buffer(dev, replay, size, usage, NULL);
+      replay->mesh_scratch[i].size = replay->mesh_scratch[i].buffer ? size : 0;
+      replay->mesh_scratch[i].serial = ++dev->temp_serial | (1ull << 62);
+   }
+   if (bound)
+      *bound = (struct wvk_driver_buffer){ replay->mesh_scratch[i].buffer, replay->mesh_scratch[i].serial, 0,
+                                           replay->mesh_scratch[i].size };
+   return replay->mesh_scratch[i].buffer;
+}
+
+/* A mesh draw (VK_EXT_mesh_shader), which WebGPU has no stages of: the
+ * setup; a task shader, if there is one, as compute (key.task 1), a
+ * workgroup a task workgroup, writing its payload and launch, and the scan
+ * of the launches; the mesh shader as compute (key.mesh 1), a workgroup a
+ * mesh workgroup, writing its vertices' and primitives' records; and a
+ * draw of every primitive it may have made, a vertex a corner, whose
+ * vertex shader reads those (key.mesh 2) -- every pass's dispatch the one
+ * before's. Of `gx` * `gy` * `gz` workgroups, or of the arguments at `at`
+ * of `indirect`, and for a draw of a count, of draw `draw_id` of those the
+ * count at `count_at` of `count` says, at most `count_limit`. */
+static void
+draw_mesh(struct wvk_cmd_buffer *cmd, uint32_t gx, uint32_t gy, uint32_t gz, WGPUBuffer indirect, uint64_t at,
+          WGPUBuffer count, uint64_t count_at, uint32_t count_limit, uint32_t draw_id)
+{
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+   const struct wvk_physical_device *pdev = wvk_device_physical(dev);
+   struct wvk_replay *replay = cmd->replay;
+   struct wvk_bound_state *st = replay->state;
+   const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
+   struct wvk_shader *mesh = st->bound_mesh, *task = st->bound_task;
+   /* The shaders run without rasterization too, for what they store. */
+   const bool discard = dyn->rs.rasterizer_discard_enable;
+   if (!mesh || replay->pass_idle)
+      return;
+   if (!indirect && (!gx || !gy || !gz))
+      return;
+   replay->draw_mesh = true;
+   select_draw_shaders(cmd);
+   replay->draw_mesh = false;
+   const uint32_t stats = wvk_replay_stats(replay);
+   struct wvk_shader *mesh_cs = wvk_shader_mesh_variant(dev, mesh, 1, task != NULL, NULL, dyn, stats);
+   struct wvk_shader *mesh_vs = wvk_shader_mesh_variant(dev, mesh, 2, false, st->fs, dyn, 0);
+   struct wvk_shader *task_cs = task ? wvk_shader_mesh_variant(dev, task, 1, false, NULL, dyn, stats) : NULL;
+   if (!mesh_cs || !mesh_vs || (task && !task_cs) || !mesh_pipelines(dev)) {
+      mesa_logw_once("wvk: mesh or task shaders that could not be made compute");
+      return;
+   }
+
+   /* The buffers, of as many workgroups as the draw has, or as fit. */
+   const uint64_t limit = MIN2(pdev->limits.maxStorageBufferBindingSize, WVK_MESH_BUDGET);
+   const uint64_t vertex_bytes = MAX2((uint64_t)mesh->mesh_vertices * wvk_record_stride(mesh->record_vars), 16);
+   const uint64_t prim_bytes = wvk_mesh_block(mesh->mesh_primitives, mesh->prim_vars);
+   const uint32_t corners = mesh->mesh_primitive == MESA_PRIM_POINTS ? 1 : mesh->mesh_primitive == MESA_PRIM_LINES ? 2 : 3;
+   const uint64_t direct = (uint64_t)gx * gy * gz;
+   uint64_t mesh_capacity = MIN3(limit / vertex_bytes, limit / prim_bytes,
+                                 UINT32_MAX / MAX2((uint64_t)mesh->mesh_primitives * corners, 1));
+   const uint32_t payload = wvk_payload_stride(MAX2(task ? task->payload_size : 0, mesh->payload_size));
+   uint64_t task_capacity = 0;
+   if (task) {
+      task_capacity = MIN3(indirect ? 65536 : direct, limit / payload, limit / 16);
+      if (!indirect && direct > task_capacity)
+         mesa_logw_once("wvk: a mesh draw of more task workgroups than its buffers hold, drawn as many as they do");
+   } else if (!indirect) {
+      if (direct > mesh_capacity)
+         mesa_logw_once("wvk: a mesh draw of more workgroups than its buffers hold, drawn as many as they do");
+      mesh_capacity = MIN2(mesh_capacity, direct);
+   }
+   const uint64_t first_capacity = task ? task_capacity : mesh_capacity;
+   const WGPUBufferUsage storage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+   WGPUBuffer header = mesh_scratch(dev, replay, 0, WVK_MESH_HEADER_WORDS * 4,
+                                    WGPUBufferUsage_Storage | WGPUBufferUsage_Indirect, &st->tess[3]);
+   WGPUBuffer launches = mesh_scratch(dev, replay, 1, task_capacity * 16, storage, &st->tess[1]);
+   WGPUBuffer payloads = mesh_scratch(dev, replay, 2, MAX2(task_capacity, 1) * payload, storage, &st->capture);
+   WGPUBuffer vertices = mesh_scratch(dev, replay, 3, mesh_capacity * vertex_bytes, storage, &st->gs_vertices);
+   WGPUBuffer prims = mesh_scratch(dev, replay, 4, mesh_capacity * prim_bytes, storage, &st->gs_indices);
+   WGPUBuffer dummy = mesh_scratch(dev, replay, 5, 16, WGPUBufferUsage_Storage, NULL);
+   if (!header || !launches || !payloads || !vertices || !prims || !dummy)
+      return;
+
+   /* The setup: of what the command says. The launches start at none,
+    * and each mesh workgroup's block of its primitives zeroes its own
+    * counts and culls (lower_mesh). */
+   const bool in_pass = replay->pass != NULL;
+   wvk_replay_end_passes(replay);
+   if (task)
+      wgpuCommandEncoderClearBuffer(replay->encoder, launches, 0, align64(MAX2(task_capacity * 16, 16), 16));
+   const bool cond = replay->cond_gpu && replay->cond.buffer;
+   if (cond)
+      wvk_replay_read(replay, replay->cond.mem, replay->cond.offset, 4);
+   /* The indirect arguments from their word, the count's and the
+    * predicate's too: bindings of theirs, on the 256-byte boundary below. */
+   const uint64_t args_at = indirect ? at & ~255ull : 0, count_base = count ? count_at & ~255ull : 0;
+   const uint64_t cond_base = cond ? replay->cond.offset & ~255ull : 0;
+   const uint32_t params[16] = { gx, gy, gz, indirect != NULL,
+                                 (uint32_t)MIN2(first_capacity, UINT32_MAX), (uint32_t)MIN2(mesh_capacity, UINT32_MAX),
+                                 mesh->mesh_primitives * corners, task != NULL,
+                                 count != NULL, count_limit, draw_id, cond ? (replay->cond.inverted ? 2 : 1) : 0,
+                                 (uint32_t)((at - args_at) / 4), (uint32_t)((count_at - count_base) / 4),
+                                 cond ? (uint32_t)((replay->cond.offset - cond_base) / 4) : 0, 0 };
+   WGPUBuffer params_buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
+   if (!params_buffer)
+      return;
+   const WGPUBindGroupEntry entries[6] = {
+      { .binding = 0, .buffer = params_buffer, .offset = 0, .size = sizeof(params) },
+      { .binding = 1, .buffer = indirect ? indirect : dummy, .offset = args_at, .size = indirect ? (at - args_at) + 12 : 16 },
+      { .binding = 2, .buffer = header, .offset = 0, .size = WVK_MESH_HEADER_WORDS * 4 },
+      { .binding = 3, .buffer = launches, .offset = 0, .size = MAX2(task_capacity * 16, 16) },
+      { .binding = 4, .buffer = count ? count : dummy, .offset = count_base, .size = count ? (count_at - count_base) + 4 : 16 },
+      { .binding = 5, .buffer = cond ? replay->cond.buffer : dummy, .offset = cond_base,
+        .size = cond ? (replay->cond.offset - cond_base) + 4 : 16 },
+   };
+   WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bgd.layout = dev->mesh_bgl;
+   bgd.entryCount = 6;
+   bgd.entries = entries;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bgd);
+   if (!group)
+      return;
+   WGPUComputePassDescriptor cpd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &cpd);
+   wgpuComputePassEncoderSetPipeline(pass, dev->mesh_pipelines[0]);
+   wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
+   wgpuComputePassEncoderEnd(pass);
+   wgpuComputePassEncoderRelease(pass);
+
+   /* The task shader, and the scan of what it launched; DrawIndex in the
+    * draw's words for both shaders, whatever vertex shader is bound. */
+   const uint32_t draw_words[8] = { WVK_DRIVER_DRAW_VALUES / 4, WVK_DRIVER_DRAW_VALUES / 4 + 1, draw_id };
+   if (memcmp(st->push + WVK_DRIVER_DRAW_OFFSET, draw_words, sizeof(draw_words))) {
+      memcpy(st->push + WVK_DRIVER_DRAW_OFFSET, draw_words, sizeof(draw_words));
+      st->push_offset = UINT32_MAX;
+   }
+   st->draw = (struct wvk_driver_buffer){ 0 };
+   if (task) {
+      dispatch_graphics_groups(cmd, task_cs, 0, header, WVK_MESH_FIRST_DISPATCH * 4);
+      pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &cpd);
+      wgpuComputePassEncoderSetPipeline(pass, dev->mesh_pipelines[1]);
+      wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+      wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
+      wgpuComputePassEncoderEnd(pass);
+      wgpuComputePassEncoderRelease(pass);
+   }
+   wgpuBindGroupRelease(group);
+   /* The mesh shader. */
+   dispatch_graphics_groups(cmd, mesh_cs, 0, header, WVK_MESH_DISPATCH * 4);
+
+   /* The draw: every primitive each mesh workgroup may have made. */
+   if (in_pass && !replay->pass)
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+   if (!replay->pass || discard)
+      return;
+   struct wvk_shader *draw_vs = st->vs;
+   st->vs = mesh_vs;
+   replay->list_topology = corners == 1 ? WGPUPrimitiveTopology_PointList
+                           : corners == 2 ? WGPUPrimitiveTopology_LineList
+                                          : WGPUPrimitiveTopology_TriangleList;
+   foreach_viewport(cmd) {
+      set_draw_parameters(st, NULL, 0, false, 0, 0, draw_id);
+      if (!flush_draw(cmd, false))
+         continue;
+      wgpuRenderPassEncoderDrawIndirect(replay->pass, header, WVK_MESH_DRAW * 4);
+   }
+   replay->list_topology = WGPUPrimitiveTopology_Undefined;
+   st->vs = draw_vs;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdDrawMeshTasksEXT(VkCommandBuffer commandBuffer, uint32_t groupCountX, uint32_t groupCountY,
+                        uint32_t groupCountZ)
+{
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP)
+      return;
+   cmd->replay->cond_gpu = cond == WVK_CONDITION_GPU;
+   draw_mesh(cmd, groupCountX, groupCountY, groupCountZ, NULL, 0, NULL, 0, 0, 0);
+   cmd->replay->cond_gpu = false;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdDrawMeshTasksIndirectEXT(VkCommandBuffer commandBuffer, VkBuffer _buffer, VkDeviceSize offset,
+                                uint32_t drawCount, uint32_t stride)
+{
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP || !drawCount)
+      return;
+   const struct wvk_bound_buffer b = bound_buffer(cmd, _buffer, offset, (uint64_t)(drawCount - 1) * stride + 12);
+   if (!b.buffer)
+      return;
+   wvk_replay_read(cmd->replay, b.mem, b.offset, b.size);
+   cmd->replay->cond_gpu = cond == WVK_CONDITION_GPU;
+   for (uint32_t i = 0; i < drawCount; ++i)
+      draw_mesh(cmd, 0, 0, 0, b.buffer, b.offset + (uint64_t)i * stride, NULL, 0, 0, i);
+   cmd->replay->cond_gpu = false;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+wvk_CmdDrawMeshTasksIndirectCountEXT(VkCommandBuffer commandBuffer, VkBuffer _buffer, VkDeviceSize offset,
+                                     VkBuffer countBuffer, VkDeviceSize countBufferOffset, uint32_t maxDrawCount,
+                                     uint32_t stride)
+{
+   VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
+   const enum wvk_condition cond = wvk_cmd_condition(cmd);
+   if (cond == WVK_CONDITION_SKIP || !maxDrawCount)
+      return;
+   const struct wvk_bound_buffer b = bound_buffer(cmd, _buffer, offset, (uint64_t)(maxDrawCount - 1) * stride + 12);
+   const struct wvk_bound_buffer c = bound_buffer(cmd, countBuffer, countBufferOffset, 4);
+   if (!b.buffer || !c.buffer)
+      return;
+   wvk_replay_read(cmd->replay, b.mem, b.offset, b.size);
+   wvk_replay_read(cmd->replay, c.mem, c.offset, 4);
+   cmd->replay->cond_gpu = cond == WVK_CONDITION_GPU;
+   for (uint32_t i = 0; i < maxDrawCount; ++i)
+      draw_mesh(cmd, 0, 0, 0, b.buffer, b.offset + (uint64_t)i * stride, c.buffer, c.offset, maxDrawCount, i);
+   cmd->replay->cond_gpu = false;
 }
 
 /* The tessellator's passes, made the first time (wvk_tessellator.c): one

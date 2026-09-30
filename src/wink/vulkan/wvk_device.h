@@ -105,6 +105,10 @@ struct wvk_device {
     * and their bind group layout. */
    WGPUComputePipeline tess_pipelines[3];
    WGPUBindGroupLayout tess_bgl;
+   /* A mesh draw's passes: its setup, and the task workgroups' launches'
+    * scan (wvk_cmd_draw.c's draw_mesh), and their bind group layout. */
+   WGPUComputePipeline mesh_pipelines[2];
+   WGPUBindGroupLayout mesh_bgl;
    /* Serials for the driver's own indirect buffers, above any memory's. */
    uint64_t temp_serial;
    WGPUComputePipeline repack_pipeline;
