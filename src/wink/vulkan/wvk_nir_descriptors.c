@@ -1003,6 +1003,72 @@ lower_reduction(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32
    nir_instr_remove(nir_def_instr(placeholder));
 }
 
+/* Trilinear filtering with an axis clamped to the border, which one
+ * sample weighed at one level cannot be: each of the two levels sampled at
+ * its own LOD, its border weighed in at its own size, the two mixed by the
+ * LOD's fraction. `lambda` is the sampler's, clamped to its LOD range. */
+static nir_def *
+border_trilinear(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot,
+                 nir_def *flags, nir_def *lambda, nir_def *coord)
+{
+   const unsigned spatial = tex->coord_components - (tex->is_array ? 1 : 0);
+   nir_def *levels = &texture_query(b, tex, nir_texop_query_levels, NULL)->def;
+   nir_def *last = nir_iadd_imm(b, levels, -1);
+   nir_def *floor = nir_ffloor(b, lambda);
+   nir_def *l0 = nir_imin(b, nir_imax(b, nir_f2i32(b, floor), nir_imm_int(b, 0)), last);
+   nir_def *l1 = nir_imin(b, nir_iadd_imm(b, l0, 1), last);
+   nir_def *frac = nir_fsub(b, lambda, floor);
+   const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   nir_def *border[4];
+   border_texel(b, meta, tex, group, slot, true, border);
+   nir_def *border_value = nir_trim_vector(b, nir_vec(b, border, 4), tex->def.num_components);
+   nir_def *one = nir_imm_float(b, 1.0f);
+   nir_def *values[2];
+   for (unsigned l = 0; l < 2; ++l) {
+      nir_def *level = l ? l1 : l0;
+      nir_def *size = &texture_query(b, tex, nir_texop_txs, level)->def;
+      nir_def *comps[4];
+      for (unsigned i = 0; i < tex->coord_components; ++i)
+         comps[i] = nir_channel(b, coord, i);
+      nir_def *weight = one;
+      for (unsigned i = 0; i < spatial; ++i) {
+         nir_def *extent = nir_i2f32(b, nir_channel(b, size, i));
+         nir_def *mode = address_mode(b, flags, i);
+         nir_def *offset = offset_idx >= 0 && i < tex->src[offset_idx].src.ssa->num_components
+                              ? nir_fdiv(b, nir_i2f32(b, nir_channel(b, tex->src[offset_idx].src.ssa, i)), extent)
+                              : NULL;
+         nir_def *c = offset ? nir_fadd(b, comps[i], offset) : comps[i];
+         c = nir_bcsel(b, nir_ieq_imm(b, mode, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE), nir_fabs(b, c), c);
+         nir_def *is_border = nir_ieq_imm(b, mode, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER);
+         nir_def *linear = flag(b, flags, WVK_SAMPLER_MIN_LINEAR);
+         nir_def *texel = nir_fmul(b, c, extent);
+         nir_def *w_linear = nir_fsat(b, nir_fadd_imm(b, nir_fmin(b, texel, nir_fsub(b, extent, texel)), 0.5));
+         nir_def *w_nearest = nir_b2f32(b, nir_iand(b, nir_fge_imm(b, c, 0.0), nir_flt_imm(b, c, 1.0)));
+         weight = nir_fmul(b, weight, nir_bcsel(b, is_border, nir_bcsel(b, linear, w_linear, w_nearest), one));
+         nir_def *half = nir_fdiv(b, nir_imm_float(b, 0.5f), extent);
+         nir_def *inset = nir_fmin(b, nir_fmax(b, c, half), nir_fsub(b, one, half));
+         c = nir_bcsel(b, nir_iand(b, is_border, linear), inset, c);
+         comps[i] = offset ? nir_fsub(b, c, offset) : c;
+      }
+      nir_def *new_coord = nir_vec(b, comps, tex->coord_components);
+      nir_def *lod = nir_i2f32(b, level);
+      nir_tex_instr *txl = nir_instr_as_tex(nir_instr_clone(b->shader, &tex->instr));
+      nir_builder_instr_insert(b, &txl->instr);
+      static const nir_tex_src_type implicit_lod[] = { nir_tex_src_bias, nir_tex_src_lod, nir_tex_src_ddx,
+                                                       nir_tex_src_ddy, nir_tex_src_min_lod };
+      for (unsigned d = 0; d < ARRAY_SIZE(implicit_lod); ++d) {
+         const int at = nir_tex_instr_src_index(txl, implicit_lod[d]);
+         if (at >= 0)
+            nir_tex_instr_remove_src(txl, at);
+      }
+      txl->op = nir_texop_txl;
+      nir_src_rewrite(&txl->src[nir_tex_instr_src_index(txl, nir_tex_src_coord)].src, new_coord);
+      nir_tex_instr_add_src(txl, nir_tex_src_lod, lod);
+      values[l] = nir_flrp(b, border_value, &txl->def, weight);
+   }
+   return nir_flrp(b, values[0], values[1], frac);
+}
+
 static bool
 lower_float_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot,
                    bool reductions)
@@ -1107,8 +1173,28 @@ lower_float_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uin
    value = nir_trim_vector(b, value, tex->def.num_components);
    nir_def *mixed = nir_flrp(b, value, &tex->def, weight);
    nir_pop_if(b, NULL);
-   nir_def_rewrite_uses(placeholder, nir_if_phi(b, mixed, &tex->def));
+   nir_def *result = nir_if_phi(b, mixed, &tex->def);
+   nir_def_rewrite_uses(placeholder, result);
    nir_instr_remove(nir_def_instr(placeholder));
+
+   /* Trilinear with a border, minified: two levels (border_trilinear).
+    * Not of depth comparisons, whose explicit LODs WGSL has only 0 of. */
+   if (lambda && !tex->is_shadow && tex->op != nir_texop_txf) {
+      nir_def *any_border = nir_imm_false(b);
+      for (unsigned i = 0; i < spatial; ++i)
+         any_border = nir_ior(b, any_border,
+                              nir_ieq_imm(b, address_mode(b, flags, i), VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER));
+      nir_def *two = nir_iand(b, nir_iand(b, flag(b, flags, WVK_SAMPLER_EMULATE), flag(b, flags, WVK_SAMPLER_MIP_LINEAR)),
+                              nir_iand(b, any_border, nir_flt(b, nir_imm_float(b, 0.0f), lambda)));
+      two = nir_iand(b, two, nir_inot(b, flag(b, flags, WVK_SAMPLER_UNNORMALIZED)));
+      nir_def *later = nir_undef(b, result->num_components, result->bit_size);
+      nir_def_rewrite_uses(result, later);
+      nir_push_if(b, two);
+      nir_def *trilinear = border_trilinear(b, meta, tex, group, slot, flags, lambda, coord);
+      nir_pop_if(b, NULL);
+      nir_def_rewrite_uses(later, nir_if_phi(b, trilinear, result));
+      nir_instr_remove(nir_def_instr(later));
+   }
    return true;
 }
 
