@@ -162,6 +162,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .VALVE_mutable_descriptor_type = true,
       .EXT_mesh_shader = wvk_physical_device_meshes(pdev),
       .EXT_discard_rectangles = true,
+      .EXT_ycbcr_image_arrays = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -368,6 +369,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Multi-planar images, a texture a plane (wvk_image.h), sampled a
        * plane a binding through the conversion (wvk_shader.c). */
       .samplerYcbcrConversion = true,
+      /* VK_EXT_ycbcr_image_arrays */
+      .ycbcrImageArrays = true,
       /* A buffer a pointer's phi or select chooses: each access one on
        * every buffer it may be, by the index (wvk_shader.c). */
       .variablePointersStorageBuffer = true,
@@ -1572,8 +1575,9 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    }
 
-   /* A multi-planar image: 2D, of one level and layer, not disjoint but
-    * where the format says it may be. */
+   /* A multi-planar image: 2D, of one level, of layers as any other
+    * (VK_EXT_ycbcr_image_arrays), not disjoint but where the format says it
+    * may be. */
    if (caps & WVK_CAP_PLANAR) {
       if (info->type != VK_IMAGE_TYPE_2D ||
           (usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -1583,7 +1587,7 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
       pImageFormatProperties->imageFormatProperties = (VkImageFormatProperties){
          .maxExtent = extent,
          .maxMipLevels = 1,
-         .maxArrayLayers = 1,
+         .maxArrayLayers = layers,
          .sampleCounts = VK_SAMPLE_COUNT_1_BIT,
          .maxResourceSize = UINT32_MAX,
       };

@@ -345,7 +345,8 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   image sampler whose immutable sampler has a conversion takes a texture
   binding for each plane after the first, and a sampler of the chroma
   filter for them. The runtime's nir_vk_lower_ycbcr_tex samples each plane
-  and converts, before the shader's source is kept.
+  and converts, before the shader's source is kept. Of optimal tiling,
+  they have layers as any other image does (ycbcrImageArrays).
 - **Memory is one WGPUBuffer**, which the buffers bound to it share. WebGPU
   lets a buffer written as storage have no other use in a usage scope --
   a dispatch, or a whole render pass -- which suballocated memory has all
