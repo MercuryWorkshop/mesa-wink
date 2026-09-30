@@ -309,21 +309,35 @@ vk_get_dynamic_graphics_states(BITSET_WORD *dynamic,
       }
    }
 
-   /* Per spec, COLOR_BLEND_ADVANCED only needs to be dynamic if
-    * advancedBlendCoherentOperations is enabled. Mark it as dynamic when
-    * the feature is not enabled to simplify downstream checks.
+   /* Per spec, COLOR_BLEND_ADVANCED only needs to be dynamic, for the rest
+    * of the colour blend state to be, if advancedBlendCoherentOperations is
+    * enabled. Mark it as dynamic when the feature is not enabled and the
+    * rest is, to simplify downstream checks. Not otherwise: the pipeline's
+    * VkPipelineColorBlendAdvancedStateCreateInfoEXT is ignored only if the
+    * state is dynamic.
     */
-   if (!device->enabled_features.advancedBlendCoherentOperations)
+   const bool advanced_dynamic =
+      BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_BLEND_ADVANCED) ||
+      !device->enabled_features.advancedBlendCoherentOperations;
+   if (advanced_dynamic &&
+       BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_LOGIC_OP_ENABLE) &&
+       BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_LOGIC_OP) &&
+       BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_COLOR_WRITE_ENABLES) &&
+       BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_BLEND_ENABLES) &&
+       BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_BLEND_EQUATIONS) &&
+       BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_WRITE_MASKS) &&
+       BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_BLEND_CONSTANTS))
       BITSET_SET(dynamic, MESA_VK_DYNAMIC_CB_BLEND_ADVANCED);
 
    /* Per spec, attachmentCount is ignored if COLOR_BLEND_ENABLE,
     * COLOR_BLEND_EQUATION, COLOR_WRITE_MASK, and COLOR_BLEND_ADVANCED
-    * are all dynamic.
+    * are all dynamic (the last, or advancedBlendCoherentOperations is not
+    * enabled).
     */
    if (BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_BLEND_ENABLES) &&
        BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_BLEND_EQUATIONS) &&
        BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_WRITE_MASKS) &&
-       BITSET_TEST(dynamic, MESA_VK_DYNAMIC_CB_BLEND_ADVANCED))
+       advanced_dynamic)
       BITSET_SET(dynamic, MESA_VK_DYNAMIC_CB_ATTACHMENT_COUNT);
 }
 
@@ -1029,12 +1043,13 @@ vk_color_blend_state_init(struct vk_color_blend_state *cb,
    cb->attachment_count = cb_info->attachmentCount;
 
    /* Per spec, pAttachments is ignored if BLEND_ENABLES, BLEND_EQUATIONS,
-    * WRITE_MASKS, and BLEND_ADVANCED are all dynamic.
+    * WRITE_MASKS, and BLEND_ADVANCED are all dynamic -- when attachmentCount
+    * is (the last, or advancedBlendCoherentOperations is not enabled).
     */
    bool full_dynamic = IS_DYNAMIC(CB_BLEND_ENABLES) &&
                        IS_DYNAMIC(CB_BLEND_EQUATIONS) &&
                        IS_DYNAMIC(CB_WRITE_MASKS) &&
-                       IS_DYNAMIC(CB_BLEND_ADVANCED);
+                       IS_DYNAMIC(CB_ATTACHMENT_COUNT);
 
    /* Advanced blend state is ignored if CB_BLEND_ADVANCED is dynamic */
    const VkPipelineColorBlendAdvancedStateCreateInfoEXT *advanced = NULL;
