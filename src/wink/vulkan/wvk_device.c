@@ -12,6 +12,8 @@
 #include "wvk_shader.h"
 
 #include "vk_cmd_enqueue_entrypoints.h"
+#include "vk_pipeline.h"
+#include "util/mesa-blake3.h"
 #include "vk_common_entrypoints.h"
 
 #include <stdio.h>
@@ -38,6 +40,8 @@ on_device_lost(WGPUDevice const *device, WGPUDeviceLostReason reason, WGPUString
    /* Destroying the device reports it lost too; that is not news. */
    if (reason == WGPUDeviceLostReason_Destroyed || reason == WGPUDeviceLostReason_CallbackCancelled)
       return;
+   snprintf(dev->lost_message, sizeof(dev->lost_message), "WebGPU device lost (%u): %.*s", (unsigned)reason,
+            wvk_sv_len(message), message.data);
    vk_device_set_lost(&dev->vk, "WebGPU device lost (%u): %.*s", (unsigned)reason,
                       wvk_sv_len(message), message.data);
 }
@@ -221,4 +225,45 @@ wvk_GetDeviceProcAddr(VkDevice _device, const char *pName)
                                                     instance->app_info.api_version,
                                                     &instance->enabled_extensions,
                                                     &dev->vk.enabled_extensions);
+}
+
+/* VK_EXT_device_fault: no addresses or vendor data, only what WebGPU said
+ * when it lost the device. */
+VKAPI_ATTR VkResult VKAPI_CALL
+wvk_GetDeviceFaultInfoEXT(VkDevice _device, VkDeviceFaultCountsEXT *pFaultCounts, VkDeviceFaultInfoEXT *pFaultInfo)
+{
+   VK_FROM_HANDLE(wvk_device, dev, _device);
+   pFaultCounts->addressInfoCount = 0;
+   pFaultCounts->vendorInfoCount = 0;
+   pFaultCounts->vendorBinarySize = 0;
+   if (pFaultInfo)
+      snprintf(pFaultInfo->description, sizeof(pFaultInfo->description), "%s",
+               dev->lost_message[0] ? dev->lost_message : "No fault");
+   return VK_SUCCESS;
+}
+
+/* A pipeline's identifier (VK_EXT_pipeline_properties): of its shaders'
+ * cache keys, which are of everything they were compiled from. */
+VKAPI_ATTR VkResult VKAPI_CALL
+wvk_GetPipelinePropertiesEXT(VkDevice device, const VkPipelineInfoEXT *pPipelineInfo,
+                             VkBaseOutStructure *pPipelineProperties)
+{
+   VK_FROM_HANDLE(vk_pipeline, pipeline, pPipelineInfo->pipeline);
+   if (pPipelineProperties->sType != VK_STRUCTURE_TYPE_PIPELINE_PROPERTIES_IDENTIFIER_EXT)
+      return VK_SUCCESS;
+   VkPipelinePropertiesIdentifierEXT *id = (VkPipelinePropertiesIdentifierEXT *)pPipelineProperties;
+   struct mesa_blake3 ctx;
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, &pipeline->bind_point, sizeof(pipeline->bind_point));
+   const bool compute = pipeline->bind_point == VK_PIPELINE_BIND_POINT_COMPUTE;
+   for (uint32_t s = compute ? MESA_SHADER_COMPUTE : 0; s < (compute ? MESA_SHADER_COMPUTE + 1 : MESA_SHADER_COMPUTE);
+        ++s) {
+      const struct vk_shader *shader = pipeline->ops->get_shader(pipeline, s);
+      if (shader)
+         _mesa_blake3_update(&ctx, shader->pipeline.cache_key, sizeof(shader->pipeline.cache_key));
+   }
+   blake3_hash hash;
+   _mesa_blake3_final(&ctx, hash);
+   memcpy(id->pipelineIdentifier, hash, sizeof(id->pipelineIdentifier));
+   return VK_SUCCESS;
 }

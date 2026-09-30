@@ -423,6 +423,14 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   explicit layout is the words shared memory already is, each block at
   0; and an attribute the shader reads that the draw has none of reads
   (0, 0, 0, 1) (vertexAttributeRobustness), in a variant.
+- **What WebGPU has no word for**: memory priorities (memoryPriority,
+  pageableDeviceLocalMemory) are hints with nowhere to go; no image is
+  compressed that WebGPU says (imageCompressionControl reports
+  DISABLED); nothing is dithered, which legacyDithering allows; a device
+  fault (deviceFault) is what WebGPU said when it lost the device; and a
+  pipeline's identifier (pipelinePropertiesIdentifier) is of its shaders'
+  cache keys. The subgroup ballot and vote of the EXT extensions are the
+  KHR ones, of subgroups of one.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
   have to stay.

@@ -610,6 +610,17 @@ wvk_BindImageMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindImage
    return result;
 }
 
+/* No image is compressed, that WebGPU says (VK_EXT_image_compression_control). */
+static void
+report_compression(VkSubresourceLayout2KHR *layout)
+{
+   VkImageCompressionPropertiesEXT *p = vk_find_struct(layout->pNext, IMAGE_COMPRESSION_PROPERTIES_EXT);
+   if (p) {
+      p->imageCompressionFlags = VK_IMAGE_COMPRESSION_DISABLED_EXT;
+      p->imageCompressionFixedRateFlags = VK_IMAGE_COMPRESSION_FIXED_RATE_NONE_EXT;
+   }
+}
+
 /* Only linear images have a layout to report. */
 VKAPI_ATTR void VKAPI_CALL
 wvk_GetImageSubresourceLayout2KHR(VkDevice device, VkImage _image, const VkImageSubresource2KHR *pSubresource,
@@ -617,6 +628,7 @@ wvk_GetImageSubresourceLayout2KHR(VkDevice device, VkImage _image, const VkImage
 {
    VK_FROM_HANDLE(wvk_image, image, _image);
    pLayout->subresourceLayout = (VkSubresourceLayout){ 0 };
+   report_compression(pLayout);
    /* A host memcpy copy's memory (wvk_host_copy.c): the subresource's
     * rows, packed, as a buffer copy has them. */
    VkSubresourceHostMemcpySize *memcpy_size = vk_find_struct(pLayout->pNext, SUBRESOURCE_HOST_MEMCPY_SIZE);
@@ -657,6 +669,7 @@ wvk_GetDeviceImageSubresourceLayoutKHR(VkDevice device, const VkDeviceImageSubre
 {
    const VkImageCreateInfo *ci = pInfo->pCreateInfo;
    pLayout->subresourceLayout = (VkSubresourceLayout){ 0 };
+   report_compression(pLayout);
    if (ci->tiling != VK_IMAGE_TILING_LINEAR)
       return;
    uint64_t offset = 0;

@@ -107,6 +107,13 @@ wvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem, const VkAllocationCallback
    wvk_device_memory_unref(mem);
 }
 
+/* WebGPU pages nothing in or out on a priority (VK_EXT_memory_priority's,
+ * VK_EXT_pageable_device_local_memory's): there is none to set. */
+VKAPI_ATTR void VKAPI_CALL
+wvk_SetDeviceMemoryPriorityEXT(VkDevice device, VkDeviceMemory memory, float priority)
+{
+}
+
 VkResult
 wvk_device_memory_get_buffer(struct wvk_device *dev, struct wvk_device_memory *mem, WGPUBuffer *out)
 {

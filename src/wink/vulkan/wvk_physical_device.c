@@ -127,6 +127,20 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_image_2d_view_of_3d = true,
       .EXT_image_sliced_view_of_3d = true,
       .EXT_blend_operation_advanced = true,
+      .KHR_variable_pointers = true,
+      .KHR_external_memory = true,
+      .KHR_external_fence = true,
+      .KHR_external_semaphore = true,
+      .EXT_queue_family_foreign = true,
+      .EXT_shader_subgroup_ballot = true,
+      .EXT_shader_subgroup_vote = true,
+      .EXT_memory_priority = true,
+      .EXT_pageable_device_local_memory = true,
+      .EXT_device_fault = true,
+      .EXT_pipeline_properties = true,
+      .EXT_image_compression_control = true,
+      .EXT_legacy_dithering = true,
+      .EXT_debug_marker = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -621,6 +635,16 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* The fragment shader's, against a copy of the attachment made before
        * each draw (lower_blend): within a draw, not coherent. */
       .advancedBlendCoherentOperations = false,
+      /* Hints, which WebGPU has nowhere to take. */
+      .memoryPriority = true,
+      .pageableDeviceLocalMemory = true,
+      /* What WebGPU said when it lost the device. */
+      .deviceFault = true,
+      .pipelinePropertiesIdentifier = true,
+      /* Every image uncompressed, for all WebGPU says. */
+      .imageCompressionControl = true,
+      /* Nothing is dithered, which legacy dithering allows. */
+      .legacyDithering = true,
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,
@@ -1530,6 +1554,13 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
       case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES: {
          VkExternalImageFormatProperties *p = ext;
          p->externalMemoryProperties = (VkExternalMemoryProperties){ 0 };
+         break;
+      }
+      case VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT: {
+         /* WebGPU says nothing of how textures are stored. */
+         VkImageCompressionPropertiesEXT *p = ext;
+         p->imageCompressionFlags = VK_IMAGE_COMPRESSION_DISABLED_EXT;
+         p->imageCompressionFixedRateFlags = VK_IMAGE_COMPRESSION_FIXED_RATE_NONE_EXT;
          break;
       }
       default:

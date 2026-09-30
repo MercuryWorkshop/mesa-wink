@@ -37,6 +37,8 @@ struct wvk_device {
 
    WGPUDevice wgpu;
    struct wvk_queue queue;
+   /* Why WebGPU lost the device, for VK_EXT_device_fault. */
+   char lost_message[VK_MAX_DESCRIPTION_SIZE];
    /* The compute family's, when one was asked for (wvk_queue.h). */
    struct vk_queue compute_queue;
 
