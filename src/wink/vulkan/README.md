@@ -84,7 +84,10 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   component. The WebGPU sampler of one filters nothing, so it takes depth
   textures too. A cube's, whose texels are across faces, is the base
   level's gathers, which the hardware finds the edges of: not the level a
-  minified sample selects.
+  minified sample selects. It is a variant's, keyed on whether a sampler
+  bound reduces -- each element of an array of them looked at -- since a
+  shader of many samples, with it in all of them, was enough more for
+  Apple's GPU to hang on.
 - **8-bit indices** (indexTypeUint8) are widened to 16 bits by a pass of
   the driver's at the first draw after a bind, the restart index 0xFFFF
   where the draw restarts primitives.
@@ -132,7 +135,8 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   textureQueryLod is worked out from the sampler's record. A view's
   minimum LOD (minLod) is its record's: where it has one, a sample's LOD
   is raised to it as a MinLod operand's is, and a fetch below its level
-  reads zero. A cube a non-seamless sampler samples (nonSeamlessCubeMap)
+  reads zero -- in a variant keyed on whether a view bound has one, as
+  it makes two of every sample. A cube a non-seamless sampler samples (nonSeamlessCubeMap)
   is, in a variant keyed on the samplers bound, the 2D array of its faces:
   the face the direction selects, at the LOD the cube's derivatives give,
   wrapped as the sampler says. A 2D view of a 3D image's slice

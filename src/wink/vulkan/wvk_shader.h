@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 38
+#define WVK_SHADER_BINARY_VERSION 40
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -88,6 +88,18 @@ enum wvk_draw_shape {
 /* 2D textures and storage images a 2D view of a 3D image may be bound at
  * (VK_EXT_image_2d_view_of_3d), which a variant has as the 3D ones. */
 #define WVK_MAX_FLAT_VIEWS 8
+
+/* Descriptors of a shader's, as runs of slots: set << 10 | the first slot,
+ * and how many -- an array's elements, which are slots of their own after
+ * its split. Or always: of more runs than there is room for, or of what
+ * has no slot of its own; whatever is bound. */
+#define WVK_MAX_SLOT_RUNS 8
+struct wvk_slot_runs {
+   uint8_t count;
+   bool always;
+   uint16_t first[WVK_MAX_SLOT_RUNS];
+   uint16_t length[WVK_MAX_SLOT_RUNS];
+};
 
 struct wvk_shader_key {
    /* Vertex: the fragment shader's inputs its outputs are made to match. */
@@ -187,6 +199,12 @@ struct wvk_shader_key {
    /* Which of wvk_shader::cube_samples a non-seamless sampler samples: a
     * bit each, their cubes the 2D arrays of their faces. */
    uint8_t non_seamless;
+   /* Whether a sampler of wvk_shader::reduce_samplers bound reduces, which
+    * min and max reductions are emulated for then (samplerFilterMinmax). */
+   uint8_t reduces;
+   /* Whether a view of wvk_shader::min_lod_views bound has a minimum LOD,
+    * which is emulated then (VK_EXT_image_view_min_lod). */
+   uint8_t min_lods;
    /* Which of wvk_shader::flat_views have a 2D view of a 3D image bound: a
     * bit each, the 3D texture or image the view is of, at its slice. */
    uint8_t views_3d;
@@ -339,6 +357,12 @@ struct wvk_shader {
     * where the device has non-seamless cubes. */
    uint8_t cube_sample_count;
    uint32_t cube_samples[WVK_MAX_CUBE_SAMPLES];
+   /* The samplers its float samples are of: a variant of it emulates
+    * reductions where one bound reduces (key.reduces). And the textures
+    * it samples and fetches: a variant emulates views' minimum LODs where
+    * one bound has one (key.min_lods). */
+   struct wvk_slot_runs reduce_samplers;
+   struct wvk_slot_runs min_lod_views;
    /* Its 2D textures and storage images, as the set and slot of each (set
     * << 10 | slot), where the device has 2D views of 3D images: whose views
     * a draw or dispatch compiles a variant for (key.views_3d). */
@@ -424,6 +448,10 @@ struct wvk_bound_views {
     * texel size, as key.fsr_attachment. */
    uint8_t fsr_attachment;
    uint8_t non_seamless;
+   /* And whether a sampler of its reduce_samplers reduces, and a view of
+    * its min_lod_views has a minimum LOD. */
+   bool reduces;
+   bool min_lods;
    /* And which of its 2D ones have 2D views of 3D images bound
     * (wvk_shader::flat_views). */
    uint8_t views_3d;

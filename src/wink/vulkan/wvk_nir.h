@@ -66,7 +66,7 @@ bool wvk_nir_lower_view_swizzles(nir_shader *nir, const uint32_t *meta_base);
 /* What WebGPU's samplers cannot do, as samplers' records say: border
  * colours, mirroring once, LOD bias, unnormalized coordinates, and
  * sampling integer textures at all. */
-bool wvk_nir_lower_samplers(nir_shader *nir, const uint32_t *meta_base);
+bool wvk_nir_lower_samplers(nir_shader *nir, const uint32_t *meta_base, bool reductions);
 
 /* Image accesses bounded by their views (robustImageAccess2), and null
  * views reading and querying zero (nullDescriptor), as records say. */

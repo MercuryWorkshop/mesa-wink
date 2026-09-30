@@ -850,14 +850,14 @@ static nir_def *wrap_texel(nir_builder *b, nir_def *t, nir_def *extent, nir_def 
  * says or the border, and their least or greatest, component by
  * component. */
 static nir_def *
-reduce_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot, nir_def *flags)
+reduce_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot, nir_def *flags,
+              nir_def *lambda)
 {
    const int texture_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
    const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    const int offset_idx = nir_tex_instr_src_index(tex, nir_tex_src_offset);
    nir_def *coord = tex->src[coord_idx].src.ssa;
    const unsigned spatial = tex->coord_components - (tex->is_array ? 1 : 0);
-   nir_def *lambda = sample_lambda(b, meta, tex, group, slot, coord, spatial);
    nir_def *is_max = flag(b, flags, WVK_SAMPLER_REDUCE_MAX);
    nir_def *zero = nir_imm_float(b, 0.0f);
    nir_def *minified = nir_flt(b, zero, lambda);
@@ -979,17 +979,20 @@ lower_reduction(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32
    nir_def *flags = sampler_word(b, meta, group, slot, WVK_META_SAMPLER_FLAGS);
    nir_def *reduces = nir_test_mask(b, flags, WVK_SAMPLER_REDUCE_MIN | WVK_SAMPLER_REDUCE_MAX);
    const bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
+   /* The LOD, of derivatives: outside the branch, which is of the
+    * sampler's flags -- of a dynamically indexed one's, not uniform. */
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   nir_def *lambda = sample_lambda(b, meta, tex, group, slot, tex->src[coord_idx].src.ssa,
+                                   cube ? 3 : tex->coord_components - (tex->is_array ? 1 : 0));
    /* A cube's nearest texel is the sample's own. */
    if (cube) {
-      const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-      nir_def *lambda = sample_lambda(b, meta, tex, group, slot, tex->src[coord_idx].src.ssa, 3);
       nir_def *linear = nir_bcsel(b, nir_flt(b, nir_imm_float(b, 0.0f), lambda),
                                   flag(b, flags, WVK_SAMPLER_MIN_LINEAR), flag(b, flags, WVK_SAMPLER_MAG_LINEAR));
       reduces = nir_iand(b, reduces, linear);
    }
    nir_push_if(b, reduces);
    nir_def *reduced = cube ? reduce_cube_sample(b, tex, flags)
-                           : reduce_sample(b, meta, tex, group, slot, flags);
+                           : reduce_sample(b, meta, tex, group, slot, flags, lambda);
    nir_pop_if(b, NULL);
    reduced = nir_if_phi(b, reduced, nir_undef(b, reduced->num_components, 32));
    b->cursor = nir_after_instr(&tex->instr);
@@ -1001,9 +1004,11 @@ lower_reduction(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32
 }
 
 static bool
-lower_float_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot)
+lower_float_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t group, uint32_t slot,
+                   bool reductions)
 {
-   lower_reduction(b, meta, tex, group, slot);
+   if (reductions)
+      lower_reduction(b, meta, tex, group, slot);
    b->cursor = nir_before_instr(&tex->instr);
    nir_def *flags = sampler_word(b, meta, group, slot, WVK_META_SAMPLER_FLAGS);
    /* What the emulation below needs of the LOD, before the bias is in. */
@@ -1514,10 +1519,16 @@ face_sample(nir_builder *b, const uint32_t *meta, nir_tex_instr *tex, uint32_t g
    nir_tex_instr_add_src(tex, nir_tex_src_lod, lod);
 }
 
+struct sampler_state {
+   const uint32_t *meta;
+   bool reductions;
+};
+
 static bool
 lower_sampler_instr(nir_builder *b, nir_instr *instr, void *data)
 {
-   const uint32_t *meta = data;
+   const struct sampler_state *state = data;
+   const uint32_t *meta = state->meta;
    if (instr->type != nir_instr_type_tex)
       return false;
    nir_tex_instr *tex = nir_instr_as_tex(instr);
@@ -1572,13 +1583,14 @@ lower_sampler_instr(nir_builder *b, nir_instr *instr, void *data)
    if (nir_alu_type_get_base_type(tex->dest_type) != nir_type_float && !tex->is_shadow)
       return tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE ? lower_integer_cube_sample(b, meta, tex, group, slot)
                                                        : lower_integer_sample(b, meta, tex, group, slot);
-   return lower_float_sample(b, meta, tex, group, slot);
+   return lower_float_sample(b, meta, tex, group, slot, state->reductions);
 }
 
 bool
-wvk_nir_lower_samplers(nir_shader *nir, const uint32_t *meta_base)
+wvk_nir_lower_samplers(nir_shader *nir, const uint32_t *meta_base, bool reductions)
 {
-   return nir_shader_instructions_pass(nir, lower_sampler_instr, nir_metadata_none, (void *)meta_base);
+   struct sampler_state state = { meta_base, reductions };
+   return nir_shader_instructions_pass(nir, lower_sampler_instr, nir_metadata_none, &state);
 }
 
 /* ---------------------------------------------------------------------- */

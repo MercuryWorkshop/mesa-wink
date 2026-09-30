@@ -4277,6 +4277,86 @@ face_cubes(nir_shader *nir, struct wvk_shader *shader, uint8_t non_seamless)
    _mesa_set_destroy(faced, NULL);
 }
 
+/* The descriptors of `src` of the shader's samplings that `of` says, as
+ * runs of slots (struct wvk_slot_runs), which a draw looks at for a
+ * variant. After the variables are split, an array's elements into slots
+ * of their own. */
+static int
+compare_u16(const void *a, const void *b)
+{
+   return (int)*(const uint16_t *)a - (int)*(const uint16_t *)b;
+}
+
+static void
+gather_slot_runs(nir_shader *nir, struct wvk_slot_runs *runs, nir_tex_src_type src,
+                 bool (*of)(const nir_tex_instr *tex))
+{
+   memset(runs, 0, sizeof(*runs));
+   uint16_t slots[256];
+   unsigned count = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            const int at_src = nir_tex_instr_src_index(tex, src);
+            if (at_src < 0 || !of(tex))
+               continue;
+            nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(tex->src[at_src].src));
+            if (!var || glsl_type_is_array(var->type) || var->data.binding >= 1024 || var->data.descriptor_set >= 64) {
+               runs->always = true;
+               continue;
+            }
+            const uint16_t at = var->data.descriptor_set << 10 | var->data.binding;
+            unsigned i = 0;
+            while (i < count && slots[i] != at)
+               ++i;
+            if (i < count)
+               continue;
+            if (count == ARRAY_SIZE(slots))
+               runs->always = true;
+            else
+               slots[count++] = at;
+         }
+      }
+   }
+   if (runs->always)
+      return;
+   qsort(slots, count, sizeof(slots[0]), compare_u16);
+   for (unsigned i = 0; i < count; ++i) {
+      const unsigned n = runs->count;
+      if (n && slots[i] == runs->first[n - 1] + runs->length[n - 1]) {
+         ++runs->length[n - 1];
+      } else if (n == WVK_MAX_SLOT_RUNS) {
+         runs->always = true;
+         return;
+      } else {
+         runs->first[n] = slots[i];
+         runs->length[n] = 1;
+         ++runs->count;
+      }
+   }
+}
+
+/* A float sample, which a sampler's reduction is of. */
+static bool
+reducible_sample(const nir_tex_instr *tex)
+{
+   return !tex->is_shadow && nir_alu_type_get_base_type(tex->dest_type) == nir_type_float &&
+          (tex->op == nir_texop_tex || tex->op == nir_texop_txb || tex->op == nir_texop_txl ||
+           tex->op == nir_texop_txd);
+}
+
+/* A sampling or fetch of a texture, which a view's minimum LOD is of:
+ * any, before the lowerings between here and wvk_nir_lower_view_min_lod
+ * make one of another. */
+static bool
+image_sample(const nir_tex_instr *tex)
+{
+   return tex->sampler_dim != GLSL_SAMPLER_DIM_BUF;
+}
+
 /* Of a variant for 2D views of 3D images (key.views_3d), a query's result
  * of the 3D texture or image as the 2D one's: its first `n` components. */
 static void
@@ -7540,6 +7620,22 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       shader->key.non_seamless = records ? records->non_seamless : 0;
       face_cubes(nir, shader, shader->key.non_seamless);
    }
+   /* Min and max reductions, emulated in a variant for samplers bound
+    * that reduce: not in every float sample, whose emulation was all a
+    * shader of many samples was else. */
+   bool reductions = false;
+   if (dev->vk.enabled_features.samplerFilterMinmax) {
+      gather_slot_runs(nir, &shader->reduce_samplers, nir_tex_src_sampler_deref, reducible_sample);
+      shader->key.reduces = records ? records->reduces : 0;
+      reductions = shader->reduce_samplers.always || shader->key.reduces;
+   }
+   /* And views' minimum LODs, which make two of every sample. */
+   bool min_lods = false;
+   if (dev->vk.enabled_features.minLod) {
+      gather_slot_runs(nir, &shader->min_lod_views, nir_tex_src_texture_deref, image_sample);
+      shader->key.min_lods = records ? records->min_lods : 0;
+      min_lods = shader->min_lod_views.always || shader->key.min_lods;
+   }
    if (dev->vk.enabled_features.image2DViewOf3D || dev->vk.enabled_features.sampler2DViewOf3D) {
       shader->key.views_3d = records ? records->views_3d : 0;
       flat_views(nir, shader, shader->key.views_3d);
@@ -7580,9 +7676,9 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       .lower_offset_filter = dynamic_offset,
    };
    NIR_PASS(_, nir, nir_lower_tex, &offsets);
-   if (dev->vk.enabled_features.minLod)
+   if (min_lods)
       NIR_PASS(_, nir, wvk_nir_lower_view_min_lod, shader->meta_base);
-   NIR_PASS(_, nir, wvk_nir_lower_samplers, shader->meta_base);
+   NIR_PASS(_, nir, wvk_nir_lower_samplers, shader->meta_base, reductions);
    NIR_PASS(_, nir, lower_1d_images);
    NIR_PASS(_, nir, lower_ms_arrays);
    NIR_PASS(_, nir, pad_io_vectors, shader->key.fetch_format);
@@ -8343,6 +8439,12 @@ key_image_formats(const struct wvk_shader *shader, const struct wvk_bound_views 
    same &= key->non_seamless == shader->key.non_seamless;
    key->views_3d = views ? views->views_3d : shader->key.views_3d;
    same &= key->views_3d == shader->key.views_3d;
+   /* And whether a sampler bound reduces. */
+   key->reduces = views ? views->reduces : shader->key.reduces;
+   same &= key->reduces == shader->key.reduces;
+   /* And whether a view bound has a minimum LOD. */
+   key->min_lods = views ? views->min_lods : shader->key.min_lods;
+   same &= key->min_lods == shader->key.min_lods;
    return same;
 }
 
@@ -8721,7 +8823,7 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
       /* A variant that failed is kept as none, not tried at every draw. */
       if (getenv("WINK_VK_VARIANT_LOG")) {
          const struct wvk_shader_key *own = &shader->key;
-         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
                  _mesa_shader_stage_to_string(shader->vk.stage), shader->id,
                  key.pulled != own->pulled ? " vertex input" : "",
                  memcmp(key.fs_inputs, own->fs_inputs, sizeof(key.fs_inputs)) ? " varyings" : "",
@@ -8743,6 +8845,8 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
                        memcmp(key.color_map, own->color_map, sizeof(key.color_map))
                     ? " attachment locations" : "",
                  key.non_seamless != own->non_seamless ? " non-seamless cubes" : "",
+                 key.reduces != own->reduces ? " reductions" : "",
+                 key.min_lods != own->min_lods ? " min-lods" : "",
                  memcmp(key.fetch_format, own->fetch_format, sizeof(key.fetch_format)) ||
                        memcmp(key.fetch_input, own->fetch_input, sizeof(key.fetch_input))
                     ? " framebuffer fetch" : "",
@@ -8780,7 +8884,8 @@ struct wvk_shader *
 wvk_shader_dispatch_variant(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_bound_views *views)
 {
    if (!shader || !shader->source ||
-       (!shader->unformatted_count && !shader->cube_sample_count && !shader->flat_view_count))
+       (!shader->unformatted_count && !shader->cube_sample_count && !shader->flat_view_count &&
+        !shader->reduce_samplers.count && !shader->min_lod_views.count))
       return shader;
    struct wvk_shader_key key = shader->key;
    if (key_image_formats(shader, views, &key))
@@ -8844,6 +8949,8 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->point_state);
    blob_write_uint8(blob, shader->unformatted_count);
    blob_write_bytes(blob, shader->unformatted, sizeof(shader->unformatted));
+   blob_write_bytes(blob, &shader->reduce_samplers, sizeof(shader->reduce_samplers));
+   blob_write_bytes(blob, &shader->min_lod_views, sizeof(shader->min_lod_views));
    blob_write_uint8(blob, shader->cube_sample_count);
    blob_write_bytes(blob, shader->cube_samples, sizeof(shader->cube_samples));
    blob_write_uint8(blob, shader->flat_view_count);
@@ -8935,6 +9042,11 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const uint8_t unformatted_count = blob_read_uint8(blob);
    uint16_t unformatted[WVK_MAX_UNFORMATTED_IMAGES];
    blob_copy_bytes(blob, unformatted, sizeof(unformatted));
+   struct wvk_slot_runs reduce_samplers, min_lod_views;
+   blob_copy_bytes(blob, &reduce_samplers, sizeof(reduce_samplers));
+   blob_copy_bytes(blob, &min_lod_views, sizeof(min_lod_views));
+   reduce_samplers.count = MIN2(reduce_samplers.count, WVK_MAX_SLOT_RUNS);
+   min_lod_views.count = MIN2(min_lod_views.count, WVK_MAX_SLOT_RUNS);
    const uint8_t cube_sample_count = blob_read_uint8(blob);
    uint32_t cube_samples[WVK_MAX_CUBE_SAMPLES];
    blob_copy_bytes(blob, cube_samples, sizeof(cube_samples));
@@ -9068,6 +9180,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->mesh_primitive = mesh_primitive;
    shader->prim_vars = prim_vars;
    shader->payload_size = payload_size;
+   shader->reduce_samplers = reduce_samplers;
+   shader->min_lod_views = min_lod_views;
    shader->tile_reads = tile_reads;
    shader->input_reads = input_reads;
    shader->writes_shading_rate = writes_shading_rate;

@@ -3525,6 +3525,36 @@ bound_descriptor(const struct wvk_bound_state *st, uint32_t bind_point, uint32_t
    return set < WVK_MAX_GROUPS ? slot_descriptor(st->sets[bind_point][set].set, slot, &sampler, &dynamic_index) : NULL;
 }
 
+/* Whether a descriptor bound of the runs is one `is` says; of runs that
+ * are always, whatever is bound (the variant's being the base's). */
+static bool
+any_bound(const struct wvk_bound_state *st, uint32_t bind_point, const struct wvk_slot_runs *runs,
+          bool (*is)(const struct wvk_descriptor *d))
+{
+   if (runs->always)
+      return false;
+   for (uint32_t i = 0; i < runs->count; ++i) {
+      for (uint32_t e = 0; e < runs->length[i]; ++e) {
+         const struct wvk_descriptor *d = bound_descriptor(st, bind_point, runs->first[i] + e);
+         if (d && is(d))
+            return true;
+      }
+   }
+   return false;
+}
+
+static bool
+reduces(const struct wvk_descriptor *d)
+{
+   return d->sampler_meta[WVK_META_SAMPLER_FLAGS] & (WVK_SAMPLER_REDUCE_MIN | WVK_SAMPLER_REDUCE_MAX);
+}
+
+static bool
+has_min_lod(const struct wvk_descriptor *d)
+{
+   return d->view && d->min_lod > 0.0f;
+}
+
 static void
 bound_views(const struct wvk_bound_state *st, uint32_t bind_point, const struct wvk_shader *shader,
             struct wvk_bound_views *views)
@@ -3547,6 +3577,8 @@ bound_views(const struct wvk_bound_state *st, uint32_t bind_point, const struct 
       if (d && d->of_3d)
          views->views_3d |= BITFIELD_BIT(i);
    }
+   views->reduces = any_bound(st, bind_point, &shader->reduce_samplers, reduces);
+   views->min_lods = any_bound(st, bind_point, &shader->min_lod_views, has_min_lod);
 }
 
 static bool lines_placed(const struct wvk_cmd_buffer *cmd);
