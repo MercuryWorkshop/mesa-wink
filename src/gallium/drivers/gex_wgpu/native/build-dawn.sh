@@ -52,12 +52,15 @@ fi
 # colour attachments takes, Dawn reported WebGPU's default of 32, too few
 # for 8 RGBA8 attachments; and it zeroed a renderable 3D texture by
 # rendering to a 2D view of it, which WebGPU has none of. Tint's SPIR-V
-# reader takes the tier1 storage formats, as wink's wasm Tint does.
+# reader takes the tier1 storage formats, as wink's wasm Tint does. And a
+# framebuffer's clear values were an array too short for resolve targets,
+# which wrote over its attachment count with more than four of them.
 PATCHES="$HERE/../../../../../wink/patches"
 for PATCH in "$PATCHES/dawn-metal-strict-math-contract.patch" "$PATCHES/dawn-metal-command-buffer-errors.patch" \
              "$PATCHES/dawn-vulkan-color-attachment-bytes.patch" \
              "$PATCHES/dawn-vulkan-clear-3d-texture.patch" \
-             "$PATCHES/tint-spirv-reader-texel-formats.patch"; do
+             "$PATCHES/tint-spirv-reader-texel-formats.patch" \
+             "$PATCHES/dawn-vulkan-framebuffer-clear-values.patch"; do
   if git -C "$SRC" apply --check "$PATCH" 2>/dev/null; then
     echo "[dawn] applying $(basename "$PATCH")"
     git -C "$SRC" apply "$PATCH"
