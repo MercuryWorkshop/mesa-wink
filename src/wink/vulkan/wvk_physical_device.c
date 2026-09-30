@@ -170,6 +170,9 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_mesh_shader = wvk_physical_device_meshes(pdev),
       .EXT_discard_rectangles = true,
       .EXT_ycbcr_image_arrays = true,
+      /* R10X6G10X6B10X6A10X6's texture is RGBA16Unorm's, which samples
+       * as it is (wvk_format.c). */
+      .EXT_rgba10x6_formats = true,
       .EXT_multisampled_render_to_single_sampled = true,
       .EXT_legacy_vertex_attributes = true,
       .KHR_multiview = true,
@@ -390,6 +393,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .samplerYcbcrConversion = true,
       /* VK_EXT_ycbcr_image_arrays */
       .ycbcrImageArrays = true,
+      /* VK_EXT_rgba10x6_formats */
+      .formatRgba10x6WithoutYCbCrSampler = true,
       /* To multisampled images of the attachments', resolved into them
        * (wvk_cmd_render.c). */
       .multisampledRenderToSingleSampled = true,
