@@ -179,6 +179,22 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   attachment of as many, since Metal wants the two of one type. A
   multisampled one is read at the invocation's own sample, which is all
   a fetch has. Not depth or stencil, which Metal fetches none of.
+- **Fragment shading rates** (VK_KHR_fragment_shading_rate: the
+  pipeline's, a vertex shader's of its primitives, an attachment's), which
+  WebGPU has none of, are coarse fragments of at most 2x2 -- a quad's
+  pixels, or a row or column of them -- every pixel of which shades as the
+  fragment would (wvk_nir_fsr.c): at its centre, its interpolated inputs
+  moved there by their derivatives, so that each computes what the
+  fragment does and writes it to its own pixel. Derivatives are the
+  fragment's: of their operand computed again of the pixel's own inputs,
+  scaled by the fragment's size, and implicit LODs of those. Storage
+  writes and atomics the fragment's first covered pixel does alone, and
+  the others read an atomic's result of it across the quad, through
+  derivatives. The fragment shader works the rate out: the pipeline's and
+  the combiner ops of the driver's data, the primitive's a flat varying
+  (a geometry or mesh shader's recorded as its other outputs are), the
+  attachment's a fetch from a 2D view of its first layer. At 1x1 with
+  sample shading, a sample mask, depth or stencil written.
 - **Logic ops** are the fragment shader's: WebGPU has no colour state
   for them. A draw with one on gets a variant that takes each output to
   its attachment format's integers (unorm, snorm, uint and sint, at the

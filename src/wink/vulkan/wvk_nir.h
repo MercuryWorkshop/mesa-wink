@@ -39,6 +39,20 @@ bool wvk_nir_fetchable(const struct wvk_physical_device *pdev, VkFormat format);
  * shader's output to it. */
 unsigned wvk_nir_fetch_components(VkFormat format);
 
+/* Coarse shading (VK_KHR_fragment_shading_rate) of a fragment shader
+ * (wvk_nir_fsr.c): whether it is done, of the pipeline's rate and
+ * combiner ops in the driver's data (else gl_ShadingRateEXT is 1x1's
+ * alone); the location + 1 of the varying of the primitive's rate (0:
+ * none, 1x1); and what builds the attachment's rate at the pixel (NULL:
+ * none, 1x1). */
+struct wvk_fsr_options {
+   bool enabled;
+   uint8_t varying;
+   nir_def *(*attachment)(struct nir_builder *b, const void *data);
+   const void *data;
+};
+bool wvk_nir_lower_fragment_shading_rate(nir_shader *nir, const struct wvk_fsr_options *options);
+
 /* 64-bit atomics on buffers and shared memory, as 32-bit accesses under a
  * lock (wvk_nir_atomic64.c): after their explicit io. */
 bool wvk_nir_lower_atomic64(nir_shader *nir);

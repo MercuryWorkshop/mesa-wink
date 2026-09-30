@@ -6925,6 +6925,105 @@ lower_64bit_io(nir_shader *nir)
    return true;
 }
 
+/* The rate of the shading rate attachment's texel the pixel is in, of
+ * texels of the size key.fsr_attachment says (wvk_nir_fsr.c). */
+static nir_def *
+fsr_attachment_rate(nir_builder *b, const void *data)
+{
+   const unsigned texel = *(const uint8_t *)data - 1;
+   nir_variable *tex = nir_variable_create(b->shader, nir_var_uniform,
+                                           glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_UINT),
+                                           "wvk_shading_rate_attachment");
+   tex->data.descriptor_set = WVK_DRIVER_GROUP;
+   tex->data.binding = WVK_DRIVER_SLOT_FSR;
+   nir_def *pixel = nir_f2i32(b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
+   nir_def *coord = nir_ushr(b, pixel, nir_imm_ivec2(b, texel >> 4, texel & 0xf));
+   return nir_channel(b, nir_txf(b, coord, .texture_deref = nir_build_deref_var(b, tex), .lod = nir_imm_int(b, 0),
+                                 .dest_type = nir_type_uint32), 0);
+}
+
+/* gl_PrimitiveShadingRateEXT, which WebGPU has no output of: a flat
+ * varying at the location the fragment shader's variant reads it at
+ * (key.fsr_varying, wvk_nir_fsr.c), or none. Whether there was one. */
+static bool
+lower_primitive_shading_rate(nir_shader *nir, unsigned varying)
+{
+   nir_variable *var = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_PRIMITIVE_SHADING_RATE);
+   if (!var || nir->info.stage == MESA_SHADER_FRAGMENT)
+      return false;
+   if (varying) {
+      var->data.location = VARYING_SLOT_VAR0 + varying - 1;
+      var->data.interpolation = INTERP_MODE_FLAT;
+      return true;
+   }
+   var->data.mode = nir_var_shader_temp;
+   nir_fixup_deref_modes(nir);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   return true;
+}
+
+/* A geometry or mesh shader's gl_PrimitiveShadingRateEXT, which it
+ * records, as its other varyings, at the first generic location after
+ * theirs -- of its compute shader and its draw's vertex shader alike --
+ * and the fragment shader reads there (key.fsr_varying). That location
+ * + 1, or 0. */
+static unsigned
+place_primitive_shading_rate(nir_shader *nir)
+{
+   nir_variable *var = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_PRIMITIVE_SHADING_RATE);
+   const unsigned location = record_vars(nir, nir_var_shader_out);
+   if (!var || location >= 31)
+      return 0;
+   var->data.location = VARYING_SLOT_VAR0 + location;
+   var->data.interpolation = INTERP_MODE_FLAT;
+   return location + 1;
+}
+
+/* Whether a fragment shader has what coarse shading is not done with:
+ * reads the sample mask -- not as gl_HelperInvocation is, a comparison
+ * of it with zero (lower_helper_invocations) -- or which sample it is,
+ * writes depth, stencil or the sample mask, or orders its invocations. */
+static bool
+shades_at_1x1(nir_shader *nir)
+{
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location == FRAG_RESULT_DEPTH || var->data.location == FRAG_RESULT_STENCIL ||
+          var->data.location == FRAG_RESULT_SAMPLE_MASK)
+         return true;
+   }
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_sample_mask_in:
+               nir_foreach_use_including_if(use, &intr->def) {
+                  if (nir_src_is_if(use))
+                     return true;
+                  nir_instr *user = nir_src_use_instr(use);
+                  if (user->type != nir_instr_type_alu || nir_instr_as_alu(user)->op != nir_op_ieq ||
+                      !nir_src_is_const(nir_instr_as_alu(user)->src[use == &nir_instr_as_alu(user)->src[0].src].src) ||
+                      nir_src_as_uint(nir_instr_as_alu(user)->src[use == &nir_instr_as_alu(user)->src[0].src].src))
+                     return true;
+               }
+               break;
+            case nir_intrinsic_load_sample_id:
+            case nir_intrinsic_load_sample_pos:
+            case nir_intrinsic_load_sample_pos_or_center:
+            case nir_intrinsic_interp_deref_at_sample:
+            case nir_intrinsic_begin_invocation_interlock:
+               return true;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
 static VkResult
 compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
             const struct vk_graphics_pipeline_state *pipeline_state, const struct wvk_shader_key *records,
@@ -6971,6 +7070,14 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    if (WVK_META_OFFSET + meta_words * 4 > WVK_PUSH_WINDOW)
       mesa_logw_once("wvk: a pipeline layout of more descriptors than their records have room for");
 
+   /* Where a geometry or mesh shader records gl_PrimitiveShadingRateEXT,
+    * as its variants place it (place_primitive_shading_rate): of its
+    * outputs as they are. */
+   if ((stage == MESA_SHADER_GEOMETRY || stage == MESA_SHADER_MESH) &&
+       nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_PRIMITIVE_SHADING_RATE)) {
+      const unsigned location = record_vars(nir, nir_var_shader_out);
+      shader->shading_rate_location = location < 31 ? location + 1 : 0;
+   }
    /* A fragment shader's inputs of each primitive (VK_EXT_mesh_shader):
     * flat, the vertex shader after the mesh shader writing them so. */
    if (stage == MESA_SHADER_FRAGMENT) {
@@ -7003,6 +7110,18 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       NIR_PASS(_, nir, split_io_structs);
       NIR_PASS(_, nir, lower_64bit_io);
    }
+   /* gl_PrimitiveShadingRateEXT: a vertex shader's variant's varying of
+    * it, placed before its outputs are matched to the fragment shader's
+    * inputs, and a geometry or mesh shader's variants' (compile_variant);
+    * else none. Where a geometry or mesh shader records it. */
+   if (stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE) {
+      shader->writes_shading_rate = lower_primitive_shading_rate(nir, 0);
+      if (records && records->fsr_varying && nir_find_variable_with_location(nir, nir_var_shader_out,
+                                                                             VARYING_SLOT_VAR0 + records->fsr_varying - 1))
+         shader->key.fsr_varying = records->fsr_varying;
+   }
+   if (stage == MESA_SHADER_FRAGMENT)
+      shader->fsr_1x1 = shades_at_1x1(nir);
 
    /* What transform feedback captures, which the driver's pass does
     * (capture_xfb): no shader's, nor any compute shader's to have. */
@@ -7145,6 +7264,22 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
          memcpy(shader->key.fetch_format, records->fetch_format, sizeof(records->fetch_format));
          memcpy(shader->key.fetch_input, records->fetch_input, sizeof(records->fetch_input));
       }
+      /* Coarse shading, of the draw's rate (key.fsr); gl_ShadingRateEXT
+       * 1x1's else. Before what reads the pixel's position below, which
+       * is the pixel's own. */
+      struct wvk_fsr_options fsr = { 0 };
+      if (records && records->fsr) {
+         fsr.enabled = true;
+         fsr.varying = records->fsr_varying;
+         if (records->fsr_attachment) {
+            fsr.attachment = fsr_attachment_rate;
+            fsr.data = &records->fsr_attachment;
+         }
+         shader->key.fsr = records->fsr;
+         shader->key.fsr_varying = records->fsr_varying;
+         shader->key.fsr_attachment = records->fsr_attachment;
+      }
+      NIR_PASS(_, nir, wvk_nir_lower_fragment_shading_rate, &fsr);
    }
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       const struct vk_multisample_state *ms = pipeline_state ? pipeline_state->ms : NULL;
@@ -7564,6 +7699,13 @@ geometry_shell(struct wvk_device *dev, struct vk_shader_compile_info *info, cons
    shader->meta_words = meta_words;
    memcpy(shader->key.meta_base, shader->meta_base, sizeof(shader->meta_base));
    shader->key.meta_words = meta_words;
+   /* gl_PrimitiveShadingRateEXT where its variants record it, which the
+    * sizes of its records below are of too. */
+   if (nir->info.stage == MESA_SHADER_GEOMETRY || nir->info.stage == MESA_SHADER_MESH) {
+      shader->writes_shading_rate =
+         nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_PRIMITIVE_SHADING_RATE) != NULL;
+      shader->shading_rate_location = place_primitive_shading_rate(nir);
+   }
    if (nir->info.stage == MESA_SHADER_MESH || nir->info.stage == MESA_SHADER_TASK) {
       /* What a mesh draw's buffers are made for (draw_mesh). */
       if (nir->info.stage == MESA_SHADER_MESH) {
@@ -7861,6 +8003,8 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
 
    struct vk_multisample_state ms = { 0 };
    struct vk_graphics_pipeline_state state = { 0 };
+   if (stage == MESA_SHADER_GEOMETRY || stage == MESA_SHADER_MESH)
+      place_primitive_shading_rate(nir);
    /* A geometry shader's draw after it: a vertex shader of its outputs. */
    if ((stage == MESA_SHADER_GEOMETRY && key->geometry == 2) || (stage == MESA_SHADER_TESS_EVAL && key->tess == 2)) {
       geometry_vertex_shader(nir, key);
@@ -7878,6 +8022,8 @@ compile_variant(struct wvk_device *dev, struct wvk_shader *base, const struct wv
    if (stage == MESA_SHADER_VERTEX) {
       if (key->clip_varying && !key->runs)
          write_clip_varyings(nir, key->clip_varying - 1, key->clip_slots);
+      if (key->fsr_varying)
+         lower_primitive_shading_rate(nir, key->fsr_varying);
       match_fragment_inputs(nir, key->fs_inputs);
       state.vi = vi;
    } else if (stage == MESA_SHADER_FRAGMENT) {
@@ -8094,6 +8240,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       if (other) {
          key.clip_varying = other->key.clip_varying;
          key.clip_slots = other->key.clip_slots;
+         key.fsr_varying = other->key.fsr_varying;
       }
       if (shape == WVK_DRAW_LINES || shape == WVK_DRAW_LINES_PLACED) {
          key.lines = 1;
@@ -8112,7 +8259,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       }
       key.pulled = pull_key(shader, &vi, points);
       if (records && images && key.pulled == shader->key.pulled && !points && !shader->key.points &&
-          !key.clip_varying && varyings_match(shader, other))
+          !key.clip_varying && !key.fsr_varying && varyings_match(shader, other))
          return shader;
       if (other)
          memcpy(key.fs_inputs, other->varyings, sizeof(key.fs_inputs));
@@ -8162,6 +8309,34 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
             }
          }
       }
+      /* Coarse shading, where the draw's rate is not 1x1's alone
+       * (wvk_nir_fsr.c): not with what the device shades at 1x1 with, of
+       * the shader's or the pipeline's -- sample shading, an API sample
+       * mask. The primitive's rate a varying: a geometry or mesh shader's
+       * where it records it (shading_rate_location), a vertex shader's
+       * at the last location free, which the others below are not at. */
+      const uint32_t all_samples = BITFIELD_MASK(MAX2(samples, 1));
+      const struct vk_features *features = &dev->vk.enabled_features;
+      if ((features->pipelineFragmentShadingRate || features->primitiveFragmentShadingRate ||
+           features->attachmentFragmentShadingRate) &&
+          !vk_fragment_shading_rate_is_disabled(&dyn->fsr) &&
+          !shader->fsr_1x1 && !shader->per_sample && (dyn->ms.sample_mask & all_samples) == all_samples) {
+         key.fsr = 1;
+         if (dyn->fsr.combiner_ops[1] != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR && views)
+            key.fsr_attachment = views->fsr_attachment;
+         if (dyn->fsr.combiner_ops[0] != VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR && other &&
+             other->writes_shading_rate) {
+            if (other->vk.stage == MESA_SHADER_VERTEX) {
+               for (int i = 30; i >= 0 && !key.fsr_varying; --i) {
+                  if (!shader->varyings[i])
+                     key.fsr_varying = i + 1;
+               }
+            } else if ((other->vk.stage == MESA_SHADER_GEOMETRY || other->vk.stage == MESA_SHADER_MESH) &&
+                       other->shading_rate_location && !shader->varyings[other->shading_rate_location - 1]) {
+               key.fsr_varying = other->shading_rate_location;
+            }
+         }
+      }
       /* After a vertex shader alone, WebGPU's primitive_index where the
        * device has it -- two triangles a point's or line's quad. Not after
        * a tessellation evaluation shader, whose primitives are its
@@ -8174,7 +8349,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       if (other && (other->vk.stage == MESA_SHADER_GEOMETRY || other->vk.stage == MESA_SHADER_MESH) &&
           (shader->point_state & 4)) {
          for (uint32_t i = 0; i < WVK_MAX_VARYINGS && !key.primitive_id; ++i) {
-            if (!shader->varyings[i])
+            if (!shader->varyings[i] && i + 1 != key.fsr_varying)
                key.primitive_id = i + 1;
          }
       }
@@ -8185,7 +8360,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
          for (uint32_t i = 0; i + slots <= WVK_MAX_VARYINGS && !key.clip_varying; ++i) {
             bool free = true;
             for (uint32_t j = 0; j < slots; ++j)
-               free &= !shader->varyings[i + j] && i + j + 1 != key.primitive_id;
+               free &= !shader->varyings[i + j] && i + j + 1 != key.primitive_id && i + j + 1 != key.fsr_varying;
             if (free) {
                key.clip_varying = i + 1;
                key.clip_slots = slots;
@@ -8197,7 +8372,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       if (shape != WVK_DRAW_PRIMITIVES && shader->point_state) {
          key.points = 1;
          for (uint32_t i = 0; points && (shader->point_state & 1) && i < WVK_MAX_VARYINGS && !key.point_coord; ++i) {
-            if (!shader->varyings[i] && i + 1 != key.primitive_id &&
+            if (!shader->varyings[i] && i + 1 != key.primitive_id && i + 1 != key.fsr_varying &&
                 (!key.clip_varying || i + 1 < key.clip_varying || i + 1 >= key.clip_varying + key.clip_slots))
                key.point_coord = i + 1;
          }
@@ -8206,7 +8381,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
        * are, at the first location free after those. */
       for (uint32_t i = 0; shape == WVK_DRAW_LINES_PLACED && i < WVK_MAX_VARYINGS && !key.line_coord; ++i) {
          if (!shader->varyings[i] && i + 1 != key.primitive_id && i + 1 != key.point_coord &&
-             (!key.clip_varying || i + 1 < key.clip_varying || i + 1 >= key.clip_varying + key.clip_slots))
+             i + 1 != key.fsr_varying && (!key.clip_varying || i + 1 < key.clip_varying || i + 1 >= key.clip_varying + key.clip_slots))
             key.line_coord = i + 1;
       }
       /* Its barycentric coordinates and inputs of each vertex: at the first
@@ -8217,7 +8392,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
          uint32_t taken = shader->per_vertex_mask;
          for (uint32_t i = 0; i < WVK_MAX_VARYINGS; ++i) {
             if (shader->varyings[i] || i + 1 == key.primitive_id || i + 1 == key.point_coord ||
-                i + 1 == key.line_coord ||
+                i + 1 == key.line_coord || i + 1 == key.fsr_varying ||
                 (key.clip_varying && i + 1 >= key.clip_varying && i + 1 < key.clip_varying + key.clip_slots))
                taken |= BITFIELD_BIT(i);
          }
@@ -8316,7 +8491,7 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
       /* A variant that failed is kept as none, not tried at every draw. */
       if (getenv("WINK_VK_VARIANT_LOG")) {
          const struct wvk_shader_key *own = &shader->key;
-         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
+         fprintf(stderr, "wvk: %s shader %" PRIu64 " variant:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n",
                  _mesa_shader_stage_to_string(shader->vk.stage), shader->id,
                  key.pulled != own->pulled ? " vertex input" : "",
                  memcmp(key.fs_inputs, own->fs_inputs, sizeof(key.fs_inputs)) ? " varyings" : "",
@@ -8340,7 +8515,10 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
                  key.non_seamless != own->non_seamless ? " non-seamless cubes" : "",
                  memcmp(key.fetch_format, own->fetch_format, sizeof(key.fetch_format)) ||
                        memcmp(key.fetch_input, own->fetch_input, sizeof(key.fetch_input))
-                    ? " framebuffer fetch" : "");
+                    ? " framebuffer fetch" : "",
+                 key.fsr != own->fsr || key.fsr_varying != own->fsr_varying ||
+                       key.fsr_attachment != own->fsr_attachment
+                    ? " shading rate" : "");
       }
       variant = compile_variant(dev, shader, &key, vi);
       if (!variant)
@@ -8459,6 +8637,11 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_uint8(blob, shader->mesh_primitive);
    blob_write_uint8(blob, shader->prim_vars);
    blob_write_uint16(blob, shader->payload_size);
+   blob_write_uint8(blob, shader->tile_reads);
+   blob_write_uint8(blob, shader->input_reads);
+   blob_write_uint8(blob, shader->writes_shading_rate);
+   blob_write_uint8(blob, shader->fsr_1x1);
+   blob_write_uint8(blob, shader->shading_rate_location);
    blob_write_uint8(blob, shader->source != NULL);
    if (shader->source)
       source_serialize(shader->source, blob);
@@ -8553,6 +8736,11 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const uint8_t mesh_primitive = blob_read_uint8(blob);
    const uint8_t prim_vars = blob_read_uint8(blob);
    const uint16_t payload_size = blob_read_uint16(blob);
+   const uint8_t tile_reads = blob_read_uint8(blob);
+   const uint8_t input_reads = blob_read_uint8(blob);
+   const bool writes_shading_rate = blob_read_uint8(blob);
+   const bool fsr_1x1 = blob_read_uint8(blob);
+   const uint8_t shading_rate_location = blob_read_uint8(blob);
    struct wvk_shader_source *source = blob_read_uint8(blob) ? source_deserialize(blob) : NULL;
    /* A geometry or tessellation shader is its source alone (geometry_shell). */
    const bool shell = stage == MESA_SHADER_GEOMETRY || stage == MESA_SHADER_TESS_CTRL ||
@@ -8640,6 +8828,11 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    shader->mesh_primitive = mesh_primitive;
    shader->prim_vars = prim_vars;
    shader->payload_size = payload_size;
+   shader->tile_reads = tile_reads;
+   shader->input_reads = input_reads;
+   shader->writes_shading_rate = writes_shading_rate;
+   shader->fsr_1x1 = fsr_1x1;
+   shader->shading_rate_location = shading_rate_location;
    shader->source = source;
    VkResult result = shader->bindings ? VK_SUCCESS : vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    for (uint32_t i = 0; result == VK_SUCCESS && i < WVK_SHADER_VARIANTS; ++i) {

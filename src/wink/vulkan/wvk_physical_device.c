@@ -248,6 +248,7 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_attachment_feedback_loop_dynamic_state = true,
       .EXT_pipeline_protected_access = true,
       .KHR_shader_atomic_int64 = true,
+      .KHR_fragment_shading_rate = true,
       .EXT_shader_atomic_float = true,
       .EXT_shader_atomic_float2 = true,
       .EXT_primitive_topology_list_restart = true,
@@ -728,6 +729,12 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
        * on a tiler (wvk_nir_fetch.c); not depth or stencil, which Metal
        * fetches none of. */
       .shaderTileImageColorReadAccess = fetch,
+      /* Coarse fragments, each pixel of one shading as it does
+       * (wvk_nir_fsr.c): the pipeline's rate, and a vertex shader's of
+       * its primitives. */
+      .pipelineFragmentShadingRate = true,
+      .primitiveFragmentShadingRate = true,
+      .attachmentFragmentShadingRate = true,
       .rasterizationOrderColorAttachmentAccess = fetch,
       /* Every descriptor is one struct, whose binding's WebGPU binding the
        * shader's use of it types (wvk_descriptor_set.c). */
@@ -737,6 +744,8 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .taskShader = wvk_physical_device_meshes(pdev),
       .meshShader = wvk_physical_device_meshes(pdev),
       .meshShaderQueries = wvk_physical_device_meshes(pdev),
+      /* Recorded with each primitive, as its other outputs of it are. */
+      .primitiveFragmentShadingRateMeshShader = wvk_physical_device_meshes(pdev),
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,
@@ -969,6 +978,25 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .triStripVertexOrderIndependentOfProvokingVertex = false,
       /* VK_EXT_shader_tile_image: Metal's programmable blending, of the
        * invocation's own sample. */
+      /* VK_KHR_fragment_shading_rate: a quad's at most (wvk_nir_fsr.c);
+       * 1x1 with what is the pixel's or sample's own. */
+      .minFragmentShadingRateAttachmentTexelSize = { 8, 8 },
+      .maxFragmentShadingRateAttachmentTexelSize = { 32, 32 },
+      .maxFragmentShadingRateAttachmentTexelSizeAspectRatio = 4,
+      .primitiveFragmentShadingRateWithMultipleViewports = false,
+      .layeredShadingRateAttachments = false,
+      .fragmentShadingRateNonTrivialCombinerOps = true,
+      .maxFragmentSize = { 2, 2 },
+      .maxFragmentSizeAspectRatio = 2,
+      .maxFragmentShadingRateCoverageSamples = 16,
+      .maxFragmentShadingRateRasterizationSamples = VK_SAMPLE_COUNT_4_BIT,
+      .fragmentShadingRateWithShaderDepthStencilWrites = false,
+      .fragmentShadingRateWithSampleMask = false,
+      .fragmentShadingRateWithShaderSampleMask = false,
+      .fragmentShadingRateWithConservativeRasterization = false,
+      .fragmentShadingRateWithFragmentShaderInterlock = false,
+      .fragmentShadingRateWithCustomSampleLocations = false,
+      .fragmentShadingRateStrictMultiplyCombiner = true,
       .shaderTileImageCoherentReadAccelerated = true,
       .shaderTileImageReadSampleFromPixelRateInvocation = false,
       .shaderTileImageReadFromHelperInvocation = false,
@@ -1476,6 +1504,10 @@ optimal_features(const struct wvk_physical_device *pdev, VkFormat format)
       /* Through the image's buffer of its texels (wvk_image.h). */
       if (wvk_format_has_atomics(format))
          f |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
+      /* A shading rate attachment, which fragment shaders fetch the
+       * first component of (wvk_nir_fsr.c). */
+      if (wvk_format_shading_rate(format))
+         f |= VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
    }
    /* Transfers work on every format: the ones WebGPU will not copy --
     * Depth24Plus at all, Depth32Float into -- go through a shader. And so
@@ -1612,6 +1644,9 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(caps & WVK_CAP_STORAGE) && !plane_storage)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    if ((usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !(caps & WVK_CAP_RENDER))
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   if ((usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR) &&
+       (!wvk_format_shading_rate(info->format) || info->type != VK_IMAGE_TYPE_2D))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    if ((usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
        !(caps & (WVK_CAP_DEPTH | WVK_CAP_STENCIL)))
@@ -1751,6 +1786,24 @@ wvk_GetPhysicalDeviceExternalBufferProperties(VkPhysicalDevice physicalDevice,
                                               VkExternalBufferProperties *pExternalBufferProperties)
 {
    pExternalBufferProperties->externalMemoryProperties = (VkExternalMemoryProperties){ 0 };
+}
+
+/* A quad's fragment sizes (wvk_nir_fsr.c), largest first: of the sample
+ * counts WebGPU has, and 1x1 of any. */
+VKAPI_ATTR VkResult VKAPI_CALL
+wvk_GetPhysicalDeviceFragmentShadingRatesKHR(VkPhysicalDevice physicalDevice, uint32_t *pFragmentShadingRateCount,
+                                             VkPhysicalDeviceFragmentShadingRateKHR *pFragmentShadingRates)
+{
+   static const VkExtent2D sizes[] = { { 2, 2 }, { 2, 1 }, { 1, 2 }, { 1, 1 } };
+   VK_OUTARRAY_MAKE_TYPED(VkPhysicalDeviceFragmentShadingRateKHR, out, pFragmentShadingRates,
+                          pFragmentShadingRateCount);
+   for (uint32_t i = 0; i < ARRAY_SIZE(sizes); ++i) {
+      vk_outarray_append_typed(VkPhysicalDeviceFragmentShadingRateKHR, &out, r) {
+         r->fragmentSize = sizes[i];
+         r->sampleCounts = i == ARRAY_SIZE(sizes) - 1 ? ~0u : WVK_SAMPLE_COUNTS;
+      }
+   }
+   return vk_outarray_status(&out);
 }
 
 /* The matrices a subgroup of one invocation multiplies (wvk_nir_cmat.c),

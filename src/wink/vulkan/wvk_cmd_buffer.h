@@ -78,6 +78,9 @@ struct wvk_replay {
       bool depth_absent, stencil_absent;
       /* Counts passes, so that what is bound knows when it is gone. */
       uint32_t serial;
+      /* The shading rate attachment's texels' size, 0 without one
+       * (fsr_view). */
+      VkExtent2D fsr_texel;
       /* Resolves WebGPU does not do -- integer formats, modes other than
        * averaging, depth and stencil -- done by vk_meta after the pass,
        * unless it only suspends. */
@@ -113,6 +116,8 @@ struct wvk_replay {
       VkRenderingInfo info;
       VkRenderingAttachmentInfo colors[8];
       VkRenderingAttachmentInfo depth, stencil;
+      /* Its shading rate attachment, the one thing of its chain kept. */
+      VkRenderingFragmentShadingRateAttachmentInfoKHR fsr;
    } pass_copy;
 
    /* Push constants for the submit's draws, 256 bytes apart: written to
@@ -167,6 +172,10 @@ struct wvk_replay {
    WGPUTextureView logic_op_views[8];
    /* And the copy of the depth attachment a depth bounds test reads. */
    WGPUTextureView depth_bounds_view;
+   /* The pass's shading rate attachment, a 2D view of its first layer
+    * (WVK_DRIVER_SLOT_FSR). */
+   WGPUTextureView fsr_view;
+   VkImageView fsr_source;
    /* The buffers the render pass has used so far, and whether written: a
     * draw that would write what it read, or read what it wrote, begins it
     * again -- a render pass is one usage scope. */

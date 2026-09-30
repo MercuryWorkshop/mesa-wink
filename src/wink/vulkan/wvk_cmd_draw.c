@@ -1611,6 +1611,10 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
          e->textureView = replay && replay->depth_bounds_view ? replay->depth_bounds_view : placeholder_view(dev, b);
          continue;
       }
+      if (group == WVK_DRIVER_GROUP && b->binding == WVK_DRIVER_SLOT_FSR) {
+         e->textureView = replay && replay->fsr_view ? replay->fsr_view : placeholder_view(dev, b);
+         continue;
+      }
       if (group == WVK_DRIVER_GROUP && b->binding == WVK_DRIVER_SLOT_LOCKS) {
          e->buffer = dev->atomic_locks;
          e->size = WVK_ATOMIC_LOCKS * 4 + 4;
@@ -2177,7 +2181,7 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
       /* And the driver's group of a draw whose logic op reads copies of
        * the attachments, which are new at every draw. */
       const bool logic_op = pass && g == WVK_DRIVER_GROUP && st->fs &&
-                            (st->fs->logic_op_reads || st->fs->reads_depth_bounds);
+                            (st->fs->logic_op_reads || st->fs->reads_depth_bounds || st->fs->key.fsr_attachment);
       const bool reads_copies = swapped || logic_op ||
                                 (pass && replay->snapshots.size && bgl->count && bound->set &&
                                  reads_snapshot(replay, bgl, bound->set));
@@ -2684,12 +2688,19 @@ prepare_discard_rects(struct wvk_cmd_buffer *cmd)
 {
    struct wvk_bound_state *st = cmd->replay->state;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
-   if (!st->fs || !st->fs->key.discard_rects)
+   if (!st->fs || (!st->fs->key.discard_rects && !st->fs->key.fsr))
       return;
    int32_t words[4 + 4 * WVK_MAX_DISCARD_RECTANGLES] = { 0 };
    const uint32_t count = MIN2(dyn->dr.rectangle_count, WVK_MAX_DISCARD_RECTANGLES);
    words[0] = (int32_t)count;
    words[1] = dyn->dr.mode == VK_DISCARD_RECTANGLE_MODE_EXCLUSIVE_EXT;
+   /* And the pipeline's shading rate and its combiner ops, which coarse
+    * shading combines at the fragment (wvk_nir_fsr.c). */
+   if (st->fs->key.fsr) {
+      const unsigned w = util_logbase2(CLAMP(dyn->fsr.fragment_size.width, 1, 4));
+      const unsigned h = util_logbase2(CLAMP(dyn->fsr.fragment_size.height, 1, 4));
+      words[2] = (int32_t)(((w << 2) | h) | dyn->fsr.combiner_ops[0] << 8 | dyn->fsr.combiner_ops[1] << 16);
+   }
    for (uint32_t i = 0; i < count; ++i) {
       const VkRect2D *r = &dyn->dr.rectangles[i];
       words[4 + 4 * i] = r->offset.x;
@@ -3557,6 +3568,12 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
    struct wvk_bound_views fs_images, vs_images;
    bound_views(st, WVK_BIND_GRAPHICS, st->bound_fs, &fs_images);
    bound_views(st, WVK_BIND_GRAPHICS, st->bound_vs, &vs_images);
+   /* And the pass's shading rate attachment's texel size. */
+   const VkExtent2D texel = replay->rendering.fsr_texel;
+   fs_images.fsr_attachment =
+      replay->fsr_view && texel.width && texel.height
+         ? ((util_logbase2(texel.width) << 4) | util_logbase2(texel.height)) + 1
+         : 0;
    const enum wvk_draw_shape shape = replay->draw_points  ? WVK_DRAW_POINTS
                                      : replay->draw_lines ? (lines_placed(cmd) ? WVK_DRAW_LINES_PLACED : WVK_DRAW_LINES)
                                                           : WVK_DRAW_PRIMITIVES;

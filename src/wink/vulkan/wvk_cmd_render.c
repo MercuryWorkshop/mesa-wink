@@ -221,9 +221,50 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
          .colorAttachmentCount = MESA_VK_MAX_COLOR_ATTACHMENTS,
       };
       vk_cmd_set_rendering_attachment_locations(&cmd->vk, &identity);
+      /* The shading rate attachment (VK_KHR_fragment_shading_rate): a 2D
+       * view of its first layer, which fragment shaders fetch their
+       * rates of (wvk_nir_fsr.c), up to date before the pass; the one
+       * made already, where the pass is begun again. */
+      const VkRenderingFragmentShadingRateAttachmentInfoKHR *fsr =
+         vk_find_struct_const(pRenderingInfo->pNext, RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR);
+      const VkImageView fsr_view = fsr ? fsr->imageView : VK_NULL_HANDLE;
+      if (!resuming || fsr_view != replay->fsr_source) {
+         replay->rendering.fsr_texel = (VkExtent2D){ 0, 0 };
+         replay->fsr_view = NULL;
+         replay->fsr_source = VK_NULL_HANDLE;
+      }
+      if (fsr_view && !replay->fsr_view) {
+         VK_FROM_HANDLE(wvk_image_view, view, fsr->imageView);
+         struct wvk_image *image = (struct wvk_image *)wvk_image_view_image(view);
+         struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
+         wvk_image_use(dev, replay, image, view->vk.base_mip_level, 1, false);
+         uint32_t layer;
+         WGPUTexture texture = wvk_image_layer_texture(image, view->vk.base_array_layer, &layer);
+         WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+         vd.format = view->format;
+         vd.dimension = WGPUTextureViewDimension_2D;
+         vd.baseMipLevel = view->vk.base_mip_level;
+         vd.mipLevelCount = 1;
+         vd.baseArrayLayer = layer;
+         vd.arrayLayerCount = 1;
+         WGPUTextureView v = texture ? wgpuTextureCreateView(texture, &vd) : NULL;
+         if (v) {
+            util_dynarray_append(&replay->views, v);
+            replay->fsr_view = v;
+            replay->fsr_source = fsr_view;
+            replay->rendering.fsr_texel = fsr->shadingRateAttachmentTexelSize;
+         }
+      }
       /* Kept, to begin the pass again with (wvk_replay_restart_pass). */
       replay->pass_copy.info = *info;
       replay->pass_copy.info.pNext = NULL;
+      const VkRenderingFragmentShadingRateAttachmentInfoKHR *rate =
+         vk_find_struct_const(pRenderingInfo->pNext, RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR);
+      if (rate) {
+         replay->pass_copy.fsr = *rate;
+         replay->pass_copy.fsr.pNext = NULL;
+         replay->pass_copy.info.pNext = &replay->pass_copy.fsr;
+      }
       const uint32_t n = MIN2(info->colorAttachmentCount, ARRAY_SIZE(replay->pass_copy.colors));
       for (uint32_t i = 0; i < n; ++i) {
          replay->pass_copy.colors[i] = info->pColorAttachments[i];

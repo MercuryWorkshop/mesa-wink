@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 37
+#define WVK_SHADER_BINARY_VERSION 38
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -217,6 +217,13 @@ struct wvk_shader_key {
     * attachment index + 1 that reads it (0: its tile image reads alone). */
    uint32_t fetch_format[8];
    uint8_t fetch_input[8];
+   /* Fragment: coarse shading (wvk_nir_fsr.c), of the pipeline's rate and
+    * combiner ops in the driver's data (WVK_DRIVER_FSR); and the
+    * attachment's texel size, the log2 of its width << 4 | of its height,
+    * + 1 (0: no attachment). Fragment and vertex: the location + 1 of the
+    * varying of the primitive's rate, which the vertex shader writes
+    * gl_PrimitiveShadingRateEXT to (0: none). */
+   uint8_t fsr, fsr_attachment, fsr_varying;
    /* The format of each storage image the shader has none for, which
     * WGSL's must have: the VkFormat of the view bound there, in the order
     * of wvk_shader::unformatted. */
@@ -262,6 +269,14 @@ struct wvk_shader {
     * a bit each: what it may read by framebuffer fetch
     * (key.fetch_format). */
    uint8_t tile_reads, input_reads;
+   /* Pre-rasterization: writes gl_PrimitiveShadingRateEXT. Fragment: has
+    * what the device shades at 1x1 with (the sample mask, depth or stencil
+    * written, sample shading: fragmentShadingRateWithShaderSampleMask and
+    * the like). */
+   bool writes_shading_rate, fsr_1x1;
+   /* Geometry and mesh: the location + 1 of the generic varying they
+    * record gl_PrimitiveShadingRateEXT as (0: none). */
+   uint8_t shading_rate_location;
    /* Vertex: writes PointSize, and so draws points as quads. Fragment:
     * reads gl_PointCoord (1) or gl_FrontFacing (2), which a point's quad
     * has not; or gl_PrimitiveID (4), which the draw after a geometry
@@ -401,6 +416,9 @@ extern const struct vk_device_shader_ops wvk_device_shader_ops;
  * samplings a non-seamless sampler does (wvk_shader::cube_samples). */
 struct wvk_bound_views {
    VkFormat image_formats[WVK_MAX_UNFORMATTED_IMAGES];
+   /* Of a fragment shader's draw: its pass's shading rate attachment's
+    * texel size, as key.fsr_attachment. */
+   uint8_t fsr_attachment;
    uint8_t non_seamless;
    /* And which of its 2D ones have 2D views of 3D images bound
     * (wvk_shader::flat_views). */

@@ -69,4 +69,26 @@ wvk_format_has_atomics(VkFormat format)
    return format == VK_FORMAT_R32_UINT || format == VK_FORMAT_R32_SINT || format == VK_FORMAT_R32_SFLOAT;
 }
 
+/* A format a shading rate attachment can be of: an unsigned integer one
+ * of WebGPU's own, whose first component fragment shaders fetch
+ * (wvk_nir_fsr.c). */
+static inline bool
+wvk_format_shading_rate(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_R8_UINT:
+   case VK_FORMAT_R8G8_UINT:
+   case VK_FORMAT_R8G8B8A8_UINT:
+   case VK_FORMAT_R16_UINT:
+   case VK_FORMAT_R16G16_UINT:
+   case VK_FORMAT_R16G16B16A16_UINT:
+   case VK_FORMAT_R32_UINT:
+   case VK_FORMAT_R32G32_UINT:
+   case VK_FORMAT_R32G32B32A32_UINT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 #endif
