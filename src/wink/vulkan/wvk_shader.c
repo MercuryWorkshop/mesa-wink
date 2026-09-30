@@ -48,6 +48,7 @@
 #include "util/u_dynarray.h"
 #include "util/u_atomic.h"
 #include "util/mesa-blake3.h"
+#include "util/os_time.h"
 #include "vk_format.h"
 #include "vk_nir.h"
 #include "vk_nir_convert_ycbcr.h"
@@ -6301,7 +6302,71 @@ struct wvk_shader_source {
    simple_mtx_t lock;
    /* struct wvk_shader_key * -> struct wvk_shader * */
    struct hash_table *variants;
+   /* Of its serialization, for the device's variants (variant_digest). */
+   blake3_hash digest;
+   bool digested;
 };
+
+/* Variants of any source, by what they are compiled of (variant_digest):
+ * pipelines of one shader each -- the CTS makes one a draw -- have
+ * sources alike, whose variants are alike. Their serializations, and
+ * their ids, which the render pipelines of them are of; the oldest go
+ * first. */
+#define WVK_VARIANT_CACHE_SIZE 1024
+struct wvk_cached_variant {
+   blake3_hash digest;
+   uint64_t id;
+   void *data;
+   size_t size;
+};
+
+struct wvk_variant_cache {
+   simple_mtx_t lock;
+   struct hash_table *table; /* digest -> struct wvk_cached_variant */
+   struct wvk_cached_variant entries[WVK_VARIANT_CACHE_SIZE];
+   uint32_t next;
+};
+
+static uint32_t
+digest_hash(const void *key)
+{
+   return _mesa_hash_data(key, sizeof(blake3_hash));
+}
+
+static bool
+digest_equal(const void *a, const void *b)
+{
+   return !memcmp(a, b, sizeof(blake3_hash));
+}
+
+void
+wvk_variant_cache_init(struct wvk_device *dev)
+{
+   struct wvk_variant_cache *c = calloc(1, sizeof(*c));
+   if (!c)
+      return;
+   simple_mtx_init(&c->lock, mtx_plain);
+   c->table = _mesa_hash_table_create(NULL, digest_hash, digest_equal);
+   if (!c->table) {
+      free(c);
+      return;
+   }
+   dev->variant_cache = c;
+}
+
+void
+wvk_variant_cache_finish(struct wvk_device *dev)
+{
+   struct wvk_variant_cache *c = dev->variant_cache;
+   if (!c)
+      return;
+   for (uint32_t i = 0; i < WVK_VARIANT_CACHE_SIZE; ++i)
+      free(c->entries[i].data);
+   _mesa_hash_table_destroy(c->table, NULL);
+   simple_mtx_destroy(&c->lock);
+   free(c);
+   dev->variant_cache = NULL;
+}
 
 static uint32_t
 key_hash(const void *key)
@@ -8477,6 +8542,92 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
    return variant_for(dev, shader, &key, &vi);
 }
 
+/* What a variant of `base` for `key` is of: its source, serialized, the key,
+ * and the sample shading its pipeline had. */
+static void
+variant_digest(struct wvk_shader *base, const struct wvk_shader_key *key, blake3_hash out)
+{
+   struct wvk_shader_source *src = base->source;
+   if (!src->digested) {
+      struct blob blob;
+      blob_init(&blob);
+      source_serialize(src, &blob);
+      _mesa_blake3_compute(blob.data, blob.size, src->digest);
+      blob_finish(&blob);
+      src->digested = true;
+   }
+   struct mesa_blake3 ctx;
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, src->digest, sizeof(src->digest));
+   _mesa_blake3_update(&ctx, key, sizeof(*key));
+   const uint8_t more[2] = { base->per_sample, base->vk.stage };
+   _mesa_blake3_update(&ctx, more, sizeof(more));
+   _mesa_blake3_final(&ctx, out);
+}
+
+static VkResult wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint32_t binary_version,
+                                       const VkAllocationCallbacks *pAllocator, struct vk_shader **shader_out);
+static bool wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader, struct blob *blob);
+
+/* The device's variant of `digest`, made again of its serialization, with
+ * its id; or NULL. */
+static struct wvk_shader *
+cached_variant(struct wvk_device *dev, const blake3_hash digest)
+{
+   struct wvk_variant_cache *c = dev->variant_cache;
+   if (!c)
+      return NULL;
+   struct wvk_shader *variant = NULL;
+   simple_mtx_lock(&c->lock);
+   struct hash_entry *he = _mesa_hash_table_search(c->table, digest);
+   if (he) {
+      const struct wvk_cached_variant *e = he->data;
+      struct blob_reader reader;
+      blob_reader_init(&reader, e->data, e->size);
+      struct vk_shader *out;
+      if (wvk_shader_deserialize(&dev->vk, &reader, WVK_SHADER_BINARY_VERSION, NULL, &out) == VK_SUCCESS) {
+         variant = wvk_shader_from_vk(out);
+         variant->id = e->id;
+      }
+   }
+   simple_mtx_unlock(&c->lock);
+   return variant;
+}
+
+/* A variant kept for the device, where it can be made again of its
+ * serialization: not of a geometry or tessellation stage, which is a
+ * source's alone. */
+static void
+cache_variant(struct wvk_device *dev, const blake3_hash digest, const struct wvk_shader *variant)
+{
+   struct wvk_variant_cache *c = dev->variant_cache;
+   if (!c || (variant->vk.stage != MESA_SHADER_VERTEX && variant->vk.stage != MESA_SHADER_FRAGMENT &&
+              variant->vk.stage != MESA_SHADER_COMPUTE))
+      return;
+   struct blob blob;
+   blob_init(&blob);
+   if (!wvk_shader_serialize(&dev->vk, &variant->vk, &blob) || blob.out_of_memory) {
+      blob_finish(&blob);
+      return;
+   }
+   simple_mtx_lock(&c->lock);
+   if (!_mesa_hash_table_search(c->table, digest)) {
+      struct wvk_cached_variant *e = &c->entries[c->next];
+      c->next = (c->next + 1) % WVK_VARIANT_CACHE_SIZE;
+      if (e->data) {
+         _mesa_hash_table_remove_key(c->table, e->digest);
+         free(e->data);
+      }
+      memcpy(e->digest, digest, sizeof(e->digest));
+      e->id = variant->id;
+      blob_finish_get_buffer(&blob, &e->data, &e->size);
+      _mesa_hash_table_insert(c->table, e->digest, e);
+   } else {
+      blob_finish(&blob);
+   }
+   simple_mtx_unlock(&c->lock);
+}
+
 /* The source's variant for `key`: made the first time. */
 static struct wvk_shader *
 variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_shader_key *k_in,
@@ -8520,7 +8671,17 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
                        key.fsr_attachment != own->fsr_attachment
                     ? " shading rate" : "");
       }
-      variant = compile_variant(dev, shader, &key, vi);
+      const int64_t started = os_time_get_nano();
+      blake3_hash digest;
+      variant_digest(shader, &key, digest);
+      variant = cached_variant(dev, digest);
+      if (!variant) {
+         variant = compile_variant(dev, shader, &key, vi);
+         if (variant)
+            cache_variant(dev, digest, variant);
+      }
+      if (getenv("WINK_VK_VARIANT_LOG"))
+         fprintf(stderr, "wvk: variant made in %.2f ms\n", (os_time_get_nano() - started) / 1e6);
       if (!variant)
          mesa_logw_once("wvk: a shader's variant for a draw or dispatch failed to compile");
       struct wvk_shader_key *k = ralloc(src->variants, struct wvk_shader_key);

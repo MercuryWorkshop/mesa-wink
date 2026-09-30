@@ -484,6 +484,7 @@ wvk_device_init_pipeline_caches(struct wvk_device *dev)
    dev->pipeline_layouts = _mesa_hash_table_create(NULL, layout_hash, layout_equal);
    dev->render_pipelines = _mesa_hash_table_create(NULL, render_hash, render_equal);
    dev->compute_pipelines = _mesa_hash_table_create(NULL, compute_hash, compute_equal);
+   wvk_variant_cache_init(dev);
    if (!dev->bind_group_layouts || !dev->pipeline_layouts || !dev->render_pipelines ||
        !dev->compute_pipelines)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
@@ -524,6 +525,7 @@ wvk_device_init_pipeline_caches(struct wvk_device *dev)
 void
 wvk_device_finish_pipeline_caches(struct wvk_device *dev)
 {
+   wvk_variant_cache_finish(dev);
    if (dev->render_pipelines) {
       hash_table_foreach(dev->render_pipelines, he) {
          struct wvk_render_pipeline *p = (void *)he->key;

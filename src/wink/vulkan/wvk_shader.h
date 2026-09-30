@@ -232,6 +232,10 @@ struct wvk_shader_key {
 
 struct wvk_shader_source;
 
+/* The device's variants of any source (wvk_shader.c's variant_for). */
+void wvk_variant_cache_init(struct wvk_device *dev);
+void wvk_variant_cache_finish(struct wvk_device *dev);
+
 enum wvk_shader_variant {
    /* Vulkan's y points down, WebGPU's up: gl_Position.y negated. */
    WVK_SHADER_FLIPPED,

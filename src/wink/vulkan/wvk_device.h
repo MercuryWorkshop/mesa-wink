@@ -62,6 +62,8 @@ struct wvk_device {
    struct hash_table *render_pipelines;     /* struct wvk_render_pipeline */
    struct hash_table *compute_pipelines;    /* struct wvk_compute_pipeline */
    uint64_t next_shader_id;
+   /* Variants of any shader's source, serialized (wvk_shader.c). */
+   struct wvk_variant_cache *variant_cache;
    uint64_t next_memory_serial;
 
    /* An empty group, for the gaps before the driver's. */

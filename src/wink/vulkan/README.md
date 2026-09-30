@@ -53,8 +53,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   multisampling. Each keeps its source for that: its NIR as compiled, and
   copies of its set layouts, serialized with it. A draw whose state
   differs from what a shader was compiled for uses a variant compiled
-  from the source and cached (`wvk_shader_draw_variant`).
-  `WINK_VK_VARIANT_LOG=1` says when one is compiled, and why.
+  from the source and cached (`wvk_shader_draw_variant`) -- by the
+  device too, serialized, of a digest of the source and what it is a
+  variant for, so that the variants of another shader alike, of another
+  pipeline, are made of that and have its render pipelines.
+  `WINK_VK_VARIANT_LOG=1` says when one is made, why, and how long it
+  took.
   Monolithic pipelines' shaders are compiled for their draws and have no
   variants.
 - **64-bit floats**, which WGSL has none of, are Mesa's float64.glsl in
