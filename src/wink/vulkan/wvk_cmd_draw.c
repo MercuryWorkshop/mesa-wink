@@ -2679,11 +2679,22 @@ set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
          depth[1] += depth[0] * 0.5f;
          depth[0] *= 0.5f;
       }
+      /* Neither clipped nor clamped: WebGPU clamps a fragment's depth to
+       * the viewport's range always, Vulkan not then. So WebGPU's range is
+       * all of it, and the shader's depth is in the viewport's already. */
+      float range_min = min_depth, range_max = max_depth;
+      if (!dyn->rs.depth_clamp_enable && !vk_rasterization_state_depth_clip_enable(&dyn->rs) &&
+          wvk_physical_device_has_feature(wvk_device_physical(wvk_cmd_buffer_device(cmd)), WGPUFeatureName_DepthClipControl)) {
+         depth[0] *= max_depth - min_depth;
+         depth[1] = depth[1] * (max_depth - min_depth) + min_depth;
+         range_min = 0.0f;
+         range_max = 1.0f;
+      }
       if (memcmp(st->push + WVK_DRIVER_DEPTH_OFFSET, depth, sizeof(depth))) {
          memcpy(st->push + WVK_DRIVER_DEPTH_OFFSET, depth, sizeof(depth));
          st->push_offset = UINT32_MAX;
       }
-      wgpuRenderPassEncoderSetViewport(pass, x0, y0, x1 - x0, y1 - y0, min_depth, max_depth);
+      wgpuRenderPassEncoderSetViewport(pass, x0, y0, x1 - x0, y1 - y0, range_min, range_max);
    }
    if (dyn->vp.scissor_count) {
       const VkRect2D s = dyn->vp.scissors[MIN2(index, dyn->vp.scissor_count - 1)];
