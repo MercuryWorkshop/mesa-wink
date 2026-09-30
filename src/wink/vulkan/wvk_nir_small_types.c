@@ -403,6 +403,12 @@ widen_type(const struct glsl_type *type, bool floats)
       free(fields);
       return t;
    }
+   /* A matrix of half floats: an array of its columns, widened -- which
+    * its derefs, a column at a time, are of too. */
+   if (glsl_type_is_matrix(type)) {
+      const struct glsl_type *column = widen_type(glsl_get_column_type(type), floats);
+      return column ? glsl_array_type(column, glsl_get_matrix_columns(type), 0) : NULL;
+   }
    if (!glsl_type_is_vector_or_scalar(type) || !is_small(glsl_get_bit_size(type)))
       return NULL;
    const enum glsl_base_type base = glsl_get_base_type(type);
