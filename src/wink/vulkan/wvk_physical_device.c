@@ -1607,6 +1607,31 @@ wvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat
    }
 }
 
+/* Whether an optimal image of `format` can have these uses. */
+static bool
+format_usage_supported(const struct wvk_physical_device *pdev, VkFormat format, VkImageType type,
+                       VkImageUsageFlags usage, bool plane_storage)
+{
+   const uint32_t caps = wvk_format_caps(pdev, format);
+   if (!caps)
+      return false;
+   if ((usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) && !(caps & WVK_CAP_SAMPLE))
+      return false;
+   /* An input attachment is an attachment too. */
+   if ((usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) && !(caps & (WVK_CAP_RENDER | WVK_CAP_DEPTH | WVK_CAP_STENCIL)))
+      return false;
+   if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(caps & WVK_CAP_STORAGE) && !plane_storage)
+      return false;
+   if ((usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !(caps & WVK_CAP_RENDER))
+      return false;
+   if ((usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR) &&
+       (!wvk_format_shading_rate(format) || type != VK_IMAGE_TYPE_2D))
+      return false;
+   if ((usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) && !(caps & (WVK_CAP_DEPTH | WVK_CAP_STENCIL)))
+      return false;
+   return true;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
                                             const VkPhysicalDeviceImageFormatInfo2 *info,
@@ -1645,26 +1670,32 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    if (stencil_usage)
       usage |= stencil_usage->stencilUsage;
 
-   if ((usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)) &&
-       !(caps & WVK_CAP_SAMPLE))
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
-   /* An input attachment is an attachment too. */
-   if ((usage & VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT) &&
-       !(caps & (WVK_CAP_RENDER | WVK_CAP_DEPTH | WVK_CAP_STENCIL)))
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
    /* A multi-planar image's planes may be storage, viewed as formats
     * that are, where it says so. */
    const bool plane_storage = (caps & WVK_CAP_PLANAR) && (info->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT);
-   if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) && !(caps & WVK_CAP_STORAGE) && !plane_storage)
+   if (info->flags & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) {
+      /* Each use of the image's own format or of a format it may be
+       * viewed as: of a texel of as many bytes, compressed alike. */
+      const enum pipe_format pf = vk_format_to_pipe_format(info->format);
+      u_foreach_bit(bit, usage) {
+         const VkImageUsageFlags one = BITFIELD_BIT(bit);
+         bool any = format_usage_supported(pdev, info->format, info->type, one, plane_storage);
+         for (VkFormat f = VK_FORMAT_R4G4_UNORM_PACK8; !any && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++f) {
+            const enum pipe_format of = vk_format_to_pipe_format(f);
+            if (of == PIPE_FORMAT_NONE || util_format_get_blocksize(of) != util_format_get_blocksize(pf) ||
+                util_format_is_compressed(of) != util_format_is_compressed(pf) ||
+                util_format_get_blockwidth(of) != util_format_get_blockwidth(pf) ||
+                util_format_get_blockheight(of) != util_format_get_blockheight(pf) ||
+                vk_format_is_depth_or_stencil(f) != vk_format_is_depth_or_stencil(info->format))
+               continue;
+            any = format_usage_supported(pdev, f, info->type, one, false);
+         }
+         if (!any)
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+      }
+   } else if (!format_usage_supported(pdev, info->format, info->type, usage, plane_storage)) {
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
-   if ((usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !(caps & WVK_CAP_RENDER))
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
-   if ((usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR) &&
-       (!wvk_format_shading_rate(info->format) || info->type != VK_IMAGE_TYPE_2D))
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
-   if ((usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) &&
-       !(caps & (WVK_CAP_DEPTH | WVK_CAP_STENCIL)))
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+   }
    if (info->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
                       VK_IMAGE_CREATE_SPARSE_ALIASED_BIT))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
