@@ -318,7 +318,14 @@ depth_in_pipeline(struct wvk_device *dev, WGPUTextureFormat format)
    while (i < ARRAY_SIZE(dev->depth_in_pipelines) && dev->depth_in_pipelines[i].pipeline &&
           dev->depth_in_pipelines[i].format != format)
       ++i;
-   if (i < ARRAY_SIZE(dev->depth_in_pipelines) && !dev->depth_in_pipelines[i].pipeline) {
+   /* Full: the last is made again, for this. Commands recorded with it
+    * hold it still. */
+   if (i == ARRAY_SIZE(dev->depth_in_pipelines)) {
+      --i;
+      wgpuRenderPipelineRelease(dev->depth_in_pipelines[i].pipeline);
+      dev->depth_in_pipelines[i].pipeline = NULL;
+   }
+   if (!dev->depth_in_pipelines[i].pipeline) {
       WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
       source.code = wvk_sv(depth_in_wgsl);
       WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
@@ -344,8 +351,7 @@ depth_in_pipeline(struct wvk_device *dev, WGPUTextureFormat format)
       dev->depth_in_pipelines[i].pipeline = wgpuDeviceCreateRenderPipeline(dev->wgpu, &desc);
       wgpuShaderModuleRelease(module);
    }
-   if (i < ARRAY_SIZE(dev->depth_in_pipelines))
-      pipeline = dev->depth_in_pipelines[i].pipeline;
+   pipeline = dev->depth_in_pipelines[i].pipeline;
    simple_mtx_unlock(&dev->cache_lock);
    return pipeline;
 }
@@ -868,7 +874,14 @@ ms_copy_pipeline(struct wvk_device *dev, WGPUTextureFormat format, VkFormat vk_f
    while (i < ARRAY_SIZE(dev->ms_copy_pipelines) && dev->ms_copy_pipelines[i].pipeline &&
           (dev->ms_copy_pipelines[i].format != format || dev->ms_copy_pipelines[i].samples != samples))
       ++i;
-   if (i < ARRAY_SIZE(dev->ms_copy_pipelines) && !dev->ms_copy_pipelines[i].pipeline) {
+   /* Full: the last is made again, for this. Commands recorded with it
+    * hold it still. */
+   if (i == ARRAY_SIZE(dev->ms_copy_pipelines)) {
+      --i;
+      wgpuRenderPipelineRelease(dev->ms_copy_pipelines[i].pipeline);
+      dev->ms_copy_pipelines[i].pipeline = NULL;
+   }
+   if (!dev->ms_copy_pipelines[i].pipeline) {
       const char *type = vk_format_is_sint(vk_format) ? "i32" : vk_format_is_int(vk_format) ? "u32" : "f32";
       char *code = ralloc_strdup(NULL, "");
       for (const char *c = ms_copy_wgsl; *c; ++c) {
@@ -902,8 +915,7 @@ ms_copy_pipeline(struct wvk_device *dev, WGPUTextureFormat format, VkFormat vk_f
       dev->ms_copy_pipelines[i].pipeline = wgpuDeviceCreateRenderPipeline(dev->wgpu, &desc);
       wgpuShaderModuleRelease(module);
    }
-   if (i < ARRAY_SIZE(dev->ms_copy_pipelines))
-      pipeline = dev->ms_copy_pipelines[i].pipeline;
+   pipeline = dev->ms_copy_pipelines[i].pipeline;
    simple_mtx_unlock(&dev->cache_lock);
    return pipeline;
 }
@@ -1083,7 +1095,14 @@ ms_bits_pipeline(struct wvk_device *dev, WGPUTextureFormat from, WGPUTextureForm
           (dev->ms_alias_pipelines[i].from != a->format || dev->ms_alias_pipelines[i].to != b->format ||
            dev->ms_alias_pipelines[i].samples != samples))
       ++i;
-   if (i < ARRAY_SIZE(dev->ms_alias_pipelines) && !dev->ms_alias_pipelines[i].pipeline) {
+   /* Full: the last is made again, for this. Commands recorded with it
+    * hold it still. */
+   if (i == ARRAY_SIZE(dev->ms_alias_pipelines)) {
+      --i;
+      wgpuRenderPipelineRelease(dev->ms_alias_pipelines[i].pipeline);
+      dev->ms_alias_pipelines[i].pipeline = NULL;
+   }
+   if (!dev->ms_alias_pipelines[i].pipeline) {
       char *code = ralloc_asprintf(
          NULL,
          "@group(0) @binding(0) var src: texture_multisampled_2d<%s>;\n"
@@ -1144,8 +1163,7 @@ ms_bits_pipeline(struct wvk_device *dev, WGPUTextureFormat from, WGPUTextureForm
       wgpuPipelineLayoutRelease(layout);
       wgpuShaderModuleRelease(module);
    }
-   if (i < ARRAY_SIZE(dev->ms_alias_pipelines))
-      pipeline = dev->ms_alias_pipelines[i].pipeline;
+   pipeline = dev->ms_alias_pipelines[i].pipeline;
    simple_mtx_unlock(&dev->cache_lock);
    return pipeline;
 }
@@ -1273,10 +1291,118 @@ ds_copy_pipeline(struct wvk_device *dev, bool stencil)
    return pipeline;
 }
 
+/* Each sample of a 4-sample image's depth into R32Float, or stencil into
+ * R8Uint: its first layer, which shaders see of a multisampled array. */
+static WGPURenderPipeline
+ds_copy_ms_pipeline(struct wvk_device *dev, bool stencil)
+{
+   simple_mtx_lock(&dev->cache_lock);
+   WGPURenderPipeline *slot = &dev->ds_copy_ms_pipelines[stencil];
+   if (!*slot) {
+      const char *code = stencil
+         ? "@group(0) @binding(0) var src: texture_multisampled_2d<u32>;\n"
+           "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n"
+           "  let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n"
+           "  return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);\n"
+           "}\n"
+           "@fragment fn fs(@builtin(position) pos: vec4f, @builtin(sample_index) s: u32) -> @location(0) vec4u {\n"
+           "  return textureLoad(src, vec2i(pos.xy), i32(s));\n"
+           "}\n"
+         : "@group(0) @binding(0) var src: texture_depth_multisampled_2d;\n"
+           "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n"
+           "  let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n"
+           "  return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);\n"
+           "}\n"
+           "@fragment fn fs(@builtin(position) pos: vec4f, @builtin(sample_index) s: u32) -> @location(0) vec4f {\n"
+           "  return vec4f(textureLoad(src, vec2i(pos.xy), i32(s)), 0.0, 0.0, 1.0);\n"
+           "}\n";
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(code);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      sm.label = wvk_sv("wvk depth-stencil ms copy");
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+      target.format = stencil ? WGPUTextureFormat_R8Uint : WGPUTextureFormat_R32Float;
+      WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+      fragment.module = module;
+      fragment.entryPoint = wvk_sv("fs");
+      fragment.targetCount = 1;
+      fragment.targets = &target;
+      WGPURenderPipelineDescriptor pd = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+      pd.label = wvk_sv("wvk depth-stencil ms copy");
+      pd.vertex.module = module;
+      pd.vertex.entryPoint = wvk_sv("vs");
+      pd.fragment = &fragment;
+      pd.multisample.count = 4;
+      *slot = wgpuDeviceCreateRenderPipeline(dev->wgpu, &pd);
+      wgpuShaderModuleRelease(module);
+   }
+   WGPURenderPipeline pipeline = *slot;
+   simple_mtx_unlock(&dev->cache_lock);
+   return pipeline;
+}
+
+static WGPUTexture
+snapshot_ds_ms(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image, bool stencil)
+{
+   if (image->vk.samples != 4)
+      return NULL;
+   WGPURenderPipeline pipeline = ds_copy_ms_pipeline(dev, stencil);
+   if (!pipeline)
+      return NULL;
+   WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+   desc.label = wvk_sv("VkImage copy");
+   desc.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_RenderAttachment;
+   desc.size = (WGPUExtent3D){ wgpuTextureGetWidth(image->texture), wgpuTextureGetHeight(image->texture), 1 };
+   desc.format = stencil ? WGPUTextureFormat_R8Uint : WGPUTextureFormat_R32Float;
+   desc.sampleCount = 4;
+   WGPUTexture copy = wgpuDeviceCreateTexture(dev->wgpu, &desc);
+   if (!copy)
+      return NULL;
+   wvk_replay_end_passes(replay);
+   WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   vd.dimension = WGPUTextureViewDimension_2D;
+   vd.arrayLayerCount = 1;
+   vd.mipLevelCount = 1;
+   vd.aspect = stencil ? WGPUTextureAspect_StencilOnly : WGPUTextureAspect_DepthOnly;
+   WGPUTextureView src = wgpuTextureCreateView(image->texture, &vd);
+   util_dynarray_append(&replay->views, src);
+   vd.aspect = WGPUTextureAspect_All;
+   WGPUTextureView dst = wgpuTextureCreateView(copy, &vd);
+   util_dynarray_append(&replay->views, dst);
+   WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+   const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = bgl;
+   bg.entryCount = 1;
+   bg.entries = &entry;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bgl);
+   WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+   color.view = dst;
+   color.loadOp = WGPULoadOp_Clear;
+   color.storeOp = WGPUStoreOp_Store;
+   WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+   pd.label = wvk_sv("wvk depth-stencil ms copy");
+   pd.colorAttachmentCount = 1;
+   pd.colorAttachments = &color;
+   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &pd);
+   wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+   wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+   wgpuRenderPassEncoderEnd(pass);
+   wgpuRenderPassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+   return copy;
+}
+
 WGPUTexture
 wvk_image_snapshot_ds(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image, bool stencil)
 {
-   if (!image->texture || image->vk.samples > 1 || image->dimension == WGPUTextureDimension_3D)
+   if (image->texture && image->vk.samples > 1)
+      return snapshot_ds_ms(dev, replay, image, stencil);
+   if (!image->texture || image->dimension == WGPUTextureDimension_3D)
       return NULL;
    WGPURenderPipeline pipeline = ds_copy_pipeline(dev, stencil);
    if (!pipeline)

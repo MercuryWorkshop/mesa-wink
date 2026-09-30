@@ -150,6 +150,8 @@ struct wvk_device {
    /* Depth into R32Float and stencil into R8Uint, for copies of them a
     * pass reads. */
    WGPURenderPipeline ds_copy_pipelines[2];
+   /* The same of 4-sample images, each sample. */
+   WGPURenderPipeline ds_copy_ms_pipelines[2];
    /* What a binding with no descriptor written shows: 1x1 textures of
     * each kind a bind group layout can want (descriptorBindingPartiallyBound),
     * as many kinds as are asked for. */

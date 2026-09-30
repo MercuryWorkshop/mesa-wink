@@ -628,6 +628,10 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       if (dev->ds_copy_pipelines[i])
          wgpuRenderPipelineRelease(dev->ds_copy_pipelines[i]);
    }
+   for (uint32_t i = 0; i < ARRAY_SIZE(dev->ds_copy_ms_pipelines); ++i) {
+      if (dev->ds_copy_ms_pipelines[i])
+         wgpuRenderPipelineRelease(dev->ds_copy_ms_pipelines[i]);
+   }
    for (uint32_t i = 0; i < ARRAY_SIZE(dev->ms_copy_pipelines); ++i) {
       if (dev->ms_copy_pipelines[i].pipeline)
          wgpuRenderPipelineRelease(dev->ms_copy_pipelines[i].pipeline);
