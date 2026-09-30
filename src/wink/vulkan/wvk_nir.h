@@ -34,6 +34,9 @@ bool wvk_nir_lower_robust_images(nir_shader *nir, const uint32_t *meta_base, boo
 /* A view's minimum LOD, where the device has them (VK_EXT_image_view_min_lod):
  * before the samplers' lowering. */
 bool wvk_nir_lower_view_min_lod(nir_shader *nir, const uint32_t *meta_base);
+/* The slices of 3D images storage views have (VK_EXT_image_sliced_view_of_3d,
+ * and 2D views of 3D images): after the robust images' bounds. */
+bool wvk_nir_lower_image_slices(nir_shader *nir, const uint32_t *meta_base);
 
 /* Storage images shaders do atomics on, as their image's buffer of
  * texels (wvk_image.h), where their records say. */

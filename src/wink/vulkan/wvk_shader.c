@@ -610,8 +610,10 @@ wvk_hash_state(struct vk_physical_device *device, const struct vk_graphics_pipel
    /* And whether images may be null, which shaders check themselves;
     * whether views may have minimum LODs, which they clamp to; and whether
     * cubes may be non-seamless, which they keep their cubes' samplers for. */
-   const uint8_t checked[3] = { enabled_features->nullDescriptor, enabled_features->minLod,
-                                enabled_features->nonSeamlessCubeMap };
+   const uint8_t checked[5] = {
+      enabled_features->nullDescriptor, enabled_features->minLod, enabled_features->nonSeamlessCubeMap,
+      enabled_features->image2DViewOf3D || enabled_features->sampler2DViewOf3D, enabled_features->imageSlicedViewOf3D,
+   };
    _mesa_blake3_update(&ctx, checked, sizeof(checked));
    _mesa_blake3_final(&ctx, blake3_out);
 }
@@ -3236,6 +3238,156 @@ face_cubes(nir_shader *nir, struct wvk_shader *shader, uint8_t non_seamless)
    if (faced->entries)
       nir_fixup_deref_types(nir);
    _mesa_set_destroy(faced, NULL);
+}
+
+/* Of a variant for 2D views of 3D images (key.views_3d), a query's result
+ * of the 3D texture or image as the 2D one's: its first `n` components. */
+static void
+flat_query(nir_builder *b, nir_def *def, unsigned n)
+{
+   def->num_components = 3;
+   b->cursor = nir_after_instr(nir_def_instr(def));
+   nir_def *placeholder = nir_undef(b, n, def->bit_size);
+   nir_def_rewrite_uses(def, placeholder);
+   b->cursor = nir_after_instr(nir_def_instr(placeholder));
+   nir_def_rewrite_uses(placeholder, nir_trim_vector(b, def, n));
+   nir_instr_remove(nir_def_instr(placeholder));
+}
+
+struct flat_views_state {
+   const uint32_t *meta;
+   struct set *deep;
+};
+
+static bool
+flat_view_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   const struct flat_views_state *s = data;
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      switch (intr->intrinsic) {
+      case nir_intrinsic_image_deref_load:
+      case nir_intrinsic_image_deref_sparse_load:
+      case nir_intrinsic_image_deref_store:
+      case nir_intrinsic_image_deref_atomic:
+      case nir_intrinsic_image_deref_atomic_swap:
+      case nir_intrinsic_image_deref_size:
+      case nir_intrinsic_image_deref_samples:
+         break;
+      default:
+         return false;
+      }
+      nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(intr->src[0]));
+      if (!var || !_mesa_set_search(s->deep, var))
+         return false;
+      nir_intrinsic_set_image_dim(intr, GLSL_SAMPLER_DIM_3D);
+      nir_intrinsic_set_image_array(intr, false);
+      if (intr->intrinsic == nir_intrinsic_image_deref_size) {
+         flat_query(b, &intr->def, MIN2(intr->def.num_components, 2));
+      } else if (intr->intrinsic != nir_intrinsic_image_deref_samples) {
+         /* At z 0: the slices' lowering moves it to the view's slice. */
+         b->cursor = nir_before_instr(instr);
+         nir_src_rewrite(&intr->src[1], nir_vector_insert_imm(b, intr->src[1].ssa, nir_imm_int(b, 0), 2));
+      }
+      return true;
+   }
+   if (instr->type != nir_instr_type_tex)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   const int texture = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   nir_variable *var = texture >= 0 ? nir_deref_instr_get_variable(nir_src_as_deref(tex->src[texture].src)) : NULL;
+   if (!var || !_mesa_set_search(s->deep, var))
+      return false;
+   b->cursor = nir_before_instr(instr);
+   tex->sampler_dim = GLSL_SAMPLER_DIM_3D;
+   tex->is_array = false;
+   switch (tex->op) {
+   case nir_texop_txs:
+      flat_query(b, &tex->def, MIN2(tex->def.num_components, 2));
+      return true;
+   case nir_texop_query_levels:
+   case nir_texop_texture_samples:
+      return true;
+   default:
+      break;
+   }
+   const int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_idx < 0)
+      return true;
+   nir_def *coord = tex->src[coord_idx].src.ssa;
+   nir_def *slice = wvk_nir_load_meta(b, s->meta, var->data.descriptor_set, nir_imm_int(b, var->data.binding),
+                                      WVK_META_TEX_SLICE);
+   nir_def *z;
+   if (tex->op == nir_texop_txf) {
+      z = slice;
+   } else {
+      /* The middle of the slice, of the level's depth. */
+      const int lod_idx = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+      nir_def *level = tex->op == nir_texop_txl && lod_idx >= 0
+                          ? nir_imax(b, nir_f2i32(b, tex->src[lod_idx].src.ssa), nir_imm_int(b, 0))
+                          : nir_imm_int(b, 0);
+      nir_def *size = nir_build_texture_query(b, tex, nir_texop_txs, 3, nir_type_int32, false, false);
+      nir_tex_instr_add_src(nir_instr_as_tex(nir_def_instr(size)), nir_tex_src_lod, level);
+      z = nir_fdiv(b, nir_fadd_imm(b, nir_u2f32(b, slice), 0.5), nir_i2f32(b, nir_channel(b, size, 2)));
+   }
+   nir_src_rewrite(&tex->src[coord_idx].src, nir_vec3(b, nir_channel(b, coord, 0), nir_channel(b, coord, 1), z));
+   tex->coord_components = 3;
+   /* Gradients and offsets of the third axis, none. */
+   const nir_tex_src_type padded[] = { nir_tex_src_ddx, nir_tex_src_ddy, nir_tex_src_offset };
+   for (unsigned i = 0; i < ARRAY_SIZE(padded); ++i) {
+      const int idx = nir_tex_instr_src_index(tex, padded[i]);
+      if (idx >= 0 && tex->src[idx].src.ssa->num_components == 2)
+         nir_src_rewrite(&tex->src[idx].src,
+                         nir_pad_vector_imm_int(b, tex->src[idx].src.ssa, 0, 3));
+   }
+   if (tex->op == nir_texop_tg4) {
+      /* WGSL gathers no 3D textures: the component, of the nearest texel. */
+      mesa_logw_once("wvk: a gather from a 2D view of a 3D image, which takes one texel");
+      tex->op = nir_texop_txl;
+      nir_tex_instr_add_src(tex, nir_tex_src_lod, nir_imm_float(b, 0.0f));
+      b->cursor = nir_after_instr(instr);
+      nir_def *c = nir_channel(b, &tex->def, tex->component);
+      nir_def *all = nir_vec4(b, c, c, c, c);
+      nir_def_rewrite_uses_after(&tex->def, all);
+   }
+   return true;
+}
+
+/* The 2D textures and storage images a shader has (wvk_shader::flat_views),
+ * where the device has 2D views of 3D images; and of a variant for such
+ * views bound (key.views_3d), each the 3D one the view is of -- a texture
+ * sampled at the middle of the view's slice, which its record says, and
+ * an image at z 0, which the slices' lowering moves to the slice
+ * (wvk_nir_lower_image_slices). After the variables are split. */
+static void
+flat_views(nir_shader *nir, struct wvk_shader *shader, uint8_t views_3d)
+{
+   shader->flat_view_count = 0;
+   struct flat_views_state s = { .meta = shader->meta_base, .deep = _mesa_pointer_set_create(NULL) };
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform | nir_var_image) {
+      const struct glsl_type *type = var->type;
+      if (glsl_type_is_array(type) || !(glsl_type_is_texture(type) || glsl_type_is_image(type)) ||
+          glsl_get_sampler_dim(type) != GLSL_SAMPLER_DIM_2D || glsl_sampler_type_is_array(type))
+         continue;
+      if (shader->flat_view_count == WVK_MAX_FLAT_VIEWS) {
+         mesa_logw_once("wvk: more 2D textures and images than %u, which have no 2D views of 3D images",
+                        WVK_MAX_FLAT_VIEWS);
+         break;
+      }
+      const unsigned i = shader->flat_view_count++;
+      shader->flat_views[i] = var->data.descriptor_set << 10 | var->data.binding;
+      if (!(views_3d & BITFIELD_BIT(i)))
+         continue;
+      const enum glsl_base_type result = glsl_get_sampler_result_type(type);
+      var->type = glsl_type_is_image(type) ? glsl_image_type(GLSL_SAMPLER_DIM_3D, false, result)
+                                           : glsl_texture_type(GLSL_SAMPLER_DIM_3D, false, result);
+      _mesa_set_add(s.deep, var);
+   }
+   if (s.deep->entries) {
+      nir_fixup_deref_types(nir);
+      nir_shader_instructions_pass(nir, flat_view_instr, nir_metadata_none, &s);
+   }
+   _mesa_set_destroy(s.deep, NULL);
 }
 
 static bool
@@ -6008,6 +6160,10 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       shader->key.non_seamless = records ? records->non_seamless : 0;
       face_cubes(nir, shader, shader->key.non_seamless);
    }
+   if (dev->vk.enabled_features.image2DViewOf3D || dev->vk.enabled_features.sampler2DViewOf3D) {
+      shader->key.views_3d = records ? records->views_3d : 0;
+      flat_views(nir, shader, shader->key.views_3d);
+   }
    NIR_PASS(_, nir, nir_shader_instructions_pass, integer_cube_query_instr, nir_metadata_control_flow, NULL);
    struct util_dynarray bgra;
    util_dynarray_init(&bgra, mem_ctx);
@@ -6025,6 +6181,8 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    NIR_PASS(_, nir, wvk_nir_lower_robust_images, shader->meta_base,
             robustness && robustness->images == VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2,
             dev->vk.enabled_features.nullDescriptor);
+   if (dev->vk.enabled_features.imageSlicedViewOf3D || dev->vk.enabled_features.image2DViewOf3D)
+      NIR_PASS(_, nir, wvk_nir_lower_image_slices, shader->meta_base);
    /* Swizzles first: a gather's is a gather of another component, which
     * then samples as its own; and the border replaces a texel before the
     * swizzle takes it apart. */
@@ -6399,6 +6557,20 @@ has_float_cubes(const nir_shader *nir)
    return false;
 }
 
+/* Whether a shader has 2D textures or storage images, a 2D view of a 3D
+ * image could be bound at (key.views_3d). */
+static bool
+has_flat_views(const nir_shader *nir)
+{
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform | nir_var_image) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      if ((glsl_type_is_sampler(type) || glsl_type_is_texture(type) || glsl_type_is_image(type)) &&
+          glsl_get_sampler_dim(type) == GLSL_SAMPLER_DIM_2D && !glsl_sampler_type_is_array(type))
+         return true;
+   }
+   return false;
+}
+
 /* The YCbCr conversion of an immutable sampler of the layout's, which
  * sampling through is a sample of each plane (nir_vk_lower_ycbcr_tex). */
 static const struct vk_ycbcr_conversion_state *
@@ -6441,7 +6613,9 @@ wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_co
       if ((infos[i].stage == MESA_SHADER_VERTEX || infos[i].stage == MESA_SHADER_FRAGMENT ||
            infos[i].stage == MESA_SHADER_GEOMETRY || infos[i].stage == MESA_SHADER_TESS_CTRL ||
            infos[i].stage == MESA_SHADER_TESS_EVAL || has_unformatted_images(infos[i].nir) ||
-           (dev->vk.enabled_features.nonSeamlessCubeMap && has_float_cubes(infos[i].nir))) &&
+           (dev->vk.enabled_features.nonSeamlessCubeMap && has_float_cubes(infos[i].nir)) ||
+           ((dev->vk.enabled_features.image2DViewOf3D || dev->vk.enabled_features.sampler2DViewOf3D) &&
+            has_flat_views(infos[i].nir))) &&
           i < ARRAY_SIZE(sources))
          sources[i] = source_create(&infos[i]);
    }
@@ -6617,9 +6791,12 @@ key_image_formats(const struct wvk_shader *shader, const struct wvk_bound_views 
       key->image_format[i] = f;
       same &= f == shader->key.image_format[i];
    }
-   /* And the cubes non-seamless samplers sample. */
+   /* And the cubes non-seamless samplers sample, and the 2D views of 3D
+    * images bound. */
    key->non_seamless = views ? views->non_seamless : shader->key.non_seamless;
    same &= key->non_seamless == shader->key.non_seamless;
+   key->views_3d = views ? views->views_3d : shader->key.views_3d;
+   same &= key->views_3d == shader->key.views_3d;
    return same;
 }
 
@@ -6857,7 +7034,8 @@ variant_for(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_
 struct wvk_shader *
 wvk_shader_dispatch_variant(struct wvk_device *dev, struct wvk_shader *shader, const struct wvk_bound_views *views)
 {
-   if (!shader || !shader->source || (!shader->unformatted_count && !shader->cube_sample_count))
+   if (!shader || !shader->source ||
+       (!shader->unformatted_count && !shader->cube_sample_count && !shader->flat_view_count))
       return shader;
    struct wvk_shader_key key = shader->key;
    if (key_image_formats(shader, views, &key))
@@ -6923,6 +7101,8 @@ wvk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader
    blob_write_bytes(blob, shader->unformatted, sizeof(shader->unformatted));
    blob_write_uint8(blob, shader->cube_sample_count);
    blob_write_bytes(blob, shader->cube_samples, sizeof(shader->cube_samples));
+   blob_write_uint8(blob, shader->flat_view_count);
+   blob_write_bytes(blob, shader->flat_views, sizeof(shader->flat_views));
    blob_write_uint8(blob, shader->writes_depth);
    blob_write_uint8(blob, shader->uses_push_constants);
    blob_write_uint8(blob, shader->uses_draw_parameters);
@@ -6998,6 +7178,9 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    const uint8_t cube_sample_count = blob_read_uint8(blob);
    uint32_t cube_samples[WVK_MAX_CUBE_SAMPLES];
    blob_copy_bytes(blob, cube_samples, sizeof(cube_samples));
+   const uint8_t flat_view_count = blob_read_uint8(blob);
+   uint16_t flat_views[WVK_MAX_FLAT_VIEWS];
+   blob_copy_bytes(blob, flat_views, sizeof(flat_views));
    const bool writes_depth = blob_read_uint8(blob);
    const bool uses_push_constants = blob_read_uint8(blob);
    const bool uses_draw_parameters = blob_read_uint8(blob);
@@ -7079,6 +7262,8 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
    memcpy(shader->unformatted, unformatted, sizeof(unformatted));
    shader->cube_sample_count = MIN2(cube_sample_count, WVK_MAX_CUBE_SAMPLES);
    memcpy(shader->cube_samples, cube_samples, sizeof(cube_samples));
+   shader->flat_view_count = MIN2(flat_view_count, WVK_MAX_FLAT_VIEWS);
+   memcpy(shader->flat_views, flat_views, sizeof(flat_views));
    shader->writes_depth = writes_depth;
    shader->uses_push_constants = uses_push_constants;
    shader->uses_draw_parameters = uses_draw_parameters;

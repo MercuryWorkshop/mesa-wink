@@ -1870,3 +1870,51 @@ wvk_nir_lower_view_min_lod(nir_shader *nir, const uint32_t *meta_base)
    }
    return progress;
 }
+
+/* ---------------------------------------------------------------------- */
+/* The slices of a 3D image a storage view has (VK_EXT_image_sliced_view_of_3d,
+ * and a 2D view's one of them): WebGPU views the level whole, so z is the
+ * view's first slice on, and the size's depth the view's slices. After the
+ * robust images' bounds, which are of the view's own coordinates. */
+
+static bool
+image_slices_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const uint32_t *meta = data;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_image_deref_load:
+   case nir_intrinsic_image_deref_sparse_load:
+   case nir_intrinsic_image_deref_store:
+   case nir_intrinsic_image_deref_atomic:
+   case nir_intrinsic_image_deref_atomic_swap:
+   case nir_intrinsic_image_deref_size:
+      break;
+   default:
+      return false;
+   }
+   uint32_t group, slot;
+   if (nir_intrinsic_image_dim(intr) != GLSL_SAMPLER_DIM_3D || !deref_binding(intr->src[0], &group, &slot))
+      return false;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *slices = wvk_nir_load_meta(b, meta, group, nir_imm_int(b, slot), WVK_META_IMG_SLICES);
+   if (intr->intrinsic == nir_intrinsic_image_deref_size) {
+      if (intr->def.num_components < 3)
+         return false;
+      b->cursor = nir_after_instr(&intr->instr);
+      nir_def *count = nir_ushr_imm(b, slices, 16);
+      nir_def *depth = nir_bcsel(b, nir_ine_imm(b, count, 0), count, nir_channel(b, &intr->def, 2));
+      nir_def *size = nir_vector_insert_imm(b, &intr->def, depth, 2);
+      nir_def_rewrite_uses_after(&intr->def, size);
+      return true;
+   }
+   nir_def *coord = intr->src[1].ssa;
+   nir_def *z = nir_iadd(b, nir_channel(b, coord, 2), nir_iand_imm(b, slices, 0xffff));
+   nir_src_rewrite(&intr->src[1], nir_vector_insert_imm(b, coord, z, 2));
+   return true;
+}
+
+bool
+wvk_nir_lower_image_slices(nir_shader *nir, const uint32_t *meta_base)
+{
+   return nir_shader_intrinsics_pass(nir, image_slices_instr, nir_metadata_control_flow, (void *)meta_base);
+}

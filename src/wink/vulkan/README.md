@@ -127,7 +127,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   reads zero. A cube a non-seamless sampler samples (nonSeamlessCubeMap)
   is, in a variant keyed on the samplers bound, the 2D array of its faces:
   the face the direction selects, at the LOD the cube's derivatives give,
-  wrapped as the sampler says.
+  wrapped as the sampler says. A 2D view of a 3D image's slice
+  (VK_EXT_image_2d_view_of_3d) is WebGPU's 3D view of the level, which a
+  variant keyed on the views bound samples at the middle of the slice its
+  record says, and loads and stores at it; and a storage view of some of
+  a 3D image's slices (VK_EXT_image_sliced_view_of_3d) moves z to its
+  first and says its count for the depth.
 - **Image atomics**, which WGSL does not have, are on a storage buffer of
   the image's texels. A 32-bit integer storage image has one besides its
   texture, and a shader that does atomics on it uses it for everything.

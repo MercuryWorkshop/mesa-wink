@@ -137,8 +137,10 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 #define WVK_META_TEX_SWIZZLE 0
 #define WVK_META_TEX_CHANNELS 1
 /* And the view's minimum LOD above its base level, a float, 0 for none
- * (VK_EXT_image_view_min_lod). */
+ * (VK_EXT_image_view_min_lod); and of a 2D view of a 3D image, the slice
+ * (VK_EXT_image_2d_view_of_3d). */
 #define WVK_META_TEX_MIN_LOD 2
+#define WVK_META_TEX_SLICE 3
 
 /* A sampler's record. */
 #define WVK_META_SAMPLER_FLAGS 0
@@ -191,6 +193,9 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* Of every storage image: which of R, G, B and A its view's format has, a
  * bit each, none for a null one (as a texture's WVK_META_TEX_CHANNELS). */
 #define WVK_META_IMG_CHANNELS 6
+/* And of a view of a 3D image, the slices it has: the first, and how many
+ * << 16 (VK_EXT_image_sliced_view_of_3d, and 2D views of one slice). */
+#define WVK_META_IMG_SLICES 7
 
 enum wvk_texel_type {
    WVK_TEXEL_UNORM,

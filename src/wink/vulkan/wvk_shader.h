@@ -48,7 +48,7 @@ struct wvk_shader_binding {
 #define WVK_MAX_XFB_OUTPUTS 64
 
 /* Of the serialized shaders, for the pipeline cache. */
-#define WVK_SHADER_BINARY_VERSION 29
+#define WVK_SHADER_BINARY_VERSION 30
 
 /* A generic varying as the WGSL between the stages has it, by location:
  * how it is interpolated and what it is of, or 0 for none. WebGPU wants a
@@ -85,6 +85,9 @@ enum wvk_draw_shape {
  * sampler (VK_EXT_non_seamless_cube_map) has a variant sample a face at a
  * time. */
 #define WVK_MAX_CUBE_SAMPLES 8
+/* 2D textures and storage images a 2D view of a 3D image may be bound at
+ * (VK_EXT_image_2d_view_of_3d), which a variant has as the 3D ones. */
+#define WVK_MAX_FLAT_VIEWS 8
 
 struct wvk_shader_key {
    /* Vertex: the fragment shader's inputs its outputs are made to match. */
@@ -162,6 +165,9 @@ struct wvk_shader_key {
    /* Which of wvk_shader::cube_samples a non-seamless sampler samples: a
     * bit each, their cubes the 2D arrays of their faces. */
    uint8_t non_seamless;
+   /* Which of wvk_shader::flat_views have a 2D view of a 3D image bound: a
+    * bit each, the 3D texture or image the view is of, at its slice. */
+   uint8_t views_3d;
    /* Where each set's descriptor records are, and how many words there
     * are of them: of the layouts of both stages, which a library of
     * independent sets has only its own sets in. */
@@ -279,6 +285,11 @@ struct wvk_shader {
     * where the device has non-seamless cubes. */
    uint8_t cube_sample_count;
    uint32_t cube_samples[WVK_MAX_CUBE_SAMPLES];
+   /* Its 2D textures and storage images, as the set and slot of each (set
+    * << 10 | slot), where the device has 2D views of 3D images: whose views
+    * a draw or dispatch compiles a variant for (key.views_3d). */
+   uint8_t flat_view_count;
+   uint16_t flat_views[WVK_MAX_FLAT_VIEWS];
    /* Fragment: writes gl_FragDepth, discards. */
    bool writes_depth;
    /* The push constants read, as a storage buffer at the driver's
@@ -339,6 +350,9 @@ extern const struct vk_device_shader_ops wvk_device_shader_ops;
 struct wvk_bound_views {
    VkFormat image_formats[WVK_MAX_UNFORMATTED_IMAGES];
    uint8_t non_seamless;
+   /* And which of its 2D ones have 2D views of 3D images bound
+    * (wvk_shader::flat_views). */
+   uint8_t views_3d;
 };
 
 /* The shader, or its variant, for a draw of this state: a vertex shader

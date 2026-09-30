@@ -287,6 +287,11 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
          d->swizzle = view->swizzle;
          d->channels = view->channels;
          d->min_lod = MAX2(view->vk.min_lod - (float)view->vk.base_mip_level, 0.0f);
+         const struct wvk_image *of = wvk_image_view_image(view);
+         if (of->vk.image_type == VK_IMAGE_TYPE_3D) {
+            d->slices = view->vk.storage.z_slice_offset | view->vk.storage.z_slice_count << 16;
+            d->of_3d = view->vk.view_type != VK_IMAGE_VIEW_TYPE_3D;
+         }
       }
       struct wvk_image *image = view ? wvk_image_view_image(view) : NULL;
       if (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && image && image->atomic_buffer &&
@@ -464,6 +469,7 @@ wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words, u
             record[WVK_META_TEX_SWIZZLE] = d->swizzle;
             record[WVK_META_TEX_CHANNELS] = d->channels;
             memcpy(&record[WVK_META_TEX_MIN_LOD], &d->min_lod, 4);
+            record[WVK_META_TEX_SLICE] = d->slices & 0xffff;
          }
          break;
       case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
@@ -471,11 +477,13 @@ wvk_descriptor_set_meta(const struct wvk_descriptor_set *set, uint32_t *words, u
          record[WVK_META_TEX_SWIZZLE] = d->swizzle;
          record[WVK_META_TEX_CHANNELS] = d->channels;
          memcpy(&record[WVK_META_TEX_MIN_LOD], &d->min_lod, 4);
+         record[WVK_META_TEX_SLICE] = d->slices & 0xffff;
          break;
       case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
          if (d->atomic_image)
             memcpy(record, d->atomic_meta, sizeof(d->atomic_meta));
          record[WVK_META_IMG_CHANNELS] = d->channels;
+         record[WVK_META_IMG_SLICES] = d->slices;
          break;
       case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
       case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:

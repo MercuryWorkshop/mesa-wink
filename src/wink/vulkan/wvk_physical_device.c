@@ -124,6 +124,8 @@ get_device_extensions(const struct wvk_physical_device *pdev,
       .EXT_shader_module_identifier = true,
       .EXT_image_view_min_lod = true,
       .EXT_non_seamless_cube_map = true,
+      .EXT_image_2d_view_of_3d = true,
+      .EXT_image_sliced_view_of_3d = true,
       .KHR_multiview = true,
       /* What WebGPU leaves out; hidden for testing what the CTS tests only
        * of implementations without it (WINK_VK_NO_PORTABILITY). */
@@ -608,6 +610,12 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* A variant samples such a cube as the 2D array of its faces, a
        * face at a time (wvk_shader.c's face_cubes). */
       .nonSeamlessCubeMap = true,
+      /* A 2D view of a 3D image is the 3D texture's view, a variant taking
+       * the slice its record says (wvk_shader.c's flat_views); and a
+       * storage view of some slices moves z to them (wvk_nir_descriptors.c). */
+      .image2DViewOf3D = true,
+      .sampler2DViewOf3D = true,
+      .imageSlicedViewOf3D = true,
       /* The runtime's (vk_pipeline.c): a fast link's stages are compiled
        * apart, which draws link (wvk_shader_draw_variant). */
       .graphicsPipelineLibrary = true,
@@ -626,7 +634,7 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       /* Of another texture of the image's, kept in step (wvk_image.h). */
       .imageViewFormatReinterpretation = true,
       .imageViewFormatSwizzle = true, /* by the shader: wvk_nir_descriptors.c */
-      .imageView2DOn3DImage = false,
+      .imageView2DOn3DImage = true,
       .multisampleArrayImage = false,
       .mutableComparisonSamplers = true,
       /* The corners of the triangles, as points (wvk_cmd_draw.c). */

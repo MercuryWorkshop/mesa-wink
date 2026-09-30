@@ -3391,8 +3391,9 @@ draw_fan_elements(struct wvk_cmd_buffer *cmd, uint32_t first_index, uint32_t ind
  * input and for that fragment shader (wvk_shader_draw_variant). */
 /* What of the descriptors bound a shader's variant is of (struct
  * wvk_bound_views): the formats of the views where it has storage images
- * without one (wvk_shader::unformatted), 0 where none is; and which of its
- * cube samplings are of non-seamless samplers (wvk_shader::cube_samples). */
+ * without one (wvk_shader::unformatted), 0 where none is; which of its
+ * cube samplings are of non-seamless samplers (wvk_shader::cube_samples);
+ * and which of its 2D textures and images are 2D views of 3D images. */
 static const struct wvk_descriptor *
 bound_descriptor(const struct wvk_bound_state *st, uint32_t bind_point, uint32_t at)
 {
@@ -3418,6 +3419,11 @@ bound_views(const struct wvk_bound_state *st, uint32_t bind_point, const struct 
       const struct wvk_descriptor *d = bound_descriptor(st, bind_point, shader->cube_samples[i] >> 16);
       if (d && (d->sampler_meta[WVK_META_SAMPLER_FLAGS] & WVK_SAMPLER_NON_SEAMLESS))
          views->non_seamless |= BITFIELD_BIT(i);
+   }
+   for (uint32_t i = 0; i < shader->flat_view_count; ++i) {
+      const struct wvk_descriptor *d = bound_descriptor(st, bind_point, shader->flat_views[i]);
+      if (d && d->of_3d)
+         views->views_3d |= BITFIELD_BIT(i);
    }
 }
 

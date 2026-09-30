@@ -45,8 +45,13 @@ struct wvk_descriptor {
    VkFormat view_format;
    uint32_t swizzle;
    uint32_t channels;
-   /* The view's minimum LOD above its base level (WVK_META_TEX_MIN_LOD). */
+   /* The view's minimum LOD above its base level (WVK_META_TEX_MIN_LOD);
+    * of a view of a 3D image, its slices (WVK_META_IMG_SLICES), and whether
+    * it is a 2D view of them, which a shader's variant samples as the 3D
+    * texture it is (key.views_3d). */
    float min_lod;
+   uint32_t slices;
+   bool of_3d;
    /* Samplers: the sampler, what a bind group layout says of it, and its
     * record. */
    WGPUSampler sampler;

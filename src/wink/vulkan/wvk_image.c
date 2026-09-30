@@ -902,6 +902,11 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
        * own format, which WebGPU works out itself. */
       desc.format = view->aspect == WGPUTextureAspect_All ? view->format : WGPUTextureFormat_Undefined;
       desc.dimension = view_dimension(view->vk.view_type);
+      /* A 2D view of a 3D image's slices (VK_EXT_image_2d_view_of_3d) is of
+       * the level whole, as WebGPU views a 3D texture: shaders take the
+       * slice, which the view's records say (storage.z_slice_offset). */
+      if (image->vk.image_type == VK_IMAGE_TYPE_3D)
+         desc.dimension = WGPUTextureViewDimension_3D;
       /* A multisampled view is 2D in WebGPU, whatever array it says. */
       if (image->vk.samples > 1)
          desc.dimension = WGPUTextureViewDimension_2D;
