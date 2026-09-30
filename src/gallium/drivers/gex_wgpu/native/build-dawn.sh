@@ -69,7 +69,8 @@ done
 
 case "$(uname -s)" in
   Darwin) BACKENDS=(-DDAWN_ENABLE_METAL=ON -DDAWN_ENABLE_VULKAN=OFF -DDAWN_USE_X11=OFF -DDAWN_USE_WAYLAND=OFF) ;;
-  *)      BACKENDS=(-DDAWN_ENABLE_VULKAN=ON) ;;
+  # Wayland surfaces as well as X11's, which Dawn leaves out by default.
+  *)      BACKENDS=(-DDAWN_ENABLE_VULKAN=ON -DDAWN_USE_X11=ON -DDAWN_USE_WAYLAND=ON) ;;
 esac
 
 echo "[dawn] configuring"

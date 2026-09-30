@@ -35,6 +35,18 @@ struct wvk_surface {
 
    /* NULL for a headless surface: presenting to it shows nothing. */
    WGPUSurface wgpu;
+   /* What it was made of, a native window's, to make it again: Dawn keeps
+    * an unconfigured surface's swapchain for the next configure, of the
+    * device it was, which a surface outliving the device then tears down
+    * on a device that is gone. */
+   WGPUInstance wgpu_instance;
+   union {
+      WGPUChainedStruct chain;
+      WGPUSurfaceSourceXlibWindow xlib;
+      WGPUSurfaceSourceWaylandSurface wayland;
+      WGPUSurfaceSourceMetalLayer metal;
+   } source;
+   bool has_source;
    /* A canvas's, whose size the swapchain has to have. */
    bool canvas;
 

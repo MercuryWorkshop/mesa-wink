@@ -76,8 +76,21 @@ create_native_surface(VkInstance _instance, const void *icd, size_t icd_size,
 
    const VkIcdSurfaceBase *base = icd;
    VkResult result = wvk_surface_create(instance, base->platform, wgpu, pAllocator, pSurface);
-   if (result == VK_SUCCESS)
-      memcpy(&wvk_surface_from_handle(*pSurface)->icd, icd, icd_size);
+   if (result == VK_SUCCESS) {
+      struct wvk_surface *surface = wvk_surface_from_handle(*pSurface);
+      memcpy(&surface->icd, icd, icd_size);
+      /* Kept to make the WGPUSurface again (wvk_surface_renew). */
+      const size_t size = source->sType == WGPUSType_SurfaceSourceXlibWindow       ? sizeof(surface->source.xlib)
+                          : source->sType == WGPUSType_SurfaceSourceWaylandSurface ? sizeof(surface->source.wayland)
+                          : source->sType == WGPUSType_SurfaceSourceMetalLayer     ? sizeof(surface->source.metal)
+                                                                                   : 0;
+      if (size) {
+         memcpy(&surface->source, source, size);
+         surface->source.chain.next = NULL;
+         surface->wgpu_instance = wgpu_instance;
+         surface->has_source = true;
+      }
+   }
    return result;
 }
 
@@ -131,6 +144,27 @@ metal_layer_extent(const CAMetalLayer *layer)
 #endif
 
 #ifdef VK_USE_PLATFORM_XCB_KHR
+#include <dlfcn.h>
+#include "c11/threads.h"
+
+/* Dawn has Xlib windows and not XCB ones: an XCB window is one of an
+ * Xlib display of the driver's own, the process's one connection to the
+ * X server $DISPLAY names -- window ids are the server's, whichever
+ * connection names them. libX11 is loaded, not linked, for an application
+ * that has none. */
+static void *xlib_display;
+static once_flag xlib_once = ONCE_FLAG_INIT;
+
+static void
+open_xlib_display(void)
+{
+   void *x11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+   void *(*open_display)(const char *) = x11 ? (void *(*)(const char *))dlsym(x11, "XOpenDisplay") : NULL;
+   xlib_display = open_display ? open_display(NULL) : NULL;
+   if (!xlib_display)
+      mesa_loge("wvk: no Xlib display for an XCB window, which Dawn has no surfaces of");
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_CreateXcbSurfaceKHR(VkInstance _instance, const VkXcbSurfaceCreateInfoKHR *pCreateInfo,
                         const VkAllocationCallbacks *pAllocator, VkSurfaceKHR *pSurface)
@@ -140,8 +174,11 @@ wvk_CreateXcbSurfaceKHR(VkInstance _instance, const VkXcbSurfaceCreateInfoKHR *p
       .connection = pCreateInfo->connection,
       .window = pCreateInfo->window,
    };
-   WGPUSurfaceSourceXCBWindow source = WGPU_SURFACE_SOURCE_XCB_WINDOW_INIT;
-   source.connection = pCreateInfo->connection;
+   call_once(&xlib_once, open_xlib_display);
+   if (!xlib_display)
+      return vk_error(vk_instance_from_handle(_instance), VK_ERROR_INITIALIZATION_FAILED);
+   WGPUSurfaceSourceXlibWindow source = WGPU_SURFACE_SOURCE_XLIB_WINDOW_INIT;
+   source.display = xlib_display;
    source.window = pCreateInfo->window;
    return create_native_surface(_instance, &icd, sizeof(icd), &source.chain, pAllocator, pSurface);
 }
@@ -677,9 +714,22 @@ wvk_DestroySwapchainKHR(VkDevice _device, VkSwapchainKHR swapchain,
    if (!sc)
       return;
    if (sc->surface->swapchain == sc) {
-      if (sc->surface->wgpu)
-         wgpuSurfaceUnconfigure(sc->surface->wgpu);
-      sc->surface->swapchain = NULL;
+      struct wvk_surface *surface = sc->surface;
+      if (surface->wgpu)
+         wgpuSurfaceUnconfigure(surface->wgpu);
+      surface->swapchain = NULL;
+      /* Dawn keeps the swapchain for the next configure, which the device
+       * may not live to: the surface made again lets it go now. */
+      if (surface->wgpu && surface->has_source) {
+         WGPUSurfaceDescriptor desc = WGPU_SURFACE_DESCRIPTOR_INIT;
+         desc.nextInChain = &surface->source.chain;
+         desc.label = wvk_sv("VkSurfaceKHR");
+         WGPUSurface renewed = wgpuInstanceCreateSurface(surface->wgpu_instance, &desc);
+         if (renewed) {
+            wgpuSurfaceRelease(surface->wgpu);
+            surface->wgpu = renewed;
+         }
+      }
    }
    destroy_images(dev, sc);
    vk_object_free(&dev->vk, pAllocator, sc);
