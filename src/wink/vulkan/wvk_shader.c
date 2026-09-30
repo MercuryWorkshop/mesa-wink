@@ -636,6 +636,13 @@ wvk_hash_state(struct vk_physical_device *device, const struct vk_graphics_pipel
          state && state->ms ? state->ms->rasterization_samples : 1,
       };
       _mesa_blake3_update(&ctx, alpha, sizeof(alpha));
+      /* And whether the pass has depth or stencil, without which it drops
+       * its depth writes (compile_one). */
+      const struct vk_render_pass_state *rp = state ? state->rp : NULL;
+      const uint8_t no_depth = rp && vk_render_pass_state_has_attachment_info(rp) &&
+                               rp->depth_attachment_format == VK_FORMAT_UNDEFINED &&
+                               rp->stencil_attachment_format == VK_FORMAT_UNDEFINED;
+      _mesa_blake3_update(&ctx, &no_depth, 1);
    }
    /* And whether images may be null, which shaders check themselves;
     * whether views may have minimum LODs, which they clamp to; and whether
@@ -7995,6 +8002,12 @@ ycbcr_conversion_lookup(const void *data, uint32_t set, uint32_t binding, uint32
    return conversion ? &conversion->state : NULL;
 }
 
+static void compile_digest(struct wvk_device *dev, const struct vk_shader_compile_info *info,
+                           const struct wvk_shader_source *src, const struct vk_graphics_pipeline_state *state,
+                           const struct vk_features *features, blake3_hash out);
+static struct wvk_shader *cached_variant(struct wvk_device *dev, const blake3_hash digest);
+static void cache_variant(struct wvk_device *dev, const blake3_hash digest, const struct wvk_shader *variant);
+
 static VkResult
 wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_compile_info *infos,
             const struct vk_graphics_pipeline_state *state, const struct vk_features *enabled_features,
@@ -8028,11 +8041,27 @@ wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_co
    if (vs && fs)
       link_interpolation(vs, fs);
    for (uint32_t i = 0; i < shader_count; ++i) {
-      VkResult result = infos[i].stage == MESA_SHADER_GEOMETRY || infos[i].stage == MESA_SHADER_TESS_CTRL ||
-                                 infos[i].stage == MESA_SHADER_TESS_EVAL || infos[i].stage == MESA_SHADER_MESH ||
-                                 infos[i].stage == MESA_SHADER_TASK
-                           ? geometry_shell(dev, &infos[i], pAllocator, &shaders_out[i])
-                           : compile_one(dev, &infos[i], state, NULL, pAllocator, &shaders_out[i]);
+      const bool shell = infos[i].stage == MESA_SHADER_GEOMETRY || infos[i].stage == MESA_SHADER_TESS_CTRL ||
+                         infos[i].stage == MESA_SHADER_TESS_EVAL || infos[i].stage == MESA_SHADER_MESH ||
+                         infos[i].stage == MESA_SHADER_TASK;
+      /* A pipeline's shader alike of another's, of the device's cache:
+       * the CTS makes pipelines of one pair over and over. */
+      blake3_hash digest;
+      const bool digested = !shell && i < ARRAY_SIZE(sources) && sources[i] && (!pAllocator || pAllocator == &dev->vk.alloc);
+      struct wvk_shader *cached = NULL;
+      if (digested) {
+         compile_digest(dev, &infos[i], sources[i], state, enabled_features, digest);
+         cached = cached_variant(dev, digest);
+      }
+      VkResult result;
+      if (cached) {
+         ralloc_free(infos[i].nir);
+         shaders_out[i] = &cached->vk;
+         result = VK_SUCCESS;
+      } else {
+         result = shell ? geometry_shell(dev, &infos[i], pAllocator, &shaders_out[i])
+                        : compile_one(dev, &infos[i], state, NULL, pAllocator, &shaders_out[i]);
+      }
       if (result != VK_SUCCESS) {
          /* compile consumes every NIR, whatever happens. */
          for (uint32_t j = i + 1; j < shader_count; ++j)
@@ -8047,10 +8076,60 @@ wvk_compile(struct vk_device *vk_dev, uint32_t shader_count, struct vk_shader_co
          }
          return result;
       }
-      if (i < ARRAY_SIZE(sources))
-         wvk_shader_from_vk(shaders_out[i])->source = sources[i];
+      if (i < ARRAY_SIZE(sources)) {
+         struct wvk_shader *shader = wvk_shader_from_vk(shaders_out[i]);
+         /* A cached one has its own source, made again with it. */
+         if (cached) {
+            if (sources[i])
+               source_destroy(dev, sources[i]);
+         } else {
+            shader->source = sources[i];
+            if (digested)
+               cache_variant(dev, digest, shader);
+         }
+      }
    }
    return VK_SUCCESS;
+}
+
+/* What a pipeline's shader is compiled of, for the device's cache of them
+ * (cached_variant): its source -- the layouts, flags, robustness -- its
+ * NIR as linked with the others', the push constants, the pipeline state
+ * it reads (wvk_hash_state), and its immutable samplers' conversions. */
+static void
+compile_digest(struct wvk_device *dev, const struct vk_shader_compile_info *info, const struct wvk_shader_source *src,
+               const struct vk_graphics_pipeline_state *state, const struct vk_features *features, blake3_hash out)
+{
+   struct blob blob;
+   blob_init(&blob);
+   blob_write_uint32(&blob, 0xba5e0000u | info->stage);
+   source_serialize(src, &blob);
+   nir_serialize(&blob, info->nir, false);
+   blob_write_uint32(&blob, info->push_constant_range_count);
+   if (info->push_constant_range_count)
+      blob_write_bytes(&blob, info->push_constant_ranges,
+                       info->push_constant_range_count * sizeof(*info->push_constant_ranges));
+   for (uint32_t g = 0; g < info->set_layout_count; ++g) {
+      const struct wvk_descriptor_set_layout *l =
+         info->set_layouts[g] ? container_of(info->set_layouts[g], struct wvk_descriptor_set_layout, vk) : NULL;
+      for (uint32_t b = 0; l && b < l->binding_count; ++b) {
+         const struct wvk_descriptor_set_binding_layout *bl = &l->bindings[b];
+         for (uint32_t e = 0; bl->immutable_samplers && e < bl->count; ++e) {
+            const struct vk_ycbcr_conversion *c = bl->immutable_samplers[e] ? bl->immutable_samplers[e]->vk.ycbcr_conversion
+                                                                             : NULL;
+            blob_write_uint8(&blob, c != NULL);
+            if (c)
+               blob_write_bytes(&blob, &c->state, sizeof(c->state));
+         }
+      }
+   }
+   blake3_hash state_hash;
+   /* Shader objects' compiles are given no features: the device's. */
+   wvk_hash_state(&wvk_device_physical(dev)->vk, state, features ? features : &dev->vk.enabled_features,
+                  mesa_to_vk_shader_stage(info->stage), state_hash);
+   blob_write_bytes(&blob, state_hash, sizeof(state_hash));
+   _mesa_blake3_compute(blob.data, blob.size, out);
+   blob_finish(&blob);
 }
 
 /* A variant of `base` for `key`, compiled from its source. */
