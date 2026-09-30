@@ -265,6 +265,8 @@ void wvk_replay_finish_state(struct wvk_device *dev, struct wvk_replay *replay);
 /* What is bound, kept around a vk_meta operation. */
 void *wvk_replay_save_state(struct wvk_replay *replay);
 void wvk_replay_restore_state(struct wvk_replay *replay, void *saved);
+/* Another copy of what wvk_replay_save_state saved, to restore twice. */
+void *wvk_replay_copy_saved_state(const void *saved);
 void wvk_replay_free_meta_memory(struct wvk_device *dev, struct wvk_replay *replay);
 
 /* The resolves of a render pass instance WebGPU could not do itself. */

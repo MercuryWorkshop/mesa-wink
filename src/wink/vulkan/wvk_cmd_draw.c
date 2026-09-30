@@ -961,6 +961,15 @@ wvk_replay_save_state(struct wvk_replay *replay)
    return copy;
 }
 
+void *
+wvk_replay_copy_saved_state(const void *saved)
+{
+   struct wvk_bound_state *copy = saved ? malloc(sizeof(*copy)) : NULL;
+   if (copy)
+      *copy = *(const struct wvk_bound_state *)saved;
+   return copy;
+}
+
 void
 wvk_replay_restore_state(struct wvk_replay *replay, void *saved)
 {

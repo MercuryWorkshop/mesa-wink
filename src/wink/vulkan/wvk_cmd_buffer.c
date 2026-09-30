@@ -265,7 +265,8 @@ pass_layers(const struct vk_cmd_queue_entry *cmd, bool *multiview, enum vk_cmd_t
       return 0;
    *end = VK_CMD_END_RENDERING;
    const VkRenderingInfo *info = cmd->u.begin_rendering.rendering_info;
-   if (!info || (info->flags & (VK_RENDERING_SUSPENDING_BIT | VK_RENDERING_RESUMING_BIT)))
+   /* A resumed one is its chain's, which the pass it began with has. */
+   if (!info || (info->flags & VK_RENDERING_RESUMING_BIT))
       return 0;
    if (info->viewMask) {
       *multiview = true;
@@ -274,41 +275,182 @@ pass_layers(const struct vk_cmd_queue_entry *cmd, bool *multiview, enum vk_cmd_t
    return info->layerCount > 1 ? BITFIELD_MASK(MIN2(info->layerCount, 32)) : 0;
 }
 
-/* A command queue, with each render pass of several layers or views run
- * once for each: WebGPU renders one layer a pass. */
-static void
-replay_queue(struct wvk_replay *replay, struct vk_cmd_queue *queue, VkCommandBuffer commandBuffer,
-             const struct vk_device_dispatch_table *disp)
+static VkRenderingFlags
+rendering_flags(const struct vk_cmd_queue_entry *cmd)
 {
-   struct list_head *head = &queue->cmds;
-   struct list_head *run = head->next;
-   for (struct list_head *it = head->next; it != head;) {
+   if (cmd->type != VK_CMD_BEGIN_RENDERING || !cmd->u.begin_rendering.rendering_info)
+      return 0;
+   return cmd->u.begin_rendering.rendering_info->flags;
+}
+
+/* A part of a chain of passes that suspend and resume: [from, to) of
+ * command buffer `cb`'s queue. */
+struct chain_part {
+   uint32_t cb;
+   struct list_head *from, *to;
+};
+#define MAX_CHAIN_PARTS 64
+
+/* The parts of the chain the pass begun at `begin`, of command buffer
+ * `cb`, is the first of: to the end of each command buffer's last pass of
+ * it, and in those after, from the start. 0 if it does not end. */
+static uint32_t
+chain_parts(struct vk_command_buffer *const *cmds, uint32_t count, uint32_t cb, struct list_head *begin,
+            struct chain_part *parts)
+{
+   uint32_t n = 0;
+   struct list_head *head = &cmds[cb]->cmd_queue.cmds, *from = begin, *it = begin;
+   for (;;) {
+      /* This pass's end. */
+      const bool suspends = rendering_flags(list_entry(it, struct vk_cmd_queue_entry, cmd_link)) &
+                            VK_RENDERING_SUSPENDING_BIT;
+      while (it != head && list_entry(it, struct vk_cmd_queue_entry, cmd_link)->type != VK_CMD_END_RENDERING)
+         it = it->next;
+      if (it == head)
+         return 0;
+      it = it->next;
+      if (!suspends) {
+         parts[n++] = (struct chain_part){ cb, from, it };
+         return n;
+      }
+      /* The pass it resumes in: later in this queue, or in the next. */
+      while (it != head && list_entry(it, struct vk_cmd_queue_entry, cmd_link)->type != VK_CMD_BEGIN_RENDERING)
+         it = it->next;
+      if (it != head)
+         continue;
+      if (n + 1 == MAX_CHAIN_PARTS || cb + 1 == count)
+         return 0;
+      parts[n++] = (struct chain_part){ cb, from, head };
+      head = &cmds[++cb]->cmd_queue.cmds;
+      from = head->next;
+      it = from;
+      while (it != head && list_entry(it, struct vk_cmd_queue_entry, cmd_link)->type != VK_CMD_BEGIN_RENDERING)
+         it = it->next;
+      if (it == head)
+         return 0;
+   }
+}
+
+/* Each command buffer starts afresh: nothing is bound across them. */
+static void
+begin_replay_buffer(struct wvk_replay *replay, struct wvk_cmd_buffer *rcmd, struct vk_command_buffer *cmd)
+{
+   const VkCommandBufferBeginInfo begin = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+   };
+   vk_command_buffer_reset(&rcmd->vk);
+   vk_command_buffer_begin(&rcmd->vk, &begin);
+   wvk_replay_reset_state(replay);
+   replay->cond.active = false;
+   replay->uses_queries = wvk_cmd_queue_has_occlusion_queries(&cmd->cmd_queue);
+}
+
+/* What a command buffer has bound where a chain begins, which each layer
+ * but the first begins it with again. */
+struct chain_state {
+   struct vk_dynamic_graphics_state dynamic;
+   struct vk_vertex_input_state vi;
+   struct vk_sample_locations_state sample_locations;
+   VkShaderStageFlags pipeline_stages;
+   void *bound;
+};
+
+static void
+save_chain_state(struct wvk_cmd_buffer *rcmd, struct chain_state *s)
+{
+   s->dynamic = rcmd->vk.dynamic_graphics_state;
+   s->vi = rcmd->dynamic_vi;
+   s->sample_locations = rcmd->dynamic_sample_locations;
+   s->pipeline_stages = rcmd->vk.pipeline_shader_stages;
+   s->bound = wvk_replay_save_state(rcmd->replay);
+}
+
+static void
+restore_chain_state(struct wvk_cmd_buffer *rcmd, const struct chain_state *s)
+{
+   rcmd->vk.dynamic_graphics_state = s->dynamic;
+   rcmd->dynamic_vi = s->vi;
+   rcmd->dynamic_sample_locations = s->sample_locations;
+   rcmd->vk.dynamic_graphics_state.vi = &rcmd->dynamic_vi;
+   rcmd->vk.dynamic_graphics_state.ms.sample_locations = &rcmd->dynamic_sample_locations;
+   BITSET_SET_RANGE(rcmd->vk.dynamic_graphics_state.dirty, 0, MESA_VK_DYNAMIC_GRAPHICS_STATE_ENUM_MAX - 1);
+   rcmd->vk.pipeline_shader_stages = s->pipeline_stages;
+   wvk_replay_restore_state(rcmd->replay, wvk_replay_copy_saved_state(s->bound));
+}
+
+/* Command buffer `cb`'s queue from `start`, with each render pass of
+ * several layers or views run once for each: WebGPU renders one layer a
+ * pass. A pass that suspends is run with those it resumes in, as one,
+ * into the command buffers after this one -- each part of the chain
+ * starting as its command buffer does. Returns the command buffer to go on
+ * with, and in `*next` where in it, NULL for its start. */
+static uint32_t
+replay_queue(struct wvk_replay *replay, struct wvk_cmd_buffer *rcmd, struct vk_command_buffer *const *cmds,
+             uint32_t count, uint32_t cb, struct list_head *start, struct list_head **next)
+{
+   const VkCommandBuffer commandBuffer = wvk_cmd_buffer_to_handle(rcmd);
+   const struct vk_device_dispatch_table *disp = &replay->dev->vk.dispatch_table;
+   struct list_head *head = &cmds[cb]->cmd_queue.cmds;
+   struct list_head *run = start;
+   *next = NULL;
+   for (struct list_head *it = start; it != head;) {
       const struct vk_cmd_queue_entry *cmd = list_entry(it, struct vk_cmd_queue_entry, cmd_link);
       bool multiview;
       enum vk_cmd_type end_type = VK_CMD_END_RENDERING;
       const uint32_t layers = pass_layers(cmd, &multiview, &end_type);
-      struct list_head *end = it->next;
-      while (layers && end != head && list_entry(end, struct vk_cmd_queue_entry, cmd_link)->type != end_type)
-         end = end->next;
-      if (!layers || end == head) {
+      if (!layers) {
+         it = it->next;
+         continue;
+      }
+      struct chain_part parts[MAX_CHAIN_PARTS];
+      uint32_t part_count;
+      if (rendering_flags(cmd) & VK_RENDERING_SUSPENDING_BIT) {
+         part_count = chain_parts(cmds, count, cb, it, parts);
+      } else {
+         struct list_head *end = it->next;
+         while (end != head && list_entry(end, struct vk_cmd_queue_entry, cmd_link)->type != end_type)
+            end = end->next;
+         part_count = end != head;
+         parts[0] = (struct chain_part){ cb, it, end != head ? end->next : head };
+      }
+      if (!part_count) {
          it = it->next;
          continue;
       }
       execute_range(run, it, commandBuffer, disp);
-      struct list_head *after = end->next;
+      const struct chain_part *last = &parts[part_count - 1];
+      struct chain_state *state = part_count > 1 ? malloc(sizeof(*state)) : NULL;
+      if (state)
+         save_chain_state(rcmd, state);
       replay->pass_first_layer = ffs(layers) - 1;
       u_foreach_bit(layer, layers) {
+         if (state && layer != replay->pass_first_layer)
+            restore_chain_state(rcmd, state);
          replay->pass_layered = true;
          replay->pass_multiview = multiview;
          replay->pass_layer = layer;
-         execute_range(it, after, commandBuffer, disp);
+         for (uint32_t p = 0; p < part_count; ++p) {
+            if (p && parts[p].cb != parts[p - 1].cb)
+               begin_replay_buffer(replay, rcmd, cmds[parts[p].cb]);
+            execute_range(parts[p].from, parts[p].to, commandBuffer, disp);
+         }
       }
+      if (state)
+         free(state->bound);
+      free(state);
       replay->pass_layered = false;
       replay->pass_multiview = false;
       replay->pass_layer = 0;
-      run = it = after;
+      /* On after the chain, in the command buffer it ended in. */
+      if (last->cb != cb) {
+         *next = last->to;
+         return last->cb;
+      }
+      run = it = last->to;
    }
    execute_range(run, head, commandBuffer, disp);
+   return cb + 1;
 }
 
 VkResult
@@ -338,19 +480,13 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    WGPUCommandEncoderDescriptor edesc = WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
    replay.encoder = wgpuDeviceCreateCommandEncoder(dev->wgpu, &edesc);
 
-   const VkCommandBufferBeginInfo begin = {
-      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-   };
    rcmd->replay = &replay;
-   for (uint32_t i = 0; i < count; ++i) {
-      /* Nothing is bound across command buffers: each starts afresh. */
-      vk_command_buffer_reset(&rcmd->vk);
-      vk_command_buffer_begin(&rcmd->vk, &begin);
-      wvk_replay_reset_state(&replay);
-      replay.cond.active = false;
-      replay.uses_queries = wvk_cmd_queue_has_occlusion_queries(&cmds[i]->cmd_queue);
-      replay_queue(&replay, &cmds[i]->cmd_queue, wvk_cmd_buffer_to_handle(rcmd), &dev->vk.dispatch_table);
+   struct list_head *next = NULL;
+   for (uint32_t i = 0; i < count;) {
+      /* Where a chain of passes ended, its command buffer is begun. */
+      if (!next)
+         begin_replay_buffer(&replay, rcmd, cmds[i]);
+      i = replay_queue(&replay, rcmd, cmds, count, i, next ? next : cmds[i]->cmd_queue.cmds.next, &next);
    }
    wvk_replay_end_passes(&replay);
    wvk_replay_sync_atomic_images(NULL, &replay);
