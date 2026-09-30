@@ -438,6 +438,10 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   AllowContract) is compiled with Dawn's strict math, natively, where
   Metal would fuse its multiply and add otherwise
   (`wink/patches/dawn-metal-strict-math-contract.patch`).
+- **Untyped pointers** (shaderUntypedPointers): buffers and workgroup
+  memory are words already; copies of memory become loads and stores
+  while they are still derefs. Pointers only compared (OpPtrEqual) are of
+  the buffer each is of, as variable ones are.
 - **Present** copies the swapchain image into the surface's current
   texture. WebGPU hands out a new texture every frame, and Vulkan's images
   have to stay.

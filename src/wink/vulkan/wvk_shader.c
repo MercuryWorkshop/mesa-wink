@@ -482,6 +482,11 @@ wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
       NIR_PASS(_, nir, nir_lower_returns);
    }
    NIR_PASS(_, nir, nir_lower_variable_initializers, ~nir_var_function_temp);
+   /* Copies of memory (OpCopyMemory of untyped pointers, and sized ones):
+    * of the variable, where the types agree, else loads and stores -- while
+    * they are still derefs, before any access is lowered to an offset. */
+   NIR_PASS(_, nir, nir_opt_memcpy);
+   NIR_PASS(_, nir, nir_lower_memcpy);
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
@@ -4157,16 +4162,37 @@ lower_variable_buffers(nir_shader *nir, struct word_buffers *wb)
    return nir_progress(true, impl, nir_metadata_none);
 }
 
+/* What is left of the descriptors once every access has its binding: what
+ * compares pointers (OpPtrEqual) -- the buffer each is of, as
+ * lower_variable_buffers has it, and an offset of zero. */
 static bool
-zero_descriptors_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+leftover_descriptors_instr(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   if (intr->intrinsic != nir_intrinsic_load_vulkan_descriptor &&
-       intr->intrinsic != nir_intrinsic_vulkan_resource_index &&
-       intr->intrinsic != nir_intrinsic_vulkan_resource_reindex)
-      return false;
    b->cursor = nir_before_instr(&intr->instr);
-   nir_def_replace(&intr->def, nir_imm_zero(b, intr->def.num_components, intr->def.bit_size));
-   return true;
+   switch (intr->intrinsic) {
+   case nir_intrinsic_vulkan_resource_index: {
+      nir_def *id = nir_iadd_imm(b, nir_u2u32(b, intr->src[0].ssa),
+                                 buffer_id(nir_intrinsic_desc_set(intr), nir_intrinsic_binding(intr)));
+      nir_def *zero = nir_imm_int(b, 0);
+      nir_def *comps[4] = { id, zero, zero, zero };
+      nir_def_replace(&intr->def, nir_u2uN(b, nir_vec(b, comps, intr->def.num_components), intr->def.bit_size));
+      return true;
+   }
+   case nir_intrinsic_vulkan_resource_reindex: {
+      nir_def *index = intr->src[0].ssa;
+      nir_def *comps[4];
+      for (unsigned c = 0; c < index->num_components; ++c)
+         comps[c] = nir_channel(b, index, c);
+      comps[0] = nir_iadd(b, comps[0], nir_u2uN(b, intr->src[1].ssa, index->bit_size));
+      nir_def_replace(&intr->def, nir_vec(b, comps, index->num_components));
+      return true;
+   }
+   case nir_intrinsic_load_vulkan_descriptor:
+      nir_def_replace(&intr->def, intr->src[0].ssa);
+      return true;
+   default:
+      return false;
+   }
 }
 
 /* The index operand of loads from one of the driver's buffers. */
@@ -4544,8 +4570,8 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
    if (wb.untraced)
       NIR_PASS(_, nir, lower_variable_buffers, &wb);
    /* Every access has its binding now; what is left of the descriptors is
-    * their offset part, which is zero. */
-   NIR_PASS(_, nir, nir_shader_intrinsics_pass, zero_descriptors_instr, nir_metadata_control_flow, NULL);
+    * which buffer, and their offset part, which is zero. */
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, leftover_descriptors_instr, nir_metadata_control_flow, NULL);
    optimize(nir);
    return true;
 }
