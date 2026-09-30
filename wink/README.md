@@ -60,7 +60,10 @@ needed for `--test`. Everything else goes into a cache (default
   the tiers only with its `allow_unsafe_apis` toggle, which both drivers set.
   It also has `patches/dawn-metal-strict-math-contract.patch`: Metal's safe
   math mode still fuses a multiply and an add, and the Vulkan driver asks
-  for strict math where a shader says not to.
+  for strict math where a shader says not to. And
+  `patches/dawn-metal-command-buffer-errors.patch`: a command buffer Metal
+  fails -- a GPU hang or fault, after which the system ignores the
+  process's work -- is logged and loses the device, which Dawn let pass.
 * A Python venv with mako, pyyaml and packaging, plus meson if the host's is
   older than 1.4.
 

@@ -44,11 +44,16 @@ fi
 
 # Metal's safe math still fuses a multiply and an add, which strict math,
 # which the Vulkan driver asks for where a shader says not to, is not to.
-PATCH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)/wink/patches/dawn-metal-strict-math-contract.patch"
-if git -C "$SRC" apply --check "$PATCH" 2>/dev/null; then
-  echo "[dawn] applying $(basename "$PATCH")"
-  git -C "$SRC" apply "$PATCH"
-fi
+# And a command buffer Metal fails (a GPU hang or fault) loses the device,
+# where Dawn said nothing -- and the system ignored all the process's work
+# after it.
+PATCHES="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)/wink/patches"
+for PATCH in "$PATCHES/dawn-metal-strict-math-contract.patch" "$PATCHES/dawn-metal-command-buffer-errors.patch"; do
+  if git -C "$SRC" apply --check "$PATCH" 2>/dev/null; then
+    echo "[dawn] applying $(basename "$PATCH")"
+    git -C "$SRC" apply "$PATCH"
+  fi
+done
 
 case "$(uname -s)" in
   Darwin) BACKENDS=(-DDAWN_ENABLE_METAL=ON -DDAWN_ENABLE_VULKAN=OFF -DDAWN_USE_X11=OFF -DDAWN_USE_WAYLAND=OFF) ;;

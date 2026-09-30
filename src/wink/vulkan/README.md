@@ -681,6 +681,7 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 | `WINK_VK_API_VERSION` | the Vulkan version reported |
 | `WINK_VK_NO_PORTABILITY=1` | hide VK_KHR_portability_subset, for CTS groups that skip on implementations of it (robustness2): testing only |
 | `WINK_VK_VARIANT_LOG=1` | say when a shader variant is compiled for a draw, and why |
+| `WINK_VK_DAWN_TOGGLES=a,b` | enable Dawn toggles, and print Dawn's log (at `MESA_LOG_LEVEL=info`): `dump_shaders` for the MSL |
 | `GEX_WGPU_SPIRV_DIR=dir` | write every module to `dir/N.spv` before Tint reads it, for one Tint does not come back from |
 | `GEX_WGPU_UNIFORM_LOG=1` | say why a module refused for a barrier in non-uniform control flow could not be made uniform |
 

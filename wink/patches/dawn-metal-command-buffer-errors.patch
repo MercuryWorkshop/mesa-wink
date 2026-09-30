@@ -1,0 +1,98 @@
+diff --git a/src/dawn/native/metal/QueueMTL.h b/src/dawn/native/metal/QueueMTL.h
+index dc23bf1f..1fd9aa56 100644
+--- a/src/dawn/native/metal/QueueMTL.h
++++ b/src/dawn/native/metal/QueueMTL.h
+@@ -39,6 +39,8 @@
+ #include "dawn/native/metal/CommandRecordingContext.h"
+ #include "dawn/native/metal/SharedFenceMTL.h"
+ 
++#include <atomic>
++
+ namespace dawn::native::metal {
+ 
+ class Device;
+@@ -63,6 +65,7 @@ class Queue final : public QueueBase {
+ 
+     MaybeError Initialize();
+     void UpdateWaitingEvents(ExecutionSerial completedSerial);
++    MaybeError CheckCommandBufferFailure();
+ 
+     MaybeError SubmitImpl(uint32_t commandCount, CommandBufferBase* const* commands) override;
+     bool HasPendingCommands() const override;
+@@ -80,6 +83,9 @@ class Queue final : public QueueBase {
+     std::mutex mLastSubmittedCommandsMutex;
+     NSPRef<id<MTLCommandBuffer>> mLastSubmittedCommands;
+ 
++    // wink: whether Metal failed a command buffer, set in its completed handler.
++    std::atomic<bool> mCommandBufferFailed{false};
++
+     // This mutex must be held to access mWaitingEvents (which may happen in a Metal driver
+     // thread).
+     // TODO(crbug.com/dawn/2065): If we atomically knew a conservative lower bound on the
+diff --git a/src/dawn/native/metal/QueueMTL.mm b/src/dawn/native/metal/QueueMTL.mm
+index 6b358550..36a77e79 100644
+--- a/src/dawn/native/metal/QueueMTL.mm
++++ b/src/dawn/native/metal/QueueMTL.mm
+@@ -27,6 +27,8 @@
+ 
+ #include "dawn/native/metal/QueueMTL.h"
+ 
++#include <cstdio>
++
+ #include "dawn/common/Math.h"
+ #include "dawn/native/Buffer.h"
+ #include "dawn/native/CommandValidation.h"
+@@ -158,6 +160,7 @@
+ }
+ 
+ MaybeError Queue::SubmitPendingCommandBuffer() {
++    DAWN_TRY(CheckCommandBufferFailure());
+     if (!mCommandContext.NeedsSubmit()) {
+         return {};
+     }
+@@ -190,7 +193,14 @@
+     // mLastSubmittedSerial so it is captured by value.
+     ExecutionSerial pendingSerial = GetPendingCommandSerial();
+     // This ObjC block runs on a different thread.
+-    [*pendingCommands addCompletedHandler:^(id<MTLCommandBuffer>) {
++    [*pendingCommands addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
++        // wink: Metal's own failures of the work, which nothing else reports.
++        if (buffer.status == MTLCommandBufferStatusError) {
++            this->mCommandBufferFailed.store(true);
++            fprintf(stderr, "Dawn: Metal command buffer %llu failed: %s\n",
++                    (unsigned long long)uint64_t(pendingSerial),
++                    buffer.error ? buffer.error.description.UTF8String : "(no error)");
++        }
+         TRACE_EVENT_ASYNC_END0(platform, GPUWork, "DeviceMTL::SubmitPendingCommandBuffer",
+                                uint64_t(pendingSerial));
+ 
+@@ -248,7 +258,18 @@
+     return SubmitPendingCommandBuffer();
+ }
+ 
++// wink: a command buffer Metal failed -- a GPU hang or fault -- loses the device: after one,
++// the system ignores the process's work (kIOGPUCommandBufferCallbackErrorSubmissionsIgnored),
++// which would else be lost without a word.
++MaybeError Queue::CheckCommandBufferFailure() {
++    if (mCommandBufferFailed.load()) {
++        return DAWN_DEVICE_LOST_ERROR("A Metal command buffer failed (GPU hang or fault).");
++    }
++    return {};
++}
++
+ ResultOrError<ExecutionSerial> Queue::CheckAndUpdateCompletedSerials() {
++    DAWN_TRY(CheckCommandBufferFailure());
+     // Metal serials are updated via a thread owned by Metal so we don't actually need to do
+     // anything, just return the latest completed serial.
+     return GetCompletedCommandSerial();
+@@ -282,7 +303,9 @@
+ 
+ ResultOrError<ExecutionSerial> Queue::WaitForQueueSerialImpl(ExecutionSerial waitSerial,
+                                                              Nanoseconds timeout) {
+-    return CreateWorkDoneEvent(waitSerial)->Wait(timeout) ? waitSerial : kWaitSerialTimeout;
++    const bool done = CreateWorkDoneEvent(waitSerial)->Wait(timeout);
++    DAWN_TRY(CheckCommandBufferFailure());
++    return done ? waitSerial : kWaitSerialTimeout;
+ }
+ 
+ }  // namespace dawn::native::metal
