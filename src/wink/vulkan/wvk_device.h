@@ -154,6 +154,9 @@ struct wvk_device {
     * that and read-only in a dispatch, as the null buffer may be. The
     * shader writes none of it (robustBufferAccess2's bounds). */
    WGPUBuffer null_storage;
+   /* The locks of 64-bit atomics on buffers (wvk_nir_atomic64.c): all
+    * free, zero, between atomics. */
+   WGPUBuffer atomic_locks;
    WGPUSampler null_sampler;
 };
 

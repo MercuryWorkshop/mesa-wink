@@ -513,6 +513,9 @@ wvk_device_init_pipeline_caches(struct wvk_device *dev)
    bd.label = wvk_sv("wvk null storage");
    bd.usage = WGPUBufferUsage_Storage;
    dev->null_storage = wgpuDeviceCreateBuffer(dev->wgpu, &bd);
+   bd.label = wvk_sv("wvk atomic locks");
+   bd.size = WVK_ATOMIC_LOCKS * 4 + 4;
+   dev->atomic_locks = wgpuDeviceCreateBuffer(dev->wgpu, &bd);
    WGPUSamplerDescriptor sd = WGPU_SAMPLER_DESCRIPTOR_INIT;
    dev->null_sampler = wgpuDeviceCreateSampler(dev->wgpu, &sd);
    return VK_SUCCESS;
@@ -637,6 +640,8 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuBufferRelease(dev->null_buffer);
    if (dev->null_storage)
       wgpuBufferRelease(dev->null_storage);
+   if (dev->atomic_locks)
+      wgpuBufferRelease(dev->atomic_locks);
    if (dev->null_sampler)
       wgpuSamplerRelease(dev->null_sampler);
    if (dev->dummy_attachment)
@@ -1606,6 +1611,11 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
          e->textureView = replay && replay->depth_bounds_view ? replay->depth_bounds_view : placeholder_view(dev, b);
          continue;
       }
+      if (group == WVK_DRIVER_GROUP && b->binding == WVK_DRIVER_SLOT_LOCKS) {
+         e->buffer = dev->atomic_locks;
+         e->size = WVK_ATOMIC_LOCKS * 4 + 4;
+         continue;
+      }
       if (group == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
          const struct wvk_driver_buffer *d = driver_binding_buffer(st, b->binding);
          e->offset = 0;
@@ -2193,8 +2203,9 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
             if (b->dynamic && offset_count < WVK_MAX_DYNAMIC) {
                /* The draw binding is the push buffer unless it is not. */
                const struct wvk_driver_buffer *d = driver_binding_buffer(st, b->binding);
-               offsets[offset_count++] = d && (d->buffer || b->binding != WVK_DRIVER_SLOT_DRAW) ? d->offset
-                                                                                                : push_at;
+               offsets[offset_count++] = b->binding == WVK_DRIVER_SLOT_LOCKS                       ? 0
+                                         : d && (d->buffer || b->binding != WVK_DRIVER_SLOT_DRAW) ? d->offset
+                                                                                                  : push_at;
             }
             continue;
          }

@@ -5559,6 +5559,7 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
    }
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo | nir_var_mem_ssbo,
             nir_address_format_32bit_index_offset);
+   NIR_PASS(_, nir, wvk_nir_lower_atomic64);
    NIR_PASS(_, nir, lower_viewport_transform);
    /* Before the draw parameters: pulling reads BaseInstance. */
    NIR_PASS(_, nir, pull_divided_attributes, state, shader);
@@ -7272,6 +7273,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
          NIR_PASS(_, nir, nir_zero_initialize_shared_memory, nir->info.shared_size, 4);
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
       NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_mem_shared, NULL);
+      NIR_PASS(_, nir, wvk_nir_lower_atomic64);
       /* Stores of less than a word, atomics on the bits of it. */
       const nir_lower_mem_access_bit_sizes_options shared = {
          .callback = shared_access,

@@ -145,6 +145,14 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   float's bits; a sum, minimum or maximum a loop of compare-exchanges on
   the word until nothing came between -- of buffers, shared memory, and
   images' buffers of texels.
+- **64-bit integer atomics** (shaderBufferInt64Atomics,
+  shaderSharedInt64Atomics): each takes a lock of a table by its address
+  -- the device's for buffers, a few after the workgroup's memory for it
+  -- reads and writes the two words by 32-bit atomics, and gives it back,
+  in one turn of a loop, so that invocations of one SIMD group do not
+  wait on each other. WGSL's atomics are relaxed, and Metal reordered an
+  exchange's words past the lock, so each access depends on the one
+  before by a zero read from memory, which no compiler can fold.
 - **A pass that reads what it renders to** -- an input attachment of its own
   subpass, a feedback loop -- reads a copy, which WebGPU wants: a texture is
   an attachment or bound in a pass, not both. The copy is made before the
@@ -655,8 +663,8 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   multisampled pass, whose quads cover samples, not whole pixels.
 - RG32 storage images both read and written: WebGPU's read-write storage
   textures are of one-channel 32-bit formats and tier2's, which RG32 is
-  not. And atomics of 64-bit integers or floats, and of 16-bit floats:
-  WGSL's are of 32-bit words.
+  not. And atomics of 64-bit floats, of 16-bit floats, and of 64-bit
+  images: WGSL's are of 32-bit words, and WebGPU has no 64-bit formats.
 - Scalar 8-bit division and remainder, and 8-bit specialization
   constants, fail a few CTS cases not yet understood.
 - A return before a barrier, taken by some invocations: WGSL refuses the

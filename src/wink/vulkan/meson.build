@@ -70,6 +70,7 @@ wvk_files = files(
   'wvk_host_copy.c',
   'wvk_image.c',
   'wvk_instance.c',
+  'wvk_nir_atomic64.c',
   'wvk_nir_cmat.c',
   'wvk_nir_descriptors.c',
   'wvk_nir_minifloats.c',

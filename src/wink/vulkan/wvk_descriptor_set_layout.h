@@ -119,6 +119,11 @@ VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_descriptor_set_layout, vk.base, VkDescriptorS
 /* The counters of the active pipeline statistics query that shaders add
  * to, a word a statistic by its bit (wvk_query.c). */
 #define WVK_DRIVER_SLOT_STATS (WVK_DRIVER_SLOT_GS_INDICES + 5)
+/* The device's locks of 64-bit atomics on buffers, a word each, which an
+ * atomic takes the one of its address, and a word of zero after them
+ * (wvk_nir_atomic64.c). */
+#define WVK_DRIVER_SLOT_LOCKS (WVK_DRIVER_SLOT_GS_INDICES + 6)
+#define WVK_ATOMIC_LOCKS 4096
 
 #define WVK_MAX_SET_SLOTS WVK_DRIVER_SLOT_BASE
 

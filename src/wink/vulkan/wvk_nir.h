@@ -25,6 +25,10 @@ bool wvk_nir_lower_cooperative_matrix(nir_shader *nir);
  * integer arithmetic of their bits (wvk_nir_minifloats.c). */
 bool wvk_nir_lower_minifloats(nir_shader *nir);
 
+/* 64-bit atomics on buffers and shared memory, as 32-bit accesses under a
+ * lock (wvk_nir_atomic64.c): after their explicit io. */
+bool wvk_nir_lower_atomic64(nir_shader *nir);
+
 /* Texel buffers as storage buffers, their format as their records say. */
 bool wvk_nir_lower_texel_buffers(nir_shader *nir, const uint32_t *meta_base);
 
