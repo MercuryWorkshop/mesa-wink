@@ -21,6 +21,9 @@ struct wvk_replay;
 struct wvk_image_alias {
    WGPUTextureFormat format;
    WGPUTexture texture;
+   /* Of a multisampled array, a texture of each layer, as the image has
+    * (layer_textures), of which `texture` is the first. */
+   WGPUTexture *layer_textures;
    /* The image's levels it has, from its level 0. */
    uint32_t first_level;
    uint32_t level_count;
@@ -199,6 +202,26 @@ wvk_image_layer_texture(const struct wvk_image *image, uint32_t layer, uint32_t 
    return image->texture;
 }
 
+/* The same of the image's texture `t`: its own, or an alias's. */
+static inline WGPUTexture
+wvk_image_texture_layer(const struct wvk_image *image, uint32_t t, uint32_t layer, uint32_t *texture_layer)
+{
+   if (t == WVK_IMAGE_TEXTURE || t == WVK_IMAGE_SHADOW) {
+      if (t == WVK_IMAGE_SHADOW) {
+         *texture_layer = layer;
+         return image->shadow;
+      }
+      return wvk_image_layer_texture(image, layer, texture_layer);
+   }
+   const struct wvk_image_alias *alias = &image->aliases[t - 1];
+   if (alias->layer_textures) {
+      *texture_layer = 0;
+      return alias->layer_textures[MIN2(layer, image->vk.array_layers - 1)];
+   }
+   *texture_layer = layer;
+   return alias->texture;
+}
+
 /* A copy of the image's texture, every level and layer of it, for a pass
  * that reads the image as it renders to it. Colour images of one sample
  * only; NULL for the rest. */
@@ -208,6 +231,17 @@ WGPUTexture wvk_image_snapshot(WGPUDevice device, const struct wvk_image *image,
 /* The same of a multisampled colour image's first layer, which is what
  * shaders see of it: a pass copying each sample (wvk_cmd_copy.c). */
 WGPUTexture wvk_image_snapshot_ms(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image);
+
+/* Whether a multisampled texture of `from` can be copied into one of
+ * `to`, bit for bit (wvk_image_copy_ms_bits): both formats' texels are
+ * words a shader packs and unpacks. */
+bool wvk_ms_bits_format(WGPUTextureFormat format);
+
+/* Every sample of a multisampled image's texture `from` into its texture
+ * `to`, the one's bits as the other's format, every layer: a pass writing
+ * each sample, outside any other (wvk_cmd_copy.c). */
+void wvk_image_copy_ms_bits(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+                            uint32_t from, uint32_t to);
 
 /* The same of a depth-stencil image's depth, as R32Float, or its stencil,
  * as R8Uint; one sample only (wvk_cmd_copy.c). */

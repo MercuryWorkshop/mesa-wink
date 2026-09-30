@@ -962,6 +962,264 @@ wvk_image_snapshot_ms(struct wvk_device *dev, struct wvk_replay *replay, const s
    return copy;
 }
 
+/* A texel of a format as the words of its bits, and back: WGSL of the
+ * value `v` a multisampled load gives, and of the words `b`. sRGB formats
+ * are viewed as their linear twins, whose bits they are. */
+static const struct ms_bits {
+   WGPUTextureFormat format;
+   char type; /* the sample type: f32, u32 or i32 */
+   const char *to_bits, *from_bits;
+} ms_bits[] = {
+   { WGPUTextureFormat_R8Unorm, 'f', "vec4u(pack4x8unorm(v) & 0xffu, 0u, 0u, 0u)",
+     "vec4f(unpack4x8unorm(b.x).x, 0.0, 0.0, 1.0)" },
+   { WGPUTextureFormat_R8Uint, 'u', "vec4u(v.x & 0xffu, 0u, 0u, 0u)", "vec4u(b.x & 0xffu, 0u, 0u, 1u)" },
+   { WGPUTextureFormat_R8Sint, 'i', "vec4u(bitcast<u32>(v.x) & 0xffu, 0u, 0u, 0u)",
+     "vec4i(extractBits(bitcast<i32>(b.x), 0u, 8u), 0, 0, 1)" },
+   { WGPUTextureFormat_RG8Unorm, 'f', "vec4u(pack4x8unorm(v) & 0xffffu, 0u, 0u, 0u)",
+     "vec4f(unpack4x8unorm(b.x).xy, 0.0, 1.0)" },
+   { WGPUTextureFormat_RG8Uint, 'u', "vec4u((v.x & 0xffu) | ((v.y & 0xffu) << 8u), 0u, 0u, 0u)",
+     "vec4u(b.x & 0xffu, (b.x >> 8u) & 0xffu, 0u, 1u)" },
+   { WGPUTextureFormat_RG8Sint, 'i', "vec4u((bitcast<u32>(v.x) & 0xffu) | ((bitcast<u32>(v.y) & 0xffu) << 8u), 0u, 0u, 0u)",
+     "vec4i(extractBits(bitcast<i32>(b.x), 0u, 8u), extractBits(bitcast<i32>(b.x), 8u, 8u), 0, 1)" },
+   { WGPUTextureFormat_R16Float, 'f', "vec4u(pack2x16float(v.xy) & 0xffffu, 0u, 0u, 0u)",
+     "vec4f(unpack2x16float(b.x).x, 0.0, 0.0, 1.0)" },
+   { WGPUTextureFormat_R16Uint, 'u', "vec4u(v.x & 0xffffu, 0u, 0u, 0u)", "vec4u(b.x & 0xffffu, 0u, 0u, 1u)" },
+   { WGPUTextureFormat_R16Sint, 'i', "vec4u(bitcast<u32>(v.x) & 0xffffu, 0u, 0u, 0u)",
+     "vec4i(extractBits(bitcast<i32>(b.x), 0u, 16u), 0, 0, 1)" },
+   { WGPUTextureFormat_RGBA8Unorm, 'f', "vec4u(pack4x8unorm(v), 0u, 0u, 0u)", "unpack4x8unorm(b.x)" },
+   { WGPUTextureFormat_BGRA8Unorm, 'f', "vec4u(pack4x8unorm(v.bgra), 0u, 0u, 0u)", "unpack4x8unorm(b.x).bgra" },
+   { WGPUTextureFormat_RGBA8Snorm, 'f', "vec4u(pack4x8snorm(v), 0u, 0u, 0u)", "unpack4x8snorm(b.x)" },
+   { WGPUTextureFormat_RGBA8Uint, 'u', "vec4u(dot(v & vec4u(0xffu), vec4u(1u, 0x100u, 0x10000u, 0x1000000u)), 0u, 0u, 0u)",
+     "vec4u(b.x & 0xffu, (b.x >> 8u) & 0xffu, (b.x >> 16u) & 0xffu, b.x >> 24u)" },
+   { WGPUTextureFormat_RGBA8Sint, 'i', "vec4u(dot(bitcast<vec4u>(v) & vec4u(0xffu), vec4u(1u, 0x100u, 0x10000u, 0x1000000u)), 0u, 0u, 0u)",
+     "vec4i(extractBits(bitcast<i32>(b.x), 0u, 8u), extractBits(bitcast<i32>(b.x), 8u, 8u),"
+     " extractBits(bitcast<i32>(b.x), 16u, 8u), extractBits(bitcast<i32>(b.x), 24u, 8u))" },
+   { WGPUTextureFormat_RG16Float, 'f', "vec4u(pack2x16float(v.xy), 0u, 0u, 0u)",
+     "vec4f(unpack2x16float(b.x), 0.0, 1.0)" },
+   { WGPUTextureFormat_RG16Unorm, 'f', "vec4u(pack2x16unorm(v.xy), 0u, 0u, 0u)",
+     "vec4f(unpack2x16unorm(b.x), 0.0, 1.0)" },
+   { WGPUTextureFormat_RG16Snorm, 'f', "vec4u(pack2x16snorm(v.xy), 0u, 0u, 0u)",
+     "vec4f(unpack2x16snorm(b.x), 0.0, 1.0)" },
+   { WGPUTextureFormat_RG16Uint, 'u', "vec4u((v.x & 0xffffu) | (v.y << 16u), 0u, 0u, 0u)",
+     "vec4u(b.x & 0xffffu, b.x >> 16u, 0u, 1u)" },
+   { WGPUTextureFormat_RG16Sint, 'i', "vec4u((bitcast<u32>(v.x) & 0xffffu) | (bitcast<u32>(v.y) << 16u), 0u, 0u, 0u)",
+     "vec4i(extractBits(bitcast<i32>(b.x), 0u, 16u), extractBits(bitcast<i32>(b.x), 16u, 16u), 0, 1)" },
+   { WGPUTextureFormat_R32Float, 'f', "vec4u(bitcast<u32>(v.x), 0u, 0u, 0u)",
+     "vec4f(bitcast<f32>(b.x), 0.0, 0.0, 1.0)" },
+   { WGPUTextureFormat_R32Uint, 'u', "vec4u(v.x, 0u, 0u, 0u)", "vec4u(b.x, 0u, 0u, 1u)" },
+   { WGPUTextureFormat_R32Sint, 'i', "vec4u(bitcast<u32>(v.x), 0u, 0u, 0u)", "vec4i(bitcast<i32>(b.x), 0, 0, 1)" },
+   { WGPUTextureFormat_RGB10A2Unorm, 'f',
+     "vec4u(u32(round(saturate(v.x) * 1023.0)) | (u32(round(saturate(v.y) * 1023.0)) << 10u) |"
+     " (u32(round(saturate(v.z) * 1023.0)) << 20u) | (u32(round(saturate(v.w) * 3.0)) << 30u), 0u, 0u, 0u)",
+     "vec4f(f32(b.x & 0x3ffu) / 1023.0, f32((b.x >> 10u) & 0x3ffu) / 1023.0,"
+     " f32((b.x >> 20u) & 0x3ffu) / 1023.0, f32(b.x >> 30u) / 3.0)" },
+   { WGPUTextureFormat_RGB10A2Uint, 'u',
+     "vec4u((v.x & 0x3ffu) | ((v.y & 0x3ffu) << 10u) | ((v.z & 0x3ffu) << 20u) | (v.w << 30u), 0u, 0u, 0u)",
+     "vec4u(b.x & 0x3ffu, (b.x >> 10u) & 0x3ffu, (b.x >> 20u) & 0x3ffu, b.x >> 30u)" },
+   { WGPUTextureFormat_RGBA16Float, 'f', "vec4u(pack2x16float(v.xy), pack2x16float(v.zw), 0u, 0u)",
+     "vec4f(unpack2x16float(b.x), unpack2x16float(b.y))" },
+   { WGPUTextureFormat_RGBA16Unorm, 'f', "vec4u(pack2x16unorm(v.xy), pack2x16unorm(v.zw), 0u, 0u)",
+     "vec4f(unpack2x16unorm(b.x), unpack2x16unorm(b.y))" },
+   { WGPUTextureFormat_RGBA16Snorm, 'f', "vec4u(pack2x16snorm(v.xy), pack2x16snorm(v.zw), 0u, 0u)",
+     "vec4f(unpack2x16snorm(b.x), unpack2x16snorm(b.y))" },
+   { WGPUTextureFormat_RGBA16Uint, 'u',
+     "vec4u((v.x & 0xffffu) | (v.y << 16u), (v.z & 0xffffu) | (v.w << 16u), 0u, 0u)",
+     "vec4u(b.x & 0xffffu, b.x >> 16u, b.y & 0xffffu, b.y >> 16u)" },
+   { WGPUTextureFormat_RGBA16Sint, 'i',
+     "vec4u((bitcast<u32>(v.x) & 0xffffu) | (bitcast<u32>(v.y) << 16u),"
+     " (bitcast<u32>(v.z) & 0xffffu) | (bitcast<u32>(v.w) << 16u), 0u, 0u)",
+     "vec4i(extractBits(bitcast<i32>(b.x), 0u, 16u), extractBits(bitcast<i32>(b.x), 16u, 16u),"
+     " extractBits(bitcast<i32>(b.y), 0u, 16u), extractBits(bitcast<i32>(b.y), 16u, 16u))" },
+   { WGPUTextureFormat_RG32Float, 'f', "vec4u(bitcast<vec2u>(v.xy), 0u, 0u)",
+     "vec4f(bitcast<vec2f>(b.xy), 0.0, 1.0)" },
+   { WGPUTextureFormat_RG32Uint, 'u', "vec4u(v.xy, 0u, 0u)", "vec4u(b.xy, 0u, 1u)" },
+   { WGPUTextureFormat_RG32Sint, 'i', "vec4u(bitcast<vec2u>(v.xy), 0u, 0u)", "vec4i(bitcast<vec2i>(b.xy), 0, 1)" },
+   { WGPUTextureFormat_RGBA32Float, 'f', "bitcast<vec4u>(v)", "bitcast<vec4f>(b)" },
+   { WGPUTextureFormat_RGBA32Uint, 'u', "v", "b" },
+   { WGPUTextureFormat_RGBA32Sint, 'i', "bitcast<vec4u>(v)", "bitcast<vec4i>(b)" },
+};
+
+static WGPUTextureFormat
+linear_format(WGPUTextureFormat format)
+{
+   return format == WGPUTextureFormat_RGBA8UnormSrgb   ? WGPUTextureFormat_RGBA8Unorm
+          : format == WGPUTextureFormat_BGRA8UnormSrgb ? WGPUTextureFormat_BGRA8Unorm
+                                                       : format;
+}
+
+static const struct ms_bits *
+find_ms_bits(WGPUTextureFormat format)
+{
+   format = linear_format(format);
+   for (uint32_t i = 0; i < ARRAY_SIZE(ms_bits); ++i) {
+      if (ms_bits[i].format == format)
+         return &ms_bits[i];
+   }
+   return NULL;
+}
+
+bool
+wvk_ms_bits_format(WGPUTextureFormat format)
+{
+   return find_ms_bits(format) != NULL;
+}
+
+static const char *
+ms_bits_type(char type)
+{
+   return type == 'u' ? "u32" : type == 'i' ? "i32" : "f32";
+}
+
+static WGPURenderPipeline
+ms_bits_pipeline(struct wvk_device *dev, WGPUTextureFormat from, WGPUTextureFormat to, uint32_t samples)
+{
+   const struct ms_bits *a = find_ms_bits(from), *b = find_ms_bits(to);
+   if (!a || !b)
+      return NULL;
+   WGPURenderPipeline pipeline = NULL;
+   simple_mtx_lock(&dev->cache_lock);
+   uint32_t i = 0;
+   while (i < ARRAY_SIZE(dev->ms_alias_pipelines) && dev->ms_alias_pipelines[i].pipeline &&
+          (dev->ms_alias_pipelines[i].from != a->format || dev->ms_alias_pipelines[i].to != b->format ||
+           dev->ms_alias_pipelines[i].samples != samples))
+      ++i;
+   if (i < ARRAY_SIZE(dev->ms_alias_pipelines) && !dev->ms_alias_pipelines[i].pipeline) {
+      char *code = ralloc_asprintf(
+         NULL,
+         "@group(0) @binding(0) var src: texture_multisampled_2d<%s>;\n"
+         "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {\n"
+         "  let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n"
+         "  return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);\n"
+         "}\n"
+         "fn to_bits(v: vec4<%s>) -> vec4u { return %s; }\n"
+         "fn from_bits(b: vec4u) -> vec4<%s> { return %s; }\n"
+         "@fragment fn fs(@builtin(position) pos: vec4f, @builtin(sample_index) s: u32) -> @location(0) vec4<%s> {\n"
+         "  return from_bits(to_bits(textureLoad(src, vec2i(pos.xy), i32(s))));\n"
+         "}\n",
+         ms_bits_type(a->type), ms_bits_type(a->type), a->to_bits, ms_bits_type(b->type), b->from_bits,
+         ms_bits_type(b->type));
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(code);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      sm.label = wvk_sv("wvk ms bits");
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      ralloc_free(code);
+      /* Unfilterable: R32Float and the rest are loaded, not filtered. */
+      WGPUBindGroupLayoutEntry entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry.binding = 0;
+      entry.visibility = WGPUShaderStage_Fragment;
+      entry.texture.sampleType = a->type == 'u'   ? WGPUTextureSampleType_Uint
+                                 : a->type == 'i' ? WGPUTextureSampleType_Sint
+                                                  : WGPUTextureSampleType_UnfilterableFloat;
+      entry.texture.viewDimension = WGPUTextureViewDimension_2D;
+      entry.texture.multisampled = true;
+      WGPUBindGroupLayoutDescriptor bgld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+      bgld.entryCount = 1;
+      bgld.entries = &entry;
+      WGPUBindGroupLayout bgl = wgpuDeviceCreateBindGroupLayout(dev->wgpu, &bgld);
+      WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+      pld.bindGroupLayoutCount = 1;
+      pld.bindGroupLayouts = &bgl;
+      WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(dev->wgpu, &pld);
+      wgpuBindGroupLayoutRelease(bgl);
+      WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+      target.format = b->format;
+      WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+      fragment.module = module;
+      fragment.entryPoint = wvk_sv("fs");
+      fragment.targetCount = 1;
+      fragment.targets = &target;
+      WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk ms bits");
+      desc.layout = layout;
+      desc.vertex.module = module;
+      desc.vertex.entryPoint = wvk_sv("vs");
+      desc.fragment = &fragment;
+      desc.multisample.count = samples;
+      dev->ms_alias_pipelines[i].from = a->format;
+      dev->ms_alias_pipelines[i].to = b->format;
+      dev->ms_alias_pipelines[i].samples = samples;
+      dev->ms_alias_pipelines[i].pipeline = wgpuDeviceCreateRenderPipeline(dev->wgpu, &desc);
+      wgpuPipelineLayoutRelease(layout);
+      wgpuShaderModuleRelease(module);
+   }
+   if (i < ARRAY_SIZE(dev->ms_alias_pipelines))
+      pipeline = dev->ms_alias_pipelines[i].pipeline;
+   simple_mtx_unlock(&dev->cache_lock);
+   return pipeline;
+}
+
+static void ms_bits_pass(struct wvk_device *dev, struct wvk_replay *replay, WGPURenderPipeline pipeline,
+                         WGPUTexture src, WGPUTextureFormat src_format, WGPUTexture dst,
+                         WGPUTextureFormat dst_format);
+
+void
+wvk_image_copy_ms_bits(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image, uint32_t from,
+                       uint32_t to)
+{
+   uint32_t first;
+   WGPUTexture src = wvk_image_texture(image, from, &first);
+   WGPUTexture dst = wvk_image_texture(image, to, &first);
+   if (!src || !dst)
+      return;
+   const WGPUTextureFormat src_format = linear_format(wgpuTextureGetFormat(src));
+   const WGPUTextureFormat dst_format = linear_format(wgpuTextureGetFormat(dst));
+   WGPURenderPipeline pipeline = ms_bits_pipeline(dev, src_format, dst_format, image->vk.samples);
+   if (!pipeline)
+      return;
+   wvk_replay_end_passes(replay);
+   /* A multisampled array is a texture a layer. */
+   for (uint32_t layer = 0; layer < image->vk.array_layers; ++layer) {
+      uint32_t unused;
+      src = wvk_image_texture_layer(image, from, layer, &unused);
+      dst = wvk_image_texture_layer(image, to, layer, &unused);
+      if (src && dst)
+         ms_bits_pass(dev, replay, pipeline, src, src_format, dst, dst_format);
+   }
+}
+
+static void
+ms_bits_pass(struct wvk_device *dev, struct wvk_replay *replay, WGPURenderPipeline pipeline, WGPUTexture src,
+             WGPUTextureFormat src_format, WGPUTexture dst, WGPUTextureFormat dst_format)
+{
+
+   WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   vd.dimension = WGPUTextureViewDimension_2D;
+   vd.arrayLayerCount = 1;
+   vd.mipLevelCount = 1;
+   vd.format = src_format;
+   WGPUTextureView src_view = wgpuTextureCreateView(src, &vd);
+   util_dynarray_append(&replay->views, src_view);
+   vd.format = dst_format;
+   WGPUTextureView dst_view = wgpuTextureCreateView(dst, &vd);
+   util_dynarray_append(&replay->views, dst_view);
+   WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+   const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src_view };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = bgl;
+   bg.entryCount = 1;
+   bg.entries = &entry;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bgl);
+
+   WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+   color.view = dst_view;
+   color.loadOp = WGPULoadOp_Clear;
+   color.storeOp = WGPUStoreOp_Store;
+   WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+   pd.label = wvk_sv("wvk ms bits");
+   pd.colorAttachmentCount = 1;
+   pd.colorAttachments = &color;
+   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &pd);
+   wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+   wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+   wgpuRenderPassEncoderEnd(pass);
+   wgpuRenderPassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+}
+
 /* Depth into R32Float, or stencil into R8Uint: a pass a level and layer,
  * loading it. Only depth16 and depth32 copy out of a texture, and none
  * into one; stencil does, but not reliably out of combined formats. */

@@ -321,8 +321,15 @@ wvk_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks *
       wgpuBufferRelease(image->atomic_buffer);
    if (image->shadow)
       wgpuTextureRelease(image->shadow);
-   for (uint32_t i = 0; i < image->alias_count; ++i)
+   for (uint32_t i = 0; i < image->alias_count; ++i) {
+      if (image->aliases[i].layer_textures) {
+         /* The first is `texture`. */
+         for (uint32_t l = 1; l < image->vk.array_layers; ++l)
+            wgpuTextureRelease(image->aliases[i].layer_textures[l]);
+         free(image->aliases[i].layer_textures);
+      }
       wgpuTextureRelease(image->aliases[i].texture);
+   }
    vk_image_destroy(&dev->vk, pAllocator, &image->vk);
 }
 
@@ -379,6 +386,12 @@ wvk_image_make_current(struct wvk_device *dev, struct wvk_replay *replay, struct
       if (t == WVK_IMAGE_SHADOW) {
          wvk_image_make_current(dev, replay, image, WVK_IMAGE_TEXTURE, l, 1);
          wvk_image_update_shadow(dev, replay, image, l);
+         image->valid[l] |= BITFIELD_BIT(t);
+         continue;
+      }
+      /* A multisampled one's samples are moved by a pass. */
+      if (image->vk.samples > 1) {
+         wvk_image_copy_ms_bits(dev, replay, image, image->owner[l], t);
          image->valid[l] |= BITFIELD_BIT(t);
          continue;
       }
@@ -740,6 +753,10 @@ image_alias(struct wvk_device *dev, struct wvk_image *image, const struct wvk_im
 
    const uint32_t caps = wvk_format_caps(pdev, vf);
    WGPUTextureUsage usage = WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+   /* A multisampled one is only drawn to, and read by the passes that
+    * keep the image's textures alike. */
+   if (image->vk.samples > 1)
+      usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_RenderAttachment;
    if (caps & WVK_CAP_SAMPLE)
       usage |= WGPUTextureUsage_TextureBinding;
    if (caps & WVK_CAP_RENDER)
@@ -767,12 +784,31 @@ image_alias(struct wvk_device *dev, struct wvk_image *image, const struct wvk_im
                                                                               : image->vk.array_layers;
       desc.mipLevelCount = image->vk.mip_levels;
    }
-   WGPUTexture texture = wgpuDeviceCreateTexture(dev->wgpu, &desc);
+   desc.sampleCount = image->vk.samples;
+   /* Of a multisampled array, a texture a layer, as the image's own. */
+   WGPUTexture *layers = NULL;
+   if (image->layer_textures) {
+      desc.size.depthOrArrayLayers = 1;
+      layers = calloc(image->vk.array_layers, sizeof(*layers));
+      for (uint32_t l = 0; layers && l < image->vk.array_layers; ++l) {
+         layers[l] = wgpuDeviceCreateTexture(dev->wgpu, &desc);
+         if (!layers[l]) {
+            while (l--)
+               wgpuTextureRelease(layers[l]);
+            free(layers);
+            layers = NULL;
+         }
+      }
+      if (!layers)
+         goto out;
+   }
+   WGPUTexture texture = layers ? layers[0] : wgpuDeviceCreateTexture(dev->wgpu, &desc);
    if (!texture)
       goto out;
    struct wvk_image_alias *alias = &image->aliases[image->alias_count];
    alias->format = format;
    alias->texture = texture;
+   alias->layer_textures = layers;
    alias->first_level = first;
    alias->level_count = desc.mipLevelCount;
    if (!image->tracked)
@@ -787,11 +823,21 @@ out:
 /* Whether a view of `format` needs a texture of the image's other than
  * its own, whose format and sRGB twin are all WebGPU views it as. */
 static bool
-needs_alias(const struct wvk_image *image, const struct wvk_image_view *view, WGPUTextureFormat format)
+needs_alias(const struct wvk_physical_device *pdev, const struct wvk_image *image, const struct wvk_image_view *view,
+            WGPUTextureFormat format)
 {
-   if (!image->texture || image->layer_textures || image->vk.samples > 1 || view->aspect != WGPUTextureAspect_All ||
+   if (!image->texture || (image->layer_textures && image->vk.samples == 1) || view->aspect != WGPUTextureAspect_All ||
        (image->vk.aspects & ~VK_IMAGE_ASPECT_COLOR_BIT) || format == image->format ||
        format == srgb_twin(image->format))
+      return false;
+   /* A multisampled one is kept by a pass that moves each sample's bits
+    * (wvk_image_copy_ms_bits), which WebGPU copies none of: of formats
+    * it multisamples, whose bits a shader knows. */
+   if (image->vk.samples > 1 &&
+       (!(image->usage & WGPUTextureUsage_TextureBinding) || !wvk_ms_bits_format(image->format) ||
+        !wvk_ms_bits_format(format) ||
+        (wvk_format_caps(pdev, view->vk.view_format) & (WVK_CAP_MSAA | WVK_CAP_SAMPLE)) !=
+           (WVK_CAP_MSAA | WVK_CAP_SAMPLE)))
       return false;
    /* Packed formats' texels are RGBA8, whose bytes are not theirs; and a
     * compressed view is its own format or its twin. */
@@ -902,7 +948,7 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    /* A compressed image of a size not whole blocks is sampled from what
     * it decodes to; a view of a format WebGPU cannot view the texture as
     * is of a texture of that format. */
-   if (needs_alias(image, view, view->format))
+   if (needs_alias(wvk_device_physical(dev), image, view, view->format))
       view->texture = image_alias(dev, image, view, view->format);
    else if (image->shadow && vk_format_is_compressed(view->vk.view_format))
       view->texture = WVK_IMAGE_SHADOW;
@@ -929,7 +975,8 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
       WGPUTexture texture = wvk_image_layer_texture(image, view->vk.base_array_layer, &texture_layer);
       if (view->texture != WVK_IMAGE_TEXTURE && view->texture != WVK_IMAGE_SHADOW) {
          uint32_t first_level;
-         texture = wvk_image_texture(image, view->texture, &first_level);
+         texture = wvk_image_texture_layer(image, view->texture, view->vk.base_array_layer, &texture_layer);
+         wvk_image_texture(image, view->texture, &first_level);
          desc.baseMipLevel -= first_level;
       } else if (view->texture == WVK_IMAGE_SHADOW) {
          texture = image->shadow;
@@ -1061,13 +1108,10 @@ wvk_image_attachment_view(struct wvk_image *image, uint32_t t, WGPUTextureFormat
                                                                  : WGPUTextureViewDimension_2D;
    desc.baseMipLevel = level;
    desc.mipLevelCount = 1;
-   uint32_t texture_layer;
-   WGPUTexture texture = wvk_image_layer_texture(image, layer, &texture_layer);
-   if (t != WVK_IMAGE_TEXTURE) {
-      uint32_t first_level;
-      texture = wvk_image_texture(image, t, &first_level);
-      desc.baseMipLevel -= first_level;
-   }
+   uint32_t texture_layer, first_level;
+   WGPUTexture texture = wvk_image_texture_layer(image, t, layer, &texture_layer);
+   wvk_image_texture(image, t, &first_level);
+   desc.baseMipLevel -= first_level;
    desc.baseArrayLayer = image->dimension == WGPUTextureDimension_3D ? 0 : texture_layer;
    desc.arrayLayerCount = 1;
    desc.aspect = aspect;

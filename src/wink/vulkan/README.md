@@ -370,7 +370,9 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
 - **Views in other formats.** WebGPU views a texture only as its format
   or its sRGB twin. A view of another format of the same texel size, or an
   uncompressed view of a compressed image (a texel a block), is of another
-  texture of the image's, in that format. The image keeps, at each level,
+  texture of the image's, in that format -- a multisampled image's too,
+  kept by a pass that moves each sample's bits, where WebGPU copies no
+  multisampled texture (`wvk_image_copy_ms_bits`). The image keeps, at each level,
   which of its textures are up to date, and brings one up to date with
   copies through a buffer when a draw, a pass or a transfer uses it.
   A compressed image whose size is not whole blocks is sampled from a
@@ -730,10 +732,10 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - Blend states whose colour factors use both CONSTANT_COLOR and
   CONSTANT_ALPHA, on a multisampled pass: WebGPU has one constant, and
   the fragment shader's blending reads single-sampled copies.
-- Views of multisampled images in formats other than the image's, or its
-  sRGB twin: other views are of a texture of the view's format, which
-  copies through a buffer keep up to date, and WebGPU copies no
-  multisampled texture.
+- Views of multisampled images in formats WebGPU does not multisample
+  (R32 integers, RG32): other formats' views are of a multisampled
+  texture of the view's format, which a pass moving each sample's bits
+  keeps up to date, as copies through a buffer keep single-sampled ones.
 - Gathers from integer cube maps take one texel four times: each face's
   2x2 footprint across its edges is not worked out.
 - Lines and points of triangles are not culled: which way a triangle

@@ -139,6 +139,14 @@ struct wvk_device {
       uint32_t samples;
       WGPURenderPipeline pipeline;
    } ms_copy_pipelines[8];
+   /* Each sample of a multisampled colour texture into one of another
+    * format, bit for bit: an image's alias (wvk_image.h). By the two
+    * formats and the sample count. */
+   struct {
+      WGPUTextureFormat from, to;
+      uint32_t samples;
+      WGPURenderPipeline pipeline;
+   } ms_alias_pipelines[16];
    /* Depth into R32Float and stencil into R8Uint, for copies of them a
     * pass reads. */
    WGPURenderPipeline ds_copy_pipelines[2];
