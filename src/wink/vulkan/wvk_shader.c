@@ -4765,12 +4765,13 @@ lower_layer_outputs(nir_shader *nir, struct wvk_shader *shader)
       shader->writes_layer = layer != NULL;
       shader->writes_viewport = viewport != NULL;
    }
+   /* Locals, not SSA yet: a point's or a line's vertex (WVK_POINT_VERTEX)
+    * is a local only stored until its attributes are pulled, after this,
+    * which would find it gone and pull at the corner's vertex_index. */
    if (progress) {
       nir_fixup_deref_modes(nir);
       NIR_PASS(_, nir, nir_lower_global_vars_to_local);
-      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
-      NIR_PASS(_, nir, nir_opt_dce);
-      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp | nir_var_shader_temp, NULL);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_temp, NULL);
    }
    return progress;
 }
