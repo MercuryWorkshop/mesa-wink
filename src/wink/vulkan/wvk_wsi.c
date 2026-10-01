@@ -143,16 +143,20 @@ metal_layer_extent(const CAMetalLayer *layer)
 }
 #endif
 
-#ifdef VK_USE_PLATFORM_XCB_KHR
+#if defined(VK_USE_PLATFORM_XCB_KHR) || defined(VK_USE_PLATFORM_XLIB_KHR)
 #include <dlfcn.h>
 #include "c11/threads.h"
 
 /* Dawn has Xlib windows and not XCB ones: an XCB window is one of an
  * Xlib display of the driver's own, the process's one connection to the
  * X server $DISPLAY names -- window ids are the server's, whichever
- * connection names them. libX11 is loaded, not linked, for an application
- * that has none. */
+ * connection names them. The same display asks any X window its size,
+ * without touching a connection of the application's. libX11 is loaded,
+ * not linked, for an application that has none. */
 static void *xlib_display;
+static int (*xlib_get_geometry)(void *, unsigned long, unsigned long *, int *, int *, unsigned *,
+                                unsigned *, unsigned *, unsigned *);
+static mtx_t xlib_lock;
 static once_flag xlib_once = ONCE_FLAG_INIT;
 
 static void
@@ -161,9 +165,34 @@ open_xlib_display(void)
    void *x11 = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
    void *(*open_display)(const char *) = x11 ? (void *(*)(const char *))dlsym(x11, "XOpenDisplay") : NULL;
    xlib_display = open_display ? open_display(NULL) : NULL;
-   if (!xlib_display)
-      mesa_loge("wvk: no Xlib display for an XCB window, which Dawn has no surfaces of");
+   if (xlib_display)
+      xlib_get_geometry = dlsym(x11, "XGetGeometry");
+   else
+      mesa_loge("wvk: no Xlib display, for X windows Dawn has no XCB surfaces of");
+   mtx_init(&xlib_lock, mtx_plain);
 }
+
+/* The window's size, as the X server has it. */
+static bool
+x11_window_extent(unsigned long window, VkExtent2D *extent)
+{
+   call_once(&xlib_once, open_xlib_display);
+   if (!xlib_get_geometry)
+      return false;
+   unsigned long root;
+   int x, y;
+   unsigned width, height, border, depth;
+   mtx_lock(&xlib_lock);
+   const int ok = xlib_get_geometry(xlib_display, window, &root, &x, &y, &width, &height, &border, &depth);
+   mtx_unlock(&xlib_lock);
+   if (!ok)
+      return false;
+   *extent = (VkExtent2D){ width, height };
+   return true;
+}
+#endif
+
+#ifdef VK_USE_PLATFORM_XCB_KHR
 
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_CreateXcbSurfaceKHR(VkInstance _instance, const VkXcbSurfaceCreateInfoKHR *pCreateInfo,
@@ -232,7 +261,7 @@ wvk_DestroySurfaceKHR(VkInstance _instance, VkSurfaceKHR _surface,
 }
 
 /* The size of the window, or UINT32_MAX where the swapchain decides it:
- * on a headless surface, and where the window cannot be asked. */
+ * on a headless or Wayland surface, and where the window cannot be asked. */
 static VkExtent2D
 surface_current_extent(const struct wvk_surface *surface)
 {
@@ -241,6 +270,16 @@ surface_current_extent(const struct wvk_surface *surface)
       return metal_layer_extent(surface->icd.metal.pLayer);
 #endif
    VkExtent2D extent;
+#ifdef VK_USE_PLATFORM_XCB_KHR
+   if (surface->icd.base.platform == VK_ICD_WSI_PLATFORM_XCB &&
+       x11_window_extent(surface->icd.xcb.window, &extent))
+      return extent;
+#endif
+#ifdef VK_USE_PLATFORM_XLIB_KHR
+   if (surface->icd.base.platform == VK_ICD_WSI_PLATFORM_XLIB &&
+       x11_window_extent(surface->icd.xlib.window, &extent))
+      return extent;
+#endif
    if (surface->canvas && wvk_platform_surface_extent(surface->wgpu, &extent))
       return extent;
    return (VkExtent2D){ UINT32_MAX, UINT32_MAX };
