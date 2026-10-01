@@ -76,6 +76,8 @@ struct wvk_pass_query {
     * between them. */
    uint32_t parts;
    bool suspended;
+   /* A pass it was in had no query left for it: what it counted is lost. */
+   bool uncounted;
 };
 
 /* The active occlusion query ended where the pass is going to, or a clear

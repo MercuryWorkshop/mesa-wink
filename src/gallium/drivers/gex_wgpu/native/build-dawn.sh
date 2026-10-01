@@ -60,7 +60,8 @@ for PATCH in "$PATCHES/dawn-metal-strict-math-contract.patch" "$PATCHES/dawn-met
              "$PATCHES/dawn-vulkan-color-attachment-bytes.patch" \
              "$PATCHES/dawn-vulkan-clear-3d-texture.patch" \
              "$PATCHES/tint-spirv-reader-texel-formats.patch" \
-             "$PATCHES/dawn-vulkan-framebuffer-clear-values.patch"; do
+             "$PATCHES/dawn-vulkan-framebuffer-clear-values.patch" \
+             "$PATCHES/dawn-vulkan-precise-occlusion.patch"; do
   if git -C "$SRC" apply --check "$PATCH" 2>/dev/null; then
     echo "[dawn] applying $(basename "$PATCH")"
     git -C "$SRC" apply "$PATCH"

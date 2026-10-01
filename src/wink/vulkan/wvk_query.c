@@ -279,9 +279,12 @@ void
 wvk_replay_resume_query(struct wvk_replay *replay)
 {
    struct wvk_pass_query *q = &replay->active_query;
-   if (!q->pool || !q->suspended || !replay->pass || !replay->query_set ||
-       replay->query_next >= WVK_QUERY_SET_SIZE)
+   if (!q->pool || !q->suspended || !replay->pass || replay->query_held)
       return;
+   if (!replay->query_set || replay->query_next >= WVK_QUERY_SET_SIZE) {
+      q->uncounted = true;
+      return;
+   }
    q->slot = replay->query_next++;
    q->suspended = false;
    wgpuRenderPassEncoderBeginOcclusionQuery(replay->pass, q->slot);
@@ -569,8 +572,14 @@ wvk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool
    }
    if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
       return;
-   if (!replay->pass || !replay->query_set) {
-      mesa_logw_once("wvk: an occlusion query outside a render pass reads as visible");
+   /* Begun outside a render pass, it counts in the passes until it ends:
+    * each resumes it. */
+   if (!replay->pass) {
+      replay->active_query = (struct wvk_pass_query){ pool, query, UINT32_MAX, .suspended = true };
+      return;
+   }
+   if (!replay->query_set) {
+      mesa_logw_once("wvk: an occlusion query without a query set reads as visible");
       replay->active_query = (struct wvk_pass_query){ pool, query, UINT32_MAX };
       return;
    }
@@ -604,8 +613,13 @@ wvk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, 
       struct wvk_pass_query part = replay->active_query;
       part.accumulate = part.parts > 0;
       util_dynarray_append(&replay->pass_queries, part);
-   } else if (replay->active_query.pool == pool && replay->active_query.parts) {
+   } else if (replay->active_query.pool == pool && replay->active_query.parts &&
+              !replay->active_query.uncounted) {
       /* Counted, in the parts it had. */
+   } else if (replay->active_query.pool == pool && replay->active_query.suspended &&
+              !replay->active_query.parts && !replay->active_query.uncounted) {
+      /* In no pass: nothing was drawn. */
+      ((uint64_t *)pool->mem->host)[query] = 0;
    } else {
       /* Not counted: say something was drawn, which is never wrong to
        * act on. */

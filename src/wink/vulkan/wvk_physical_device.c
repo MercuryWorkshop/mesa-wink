@@ -331,6 +331,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .shaderTessellationAndGeometryPointSize = true,
       /* The driver's counts, the host's and the shaders' (wvk_query.c). */
       .pipelineStatisticsQuery = true,
+      /* Occlusion counts samples on native Dawn's Vulkan, which has the
+       * host's precise queries (dawn-vulkan-precise-occlusion.patch);
+       * Metal's and a browser's are only zero or not. */
+      .occlusionQueryPrecise = pdev->info.backendType == WGPUBackendType_Vulkan,
       /* As compute, before a draw of what it emits (draw_geometry). */
       .geometryShader = true,
       /* As compute, around a tessellator of the same (draw_tessellated). */

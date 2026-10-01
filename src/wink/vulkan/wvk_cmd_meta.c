@@ -114,7 +114,7 @@ struct wvk_meta_save {
    struct vk_vertex_input_state vi;
    struct vk_sample_locations_state sample_locations;
    void *state;
-   bool xfb_active, cond_active;
+   bool xfb_active, cond_active, query_held;
    /* The stages the runtime has of a pipeline bound: vk_meta's pipeline
     * is not the application's, whose shader objects a bind of others
     * would unbind for it else. */
@@ -135,6 +135,10 @@ meta_begin(struct wvk_cmd_buffer *cmd, struct wvk_meta_save *save)
    /* Nor conditional rendering's, but those of vkCmdClearAttachments. */
    save->cond_active = cmd->replay->cond.active;
    cmd->replay->cond.active = false;
+   /* Nor an occlusion query's: one begun outside a pass is resumed by
+    * passes, which a blit's or a resolve's are not. */
+   save->query_held = cmd->replay->query_held;
+   cmd->replay->query_held = true;
 }
 
 static void
@@ -151,6 +155,7 @@ meta_end(struct wvk_cmd_buffer *cmd, struct wvk_meta_save *save)
    cmd->vk.pipeline_shader_stages = save->pipeline_stages;
    cmd->replay->xfb_active = save->xfb_active;
    cmd->replay->cond.active = save->cond_active;
+   cmd->replay->query_held = save->query_held;
 }
 
 VKAPI_ATTR void VKAPI_CALL

@@ -1,0 +1,33 @@
+diff --git a/src/dawn/native/vulkan/CommandBufferVk.cpp b/src/dawn/native/vulkan/CommandBufferVk.cpp
+index eba7850c2b..528f31e153 100644
+--- a/src/dawn/native/vulkan/CommandBufferVk.cpp
++++ b/src/dawn/native/vulkan/CommandBufferVk.cpp
+@@ -1575,7 +1575,10 @@ MaybeError CommandBuffer::RecordRenderPass(CommandRecordingContext* recordingCon
+                 BeginOcclusionQueryCmd* cmd = mCommands.NextCommand<BeginOcclusionQueryCmd>();
+ 
+                 device->fn.CmdBeginQuery(commands, ToBackend(cmd->querySet.Get())->GetHandle(),
+-                                         cmd->queryIndex, 0);
++                                         cmd->queryIndex,
++                                         device->GetDeviceInfo().features.occlusionQueryPrecise
++                                             ? VK_QUERY_CONTROL_PRECISE_BIT
++                                             : 0);
+                 break;
+             }
+ 
+diff --git a/src/dawn/native/vulkan/DeviceVk.cpp b/src/dawn/native/vulkan/DeviceVk.cpp
+index d18e123272..12d0ef6919 100644
+--- a/src/dawn/native/vulkan/DeviceVk.cpp
++++ b/src/dawn/native/vulkan/DeviceVk.cpp
+@@ -547,6 +547,12 @@ ResultOrError<VulkanDeviceKnobs> Device::CreateDevice(VkPhysicalDevice vkPhysica
+         usedKnobs.features.depthClamp = VK_TRUE;
+     }
+ 
++    // Occlusion queries count samples where the GPU can (wink's
++    // occlusionQueryPrecise): WebGPU only asks zero or not, which a count is.
++    if (mDeviceInfo.features.occlusionQueryPrecise == VK_TRUE) {
++        usedKnobs.features.occlusionQueryPrecise = VK_TRUE;
++    }
++
+     if (HasFeature(Feature::PrimitiveIndex)) {
+         DAWN_ASSERT(mDeviceInfo.features.geometryShader == VK_TRUE);
+         usedKnobs.features.geometryShader = VK_TRUE;

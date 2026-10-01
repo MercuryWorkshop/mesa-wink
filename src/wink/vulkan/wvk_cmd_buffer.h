@@ -193,6 +193,8 @@ struct wvk_replay {
    uint32_t pass_query_first;
    struct util_dynarray pass_queries;   /* struct wvk_pass_query */
    struct wvk_pass_query active_query;
+   /* In a meta operation, whose passes the active query is not in. */
+   bool query_held;
    /* Queries counted as the replay goes -- pipeline statistics, primitives
     * generated, transform feedback: what the host counts, the counters
     * shaders and the driver's passes add to on the GPU
