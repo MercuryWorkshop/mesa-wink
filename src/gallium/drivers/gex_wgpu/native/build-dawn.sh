@@ -68,9 +68,15 @@ for PATCH in "$PATCHES/dawn-metal-strict-math-contract.patch" "$PATCHES/dawn-met
 done
 
 case "$(uname -s)" in
-  Darwin) BACKENDS=(-DDAWN_ENABLE_METAL=ON -DDAWN_ENABLE_VULKAN=OFF -DDAWN_USE_X11=OFF -DDAWN_USE_WAYLAND=OFF) ;;
+  Darwin) BACKENDS=(-DDAWN_ENABLE_METAL=ON -DDAWN_ENABLE_VULKAN=OFF -DDAWN_USE_X11=OFF -DDAWN_USE_WAYLAND=OFF)
+          LINK=() ;;
   # Wayland surfaces as well as X11's, which Dawn leaves out by default.
-  *)      BACKENDS=(-DDAWN_ENABLE_VULKAN=ON -DDAWN_USE_X11=ON -DDAWN_USE_WAYLAND=ON) ;;
+  # The library's calls are its own: an application that has a SPIRV-Tools
+  # of its own loaded (Dolphin) would otherwise have ELF's flat namespace
+  # bind Dawn's spvtools calls to that one, of another version and layout.
+  # SPIRV-Tools is not exported at all; Tint is, for wink's compiler.
+  *)      BACKENDS=(-DDAWN_ENABLE_VULKAN=ON -DDAWN_USE_X11=ON -DDAWN_USE_WAYLAND=ON)
+          LINK=(-DCMAKE_SHARED_LINKER_FLAGS="-Wl,-Bsymbolic-functions -Wl,--version-script=$HERE/dawn-exports.map") ;;
 esac
 
 echo "[dawn] configuring"
@@ -84,7 +90,7 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_C_FLAGS="-Wno-c2y-extensions -Wno-unknown-warning-option" \
   -DCMAKE_BUILD_TYPE=Release \
   -DDAWN_FETCH_DEPENDENCIES=OFF \
-  "${BACKENDS[@]}" \
+  "${BACKENDS[@]}" "${LINK[@]}" \
   -DDAWN_USE_GLFW=OFF \
   -DTINT_BUILD_SPV_READER=ON -DTINT_BUILD_WGSL_WRITER=ON \
   -DDAWN_ENABLE_OPENGLES=OFF -DDAWN_ENABLE_DESKTOP_GL=OFF \

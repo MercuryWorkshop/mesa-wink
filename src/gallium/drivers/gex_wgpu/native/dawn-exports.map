@@ -1,0 +1,8 @@
+/* libwebgpu_dawn.so on ELF: everything but SPIRV-Tools, which an
+ * application may have another version of loaded (see build-dawn.sh). */
+{
+  global: *;
+  local:
+    extern "C++" { *spvtools::*; };
+    spv*;
+};
