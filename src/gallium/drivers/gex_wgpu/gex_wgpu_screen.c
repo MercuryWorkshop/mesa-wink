@@ -47507,6 +47507,16 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    }
    /* One pool for both: this driver has no separate constant-buffer heap. */
    ctx->base.const_uploader = ctx->base.stream_uploader;
+   /* Mapped explicitly, not persistently. The screen advertises coherent
+    * persistent maps for ARB_buffer_storage, and u_upload takes them when
+    * offered -- but a coherent mapping tells the driver nothing about what
+    * was written, so gex_wgpu_flush_persistent_maps uploads the uploader's
+    * whole megabyte at every submit (no shader writes it, so not even the
+    * diff applies). Noita submits ~58 times a frame: 58 MB of writeBuffer a
+    * frame for ~1 MB of vertices. With FLUSH_EXPLICIT u_upload names each
+    * written range through transfer_flush_region, which uploads just that,
+    * and an unsynchronized map orders nothing, so no submit follows. */
+   u_upload_disable_persistent(ctx->base.stream_uploader);
 
    ctx->primconvert = util_primconvert_create(&ctx->base, GEX_WGPU_PRIM_MODES);
    if (!ctx->primconvert) {
