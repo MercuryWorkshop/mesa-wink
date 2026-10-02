@@ -2244,6 +2244,12 @@ struct gex_wgpu_context {
     * See gex_wgpu_set_constant_buffer. */
    struct pipe_resource *constant_ring;
    unsigned constant_ring_offset;
+   /* Where a buffer_subdata into a buffer the pending batch reads is staged
+    * until the copy recorded in the batch moves it -- see
+    * gex_wgpu_subdata_in_batch. Bump-allocated, and reset at each submit:
+    * the queue runs a later write to it after the copies before it. */
+   WGPUBuffer subdata_stage;
+   uint32_t subdata_stage_offset;
    /* A zero-filled buffer bound in place of a storage block a shader
     * declares and the application never bound. See
     * gex_wgpu_placeholder_storage. */
@@ -19298,6 +19304,59 @@ gex_wgpu_log_upload(const char *via, unsigned width0, uint32_t offset,
    fprintf(stderr, "\n");
 }
 
+#define GEX_WGPU_SUBDATA_STAGE_BYTES (4u << 20)
+
+/* buffer_subdata into a buffer that draws already recorded in the pending
+ * batch read, without submitting the batch.
+ *
+ * A queue write lands ahead of the whole batch, so those draws would read the
+ * new bytes; until now the batch was submitted first. Noita streams its
+ * vertices with glBufferSubData into buffers it drew from moments before, so
+ * that was ~55 submits a frame -- 94% of them. Instead the bytes go to a
+ * staging buffer (a range no recorded command reads) and a copy recorded in
+ * the batch moves them into place, ordered after the draws before it and
+ * before the ones after, as GL orders them. The copy needs the render pass
+ * closed; the next draw opens another.
+ *
+ * Only for a 4-aligned range the staging buffer has room for; anything else
+ * takes the submit as before. Returns whether it took the write. */
+static bool
+gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
+                          struct pipe_resource *resource, unsigned usage,
+                          unsigned offset, unsigned size, const void *data)
+{
+   struct gex_wgpu_resource *gex = gex_resource(resource);
+   if (!ctx->pending_encoder || !size || !data || (usage & PIPE_MAP_READ) ||
+       resource->target != PIPE_BUFFER || !gex->buffer ||
+       ((offset | size) & 3u) != 0 ||
+       (uint64_t)offset + size > resource->width0 ||
+       size > GEX_WGPU_SUBDATA_STAGE_BYTES - ctx->subdata_stage_offset)
+      return false;
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   if (!ctx->subdata_stage) {
+      WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+      desc.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+      desc.size = GEX_WGPU_SUBDATA_STAGE_BYTES;
+      ctx->subdata_stage = wgpuDeviceCreateBuffer(screen->device, &desc);
+      if (!ctx->subdata_stage)
+         return false;
+   }
+   const uint32_t at = ctx->subdata_stage_offset;
+   ctx->subdata_stage_offset = at + size;
+   gex_wgpu_end_pass(ctx);
+   wgpuQueueWriteBuffer(screen->queue, ctx->subdata_stage, at, data, size);
+   wgpuCommandEncoderCopyBufferToBuffer(ctx->pending_encoder,
+                                        ctx->subdata_stage, at, gex->buffer,
+                                        offset, size);
+   /* The shadow, where there is one, mirrors the buffer as the draws after
+    * this see it. */
+   if (gex->shadow)
+      memcpy(gex->shadow + offset, data, size);
+   gex->bytes_written += size;
+   gex_wgpu_log_upload("sub-batch", resource->width0, offset, data, size);
+   return true;
+}
+
 static void
 gex_wgpu_buffer_subdata(struct pipe_context *pipe,
                         struct pipe_resource *resource, unsigned usage,
@@ -19312,8 +19371,11 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
     * still has to read -- and there are two of them per draw, so breaking the
     * batch for them would leave nothing batched at all. */
    if (resource != ctx->constant_ring &&
-       gex_wgpu_batch_conflicts_usage(ctx, resource, usage))
+       gex_wgpu_batch_conflicts_usage(ctx, resource, usage)) {
+      if (gex_wgpu_subdata_in_batch(ctx, resource, usage, offset, size, data))
+         return;
       gex_wgpu_submit_pending(ctx);
+   }
    struct gex_wgpu_resource *gex = gex_resource(resource);
    /* An aligned write to a buffer that has no shadow needs none: the bytes go
     * straight to the GPU and nothing here has to remember them. This is what
@@ -39424,6 +39486,9 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
    }
    ctx->batch_touched_count = 0;
    ctx->batch_touched_overflowed = false;
+   /* The staged subdata goes with this batch; a later queue write to the
+    * staging buffer runs after it. */
+   ctx->subdata_stage_offset = 0;
    WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, NULL);
    wgpuCommandEncoderRelease(encoder);
    if (!command) {
@@ -47342,6 +47407,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    ctx->line_quads = NULL;
    if (ctx->occlusion_set) wgpuQuerySetRelease(ctx->occlusion_set);
    if (ctx->occlusion_resolve) wgpuBufferRelease(ctx->occlusion_resolve);
+   if (ctx->subdata_stage) wgpuBufferRelease(ctx->subdata_stage);
    if (ctx->occlusion_readback) wgpuBufferRelease(ctx->occlusion_readback);
    /* const_uploader aliases stream_uploader, so destroy it once. */
    if (ctx->base.stream_uploader) {
