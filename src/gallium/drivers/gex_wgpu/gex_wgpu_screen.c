@@ -22746,6 +22746,40 @@ gex_wgpu_clamp_sint_clear(enum pipe_format format, unsigned component,
    return CLAMP((int64_t)value, -hi - 1, hi);
 }
 
+/* Clears go into the pending batch, as a render pass of their own recorded
+ * after the draws before them, instead of submitting the batch and then a
+ * command buffer of their own. A glClear per render target per frame was
+ * two submits each: Noita's frame was 12 submits, 4 of them only to clear.
+ * The cleared resource is touched, so a write or read of it waits for the
+ * batch as one of a draw's would. GEX_WGPU_UNBATCHED_CLEARS=1 restores the
+ * submits. */
+static bool
+gex_wgpu_batched_clears(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("GEX_WGPU_UNBATCHED_CLEARS") ? 0 : 1;
+   return on != 0;
+}
+
+/* The encoder a clear of `resource` records into: the batch's (its pass
+ * closed, the resource touched), or a fresh one the caller submits. */
+static WGPUCommandEncoder
+gex_wgpu_clear_encoder(struct gex_wgpu_context *ctx,
+                       struct pipe_resource *resource, bool *batched)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   *batched = gex_wgpu_batched_clears();
+   if (!*batched)
+      return wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+   gex_wgpu_end_pass(ctx);
+   if (!ctx->pending_encoder)
+      ctx->pending_encoder =
+         wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+   gex_wgpu_batch_touch(ctx, resource);
+   return ctx->pending_encoder;
+}
+
 static void
 gex_wgpu_clear_render_target(struct pipe_context *pipe,
                              struct pipe_surface *dst,
@@ -22755,7 +22789,8 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
                              bool render_condition_enabled)
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
-   gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
+   if (!gex_wgpu_batched_clears())
+      gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct pipe_resource *resource = dst ? dst->texture : NULL;
    /* Whatever level the surface names, cleared at that level's own size --
@@ -22874,10 +22909,17 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
       wgpuTextureCreateView(clear_scratch ? gex_resource(resource)->rt_scratch
                                           : gex_resource(resource)->texture,
                             &clear_view);
-   WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+   /* Into the batch unless the clear goes to a scratch, whose bytes are
+    * copied back right after it. */
+   bool batched = false;
+   if (clear_scratch)
+      gex_wgpu_submit_pending(ctx);
+   WGPUCommandEncoder encoder = clear_scratch
+      ? wgpuDeviceCreateCommandEncoder(screen->device, NULL)
+      : gex_wgpu_clear_encoder(ctx, resource, &batched);
    if (!view || !encoder) {
       if (view) wgpuTextureViewRelease(view);
-      if (encoder) wgpuCommandEncoderRelease(encoder);
+      if (encoder && !batched) wgpuCommandEncoderRelease(encoder);
       gex_decline(ctx);
       return;
    }
@@ -22930,6 +22972,12 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
       wgpuRenderPassEncoderEnd(pass);
       wgpuRenderPassEncoderRelease(pass);
    }
+   if (batched) {
+      wgpuTextureViewRelease(view);
+      if (!pass)
+         gex_decline(ctx);
+      return;
+   }
    WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, NULL);
    wgpuCommandEncoderRelease(encoder);
    wgpuTextureViewRelease(view);
@@ -22955,7 +23003,8 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
                              bool render_condition_enabled)
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
-   gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
+   if (!gex_wgpu_batched_clears())
+      gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    struct pipe_resource *resource = dst ? dst->texture : NULL;
    const bool has_stencil = dst &&
@@ -23041,8 +23090,10 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
    clear_desc.arrayLayerCount = 1;
    WGPUTextureView view =
       wgpuTextureCreateView(gex_resource(resource)->texture, &clear_desc);
-   WGPUCommandEncoder encoder =
-      wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+   bool batched = false;
+   WGPUCommandEncoder encoder = view
+      ? gex_wgpu_clear_encoder(ctx, resource, &batched) : NULL;
+   (void)screen;
    WGPURenderPassDepthStencilAttachment attachment =
       WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
    attachment.view = view;
@@ -23077,6 +23128,12 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
    if (pass) {
       wgpuRenderPassEncoderEnd(pass);
       wgpuRenderPassEncoderRelease(pass);
+   }
+   if (batched) {
+      if (view) wgpuTextureViewRelease(view);
+      if (!pass)
+         gex_decline(ctx);
+      return;
    }
    WGPUCommandBuffer command = pass
       ? wgpuCommandEncoderFinish(encoder, NULL) : NULL;
@@ -27258,7 +27315,8 @@ gex_wgpu_clear(struct pipe_context *pipe, unsigned buffers,
                unsigned stencil)
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
-   gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
+   if (!gex_wgpu_batched_clears())
+      gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    /* glClear is one of the commands an active conditional render discards,
     * and `pipe_context::clear` carries no flag to ask about it the way
