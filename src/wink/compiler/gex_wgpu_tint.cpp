@@ -359,9 +359,8 @@ void set_error(char **error_out, const std::string& message)
 
 } // namespace
 
-extern "C" char *
-gex_wgpu_spirv_to_wgsl(const uint32_t *words, size_t word_count,
-                       char **error_out)
+static char *
+translate(const uint32_t *words, size_t word_count, char **error_out)
 {
    if (error_out)
       *error_out = nullptr;
@@ -488,4 +487,164 @@ gex_wgpu_spirv_to_wgsl(const uint32_t *words, size_t word_count,
    if (!wgsl)
       set_error(error_out, "out of memory copying WGSL");
    return wgsl;
+}
+
+/* The translation cache: SPIR-V in, the WGSL Tint made of it out.
+ *
+ * Tint is most of a shader compile here (a 600-word module took 341 ms of
+ * 351 in a software run; Noita's first menus and its first world frame each
+ * wait ~3 s on it), and its answer depends on nothing but the words and this
+ * build. So the page keeps the answers: it hands a blob of them in before the
+ * first compile (`gex_wgsl_cache_load`, from the site's bundle or the
+ * browser's own store) and takes back what was translated since
+ * (`gex_wgsl_cache_dump`) to keep for the next load. A blob made by another
+ * build is refused whole, so a rebuilt Tint never serves an old answer.
+ *
+ * Keyed by two independent 64-bit hashes of the words and their count. */
+namespace {
+
+struct cache_key {
+   uint64_t a, b;
+   bool operator==(const cache_key &o) const { return a == o.a && b == o.b; }
+};
+struct cache_key_hash {
+   size_t operator()(const cache_key &k) const { return (size_t)(k.a ^ (k.b * 0x9e3779b97f4a7c15ull)); }
+};
+struct cache_entry {
+   std::string wgsl;
+   bool fresh; /* translated in this process, not loaded */
+};
+
+std::mutex cache_mutex;
+std::unordered_map<cache_key, cache_entry, cache_key_hash> cache;
+uint32_t cache_hits, cache_misses, cache_loaded;
+
+const char cache_magic[8] = {'G', 'X', 'W', 'G', 'S', 'L', '1', 0};
+/* This build: a blob from any other is not trusted. */
+const char cache_build[] = __DATE__ " " __TIME__ " " __FILE__;
+
+cache_key key_of(const uint32_t *words, size_t n)
+{
+   uint64_t a = 0xcbf29ce484222325ull ^ n, b = 0x84222325cbf29ce4ull + n;
+   for (size_t i = 0; i < n; ++i) {
+      a = (a ^ words[i]) * 0x100000001b3ull;
+      b += words[i] + 0x9e3779b97f4a7c15ull;
+      b = (b ^ (b >> 30)) * 0xbf58476d1ce4e5b9ull;
+      b = (b ^ (b >> 27)) * 0x94d049bb133111ebull;
+   }
+   return {a, b ^ (b >> 31)};
+}
+
+void put_u32(std::string &out, uint32_t v) { out.append(reinterpret_cast<const char *>(&v), 4); }
+void put_u64(std::string &out, uint64_t v) { out.append(reinterpret_cast<const char *>(&v), 8); }
+
+} // namespace
+
+extern "C" char *
+gex_wgpu_spirv_to_wgsl(const uint32_t *words, size_t word_count,
+                       char **error_out)
+{
+   const char *off = getenv("GEX_WGSL_CACHE");
+   if ((off && !strcmp(off, "0")) || !words || !word_count)
+      return translate(words, word_count, error_out);
+   const cache_key k = key_of(words, word_count);
+   {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      auto it = cache.find(k);
+      if (it != cache.end()) {
+         ++cache_hits;
+         if (error_out)
+            *error_out = nullptr;
+         return copy_string(it->second.wgsl);
+      }
+      ++cache_misses;
+   }
+   char *wgsl = translate(words, word_count, error_out);
+   if (wgsl) {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      cache.emplace(k, cache_entry{std::string(wgsl), true});
+   }
+   return wgsl;
+}
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#define GEX_WGSL_EXPORT extern "C" EMSCRIPTEN_KEEPALIVE __attribute__((visibility("default")))
+#else
+#define GEX_WGSL_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
+
+/* Entries from a blob `gex_wgsl_cache_dump` made: how many were added, or -1
+ * if the blob is not this build's (or is malformed; nothing is added then). */
+GEX_WGSL_EXPORT int
+gex_wgsl_cache_load(const uint8_t *blob, uint32_t len)
+{
+   const uint32_t idlen = sizeof(cache_build);
+   if (!blob || len < 12 + idlen || memcmp(blob, cache_magic, 8))
+      return -1;
+   uint32_t got;
+   memcpy(&got, blob + 8, 4);
+   if (got != idlen || memcmp(blob + 12, cache_build, idlen))
+      return -1;
+   std::vector<std::pair<cache_key, std::string>> entries;
+   for (uint32_t at = 12 + idlen; at < len;) {
+      if (len - at < 20)
+         return -1;
+      cache_key k;
+      uint32_t n;
+      memcpy(&k.a, blob + at, 8);
+      memcpy(&k.b, blob + at + 8, 8);
+      memcpy(&n, blob + at + 16, 4);
+      at += 20;
+      if (len - at < n)
+         return -1;
+      entries.emplace_back(k, std::string(reinterpret_cast<const char *>(blob + at), n));
+      at += n;
+   }
+   std::lock_guard<std::mutex> lock(cache_mutex);
+   int added = 0;
+   for (auto &e : entries)
+      added += cache.emplace(e.first, cache_entry{std::move(e.second), false}).second;
+   cache_loaded += added;
+   return added;
+}
+
+/* The cache as a blob (malloc'd; the caller frees it), its length in
+ * *len_out: every entry, or with `only_fresh` only those translated in this
+ * process since it started. */
+GEX_WGSL_EXPORT uint8_t *
+gex_wgsl_cache_dump(int only_fresh, uint32_t *len_out)
+{
+   std::string out(cache_magic, 8);
+   put_u32(out, sizeof(cache_build));
+   out.append(cache_build, sizeof(cache_build));
+   {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      for (const auto &e : cache) {
+         if (only_fresh && !e.second.fresh)
+            continue;
+         put_u64(out, e.first.a);
+         put_u64(out, e.first.b);
+         put_u32(out, (uint32_t)e.second.wgsl.size());
+         out += e.second.wgsl;
+      }
+   }
+   uint8_t *blob = static_cast<uint8_t *>(std::malloc(out.size()));
+   if (!blob)
+      return nullptr;
+   memcpy(blob, out.data(), out.size());
+   if (len_out)
+      *len_out = (uint32_t)out.size();
+   return blob;
+}
+
+/* hits, misses, entries loaded from blobs, entries now held. */
+GEX_WGSL_EXPORT void
+gex_wgsl_cache_stats(uint32_t *out)
+{
+   std::lock_guard<std::mutex> lock(cache_mutex);
+   out[0] = cache_hits;
+   out[1] = cache_misses;
+   out[2] = cache_loaded;
+   out[3] = (uint32_t)cache.size();
 }
