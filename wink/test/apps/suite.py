@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 from compare import compare_directories, compare_images
 from build_replay_support import HERE, MESA
 
-ERRORS = re.compile(r"error:|\[ERROR\]|\[gfxrecon\] ERROR|\bFATAL\b|GL_INVALID_|WebGPU error|validation error|device lost|unsupported:|unsupported \w+ call|failed to (?:compile|link|get snapshot)|FAIL\b", re.I)
+ERRORS = re.compile(r"error:|(?:\[|/)ERROR\]|\[gfxrecon\] ERROR|\bFATAL\b|GL_INVALID_|WebGPU error|validation error|device lost|unsupported:|unsupported \w+ call|failed to (?:compile|link|get snapshot)|FAIL\b", re.I)
 BENIGN_LOG_LINES = {"Errors from xkbcomp are not fatal to the X server"}
 
 
