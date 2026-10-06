@@ -75,7 +75,8 @@ FROM applications AS application-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     clang libc++-dev libc++abi-dev libegl1-mesa-dev libgles2-mesa-dev libsdl2-dev \
     libvulkan-dev libgl-dev libglew-dev libpng-dev libsnappy-dev libzstd-dev \
-    libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libzip-dev \
+    libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev \
+    libavdevice-dev libavfilter-dev libzip-dev \
     zlib1g-dev pkg-config python3-dev && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /opt/extended-inputs /src/
 RUN CC=clang CXX=clang++ cmake -S /src/filament -B /build/filament -G Ninja \
@@ -83,7 +84,9 @@ RUN CC=clang CXX=clang++ cmake -S /src/filament -B /build/filament -G Ninja \
     -DFILAMENT_SUPPORTS_VULKAN=ON -DFILAMENT_BUILD_JAVA=OFF -DFILAMENT_SUPPORTS_EGL_ON_LINUX=ON && \
     cmake --build /build/filament --target gltf_viewer -j4 && \
     cp /build/filament/samples/gltf_viewer /opt/apps/ && \
-    mkdir -p /opt/apps/filament-assets && cp -r /build/filament/assets/ibl /opt/apps/filament-assets/
+    mkdir -p /opt/apps/filament-assets /opt/apps/assets && \
+    cp -r /build/filament/samples/assets/ibl /opt/apps/filament-assets/ && \
+    cp -r /build/filament/samples/assets/fonts /opt/apps/assets/
 RUN cmake -S /src/ppsspp -B /build/ppsspp -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DUSING_GLES2=ON -DUSING_EGL=ON -DUSE_SYSTEM_FFMPEG=ON -DUNITTEST=OFF && \
     cmake --build /build/ppsspp --target PPSSPPSDL -j4 && \
@@ -93,6 +96,6 @@ RUN cp -r /src/pspautotests/demos /opt/apps/psp-demos
 FROM applications AS extended
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libc++1 libc++abi1 libsdl2-2.0-0 libavcodec60 libavformat60 libavutil58 \
-    libswresample4 libzip4t64 libsnappy1v5 libglew2.2 libegl1 libgles2 libgl1 && \
+    libswresample4 libswscale7 libavdevice60 libavfilter9 libzip4t64 libsnappy1v5 libglew2.2 libegl1 libgles2 libgl1 && \
     rm -rf /var/lib/apt/lists/*
 COPY --from=application-builder /opt/apps /opt/apps

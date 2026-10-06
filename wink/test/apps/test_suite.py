@@ -101,6 +101,24 @@ class GateTests(unittest.TestCase):
                 self.assertFalse(suite.record(a, case, root)["pass"])
             self.assertEqual(lock.read_bytes(), before)
 
+    def test_changed_application_tool_rejected_before_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            tools = out / "tools"
+            tools.mkdir()
+            binary = tools / "gltf_viewer"
+            binary.write_bytes(b"original")
+            manifest = tools / "tools.lock.json"
+            manifest.write_text(json.dumps({"files": {binary.name: suite.sha256(binary)}}))
+            case = {"id": "filament", "api": "gles", "command": ["/tools/gltf_viewer"],
+                    "tools_manifest_sha256": suite.sha256(manifest)}
+            binary.write_bytes(b"changed")
+            (out / "reference.lock.json").write_text("{}")
+            a = SimpleNamespace(out=out, tools=tools)
+            with patch("suite.shutil.disk_usage", return_value=SimpleNamespace(free=8 * 1024**3)), patch("suite.execute") as execute:
+                self.assertEqual(suite.record(a, case, out / "case")["status"], "missing-tools")
+                execute.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
