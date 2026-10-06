@@ -61,6 +61,8 @@ def main():
     p.add_argument("--settings", type=Path, default=HERE / "presets", help="curated per-pack stress settings ID.txt")
     p.add_argument("--resourcepack", type=Path, help="local public LabPBR resource pack")
     p.add_argument("--tools", type=Path, help="pinned runtime tree from build-extended.py")
+    p.add_argument("--qt-tools", type=Path, help="corrected Qt tree from build-qt.py")
+    p.add_argument("--filament-tools", type=Path, help="corrected Vulkan viewer from build-filament.py")
     a = p.parse_args()
     if not a.resourcepack:
         resourcepack = json.loads((HERE / "resourcepack.lock.json").read_text())
@@ -72,6 +74,8 @@ def main():
     recipes = json.loads((HERE / "recipes.example.json").read_text())
     for name, recipe in recipes.items():
         inputs = []
+        if name.startswith("qtquick-"):
+            inputs = [(HERE / "fixtures/qtquick/main.qml", "/fixtures/qtquick/main.qml")]
         if name.startswith("godot-"):
             inputs = [(p, "/work/godot-project/" + str(p.relative_to(a.out / "godot-project")))
                       for p in (a.out / "godot-project").rglob("*")
@@ -91,6 +95,18 @@ def main():
                 recipe["command"] = [word.replace("/opt/apps/", "/tools/") for word in recipe["command"]]
                 recipe["tools_manifest_sha256"] = digest(manifest, "sha256")
                 recipe.setdefault("env", {})["LD_LIBRARY_PATH"] = "/opt/reference/lib:/opt/tools/lib:/tools/lib"
+    for tool_path, names in ((a.qt_tools, ("qtquick-gles", "qtquick-vulkan")),
+                             (a.filament_tools, ("filament-vulkan",))):
+        if not tool_path:
+            continue
+        manifest = tool_path / "tools.lock.json"
+        if not manifest.is_file():
+            raise RuntimeError("Build the pinned application tools tree first")
+        for name in names:
+            recipe = recipes[name]
+            recipe["command"] = [word.replace("/opt/apps/", "/tools/") for word in recipe["command"]]
+            recipe["tools_manifest_sha256"] = digest(manifest, "sha256")
+            recipe.setdefault("env", {})["LD_LIBRARY_PATH"] = "/opt/reference/lib:/opt/tools/lib:/tools/lib"
     presets = a.out / "presets"
     presets.mkdir(exist_ok=True)
     missing = []

@@ -61,7 +61,7 @@ ENTRYPOINT ["python3", "/opt/tools/bin/reference.py"]
 
 FROM reference AS applications
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake ninja-build g++ qt6-base-dev qt6-declarative-dev qml6-module-qtquick \
+    cmake ninja-build g++ qt6-base-dev qt6-base-private-dev qt6-declarative-dev qml6-module-qtquick \
     qml6-module-qtquick-window qml6-module-qtqml-workerscript \
     openjdk-21-jre-headless unzip libasound2t64 libpulse0 libxcursor1 libxi6 \
     libxinerama1 libxkbcommon0 libflite1 && rm -rf /var/lib/apt/lists/*

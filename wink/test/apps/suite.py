@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import html
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -140,8 +141,9 @@ def record(a, case, root):
                     outcome["status"] = "reference-reused"
                 return outcome
             return {"status": "reference-exists", "pass": False, "error": "Use a fresh --out directory for an explicit reference refresh."}
-    if shutil.disk_usage(a.out).free < 4 * 1024**3:
-        return {"status": "resource-limit", "pass": False, "error": "Recording requires at least 4 GiB free disk space"}
+    if shutil.disk_usage(a.out).free < a.min_free_space_gib * 1024**3:
+        return {"status": "resource-limit", "pass": False,
+                "error": f"Recording requires at least {a.min_free_space_gib:g} GiB free disk space"}
     if root.exists():
         root.rename(root.with_name(root.name + ".incomplete-" + str(time.time_ns())))
     root.mkdir(parents=True)
@@ -330,12 +332,16 @@ def main():
     p.add_argument("--image", default="wink-reference")
     p.add_argument("--recipes", type=Path)
     p.add_argument("--tools", type=Path, help="pinned Linux ARM64 application tree mounted at /tools")
+    p.add_argument("--min-free-space-gib", type=float, default=4,
+                   help="recording disk reserve; lower only for small non-Minecraft fixtures")
     p.add_argument("--reference-tools", type=Path, help="pinned software retracers from build-reference-replay.py")
     p.add_argument("--replayers", type=Path, help="reuse retracer builds from another output directory")
     p.add_argument("--reuse-references", action="store_true", help="validate and reuse locked baselines while recording missing cases")
     p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--icd", type=Path, default=MESA / "build/wvk-native/src/wink/vulkan/wink_devenv_icd.aarch64.json")
     a = p.parse_args()
+    if not math.isfinite(a.min_free_space_gib) or a.min_free_space_gib <= 0:
+        p.error("--min-free-space-gib must be finite and positive")
     a.out = a.out.resolve()
     if a.replayers:
         a.replayers = a.replayers.resolve()

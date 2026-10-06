@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(wink_qt_fixture LANGUAGES CXX)
 find_package(Qt6 REQUIRED COMPONENTS Quick)
+find_package(Vulkan REQUIRED)
 qt_add_executable(wink-qt-fixture main.cpp)
-target_link_libraries(wink-qt-fixture PRIVATE Qt6::Quick)
+target_link_libraries(wink-qt-fixture PRIVATE Qt6::Quick Qt6::GuiPrivate Vulkan::Vulkan)
