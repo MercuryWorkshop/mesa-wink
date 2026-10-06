@@ -20,6 +20,8 @@ if(EMSCRIPTEN)
         -sEXPORTED_FUNCTIONS=_main,_malloc,_free
         "-sEXPORTED_RUNTIME_METHODS=['FS','UTF8ToString','stringToUTF8','lengthBytesUTF8']"
         -sINITIAL_MEMORY=128MB -sASSERTIONS=1 --profiling-funcs)
+    set_property(TARGET wink-glretrace APPEND PROPERTY LINK_DEPENDS
+        "${WINK_APPS}/replay/library_replay.js")
     set_target_properties(wink-glretrace PROPERTIES SUFFIX ".js")
     if(WINK_PACKAGE MATCHES "/mt$")
         # Emscripten 3.1.56 otherwise discovers this HTML5 JS dependency

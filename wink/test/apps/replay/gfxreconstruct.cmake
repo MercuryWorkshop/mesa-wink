@@ -14,6 +14,8 @@ if(EMSCRIPTEN)
         -sEXPORTED_FUNCTIONS=_main,_malloc,_free
         "-sEXPORTED_RUNTIME_METHODS=['FS','UTF8ToString','stringToUTF8','lengthBytesUTF8']"
         -sINITIAL_MEMORY=256MB -sASSERTIONS=1 --profiling-funcs)
+    set_property(TARGET gfxrecon-replay APPEND PROPERTY LINK_DEPENDS
+        "${WINK_APPS}/replay/library_replay.js")
     set_target_properties(gfxrecon-replay PROPERTIES SUFFIX ".js")
     if(WINK_PACKAGE MATCHES "/mt$")
         target_link_options(gfxrecon-replay PRIVATE "-Wl,-u,_emscripten_run_callback_on_thread")
