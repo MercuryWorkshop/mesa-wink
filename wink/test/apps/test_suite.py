@@ -38,6 +38,11 @@ class GateTests(unittest.TestCase):
             result = suite.execute(["/bin/echo", "[Render thread/ERROR]: Shader compilation failed"], Path(root) / "log", 5)
             self.assertFalse(result["pass"])
 
+    def test_ppsspp_subsystem_error_never_passes(self):
+        with tempfile.TemporaryDirectory() as root:
+            result = suite.execute(["/bin/echo", "Core.cpp E[G3D]: pipeline creation failed"], Path(root) / "log", 5)
+            self.assertFalse(result["pass"])
+
     def test_timeout_never_passes(self):
         with tempfile.TemporaryDirectory() as root:
             import subprocess
