@@ -25,6 +25,21 @@ extern "C" {
  * Defaults to the highest compatibility-profile version. */
 WINK_EXPORT void wink_set_next_context(int api, int major, int minor, unsigned flags);
 
+/* Whether the next wink_webgl_create_context's canvas composites its alpha
+ * channel (GLFW_TRANSPARENT_FRAMEBUFFER). Defaults to 0: a window is opaque
+ * whatever its alpha bits, as on a desktop, so an application that clears to
+ * alpha 0 -- Minecraft does -- does not show the page through. */
+WINK_EXPORT void wink_set_next_surface_transparent(int transparent);
+
+/* wink_init_attribs.flags for the wink_init the next wink_webgl_create_context
+ * makes -- WINK_INIT_GL_ON_MAIN_THREAD, for a windowing layer on a worker whose
+ * canvas stayed on the main thread. Only the first context's call initializes
+ * wink, so this matters before that one only. */
+WINK_EXPORT void wink_set_next_init_flags(unsigned flags);
+
+/* wink_swap_interval for the current context's surface. */
+WINK_EXPORT void wink_set_swap_interval(int interval);
+
 WINK_EXPORT EMSCRIPTEN_WEBGL_CONTEXT_HANDLE
 wink_webgl_create_context(const char *target, const EmscriptenWebGLContextAttributes *attributes);
 WINK_EXPORT EMSCRIPTEN_RESULT wink_webgl_make_context_current(EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context);

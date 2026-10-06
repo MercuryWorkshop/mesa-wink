@@ -112,6 +112,12 @@ typedef struct wink_surface_attribs {
    /* Native builds: where frames go instead of a canvas -- a CAMetalLayer
     * on macOS. The surface is always its size. */
    void *native_layer;
+   /* Composite the canvas opaque even with alpha_bits 8. A WINDOW's default
+    * framebuffer has an alpha channel the application may use, and a desktop
+    * compositor ignores it unless the window asked to be transparent (GLFW's
+    * GLFW_TRANSPARENT_FRAMEBUFFER); a WebGL-style canvas composites its alpha.
+    * 0 (the default) keeps the canvas rule: opaque only when alpha_bits is 0. */
+   uint8_t opaque;
 } wink_surface_attribs;
 
 typedef struct wink_context_attribs {

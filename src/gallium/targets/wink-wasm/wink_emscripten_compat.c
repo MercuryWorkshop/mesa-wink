@@ -15,6 +15,27 @@ static wink_context_attribs next_context = {
    .api = WINK_API_OPENGL_COMPAT,
 };
 static struct wink_webgl *current;
+static int next_transparent;
+static unsigned next_init_flags;
+
+void
+wink_set_next_init_flags(unsigned flags)
+{
+   next_init_flags = flags;
+}
+
+void
+wink_set_swap_interval(int interval)
+{
+   if (current)
+      wink_swap_interval(current->surface, interval);
+}
+
+void
+wink_set_next_surface_transparent(int transparent)
+{
+   next_transparent = transparent != 0;
+}
 
 void
 wink_set_next_context(int api, int major, int minor, unsigned flags)
@@ -29,7 +50,10 @@ wink_set_next_context(int api, int major, int minor, unsigned flags)
 EMSCRIPTEN_WEBGL_CONTEXT_HANDLE
 wink_webgl_create_context(const char *target, const EmscriptenWebGLContextAttributes *attributes)
 {
-   int status = wink_init(NULL);
+   wink_init_attribs ia;
+   wink_init_attribs_default(&ia);
+   ia.flags = next_init_flags;
+   int status = wink_init(&ia);
    if (status != WINK_OK) {
       fprintf(stderr, "wink: %s\n", wink_status_string(status));
       return 0;
@@ -48,6 +72,7 @@ wink_webgl_create_context(const char *target, const EmscriptenWebGLContextAttrib
       sa.stencil_bits = attributes->stencil ? 8 : 0;
       sa.premultiplied_alpha = attributes->premultipliedAlpha;
    }
+   sa.opaque = !next_transparent;
 
    struct wink_webgl *pair = calloc(1, sizeof(*pair));
    if (!pair)

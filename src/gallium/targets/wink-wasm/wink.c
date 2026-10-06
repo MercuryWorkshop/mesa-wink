@@ -606,7 +606,7 @@ surface_create_here(const wink_surface_attribs *a, int *status)
    s->height = a->height;
    s->offscreen = a->offscreen;
    s->manage_canvas_size = a->manage_canvas_size;
-   s->opaque = a->alpha_bits == 0;
+   s->opaque = a->alpha_bits == 0 || a->opaque;
    s->swap_interval = wink.remote ? 1 : WINK_SWAP_UNPACED;
    util_queue_fence_init(&s->swap_fence[0]);
    util_queue_fence_init(&s->swap_fence[1]);
@@ -1270,6 +1270,20 @@ wink_swap_buffers(wink_surface *s)
       _mesa_glthread_call_async(tls_current->st->ctx, swap_glthread, s,
                                 &s->swap_fence[i]);
       util_queue_fence_wait(&s->swap_fence[i ^ 1]);
+      /* Every 240 frames: how often this thread waited for the main thread
+       * between swaps, and for which GL calls -- each wait is a round trip
+       * through the main thread's event loop. */
+      static unsigned swaps;
+      if (++swaps % 240 == 0) {
+         char why[640];
+         uint64_t waits, copies;
+         _mesa_glthread_remote_census(why, sizeof(why), &waits, &copies);
+         fprintf(stderr, "wink: the GL thread waited for the main thread %.1f "
+                 "times a frame over 240 frames (%s); %.1f client-array draws "
+                 "a frame copied instead, %u read live\n", waits / 240.0,
+                 why[0] ? why : "none", copies / 240.0,
+                 _mesa_glthread_remote_unmatched);
+      }
       return WINK_OK;
    }
 #endif
