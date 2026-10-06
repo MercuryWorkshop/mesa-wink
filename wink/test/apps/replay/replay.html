@@ -6,6 +6,18 @@
 <script type="module">
 const options = new URLSearchParams(location.search);
 const log = [];
+let Module;
+function screenshots() {
+  if (!Module) return [];
+  let names;
+  try { names = Module.FS.readdir('/shots'); } catch { return []; }
+  return names.filter(n => n.endsWith('.png')).map(name => {
+    const bytes = Module.FS.readFile('/shots/' + name);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+    return { name, encoding: 'base64', data: btoa(binary) };
+  });
+}
 globalThis.__winkResult = null;
 try {
   const api = options.get('api') || 'gl';
@@ -17,7 +29,7 @@ try {
   if (!response.ok) throw Error(`trace HTTP ${response.status}`);
   const data = new Uint8Array(await response.arrayBuffer());
   if (data.length > 1024 * 1024 * 1024) throw Error('trace exceeds 1 GiB Wasm replay limit; trim with setup/history retained');
-  const Module = await create({
+  Module = await create({
     noInitialRun: true,
     canvas: document.getElementById('canvas'),
     print: s => { log.push(s); console.log(s); },
@@ -40,16 +52,11 @@ try {
   let rc;
   try { rc = await WebAssembly.promising(Module.winkReplayRaw)(pointers.length, argv); }
   catch (e) { if (e.name === 'ExitStatus') rc = e.status; else throw e; }
-  const artifacts = Module.FS.readdir('/shots').filter(n => n.endsWith('.png')).map(name => {
-    const bytes = Module.FS.readFile('/shots/' + name);
-    let binary = '';
-    for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
-    return { name, encoding: 'base64', data: btoa(binary) };
-  });
+  const artifacts = screenshots();
   const errors = log.filter(s => /(?:error:|GL_INVALID_|WebGPU error|validation error|device lost|unsupported:|failed to (?:compile|link|get snapshot))/i.test(s));
   globalThis.__winkResult = { pass: rc === 0 && artifacts.length > 0 && errors.length === 0, rc, api, log, errors, artifacts };
 } catch (e) {
   console.error(e.stack || String(e));
-  globalThis.__winkResult = { pass: false, rc: -1, log, error: e.stack || String(e), artifacts: [] };
+  globalThis.__winkResult = { pass: false, rc: -1, log, error: e.stack || String(e), artifacts: screenshots() };
 }
 </script>
