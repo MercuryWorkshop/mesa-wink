@@ -42,15 +42,22 @@ def main():
         lock = json.loads(a.source_lock.read_text())
         if lock["pins"]["applications"] != pins["applications"]:
             raise RuntimeError("Staged application revisions differ from pins.json")
-        bundle = stage / "app-inputs.tar.gz"
-        expected = next(value for key, value in lock["inputs"].items() if key.endswith("app-inputs.tar.gz"))
-        if digest(bundle) != expected:
-            raise RuntimeError("Staged app bundle differs from verified image inputs")
-        with tarfile.open(bundle) as archive:
+        if "sources" in lock:
+            # A locked tools tree already records each individual source hash;
+            # it does not need the duplicate image-input bundle retained.
             for name in ("filament", "ppsspp", "pspautotests"):
-                with archive.extractfile(name + ".tar.gz") as source:
-                    if hashlib.file_digest(source, "sha256").hexdigest() != digest(stage / (name + ".tar.gz")):
-                        raise RuntimeError("Staged source archive changed: " + name)
+                if digest(stage / (name + ".tar.gz")) != lock["sources"][name]:
+                    raise RuntimeError("Staged source archive changed: " + name)
+        else:
+            bundle = stage / "app-inputs.tar.gz"
+            expected = next(value for key, value in lock["inputs"].items() if key.endswith("app-inputs.tar.gz"))
+            if digest(bundle) != expected:
+                raise RuntimeError("Staged app bundle differs from verified image inputs")
+            with tarfile.open(bundle) as archive:
+                for name in ("filament", "ppsspp", "pspautotests"):
+                    with archive.extractfile(name + ".tar.gz") as source:
+                        if hashlib.file_digest(source, "sha256").hexdigest() != digest(stage / (name + ".tar.gz")):
+                            raise RuntimeError("Staged source archive changed: " + name)
     else:
         stage.mkdir(exist_ok=True)
         spec = importlib.util.spec_from_file_location("extended_apps", HERE / "extended-apps.py")
@@ -69,6 +76,8 @@ def main():
         "builder_sha256": digest(HERE / "reference/build-apps.py"),
         "builder_source": (HERE / "reference/build-apps.py").read_text(),
         "sources": {name: digest(stage / (name + ".tar.gz")) for name in ("filament", "ppsspp", "pspautotests")}}
+    patch = HERE / "reference/patch-filament.py"
+    specification["framebuffer_lifetime_adapter"] = {"sha256": digest(patch), "source": patch.read_text()}
     previous = a.out / "extended-build.json"
     if a.resume and (not previous.exists() or json.loads(previous.read_text()).get("build_vm") != name):
         raise RuntimeError("Resume VM does not match this output root's build specification")

@@ -38,6 +38,10 @@ for name, expected in spec["sources"].items():
         with tarfile.open(archive) as source:
             source.extractall(scratch, filter="data")
         marker.write_text(expected)
+patch = Path("/suite/reference/patch-filament.py")
+if digest(patch) != spec["framebuffer_lifetime_adapter"]["sha256"]:
+    raise RuntimeError("Filament lifetime adapter changed")
+run(["python3", patch, scratch / "filament"])
 run(["apt-get", "update"])
 run(["apt-get", "install", "-y", "--no-install-recommends", "clang", "libc++-dev", "libc++abi-dev",
      "libegl1-mesa-dev", "libgles2-mesa-dev", "libsdl2-dev", "libvulkan-dev", "libgl-dev", "libglew-dev",
