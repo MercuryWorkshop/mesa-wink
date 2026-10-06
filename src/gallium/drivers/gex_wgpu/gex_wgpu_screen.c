@@ -1533,6 +1533,7 @@ struct gex_wgpu_screen {
     * without it the SRC1 blend factors have no meaning and a fragment shader
     * must not declare a second blend source. */
    bool dual_source_blending;
+   bool framebuffer_fetch;
    bool timestamp_query;
    /* Optional WebGPU features the page may have been able to request.  Each
     * one gates a GL extension st/mesa derives from format support, so they
@@ -2814,6 +2815,8 @@ struct gex_wgpu_shader {
     * the destination texel, and the draw has to bind a snapshot of it.
     * See gex_wgpu_lower_fb_fetch. */
    bool fb_fetch;
+   /* Native raster-order colour inputs, specialized to attachment formats. */
+   uint8_t fb_fetch_native;
    /* The rasterising copy of this vertex shader computes the wrong thing --
     * an atomic it cannot perform reads as zero -- so no draw that would
     * rasterise it may run. Its stores still happen, in the capture dispatch.
@@ -2923,6 +2926,7 @@ struct gex_wgpu_interp_variant {
 
 struct gex_wgpu_shader_variant {
    WGPUShaderModule module;
+   enum pipe_format fetch_formats[8];
    /* Framebuffer height baked into this variant's gl_FragCoord correction,
     * or 0 when the draw is not flipped and none was applied. */
    /* The colour output base type this variant declares, which has to match
@@ -14101,8 +14105,21 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * *output*, so the colour-output scan just below must not see it. The
     * logic op's texture is created later still, on a variant, for the first
     * of those two reasons. */
-   if (expected_stage == MESA_SHADER_FRAGMENT)
-      shader->fb_fetch = gex_wgpu_lower_fb_fetch(nir);
+   if (expected_stage == MESA_SHADER_FRAGMENT) {
+      if (gex_screen(pipe->screen)->framebuffer_fetch) {
+         nir_foreach_shader_out_variable(var, nir) {
+            if (var->data.fb_fetch_output) {
+               unsigned rt = var->data.location == FRAG_RESULT_COLOR ? 0 :
+                             var->data.location - FRAG_RESULT_DATA0;
+               unsigned slots = glsl_count_attribute_slots(var->type, false);
+               if (rt < 8)
+                  shader->fb_fetch_native |= BITFIELD_RANGE(rt, MIN2(slots, 8 - rt));
+            }
+         }
+      } else {
+         shader->fb_fetch = gex_wgpu_lower_fb_fetch(nir);
+      }
+   }
 
    /* layout(early_fragment_tests) in, which cannot be honoured here.
     *
@@ -14356,7 +14373,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
        shader->ms_array_slots != 0 ||
        shader->reads_clip_dist || shader->reads_interp_offset ||
        shader->has_double_inputs ||
-       shader->reads_primitive_id) &&
+       shader->reads_primitive_id || shader->fb_fetch_native) &&
       (expected_stage == MESA_SHADER_FRAGMENT ||
        expected_stage == MESA_SHADER_VERTEX);
    if (deferred_integer_sampling)
@@ -14694,6 +14711,134 @@ gex_wgpu_lower_fb_fetch_load(nir_builder *b, nir_intrinsic_instr *intr,
    nir_instr_remove(&intr->instr);
    state->lowered = true;
    return true;
+}
+
+static WGPUTextureFormat gex_wgpu_texture_format(enum pipe_format format);
+
+static unsigned
+gex_wgpu_fetch_components(WGPUTextureFormat format)
+{
+   switch (format) {
+   case WGPUTextureFormat_R8Unorm:
+   case WGPUTextureFormat_R8Snorm:
+   case WGPUTextureFormat_R8Uint:
+   case WGPUTextureFormat_R8Sint:
+   case WGPUTextureFormat_R16Unorm:
+   case WGPUTextureFormat_R16Snorm:
+   case WGPUTextureFormat_R16Uint:
+   case WGPUTextureFormat_R16Sint:
+   case WGPUTextureFormat_R16Float:
+   case WGPUTextureFormat_R32Uint:
+   case WGPUTextureFormat_R32Sint:
+   case WGPUTextureFormat_R32Float:
+      return 1;
+   case WGPUTextureFormat_RG8Unorm:
+   case WGPUTextureFormat_RG8Snorm:
+   case WGPUTextureFormat_RG8Uint:
+   case WGPUTextureFormat_RG8Sint:
+   case WGPUTextureFormat_RG16Unorm:
+   case WGPUTextureFormat_RG16Snorm:
+   case WGPUTextureFormat_RG16Uint:
+   case WGPUTextureFormat_RG16Sint:
+   case WGPUTextureFormat_RG16Float:
+   case WGPUTextureFormat_RG32Uint:
+   case WGPUTextureFormat_RG32Sint:
+   case WGPUTextureFormat_RG32Float:
+      return 2;
+   case WGPUTextureFormat_RG11B10Ufloat:
+      return 3;
+   default:
+      return 4;
+   }
+}
+
+struct gex_wgpu_fetch_state {
+   const enum pipe_format *formats;
+   nir_variable *inputs[8];
+   uint32_t locations;
+};
+
+static bool
+gex_wgpu_native_fetch_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct gex_wgpu_fetch_state *state = data;
+   if (intr->intrinsic != nir_intrinsic_load_deref && intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   if (!var || var->data.mode != nir_var_shader_out || !var->data.fb_fetch_output)
+      return false;
+   /* Coherence is provided by the raster-order attachment input. A colour
+    * output is not SPIR-V atomic memory, even when GLSL marked it coherent. */
+   if (intr->intrinsic == nir_intrinsic_store_deref) {
+      nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) & ~ACCESS_COHERENT);
+      return true;
+   }
+   unsigned rt = var->data.location == FRAG_RESULT_COLOR ? 0 :
+                 var->data.location - FRAG_RESULT_DATA0;
+   for (nir_deref_instr *d = deref; d->deref_type != nir_deref_type_var;
+        d = nir_deref_instr_parent(d)) {
+      if (d->deref_type != nir_deref_type_array || !nir_src_is_const(d->arr.index))
+         return false;
+      rt += nir_src_as_uint(d->arr.index);
+   }
+   if (rt >= 8 || state->formats[rt] == PIPE_FORMAT_NONE)
+      return false;
+   const enum pipe_format format = state->formats[rt];
+   const enum glsl_base_type base = util_format_is_pure_uint(format) ? GLSL_TYPE_UINT :
+                                    util_format_is_pure_sint(format) ? GLSL_TYPE_INT : GLSL_TYPE_FLOAT;
+   const unsigned n = gex_wgpu_fetch_components(gex_wgpu_texture_format(format));
+   if (!state->inputs[rt]) {
+      unsigned location = 31;
+      while (location && (state->locations & BITFIELD_BIT(location)))
+         --location;
+      state->locations |= BITFIELD_BIT(location);
+      char name[24];
+      snprintf(name, sizeof(name), "wink_color_%u", rt);
+      nir_variable *input = nir_variable_create(b->shader, nir_var_shader_in,
+                                                glsl_vector_type(base, n), name);
+      input->data.location = VARYING_SLOT_VAR0 + location;
+      input->data.interpolation = INTERP_MODE_FLAT;
+      input->data.fb_fetch_output = true;
+      state->inputs[rt] = input;
+   }
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *value = nir_load_var(b, state->inputs[rt]);
+   const unsigned channels = util_format_get_nr_components(format);
+   nir_def *c[4];
+   for (unsigned i = 0; i < 4; ++i) {
+      if (i < n && i < channels)
+         c[i] = nir_channel(b, value, i);
+      else if (i == 3)
+         c[i] = base == GLSL_TYPE_FLOAT ? nir_imm_float(b, 1.0) : nir_imm_int(b, 1);
+      else
+         c[i] = nir_imm_int(b, 0);
+   }
+   value = nir_trim_vector(b, nir_vec(b, c, 4), intr->def.num_components);
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
+static void
+gex_wgpu_lower_native_fetch(nir_shader *nir, const enum pipe_format *formats)
+{
+   struct gex_wgpu_fetch_state state = { .formats = formats };
+   nir_foreach_shader_in_variable(var, nir) {
+      if (var->data.location >= VARYING_SLOT_VAR0) {
+         unsigned first = var->data.location - VARYING_SLOT_VAR0;
+         unsigned slots = glsl_count_attribute_slots(var->type, false);
+         if (first < 32)
+            state.locations |= BITFIELD_RANGE(first, MIN2(slots, 32 - first));
+      }
+   }
+   nir_shader_intrinsics_pass(nir, gex_wgpu_native_fetch_load,
+                              nir_metadata_control_flow, &state);
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.fb_fetch_output)
+         var->data.access &= ~ACCESS_COHERENT;
+      var->data.fb_fetch_output = false;
+   }
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 }
 
 static bool
@@ -15135,6 +15280,10 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    } while (0)
 
    struct gex_wgpu_shader *fs = ctx->fs;
+   enum pipe_format fetch_formats[8] = {0};
+   for (unsigned i = 0; i < 8; ++i)
+      if ((fs->fb_fetch_native & BITFIELD_BIT(i)) && ctx->framebuffer.cbufs[i].texture)
+         fetch_formats[i] = ctx->framebuffer.cbufs[i].format;
    /* GL applies the multisample fragment operations only when SAMPLE_BUFFERS
     * is one, so a shader's gl_SampleMask write does nothing on an ordinary
     * framebuffer. WebGPU honours it whatever the sample count, so the write
@@ -15421,7 +15570,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * texture does: the shader has no base module when it reads one, so
     * falling through here returns NULL and the draw disappears without a
     * word -- `if (!fragment.module) return;` is a silent early exit. */
-   if (!fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
+   if (!fs->fb_fetch_native && !fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
        line_edge_location == ~0u && !fs->buftex_count &&
        !want_sample_positions && !want_clip_dist && !want_logicop &&
@@ -15551,7 +15700,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * predicate, because a shader whose module was deferred always needs a
     * variant regardless of what is bound. */
    const bool needs_variant =
-      fs->integer_sampled_slots != 0 ||
+      fs->integer_sampled_slots != 0 || fs->fb_fetch_native != 0 ||
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
@@ -15571,7 +15720,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
 
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
         cached; cached = cached->next) {
-      bool match = cached->sampler_mask == sampler_mask &&
+      bool match = memcmp(cached->fetch_formats, fetch_formats, sizeof(fetch_formats)) == 0 &&
+                   cached->sampler_mask == sampler_mask &&
                    memcmp(cached->buftex_words, want_buftex,
                           sizeof(cached->buftex_words)) == 0 &&
                    cached->color_output_type == wanted_output &&
@@ -15721,6 +15871,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
          fprintf(stderr, "==== gex wide-point FS variant %u\n", told);
          nir_print_shader(variant, stderr); }
    }
+   if (fs->fb_fetch_native)
+      gex_wgpu_lower_native_fetch(variant, fetch_formats);
    if (want_ignore_sample_mask)
       gex_wgpu_ignore_sample_mask(variant);
    if (want_drop_color)
@@ -15816,6 +15968,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       return NULL;
    }
    cached->module = module;
+   memcpy(cached->fetch_formats, fetch_formats, sizeof(fetch_formats));
    memcpy(cached->buftex_words, want_buftex, sizeof(cached->buftex_words));
    cached->sampler_mask = sampler_mask;
    cached->color_output_type = wanted_output;
@@ -48563,19 +48716,21 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    caps->anisotropic_filter = true;
    caps->max_texture_anisotropy = 16.0f;
    caps->polygon_offset_clamp = true;
-   /* One readable colour attachment, which is what
+   /* Native Dawn's raster-order colour inputs provide coherent fetch for
+    * every attachment, including multisampling. Other devices keep the one
+    * readable colour attachment which
     * KHR_blend_equation_advanced needs and all it needs: the extension
     * applies to draw buffer zero only. Mesa's GLSL linker writes every one of
     * the fourteen equations itself once HasFBFetch is set, and asks the
     * driver for the destination texel -- which the colour-attachment snapshot
     * already produces for glLogicOp. See gex_wgpu_lower_fb_fetch.
     *
-    * Not coherent, and that is not a shortfall being hidden: the snapshot is
+    * The snapshot path is not coherent: the snapshot is
     * taken once per draw, so overlapping primitives inside one draw do not
     * see each other. That is exactly what the non-coherent form permits, and
     * why it makes the application call glBlendBarrier. */
-   caps->fbfetch = 1;
-   caps->fbfetch_coherent = false;
+   caps->fbfetch = screen->framebuffer_fetch ? 8 : 1;
+   caps->fbfetch_coherent = screen->framebuffer_fetch;
    /* Kept for the record: ARB_polygon_offset_clamp used to be *not* claimed,
     * worth keeping: every part of it is already here.
     * pipe_rasterizer_state::offset_clamp is carried through to
@@ -49537,6 +49692,9 @@ gex_wgpu_screen_create(WGPUDevice device)
       wgpuDeviceHasFeature(device, WGPUFeatureName_Float32Blendable);
    screen->dual_source_blending =
       wgpuDeviceHasFeature(device, WGPUFeatureName_DualSourceBlending);
+#ifndef __EMSCRIPTEN__
+   screen->framebuffer_fetch = wgpuDeviceHasFeature(device, WGPUFeatureName_FramebufferFetch);
+#endif
    /* Real GPU timestamps, if the device has them. ARB_timer_query is one of
     * the two things GL 3.3 still wants, and the alternative -- answering from
     * the CPU clock -- measures the gap between commands being recorded rather

@@ -245,6 +245,7 @@ create_device(void)
       WGPUFeatureName_Float32Blendable,
       WGPUFeatureName_ClipDistances,
       WGPUFeatureName_DualSourceBlending,
+      WGPUFeatureName_FramebufferFetch,
       WGPUFeatureName_TimestampQuery,
       /* Subgroups. Requested although nothing uses it yet: WGSL has the
        * ballots ARB_shader_group_vote needs and this adapter grants the

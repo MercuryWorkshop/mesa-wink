@@ -54,6 +54,7 @@ note(const char *fmt, ...)
  * pointers are p_gl* because GL/gl.h already declares the gl* prototypes. */
 #define GL_FUNCS(X)                                                              \
    X(const GLubyte *, GetString, (GLenum))                                       \
+   X(const GLubyte *, GetStringi, (GLenum, GLuint))                               \
    X(GLenum, GetError, (void))                                                   \
    X(void, GetIntegerv, (GLenum, GLint *))                                       \
    X(void, Viewport, (GLint, GLint, GLsizei, GLsizei))                           \
@@ -103,6 +104,10 @@ note(const char *fmt, ...)
    X(void, FramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint))       \
    X(GLenum, CheckFramebufferStatus, (GLenum))                                 \
    X(void, DeleteFramebuffers, (GLsizei, const GLuint *))                       \
+   X(void, DrawBuffers, (GLsizei, const GLenum *))                              \
+   X(void, ReadBuffer, (GLenum))                                                \
+   X(void, TexStorage2DMultisample, (GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean)) \
+   X(void, BlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum)) \
    X(void, CompressedTexImage2D, (GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *)) \
    X(void, DeleteTextures, (GLsizei, const GLuint *))
 
@@ -525,6 +530,91 @@ buffer_read_sources(void)
    p_glDeleteBuffers(3, buffers);
 }
 
+/* Repeated triangles in a single draw must read earlier primitives' writes.
+ * Three increments distinguish coherent fetch from a once-per-draw snapshot. */
+static void
+framebuffer_fetch(void)
+{
+   GLint n = 0;
+   bool supported = false;
+   p_glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+   for (GLint i = 0; i < n; ++i)
+      supported |= strcmp((const char *)p_glGetStringi(GL_EXTENSIONS, i),
+                          "GL_EXT_shader_framebuffer_fetch") == 0;
+   if (!supported) {
+      note("coherent framebuffer fetch: unavailable");
+      return;
+   }
+   const char *vs = "#version 300 es\n"
+      "void main(){ int i=gl_VertexID%3; vec2 p=vec2(i==1?3.0:-1.0,i==2?3.0:-1.0);"
+      "gl_Position=vec4(p,0,1); }\n";
+   const char *fs = "#version 300 es\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; layout(location=0) inout vec4 color;"
+      "void main(){ color += vec4(0.125,0.0,0.0,0.0); }\n";
+   GLuint v = compile(GL_VERTEX_SHADER, vs), f = compile(GL_FRAGMENT_SHADER, fs);
+   GLuint prog = p_glCreateProgram();
+   p_glAttachShader(prog, v); p_glAttachShader(prog, f); p_glLinkProgram(prog);
+   GLint linked = 0; p_glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+   CHECK(linked, "framebuffer fetch: link failed");
+   p_glUseProgram(prog);
+   p_glClearColor(0, 0, 0, 1); p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glDrawArrays(GL_TRIANGLES, 0, 9);
+   uint8_t px[4]; read_center(px, W, H);
+   CHECK(near(px, 96, 0, 0), "coherent framebuffer fetch: %u,%u,%u,%u", px[0],px[1],px[2],px[3]);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "framebuffer fetch: context failed");
+   p_glDeleteProgram(prog); p_glDeleteShader(f);
+   const char *mrt = "#version 300 es\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; layout(location=0) inout vec4 c0;"
+      "layout(location=1) inout vec4 c1;"
+      "void main(){ c0+=vec4(0.125,0,0,0); c1+=vec4(0,0.25,0,0); }\n";
+   f = compile(GL_FRAGMENT_SHADER, mrt);
+   prog = p_glCreateProgram(); p_glAttachShader(prog,v); p_glAttachShader(prog,f); p_glLinkProgram(prog);
+   p_glGetProgramiv(prog,GL_LINK_STATUS,&linked); CHECK(linked,"MRT fetch: link failed");
+   p_glUseProgram(prog);
+   const GLenum buffers[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+   GLuint fb[2], tex[3]; p_glGenFramebuffers(2,fb); p_glGenTextures(3,tex);
+   p_glBindFramebuffer(GL_FRAMEBUFFER,fb[1]);
+   p_glBindTexture(GL_TEXTURE_2D,tex[2]);
+   p_glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,W,H,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+   p_glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,tex[2],0);
+   for (unsigned samples = 1; samples <= 4; samples += 3) {
+      const GLenum target = samples == 1 ? GL_TEXTURE_2D : GL_TEXTURE_2D_MULTISAMPLE;
+      p_glBindFramebuffer(GL_FRAMEBUFFER,fb[0]);
+      for (unsigned i=0;i<2;++i) {
+         p_glBindTexture(target,tex[i]);
+         if (samples == 1)
+            p_glTexImage2D(target,0,GL_RGBA8,W,H,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+         else
+            p_glTexStorage2DMultisample(target,4,GL_RGBA8,W,H,GL_TRUE);
+         p_glFramebufferTexture2D(GL_FRAMEBUFFER,buffers[i],target,tex[i],0);
+      }
+      p_glDrawBuffers(2,buffers);
+      CHECK(p_glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE,"MRT fetch framebuffer");
+      p_glClear(GL_COLOR_BUFFER_BIT); p_glDrawArrays(GL_TRIANGLES,0,9);
+      for (unsigned i=0;i<2;++i) {
+         p_glReadBuffer(buffers[i]);
+         if (samples == 4) {
+            p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER,fb[1]);
+            p_glBlitFramebuffer(0,0,W,H,0,0,W,H,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+            p_glBindFramebuffer(GL_READ_FRAMEBUFFER,fb[1]);
+         }
+         read_center(px,W,H);
+         CHECK(near(px,i==0?96:0,i==1?192:0,0),"MRT fetch %ux RT%u: %u,%u,%u,%u",
+               samples,i,px[0],px[1],px[2],px[3]);
+         p_glBindFramebuffer(GL_FRAMEBUFFER,fb[0]);
+      }
+      p_glBindTexture(target,0);
+      // A texture's target is immutable; make new objects for the MSAA pass.
+      if (samples == 1) { p_glDeleteTextures(2,tex); p_glGenTextures(2,tex); }
+   }
+   p_glBindFramebuffer(GL_FRAMEBUFFER,0);
+   p_glDeleteFramebuffers(2,fb); p_glDeleteTextures(3,tex);
+   CHECK(p_glGetError()==GL_NO_ERROR && !wink_device_lost(),"MRT fetch context failed");
+   p_glUseProgram(0); p_glDeleteProgram(prog); p_glDeleteShader(v); p_glDeleteShader(f);
+}
+
 static void
 exercise(const char *label, int api, wink_surface *surface)
 {
@@ -617,6 +707,9 @@ exercise(const char *label, int api, wink_surface *surface)
 
    GLenum err = p_glGetError();
    CHECK(err == GL_NO_ERROR, "%s: GL error 0x%x", label, err);
+
+   if (api == WINK_API_OPENGL_ES)
+      framebuffer_fetch();
 
    if (api == WINK_API_OPENGL_CORE) {
       vertex_input_types();
