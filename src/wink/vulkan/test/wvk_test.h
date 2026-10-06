@@ -135,13 +135,13 @@ struct image {
 };
 
 static struct image
-make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage)
+make_image_samples(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkSampleCountFlagBits samples)
 {
    struct image im = { 0 };
    VK(vkCreateImage(dev, &(VkImageCreateInfo){
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
       .format = format, .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
-      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
+      .samples = samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
    }, NULL, &im.image));
    VkMemoryRequirements req;
@@ -159,6 +159,12 @@ make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage)
       .subresourceRange = { depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
    }, NULL, &im.view));
    return im;
+}
+
+static struct image
+make_image(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage)
+{
+   return make_image_samples(w, h, format, usage, VK_SAMPLE_COUNT_1_BIT);
 }
 
 static void

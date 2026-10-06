@@ -469,6 +469,22 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    }
 
    WGPURenderPassDescriptor desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+   replay->precise_view = NULL;
+   if (replay->active_query.pool && replay->active_query.precise) {
+      replay->precise_slot = replay->rendering.empty ? 0 : pass_color_count;
+      WGPUTextureView counter = wvk_replay_precise_attachment(replay);
+      if (counter) {
+         const uint32_t slot = replay->precise_slot;
+         colors[slot] = (WGPURenderPassColorAttachment)WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+         colors[slot].view = counter;
+         colors[slot].loadOp = WGPULoadOp_Clear;
+         colors[slot].storeOp = WGPUStoreOp_Store;
+         replay->rendering.color[slot] = NULL;
+         replay->rendering.color_format[slot] = WGPUTextureFormat_R32Float;
+         pass_color_count = MAX2(pass_color_count, slot + 1);
+         replay->rendering.color_count = pass_color_count;
+      }
+   }
    desc.colorAttachmentCount = pass_color_count;
    desc.colorAttachments = colors;
    desc.depthStencilAttachment = (depth || stencil) ? &ds : NULL;

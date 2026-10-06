@@ -203,6 +203,10 @@ struct wvk_replay {
     * buffers that have queries count in, and where the results go. */
    bool uses_queries;
    WGPUQuerySet query_set;
+   WGPUTextureView precise_view;
+   struct wvk_pass_query precise_query;
+   uint32_t precise_slot;
+   bool precise_dirty;
    WGPUBuffer query_resolve;
    uint32_t query_next;
    uint32_t pass_query_first;

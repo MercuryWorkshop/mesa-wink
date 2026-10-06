@@ -38,11 +38,131 @@
 #include "util/os_time.h"
 
 #include <stdlib.h>
+#include <stdio.h>
 
 #define WVK_QUERY_SET_SIZE 4096
 #define WVK_TIMESTAMP_SET_SIZE 1024
 /* resolveQuerySet writes to 256-byte aligned offsets: 32 queries. */
 #define WVK_QUERY_ALIGN 32
+
+/* WebGPU's Metal occlusion query is boolean. An extra R32Float attachment
+ * adds one for every sample that survives rasterization, shader discard,
+ * coverage, depth and stencil, including overlapping primitives. A compute
+ * pass accumulates its samples into the query's 64-bit integer result. */
+WGPUTextureView
+wvk_replay_precise_attachment(struct wvk_replay *replay)
+{
+   WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+   td.label = wvk_sv("wvk precise occlusion samples");
+   td.dimension = WGPUTextureDimension_2D;
+   td.format = WGPUTextureFormat_R32Float;
+   td.size = (WGPUExtent3D){ MAX2(replay->rendering.extent.width, 1),
+                           MAX2(replay->rendering.extent.height, 1), 1 };
+   td.mipLevelCount = 1;
+   td.sampleCount = MAX2(replay->rendering.samples, 1);
+   td.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+   WGPUTexture texture = wgpuDeviceCreateTexture(replay->dev->wgpu, &td);
+   if (!texture)
+      return NULL;
+   WGPUTextureView view = wgpuTextureCreateView(texture, NULL);
+   util_dynarray_append(&replay->textures, texture);
+   util_dynarray_append(&replay->views, view);
+   replay->precise_view = view;
+   replay->precise_dirty = false;
+   replay->precise_query = replay->active_query;
+   return view;
+}
+
+void
+wvk_replay_resolve_precise(struct wvk_replay *replay)
+{
+   if (!replay->precise_view)
+      return;
+   struct wvk_device *dev = replay->dev;
+   const struct wvk_pass_query q = replay->precise_query;
+   const bool ms = replay->rendering.samples > 1;
+   simple_mtx_lock(&dev->cache_lock);
+   if (!dev->precise_pipeline[ms]) {
+      const char *texture = ms ? "texture_multisampled_2d<f32>" : "texture_2d<f32>";
+      char code[2048];
+      snprintf(code, sizeof(code),
+         "@group(0) @binding(0) var samples: %s;\n"
+         "@group(0) @binding(1) var<storage, read_write> result: array<atomic<u32>>;\n"
+         "@group(0) @binding(2) var<uniform> query: vec4<u32>;\n"
+         "@compute @workgroup_size(8,8) fn main(@builtin(global_invocation_id) id: vec3<u32>) {\n"
+         " if (any(id.xy >= textureDimensions(samples))) { return; }\n"
+         " let n = %s;\n"
+         " for (var s = 0u; s < n; s++) {\n"
+         "  let value = u32(textureLoad(samples, vec2<i32>(id.xy), %s).r);\n"
+         "  let old = atomicAdd(&result[query.x], value);\n"
+         "  if (old > 0xffffffffu - value) { atomicAdd(&result[query.x + 1u], 1u); }\n"
+         " }\n}\n", texture, ms ? "textureNumSamples(samples)" : "1u", ms ? "i32(s)" : "0");
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv(code);
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      WGPUComputePipelineDescriptor pd = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+      pd.label = wvk_sv("wvk count passing samples");
+      pd.compute.module = module;
+      pd.compute.entryPoint = wvk_sv("main");
+      /* R32Float is unfilterable in WebGPU unless float32-filterable is
+       * also enabled. No filtering is involved in this reduction. */
+      WGPUBindGroupLayoutEntry le[3] = { WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+                                       WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+                                       WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT };
+      le[0].binding = 0;
+      le[0].visibility = WGPUShaderStage_Compute;
+      le[0].texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+      le[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+      le[0].texture.multisampled = ms;
+      le[1].binding = 1;
+      le[1].visibility = WGPUShaderStage_Compute;
+      le[1].buffer.type = WGPUBufferBindingType_Storage;
+      le[2].binding = 2;
+      le[2].visibility = WGPUShaderStage_Compute;
+      le[2].buffer.type = WGPUBufferBindingType_Uniform;
+      WGPUBindGroupLayoutDescriptor bld = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+      bld.entryCount = ARRAY_SIZE(le);
+      bld.entries = le;
+      WGPUBindGroupLayout bl = wgpuDeviceCreateBindGroupLayout(dev->wgpu, &bld);
+      WGPUPipelineLayoutDescriptor pld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+      pld.bindGroupLayoutCount = 1;
+      pld.bindGroupLayouts = &bl;
+      pd.layout = wgpuDeviceCreatePipelineLayout(dev->wgpu, &pld);
+      dev->precise_pipeline[ms] = wgpuDeviceCreateComputePipeline(dev->wgpu, &pd);
+      wgpuPipelineLayoutRelease(pd.layout);
+      wgpuBindGroupLayoutRelease(bl);
+      wgpuShaderModuleRelease(module);
+   }
+   WGPUComputePipeline pipeline = dev->precise_pipeline[ms];
+   simple_mtx_unlock(&dev->cache_lock);
+   const uint32_t params[4] = { q.query * 2 };
+   WGPUBuffer buffer = wvk_replay_temp_buffer(dev, replay, sizeof(params), WGPUBufferUsage_Uniform, params);
+   const WGPUBindGroupEntry entries[] = {
+      { .binding = 0, .textureView = replay->precise_view },
+      { .binding = 1, .buffer = q.pool->buffer, .size = q.pool->mem->buffer_size },
+      { .binding = 2, .buffer = buffer, .size = sizeof(params) },
+   };
+   WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bgd.layout = wgpuComputePipelineGetBindGroupLayout(pipeline, 0);
+   bgd.entryCount = ARRAY_SIZE(entries);
+   bgd.entries = entries;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bgd);
+   wgpuBindGroupLayoutRelease(bgd.layout);
+   WGPUComputePassDescriptor desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &desc);
+   wgpuComputePassEncoderSetPipeline(pass, pipeline);
+   wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuComputePassEncoderDispatchWorkgroups(pass, DIV_ROUND_UP(replay->rendering.extent.width, 8),
+                                           DIV_ROUND_UP(replay->rendering.extent.height, 8), 1);
+   wgpuComputePassEncoderEnd(pass);
+   wgpuComputePassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+   wvk_replay_write(replay, q.pool->mem, (uint64_t)q.query * 8, 8);
+   replay->precise_view = NULL;
+   replay->precise_dirty = false;
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_CreateQueryPool(VkDevice _device, const VkQueryPoolCreateInfo *pCreateInfo,
@@ -263,6 +383,11 @@ void
 wvk_replay_suspend_query(struct wvk_replay *replay)
 {
    struct wvk_pass_query *q = &replay->active_query;
+   if (q->pool && q->precise && replay->pass && !q->suspended) {
+      q->parts++;
+      q->suspended = true;
+      return;
+   }
    if (!replay->pass || !q->pool || q->slot == UINT32_MAX || q->suspended)
       return;
    wgpuRenderPassEncoderEndOcclusionQuery(replay->pass);
@@ -278,6 +403,10 @@ wvk_replay_resume_query(struct wvk_replay *replay)
    struct wvk_pass_query *q = &replay->active_query;
    if (!q->pool || !q->suspended || !replay->pass || replay->query_held)
       return;
+   if (q->precise) {
+      q->suspended = false;
+      return;
+   }
    if (!replay->query_set || replay->query_next >= WVK_QUERY_SET_SIZE) {
       q->uncounted = true;
       return;
@@ -577,6 +706,21 @@ wvk_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool
    }
    if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
       return;
+   const bool precise = (flags & VK_QUERY_CONTROL_PRECISE_BIT) &&
+                        wvk_device_physical(wvk_cmd_buffer_device(cmd))->info.backendType != WGPUBackendType_Vulkan;
+   if (precise) {
+      /* Split before changing the attachments; keep the Vulkan pass's
+       * contents and continue it with the private counter. */
+      const bool pass = replay->pass != NULL;
+      wvk_replay_end_passes(replay);
+      wgpuCommandEncoderClearBuffer(replay->encoder, pool->buffer, (uint64_t)query * 8, 8);
+      wvk_replay_write(replay, pool->mem, (uint64_t)query * 8, 8);
+      replay->active_query = (struct wvk_pass_query){ pool, query, UINT32_MAX,
+                                                   .suspended = true, .precise = true };
+      if (pass)
+         wvk_replay_restart_pass(cmd, replay->pass_layer);
+      return;
+   }
    /* Begun outside a render pass, it counts in the passes until it ends:
     * each resumes it. */
    if (!replay->pass) {
@@ -612,6 +756,14 @@ wvk_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer, VkQueryPool queryPool, 
    }
    if (pool->vk.query_type != VK_QUERY_TYPE_OCCLUSION)
       return;
+   if (replay->active_query.pool == pool && replay->active_query.precise) {
+      const bool pass = replay->pass != NULL;
+      wvk_replay_end_passes(replay);
+      replay->active_query = (struct wvk_pass_query){ 0 };
+      if (pass)
+         wvk_replay_restart_pass(cmd, replay->pass_layer);
+      return;
+   }
    if (replay->active_query.pool == pool && replay->active_query.slot != UINT32_MAX && replay->pass &&
        !replay->active_query.suspended) {
       wgpuRenderPassEncoderEndOcclusionQuery(replay->pass);

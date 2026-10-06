@@ -332,6 +332,7 @@ struct wvk_render_key {
    uint8_t samples, alpha_to_coverage;
    uint16_t sample_mask;
    uint8_t color_count;
+   uint8_t occlusion;
    struct {
       uint8_t blend, write_mask, src_c, dst_c, op_c, src_a, dst_a, op_a;
    } color[8];
@@ -615,6 +616,12 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuComputePipelineRelease(dev->copy_query_pipeline);
    if (dev->add_query_pipeline)
       wgpuComputePipelineRelease(dev->add_query_pipeline);
+   for (unsigned i = 0; i < ARRAY_SIZE(dev->precise_pipeline); ++i)
+      if (dev->precise_pipeline[i])
+         wgpuComputePipelineRelease(dev->precise_pipeline[i]);
+   for (unsigned i = 0; i < ARRAY_SIZE(dev->precise_fragment); ++i)
+      if (dev->precise_fragment[i])
+         wgpuShaderModuleRelease(dev->precise_fragment[i]);
    if (dev->timestamp_pipeline)
       wgpuComputePipelineRelease(dev->timestamp_pipeline);
    if (dev->add_stats_pipeline)
@@ -950,6 +957,19 @@ create_render_pipeline(struct wvk_device *dev, const struct wvk_render_key *k,
    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
    if (fs || k->color_count) {
       fragment.module = fs ? fs->module[0] : dev->empty_fragment;
+      if (!fs && k->occlusion) {
+         const uint32_t slot = k->occlusion - 1;
+         if (!dev->precise_fragment[slot]) {
+            char code[128];
+            snprintf(code, sizeof(code), "@fragment fn main() -> @location(%u) f32 { return 1.0; }", slot);
+            WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+            source.code = wvk_sv(code);
+            WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+            sm.nextInChain = &source.chain;
+            dev->precise_fragment[slot] = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+         }
+         fragment.module = dev->precise_fragment[slot];
+      }
       fragment.entryPoint = wvk_sv("main");
       fragment.targetCount = k->color_count;
       fragment.targets = targets;
@@ -2593,6 +2613,15 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
       k->color_formats[i] = replay->rendering.color_format[i];
       if (!k->color_formats[i])
          continue;
+      if (replay->precise_view && !replay->query_held && i == replay->precise_slot) {
+         k->occlusion = i + 1;
+         k->color[i].write_mask = WGPUColorWriteMask_Red;
+         k->color[i].blend = true;
+         k->color[i].src_c = k->color[i].dst_c = WGPUBlendFactor_One;
+         k->color[i].src_a = k->color[i].dst_a = WGPUBlendFactor_One;
+         k->color[i].op_c = k->color[i].op_a = WGPUBlendOperation_Add;
+         continue;
+      }
       const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
       const bool written = st->fs && (st->fs->io_mask & BITFIELD_BIT(i)) &&
                            (dyn->cb.color_write_enables & BITFIELD_BIT(i));
@@ -3078,6 +3107,13 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
    WGPURenderPassEncoder pass = replay->pass;
    const struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
 
+   /* Reduce between draws so the float attachment never accumulates a
+    * long query's overdraw. Its integer query result accumulates in u64. */
+   if (replay->precise_view && replay->precise_dirty && !replay->query_held) {
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+      pass = replay->pass;
+   }
+
    if (!pass) {
       mesa_logw_once("wvk: a draw outside a render pass");
       return false;
@@ -3202,6 +3238,8 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
 
    wgpuRenderPassEncoderSetBlendConstant(pass, &blend);
    wgpuRenderPassEncoderSetStencilReference(pass, draw_stencil_face(replay, dyn)->reference);
+   if (replay->precise_view && !replay->query_held)
+      replay->precise_dirty = true;
    return true;
 }
 
@@ -4095,7 +4133,9 @@ select_draw_shaders(struct wvk_cmd_buffer *cmd)
                                      : st->bound_tes ? st->bound_tes
                                                      : st->bound_vs;
    st->fs = wvk_shader_draw_variant(dev, st->bound_fs, before, dyn, samples, has_depth, color_formats, &fs_images,
-                                    shape, 0, wvk_replay_stats(replay));
+                                    shape, 0, wvk_replay_stats(replay) |
+                                    (replay->precise_view && !replay->query_held
+                                       ? WVK_PRECISE_QUERY_SLOT(replay->precise_slot) : 0));
    st->vs = wvk_shader_draw_variant(dev, st->bound_vs, st->fs, dyn, samples, has_depth, color_formats, &vs_images,
                                     shape, 0, 0);
    /* No fragment shader to do the depth bounds test: the driver's. And the

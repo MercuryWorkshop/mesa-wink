@@ -7805,6 +7805,17 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       NIR_PASS(_, nir, wvk_nir_lower_fragment_shading_rate, &fsr);
    }
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      if (records && records->occlusion) {
+         shader->key.occlusion = records->occlusion;
+         nir_variable *counter = nir_variable_create(nir, nir_var_shader_out,
+                                                     glsl_float_type(), "wvk_passing_sample");
+         counter->data.location = FRAG_RESULT_DATA0 + records->occlusion - 1;
+         NIR_PASS(_, nir, nir_lower_returns);
+         nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+         nir_builder b = nir_builder_at(nir_after_impl(impl));
+         nir_store_var(&b, counter, nir_imm_float(&b, 1.0), 1);
+         nir_progress(true, impl, nir_metadata_none);
+      }
       const struct vk_multisample_state *ms = pipeline_state ? pipeline_state->ms : NULL;
       bool own_mask = false;
       nir_foreach_shader_out_variable(var, nir)
@@ -8919,6 +8930,7 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
       key.samples = shader->uses_samples || key.by_alpha ? samples : 0;
       key.no_depth = shader->source_writes_depth && !has_depth;
       key.stats = (stats & VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT) != 0;
+      key.occlusion = stats >> 24;
       /* Its colour outputs at their attachments' locations
        * (dynamicRenderingLocalRead), of the attachments the pass has, and
        * which of them it writes. */

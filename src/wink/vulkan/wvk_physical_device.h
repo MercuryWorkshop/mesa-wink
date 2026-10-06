@@ -40,6 +40,7 @@ struct wvk_physical_device {
    WGPUAdapterInfo info;
    /* The adapter's limits, which is what a device is created with. */
    WGPULimits limits;
+   uint32_t color_attachments;
 
    /* The adapter's features that the driver uses: what vkCreateDevice
     * requests. */

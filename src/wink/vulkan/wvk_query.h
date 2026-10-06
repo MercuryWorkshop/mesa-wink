@@ -78,7 +78,15 @@ struct wvk_pass_query {
    bool suspended;
    /* A pass it was in had no query left for it: what it counted is lost. */
    bool uncounted;
+   /* Count passing samples in a private additive attachment where WebGPU's
+    * occlusion query is only a visibility bit. */
+   bool precise;
 };
+
+/* The private counting attachment of an emulated precise query. */
+WGPUTextureView wvk_replay_precise_attachment(struct wvk_replay *replay);
+void wvk_replay_resolve_precise(struct wvk_replay *replay);
+#define WVK_PRECISE_QUERY_SLOT(s) (((s) + 1u) << 24)
 
 /* The active occlusion query ended where the pass is going to, or a clear
  * is not to be counted; and begun again, in a slot of its own, after. */

@@ -20,6 +20,7 @@
 
 #include "quad_vert.h"
 #include "color_frag.h"
+#include "discard_frag.h"
 #include "texture_frag.h"
 #include "instanced_vert.h"
 
@@ -42,7 +43,8 @@ static const float quad[] = {
 /* The pipeline for the quad, or with `divisor` for instanced.vert: one
  * instance-rate attribute of that divisor, and strips of four indices. */
 static VkPipeline
-make_pipeline_with(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, uint32_t divisor)
+make_pipeline_samples(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, uint32_t divisor,
+                      VkSampleCountFlagBits samples, VkSampleMask mask)
 {
    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
    const VkPipelineShaderStageCreateInfo stages[] = {
@@ -102,7 +104,7 @@ make_pipeline_with(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs
       },
       .pMultisampleState = &(VkPipelineMultisampleStateCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+         .rasterizationSamples = samples, .pSampleMask = &mask,
       },
       .pColorBlendState = &(VkPipelineColorBlendStateCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
@@ -118,6 +120,12 @@ make_pipeline_with(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs
       .layout = layout,
    }, NULL, &pipeline));
    return pipeline;
+}
+
+static VkPipeline
+make_pipeline_with(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, uint32_t divisor)
+{
+   return make_pipeline_samples(layout, vs, fs, divisor, VK_SAMPLE_COUNT_1_BIT, ~0u);
 }
 
 static VkPipeline
@@ -257,6 +265,88 @@ test_colors(VkBuffer vertices)
    vkDestroyShaderModule(dev, fs, NULL);
    vkDestroyPipelineLayout(dev, layout, NULL);
    printf("colors: done\n");
+}
+
+static void
+test_precise_queries(VkBuffer vertices, VkSampleCountFlagBits samples, VkSampleMask mask, unsigned covered)
+{
+   VkPhysicalDeviceFeatures features;
+   vkGetPhysicalDeviceFeatures(pdev, &features);
+   CHECK(features.occlusionQueryPrecise, "precise occlusion queries unavailable");
+   if (!features.occlusionQueryPrecise)
+      return;
+   VkQueryPool queries;
+   VK(vkCreateQueryPool(dev, &(VkQueryPoolCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+      .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = 5,
+   }, NULL, &queries));
+   VkPipelineLayout layout;
+   VK(vkCreatePipelineLayout(dev, &(VkPipelineLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &(VkPushConstantRange){
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(struct push),
+      },
+   }, NULL, &layout));
+   VkShaderModule vs = make_module(spv_quad_vert, sizeof(spv_quad_vert));
+   VkShaderModule fs = make_module(spv_color_frag, sizeof(spv_color_frag));
+   VkPipeline pipeline = make_pipeline_samples(layout, vs, fs, 0, samples, mask);
+   VkShaderModule discard = make_module(spv_discard_frag, sizeof(spv_discard_frag));
+   VkPipeline discard_pipeline = make_pipeline_samples(layout, vs, discard, 0, samples, mask);
+   struct image target = make_image_samples(W, H, VK_FORMAT_R8G8B8A8_UNORM,
+                                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, samples);
+   VkCommandBuffer cmd = begin();
+   vkCmdResetQueryPool(cmd, queries, 0, 5);
+   begin_pass(cmd, &target, false);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   const VkDeviceSize zero = 0;
+   vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &zero);
+   const struct push push = { { 1, 1, 1, 1 }, { 0, 0 } };
+   vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                      0, sizeof(push), &push);
+   vkCmdBeginQuery(cmd, queries, 0, VK_QUERY_CONTROL_PRECISE_BIT);
+   vkCmdDraw(cmd, 4, 3, 0, 0);
+   /* Clears and a split of the underlying WebGPU pass must not change the
+    * count, and the second draw's overlapping samples count again. */
+   vkCmdClearAttachments(cmd, 1, &(VkClearAttachment){
+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0,
+   }, 1, &(VkClearRect){ .rect = {{0,0},{W,H}}, .layerCount = 1 });
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT,
+                        0, 0, NULL, 0, NULL, 0, NULL);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   vkCmdEndQuery(cmd, queries, 0);
+   vkCmdBeginQuery(cmd, queries, 1, VK_QUERY_CONTROL_PRECISE_BIT);
+   vkCmdEndQuery(cmd, queries, 1);
+   vkCmdSetScissor(cmd, 0, 1, &(VkRect2D){ {0,0}, {W/2,H/2} });
+   vkCmdBeginQuery(cmd, queries, 2, VK_QUERY_CONTROL_PRECISE_BIT);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   vkCmdEndQuery(cmd, queries, 2);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, discard_pipeline);
+   vkCmdBeginQuery(cmd, queries, 3, VK_QUERY_CONTROL_PRECISE_BIT);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   vkCmdEndQuery(cmd, queries, 3);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   vkCmdBeginQuery(cmd, queries, 4, VK_QUERY_CONTROL_PRECISE_BIT);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   vkCmdEndQuery(cmd, queries, 4);
+   end_rendering(cmd);
+   submit_and_wait(cmd);
+   uint64_t result[5][2] = {{0}};
+   VK(vkGetQueryPoolResults(dev, queries, 0, 5, sizeof(result), result, sizeof(result[0]),
+      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT));
+   const uint64_t expected[] = { 4 * W * H * covered, 0, W * H * covered / 4,
+                                 W * H * covered / 8, W * H * covered / 4 };
+   for (unsigned i = 0; i < 5; ++i)
+      CHECK(result[i][1] && result[i][0] == expected[i], "precise query %u: %llu available %llu, expected %llu",
+            i, (unsigned long long)result[i][0], (unsigned long long)result[i][1], (unsigned long long)expected[i]);
+   vkDestroyQueryPool(dev, queries, NULL);
+   vkDestroyPipeline(dev, pipeline, NULL);
+   vkDestroyPipeline(dev, discard_pipeline, NULL);
+   vkDestroyShaderModule(dev, discard, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   vkDestroyShaderModule(dev, vs, NULL);
+   vkDestroyShaderModule(dev, fs, NULL);
+   free_image(&target);
+   printf("precise queries (%u samples, mask %x): done\n", samples, mask);
 }
 
 static void
@@ -552,7 +642,7 @@ main(void)
    };
    test_init(3, extensions, &(VkPhysicalDeviceFeatures2){
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &vk11,
-      .features = { .multiDrawIndirect = VK_TRUE },
+      .features = { .multiDrawIndirect = VK_TRUE, .occlusionQueryPrecise = VK_TRUE },
    });
    begin_rendering = (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(dev, "vkCmdBeginRenderingKHR");
    end_rendering = (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(dev, "vkCmdEndRenderingKHR");
@@ -561,6 +651,9 @@ main(void)
    memcpy(vertices.map, quad, sizeof(quad));
 
    test_colors(vertices.buffer);
+   test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_1_BIT, ~0u, 1);
+   test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_4_BIT, ~0u, 4);
+   test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_4_BIT, 5u, 2);
    test_texture(vertices.buffer);
    test_clear_attachments();
    test_blit();

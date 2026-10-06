@@ -115,6 +115,8 @@ struct wvk_shader_key {
    /* Fragment: its depth write dropped, for a pass without a depth
     * attachment, which WebGPU will not have it write to. */
    uint8_t no_depth;
+   /* The additive sample counter's output location plus one. */
+   uint8_t occlusion;
    /* Points drawn as quads (largePoints): the vertex shader making six
     * vertices a point, the fragment shader reading gl_PointCoord from the
     * varying at location point_coord - 1 (0: none) and facing front, as it

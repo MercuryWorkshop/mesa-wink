@@ -333,10 +333,10 @@ get_device_features(const struct wvk_physical_device *pdev, struct vk_features *
       .shaderTessellationAndGeometryPointSize = true,
       /* The driver's counts, the host's and the shaders' (wvk_query.c). */
       .pipelineStatisticsQuery = true,
-      /* Occlusion counts samples on native Dawn's Vulkan, which has the
-       * host's precise queries (dawn-vulkan-precise-occlusion.patch);
-       * Metal's and a browser's are only zero or not. */
-      .occlusionQueryPrecise = pdev->info.backendType == WGPUBackendType_Vulkan,
+      /* Native Vulkan counts in hardware. Metal and browsers add passing
+       * samples to a private float attachment, then reduce it into u64. */
+      .occlusionQueryPrecise = pdev->info.backendType == WGPUBackendType_Vulkan ||
+                              wvk_physical_device_has_feature(pdev, WGPUFeatureName_Float32Blendable),
       /* As compute, before a draw of what it emits (draw_geometry). */
       .geometryShader = true,
       /* As compute, around a tessellator of the same (draw_tessellated). */
@@ -909,7 +909,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .maxTessellationEvaluationInputComponents = 128,
       .maxTessellationEvaluationOutputComponents = l->maxInterStageShaderVariables * 4,
       .maxFragmentInputComponents = l->maxInterStageShaderVariables * 4,
-      .maxFragmentOutputAttachments = l->maxColorAttachments,
+      .maxFragmentOutputAttachments = pdev->color_attachments,
       .maxFragmentDualSrcAttachments =
          wvk_physical_device_has_feature(pdev, WGPUFeatureName_DualSourceBlending) ? 1 : 0,
       .maxFragmentCombinedOutputResources = l->maxColorAttachments + ssbos +
@@ -1050,7 +1050,7 @@ get_device_properties(const struct wvk_physical_device *pdev,
       .framebufferDepthSampleCounts = WVK_SAMPLE_COUNTS,
       .framebufferStencilSampleCounts = WVK_SAMPLE_COUNTS,
       .framebufferNoAttachmentsSampleCounts = WVK_SAMPLE_COUNTS,
-      .maxColorAttachments = l->maxColorAttachments,
+      .maxColorAttachments = pdev->color_attachments,
       .sampledImageColorSampleCounts = WVK_SAMPLE_COUNTS,
       /* WebGPU multisamples few integer formats. */
       .sampledImageIntegerSampleCounts = VK_SAMPLE_COUNT_1_BIT,
@@ -1342,7 +1342,7 @@ wvk_enumerate_physical_devices(struct vk_instance *_instance)
     * it renders to but a few 32-bit four-channel ones. Not below Vulkan's
     * minimum of 4, which a device of 32 bytes (WebGPU's default, and what
     * Dawn reports on Vulkan) has only of the smaller formats. */
-   pdev->limits.maxColorAttachments =
+   pdev->color_attachments =
       MIN2(pdev->limits.maxColorAttachments,
            MAX2(pdev->limits.maxColorAttachmentBytesPerSample / 8, 4));
    for (size_t i = 0; i < ARRAY_SIZE(wanted_features); ++i) {
@@ -1350,6 +1350,12 @@ wvk_enumerate_physical_devices(struct vk_instance *_instance)
           pdev->feature_count < ARRAY_SIZE(pdev->features))
          pdev->features[pdev->feature_count++] = wanted_features[i];
    }
+   /* Reserve an attachment (and four bytes per sample) for exact occlusion
+    * counts on backends whose WebGPU query returns only visibility. */
+   if (pdev->info.backendType != WGPUBackendType_Vulkan &&
+       wvk_physical_device_has_feature(pdev, WGPUFeatureName_Float32Blendable))
+      pdev->color_attachments = MIN2(pdev->color_attachments,
+         MIN2(7, (pdev->limits.maxColorAttachmentBytesPerSample - 4) / 8));
 
    struct vk_physical_device_dispatch_table dispatch_table;
    vk_physical_device_dispatch_table_from_entrypoints(&dispatch_table,

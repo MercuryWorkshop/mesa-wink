@@ -105,6 +105,7 @@ wvk_replay_end_passes(struct wvk_replay *replay)
       wgpuRenderPassEncoderEnd(replay->pass);
       wgpuRenderPassEncoderRelease(replay->pass);
       replay->pass = NULL;
+      wvk_replay_resolve_precise(replay);
       if (replay->query_set)
          wvk_replay_resolve_queries(replay);
    }
