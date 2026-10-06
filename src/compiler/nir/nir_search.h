@@ -161,6 +161,13 @@ typedef struct {
 struct per_op_table {
    const uint16_t *filter;
    unsigned num_filtered_states;
+   /* The transitions by the filtered states of the sources, the last
+    * source's fastest. With `rows`, those of every source but the last
+    * index `rows`, which says which row of num_filtered_states `table`
+    * holds for them: rows alike are kept once, which for a three-source
+    * opcode such as bcsel is a twentieth of the table, all of it data
+    * every binary carries. */
+   const uint16_t *rows;
    const uint16_t *table;
 };
 

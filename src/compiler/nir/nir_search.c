@@ -772,7 +772,11 @@ nir_algebraic_automaton(nir_instr *instr, struct util_dynarray *states,
        * table.
        */
       unsigned index = 0;
-      for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++) {
+      const unsigned num_inputs = nir_op_infos[op].num_inputs;
+      for (unsigned i = 0; i < num_inputs; i++) {
+         /* The row of the sources before the last, kept once (rows). */
+         if (tbl->rows && i + 1 == num_inputs)
+            index = tbl->rows[index];
          index *= tbl->num_filtered_states;
          if (tbl->filter)
             index += tbl->filter[*util_dynarray_element(states, uint16_t,

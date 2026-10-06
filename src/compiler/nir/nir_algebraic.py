@@ -1207,14 +1207,37 @@ static const struct per_op_table ${pass_name}_pass_op_table[nir_num_search_ops] 
         num_filtered = len(automaton.rep[op])
       %>
       .num_filtered_states = ${num_filtered},
-      .table = (const uint16_t []) {
       <%
         num_srcs = len(next(iter(automaton.table[op])))
+        # Rows of the last source's states, each kept once, and which of
+        # them the states of the others before it have (per_op_table).
+        unique_rows = {}
+        row_index = []
+        for prefix in itertools.product(range(num_filtered), repeat=num_srcs - 1):
+           row = tuple(automaton.table[op][prefix + (j,)] for j in range(num_filtered))
+           row_index.append(unique_rows.setdefault(row, len(unique_rows)))
+        dedup = num_srcs > 1 and len(unique_rows) * num_filtered + len(row_index) < num_filtered ** num_srcs
       %>
+      % if dedup:
+      .rows = (const uint16_t []) {
+      % for r in row_index:
+         ${r},
+      % endfor
+      },
+      .table = (const uint16_t []) {
+      % for row in unique_rows:
+      % for e in row:
+         ${e},
+      % endfor
+      % endfor
+      },
+      % else:
+      .table = (const uint16_t []) {
       % for indices in itertools.product(range(num_filtered), repeat=num_srcs):
          ${automaton.table[op][indices]},
       % endfor
       },
+      % endif
    },
 % endfor
 };
