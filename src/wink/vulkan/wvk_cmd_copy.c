@@ -1537,6 +1537,51 @@ wvk_image_snapshot_ds(struct wvk_device *dev, struct wvk_replay *replay, const s
    return copy;
 }
 
+bool
+wvk_image_copy_depth_layer(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image,
+                           uint32_t level, uint32_t layer, WGPUTextureView dst)
+{
+   if (!image->texture || image->vk.samples > 1 || image->dimension == WGPUTextureDimension_3D)
+      return false;
+   WGPURenderPipeline pipeline = ds_copy_pipeline(dev, false);
+   if (!pipeline)
+      return false;
+   wvk_replay_end_passes(replay);
+   WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   vd.dimension = WGPUTextureViewDimension_2DArray;
+   vd.baseMipLevel = level;
+   vd.mipLevelCount = 1;
+   vd.baseArrayLayer = layer;
+   vd.arrayLayerCount = 1;
+   vd.aspect = WGPUTextureAspect_DepthOnly;
+   WGPUTextureView src = wgpuTextureCreateView(image->texture, &vd);
+   util_dynarray_append(&replay->views, src);
+   WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+   const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = bgl;
+   bg.entryCount = 1;
+   bg.entries = &entry;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bgl);
+   WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+   color.view = dst;
+   color.loadOp = WGPULoadOp_Clear;
+   color.storeOp = WGPUStoreOp_Store;
+   WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+   pd.label = wvk_sv("wvk depth copy");
+   pd.colorAttachmentCount = 1;
+   pd.colorAttachments = &color;
+   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &pd);
+   wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+   wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+   wgpuRenderPassEncoderEnd(pass);
+   wgpuRenderPassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+   return true;
+}
+
 /* A depth or stencil aspect to a buffer. */
 static void
 copy_ds_to_buffer(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,

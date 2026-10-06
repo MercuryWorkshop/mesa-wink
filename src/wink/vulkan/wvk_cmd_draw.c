@@ -2902,23 +2902,32 @@ snapshot_logic_op(struct wvk_cmd_buffer *cmd)
          td.viewFormatCount = 1;
          td.viewFormats = &view->format;
       }
-      WGPUTexture copy = wgpuDeviceCreateTexture(dev->wgpu, &td);
-      if (!copy)
-         continue;
+      /* The copy the last such draw of the submit made of an attachment
+       * like it, copied into again: each draw's copy is read by that draw
+       * alone, and the submit's draws are one after another. Not a copy of
+       * its own for each, all of them the submit's until it is done. */
+      struct wvk_attachment_copy *c = &replay->logic_op_copies[i];
+      if (!c->texture || c->width != e.width || c->height != e.height || c->format != td.format ||
+          c->view_format != view->format) {
+         WGPUTexture copy = wgpuDeviceCreateTexture(dev->wgpu, &td);
+         if (!copy)
+            continue;
+         WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+         vd.format = view->format;
+         WGPUTextureView v = wgpuTextureCreateView(copy, td.viewFormatCount ? &vd : NULL);
+         wvk_replay_temp_texture(replay, copy);
+         if (!v)
+            continue;
+         util_dynarray_append(&replay->views, v);
+         *c = (struct wvk_attachment_copy){ copy, v, td.format, view->format, e.width, e.height };
+      }
       WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
       src.texture = texture;
       src.mipLevel = level - first_level;
       src.origin.z = texture_layer;
-      dst.texture = copy;
+      dst.texture = c->texture;
       wgpuCommandEncoderCopyTextureToTexture(replay->encoder, &src, &dst, &td.size);
-      WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
-      vd.format = view->format;
-      WGPUTextureView v = wgpuTextureCreateView(copy, td.viewFormatCount ? &vd : NULL);
-      wvk_replay_temp_texture(replay, copy);
-      if (!v)
-         continue;
-      util_dynarray_append(&replay->views, v);
-      replay->logic_op_views[i] = v;
+      replay->logic_op_views[i] = c->view;
    }
    wvk_replay_restart_pass(cmd, replay->pass_layer);
 }
@@ -2977,7 +2986,34 @@ prepare_depth_bounds(struct wvk_cmd_buffer *cmd)
    const struct wvk_image_view *ds = replay->rendering.depth_stencil;
    if (!ds)
       return;
-   WGPUTexture copy = wvk_image_snapshot_ds(dev, replay, wvk_image_view_image(ds), false);
+   /* The level and layer the pass renders, the one the test reads: into
+    * the submit's texture of its size, copied into again for each draw
+    * (snapshot_logic_op), not a copy of every level and layer each. */
+   const struct wvk_image *image = wvk_image_view_image(ds);
+   if (image->vk.samples == 1 && image->dimension != WGPUTextureDimension_3D) {
+      const VkExtent3D e = vk_image_mip_level_extent(&image->vk, ds->vk.base_mip_level);
+      struct wvk_attachment_copy *c = &replay->depth_bounds_copy;
+      if (!c->texture || c->width != e.width || c->height != e.height) {
+         WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
+         td.label = wvk_sv("wvk depth bounds");
+         td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_RenderAttachment;
+         td.size = (WGPUExtent3D){ e.width, e.height, 1 };
+         td.format = WGPUTextureFormat_R32Float;
+         WGPUTexture copy = wgpuDeviceCreateTexture(dev->wgpu, &td);
+         WGPUTextureView v = copy ? wgpuTextureCreateView(copy, NULL) : NULL;
+         wvk_replay_temp_texture(replay, copy);
+         if (!v)
+            return;
+         util_dynarray_append(&replay->views, v);
+         *c = (struct wvk_attachment_copy){ copy, v, td.format, td.format, e.width, e.height };
+      }
+      if (wvk_image_copy_depth_layer(dev, replay, image, ds->vk.base_mip_level,
+                                     ds->vk.base_array_layer + replay->pass_layer, c->view))
+         replay->depth_bounds_view = c->view;
+      wvk_replay_restart_pass(cmd, replay->pass_layer);
+      return;
+   }
+   WGPUTexture copy = wvk_image_snapshot_ds(dev, replay, image, false);
    if (copy) {
       WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
       vd.dimension = WGPUTextureViewDimension_2D;
@@ -4962,8 +4998,14 @@ scratch(struct wvk_device *dev, struct wvk_replay *replay, unsigned i, uint64_t 
 {
    size = align64(MAX2(size, 16), 16);
    if (replay->scratch[i].size < size) {
-      replay->scratch[i].buffer = wvk_replay_temp_buffer(dev, replay, size, usage | WGPUBufferUsage_CopyDst, NULL);
-      replay->scratch[i].size = replay->scratch[i].buffer ? size : 0;
+      /* At least twice what it was: each it grows out of stays until the
+       * submit is done, as earlier draws have it, so the submit's are at
+       * most twice its biggest, not one of each size it went through. As
+       * much as a storage binding has, which it is bound whole as. */
+      const uint64_t limit = wvk_device_physical(dev)->limits.maxStorageBufferBindingSize & ~15ull;
+      const uint64_t grown = MAX2(size, MIN2(replay->scratch[i].size * 2, limit));
+      replay->scratch[i].buffer = wvk_replay_temp_buffer(dev, replay, grown, usage | WGPUBufferUsage_CopyDst, NULL);
+      replay->scratch[i].size = replay->scratch[i].buffer ? grown : 0;
       replay->scratch[i].serial = ++dev->temp_serial | (1ull << 62);
    } else if (clear) {
       util_dynarray_append(&replay->scratch_clears, ((struct wvk_scratch_clear){ replay->scratch[i].buffer, size }));

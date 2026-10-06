@@ -280,6 +280,10 @@ void wvk_image_copy_ms_bits(struct wvk_device *dev, struct wvk_replay *replay, s
 /* The same of a depth-stencil image's depth, as R32Float, or its stencil,
  * as R8Uint: of a 4-sample image, each sample of its first layer
  * (wvk_cmd_copy.c). */
+/* Depth of one level and layer of a single-sampled 2D image into an
+ * R32Float view of its size, which `dst` is (a depth bounds test's). */
+bool wvk_image_copy_depth_layer(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image,
+                                uint32_t level, uint32_t layer, WGPUTextureView dst);
 WGPUTexture wvk_image_snapshot_ds(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image,
                                   bool stencil);
 

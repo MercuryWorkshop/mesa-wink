@@ -45,6 +45,16 @@ struct wvk_scratch_clear {
    uint64_t size;
 };
 
+/* A texture of the submit's an attachment is copied into, for a draw that
+ * reads it as it renders to it, and its view: of the size and formats it
+ * was made for. */
+struct wvk_attachment_copy {
+   WGPUTexture texture;
+   WGPUTextureView view;
+   WGPUTextureFormat format, view_format;
+   uint32_t width, height;
+};
+
 struct wvk_replay {
    WGPUCommandEncoder encoder;
    WGPURenderPassEncoder pass;
@@ -169,10 +179,14 @@ struct wvk_replay {
     * of the levels it does not write, or of a copy (wvk_cmd_draw.c). */
    struct util_dynarray texture_swaps; /* struct wvk_texture_swap */
    /* The copies of colour attachments a draw's logic op reads, made
-    * before it (wvk_cmd_draw.c), at WVK_DRIVER_SLOT_LOGIC_OP + i. */
+    * before it (wvk_cmd_draw.c), at WVK_DRIVER_SLOT_LOGIC_OP + i: of the
+    * submit's textures for them, copied into again for each draw. */
    WGPUTextureView logic_op_views[8];
-   /* And the copy of the depth attachment a depth bounds test reads. */
+   struct wvk_attachment_copy logic_op_copies[8];
+   /* And the copy of the depth attachment a depth bounds test reads: of
+    * the level and layer the pass renders, into the submit's texture. */
    WGPUTextureView depth_bounds_view;
+   struct wvk_attachment_copy depth_bounds_copy;
    /* The pass's shading rate attachment, a 2D view of its first layer
     * (WVK_DRIVER_SLOT_FSR). */
    WGPUTextureView fsr_view;
