@@ -4,9 +4,11 @@
  */
 #include "gex_wgpu_tint.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -500,7 +502,12 @@ translate(const uint32_t *words, size_t word_count, char **error_out)
  * (`gex_wgsl_cache_dump`) to keep for the next load. A blob made by another
  * build is refused whole, so a rebuilt Tint never serves an old answer.
  *
- * Keyed by two independent 64-bit hashes of the words and their count. */
+ * Keyed by two independent 64-bit hashes of the words and their count.
+ *
+ * Held to a budget of bytes of WGSL (GEX_WGSL_CACHE_BYTES, or the page's
+ * gex_wgsl_cache_budget; 32 MiB): past it, what was used least recently
+ * goes first -- which, after a load, is what the load brought and nothing
+ * has asked for. In a browser all of it is wasm heap, whose peak stays. */
 namespace {
 
 struct cache_key {
@@ -513,11 +520,58 @@ struct cache_key_hash {
 struct cache_entry {
    std::string wgsl;
    bool fresh; /* translated in this process, not loaded */
+   std::list<cache_key>::iterator lru;
 };
 
 std::mutex cache_mutex;
 std::unordered_map<cache_key, cache_entry, cache_key_hash> cache;
-uint32_t cache_hits, cache_misses, cache_loaded;
+/* Most recently used first. */
+std::list<cache_key> cache_lru;
+size_t cache_bytes;
+size_t cache_budget = 32u << 20;
+bool cache_budget_read;
+uint32_t cache_hits, cache_misses, cache_loaded, cache_evicted;
+
+/* Under cache_mutex. */
+void
+read_budget()
+{
+   if (cache_budget_read)
+      return;
+   cache_budget_read = true;
+   const char *v = getenv("GEX_WGSL_CACHE_BYTES");
+   if (v && *v)
+      cache_budget = (size_t)strtoull(v, nullptr, 0);
+}
+
+void
+evict_to(size_t budget)
+{
+   while (cache_bytes > budget && !cache_lru.empty()) {
+      auto it = cache.find(cache_lru.back());
+      cache_lru.pop_back();
+      if (it == cache.end())
+         continue;
+      cache_bytes -= it->second.wgsl.size();
+      cache.erase(it);
+      ++cache_evicted;
+   }
+}
+
+/* An entry, at the front, or not if its key is held already; within the
+ * budget after, but for one bigger than all of it. */
+bool
+insert(const cache_key &k, std::string &&wgsl, bool fresh)
+{
+   read_budget();
+   if (wgsl.size() > cache_budget || cache.count(k))
+      return false;
+   cache_lru.push_front(k);
+   cache_bytes += wgsl.size();
+   cache.emplace(k, cache_entry{std::move(wgsl), fresh, cache_lru.begin()});
+   evict_to(cache_budget);
+   return true;
+}
 
 const char cache_magic[8] = {'G', 'X', 'W', 'G', 'S', 'L', '1', 0};
 /* This build: a blob from any other is not trusted. */
@@ -535,8 +589,11 @@ cache_key key_of(const uint32_t *words, size_t n)
    return {a, b ^ (b >> 31)};
 }
 
-void put_u32(std::string &out, uint32_t v) { out.append(reinterpret_cast<const char *>(&v), 4); }
-void put_u64(std::string &out, uint64_t v) { out.append(reinterpret_cast<const char *>(&v), 8); }
+uint8_t *put(uint8_t *at, const void *v, size_t n)
+{
+   memcpy(at, v, n);
+   return at + n;
+}
 
 } // namespace
 
@@ -553,6 +610,7 @@ gex_wgpu_spirv_to_wgsl(const uint32_t *words, size_t word_count,
       auto it = cache.find(k);
       if (it != cache.end()) {
          ++cache_hits;
+         cache_lru.splice(cache_lru.begin(), cache_lru, it->second.lru);
          if (error_out)
             *error_out = nullptr;
          return copy_string(it->second.wgsl);
@@ -562,7 +620,7 @@ gex_wgpu_spirv_to_wgsl(const uint32_t *words, size_t word_count,
    char *wgsl = translate(words, word_count, error_out);
    if (wgsl) {
       std::lock_guard<std::mutex> lock(cache_mutex);
-      cache.emplace(k, cache_entry{std::string(wgsl), true});
+      insert(k, std::string(wgsl), true);
    }
    return wgsl;
 }
@@ -586,27 +644,53 @@ gex_wgsl_cache_load(const uint8_t *blob, uint32_t len)
    memcpy(&got, blob + 8, 4);
    if (got != idlen || memcmp(blob + 12, cache_build, idlen))
       return -1;
-   std::vector<std::pair<cache_key, std::string>> entries;
+   /* Checked whole first, so that a bad one adds nothing, and then read
+    * straight into the cache: not into a copy of all of it first. */
    for (uint32_t at = 12 + idlen; at < len;) {
+      uint32_t n;
       if (len - at < 20)
          return -1;
+      memcpy(&n, blob + at + 16, 4);
+      at += 20;
+      if (len - at < n)
+         return -1;
+      at += n;
+   }
+   std::lock_guard<std::mutex> lock(cache_mutex);
+   int added = 0;
+   for (uint32_t at = 12 + idlen; at < len;) {
       cache_key k;
       uint32_t n;
       memcpy(&k.a, blob + at, 8);
       memcpy(&k.b, blob + at + 8, 8);
       memcpy(&n, blob + at + 16, 4);
       at += 20;
-      if (len - at < n)
-         return -1;
-      entries.emplace_back(k, std::string(reinterpret_cast<const char *>(blob + at), n));
+      /* Behind what is already held: the budget takes the blob's own
+       * first, which nothing has asked for yet. */
+      read_budget();
+      if (n <= cache_budget && !cache.count(k)) {
+         cache_lru.push_back(k);
+         cache_bytes += n;
+         cache.emplace(k, cache_entry{std::string(reinterpret_cast<const char *>(blob + at), n), false,
+                                      std::prev(cache_lru.end())});
+         ++added;
+      }
       at += n;
    }
-   std::lock_guard<std::mutex> lock(cache_mutex);
-   int added = 0;
-   for (auto &e : entries)
-      added += cache.emplace(e.first, cache_entry{std::move(e.second), false}).second;
+   evict_to(cache_budget);
    cache_loaded += added;
    return added;
+}
+
+/* The most bytes of WGSL the cache keeps; 0 keeps none. What is over goes
+ * at once, least recently used first. */
+GEX_WGSL_EXPORT void
+gex_wgsl_cache_budget(uint32_t bytes)
+{
+   std::lock_guard<std::mutex> lock(cache_mutex);
+   cache_budget_read = true;
+   cache_budget = bytes;
+   evict_to(cache_budget);
 }
 
 /* The cache as a blob (malloc'd; the caller frees it), its length in
@@ -615,26 +699,32 @@ gex_wgsl_cache_load(const uint8_t *blob, uint32_t len)
 GEX_WGSL_EXPORT uint8_t *
 gex_wgsl_cache_dump(int only_fresh, uint32_t *len_out)
 {
-   std::string out(cache_magic, 8);
-   put_u32(out, sizeof(cache_build));
-   out.append(cache_build, sizeof(cache_build));
-   {
-      std::lock_guard<std::mutex> lock(cache_mutex);
-      for (const auto &e : cache) {
-         if (only_fresh && !e.second.fresh)
-            continue;
-         put_u64(out, e.first.a);
-         put_u64(out, e.first.b);
-         put_u32(out, (uint32_t)e.second.wgsl.size());
-         out += e.second.wgsl;
-      }
+   std::lock_guard<std::mutex> lock(cache_mutex);
+   /* Measured, then written into the one allocation: not built up in a
+    * string and copied, which held it twice. */
+   const uint32_t idlen = sizeof(cache_build);
+   size_t size = 12 + idlen;
+   for (const auto &e : cache) {
+      if (!only_fresh || e.second.fresh)
+         size += 20 + e.second.wgsl.size();
    }
-   uint8_t *blob = static_cast<uint8_t *>(std::malloc(out.size()));
+   uint8_t *blob = static_cast<uint8_t *>(std::malloc(size));
    if (!blob)
       return nullptr;
-   memcpy(blob, out.data(), out.size());
+   uint8_t *at = put(blob, cache_magic, 8);
+   at = put(at, &idlen, 4);
+   at = put(at, cache_build, idlen);
+   for (const auto &e : cache) {
+      if (only_fresh && !e.second.fresh)
+         continue;
+      const uint32_t n = (uint32_t)e.second.wgsl.size();
+      at = put(at, &e.first.a, 8);
+      at = put(at, &e.first.b, 8);
+      at = put(at, &n, 4);
+      at = put(at, e.second.wgsl.data(), n);
+   }
    if (len_out)
-      *len_out = (uint32_t)out.size();
+      *len_out = (uint32_t)size;
    return blob;
 }
 
@@ -647,4 +737,14 @@ gex_wgsl_cache_stats(uint32_t *out)
    out[1] = cache_misses;
    out[2] = cache_loaded;
    out[3] = (uint32_t)cache.size();
+}
+
+/* The same, and entries evicted and bytes of WGSL held: `out` of six. */
+GEX_WGSL_EXPORT void
+gex_wgsl_cache_stats2(uint32_t *out)
+{
+   gex_wgsl_cache_stats(out);
+   std::lock_guard<std::mutex> lock(cache_mutex);
+   out[4] = cache_evicted;
+   out[5] = (uint32_t)std::min(cache_bytes, (size_t)UINT32_MAX);
 }
