@@ -131,12 +131,6 @@ KHR-GL46.texture_swizzle.functional_format_idx_12_target_idx_7,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_12_target_idx_8,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_13_target_idx_7,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_13_target_idx_8,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_14_target_idx_7,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_14_target_idx_8,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_15_target_idx_7,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_15_target_idx_8,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_16_target_idx_7,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_16_target_idx_8,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_1_target_idx_0,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_1_target_idx_1,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_1_target_idx_2,Fail
@@ -151,14 +145,6 @@ KHR-GL46.texture_swizzle.functional_format_idx_21_target_idx_3,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_21_target_idx_4,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_21_target_idx_7,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_21_target_idx_8,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_24_target_idx_7,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_24_target_idx_8,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_25_target_idx_7,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_25_target_idx_8,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_26_target_idx_7,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_26_target_idx_8,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_2_target_idx_7,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_2_target_idx_8,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_33_target_idx_7,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_33_target_idx_8,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_34_target_idx_7,Fail
@@ -167,8 +153,6 @@ KHR-GL46.texture_swizzle.functional_format_idx_35_target_idx_7,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_35_target_idx_8,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_36_target_idx_7,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_36_target_idx_8,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_3_target_idx_7,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_3_target_idx_8,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_43_target_idx_7,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_43_target_idx_8,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_44_target_idx_7,Fail
@@ -216,10 +200,6 @@ KHR-GL46.texture_swizzle.functional_format_idx_68_target_idx_0,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_68_target_idx_1,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_68_target_idx_3,Fail
 KHR-GL46.texture_swizzle.functional_format_idx_68_target_idx_4,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_6_target_idx_7,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_6_target_idx_8,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_7_target_idx_7,Fail
-KHR-GL46.texture_swizzle.functional_format_idx_7_target_idx_8,Fail
 KHR-GL46.texture_view.view_classes,Fail
 KHR-GL46.texture_view.view_sampling,Fail
 KHR-GL46.transform_feedback.draw_xfb_test,Fail

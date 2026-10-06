@@ -17944,19 +17944,26 @@ gex_wgpu_promote_storage(void)
  * Gallium format. */
 static enum pipe_format gex_wgpu_stored_format(enum pipe_format format);
 
+/* Whether the device has texture-formats-tier1, whose 16-bit normalized
+ * formats are WebGPU's own: then they are stored as they are, not widened to
+ * float32 at twice the memory and a conversion every upload and readback.
+ * Process-wide, as the format helpers have no screen to ask; set once, when
+ * the screen is made (GEX_WGPU_NO_TIER1=1 keeps the widening). */
+static bool gex_wgpu_native_unorm16;
+
 static enum pipe_format
 gex_wgpu_format_backing(enum pipe_format format)
 {
    switch (format) {
    case PIPE_FORMAT_R16_UNORM:
    case PIPE_FORMAT_R16_SNORM:
-      return PIPE_FORMAT_R32_FLOAT;
+      return gex_wgpu_native_unorm16 ? PIPE_FORMAT_NONE : PIPE_FORMAT_R32_FLOAT;
    case PIPE_FORMAT_R16G16_UNORM:
    case PIPE_FORMAT_R16G16_SNORM:
-      return PIPE_FORMAT_R32G32_FLOAT;
+      return gex_wgpu_native_unorm16 ? PIPE_FORMAT_NONE : PIPE_FORMAT_R32G32_FLOAT;
    case PIPE_FORMAT_R16G16B16A16_UNORM:
    case PIPE_FORMAT_R16G16B16A16_SNORM:
-      return PIPE_FORMAT_R32G32B32A32_FLOAT;
+      return gex_wgpu_native_unorm16 ? PIPE_FORMAT_NONE : PIPE_FORMAT_R32G32B32A32_FLOAT;
    case PIPE_FORMAT_R16_FLOAT:
       return gex_wgpu_promote_storage() ? PIPE_FORMAT_R32_FLOAT
                                         : PIPE_FORMAT_NONE;
@@ -18021,6 +18028,14 @@ gex_wgpu_texture_format(enum pipe_format format)
    case PIPE_FORMAT_R16_FLOAT: return WGPUTextureFormat_R16Float;
    case PIPE_FORMAT_R16G16_FLOAT: return WGPUTextureFormat_RG16Float;
    case PIPE_FORMAT_R16G16B16A16_FLOAT: return WGPUTextureFormat_RGBA16Float;
+   /* texture-formats-tier1's (gex_wgpu_native_unorm16); float32 otherwise,
+    * which gex_wgpu_format_backing has made of these above. */
+   case PIPE_FORMAT_R16_UNORM: return WGPUTextureFormat_R16Unorm;
+   case PIPE_FORMAT_R16G16_UNORM: return WGPUTextureFormat_RG16Unorm;
+   case PIPE_FORMAT_R16G16B16A16_UNORM: return WGPUTextureFormat_RGBA16Unorm;
+   case PIPE_FORMAT_R16_SNORM: return WGPUTextureFormat_R16Snorm;
+   case PIPE_FORMAT_R16G16_SNORM: return WGPUTextureFormat_RG16Snorm;
+   case PIPE_FORMAT_R16G16B16A16_SNORM: return WGPUTextureFormat_RGBA16Snorm;
    /* WebGPU core guarantees the 32-bit float colour formats as renderable and
     * sampleable; filtering them additionally needs the float32-filterable
     * feature, which is why texture_float_linear stays off. */
@@ -18432,8 +18447,9 @@ gex_wgpu_color_renderable(struct pipe_screen *screen, enum pipe_format format)
    case PIPE_FORMAT_R16G16_SNORM:
    case PIPE_FORMAT_R16G16B16A16_UNORM:
    case PIPE_FORMAT_R16G16B16A16_SNORM:
-      return gex_screen(screen)->float32_filterable &&
-             gex_screen(screen)->float32_blendable;
+      return gex_wgpu_native_unorm16 ||
+             (gex_screen(screen)->float32_filterable &&
+              gex_screen(screen)->float32_blendable);
    default:
       return false;
    }
@@ -49329,6 +49345,9 @@ gex_wgpu_screen_create(WGPUDevice device)
     * granted these. Without them the formats stay unadvertised rather than
     * becoming a validation error the first time something samples or blends
     * one. */
+   gex_wgpu_native_unorm16 =
+      wgpuDeviceHasFeature(device, WGPUFeatureName_TextureFormatsTier1) &&
+      !getenv("GEX_WGPU_NO_TIER1");
    screen->float32_filterable =
       wgpuDeviceHasFeature(device, WGPUFeatureName_Float32Filterable);
    screen->float32_blendable =
