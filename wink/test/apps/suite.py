@@ -102,8 +102,6 @@ def validate_reference(case, root):
 def record(a, case, root):
     if not (a.out / "reference.lock.json").is_file():
         return {"status": "missing-tools", "pass": False, "error": "Build the pinned reference image first"}
-    if shutil.disk_usage(a.out).free < 4 * 1024**3:
-        return {"status": "resource-limit", "pass": False, "error": "Recording requires at least 4 GiB free disk space"}
     # A refresh gets a new directory. Partial and stale captures cannot pass.
     if root.exists():
         if (root / "capture.lock.json").exists():
@@ -115,6 +113,9 @@ def record(a, case, root):
                     outcome["status"] = "reference-reused"
                 return outcome
             return {"status": "reference-exists", "pass": False, "error": "Use a fresh --out directory for an explicit reference refresh."}
+    if shutil.disk_usage(a.out).free < 4 * 1024**3:
+        return {"status": "resource-limit", "pass": False, "error": "Recording requires at least 4 GiB free disk space"}
+    if root.exists():
         root.rename(root.with_name(root.name + ".incomplete-" + str(time.time_ns())))
     root.mkdir(parents=True)
     if not case.get("probe") and not case.get("command"):
@@ -237,8 +238,10 @@ def replay(a, case, root, target):
         result = output / "browser.json"
         if result.exists() and not json.loads(result.read_text()).get("pass"):
             outcome["pass"] = False
+            if outcome["status"] == "pass":
+                outcome["status"] = "replay-error"
     if not outcome["pass"]:
-        return dict(outcome, status="unsupported" if any("unsupported" in e.lower() or "VK_ERROR_EXTENSION_NOT_PRESENT" in e for e in outcome.get("errors", [])) else outcome["status"], artifacts=str(output))
+        return dict(outcome, status="unsupported" if any("unsupported" in e.lower() or "VK_ERROR_EXTENSION_NOT_PRESENT" in e or "VK_ERROR_FEATURE_NOT_PRESENT" in e for e in outcome.get("errors", [])) else outcome["status"], artifacts=str(output))
     checks = compare_directories(root / "reference-0", output, case.get("policy"), output, list(lock["checkpoints"]))
     result = {"status": "pass" if all(c["pass"] for c in checks) else "render-mismatch",
               "pass": all(c["pass"] for c in checks), "comparison": checks, "artifacts": str(output)}
