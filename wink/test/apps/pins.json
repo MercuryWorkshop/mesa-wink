@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "apitrace": {"url": "https://github.com/apitrace/apitrace.git", "commit": "706f9d61190684cb3e710fdf14c8f2a5ff13d9a3"},
+  "gfxreconstruct": {"url": "https://github.com/LunarG/gfxreconstruct.git", "commit": "e3330fb38b9e2205ab7273a1d6ae97b7ff681486"},
+  "reference_base": "ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55",
+  "applications": {
+    "godot": {"url": "https://github.com/godotengine/godot.git", "commit": "49a5bc7b616bd04689a2c89e89bda41f50241464"},
+    "filament": {"url": "https://github.com/google/filament.git", "commit": "4d35a7db75d67c9ee74361e96f4e4bce3ecd7a99"},
+    "ppsspp": {"url": "https://github.com/hrydgard/ppsspp.git", "commit": "0f50225f8e741c2f8a3a35cfd3b7d9dd0a16b34f"},
+    "pspautotests": {"url": "https://github.com/hrydgard/pspautotests.git", "commit": "f93c29855718a587360976e793f5b41a88ef7e68"}
+  },
+  "reference_mesa": "2d6c527ba56defd7bf177a577a604704f4bb6aa8",
+  "resources": {"cpus": 4, "memory": "8g"}
+}

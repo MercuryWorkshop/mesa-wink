@@ -1,0 +1,55 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<meta charset="utf-8">
+<title>Wink API replay</title>
+<canvas id="canvas" width="640" height="360"></canvas>
+<script type="module">
+const options = new URLSearchParams(location.search);
+const log = [];
+globalThis.__winkResult = null;
+try {
+  const api = options.get('api') || 'gl';
+  if (!['gl', 'gles', 'vulkan'].includes(api)) throw Error('unknown API');
+  const executable = api === 'vulkan' ? 'gfxrecon-replay' : 'wink-glretrace';
+  const { default: create } = await import(`./${executable}.js`);
+  const trace = options.get('trace') || (api === 'vulkan' ? 'capture.gfxr' : 'capture.trace');
+  const response = await fetch(trace);
+  if (!response.ok) throw Error(`trace HTTP ${response.status}`);
+  const data = new Uint8Array(await response.arrayBuffer());
+  if (data.length > 1024 * 1024 * 1024) throw Error('trace exceeds 1 GiB Wasm replay limit; trim with setup/history retained');
+  const Module = await create({
+    noInitialRun: true,
+    canvas: document.getElementById('canvas'),
+    print: s => { log.push(s); console.log(s); },
+    printErr: s => { log.push(s); console.warn(s); },
+    winkEnv: { MESA_DEBUG: 'context', WINK_VK_ABORT_ON_ERROR: '1' },
+  });
+  Module.FS.writeFile('/capture', data);
+  Module.FS.mkdir('/shots');
+  const checkpoints = options.get('checkpoints');
+  const args = api === 'vulkan'
+    ? ['gfxrecon-replay', '--wsi', 'headless', '-m', 'rebind', '--screenshots', checkpoints || '1,8,32,64', '--screenshot-format', 'png', '--screenshot-dir', '/shots', '/capture']
+    : ['wink-glretrace', '--singlethread', '--headless', '--debug', '-s', '/shots/frame-', '-S', checkpoints || '*/frame', '/capture'];
+  const pointers = args.map(arg => {
+    const ptr = Module._malloc(Module.lengthBytesUTF8(arg) + 1);
+    Module.stringToUTF8(arg, ptr, Module.lengthBytesUTF8(arg) + 1);
+    return ptr;
+  });
+  const argv = Module._malloc((pointers.length + 1) * 4);
+  new Uint32Array(Module.HEAPU8.buffer, argv, pointers.length + 1).set([...pointers, 0]);
+  let rc;
+  try { rc = await WebAssembly.promising(Module.winkReplayRaw)(pointers.length, argv); }
+  catch (e) { if (e.name === 'ExitStatus') rc = e.status; else throw e; }
+  const artifacts = Module.FS.readdir('/shots').filter(n => n.endsWith('.png')).map(name => {
+    const bytes = Module.FS.readFile('/shots/' + name);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += 8192) binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
+    return { name, encoding: 'base64', data: btoa(binary) };
+  });
+  const errors = log.filter(s => /(?:error:|GL_INVALID_|WebGPU error|validation error|device lost|unsupported:|failed to (?:compile|link|get snapshot))/i.test(s));
+  globalThis.__winkResult = { pass: rc === 0 && artifacts.length > 0 && errors.length === 0, rc, api, log, errors, artifacts };
+} catch (e) {
+  console.error(e.stack || String(e));
+  globalThis.__winkResult = { pass: false, rc: -1, log, error: e.stack || String(e), artifacts: [] };
+}
+</script>
