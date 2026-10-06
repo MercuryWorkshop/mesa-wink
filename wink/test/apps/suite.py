@@ -77,6 +77,21 @@ def case_hash(case):
     return hashlib.sha256(json.dumps(case, sort_keys=True).encode()).hexdigest()
 
 
+def validate_reference(case, root):
+    lock_path = root / "capture.lock.json"
+    if not lock_path.exists():
+        return {"status": "missing-reference", "pass": False}
+    lock = json.loads(lock_path.read_text())
+    trace = root / ("capture.gfxr" if case["api"] == "vulkan" else "capture.trace")
+    if lock["case_sha256"] != case_hash(case) or lock["trace_sha256"] != sha256(trace):
+        return {"status": "reference-incompatible", "pass": False, "error": "Case or trace changed; record a fresh reference."}
+    if len(lock["checkpoints"]) < case.get("min_frames", 1) or any(
+        sha256(root / "reference-0" / name) != value for name, value in lock["checkpoints"].items()
+    ):
+        return {"status": "reference-incompatible", "pass": False, "error": "Reference checkpoint checksum or coverage changed"}
+    return {"status": "pass", "pass": True, "lock": lock, "trace": trace}
+
+
 def record(a, case, root):
     if not (a.out / "reference.lock.json").is_file():
         return {"status": "missing-tools", "pass": False, "error": "Build the pinned reference image first"}
@@ -85,6 +100,13 @@ def record(a, case, root):
     # A refresh gets a new directory. Partial and stale captures cannot pass.
     if root.exists():
         if (root / "capture.lock.json").exists():
+            if a.reuse_references:
+                outcome = validate_reference(case, root)
+                outcome.pop("lock", None)
+                outcome.pop("trace", None)
+                if outcome["pass"]:
+                    outcome["status"] = "reference-reused"
+                return outcome
             return {"status": "reference-exists", "pass": False, "error": "Use a fresh --out directory for an explicit reference refresh."}
         root.rename(root.with_name(root.name + ".incomplete-" + str(time.time_ns())))
     root.mkdir(parents=True)
@@ -159,15 +181,10 @@ def record(a, case, root):
 
 
 def replay(a, case, root, target):
-    lock_path = root / "capture.lock.json"
-    if not lock_path.exists():
-        return {"status": "missing-reference", "pass": False}
-    lock = json.loads(lock_path.read_text())
-    trace = root / ("capture.gfxr" if case["api"] == "vulkan" else "capture.trace")
-    if lock["case_sha256"] != case_hash(case) or lock["trace_sha256"] != sha256(trace):
-        return {"status": "reference-incompatible", "pass": False, "error": "Case or trace changed; record a fresh reference."}
-    if any(sha256(root / "reference-0" / name) != value for name, value in lock["checkpoints"].items()):
-        return {"status": "reference-incompatible", "pass": False, "error": "Reference checkpoint checksum changed"}
+    validated = validate_reference(case, root)
+    if not validated["pass"]:
+        return validated
+    lock, trace = validated["lock"], validated["trace"]
     output = root / f"candidate-{target}-{time.time_ns()}"
     output.mkdir()
     api = "vulkan" if case["api"] == "vulkan" else "gl"
@@ -243,6 +260,7 @@ def main():
     p.add_argument("--recipes", type=Path)
     p.add_argument("--tools", type=Path, help="pinned Linux ARM64 application tree mounted at /tools")
     p.add_argument("--replayers", type=Path, help="reuse retracer builds from another output directory")
+    p.add_argument("--reuse-references", action="store_true", help="validate and reuse locked baselines while recording missing cases")
     p.add_argument("--timeout", type=int, default=900)
     p.add_argument("--icd", type=Path, default=MESA / "build/wvk-native/src/wink/vulkan/wink_devenv_icd.aarch64.json")
     a = p.parse_args()

@@ -62,6 +62,28 @@ class GateTests(unittest.TestCase):
             (root / "capture.lock.json").write_text(json.dumps({"case_sha256": suite.case_hash(case), "trace_sha256": "old"}))
             self.assertEqual(suite.replay(None, case, root, "st")["status"], "reference-incompatible")
 
+    def test_reuse_checks_reference_pixels_and_preserves_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            root = out / "proof"
+            (root / "reference-0").mkdir(parents=True)
+            (out / "reference.lock.json").write_text("{}")
+            case = {"id": "proof", "api": "gles", "min_frames": 1}
+            trace = root / "capture.trace"
+            trace.write_bytes(b"recorded trace")
+            image = root / "reference-0/frame-1.png"
+            Image.new("RGB", (2, 2), "red").save(image)
+            lock = root / "capture.lock.json"
+            lock.write_text(json.dumps({"case_sha256": suite.case_hash(case),
+                "trace_sha256": suite.sha256(trace), "checkpoints": {image.name: suite.sha256(image)}}))
+            before = lock.read_bytes()
+            a = SimpleNamespace(out=out, reuse_references=True)
+            with patch("suite.shutil.disk_usage", return_value=SimpleNamespace(free=8 * 1024**3)):
+                self.assertEqual(suite.record(a, case, root)["status"], "reference-reused")
+                Image.new("RGB", (2, 2), "green").save(image)
+                self.assertFalse(suite.record(a, case, root)["pass"])
+            self.assertEqual(lock.read_bytes(), before)
+
 
 if __name__ == "__main__":
     unittest.main()
