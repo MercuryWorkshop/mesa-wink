@@ -78,6 +78,8 @@ clear_descriptor(struct wvk_descriptor *d, bool keep_sampler)
       wgpuTextureViewRelease(d->view);
    if (d->cube_faces)
       wgpuTextureViewRelease(d->cube_faces);
+   wvk_image_unref(d->view_image);
+   wvk_image_unref(d->atomic_image);
    struct wvk_descriptor kept = { 0 };
    if (keep_sampler) {
       kept.sampler = d->sampler;
@@ -103,6 +105,8 @@ copy_descriptor(struct wvk_descriptor *dst, const struct wvk_descriptor *src, bo
       wgpuTextureViewAddRef(dst->view);
    if (dst->cube_faces)
       wgpuTextureViewAddRef(dst->cube_faces);
+   wvk_image_ref(dst->view_image);
+   wvk_image_ref(dst->atomic_image);
    if (keep_sampler) {
       dst->sampler = kept.sampler;
       dst->sampler_type = kept.sampler_type;
@@ -279,6 +283,7 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
       }
       if (wgpu) {
          d->view_image = wvk_image_view_image(view);
+         wvk_image_ref(d->view_image);
          d->view_texture = view->texture;
          d->view_level = view->vk.base_mip_level;
          d->view_levels = desc->mipLevelCount;
@@ -311,6 +316,7 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
          const bool is_3d = image->vk.image_type == VK_IMAGE_TYPE_3D;
          const uint32_t row = image->atomic_pitch[level] / 4;
          d->atomic_image = image;
+         wvk_image_ref(image);
          d->buffer = image->atomic_buffer;
          wgpuBufferAddRef(d->buffer);
          d->offset = 0;

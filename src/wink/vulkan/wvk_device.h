@@ -160,6 +160,18 @@ struct wvk_device {
     * such image bound where one is, of the same layout, is an alias of
     * (wvk_BindImageMemory2): struct wvk_bound_alias, under cache_lock. */
    struct util_dynarray bound_aliases;
+   /* Textures and buffers whose owner went while a submit was being
+    * replayed, which may use them: destroyed once it is submitted
+    * (wvk_device_doom_texture). Replays are one at a time, under the
+    * queue's submit_lock. */
+   simple_mtx_t doom_lock;
+   bool replaying;
+   struct util_dynarray doomed_textures;  /* WGPUTexture */
+   struct util_dynarray doomed_buffers;   /* WGPUBuffer */
+   /* Textures of VK_IMAGE_CREATE_ALIAS_BIT images that are other images'
+    * too, with how many more images have them than the one that made
+    * them (under cache_lock): the last of them destroys it. */
+   struct util_dynarray shared_textures;  /* struct wvk_shared_texture */
    /* What a pass without attachments renders to. */
    WGPUTexture dummy_attachment;
    VkExtent2D dummy_extent;
@@ -175,6 +187,22 @@ struct wvk_device {
    WGPUBuffer atomic_locks;
    WGPUSampler null_sampler;
 };
+
+struct wvk_shared_texture {
+   WGPUTexture texture;
+   uint32_t others;
+};
+
+/* A texture or buffer of the device's let go of: destroyed, not only
+ * released -- in a browser the last release lets JavaScript collect the
+ * object when it next collects, and its memory is the GPU's until then --
+ * now, or after the submit being replayed, which may use it. */
+void wvk_device_doom_texture(struct wvk_device *dev, WGPUTexture texture);
+void wvk_device_doom_buffer(struct wvk_device *dev, WGPUBuffer buffer);
+/* A submit's replay begins, and is over: what was let go of meanwhile is
+ * destroyed after it. */
+void wvk_device_replay_begin(struct wvk_device *dev);
+void wvk_device_replay_end(struct wvk_device *dev);
 
 /* The caches: made with the device, gone with it. */
 VkResult wvk_device_init_pipeline_caches(struct wvk_device *dev);

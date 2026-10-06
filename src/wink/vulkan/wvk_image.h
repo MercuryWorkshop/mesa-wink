@@ -41,6 +41,11 @@ struct wvk_image_alias {
  * to, which WebGPU's 1D textures cannot. */
 struct wvk_image {
    struct vk_image vk;
+   /* The application's reference and descriptors' (wvk_image_unref), and
+    * the allocator vkDestroyImage was given, which the last frees with. */
+   uint32_t refs;
+   VkAllocationCallbacks free_alloc;
+   bool free_with_alloc;
    WGPUTexture texture;
    /* A multisampled array, which WebGPU has no textures of: a texture of
     * each layer, of which `texture` is the first. */
@@ -102,6 +107,9 @@ struct wvk_bound_alias {
    const struct wvk_device_memory *mem;
    uint64_t offset;
 };
+
+void wvk_image_ref(struct wvk_image *image);
+void wvk_image_unref(struct wvk_image *image);
 
 /* The plane an aspect names, of a multi-planar image. */
 static inline uint32_t

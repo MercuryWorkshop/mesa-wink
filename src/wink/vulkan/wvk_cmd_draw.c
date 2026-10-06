@@ -504,6 +504,10 @@ wvk_device_init_pipeline_caches(struct wvk_device *dev)
    simple_mtx_init(&dev->cache_lock, mtx_plain);
    util_dynarray_init(&dev->placeholders, NULL);
    util_dynarray_init(&dev->bound_aliases, NULL);
+   util_dynarray_init(&dev->shared_textures, NULL);
+   simple_mtx_init(&dev->doom_lock, mtx_plain);
+   util_dynarray_init(&dev->doomed_textures, NULL);
+   util_dynarray_init(&dev->doomed_buffers, NULL);
    dev->bind_group_layouts = _mesa_hash_table_create(NULL, bgl_hash, bgl_equal);
    dev->pipeline_layouts = _mesa_hash_table_create(NULL, layout_hash, layout_equal);
    dev->render_pipelines = _mesa_hash_table_create(NULL, render_hash, render_equal);
@@ -686,7 +690,68 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
    }
    util_dynarray_fini(&dev->placeholders);
    util_dynarray_fini(&dev->bound_aliases);
+   util_dynarray_fini(&dev->shared_textures);
+   wvk_device_replay_end(dev);
+   util_dynarray_fini(&dev->doomed_textures);
+   util_dynarray_fini(&dev->doomed_buffers);
+   simple_mtx_destroy(&dev->doom_lock);
    simple_mtx_destroy(&dev->cache_lock);
+}
+
+void
+wvk_device_doom_texture(struct wvk_device *dev, WGPUTexture texture)
+{
+   if (!texture)
+      return;
+   simple_mtx_lock(&dev->doom_lock);
+   if (dev->replaying) {
+      util_dynarray_append(&dev->doomed_textures, texture);
+   } else {
+      wgpuTextureDestroy(texture);
+      wgpuTextureRelease(texture);
+   }
+   simple_mtx_unlock(&dev->doom_lock);
+}
+
+void
+wvk_device_doom_buffer(struct wvk_device *dev, WGPUBuffer buffer)
+{
+   if (!buffer)
+      return;
+   simple_mtx_lock(&dev->doom_lock);
+   if (dev->replaying) {
+      util_dynarray_append(&dev->doomed_buffers, buffer);
+   } else {
+      wgpuBufferDestroy(buffer);
+      wgpuBufferRelease(buffer);
+   }
+   simple_mtx_unlock(&dev->doom_lock);
+}
+
+void
+wvk_device_replay_begin(struct wvk_device *dev)
+{
+   simple_mtx_lock(&dev->doom_lock);
+   dev->replaying = true;
+   simple_mtx_unlock(&dev->doom_lock);
+}
+
+void
+wvk_device_replay_end(struct wvk_device *dev)
+{
+   simple_mtx_lock(&dev->doom_lock);
+   dev->replaying = false;
+   util_dynarray_foreach(&dev->doomed_textures, WGPUTexture, t) {
+      wgpuTextureDestroy(*t);
+      wgpuTextureRelease(*t);
+   }
+   util_dynarray_foreach(&dev->doomed_buffers, WGPUBuffer, b) {
+      wgpuBufferDestroy(*b);
+      wgpuBufferRelease(*b);
+   }
+   util_dynarray_clear(&dev->doomed_textures);
+   util_dynarray_clear(&dev->doomed_buffers);
+   simple_mtx_unlock(&dev->doom_lock);
 }
 
 static WGPUPrimitiveTopology

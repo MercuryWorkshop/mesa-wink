@@ -107,6 +107,7 @@ create_planar_image(VkDevice _device, const VkImageCreateInfo *pCreateInfo, cons
    struct wvk_image *image = vk_image_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*image));
    if (!image)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   image->refs = 1;
    image->linear = pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR;
    image->dimension = WGPUTextureDimension_2D;
    plane_offsets(pCreateInfo, image->plane_offset);
@@ -150,6 +151,7 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    struct wvk_image *image = vk_image_create(&dev->vk, pCreateInfo, pAllocator, sizeof(*image));
    if (!image)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   image->refs = 1;
 
    image->format = format->texture;
    if (linear) {
@@ -225,8 +227,10 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
    }
    if (!image->texture) {
       if (image->layer_textures) {
-         for (uint32_t l = 0; l < image->vk.array_layers && image->layer_textures[l]; ++l)
+         for (uint32_t l = 0; l < image->vk.array_layers && image->layer_textures[l]; ++l) {
+            wgpuTextureDestroy(image->layer_textures[l]);
             wgpuTextureRelease(image->layer_textures[l]);
+         }
          free(image->layer_textures);
       }
       vk_image_destroy(&dev->vk, pAllocator, &image->vk);
@@ -309,31 +313,73 @@ wvk_DestroyImage(VkDevice _device, VkImage _image, const VkAllocationCallbacks *
    for (uint32_t p = 0; p < image->plane_count; ++p)
       wvk_DestroyImage(_device, wvk_image_to_handle(image->planes[p]), pAllocator);
    unbind_alias(dev, image);
-   /* Swapchain images belong to the surface. Released, not destroyed:
-    * views of it in descriptors, which may outlive it unused, still have
-    * it, and it goes with the last of them. */
+   if (pAllocator) {
+      image->free_alloc = *pAllocator;
+      image->free_with_alloc = true;
+   }
+   wvk_image_unref(image);
+}
+
+void
+wvk_image_ref(struct wvk_image *image)
+{
+   if (image)
+      p_atomic_inc(&image->refs);
+}
+
+/* A texture other images of VK_IMAGE_CREATE_ALIAS_BIT have too goes with
+ * the last of them: whether this one is that. */
+static bool
+last_of_shared(struct wvk_device *dev, WGPUTexture texture)
+{
+   bool last = true;
+   simple_mtx_lock(&dev->cache_lock);
+   util_dynarray_foreach(&dev->shared_textures, struct wvk_shared_texture, s) {
+      if (s->texture == texture) {
+         if (!--s->others)
+            *s = util_dynarray_pop(&dev->shared_textures, struct wvk_shared_texture);
+         last = false;
+         break;
+      }
+   }
+   simple_mtx_unlock(&dev->cache_lock);
+   return last;
+}
+
+/* The application's reference, and descriptors': one may name an image
+ * destroyed while it is in a set, unused, and a bind group of the set
+ * still has its views. Its textures are destroyed with the last. Swapchain
+ * images are the swapchain's, which presents copies of them. */
+void
+wvk_image_unref(struct wvk_image *image)
+{
+   if (!image || !p_atomic_dec_zero(&image->refs))
+      return;
+   struct wvk_device *dev = container_of(image->vk.base.device, struct wvk_device, vk);
    if (image->layer_textures) {
       /* The first is `texture`. */
       for (uint32_t l = 1; l < image->vk.array_layers; ++l)
-         wgpuTextureRelease(image->layer_textures[l]);
+         wvk_device_doom_texture(dev, image->layer_textures[l]);
       free(image->layer_textures);
    }
-   if (image->texture)
-      wgpuTextureRelease(image->texture);
-   if (image->atomic_buffer)
-      wgpuBufferRelease(image->atomic_buffer);
-   if (image->shadow)
-      wgpuTextureRelease(image->shadow);
+   if (image->texture) {
+      if (last_of_shared(dev, image->texture))
+         wvk_device_doom_texture(dev, image->texture);
+      else
+         wgpuTextureRelease(image->texture);
+   }
+   wvk_device_doom_buffer(dev, image->atomic_buffer);
+   wvk_device_doom_texture(dev, image->shadow);
    for (uint32_t i = 0; i < image->alias_count; ++i) {
       if (image->aliases[i].layer_textures) {
          /* The first is `texture`. */
          for (uint32_t l = 1; l < image->vk.array_layers; ++l)
-            wgpuTextureRelease(image->aliases[i].layer_textures[l]);
+            wvk_device_doom_texture(dev, image->aliases[i].layer_textures[l]);
          free(image->aliases[i].layer_textures);
       }
-      wgpuTextureRelease(image->aliases[i].texture);
+      wvk_device_doom_texture(dev, image->aliases[i].texture);
    }
-   vk_image_destroy(&dev->vk, pAllocator, &image->vk);
+   vk_image_destroy(&dev->vk, image->free_with_alloc ? &image->free_alloc : NULL, &image->vk);
 }
 
 WGPUTexture
@@ -649,8 +695,22 @@ bind_alias(struct wvk_device *dev, struct wvk_image *image, struct wvk_device_me
                 : (~other->usage & (WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst))))
          continue;
       wgpuTextureAddRef(other->texture);
+      /* Its own, unused, goes now. */
+      wgpuTextureDestroy(image->texture);
       wgpuTextureRelease(image->texture);
       image->texture = other->texture;
+      bool counted = false;
+      util_dynarray_foreach(&dev->shared_textures, struct wvk_shared_texture, s) {
+         if (s->texture == image->texture) {
+            ++s->others;
+            counted = true;
+            break;
+         }
+      }
+      if (!counted) {
+         const struct wvk_shared_texture s = { image->texture, 1 };
+         util_dynarray_append(&dev->shared_textures, s);
+      }
       if (!same) {
          /* What is in the texture is the other image's: views of this
           * one's format copy it first. */

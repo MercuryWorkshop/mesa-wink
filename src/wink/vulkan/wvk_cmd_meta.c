@@ -279,8 +279,8 @@ wvk_dummy_attachment(struct wvk_device *dev, VkExtent2D extent, uint32_t samples
    simple_mtx_lock(&dev->cache_lock);
    if (!dev->dummy_attachment || dev->dummy_extent.width < extent.width ||
        dev->dummy_extent.height < extent.height || dev->dummy_samples != samples) {
-      if (dev->dummy_attachment)
-         wgpuTextureRelease(dev->dummy_attachment);
+      /* Passes of this replay may have it. */
+      wvk_device_doom_texture(dev, dev->dummy_attachment);
       WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
       desc.label = wvk_sv("wvk attachment for a pass without any");
       desc.usage = WGPUTextureUsage_RenderAttachment;
