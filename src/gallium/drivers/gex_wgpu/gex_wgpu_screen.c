@@ -753,6 +753,31 @@ gex_wgpu_say_once(uint32_t *shapes, unsigned *count, uint32_t shape)
                          &GEX_SAY_CAT(gex_said_count_, __LINE__),           \
                          (uint32_t)(shape)))
 
+/* getenv, read once per call site, for the switches tested on every draw or
+ * upload. musl's getenv walks the whole environment with strncmp, and an
+ * embedder's environment is not small: under the .NET runtime it holds every
+ * MONO_* knob, and three uncached reads on the draw path were 1.8% of
+ * Minecraft's render thread. The value is copied, so a later setenv cannot
+ * leave the cached pointer dangling; such a later setenv is not seen, which is
+ * what the many sites that already cache an int in a static do too. */
+static const char *
+gex_wgpu_getenv_cached(const char *name, const char **slot, bool *read)
+{
+   if (!*read) {
+      const char *v = getenv(name);
+      *slot = v ? strdup(v) : NULL;
+      *read = true;
+   }
+   return *slot;
+}
+#define GEX_GETENV_ONCE(name)                                               \
+   ({                                                                       \
+      static const char *GEX_SAY_CAT(gex_env_, __LINE__);                   \
+      static bool GEX_SAY_CAT(gex_env_read_, __LINE__);                     \
+      gex_wgpu_getenv_cached((name), &GEX_SAY_CAT(gex_env_, __LINE__),      \
+                             &GEX_SAY_CAT(gex_env_read_, __LINE__));        \
+   })
+
 /* What GL_MIN_MAP_BUFFER_ALIGNMENT promises and what the shadow block a map
  * returns is therefore allocated to; see gex_wgpu_shadow_ensure. */
 #define GEX_WGPU_MAP_ALIGNMENT 64
@@ -1974,6 +1999,16 @@ gex_wgpu_query_slot(unsigned type)
    }
 }
 
+/* One command of a multi-draw as WebGPU's drawIndexed takes it; see
+ * gex_wgpu_context::repeat. */
+struct gex_wgpu_repeat_cmd {
+   uint32_t index_count;
+   uint32_t instance_count;
+   uint32_t first_index;
+   int32_t base_vertex;
+   uint32_t start_instance;
+};
+
 struct gex_wgpu_context {
    struct pipe_context base;
    bool failed;
@@ -2436,6 +2471,29 @@ struct gex_wgpu_context {
    struct gex_wgpu_gs *gs;
    /* Rewrites the topologies WebGPU does not have into the ones it does. */
    struct primconvert_context *primconvert;
+   /* GEX_WGPU_QUAD_IB: the cached quads-as-triangles index buffers, [0] for the
+    * last-vertex convention and [1] for the first, and how many quads each covers. */
+   struct pipe_resource *quad_ib[2];
+   unsigned quad_ib_quads[2];
+   /* GEX_WGPU_REPEAT: the commands of one multi-draw after its first, handed to
+    * the emit of that first command, which -- when nothing it built depends on
+    * the command -- records them as further drawIndexed calls on the pipeline,
+    * bind groups and buffers it has just bound. See gex_wgpu_repeat_arm. */
+   struct {
+      const struct gex_wgpu_repeat_cmd *cmds;
+      unsigned count;
+      unsigned depth;
+      struct pipe_resource *index;
+      bool armed;
+      bool taken;
+   } repeat;
+   /* The draw's WebGPU labels, rebuilt only when the program's names change:
+    * six snprintf calls per draw were 5.8% of Minecraft's render thread. */
+   char label_vs[24], label_fs[24];
+   bool label_valid;
+   char draw_label[72];
+   char group_label[4][80];
+   char layout_label[80];
    struct pipe_resource *gs_vs_out;
    struct pipe_resource *gs_vertices;
    /* The record buffer the passthrough vertex shader reads, for the length of
@@ -6307,7 +6365,7 @@ static unsigned gex_wgpu_map_aligned, gex_wgpu_map_unaligned;
 static unsigned gex_wgpu_maps_staged, gex_wgpu_maps_shadowed;
 static unsigned gex_wgpu_shadow_cause_subdata, gex_wgpu_shadow_cause_read,
    gex_wgpu_shadow_cause_bind, gex_wgpu_shadow_cause_unaligned,
-   gex_wgpu_shadow_cause_existing;
+   gex_wgpu_shadow_cause_existing, gex_wgpu_shadow_cause_adopted;
 unsigned gex_wgpu_buffers_live;
 
 static void
@@ -6906,11 +6964,11 @@ gex_wgpu_report_draw_targets(void)
            gex_wgpu_maps_open);
    fprintf(stderr,
            "gex-wgpu: maps staged %u shadowed %u; shadow causes "
-           "subdata %u read %u bind %u unaligned %u existing %u\n",
+           "subdata %u read %u bind %u unaligned %u existing %u adopted %u\n",
            gex_wgpu_maps_staged, gex_wgpu_maps_shadowed,
            gex_wgpu_shadow_cause_subdata, gex_wgpu_shadow_cause_read,
            gex_wgpu_shadow_cause_bind, gex_wgpu_shadow_cause_unaligned,
-           gex_wgpu_shadow_cause_existing);
+           gex_wgpu_shadow_cause_existing, gex_wgpu_shadow_cause_adopted);
    fprintf(stderr,
            "gex-wgpu: live transfers %d, buffer maps %u unmaps %u\n",
            gex_wgpu_transfers_live, gex_wgpu_buffer_maps,
@@ -11269,6 +11327,10 @@ struct gex_wgpu_capture_pack {
 /* Two 16-bit components in one word. */
 #define GEX_CAPTURE_1616(c) \
    { 1, 2, {0,0,0,0}, {0,16,0,0}, {16,16,0,0}, (c) }
+/* Three 16-bit components across two words; the render path fetches these
+ * four wide and supplies w itself (gex_wgpu_vertex_unpack_kind). */
+#define GEX_CAPTURE_161616(c) \
+   { 2, 3, {0,0,1,0}, {0,16,0,0}, {16,16,16,0}, (c) }
 /* 10/10/10/2 packed into one word, and its BGRA spelling. GL puts alpha in the
  * top two bits either way; only r and b trade places. */
 #define GEX_CAPTURE_1010102(c) \
@@ -11352,6 +11414,19 @@ gex_wgpu_capture_pack_for(enum pipe_format format,
        * in a layout no bitfield describes. */
       { PIPE_FORMAT_R16G16_FLOAT,        GEX_CAPTURE_1616(GEX_CAPTURE_FLOAT16) },
       { PIPE_FORMAT_R16G16B16A16_FLOAT,  GEX_CAPTURE_16161616(GEX_CAPTURE_FLOAT16) },
+
+      /* The 16-bit scaled and three-component forms, fetched natively and
+       * converted in the vertex shader rather than translated by u_vbuf on
+       * the CPU at every draw (gex_wgpu_vertex_unpack_kind). */
+      { PIPE_FORMAT_R16G16_USCALED,       GEX_CAPTURE_1616(GEX_CAPTURE_USCALED) },
+      { PIPE_FORMAT_R16G16_SSCALED,       GEX_CAPTURE_1616(GEX_CAPTURE_SSCALED) },
+      { PIPE_FORMAT_R16G16B16A16_USCALED, GEX_CAPTURE_16161616(GEX_CAPTURE_USCALED) },
+      { PIPE_FORMAT_R16G16B16A16_SSCALED, GEX_CAPTURE_16161616(GEX_CAPTURE_SSCALED) },
+      { PIPE_FORMAT_R16G16B16_USCALED,    GEX_CAPTURE_161616(GEX_CAPTURE_USCALED) },
+      { PIPE_FORMAT_R16G16B16_SSCALED,    GEX_CAPTURE_161616(GEX_CAPTURE_SSCALED) },
+      { PIPE_FORMAT_R16G16B16_UNORM,      GEX_CAPTURE_161616(GEX_CAPTURE_UNORM) },
+      { PIPE_FORMAT_R16G16B16_SNORM,      GEX_CAPTURE_161616(GEX_CAPTURE_SNORM) },
+      { PIPE_FORMAT_R16G16B16_FLOAT,      GEX_CAPTURE_161616(GEX_CAPTURE_FLOAT16) },
       { PIPE_FORMAT_R11G11B10_FLOAT,     GEX_CAPTURE_PACKED3 },
    };
    for (unsigned i = 0; i < ARRAY_SIZE(table); ++i)
@@ -15795,7 +15870,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    /* Before the unproduced substitution, which would otherwise replace a
     * coord-replaced texcoord with the one-pixel constant and leave nothing
     * for this to find. */
-   if (getenv("GEX_WGPU_POINT_LOG") && point_coord_location != ~0u) {
+   if (GEX_GETENV_ONCE("GEX_WGPU_POINT_LOG") && point_coord_location != ~0u) {
       static unsigned told;
       if (told < 4) { ++told;
          fprintf(stderr, "gex-wgpu: fs variant sprite=0x%llx coord_loc=%u "
@@ -15854,7 +15929,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    if (want_line_stipple)
       gex_wgpu_lower_line_stipple(variant, line_edge_location,
                                   line_stipple_pattern, line_stipple_factor);
-   if (point_coord_location != ~0u && getenv("GEX_WGPU_POINT_NIR")) {
+   if (point_coord_location != ~0u && GEX_GETENV_ONCE("GEX_WGPU_POINT_NIR")) {
       static unsigned told;
       if (told < 6) { ++told;
          fprintf(stderr, "==== gex wide-point FS variant %u\n", told);
@@ -16911,6 +16986,35 @@ gex_wgpu_vertex_format(enum pipe_format format, unsigned *size,
       *size = 4; *alignment = 2; return WGPUVertexFormat_Sint16x2;
    case PIPE_FORMAT_R16G16B16A16_SINT:
       *size = 8; *alignment = 2; return WGPUVertexFormat_Sint16x4;
+   /* 16-bit SCALED: integers read as floats, which WebGPU has no vertex format
+    * for. Declined, u_vbuf converted them on the CPU at every draw and
+    * re-uploaded the result -- Sodium's compact chunk vertices (positions
+    * R16G16B16_USCALED, light coordinates R16G16_USCALED) put a third of the
+    * render thread there, and a frame of terrain at 1 fps. Fetched as the
+    * integers they are and converted in the vertex shader instead
+    * (GEX_WGPU_UNPACK_U16 / _S16). */
+   case PIPE_FORMAT_R16G16_USCALED:
+      *size = 4; *alignment = 2; return WGPUVertexFormat_Uint16x2;
+   case PIPE_FORMAT_R16G16B16A16_USCALED:
+      *size = 8; *alignment = 2; return WGPUVertexFormat_Uint16x4;
+   case PIPE_FORMAT_R16G16_SSCALED:
+      *size = 4; *alignment = 2; return WGPUVertexFormat_Sint16x2;
+   case PIPE_FORMAT_R16G16B16A16_SSCALED:
+      *size = 8; *alignment = 2; return WGPUVertexFormat_Sint16x4;
+   /* Three 16-bit components, which WebGPU has no format for at any type:
+    * fetched FOUR wide -- two bytes past the attribute, so the element has to
+    * leave room for them inside its stride (checked at element creation) --
+    * and the shader replaces w with GL's 1 (GEX_WGPU_UNPACK_XYZ). */
+   case PIPE_FORMAT_R16G16B16_USCALED:
+      *size = 8; *alignment = 2; return WGPUVertexFormat_Uint16x4;
+   case PIPE_FORMAT_R16G16B16_SSCALED:
+      *size = 8; *alignment = 2; return WGPUVertexFormat_Sint16x4;
+   case PIPE_FORMAT_R16G16B16_UNORM:
+      *size = 8; *alignment = 2; return WGPUVertexFormat_Unorm16x4;
+   case PIPE_FORMAT_R16G16B16_SNORM:
+      *size = 8; *alignment = 2; return WGPUVertexFormat_Snorm16x4;
+   case PIPE_FORMAT_R16G16B16_FLOAT:
+      *size = 8; *alignment = 2; return WGPUVertexFormat_Float16x4;
    case PIPE_FORMAT_R8G8_UNORM:
       *size = 2; *alignment = 1; return WGPUVertexFormat_Unorm8x2;
    case PIPE_FORMAT_R8G8B8A8_UNORM:
@@ -16980,8 +17084,19 @@ enum {
    GEX_WGPU_UNPACK_R11G11B10F,
    GEX_WGPU_UNPACK_SINT_BITS,
    GEX_WGPU_UNPACK_UINT_BITS,
+   /* 16-bit USCALED / SSCALED, fetched as Uint16xN / Sint16xN: the shader
+    * input becomes an integer vector and is converted to float. */
+   GEX_WGPU_UNPACK_U16,
+   GEX_WGPU_UNPACK_S16,
+   /* A three-component 16-bit unorm, snorm or half format fetched four wide:
+    * the value is right, only w has to become 1. */
+   GEX_WGPU_UNPACK_W1,
    GEX_WGPU_UNPACK_KIND_MASK = 0x0f,
    GEX_WGPU_UNPACK_BGR = 0x10,
+   /* The format has three components and is fetched as four: w := 1. */
+   GEX_WGPU_UNPACK_XYZ = 0x20,
+   /* The fetch is two components wide (x, y); z and w are GL's 0 and 1. */
+   GEX_WGPU_UNPACK_PAIR = 0x40,
 };
 
 static uint8_t
@@ -17002,6 +17117,20 @@ gex_wgpu_vertex_unpack_kind(enum pipe_format format)
    case PIPE_FORMAT_B10G10R10A2_SSCALED:
       return GEX_WGPU_UNPACK_SSCALED | GEX_WGPU_UNPACK_BGR;
    case PIPE_FORMAT_R11G11B10_FLOAT:     return GEX_WGPU_UNPACK_R11G11B10F;
+   case PIPE_FORMAT_R16G16_USCALED:
+      return GEX_WGPU_UNPACK_U16 | GEX_WGPU_UNPACK_PAIR;
+   case PIPE_FORMAT_R16G16_SSCALED:
+      return GEX_WGPU_UNPACK_S16 | GEX_WGPU_UNPACK_PAIR;
+   case PIPE_FORMAT_R16G16B16A16_USCALED: return GEX_WGPU_UNPACK_U16;
+   case PIPE_FORMAT_R16G16B16A16_SSCALED: return GEX_WGPU_UNPACK_S16;
+   case PIPE_FORMAT_R16G16B16_USCALED:
+      return GEX_WGPU_UNPACK_U16 | GEX_WGPU_UNPACK_XYZ;
+   case PIPE_FORMAT_R16G16B16_SSCALED:
+      return GEX_WGPU_UNPACK_S16 | GEX_WGPU_UNPACK_XYZ;
+   case PIPE_FORMAT_R16G16B16_UNORM:
+   case PIPE_FORMAT_R16G16B16_SNORM:
+   case PIPE_FORMAT_R16G16B16_FLOAT:
+      return GEX_WGPU_UNPACK_W1 | GEX_WGPU_UNPACK_XYZ;
    default:                              return GEX_WGPU_UNPACK_NONE;
    }
 }
@@ -17206,6 +17335,7 @@ gex_wgpu_lower_vertex_attrib_unpack(nir_shader *nir, const uint8_t *kinds)
       const unsigned element = var->data.driver_location;
       if (element < GEX_WGPU_MAX_VERTEX_ELEMENTS && kinds[element]) {
          const unsigned kind = kinds[element] & GEX_WGPU_UNPACK_KIND_MASK;
+         const unsigned n = (kinds[element] & GEX_WGPU_UNPACK_PAIR) ? 2 : 4;
          if (kind == GEX_WGPU_UNPACK_SINT_BITS ||
              kind == GEX_WGPU_UNPACK_UINT_BITS) {
             /* An integer array feeding a float input has undefined values
@@ -17214,6 +17344,12 @@ gex_wgpu_lower_vertex_attrib_unpack(nir_shader *nir, const uint8_t *kinds)
             var->type = glsl_vector_type(
                kind == GEX_WGPU_UNPACK_SINT_BITS ? GLSL_TYPE_INT : GLSL_TYPE_UINT,
                glsl_get_vector_elements(var->type));
+         } else if (kind == GEX_WGPU_UNPACK_U16) {
+            var->type = glsl_vector_type(GLSL_TYPE_UINT, n);
+         } else if (kind == GEX_WGPU_UNPACK_S16) {
+            var->type = glsl_vector_type(GLSL_TYPE_INT, n);
+         } else if (kind == GEX_WGPU_UNPACK_W1) {
+            var->type = glsl_vec4_type();
          } else {
             var->type = glsl_uint_type();
          }
@@ -17263,6 +17399,38 @@ gex_wgpu_lower_vertex_attrib_unpack(nir_shader *nir, const uint8_t *kinds)
          const bool bgr = (kinds[element] & GEX_WGPU_UNPACK_BGR) != 0;
          const bool is_signed = kind == GEX_WGPU_UNPACK_SNORM ||
                                 kind == GEX_WGPU_UNPACK_SSCALED;
+
+         /* The natively fetched forms: the load is the value, or the integers
+          * that become it; only the missing components are GL's fill. */
+         if (kind == GEX_WGPU_UNPACK_U16 || kind == GEX_WGPU_UNPACK_S16 ||
+             kind == GEX_WGPU_UNPACK_W1) {
+            const unsigned fetched =
+               (kinds[element] & GEX_WGPU_UNPACK_PAIR) ? 2 : 4;
+            load->num_components = fetched;
+            load->def.num_components = fetched;
+            load->def.bit_size = 32;
+            b.cursor = nir_after_instr(instr);
+            nir_def *v = &load->def;
+            if (kind == GEX_WGPU_UNPACK_U16)
+               v = nir_u2f32(&b, v);
+            else if (kind == GEX_WGPU_UNPACK_S16)
+               v = nir_i2f32(&b, v);
+            nir_def *one = nir_imm_float(&b, 1.0f);
+            nir_def *value;
+            if (fetched == 2)
+               value = nir_vec4(&b, nir_channel(&b, v, 0), nir_channel(&b, v, 1),
+                                nir_imm_float(&b, 0.0f), one);
+            else if (kinds[element] & GEX_WGPU_UNPACK_XYZ)
+               value = nir_vec4(&b, nir_channel(&b, v, 0), nir_channel(&b, v, 1),
+                                nir_channel(&b, v, 2), one);
+            else
+               value = v;
+            if (wanted != 4)
+               value = nir_trim_vector(&b, value, wanted);
+            nir_def_rewrite_uses_after(&load->def, value);
+            progress = true;
+            continue;
+         }
 
          load->num_components = 1;
          load->def.num_components = 1;
@@ -17469,6 +17637,17 @@ gex_wgpu_create_vertex_elements_state(struct pipe_context *pipe,
          state->unpack[i] =
             gex_wgpu_vertex_unpack_kind(elements[i].src_format);
          state->any_unpack |= state->unpack[i] != GEX_WGPU_UNPACK_NONE;
+         const uint8_t kind = state->unpack[i] & GEX_WGPU_UNPACK_KIND_MASK;
+         if (kind == GEX_WGPU_UNPACK_U16 || kind == GEX_WGPU_UNPACK_S16 ||
+             kind == GEX_WGPU_UNPACK_W1) {
+            static bool said;
+            if (!said) {
+               said = true;
+               fprintf(stderr, "gex-wgpu: vertex format %s fetched natively, "
+                       "converted in the shader\n",
+                       util_format_short_name(elements[i].src_format));
+            }
+         }
       }
    }
    if (unlikely(getenv("GEX_WGPU_VS_STATE_LOG") != NULL)) {
@@ -19140,7 +19319,7 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
     * So the cheap route is ruled out by measurement rather than by argument,
     * which is the reason to keep this knob: the next person to have the same
     * idea can check in one run instead of reasoning about it. */
-   if (templ && getenv("GEX_WGPU_IMGFMT_LOG") &&
+   if (templ && GEX_GETENV_ONCE("GEX_WGPU_IMGFMT_LOG") &&
        gex_wgpu_storage_texture_format(templ->format) ==
           WGPUTextureFormat_Undefined &&
        !util_format_is_depth_or_stencil(templ->format) &&
@@ -19717,7 +19896,7 @@ gex_wgpu_log_upload(const char *via, unsigned width0, uint32_t offset,
     * or a single frame's worth never covers it -- which is how it went
     * unexamined while everything around it was compared. */
    {
-      const char *big = getenv("GEX_WGPU_UPLOAD_BIG");
+      const char *big = GEX_GETENV_ONCE("GEX_WGPU_UPLOAD_BIG");
       if (big && width0 >= (unsigned)atoi(big)) {
          static unsigned bigseq;
          uint32_t h = 2166136261u;
@@ -19727,7 +19906,7 @@ gex_wgpu_log_upload(const char *via, unsigned width0, uint32_t offset,
                  bigseq++, via, width0, offset, (unsigned)size, h);
       }
    }
-   const char *want = getenv("GEX_WGPU_UPLOAD_LOG");
+   const char *want = GEX_GETENV_ONCE("GEX_WGPU_UPLOAD_LOG");
    if (!want && !gex_wgpu_cmd_logging())
       return;
    if (!want) {
@@ -19874,6 +20053,37 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
    static int ubo_shadow = -1;
    if (ubo_shadow < 0)
       ubo_shadow = getenv("GEX_WGPU_UBO_SHADOW") ? 1 : 0;
+   /* GEX_WGPU_ADOPT_SHADOW (default on; "0" for the old behaviour): a write
+    * that decides every byte of a buffer -- all of it, or its first write,
+    * before which it holds zeros -- leaves a shadow taken from the data, for
+    * the buffers the driver reads on the CPU itself: indirect commands
+    * (util_draw_indirect_read) and, since an application may fill those
+    * through another binding, any buffer of 16 KiB or less. Without one, the
+    * first CPU read is a GPU readback -- a submit and a wait for the GPU --
+    * and a buffer re-specified at a new size is a new resource with no
+    * shadow: Sodium re-specifies its indirect commands before every
+    * glMultiDrawArraysIndirect, so every one of those draws waited for the
+    * GPU first (R477). Narrow on purpose: a shadow is wasm heap the
+    * application does not get, so index and vertex buffers stay without. */
+   static int adopt = -1;
+   if (adopt < 0) {
+      const char *v = getenv("GEX_WGPU_ADOPT_SHADOW");
+      adopt = !(v && *v == '0');
+   }
+   if (adopt && size && !gex->shadow && data && !(usage & PIPE_MAP_READ) &&
+       resource->target == PIPE_BUFFER && gex->buffer &&
+       (uint64_t)offset + size <= resource->width0 &&
+       ((offset == 0 && size == resource->width0) ||
+        (!gex->bytes_written && !gex->gpu_written)) &&
+       ((resource->bind & PIPE_BIND_COMMAND_ARGS_BUFFER) ||
+        resource->width0 <= 16384) &&
+       gex_wgpu_shadow_ensure(gex)) {
+      /* Falls through to the shadowed path below, which copies the data in
+       * and uploads from the shadow. */
+      if (!gex_wgpu_shadow_cause_adopted++)
+         fprintf(stderr, "gex-wgpu: buffers written whole keep a shadow of "
+                         "the write (GEX_WGPU_ADOPT_SHADOW)\n");
+   }
    /* A write to the end of the buffer whose size is not whole words -- an
     * odd number of 16-bit indices, from glBufferData itself -- is whole
     * words too, its last one padded with zeros: past width0 the bytes are
@@ -22833,7 +23043,7 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
     * copy for anything to inspect afterwards. */
    static int no_staged = -1;
    if (no_staged < 0)
-      no_staged = getenv("GEX_WGPU_NO_STAGED_MAP") ? 1 : 0;
+      no_staged = GEX_GETENV_ONCE("GEX_WGPU_NO_STAGED_MAP") ? 1 : 0;
    /* The staged block starts out zeroed and the whole mapped range is
     * uploaded out of it at unmap, so this path is only correct when the
     * caller has undertaken to write every byte of that range -- which in
@@ -22886,7 +23096,7 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
          return NULL;
       }
       transfer->staged_write = true;
-      if (getenv("GEX_WGPU_MAP_FLAGS")) {
+      if (GEX_GETENV_ONCE("GEX_WGPU_MAP_FLAGS")) {
          /* Which usage flags actually reach this path, once per distinct
           * combination. Reasoning about Gallium's map contract from the
           * outside is how two wrong fixes got written; this says what the
@@ -23096,7 +23306,7 @@ gex_wgpu_buffer_unmap(struct pipe_context *pipe,
     * range again here would be redundant, and for an unsynchronized map it
     * would also write back bytes another map may since have changed.
     */
-   if (getenv("GEX_WGPU_MAP_FLAGS") && gex_transfer->staged_write &&
+   if (GEX_GETENV_ONCE("GEX_WGPU_MAP_FLAGS") && gex_transfer->staged_write &&
        gex_transfer->data && transfer->box.width > 0) {
       /* How much of the block the caller actually wrote. The staged path
        * uploads the whole mapped range out of a zeroed block, so anything it
@@ -23227,7 +23437,7 @@ gex_wgpu_texture_unmap(struct pipe_context *pipe,
                        struct pipe_transfer *transfer)
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
-   if (getenv("GEX_WGPU_MAPBOX_LOG"))
+   if (GEX_GETENV_ONCE("GEX_WGPU_MAPBOX_LOG"))
       fprintf(stderr, "gex-mapbox: unmap usage=0x%x target=%d level=%u "
               "box=%d,%d,%d %dx%dx%d stride=%u layer_stride=%llu data=%p\n",
               transfer->usage, (int)transfer->resource->target,
@@ -26638,7 +26848,7 @@ gex_wgpu_render_cond_passes(struct gex_wgpu_context *ctx)
    /* The convention is easy to get backwards and the symptom is every
     * conditional draw inverted, which looks like an application bug.
     * GEX_WGPU_CONDRENDER_LOG=1. */
-   if (getenv("GEX_WGPU_CONDRENDER_LOG"))
+   if (GEX_GETENV_ONCE("GEX_WGPU_CONDRENDER_LOG"))
       fprintf(stderr,
               "gex-wgpu: render condition type=%u u64=%llu b=%d nonzero=%d "
               "inverted=%d -> %s\n", query->type,
@@ -28650,7 +28860,7 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
       nir_shader_intrinsics_pass(nir, gex_wgpu_lower_draw_params,
                                  nir_metadata_control_flow, &draw_params);
    }
-   if (getenv("GEX_WGPU_XFB_DEBUG")) {
+   if (GEX_GETENV_ONCE("GEX_WGPU_XFB_DEBUG")) {
       const nir_xfb_info *dbg = nir->xfb_info;
       fprintf(stderr, "gex-xfb: so_mask=0x%x failed=%d outputs=%u written=0x%x\n",
               state.so_mask, (int)state.failed,
@@ -28781,7 +28991,7 @@ gex_wgpu_capture_variant_get(struct gex_wgpu_context *ctx,
     * are actually there. "view=1 samp=0" is the state that hides a refused
     * sampler: the lowering reads a missing sampler as texelFetch-only and
     * leaves a sampled image behind for Tint to reject. */
-   if (getenv("GEX_WGPU_CAPTEX_LOG")) {
+   if (GEX_GETENV_ONCE("GEX_WGPU_CAPTEX_LOG")) {
       fprintf(stderr, "gex-captex: int_sampled=0x%04x tex=%u:",
               vs->integer_sampled_slots, variant->textures.count);
       for (unsigned i = 0; i < variant->textures.count; ++i) {
@@ -29061,7 +29271,7 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
          return v;
    }
    if (!kept) {
-      if (getenv("GEX_WGPU_UNFILLED_LOG"))
+      if (GEX_GETENV_ONCE("GEX_WGPU_UNFILLED_LOG"))
          fprintf(stderr, "gex-wgpu: capture variant: no varying_nir kept\n");
       return NULL;
    }
@@ -29075,7 +29285,7 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
       nir = nir_deserialize(NULL, vs->varying_nir_options, &reader);
    }
    if (!nir) {
-      if (getenv("GEX_WGPU_UNFILLED_LOG"))
+      if (GEX_GETENV_ONCE("GEX_WGPU_UNFILLED_LOG"))
          fprintf(stderr, "gex-wgpu: capture variant: clone failed\n");
       return NULL;
    }
@@ -29129,7 +29339,7 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
       !state.failed &&
       gex_wgpu_emit_varying_stores(nir, &state, gex_wgpu_capture_slot_of);
    if (!stores_ok) {
-      if (getenv("GEX_WGPU_UNFILLED_LOG"))
+      if (GEX_GETENV_ONCE("GEX_WGPU_UNFILLED_LOG"))
          fprintf(stderr, "gex-wgpu: capture variant failed (%s) slots=%u\n",
                  state.failed ? "input lowering" : "varying stores",
                  varyings->count);
@@ -30523,7 +30733,7 @@ gex_wgpu_flat_replay_get(struct gex_wgpu_context *ctx,
    const unsigned needed = lerp
       ? 2 * n - util_bitcount(flat_mask & BITFIELD_MASK(n)) + 1 : n;
    if (!n || needed > GEX_WGPU_MAX_VERTEX_ELEMENTS) {
-      if (getenv("GEX_WGPU_UNFILLED_LOG"))
+      if (GEX_GETENV_ONCE("GEX_WGPU_UNFILLED_LOG"))
          fprintf(stderr, "gex-wgpu: replay layout too wide (n=%u needed=%u "
                  "lerp=%d)\n", n, needed, (int)lerp);
       return NULL;
@@ -30545,7 +30755,7 @@ gex_wgpu_flat_replay_get(struct gex_wgpu_context *ctx,
    replay->shader = state.ir.nir
       ? gex_wgpu_create_shader_state(&ctx->base, &state, MESA_SHADER_VERTEX)
       : NULL;
-   if (!replay->shader && getenv("GEX_WGPU_UNFILLED_LOG"))
+   if (!replay->shader && GEX_GETENV_ONCE("GEX_WGPU_UNFILLED_LOG"))
       fprintf(stderr, "gex-wgpu: replay shader rejected (lerp=%d n=%u "
               "mask=0x%x): %s\n", (int)lerp, n, flat_mask,
               state.error_message ? state.error_message : "no message");
@@ -30595,7 +30805,7 @@ gex_wgpu_flat_replay_get(struct gex_wgpu_context *ctx,
    replay->next = ctx->flat_replays;
    ctx->flat_replays = replay;
    if ((!replay->shader || !replay->elements) &&
-       getenv("GEX_WGPU_UNFILLED_LOG"))
+       GEX_GETENV_ONCE("GEX_WGPU_UNFILLED_LOG"))
       fprintf(stderr, "gex-wgpu: replay incomplete (shader=%d elements=%d "
               "lerp=%d n=%u at=%u)\n", replay->shader ? 1 : 0,
               replay->elements ? 1 : 0, (int)lerp, n, at);
@@ -33655,7 +33865,7 @@ gex_wgpu_bind_textures_from(struct pipe_context *pipe,
       struct gex_wgpu_sampler_view *view =
          (struct gex_wgpu_sampler_view *)views[slot];
       if (!view || group->count + 2 > GEX_WGPU_MAX_GROUP_BINDINGS) {
-         if (getenv("GEX_WGPU_STAGE_TEXTURE_LOG"))
+         if (GEX_GETENV_ONCE("GEX_WGPU_STAGE_TEXTURE_LOG"))
             fprintf(stderr, "gex-wgpu: stage texture %u %s\n",
                     slot, view ? "has no room in the group"
                                : "has no view bound");
@@ -33715,7 +33925,7 @@ gex_wgpu_bind_textures_from(struct pipe_context *pipe,
                ? sampler->nonfiltering : sampler->sampler)
          : NULL;
       if (!group->sampler[at]) {
-         if (getenv("GEX_WGPU_STAGE_TEXTURE_LOG"))
+         if (GEX_GETENV_ONCE("GEX_WGPU_STAGE_TEXTURE_LOG"))
             fprintf(stderr, "gex-wgpu: stage sampler %u has no state\n", slot);
          return false;
       }
@@ -33731,7 +33941,7 @@ gex_wgpu_bind_textures_from(struct pipe_context *pipe,
       const unsigned slot = textures->buftex_slots[i];
       const struct pipe_sampler_view *bufview = views[slot];
       if (group->count >= GEX_WGPU_MAX_GROUP_BINDINGS) {
-         if (getenv("GEX_WGPU_STAGE_TEXTURE_LOG"))
+         if (GEX_GETENV_ONCE("GEX_WGPU_STAGE_TEXTURE_LOG"))
             fprintf(stderr, "gex-wgpu: stage texture buffer %u has no room in "
                     "the group\n", slot);
          return false;
@@ -34959,7 +35169,7 @@ gex_wgpu_gather_indexed_vertices(struct gex_wgpu_context *ctx,
    uint32_t *indices = gex_wgpu_read_indices(pipe, info, draw, count);
    if (!indices)
       return false;
-   if (getenv("GEX_WGPU_POINT_LOG")) {
+   if (GEX_GETENV_ONCE("GEX_WGPU_POINT_LOG")) {
       static unsigned told;
       if (told < 8) { ++told;
          fprintf(stderr, "gex-wgpu: gather n=%u start=%u bias=%d user=%d "
@@ -35022,7 +35232,7 @@ gex_wgpu_gather_indexed_vertices(struct gex_wgpu_context *ctx,
            gex_wgpu_dispatch(ctx, "point gather (vertices)", module,
                              &group0, &group1, NULL,
                              DIV_ROUND_UP(total, GEX_WGPU_GATHER_GROUP));
-      if (getenv("GEX_WGPU_POINT_LOG")) {
+      if (GEX_GETENV_ONCE("GEX_WGPU_POINT_LOG")) {
          static unsigned told;
          if (told < 6) { ++told;
             fprintf(stderr, "gex-wgpu: gather buf%u stride=%u dwords=%u "
@@ -35075,7 +35285,7 @@ gex_wgpu_gather_indexed_vertices(struct gex_wgpu_context *ctx,
          pipe_resource_reference(&param_buffer, NULL);
          if (ok)
             ctx->point_records_gathered = true;
-         if (getenv("GEX_WGPU_POINT_LOG"))
+         if (GEX_GETENV_ONCE("GEX_WGPU_POINT_LOG"))
             fprintf(stderr, "gex-wgpu: gather records stride=%u count=%u "
                     "ok=%d\n", stride, count, (int)ok);
       }
@@ -35293,7 +35503,7 @@ gex_wgpu_deindex_for_primitive_id(struct gex_wgpu_context *ctx,
    struct pipe_draw_start_count_bias flat_draw = listed_draw;
    flat_draw.start = 0;
    flat_draw.count = out_nr;
-   if (getenv("GEX_WGPU_PID_LOG")) {
+   if (GEX_GETENV_ONCE("GEX_WGPU_PID_LOG")) {
       fprintf(stderr, "gex-wgpu: primitive-id de-index mode=%u->%u count=%u"
               "->%u mask=0x%x isz=%u idx=", (unsigned)info->mode,
               (unsigned)out_prim, count, out_nr, ctx->point_gather_mask,
@@ -35389,7 +35599,7 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
          edge_location = ~0u;
    }
    const bool perpendicular = smooth && edge_location != ~0u;
-   if (getenv("GEX_WGPU_LINE_LOG")) {
+   if (GEX_GETENV_ONCE("GEX_WGPU_LINE_LOG")) {
       static unsigned told;
       if (told < 8) { ++told;
          fprintf(stderr, "gex-wgpu: line segments=%u records=%u fs=%p "
@@ -35555,7 +35765,7 @@ gex_wgpu_line_draw(struct gex_wgpu_context *ctx,
    pipe_resource_reference(&slot_table, NULL);
    if (!ok)
       GEX_LINE_DECLINE("the capture pass did not run");
-   if (getenv("GEX_WGPU_LINE_LOG")) {
+   if (GEX_GETENV_ONCE("GEX_WGPU_LINE_LOG")) {
       static unsigned told;
       if (told < 4) { ++told;
          struct pipe_transfer *transfer = NULL;
@@ -37966,7 +38176,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
 
    const uint64_t fs_mask = fs ? fs->varying_interp_mask : 0;
    const uint64_t shared = vs->varying_interp_mask & fs_mask;
-   if (getenv("GEX_WGPU_INTERP_TRACE")) {
+   if (GEX_GETENV_ONCE("GEX_WGPU_INTERP_TRACE")) {
       static unsigned told;
       if (told < 8) {
          ++told;
@@ -38176,7 +38386,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
          }
       }
       if (wide && wide->coord_location != ~0u && pass == 0 &&
-          getenv("GEX_WGPU_POINT_NIR")) {
+          GEX_GETENV_ONCE("GEX_WGPU_POINT_NIR")) {
          static unsigned told;
          if (told < 6) { ++told;
             fprintf(stderr, "==== gex wide-point VS variant %u\n", told);
@@ -39552,7 +39762,7 @@ gex_wgpu_trace_buffer_aliasing(const char *where,
                                const WGPUBindGroupEntry *bindings,
                                unsigned count)
 {
-   const bool trace = getenv("GEX_WGPU_ALIAS_TRACE") != NULL;
+   const bool trace = GEX_GETENV_ONCE("GEX_WGPU_ALIAS_TRACE") != NULL;
    /* Two *writable* storage bindings over one range is the case with no
     * repair -- the read-only half of a mixed pair can be snapshotted, and is,
     * but neither half of this one can be. It has to be reported, because
@@ -40417,7 +40627,7 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
     * ownership to the caller, which is what `*cached = false` means. For
     * telling a cache bug apart from everything else: a fault that survives it
     * is not the cache's. */
-   if (getenv("GEX_WGPU_NO_PIPELINE_CACHE")) {
+   if (GEX_GETENV_ONCE("GEX_WGPU_NO_PIPELINE_CACHE")) {
       const WGPURenderPipeline fresh =
          wgpuDeviceCreateRenderPipeline(screen->device, desc);
       *cached = false;
@@ -41477,7 +41687,7 @@ gex_wgpu_cull_distance_filter(struct pipe_context *pipe,
 {
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    const struct gex_wgpu_shader *vs = ctx->vs;
-   if (getenv("GEX_WGPU_CULL_TRACE"))
+   if (GEX_GETENV_ONCE("GEX_WGPU_CULL_TRACE"))
       fprintf(stderr, "gex-cull: enter vs=%p cull=%u orig=%p mode=%u "
               "count=%u isz=%u inst=%u\n", (void *)vs,
               vs ? vs->cull_distances : 0u,
@@ -41558,13 +41768,13 @@ gex_wgpu_cull_distance_filter(struct pipe_context *pipe,
    if (!gex_wgpu_capture_positions(ctx, low, high - low + 1, &record,
                                    &edge_offset, &clip_offset) ||
        clip_offset == ~0u) {
-      if (getenv("GEX_WGPU_CULL_TRACE"))
+      if (GEX_GETENV_ONCE("GEX_WGPU_CULL_TRACE"))
          fprintf(stderr, "gex-cull: capture failed (clip_offset=%u)\n",
                  clip_offset);
       FREE(source);
       return false;
    }
-   if (getenv("GEX_WGPU_CULL_TRACE"))
+   if (GEX_GETENV_ONCE("GEX_WGPU_CULL_TRACE"))
       fprintf(stderr, "gex-cull: captured record=%u clip_offset=%u clip=%u "
               "cull=%u\n", record, clip_offset, clip, cull);
    const float *captured =
@@ -41603,7 +41813,7 @@ gex_wgpu_cull_distance_filter(struct pipe_context *pipe,
           * primitive whole. */
          culled = all_negative;
       }
-      if (getenv("GEX_WGPU_CULL_TRACE")) {
+      if (GEX_GETENV_ONCE("GEX_WGPU_CULL_TRACE")) {
          static unsigned told;
          if (told < 6) { ++told;
             fprintf(stderr, "gex-cull: prim %u culled=%d dists:", base / verts,
@@ -41984,7 +42194,7 @@ gex_wgpu_cull_polygons(struct pipe_context *pipe,
       const bool culled = usable && area != 0.0f &&
                           (front ? cull_face == PIPE_FACE_FRONT
                                  : cull_face == PIPE_FACE_BACK);
-      if (getenv("GEX_WGPU_UNFILLED_LOG")) {
+      if (GEX_GETENV_ONCE("GEX_WGPU_UNFILLED_LOG")) {
          static unsigned told;
          if (told < 8) { ++told;
             fprintf(stderr, "gex-wgpu: facing p=%u area=%.4f usable=%d "
@@ -42450,7 +42660,7 @@ gex_wgpu_atomic_replay_draw(struct pipe_context *pipe,
 #define GEX_REPLAY_DECLINE(why)                                               \
    do {                                                                       \
       static bool said;                                                       \
-      if (!said || getenv("GEX_WGPU_REPLAY_LOG")) {                           \
+      if (!said || GEX_GETENV_ONCE("GEX_WGPU_REPLAY_LOG")) {                           \
          said = true;                                                         \
          fprintf(stderr, "gex-wgpu: atomic-result replay declined (%s)\n",    \
                  (why));                                                      \
@@ -42664,7 +42874,7 @@ gex_wgpu_atomic_replay_draw(struct pipe_context *pipe,
    struct pipe_draw_start_count_bias raster_draw;
    memset(&raster_draw, 0, sizeof(raster_draw));
    raster_draw.count = count;
-   if (getenv("GEX_WGPU_REPLAY_LOG"))
+   if (GEX_GETENV_ONCE("GEX_WGPU_REPLAY_LOG"))
       fprintf(stderr, "gex-wgpu: atomic-result replay verts=%u record=%u "
               "slots=%u mode=%u\n", count, record, varyings.count,
               (unsigned)info->mode);
@@ -43060,7 +43270,7 @@ gex_wgpu_note_draw_drop(int line, bool handed_off)
    else
       ++gex_wgpu_draws_dropped;
    static int on = -1;
-   if (on < 0) on = getenv("GEX_WGPU_DRAW_DROP") ? 1 : 0;
+   if (on < 0) on = GEX_GETENV_ONCE("GEX_WGPU_DRAW_DROP") ? 1 : 0;
    if (on)
       fprintf(stderr, "gex-wgpu: draw %s at gex_wgpu_screen.c:%d\n",
               handed_off ? "handed off" : "dropped", line);
@@ -43074,6 +43284,329 @@ gex_wgpu_note_draw_drop(int line, bool handed_off)
     * 7.5% of correct runs trains its reader to ignore it, which costs more
     * than it saves. GEX_WGPU_DRAW_DROP=1 remains the way to see them. */
 }
+/* GEX_WGPU_QUAD_IB (default on; "0" for u_primconvert): a non-indexed
+ * GL_QUADS draw -- and every sub-draw of a glMultiDrawArrays of them -- becomes
+ * ONE indexed TRIANGLES draw against a cached index buffer, each sub-draw's first
+ * vertex as its base vertex, instead of u_primconvert generating six indices per
+ * quad into the stream uploader and issuing one draw per sub-draw, every frame.
+ * Minecraft 1.16 and Sodium draw nearly everything as non-indexed quads from
+ * glDrawArrays / glMultiDrawArrays (display lists are converted earlier, by
+ * vbo_save). The triangulation is u_primconvert's own for the current
+ * provoking-vertex convention -- (0,1,3),(1,2,3) last, (0,1,2),(0,2,3) first --
+ * so flat shading and the provoking-vertex rewrite see the same triangles, and
+ * gl_VertexID is first + i either way. */
+static bool
+gex_wgpu_quad_ib_enabled(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("GEX_WGPU_QUAD_IB");
+      on = !(v && *v == '0');
+   }
+   return on;
+}
+
+static struct pipe_resource *
+gex_wgpu_quad_ib(struct gex_wgpu_context *ctx, unsigned quads, bool first)
+{
+   const unsigned k = first ? 1 : 0;
+   if (ctx->quad_ib[k] && ctx->quad_ib_quads[k] >= quads)
+      return ctx->quad_ib[k];
+   unsigned n = MAX2(ctx->quad_ib_quads[k] * 2, 16384u);
+   while (n < quads)
+      n *= 2;
+   /* 2M quads = 48 MiB of indices; a bigger draw keeps u_primconvert */
+   if (n > (2u << 20))
+      return NULL;
+   uint32_t *idx = malloc((size_t)n * 6 * sizeof(uint32_t));
+   if (!idx)
+      return NULL;
+   for (unsigned q = 0; q < n; ++q) {
+      const uint32_t b = q * 4;
+      uint32_t *o = idx + (size_t)q * 6;
+      if (first) {
+         o[0] = b; o[1] = b + 1; o[2] = b + 2; o[3] = b; o[4] = b + 2; o[5] = b + 3;
+      } else {
+         o[0] = b; o[1] = b + 1; o[2] = b + 3; o[3] = b + 1; o[4] = b + 2; o[5] = b + 3;
+      }
+   }
+   struct pipe_resource *r = pipe_buffer_create_with_data(
+      &ctx->base, PIPE_BIND_INDEX_BUFFER, PIPE_USAGE_IMMUTABLE,
+      n * 6 * sizeof(uint32_t), idx);
+   free(idx);
+   if (!r)
+      return NULL;
+   pipe_resource_reference(&ctx->quad_ib[k], NULL);
+   ctx->quad_ib[k] = r;
+   ctx->quad_ib_quads[k] = n;
+   return r;
+}
+
+/* True when the draw was issued (or had nothing to draw). */
+static bool
+gex_wgpu_draw_quads_indexed(struct gex_wgpu_context *ctx,
+                            const struct pipe_draw_info *info,
+                            unsigned drawid_offset,
+                            const struct pipe_draw_start_count_bias *draws,
+                            unsigned num_draws)
+{
+   const struct gex_wgpu_rasterizer *rasterizer = ctx->rasterizer;
+   const bool first = rasterizer && rasterizer->flatshade_first;
+   unsigned maxq = 0;
+   for (unsigned i = 0; i < num_draws; ++i)
+      maxq = MAX2(maxq, draws[i].count / 4);
+   if (!maxq)
+      return true;
+   struct pipe_resource *ib = gex_wgpu_quad_ib(ctx, maxq, first);
+   if (!ib)
+      return false;
+   struct pipe_draw_start_count_bias stack[64];
+   struct pipe_draw_start_count_bias *nd =
+      num_draws <= ARRAY_SIZE(stack) ? stack : malloc(sizeof(*nd) * num_draws);
+   if (!nd)
+      return false;
+   for (unsigned i = 0; i < num_draws; ++i) {
+      nd[i].start = 0;
+      nd[i].count = (draws[i].count / 4) * 6;
+      nd[i].index_bias = (int)draws[i].start;
+   }
+   struct pipe_draw_info ni = *info;
+   ni.mode = MESA_PRIM_TRIANGLES;
+   ni.index_size = 4;
+   ni.has_user_indices = false;
+   ni.was_line_loop = false;
+   ni.index.resource = ib;
+   ni.index_bounds_valid = false;
+   ni.min_index = 0;
+   ni.max_index = ~0u;
+   ni.primitive_restart = false;
+   ni.index_bias_varies = num_draws > 1;
+   ctx->base.draw_vbo(&ctx->base, &ni, drawid_offset, NULL, nd, num_draws);
+   if (nd != stack)
+      free(nd);
+   return true;
+}
+
+/* GEX_WGPU_REPEAT (default on; "0" draws every command through the whole
+ * path): a multi-draw's commands share every piece of state, so once the first
+ * one's emit has bound the pipeline, bind groups and buffers, the rest differ
+ * only in what drawIndexed takes and in where the instance-stepped buffers
+ * start (the base instance is folded into their offsets). The caller arms
+ * ctx->repeat with the commands; the emit of the first takes them when nothing
+ * it built depends on the command (gex_wgpu_repeat_ok) and records the rest
+ * itself, setting ctx->repeat.taken. A caller whose first command was not
+ * taken -- a rewrite re-entered, a shader reads gl_DrawID, an uploaded index
+ * list -- issues the rest one at a time, as before. Sodium's terrain is one
+ * glMultiDrawArraysIndirect per region with a command per chunk section, and
+ * each command through the whole path was the bulk of R477's 60 M cycles a
+ * frame. */
+static bool
+gex_wgpu_repeat_enabled(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("GEX_WGPU_REPEAT");
+      on = !(v && *v == '0');
+   }
+   return on;
+}
+
+/* Commands recorded by a repeat rather than drawn through the whole path. */
+uint64_t gex_wgpu_repeat_cmds;
+
+static void
+gex_wgpu_repeat_arm(struct gex_wgpu_context *ctx,
+                    const struct gex_wgpu_repeat_cmd *cmds, unsigned count,
+                    struct pipe_resource *index)
+{
+   ctx->repeat.cmds = cmds;
+   ctx->repeat.count = count;
+   /* The emit happens inside the draw_vbo this caller is about to make, which
+    * is one level deeper than the caller. */
+   ctx->repeat.depth = ctx->draw_depth + 1;
+   ctx->repeat.index = index;
+   ctx->repeat.armed = count > 1 && gex_wgpu_repeat_enabled();
+   ctx->repeat.taken = false;
+}
+
+/* Disarms, and says whether the caller's first command took the rest. */
+static bool
+gex_wgpu_repeat_disarm(struct gex_wgpu_context *ctx)
+{
+   const bool taken = ctx->repeat.taken;
+   ctx->repeat.armed = false;
+   ctx->repeat.taken = false;
+   return taken;
+}
+
+/* At the emit of an indexed draw: whether it is the armed first command and
+ * nothing it bound depends on which command it is. Disarms either way, so a
+ * deeper draw a rewrite issues cannot take the commands either. What can
+ * differ between commands is count, instance count, first index, base vertex
+ * and base instance; everything that reads one of those beyond drawIndexed is
+ * excluded here -- the draw-parameters uniform, a de-indexing gather, an
+ * expanded instance divisor, an occlusion query's per-draw begin/end, a split
+ * by stencil face, a user vertex array (uploaded per draw range) -- and the
+ * base instance is re-folded into the instance-stepped offsets per command. */
+static bool
+gex_wgpu_repeat_ok(struct gex_wgpu_context *ctx,
+                   const struct pipe_draw_info *info,
+                   const struct pipe_draw_start_count_bias *draw,
+                   struct pipe_resource *index_resource, bool uploaded,
+                   unsigned first_index, bool draw_params, bool counting,
+                   unsigned vb_slot_count, const uint8_t *vb_buffer)
+{
+   if (!ctx->repeat.armed)
+      return false;
+   ctx->repeat.armed = false;
+   const struct gex_wgpu_repeat_cmd *c = &ctx->repeat.cmds[0];
+   if (ctx->draw_depth != ctx->repeat.depth ||
+       index_resource != ctx->repeat.index || uploaded ||
+       draw->count != c->index_count || first_index != c->first_index ||
+       draw->index_bias != c->base_vertex ||
+       info->instance_count != c->instance_count ||
+       info->start_instance != c->start_instance ||
+       draw_params || counting || ctx->point_expand.active ||
+       (ctx->point_gather_mask | ctx->deindex_gather_mask) ||
+       ctx->divisor_expansion_active || ctx->stencil_face)
+      return false;
+   for (unsigned slot = 0; slot < vb_slot_count; ++slot)
+      if (ctx->vertex_buffer_state[vb_buffer[slot]].is_user_buffer)
+         return false;
+   return true;
+}
+
+/* The armed commands after the first, recorded on the pass the first was. */
+static void
+gex_wgpu_repeat_emit(struct gex_wgpu_context *ctx, WGPURenderPassEncoder pass,
+                     unsigned vb_slot_count, const uint8_t *vb_buffer,
+                     const bool *vb_instanced, const uint32_t *vb_stride)
+{
+   for (unsigned k = 1; k < ctx->repeat.count; ++k) {
+      const struct gex_wgpu_repeat_cmd *c = &ctx->repeat.cmds[k];
+      for (unsigned slot = 0; slot < vb_slot_count; ++slot) {
+         if (!vb_instanced[slot])
+            continue;
+         const unsigned which = vb_buffer[slot];
+         struct pipe_resource *buffer = ctx->vertex_buffers[which];
+         uint32_t offset = ctx->vertex_buffer_offsets[which] +
+                           c->start_instance * vb_stride[slot];
+         /* Past the end reads zeros, as an out-of-range fetch does, rather
+          * than binding an offset WebGPU rejects with the whole pass. */
+         offset = MIN2(offset, buffer->width0);
+         WGPUBuffer handle = gex_resource(buffer)->buffer;
+         if (ctx->emitted.vertex[slot] == handle &&
+             ctx->emitted.vertex_offset[slot] == offset)
+            continue;
+         wgpuRenderPassEncoderSetVertexBuffer(pass, slot, handle, offset,
+                                              buffer->width0 - offset);
+         ctx->emitted.vertex[slot] = handle;
+         ctx->emitted.vertex_offset[slot] = offset;
+      }
+      ++gex_wgpu_draws_issued;
+      wgpuRenderPassEncoderDrawIndexed(pass, c->index_count, c->instance_count,
+                                       c->first_index, c->base_vertex, 0u);
+   }
+   gex_wgpu_repeat_cmds += ctx->repeat.count - 1;
+   ctx->repeat.taken = true;
+   static bool said;
+   if (!said) {
+      said = true;
+      fprintf(stderr, "gex-wgpu: multi-draw commands recorded as repeats of "
+                      "the first (GEX_WGPU_REPEAT)\n");
+   }
+}
+
+/* GL_QUADS from glMultiDrawArraysIndirect: the commands are read here, as
+ * util_draw_indirect would, and drawn against the quad index buffer, the first
+ * through the whole path and the rest as its repeats. u_primconvert took these
+ * before -- it reads the commands back too, then builds six indices per quad
+ * into the uploader and issues one whole draw per command. */
+static bool
+gex_wgpu_draw_quads_indirect(struct gex_wgpu_context *ctx,
+                             const struct pipe_draw_info *info,
+                             unsigned drawid_offset,
+                             const struct pipe_draw_indirect_info *indirect)
+{
+   unsigned n = 0;
+   struct u_indirect_params *cmds =
+      util_draw_indirect_read(&ctx->base, info, indirect, &n);
+   if (!cmds)
+      return n == 0;   /* no commands; a failed read goes to primconvert */
+   const struct gex_wgpu_rasterizer *rasterizer = ctx->rasterizer;
+   const bool first = rasterizer && rasterizer->flatshade_first;
+   unsigned maxq = 0;
+   for (unsigned i = 0; i < n; ++i)
+      maxq = MAX2(maxq, cmds[i].draw.count / 4);
+   struct pipe_resource *ib = maxq ? gex_wgpu_quad_ib(ctx, maxq, first) : NULL;
+   if (maxq && !ib) {
+      free(cmds);
+      return false;
+   }
+   /* The commands that draw anything, in order, and which command each was:
+    * an empty one is dropped here so that the first live one can carry the
+    * rest, and the index is its gl_DrawID. */
+   struct gex_wgpu_repeat_cmd stack_cmd[128];
+   unsigned stack_which[128];
+   struct gex_wgpu_repeat_cmd *rc =
+      n <= ARRAY_SIZE(stack_cmd) ? stack_cmd : malloc(sizeof(*rc) * n);
+   unsigned *which =
+      n <= ARRAY_SIZE(stack_which) ? stack_which : malloc(sizeof(*which) * n);
+   if (!rc || !which) {
+      if (rc != stack_cmd)
+         free(rc);
+      if (which != stack_which)
+         free(which);
+      free(cmds);
+      return false;
+   }
+   unsigned live = 0;
+   for (unsigned i = 0; i < n; ++i) {
+      const unsigned quads = cmds[i].draw.count / 4;
+      if (!quads || !cmds[i].info.instance_count)
+         continue;
+      rc[live].index_count = quads * 6;
+      rc[live].instance_count = cmds[i].info.instance_count;
+      rc[live].first_index = 0;
+      rc[live].base_vertex = (int32_t)cmds[i].draw.start;
+      rc[live].start_instance = cmds[i].info.start_instance;
+      which[live++] = i;
+   }
+   /* Each command owns its draw parameters, as a command util_draw_indirect
+    * reissues does; see own_draw_params. */
+   const unsigned saved_resolve_at = ctx->indirect_resolve_at;
+   ctx->indirect_resolve_at = ctx->draw_depth;
+   for (unsigned k = 0; k < live && !ctx->failed;) {
+      struct pipe_draw_info ni = cmds[which[k]].info;
+      ni.mode = MESA_PRIM_TRIANGLES;
+      ni.index_size = 4;
+      ni.has_user_indices = false;
+      ni.was_line_loop = false;
+      ni.index.resource = ib;
+      ni.index_bounds_valid = false;
+      ni.min_index = 0;
+      ni.max_index = ~0u;
+      ni.primitive_restart = false;
+      ni.index_bias_varies = false;
+      ni.increment_draw_id = false;
+      struct pipe_draw_start_count_bias d = {
+         .start = 0, .count = rc[k].index_count,
+         .index_bias = rc[k].base_vertex,
+      };
+      gex_wgpu_repeat_arm(ctx, rc + k, live - k, ib);
+      ctx->base.draw_vbo(&ctx->base, &ni, drawid_offset + which[k], NULL, &d,
+                         1);
+      k += gex_wgpu_repeat_disarm(ctx) ? live - k : 1;
+   }
+   ctx->indirect_resolve_at = saved_resolve_at;
+   if (rc != stack_cmd)
+      free(rc);
+   if (which != stack_which)
+      free(which);
+   free(cmds);
+   return true;
+}
+
 /* `gex_draws_at_entry` is a local of draw_vbo_inner, which is the only
  * function this macro is used in. */
 #define GEX_DRAW_DROP()                                                       \
@@ -43107,7 +43640,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * left to win down here. */
    static int gex_no_draw = -1;
    if (gex_no_draw < 0) {
-      const char *value = getenv("GEX_WGPU_NO_DRAW");
+      const char *value = GEX_GETENV_ONCE("GEX_WGPU_NO_DRAW");
       gex_no_draw = value && *value && *value != '0';
    }
    if (gex_no_draw) {
@@ -43195,7 +43728,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * measured against a run that needs it. */
    static int no_pv = -1;
    if (no_pv < 0)
-      no_pv = getenv("GEX_WGPU_NO_PROVOKING") ? 1 : 0;
+      no_pv = GEX_GETENV_ONCE("GEX_WGPU_NO_PROVOKING") ? 1 : 0;
    /* Points are excluded, and not only to save the work: a point primitive
     * has one vertex, so its first vertex *is* its provoking one and the
     * rewrite cannot change any flat varying's value. What it can do is turn a
@@ -43349,7 +43882,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * LINES or POINTS, which are not polygons, so it does not recurse. */
    static int no_unfilled = -1;
    if (no_unfilled < 0)
-      no_unfilled = getenv("GEX_WGPU_NO_UNFILLED") ? 1 : 0;
+      no_unfilled = GEX_GETENV_ONCE("GEX_WGPU_NO_UNFILLED") ? 1 : 0;
    /* Not a draw this driver built to *rasterize* a line.
     *
     * The wide, smooth and stippled line rewrite draws its segments as
@@ -43395,7 +43928,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           BITFIELD64_BIT(VARYING_SLOT_EDGE));
       static int no_facing = -1;
       if (no_facing < 0)
-         no_facing = getenv("GEX_WGPU_NO_FACING_CULL") ? 1 : 0;
+         no_facing = GEX_GETENV_ONCE("GEX_WGPU_NO_FACING_CULL") ? 1 : 0;
       /* A user clip plane needs the same pass, for a different reason: GL
        * clips a polygon *before* applying polygon mode, so the outline of a
        * cut polygon has an edge along the plane that this driver drew nowhere
@@ -43403,7 +43936,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * distances, which only the capture has. */
       static int no_clip = -1;
       if (no_clip < 0)
-         no_clip = getenv("GEX_WGPU_NO_POLYGON_CLIP") ? 1 : 0;
+         no_clip = GEX_GETENV_ONCE("GEX_WGPU_NO_POLYGON_CLIP") ? 1 : 0;
       const bool want_clip = !no_clip &&
          ctx->rasterizer->fill_mode == PIPE_POLYGON_MODE_LINE &&
          ctx->vs && ctx->vs->original_nir &&
@@ -43428,7 +43961,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                                 clip_edges.b, clip_edges.t,
                                                 clip_edges.flat,
                                                 clip_edges.count) &&
-                   getenv("GEX_WGPU_UNFILLED_LOG"))
+                   GEX_GETENV_ONCE("GEX_WGPU_UNFILLED_LOG"))
                   fprintf(stderr, "gex-wgpu: %u clipped outline vertices "
                           "went undrawn\n", clip_edges.count);
             }
@@ -43463,7 +43996,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
              * it picks up the wide, smooth and stippled line rewrites on the
              * way, which is where GL_LINE_SMOOTH on an unfilled polygon gets
              * honoured. */
-            if (getenv("GEX_WGPU_UNFILLED_LOG"))
+            if (GEX_GETENV_ONCE("GEX_WGPU_UNFILLED_LOG"))
                fprintf(stderr, "gex-wgpu: unfilled filtered mode=%u count=%u "
                        "(from mode=%u fill=%u cull=%u edges=%d)\n",
                        culled_mode, culled_count, info->mode,
@@ -43489,7 +44022,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             }
          }
       }
-      if (getenv("GEX_WGPU_UNFILLED_LOG"))
+      if (GEX_GETENV_ONCE("GEX_WGPU_UNFILLED_LOG"))
          fprintf(stderr, "gex-wgpu: unfilled mode=%u fill=%u cull=%u "
                  "want_edges=%d filtered=%s count=%u\n", info->mode,
                  ctx->rasterizer->fill_mode, ctx->rasterizer->cull_face,
@@ -43518,7 +44051,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * Only when there is something to gain: an ordinary one-pixel line is
     * what WebGPU draws anyway, and glPolygonMode's rewrite produces a great
     * many of those. */
-   if (getenv("GEX_WGPU_LINE_TRACE") && info && ctx->rasterizer &&
+   if (GEX_GETENV_ONCE("GEX_WGPU_LINE_TRACE") && info && ctx->rasterizer &&
        (info->mode == MESA_PRIM_LINES || info->mode == MESA_PRIM_LINE_STRIP ||
         info->mode == MESA_PRIM_LINE_LOOP)) {
       static unsigned told;
@@ -43578,6 +44111,20 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        gex_wgpu_deindex_for_primitive_id(ctx, info, drawid_offset, &draws[0]))
       GEX_DRAW_DROP();
 
+   if (!ctx->failed && info && draws && !indirect &&
+       info->mode == MESA_PRIM_QUADS && !info->index_size &&
+       !info->primitive_restart && !ctx->gs && !ctx->tcs && !ctx->tes &&
+       gex_wgpu_quad_ib_enabled() &&
+       gex_wgpu_draw_quads_indexed(ctx, info, drawid_offset, draws, num_draws))
+      GEX_DRAW_DROP();
+   if (!ctx->failed && info && indirect && indirect->buffer &&
+       !indirect->count_from_stream_output &&
+       info->mode == MESA_PRIM_QUADS && !info->index_size &&
+       !info->primitive_restart && !ctx->gs && !ctx->tcs && !ctx->tes &&
+       gex_wgpu_quad_ib_enabled() &&
+       gex_wgpu_draw_quads_indirect(ctx, info, drawid_offset, indirect))
+      GEX_DRAW_DROP();
+
    /* A topology WebGPU does not have is rewritten into one it does, which
     * comes straight back here as a supported mode -- but only for the
     * topologies u_index_translator actually converts. */
@@ -43610,7 +44157,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       else {
       const enum mesa_prim converted = u_index_prim_type_convert(
          GEX_WGPU_PRIM_MODES, info->mode, info->index_size != 0);
-      if (getenv("GEX_WGPU_PRIM_LOG")) {
+      if (GEX_GETENV_ONCE("GEX_WGPU_PRIM_LOG")) {
          static unsigned told;
          if (told < 6) { ++told;
             fprintf(stderr, "gex-wgpu: primconvert mode=%u -> %u\n",
@@ -43640,6 +44187,22 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * util_draw_vbo_without_prim_restart below re-issues a restarting draw as
     * however many restart-free ranges it found, so this is not a rare path. */
    if (info && draws && num_draws > 1) {
+      /* Sub-draws of an index buffer can be repeats of the first; see
+       * gex_wgpu_repeat_arm. */
+      struct gex_wgpu_repeat_cmd repeat_stack[64];
+      struct gex_wgpu_repeat_cmd *repeat_cmds = NULL;
+      if (info->index_size && !info->has_user_indices && !indirect &&
+          gex_wgpu_repeat_enabled()) {
+         repeat_cmds = num_draws <= ARRAY_SIZE(repeat_stack)
+            ? repeat_stack : malloc(sizeof(*repeat_cmds) * num_draws);
+         for (unsigned i = 0; repeat_cmds && i < num_draws; ++i) {
+            repeat_cmds[i].index_count = draws[i].count;
+            repeat_cmds[i].instance_count = info->instance_count;
+            repeat_cmds[i].first_index = draws[i].start;
+            repeat_cmds[i].base_vertex = draws[i].index_bias;
+            repeat_cmds[i].start_instance = info->start_instance;
+         }
+      }
       for (unsigned i = 0; i < num_draws && !ctx->failed; ++i) {
          /* A multi-draw may give each sub-draw its own basevertex. */
          if (info->index_bias_varies && info->index_size) {
@@ -43661,11 +44224,18 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           * unchanged gave every sub-draw of a glMultiDrawArrays the same
           * gl_DrawIDARB, which the probe reads as 1,1,1 where it should see
           * 1,2,3. */
+         if (repeat_cmds)
+            gex_wgpu_repeat_arm(ctx, repeat_cmds + i, num_draws - i,
+                                info->index.resource);
          gex_wgpu_draw_vbo(pipe, info,
                            info->increment_draw_id ? drawid_offset + i
                                                    : drawid_offset,
                            indirect, &draws[i], 1);
+         if (repeat_cmds && gex_wgpu_repeat_disarm(ctx))
+            break;
       }
+      if (repeat_cmds && repeat_cmds != repeat_stack)
+         free(repeat_cmds);
       GEX_DRAW_DROP();
    }
 
@@ -44355,7 +44925,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             }
          }
       }
-      if (getenv("GEX_WGPU_POINT_LOG")) {
+      if (GEX_GETENV_ONCE("GEX_WGPU_POINT_LOG")) {
          static unsigned told;
          if (told < 8) { ++told;
             fprintf(stderr, "gex-wgpu: points count=%u size=%.2f pv=%d "
@@ -44488,7 +45058,16 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * the second without the first, and this dereferenced NULL. The draw
        * reads its gathered buffer linearly, so `last_vertex` computed from
        * the draw's own start and count is exactly right for it. */
-      if (index_resource) {
+      /* The quad index buffer's highest index in a draw is known: it is
+       * (0,1,3),(1,2,3) or (0,1,2),(0,2,3) over consecutive quads, so this
+       * skips reading back every index of every Sodium draw. */
+      if (index_resource &&
+          (index_resource == ctx->quad_ib[0] ||
+           index_resource == ctx->quad_ib[1]) &&
+          !uploaded_index_resource && first_index == 0) {
+         last_vertex = draws[0].count >= 6
+            ? (uint64_t)(draws[0].count / 6) * 4 - 1 : 0;
+      } else if (index_resource) {
          last_vertex = 0;
          const uint8_t *shadow = gex_resource(index_resource)->shadow;
          if (!shadow) {
@@ -44693,7 +45272,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          max_depth = sorted_max;
          viewport_fold[4] = -1.0f;
          fold_viewport = true;
-         if (getenv("GEX_WGPU_DEPTH_LOG"))
+         if (GEX_GETENV_ONCE("GEX_WGPU_DEPTH_LOG"))
             fprintf(stderr, "gex-depth: inverted range folded, viewport now "
                     "%.3f..%.3f with clip z negated\n", min_depth, max_depth);
       }
@@ -45029,7 +45608,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           * dump. Cached rather than called per draw. */
          static int want_state = -1;
          if (want_state < 0)
-            want_state = getenv("GEX_WGPU_VS_STATE_LOG") ? 1 : 0;
+            want_state = GEX_GETENV_ONCE("GEX_WGPU_VS_STATE_LOG") ? 1 : 0;
          /* Once per distinct shader shape, not per draw: the first eight
           * draws of a frame are all the same two-attribute UI quad, and say
           * nothing about the geometry that matters. */
@@ -45515,7 +46094,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       words[GEX_WGPU_DRAW_PARAM_FIRST_VERTEX] = ctx->draw_first_vertex;
       words[GEX_WGPU_DRAW_PARAM_BASE_INSTANCE] = ctx->draw_base_instance;
       words[GEX_WGPU_DRAW_PARAM_DRAW_ID] = drawid_offset;
-      if (getenv("GEX_WGPU_DRAW_PARAMS_LOG"))
+      if (GEX_GETENV_ONCE("GEX_WGPU_DRAW_PARAMS_LOG"))
          fprintf(stderr, "gex-wgpu: draw params base_vertex=%u "
                  "base_instance=%u draw_id=%u first_vertex=%u "
                  "(index_size=%u bias=%d start=%u)\n",
@@ -45589,7 +46168,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    const bool static_constant_offsets =
       want_dynamic_uniform > dyn_screen->max_dynamic_uniform_buffers ||
       want_dynamic_storage > dyn_screen->max_dynamic_storage_buffers;
-   if (static_constant_offsets && getenv("GEX_WGPU_LIMIT_TRACE"))
+   if (static_constant_offsets && GEX_GETENV_ONCE("GEX_WGPU_LIMIT_TRACE"))
       fprintf(stderr, "gex-wgpu: baking constant offsets: want %u dynamic "
               "uniform (max %u), %u dynamic storage (max %u)\n",
               want_dynamic_uniform, dyn_screen->max_dynamic_uniform_buffers,
@@ -46482,15 +47061,27 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * is the question a validation message otherwise leaves open. Locals,
     * because WGPUStringView does not own its bytes and every create call
     * below copies during the call. */
-   char draw_label[72];
-   snprintf(draw_label, sizeof(draw_label), "draw %s/%s",
-            ctx->vs ? ctx->vs->name : "?", ctx->fs ? ctx->fs->name : "?");
-   char group_label[4][80];
-   for (unsigned g = 0; g < 4; ++g)
-      snprintf(group_label[g], sizeof(group_label[g]), "%s g%u",
-               draw_label, g);
-   char layout_label[80];
-   snprintf(layout_label, sizeof(layout_label), "%s layout", draw_label);
+   {
+      const char *vs_name = ctx->vs ? ctx->vs->name : "?";
+      const char *fs_name = ctx->fs ? ctx->fs->name : "?";
+      if (!ctx->label_valid ||
+          strncmp(ctx->label_vs, vs_name, sizeof(ctx->label_vs)) != 0 ||
+          strncmp(ctx->label_fs, fs_name, sizeof(ctx->label_fs)) != 0) {
+         strncpy(ctx->label_vs, vs_name, sizeof(ctx->label_vs));
+         strncpy(ctx->label_fs, fs_name, sizeof(ctx->label_fs));
+         snprintf(ctx->draw_label, sizeof(ctx->draw_label), "draw %s/%s",
+                  vs_name, fs_name);
+         for (unsigned g = 0; g < 4; ++g)
+            snprintf(ctx->group_label[g], sizeof(ctx->group_label[g]),
+                     "%s g%u", ctx->draw_label, g);
+         snprintf(ctx->layout_label, sizeof(ctx->layout_label), "%s layout",
+                  ctx->draw_label);
+         ctx->label_valid = true;
+      }
+   }
+   const char *draw_label = ctx->draw_label;
+   char (*group_label)[80] = ctx->group_label;
+   const char *layout_label = ctx->layout_label;
    for (unsigned group = 0; group < group_count; ++group) {
       WGPUBindGroupLayoutDescriptor desc =
          WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
@@ -47189,7 +47780,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             continue;
          }
          if (iv->format != iv->resource->format &&
-             getenv("GEX_WGPU_IMAGE_TRACE"))
+             GEX_GETENV_ONCE("GEX_WGPU_IMAGE_TRACE"))
             fprintf(stderr, "gex-imgview: fragment slot=%u image=%s "
                     "texture=%s stored=%s\n", slot,
                     util_format_short_name(iv->format),
@@ -47913,6 +48504,15 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                serial_fetch ? 1 : info->instance_count,
                first_index + (serial_fetch ? ordered_primitive * primitive_step : 0),
                draws[0].index_bias, serial_fetch ? ordered_instance : 0u);
+            /* Not per primitive: ordered framebuffer fetch draws one at a
+             * time and has nothing to repeat. */
+            if (!serial_fetch &&
+                gex_wgpu_repeat_ok(ctx, info, &draws[0], index_resource,
+                                   uploaded_index_resource != NULL, first_index,
+                                   draw_params_offset != ~0u, counting,
+                                   vb_slot_count, vb_buffer))
+               gex_wgpu_repeat_emit(ctx, pass, vb_slot_count, vb_buffer,
+                                    vb_instanced, vb_stride);
          } else {
             ++gex_wgpu_draws_issued;
             gex_wgpu_count_draw_vs(ctx->vs);
@@ -48141,7 +48741,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     */
    static int batch_limit = -1;
    if (batch_limit < 0) {
-      const char *want = getenv("GEX_WGPU_MAX_BATCH");
+      const char *want = GEX_GETENV_ONCE("GEX_WGPU_MAX_BATCH");
       batch_limit = want ? MAX2(1, atoi(want)) : GEX_WGPU_MAX_BATCHED_DRAWS;
    }
    ++gex_wgpu_draws_recorded;
@@ -48216,6 +48816,8 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
       util_blitter_destroy(ctx->blitter);
    if (ctx->primconvert)
       util_primconvert_destroy(ctx->primconvert);
+   pipe_resource_reference(&ctx->quad_ib[0], NULL);
+   pipe_resource_reference(&ctx->quad_ib[1], NULL);
    FREE(ctx->facing_pass);
    pipe_resource_reference(&ctx->facing_vs_out, NULL);
    util_copy_framebuffer_state(&ctx->framebuffer, NULL);
