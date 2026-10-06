@@ -26968,6 +26968,25 @@ gex_wgpu_copy_buffer_region(struct pipe_context *pipe,
          return false;
       gex_wgpu_queue_submit(screen, 1, &commands);
       wgpuCommandBufferRelease(commands);
+      /* A copy of CPU-authored bytes can keep a current CPU shadow. Sodium
+       * grows its vertex arenas with these copies, then Mesa translates
+       * their vertex layouts on the CPU. Invalidating a known shadow here
+       * makes every following translation wait for a GPU readback.
+       * Neither side may have GPU writes. Untouched destination bytes must
+       * already have a shadow or still be the device's initial zeroes;
+       * aligned CPU uploads may deliberately have no shadow at all.
+       * Otherwise the ordinary readback path below stays. */
+      if (!gex_src->gpu_written && !gex_dst->gpu_written &&
+          gex_src->shadow && (gex_dst->shadow || !gex_dst->bytes_written) &&
+          gex_wgpu_shadow_ensure(gex_dst)) {
+         memmove(gex_dst->shadow + dst_offset, gex_src->shadow + src_offset, size);
+         if (gex_dst->persistent_sent &&
+             dst_offset + size <= gex_dst->persistent_sent_size)
+            memcpy(gex_dst->persistent_sent + dst_offset,
+                   gex_dst->shadow + dst_offset, size);
+         gex_dst->bytes_written += size;
+         return true;
+      }
       /* The destination's shadow, if it has one, no longer mirrors it. A read
        * map of a gpu_written buffer skips the shadow and reads the device, so
        * this is the whole invalidation. */

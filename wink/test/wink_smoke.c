@@ -409,8 +409,8 @@ buffer_read_sources(void)
 {
    const uint32_t original[4] = {3, 11, 29, 47};
    uint32_t data[4] = {0};
-   GLuint buffers[2];
-   p_glGenBuffers(2, buffers);
+   GLuint buffers[3];
+   p_glGenBuffers(3, buffers);
    p_glBindBuffer(GL_COPY_READ_BUFFER, buffers[0]);
    p_glBufferData(GL_COPY_READ_BUFFER, sizeof(original), original, GL_STATIC_DRAW);
    p_glGetBufferSubData(GL_COPY_READ_BUFFER, 0, sizeof(data), data);
@@ -421,6 +421,20 @@ buffer_read_sources(void)
    p_glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, sizeof(data));
    p_glGetBufferSubData(GL_COPY_WRITE_BUFFER, 0, sizeof(data), data);
    CHECK(memcmp(data, original, sizeof(data)) == 0, "GPU-copied buffer read");
+   p_glBindBuffer(GL_COPY_READ_BUFFER, buffers[1]);
+   p_glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 12, 4);
+   p_glGetBufferSubData(GL_COPY_WRITE_BUFFER, 0, sizeof(data), data);
+   CHECK(data[0] == 3 && data[1] == 11 && data[2] == 29 && data[3] == 3,
+         "CPU-authored self-copy preserved other bytes");
+   p_glBindBuffer(GL_COPY_READ_BUFFER, buffers[0]);
+   p_glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, sizeof(data));
+   p_glBindBuffer(GL_COPY_WRITE_BUFFER, buffers[2]);
+   p_glBufferData(GL_COPY_WRITE_BUFFER, sizeof(data), original, GL_STATIC_DRAW);
+   p_glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 12, 4);
+   p_glGetBufferSubData(GL_COPY_WRITE_BUFFER, 0, sizeof(data), data);
+   CHECK(data[0] == 3 && data[1] == 11 && data[2] == 29 && data[3] == 3,
+         "partial copy preserved an unread destination");
+   p_glBindBuffer(GL_COPY_WRITE_BUFFER, buffers[1]);
 
    static const char *cs =
       "#version 430 core\n"
@@ -470,7 +484,7 @@ buffer_read_sources(void)
    p_glUseProgram(0);
    p_glDeleteProgram(prog);
    p_glDeleteShader(shader);
-   p_glDeleteBuffers(2, buffers);
+   p_glDeleteBuffers(3, buffers);
 }
 
 static void
