@@ -440,7 +440,11 @@ wvk_GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice physicalDevice, VkS
 
    const uint32_t max_dim = pdev->limits.maxTextureDimension2D;
    *pSurfaceCapabilities = (VkSurfaceCapabilitiesKHR){
-      .minImageCount = 2,
+      /* One is enough: acquiring never waits, and presenting copies the
+       * image into the canvas's texture, after which the queue has it for
+       * the next frame's rendering in order. An application that asks for
+       * one more than the least gets two, not three, of the screen's size. */
+      .minImageCount = 1,
       .maxImageCount = ARRAY_SIZE(((struct wvk_swapchain *)NULL)->images),
       .currentExtent = surface_current_extent(surface),
       .minImageExtent = { 1, 1 },
@@ -721,7 +725,7 @@ wvk_CreateSwapchainKHR(VkDevice _device, const VkSwapchainCreateInfoKHR *pCreate
       .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
    };
-   const uint32_t count = CLAMP(pCreateInfo->minImageCount, 2, ARRAY_SIZE(sc->images));
+   const uint32_t count = CLAMP(pCreateInfo->minImageCount, 1, ARRAY_SIZE(sc->images));
    for (uint32_t i = 0; i < count; ++i) {
       result = wvk_CreateImage(_device, &image_info, NULL, &sc->images[i]);
       if (result != VK_SUCCESS)
