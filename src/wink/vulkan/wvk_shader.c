@@ -6742,6 +6742,11 @@ struct wvk_variant_cache {
    struct hash_table *table; /* digest -> struct wvk_cached_variant */
    struct wvk_cached_variant entries[WVK_VARIANT_CACHE_SIZE];
    uint32_t next;
+   /* The bytes of the entries, held to `budget` (WINK_VK_VARIANT_CACHE_BYTES,
+    * 32 MiB): each is a shader's WGSL and, of a pipeline's, its source NIR,
+    * a hundred kilobytes and more, and a thousand of them were all wasm
+    * heap. The oldest go first, as they do at the thousandth. */
+   size_t bytes, budget;
 };
 
 static uint32_t
@@ -6763,6 +6768,8 @@ wvk_variant_cache_init(struct wvk_device *dev)
    if (!c)
       return;
    simple_mtx_init(&c->lock, mtx_plain);
+   const char *budget = getenv("WINK_VK_VARIANT_CACHE_BYTES");
+   c->budget = budget && *budget ? (size_t)strtoull(budget, NULL, 0) : (size_t)32 << 20;
    c->table = _mesa_hash_table_create(NULL, digest_hash, digest_equal);
    if (!c->table) {
       free(c);
@@ -6990,11 +6997,38 @@ source_deserialize(struct blob_reader *blob)
    return src;
 }
 
+/* A live shader of `id` more (delta 1) or fewer (-1), or neither (0).
+ * Returns how many are left. */
+static uint32_t
+shader_id_live(struct wvk_device *dev, uint64_t id, int delta)
+{
+   if (!dev->live_shader_ids || !id)
+      return 0;
+   simple_mtx_lock(&dev->cache_lock);
+   const uint32_t was = (uint32_t)(uintptr_t)_mesa_hash_table_u64_search(dev->live_shader_ids, id);
+   const uint32_t now = delta > 0 ? was + 1 : delta < 0 && was ? was - 1 : was;
+   if (now)
+      _mesa_hash_table_u64_insert(dev->live_shader_ids, id, (void *)(uintptr_t)now);
+   else
+      _mesa_hash_table_u64_remove(dev->live_shader_ids, id);
+   simple_mtx_unlock(&dev->cache_lock);
+   return now;
+}
+
+static bool variant_cache_has(struct wvk_device *dev, uint64_t id);
+
 static void
 wvk_shader_destroy(struct vk_device *vk_dev, struct vk_shader *vk_shader,
                    const VkAllocationCallbacks *pAllocator)
 {
    struct wvk_shader *shader = wvk_shader_from_vk(vk_shader);
+   struct wvk_device *dev = container_of(vk_dev, struct wvk_device, vk);
+   /* The last of its id, which no cached variant has either: its
+    * pipelines go too, each a WebGPU pipeline -- in a browser a JavaScript
+    * object and the GPU process's pipeline state -- for nothing to draw
+    * with again. */
+   if (!shader_id_live(dev, shader->id, -1) && !variant_cache_has(dev, shader->id))
+      wvk_device_prune_pipelines(dev, shader->id);
    for (uint32_t i = 0; i < ARRAY_SIZE(shader->cull_gs); ++i) {
       if (shader->cull_gs[i])
          wvk_shader_destroy(vk_dev, &shader->cull_gs[i]->vk, NULL);
@@ -7523,6 +7557,7 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
    shader->id = p_atomic_inc_return(&dev->next_shader_id);
+   shader_id_live(dev, shader->id, 1);
 
    void *mem_ctx = ralloc_context(NULL);
    struct lower_state state = {
@@ -8178,6 +8213,7 @@ geometry_shell(struct wvk_device *dev, struct vk_shader_compile_info *info, cons
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
    shader->id = p_atomic_inc_return(&dev->next_shader_id);
+   shader_id_live(dev, shader->id, 1);
    uint32_t meta_words = 0;
    for (uint32_t g = 0; g < 4; ++g) {
       shader->meta_base[g] = meta_words;
@@ -9136,7 +9172,10 @@ cached_variant(struct wvk_device *dev, const blake3_hash digest)
       struct vk_shader *out;
       if (wvk_shader_deserialize(&dev->vk, &reader, WVK_SHADER_BINARY_VERSION, NULL, &out) == VK_SUCCESS) {
          variant = wvk_shader_from_vk(out);
+         /* The cached one's id, whose pipelines it has: not its own. */
+         shader_id_live(dev, variant->id, -1);
          variant->id = e->id;
+         shader_id_live(dev, variant->id, 1);
       }
    }
    simple_mtx_unlock(&c->lock);
@@ -9159,22 +9198,61 @@ cache_variant(struct wvk_device *dev, const blake3_hash digest, const struct wvk
       blob_finish(&blob);
       return;
    }
+   /* What is evicted, pruned of pipelines after if no live shader has the
+    * id either (wvk_shader_destroy). */
+   uint64_t evicted[16];
+   uint32_t evicted_count = 0;
    simple_mtx_lock(&c->lock);
    if (!_mesa_hash_table_search(c->table, digest)) {
       struct wvk_cached_variant *e = &c->entries[c->next];
       c->next = (c->next + 1) % WVK_VARIANT_CACHE_SIZE;
       if (e->data) {
          _mesa_hash_table_remove_key(c->table, e->digest);
+         c->bytes -= e->size;
          free(e->data);
+         if (evicted_count < ARRAY_SIZE(evicted))
+            evicted[evicted_count++] = e->id;
       }
       memcpy(e->digest, digest, sizeof(e->digest));
       e->id = variant->id;
       blob_finish_get_buffer(&blob, &e->data, &e->size);
       _mesa_hash_table_insert(c->table, e->digest, e);
+      c->bytes += e->size;
+      /* The oldest, from the next to be overwritten on, while over. */
+      for (uint32_t i = 0; c->bytes > c->budget && i + 1 < WVK_VARIANT_CACHE_SIZE; ++i) {
+         struct wvk_cached_variant *old = &c->entries[(c->next + i) % WVK_VARIANT_CACHE_SIZE];
+         if (old == e || !old->data)
+            continue;
+         _mesa_hash_table_remove_key(c->table, old->digest);
+         c->bytes -= old->size;
+         free(old->data);
+         old->data = NULL;
+         old->size = 0;
+         if (evicted_count < ARRAY_SIZE(evicted))
+            evicted[evicted_count++] = old->id;
+      }
    } else {
       blob_finish(&blob);
    }
    simple_mtx_unlock(&c->lock);
+   for (uint32_t i = 0; i < evicted_count; ++i) {
+      if (!shader_id_live(dev, evicted[i], 0) && !variant_cache_has(dev, evicted[i]))
+         wvk_device_prune_pipelines(dev, evicted[i]);
+   }
+}
+
+static bool
+variant_cache_has(struct wvk_device *dev, uint64_t id)
+{
+   struct wvk_variant_cache *c = dev->variant_cache;
+   if (!c)
+      return false;
+   bool has = false;
+   simple_mtx_lock(&c->lock);
+   for (uint32_t i = 0; i < WVK_VARIANT_CACHE_SIZE && !has; ++i)
+      has = c->entries[i].data && c->entries[i].id == id;
+   simple_mtx_unlock(&c->lock);
+   return has;
 }
 
 /* The source's variant for `key`: made the first time. */
@@ -9483,6 +9561,7 @@ wvk_shader_deserialize(struct vk_device *vk_dev, struct blob_reader *blob, uint3
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
    }
    shader->id = p_atomic_inc_return(&dev->next_shader_id);
+   shader_id_live(dev, shader->id, 1);
    memcpy(shader->wgsl, wgsl, sizeof(wgsl));
    shader->binding_count = binding_count;
    shader->bindings = calloc(MAX2(binding_count, 1), sizeof(*shader->bindings));

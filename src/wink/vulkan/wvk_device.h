@@ -62,6 +62,11 @@ struct wvk_device {
    struct hash_table *render_pipelines;     /* struct wvk_render_pipeline */
    struct hash_table *compute_pipelines;    /* struct wvk_compute_pipeline */
    uint64_t next_shader_id;
+   /* How many live shaders have each id (a variant cache's hit has the
+    * cached one's), under cache_lock: the render and compute pipelines of
+    * an id no live shader and no cached variant has are let go of
+    * (wvk_device_prune_pipelines). */
+   struct hash_table_u64 *live_shader_ids;
    /* Variants of any shader's source, serialized (wvk_shader.c). */
    struct wvk_variant_cache *variant_cache;
    uint64_t next_memory_serial;
@@ -203,6 +208,10 @@ void wvk_device_doom_buffer(struct wvk_device *dev, WGPUBuffer buffer);
  * destroyed after it. */
 void wvk_device_replay_begin(struct wvk_device *dev);
 void wvk_device_replay_end(struct wvk_device *dev);
+
+/* The render and compute pipelines of shader `id`, gone: no shader of it
+ * is left, nor a cached variant that could make one again. */
+void wvk_device_prune_pipelines(struct wvk_device *dev, uint64_t id);
 
 /* The caches: made with the device, gone with it. */
 VkResult wvk_device_init_pipeline_caches(struct wvk_device *dev);

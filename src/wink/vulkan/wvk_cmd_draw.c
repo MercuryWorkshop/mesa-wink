@@ -512,9 +512,10 @@ wvk_device_init_pipeline_caches(struct wvk_device *dev)
    dev->pipeline_layouts = _mesa_hash_table_create(NULL, layout_hash, layout_equal);
    dev->render_pipelines = _mesa_hash_table_create(NULL, render_hash, render_equal);
    dev->compute_pipelines = _mesa_hash_table_create(NULL, compute_hash, compute_equal);
+   dev->live_shader_ids = _mesa_hash_table_u64_create(NULL);
    wvk_variant_cache_init(dev);
    if (!dev->bind_group_layouts || !dev->pipeline_layouts || !dev->render_pipelines ||
-       !dev->compute_pipelines)
+       !dev->compute_pipelines || !dev->live_shader_ids)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    dev->empty_bgl = get_bgl(dev, NULL, 0);
@@ -691,11 +692,37 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
    util_dynarray_fini(&dev->placeholders);
    util_dynarray_fini(&dev->bound_aliases);
    util_dynarray_fini(&dev->shared_textures);
+   _mesa_hash_table_u64_destroy(dev->live_shader_ids);
    wvk_device_replay_end(dev);
    util_dynarray_fini(&dev->doomed_textures);
    util_dynarray_fini(&dev->doomed_buffers);
    simple_mtx_destroy(&dev->doom_lock);
    simple_mtx_destroy(&dev->cache_lock);
+}
+
+void
+wvk_device_prune_pipelines(struct wvk_device *dev, uint64_t id)
+{
+   simple_mtx_lock(&dev->cache_lock);
+   hash_table_foreach(dev->render_pipelines, he) {
+      struct wvk_render_pipeline *p = (void *)he->key;
+      if (p->key.vs != id && p->key.fs != id)
+         continue;
+      _mesa_hash_table_remove(dev->render_pipelines, he);
+      if (p->pipeline)
+         wgpuRenderPipelineRelease(p->pipeline);
+      free(p);
+   }
+   hash_table_foreach(dev->compute_pipelines, he) {
+      struct wvk_compute_pipeline *p = (void *)he->key;
+      if (p->cs != id)
+         continue;
+      _mesa_hash_table_remove(dev->compute_pipelines, he);
+      if (p->pipeline)
+         wgpuComputePipelineRelease(p->pipeline);
+      free(p);
+   }
+   simple_mtx_unlock(&dev->cache_lock);
 }
 
 void
