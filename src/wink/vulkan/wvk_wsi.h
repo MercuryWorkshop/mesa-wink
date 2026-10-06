@@ -42,9 +42,11 @@ struct wvk_surface {
    WGPUInstance wgpu_instance;
    union {
       WGPUChainedStruct chain;
+#ifndef __EMSCRIPTEN__
       WGPUSurfaceSourceXlibWindow xlib;
       WGPUSurfaceSourceWaylandSurface wayland;
       WGPUSurfaceSourceMetalLayer metal;
+#endif
    } source;
    bool has_source;
    /* A canvas's, whose size the swapchain has to have. */

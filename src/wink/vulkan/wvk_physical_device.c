@@ -56,9 +56,11 @@ static const WGPUFeatureName wanted_features[] = {
    WGPUFeatureName_DualSourceBlending,
    /* gl_PrimitiveID of a fragment shader without a geometry shader. */
    WGPUFeatureName_PrimitiveIndex,
+#ifndef __EMSCRIPTEN__
    /* Attachments read as they are: tile images, and input attachments
-    * in rasterization order (wvk_nir_fetch.c). */
+    * in rasterization order (wvk_nir_fetch.c). Dawn's; no browser has it. */
    WGPUFeatureName_FramebufferFetch,
+#endif
    /* More storage formats, and the 16-bit normalized ones (wvk_format.c). */
    WGPUFeatureName_TextureFormatsTier1,
    WGPUFeatureName_TextureFormatsTier2,

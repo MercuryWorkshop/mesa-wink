@@ -14,6 +14,12 @@
 
 struct wvk_instance;
 
+#ifdef __EMSCRIPTEN__
+/* Dawn's framebuffer fetch, which no browser's WebGPU has: a feature no
+ * adapter there has, so what it gates is off. */
+#define WGPUFeatureName_FramebufferFetch ((WGPUFeatureName)0x7fff0f00)
+#endif
+
 /* The memory types, by role; see wvk_physical_device.c. */
 enum wvk_memory_type {
    WVK_MEMORY_DEVICE,          /* buffers and linear images */

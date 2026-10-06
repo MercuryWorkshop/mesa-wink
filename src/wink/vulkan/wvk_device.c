@@ -32,6 +32,7 @@ on_uncaptured_error(WGPUDevice const *device, WGPUErrorType type, WGPUStringView
       abort();
 }
 
+#ifndef __EMSCRIPTEN__
 /* Dawn's own messages: of its toggles' dump_shaders, the MSL. */
 static void
 on_dawn_log(WGPULoggingType type, WGPUStringView message, void *userdata1, void *userdata2)
@@ -39,6 +40,7 @@ on_dawn_log(WGPULoggingType type, WGPUStringView message, void *userdata1, void 
    (void)userdata1; (void)userdata2;
    mesa_logi("wvk: Dawn (%u): %.*s", (unsigned)type, wvk_sv_len(message), message.data);
 }
+#endif
 
 static void
 on_device_lost(WGPUDevice const *device, WGPUDeviceLostReason reason, WGPUStringView message,
@@ -103,8 +105,10 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
    desc.deviceLostCallbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
    desc.deviceLostCallbackInfo.callback = on_device_lost;
    desc.deviceLostCallbackInfo.userdata1 = dev;
+#ifndef __EMSCRIPTEN__
    /* WINK_VK_DAWN_TOGGLES: Dawn toggles to enable, comma-separated, for
-    * debugging -- dump_shaders and the like. */
+    * debugging -- dump_shaders and the like. Dawn's own: emdawnwebgpu has
+    * neither toggles nor its logging. */
    const char *toggles_env = getenv("WINK_VK_DAWN_TOGGLES");
    char *toggles_str = toggles_env ? strdup(toggles_env) : NULL;
    const char *toggles[16];
@@ -124,6 +128,9 @@ wvk_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCre
       log.callback = on_dawn_log;
       wgpuDeviceSetLoggingCallback(dev->wgpu, log);
    }
+#else
+   dev->wgpu = wvk_platform_request_device(instance->wgpu, pdev->adapter, &desc);
+#endif
    if (!dev->wgpu) {
       result = vk_errorf(pdev, VK_ERROR_INITIALIZATION_FAILED, "no WebGPU device");
       goto fail_init;

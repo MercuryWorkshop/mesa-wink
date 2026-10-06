@@ -79,11 +79,16 @@ create_native_surface(VkInstance _instance, const void *icd, size_t icd_size,
    if (result == VK_SUCCESS) {
       struct wvk_surface *surface = wvk_surface_from_handle(*pSurface);
       memcpy(&surface->icd, icd, icd_size);
-      /* Kept to make the WGPUSurface again (wvk_surface_renew). */
+      /* Kept to make the WGPUSurface again (wvk_surface_renew): a native
+       * window's, which a browser has none of. */
+#ifndef __EMSCRIPTEN__
       const size_t size = source->sType == WGPUSType_SurfaceSourceXlibWindow       ? sizeof(surface->source.xlib)
                           : source->sType == WGPUSType_SurfaceSourceWaylandSurface ? sizeof(surface->source.wayland)
                           : source->sType == WGPUSType_SurfaceSourceMetalLayer     ? sizeof(surface->source.metal)
                                                                                    : 0;
+#else
+      const size_t size = 0;
+#endif
       if (size) {
          memcpy(&surface->source, source, size);
          surface->source.chain.next = NULL;
