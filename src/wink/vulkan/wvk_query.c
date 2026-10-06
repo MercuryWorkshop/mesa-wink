@@ -643,6 +643,27 @@ wvk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool, uint
    reset_queries(pool, firstQuery, queryCount);
 }
 
+static WGPUComputePipeline
+timestamp_pipeline(struct wvk_device *dev)
+{
+   simple_mtx_lock(&dev->cache_lock);
+   if (!dev->timestamp_pipeline) {
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = wvk_sv("@compute @workgroup_size(1) fn main() {}\n");
+      WGPUShaderModuleDescriptor sm = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      sm.nextInChain = &source.chain;
+      WGPUShaderModule module = wgpuDeviceCreateShaderModule(dev->wgpu, &sm);
+      WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+      desc.label = wvk_sv("wvk timestamp");
+      desc.compute.module = module;
+      desc.compute.entryPoint = wvk_sv("main");
+      dev->timestamp_pipeline = wgpuDeviceCreateComputePipeline(dev->wgpu, &desc);
+      wgpuShaderModuleRelease(module);
+   }
+   simple_mtx_unlock(&dev->cache_lock);
+   return dev->timestamp_pipeline;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stage,
                        VkQueryPool queryPool, uint32_t query)
@@ -682,6 +703,10 @@ wvk_CmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 stag
    WGPUComputePassDescriptor pd = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
    pd.timestampWrites = &writes;
    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(replay->encoder, &pd);
+   /* Metal can leave the sample at zero for an empty compute encoder.
+    * Dispatch one invocation so the timestamp pass actually reaches the GPU. */
+   wgpuComputePassEncoderSetPipeline(pass, timestamp_pipeline(dev));
+   wgpuComputePassEncoderDispatchWorkgroups(pass, 1, 1, 1);
    wgpuComputePassEncoderEnd(pass);
    wgpuComputePassEncoderRelease(pass);
    wgpuCommandEncoderResolveQuerySet(replay->encoder, replay->timestamp_set, slot, 1, replay->timestamp_resolve,
@@ -916,4 +941,3 @@ wvk_GetDeviceMemoryOpaqueCaptureAddress(VkDevice device,
 {
    return 0;
 }
-

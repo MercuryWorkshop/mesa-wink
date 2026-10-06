@@ -7,8 +7,8 @@ in its new form is left alone, text in its old form is replaced, and text in
 neither form is an error -- a silently unpatched library is the failure this
 exists to prevent.
 
-The first three are MobileGL's (cmake/FetchEmdawnwebgpu.cmake), which has
-shipped them in ikvm-wasm-build's .NET 10 link; the last is gex's.
+The compatibility edits originated in MobileGL's
+cmake/FetchEmdawnwebgpu.cmake; the API corrections are exercised by Wink.
 """
 import os
 import sys
@@ -31,6 +31,15 @@ EDITS = {
          'WebGPU.Internals.jsObjects[ptr >>> 0] = obj;'),
         ('delete WebGPU.Internals.jsObjects[ptr];',
          'delete WebGPU.Internals.jsObjects[ptr >>> 0];'),
+        # The C API uses UINT32_MAX for an omitted pass timestamp. The JS
+        # API needs undefined; forwarding the sentinel fails validation.
+        ('makePassTimestampWrites: (ptr) => {',
+         'optionalQuerySetIndex: (index) => index === 0xffffffff ? undefined : index,\n\n'
+         '    makePassTimestampWrites: (ptr) => {'),
+        ('"beginningOfPassWriteIndex": {{{ gpu.makeGetU32(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.beginningOfPassWriteIndex) }}}',
+         '"beginningOfPassWriteIndex": WebGPU.optionalQuerySetIndex({{{ gpu.makeGetU32(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.beginningOfPassWriteIndex) }}})'),
+        ('"endOfPassWriteIndex": {{{ gpu.makeGetU32(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.endOfPassWriteIndex) }}}',
+         '"endOfPassWriteIndex": WebGPU.optionalQuerySetIndex({{{ gpu.makeGetU32(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.endOfPassWriteIndex) }}})'),
     ],
     'webgpu/src/library_webgpu_enum_tables.js': [
         # Upstream typo: the WebGPU blend factor is 'src1-alpha'. The wrong

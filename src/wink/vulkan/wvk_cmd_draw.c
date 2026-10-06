@@ -615,6 +615,8 @@ wvk_device_finish_pipeline_caches(struct wvk_device *dev)
       wgpuComputePipelineRelease(dev->copy_query_pipeline);
    if (dev->add_query_pipeline)
       wgpuComputePipelineRelease(dev->add_query_pipeline);
+   if (dev->timestamp_pipeline)
+      wgpuComputePipelineRelease(dev->timestamp_pipeline);
    if (dev->add_stats_pipeline)
       wgpuComputePipelineRelease(dev->add_stats_pipeline);
    if (dev->finish_stats_pipeline)

@@ -385,6 +385,43 @@ test_sync(void)
 }
 
 static void
+test_timestamps(void)
+{
+   VkQueueFamilyProperties properties;
+   uint32_t count = 1;
+   vkGetPhysicalDeviceQueueFamilyProperties(pdev, &count, &properties);
+   if (!properties.timestampValidBits) {
+      printf("timestamps: unavailable\n");
+      return;
+   }
+   VkQueryPool queries;
+   VK(vkCreateQueryPool(dev, &(VkQueryPoolCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+      .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2,
+   }, NULL, &queries));
+   struct buffer b = make_buffer(4096, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+   VkCommandBuffer cmd = begin(0);
+   vkCmdResetQueryPool(cmd, queries, 0, 2);
+   vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries, 0);
+   vkCmdFillBuffer(cmd, b.buffer, 0, VK_WHOLE_SIZE, 0x12345678);
+   vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, queries, 1);
+   VK(vkEndCommandBuffer(cmd));
+   submit_and_wait(cmd);
+   struct { uint64_t value, available; } results[2] = {{0}};
+   VK(vkGetQueryPoolResults(dev, queries, 0, 2, sizeof(results), results,
+                           sizeof(results[0]), VK_QUERY_RESULT_64_BIT |
+                           VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT));
+   CHECK(results[0].available && results[1].available, "timestamps not available");
+   CHECK(results[0].value > 0 && results[1].value >= results[0].value,
+         "timestamps not ordered: %llu, %llu",
+         (unsigned long long)results[0].value, (unsigned long long)results[1].value);
+   free_buffer(&b);
+   vkDestroyQueryPool(dev, queries, NULL);
+   printf("timestamps: done\n");
+}
+
+static void
 test_present(void)
 {
    PFN_vkCreateHeadlessSurfaceEXT create_headless =
@@ -582,6 +619,7 @@ main(void)
    test_buffers();
    test_clears();
    test_sync();
+   test_timestamps();
    test_present();
 
    vkDestroyCommandPool(dev, pool, NULL);
