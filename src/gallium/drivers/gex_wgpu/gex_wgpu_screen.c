@@ -19580,22 +19580,39 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
    static int ubo_shadow = -1;
    if (ubo_shadow < 0)
       ubo_shadow = getenv("GEX_WGPU_UBO_SHADOW") ? 1 : 0;
+   /* A write to the end of the buffer whose size is not whole words -- an
+    * odd number of 16-bit indices, from glBufferData itself -- is whole
+    * words too, its last one padded with zeros: past width0 the bytes are
+    * nobody's, and the allocation has the word (gex_wgpu_buffer_create
+    * rounds it up). */
+   const bool to_end = (uint64_t)offset + size == resource->width0 &&
+                       gex->gpu_size >= ALIGN_POT((uint64_t)offset + size, 4);
    const bool subdata_direct =
       size && !gex->shadow && data && !(usage & PIPE_MAP_READ) &&
       !(ubo_shadow && (resource->bind & PIPE_BIND_CONSTANT_BUFFER)) &&
-      (offset & 3u) == 0 && (size & 3u) == 0 &&
-      /* Index buffers only: the draw path scans an index buffer's shadow to
-       * bound its vertex fetch. Constant buffers reach the GPU through
-       * `gex->buffer` and nothing reads their shadow, and u_upload's constant
-       * pages are megabyte-sized -- which is where the memory is. */
-      !(resource->bind & PIPE_BIND_INDEX_BUFFER) &&
+      (offset & 3u) == 0 && ((size & 3u) == 0 || to_end) &&
+      /* Index buffers too. The draw path's scan of an index buffer's shadow
+       * only warns of a vertex fetch past a buffer's end, and does without
+       * one; what reads the indices themselves -- primitive conversion,
+       * restart splitting, transform feedback's capture -- maps the buffer
+       * or asks gex_wgpu_shadow_for_read, which makes the shadow then, from
+       * the GPU's copy, and keeps it. Kept from the start, every index buffer
+       * was all of it twice, the second copy in the wasm heap for good. */
       resource->target == PIPE_BUFFER && gex->buffer &&
       (uint64_t)offset + size <= resource->width0;
    if (subdata_direct) {
       gex->bytes_written += size;
       gex_wgpu_log_upload("sub-dir", resource->width0, offset, data, size);
-      wgpuQueueWriteBuffer(gex_screen(pipe->screen)->queue, gex->buffer,
-                           offset, data, size);
+      const unsigned whole = size & ~3u;
+      if (whole)
+         wgpuQueueWriteBuffer(gex_screen(pipe->screen)->queue, gex->buffer,
+                              offset, data, whole);
+      if (size > whole) {
+         uint8_t tail[4] = {0};
+         memcpy(tail, (const uint8_t *)data + whole, size - whole);
+         wgpuQueueWriteBuffer(gex_screen(pipe->screen)->queue, gex->buffer,
+                              offset + whole, tail, 4);
+      }
       return;
    }
    /* Everything else keeps the shadow, and if the buffer already has contents
@@ -22509,10 +22526,9 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
     *
     * `buffer_unmap` uploads the 4-byte-aligned range around what was mapped,
     * so an aligned map needs no bytes the caller did not write and no prior
-    * contents at all. Index and constant buffers keep the shadow: the draw
-    * path reads an index buffer's shadow directly to bound its vertex fetch,
-    * and both are small. An unaligned map keeps it too -- there were ten of
-    * those in 1.3 million. */
+    * contents at all. Index buffers too: what reads their indices makes the
+    * shadow when it does (see gex_wgpu_buffer_subdata). An unaligned map
+    * keeps it -- there were ten of those in 1.3 million. */
    /* GEX_WGPU_NO_STAGED_MAP=1 sends every write map down the shadow path
     * instead. Slower and far heavier on memory -- which is the whole reason
     * the staged path exists -- but it is the only way to ask whether the
@@ -22562,7 +22578,6 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
        * mapping is not unmapped. */
       !(usage & PIPE_MAP_PERSISTENT) &&
       !gex->shadow && !(usage & PIPE_MAP_READ) &&
-      !(resource->bind & PIPE_BIND_INDEX_BUFFER) &&
       ((uint32_t)box->x & 3u) == 0 && ((uint32_t)box->width & 3u) == 0;
    if (staged) {
       transfer->data = CALLOC(1, (size_t)box->width);
@@ -32387,9 +32402,12 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
    }
    const uint8_t *indices = NULL;
    if (info->index_size) {
+      /* The index buffer's shadow, made from the GPU's copy if it has none:
+       * index buffers are not kept on the host until something reads them. */
       indices = info->has_user_indices
          ? (const uint8_t *)info->index.user
-         : (info->index.resource
+         : (info->index.resource &&
+            gex_wgpu_shadow_for_read(&ctx->base, gex_resource(info->index.resource))
                ? gex_resource(info->index.resource)->shadow : NULL);
       if (!indices ||
           (info->index_size != 1 && info->index_size != 2 &&
