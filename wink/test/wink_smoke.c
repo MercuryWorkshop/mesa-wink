@@ -21,6 +21,7 @@
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,7 @@ note(const char *fmt, ...)
    X(void, Viewport, (GLint, GLint, GLsizei, GLsizei))                           \
    X(void, ClearColor, (GLfloat, GLfloat, GLfloat, GLfloat))                     \
    X(void, Clear, (GLbitfield))                                                  \
+   X(void, ClampColor, (GLenum, GLenum))                                         \
    X(void, ReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *)) \
    X(GLuint, CreateShader, (GLenum))                                             \
    X(void, ShaderSource, (GLuint, GLsizei, const GLchar *const *, const GLint *)) \
@@ -86,6 +88,12 @@ note(const char *fmt, ...)
    X(void, GenTextures, (GLsizei, GLuint *))                                     \
    X(void, BindTexture, (GLenum, GLuint))                                        \
    X(void, TexParameteri, (GLenum, GLenum, GLint))                               \
+   X(void, TexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
+   X(void, GenFramebuffers, (GLsizei, GLuint *))                                \
+   X(void, BindFramebuffer, (GLenum, GLuint))                                   \
+   X(void, FramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint))       \
+   X(GLenum, CheckFramebufferStatus, (GLenum))                                 \
+   X(void, DeleteFramebuffers, (GLsizei, const GLuint *))                       \
    X(void, CompressedTexImage2D, (GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *)) \
    X(void, DeleteTextures, (GLsizei, const GLuint *))
 
@@ -309,6 +317,85 @@ vertex_input_types(void)
 }
 
 static void
+snorm_attachments(void)
+{
+   const GLenum internal[] = {GL_R8_SNORM, GL_RG8_SNORM, GL_RGB8_SNORM, GL_RGBA8_SNORM};
+   const GLenum format[] = {GL_RED, GL_RG, GL_RGB, GL_RGBA};
+   GLuint texture, framebuffer;
+   p_glGenTextures(1, &texture);
+   p_glBindTexture(GL_TEXTURE_2D, texture);
+   p_glGenFramebuffers(1, &framebuffer);
+   p_glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+   p_glClampColor(GL_CLAMP_READ_COLOR, GL_FALSE);
+   for (unsigned i = 0; i < 4; ++i) {
+      p_glTexImage2D(GL_TEXTURE_2D, 0, internal[i], 4, 4, 0, format[i], GL_BYTE, NULL);
+      p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+      GLenum status = p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+      CHECK(status == GL_FRAMEBUFFER_COMPLETE, "snorm 0x%x: framebuffer 0x%x", internal[i], status);
+      if (status != GL_FRAMEBUFFER_COMPLETE)
+         continue;
+      p_glClearColor(-1.0f, -0.5f, 0.25f, 0.75f);
+      p_glClear(GL_COLOR_BUFFER_BIT);
+      float px[4] = {0};
+      p_glReadPixels(2, 2, 1, 1, GL_RGBA, GL_FLOAT, px);
+      const float expected[4] = {-1.0f, i >= 1 ? -0.5f : 0.0f,
+                                 i >= 2 ? 0.25f : 0.0f, i >= 3 ? 0.75f : 1.0f};
+      for (unsigned c = 0; c < 4; ++c)
+         CHECK(fabsf(px[c] - expected[c]) < 0.01f,
+               "snorm 0x%x: component %u read %f expected %f", internal[i], c, px[c], expected[c]);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "snorm attachments: context failed");
+   p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   p_glClampColor(GL_CLAMP_READ_COLOR, GL_FIXED_ONLY);
+   p_glDeleteFramebuffers(1, &framebuffer);
+   p_glDeleteTextures(1, &texture);
+}
+
+static void
+norm16_filtering(void)
+{
+   static const char *vs =
+      "#version 330 core\n"
+      "void main() {\n"
+      "  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+      "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+      "}\n";
+   static const char *fs =
+      "#version 330 core\n"
+      "uniform sampler2D tex; out vec4 color;\n"
+      "void main() { color = texture(tex, vec2(0.5)); }\n";
+   GLuint prog = link_program(vs, fs, "norm16 filtering");
+   GLuint vao, texture;
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glGenTextures(1, &texture);
+   p_glBindTexture(GL_TEXTURE_2D, texture);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   const uint16_t unorm[8] = {0, 65535, 32768, 65535, 65535, 0, 32768, 65535};
+   const int16_t snorm[8] = {-32767, 32767, 0, 32767, 32767, -32767, 0, 32767};
+   p_glUseProgram(prog);
+   for (unsigned i = 0; i < 2; ++i) {
+      p_glTexImage2D(GL_TEXTURE_2D, 0, i ? GL_RGBA16_SNORM : GL_RGBA16,
+                    2, 1, 0, GL_RGBA, i ? GL_SHORT : GL_UNSIGNED_SHORT,
+                    i ? (const void *)snorm : (const void *)unorm);
+      p_glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+      p_glClear(GL_COLOR_BUFFER_BIT);
+      p_glDrawArrays(GL_TRIANGLES, 0, 3);
+      uint8_t px[4];
+      read_center(px, W, H);
+      CHECK(near(px, i ? 0 : 128, i ? 0 : 128, i ? 0 : 128),
+            "%snorm16 linear filtering: read %u,%u,%u,%u", i ? "s" : "u", px[0], px[1], px[2], px[3]);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "norm16 filtering: context failed");
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glDeleteTextures(1, &texture);
+}
+
+static void
 exercise(const char *label, int api, wink_surface *surface)
 {
    wink_context_attribs ca;
@@ -401,8 +488,11 @@ exercise(const char *label, int api, wink_surface *surface)
    GLenum err = p_glGetError();
    CHECK(err == GL_NO_ERROR, "%s: GL error 0x%x", label, err);
 
-   if (api == WINK_API_OPENGL_CORE)
+   if (api == WINK_API_OPENGL_CORE) {
       vertex_input_types();
+      snorm_attachments();
+      norm16_filtering();
+   }
 
    p_glBindVertexArray(0);
    p_glDeleteVertexArrays(1, &vao);

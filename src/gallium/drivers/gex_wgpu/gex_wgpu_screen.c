@@ -1545,6 +1545,7 @@ struct gex_wgpu_screen {
     * gex_wgpu_format_backing. That only works if the device will filter and
     * blend a float32 attachment, both of which are optional features. */
    bool float32_filterable;
+   bool texture_formats_tier1;
    bool float32_blendable;
    /* WebGPU bounds the total bytes per sample across colour attachments.
     *
@@ -18486,6 +18487,12 @@ gex_wgpu_color_renderable(struct pipe_screen *screen, enum pipe_format format)
    if (format == PIPE_FORMAT_R11G11B10_FLOAT)
       return gex_screen(screen)->rg11b10_renderable;
    switch (format) {
+   case PIPE_FORMAT_R8_SNORM:
+   case PIPE_FORMAT_R8G8_SNORM:
+   case PIPE_FORMAT_R8G8B8A8_SNORM:
+      /* Tier 1 adds attachments, blending and multisampling for these
+       * already sampleable formats. Iris attaches RGB/RGBA8_SNORM. */
+      return gex_screen(screen)->texture_formats_tier1;
    case PIPE_FORMAT_R8_UNORM:
    case PIPE_FORMAT_R8G8_UNORM:
    case PIPE_FORMAT_R8G8B8A8_UNORM:
@@ -49479,9 +49486,16 @@ gex_wgpu_screen_create(WGPUDevice device)
     * granted these. Without them the formats stay unadvertised rather than
     * becoming a validation error the first time something samples or blends
     * one. */
-   gex_wgpu_native_unorm16 =
+   screen->texture_formats_tier1 =
       wgpuDeviceHasFeature(device, WGPUFeatureName_TextureFormatsTier1) &&
       !getenv("GEX_WGPU_NO_TIER1");
+   gex_wgpu_native_unorm16 = screen->texture_formats_tier1;
+#ifdef __EMSCRIPTEN__
+   /* Browser tier 1 exposes norm16 with an unfilterable-float sample type.
+    * GL permits linear filtering, so retain the float32 backing until the
+    * sampler lowering can implement filtering for these native textures. */
+   gex_wgpu_native_unorm16 = false;
+#endif
    screen->float32_filterable =
       wgpuDeviceHasFeature(device, WGPUFeatureName_Float32Filterable);
    screen->float32_blendable =
