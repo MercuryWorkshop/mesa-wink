@@ -113,7 +113,20 @@ note(const char *fmt, ...)
    X(void, TexStorage2DMultisample, (GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean)) \
    X(void, BlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum)) \
    X(void, CompressedTexImage2D, (GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *)) \
-   X(void, DeleteTextures, (GLsizei, const GLuint *))
+   X(void, DeleteTextures, (GLsizei, const GLuint *))                             \
+   X(void, GenBuffers, (GLsizei, GLuint *))                                      \
+   X(void, BindBuffer, (GLenum, GLuint))                                         \
+   X(void, BufferData, (GLenum, GLsizeiptr, const void *, GLenum))               \
+   X(void, DeleteBuffers, (GLsizei, const GLuint *))                             \
+   X(void, VertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)) \
+   X(void, EnableVertexAttribArray, (GLuint))                                    \
+   X(void, VertexAttribDivisor, (GLuint, GLuint))                                \
+   X(void, MultiDrawArrays, (GLenum, const GLint *, const GLsizei *, GLsizei))   \
+   X(void, MultiDrawArraysIndirect, (GLenum, const void *, GLsizei, GLsizei))  \
+   X(void, EnableClientState, (GLenum))                                          \
+   X(void, DisableClientState, (GLenum))                                         \
+   X(void, VertexPointer, (GLint, GLenum, GLsizei, const void *))                \
+   X(void, ColorPointer, (GLint, GLenum, GLsizei, const void *))
 
 #define DECLARE(ret, name, args) static ret (*p_gl##name) args;
 GL_FUNCS(DECLARE)
@@ -270,6 +283,193 @@ compressed(const char *label, wink_surface *surface)
    snprintf(name, sizeof(name), "%s etc2", label);
    sample_block(name, GL_COMPRESSED_RGB8_ETC2, 4, 4, etc2, sizeof(etc2), 255, 138, 2);
 
+   wink_make_current(NULL, NULL, NULL);
+   wink_context_destroy(ctx);
+}
+
+/* The pixel at the middle of each third of the screen, left to right. */
+static void
+check_thirds(const char *label, const int want[3][3])
+{
+   for (int t = 0; t < 3; ++t) {
+      uint8_t px[4] = {0};
+      p_glReadPixels(W * (2 * t + 1) / 6, H / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+      CHECK(near(px, want[t][0], want[t][1], want[t][2]),
+            "%s: third %d read %u,%u,%u, want %d,%d,%d", label, t, px[0], px[1], px[2],
+            want[t][0], want[t][1], want[t][2]);
+   }
+}
+
+/* Sodium's terrain path: GL_QUADS through glMultiDrawArraysIndirect, each
+ * command taking its tint from an instance-stepped attribute through its
+ * baseInstance, with an empty command among them; then glMultiDrawArrays of
+ * quads. gex_wgpu draws both against its quad index buffer and records every
+ * command after the first as a repeat of it (GEX_WGPU_REPEAT), so a wrong base
+ * vertex or base instance shows as a wrong colour in some third. */
+static void
+multidraw_quads(const char *label, wink_surface *surface)
+{
+   wink_context_attribs ca;
+   wink_context_attribs_default(&ca);
+   ca.api = WINK_API_OPENGL_COMPAT;
+   int status = 0;
+   wink_context *ctx = wink_context_create(&ca, &status);
+   CHECK(ctx, "%s: compat context: %s", label, wink_status_string(status));
+   if (!ctx)
+      return;
+   int api, major, minor;
+   wink_context_get_version(ctx, &api, &major, &minor);
+   wink_make_current(ctx, surface, surface);
+   char name[96];
+   if (major * 10 + minor < 43) {
+      note("%s: multidraw quads skipped (compat %d.%d)", label, major, minor);
+      wink_make_current(NULL, NULL, NULL);
+      wink_context_destroy(ctx);
+      return;
+   }
+   static const char *vs =
+      "#version 330 core\n"
+      "layout(location = 0) in vec2 pos;\n"
+      "layout(location = 1) in vec3 tint;\n"
+      "out vec3 v_tint;\n"
+      "void main() { v_tint = tint; gl_Position = vec4(pos, 0.0, 1.0); }\n";
+   static const char *fs =
+      "#version 330 core\n"
+      "in vec3 v_tint;\n"
+      "out vec4 color;\n"
+      "void main() { color = vec4(v_tint, 1.0); }\n";
+   snprintf(name, sizeof(name), "%s multidraw quads", label);
+   GLuint prog = link_program(vs, fs, name);
+   /* Quad q covers third q, as four vertices from 4q. */
+   float pos[3 * 8];
+   for (int q = 0; q < 3; ++q) {
+      const float x0 = -1.0f + 2.0f * q / 3.0f, x1 = -1.0f + 2.0f * (q + 1) / 3.0f;
+      const float v[8] = { x0, -1.0f, x1, -1.0f, x1, 1.0f, x0, 1.0f };
+      memcpy(pos + q * 8, v, sizeof(v));
+   }
+   static const float tints[4 * 3] = { 1, 0, 0,  0, 1, 0,  0, 0, 1,  1, 1, 0 };
+   /* count, instanceCount, first, baseInstance */
+   static const GLuint cmds[4 * 4] = {
+      4, 1, 0, 2,   /* left: blue */
+      0, 1, 0, 3,   /* empty */
+      4, 1, 4, 0,   /* middle: red */
+      4, 1, 8, 1,   /* right: green */
+   };
+   GLuint vao = 0, bufs[3] = {0};
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glGenBuffers(3, bufs);
+   p_glBindBuffer(GL_ARRAY_BUFFER, bufs[0]);
+   p_glBufferData(GL_ARRAY_BUFFER, sizeof(pos), pos, GL_STATIC_DRAW);
+   p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+   p_glEnableVertexAttribArray(0);
+   p_glBindBuffer(GL_ARRAY_BUFFER, bufs[1]);
+   p_glBufferData(GL_ARRAY_BUFFER, sizeof(tints), tints, GL_STATIC_DRAW);
+   p_glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, NULL);
+   p_glEnableVertexAttribArray(1);
+   p_glVertexAttribDivisor(1, 1);
+   p_glBindBuffer(GL_DRAW_INDIRECT_BUFFER, bufs[2]);
+   p_glBufferData(GL_DRAW_INDIRECT_BUFFER, sizeof(cmds), cmds, GL_STATIC_DRAW);
+   p_glUseProgram(prog);
+   p_glViewport(0, 0, W, H);
+
+   p_glClearColor(0, 0, 0, 1);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glMultiDrawArraysIndirect(GL_QUADS, NULL, 4, 0);
+   static const int indirect_want[3][3] = { {0, 0, 255}, {255, 0, 0}, {0, 255, 0} };
+   snprintf(name, sizeof(name), "%s quads indirect", label);
+   check_thirds(name, indirect_want);
+
+   /* Every sub-draw takes instance 0's tint; the right and left thirds are
+    * drawn, in that order, and the middle one's sub-draw is empty. */
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   static const GLint firsts[3] = { 8, 4, 0 };
+   static const GLsizei counts[3] = { 4, 0, 4 };
+   p_glMultiDrawArrays(GL_QUADS, firsts, counts, 3);
+   static const int multi_want[3][3] = { {255, 0, 0}, {0, 0, 0}, {255, 0, 0} };
+   snprintf(name, sizeof(name), "%s quads multidraw", label);
+   check_thirds(name, multi_want);
+
+   GLenum err = p_glGetError();
+   CHECK(err == GL_NO_ERROR, "%s multidraw quads: GL error 0x%x", label, err);
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glDeleteBuffers(3, bufs);
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+   wink_make_current(NULL, NULL, NULL);
+   wink_context_destroy(ctx);
+}
+
+/* One quad over third `t`, as four interleaved (x, y, r, g, b) vertices. */
+static void
+client_quad(float *v, int t, float r, float g, float b)
+{
+   const float x0 = -1.0f + 2.0f * t / 3.0f, x1 = -1.0f + 2.0f * (t + 1) / 3.0f;
+   const float xy[8] = { x0, -1.0f, x1, -1.0f, x1, 1.0f, x0, 1.0f };
+   for (int i = 0; i < 4; ++i) {
+      v[i * 5 + 0] = xy[i * 2];
+      v[i * 5 + 1] = xy[i * 2 + 1];
+      v[i * 5 + 2] = r;
+      v[i * 5 + 3] = g;
+      v[i * 5 + 4] = b;
+   }
+}
+
+/* Fixed-function draws from client arrays, the way Minecraft 1.16 draws its
+ * entities, text and GUI. With GL on the main thread the driver reads these
+ * arrays later, on another thread, so each draw either waits for it or takes
+ * a copy of what it reads (glthread's draw_arrays_remote_copy) -- and the
+ * application rewrites the array the moment the call returns, as here. A copy
+ * taken late, or a wait that did not happen, draws the overwritten quad. */
+static void
+client_arrays(const char *label, wink_surface *surface)
+{
+   wink_context_attribs ca;
+   wink_context_attribs_default(&ca);
+   ca.api = WINK_API_OPENGL_COMPAT;
+   int status = 0;
+   wink_context *ctx = wink_context_create(&ca, &status);
+   CHECK(ctx, "%s: compat context: %s", label, wink_status_string(status));
+   if (!ctx)
+      return;
+   wink_make_current(ctx, surface, surface);
+   char name[96];
+   static float v[8 * 5];
+   p_glUseProgram(0);
+   p_glBindVertexArray(0);
+   p_glBindBuffer(GL_ARRAY_BUFFER, 0);
+   p_glViewport(0, 0, W, H);
+   p_glClearColor(0, 0, 0, 1);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glEnableClientState(GL_VERTEX_ARRAY);
+   p_glEnableClientState(GL_COLOR_ARRAY);
+   p_glVertexPointer(2, GL_FLOAT, 5 * sizeof(float), v);
+   p_glColorPointer(3, GL_FLOAT, 5 * sizeof(float), v + 2);
+
+   client_quad(v, 0, 1, 0, 0);
+   p_glDrawArrays(GL_QUADS, 0, 4);
+   client_quad(v, 2, 0, 1, 0);
+   p_glDrawArrays(GL_QUADS, 0, 4);
+   client_quad(v, 1, 0, 0, 1);   /* never drawn */
+   static const int want[3][3] = { {255, 0, 0}, {0, 0, 0}, {0, 255, 0} };
+   snprintf(name, sizeof(name), "%s client arrays", label);
+   check_thirds(name, want);
+
+   /* A non-zero first: the draw reads vertices 4..7 only. */
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   client_quad(v, 0, 1, 1, 0);
+   client_quad(v + 4 * 5, 1, 0, 1, 1);
+   p_glDrawArrays(GL_QUADS, 4, 4);
+   client_quad(v + 4 * 5, 2, 1, 0, 1);   /* never drawn */
+   static const int want_first[3][3] = { {0, 0, 0}, {0, 255, 255}, {0, 0, 0} };
+   snprintf(name, sizeof(name), "%s client arrays from 4", label);
+   check_thirds(name, want_first);
+
+   GLenum err = p_glGetError();
+   CHECK(err == GL_NO_ERROR, "%s client arrays: GL error 0x%x", label, err);
+   p_glDisableClientState(GL_COLOR_ARRAY);
+   p_glDisableClientState(GL_VERTEX_ARRAY);
    wink_make_current(NULL, NULL, NULL);
    wink_context_destroy(ctx);
 }
@@ -917,6 +1117,8 @@ run_pass(const char *label)
    exercise("core", WINK_API_OPENGL_CORE, surface);
    exercise("compat", WINK_API_OPENGL_COMPAT, surface);
    compressed(label, surface);
+   multidraw_quads(label, surface);
+   client_arrays(label, surface);
 
    /* A version that does not exist is refused, not quietly lowered. */
    wink_context_attribs ca;
