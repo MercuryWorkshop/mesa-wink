@@ -425,6 +425,11 @@ for MobileGL, rather than in Mesa.
 
 ## Tests
 
+The [application correctness suite](test/apps/README.md) records local
+llvmpipe/lavapipe API captures in Apple container and compares native Wink
+and browser WebGPU replays. It covers Iris shaderpacks, Godot, Filament,
+PPSSPP public homebrew and Qt Quick, with strict coverage and image gates.
+
 `--test` links `test/wink_smoke.c` against each packaged variant with plain
 emcc, exactly as the manifest says to, and runs it in headless Chrome
 (`test/run-browser.mjs`; `CHROME=` picks the browser). For GL ES 3.2, core
