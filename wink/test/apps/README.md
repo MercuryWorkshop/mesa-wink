@@ -180,17 +180,43 @@ feature/extension requests are reported without stripping them from the
 capture. A partial selection passing does not imply the full matrix passed.
 
 The live-readback oracle is enforced for the three API proofs. App baselines
-require identical CPU replays; apitrace entrypoint lookup warnings remain in
-their recording logs for review. Stability alone does not prove that an
-extension outside the tracer's wrapper coverage was fully captured.
+require identical CPU replays and clean recording/replay logs. A software
+retracer skipping an unavailable function rejects the reference even if its
+images are repeatable. Stability alone does not prove that an extension
+outside the tracer's wrapper coverage was fully captured.
+
+Vulkan references also require `vulkan-lifetimes.json`, bound to the capture
+checksum and the checker version. The reference runner streams the pinned
+`gfxrecon-convert` JSON output through
+[`reference/vulkan_lifetimes.py`](reference/vulkan_lifetimes.py), which checks
+framebuffer and dynamic-rendering attachment lifetimes at recording time.
+This focused check does not replace full Vulkan validation. Existing captures
+can be audited without changing their traces, image baselines or locks:
+
+```sh
+container run --rm --disable-progress-updates --cpus 2 --memory 1g \
+  --volume "$PWD/build/wink-apps-validated:/work" \
+  --volume "$PWD/wink/test/apps/reference:/audit:ro" \
+  --entrypoint python3 wink-reference-apps-v2 \
+  /audit/vulkan_lifetimes.py /work/cases/filament-vulkan/capture.gfxr \
+  --out /work/cases/filament-vulkan/vulkan-lifetimes.json
+```
+
+Browser replay preserves completed screenshots on a crash, while retaining
+the failed result. Driver environment settings are installed before replay
+starts for both API paths.
 
 ## Initial local validation
 
-The 2026-10-06 run on this Mac accepted 13 locked references: all three API
+The initial 2026-10-06 run on this Mac produced 13 locked references: all three API
 proofs, all three Godot backends, both Filament backends, PPSSPP GLES, both
 Qt backends, and Complementary Reimagined/BSL day/default. Each reference
 matched three software replays exactly. The proofs also matched live pixel
-readback exactly. Native, browser st and browser mt ran identical captures.
+readback exactly. Subsequent admission checks reject Qt GLES (189 skipped
+`glPolygonMode` calls in the CPU retracer) and Filament Vulkan (27 uses of
+expired framebuffer attachments), leaving 11 eligible references. Their old
+captures and diagnostic replay results are preserved. Native, browser st and
+browser mt use identical captures and unchanged comparison thresholds.
 
 | Workload | Observed candidate result |
 | --- | --- |
@@ -198,21 +224,37 @@ readback exactly. Native, browser st and browser mt ran identical captures.
 | Godot GLES | Passed on all three targets |
 | Godot Mobile / Forward+ | Device creation failed; `VK_KHR_buffer_device_address` unavailable |
 | Filament GLES / PPSSPP GLES | Captured shaders require unsupported `GL_EXT_shader_framebuffer_fetch` |
-| Filament Vulkan | WebGPU rejected a copy with the same source and destination buffer |
-| Qt Quick GLES | `GL_INVALID_OPERATION` from captured `glPolygonMode` calls |
+| Filament Vulkan | Reference rejected: framebuffer attachments used after image/view destruction. After the driver copy fix, a native diagnostic replay matches all four images; browser replay exposes the expired image. This is not an admitted correctness pass. |
+| Qt Quick GLES | Reference rejected: CPU retracer skipped captured `glPolygonMode` calls |
 | Qt Quick Vulkan | `occlusionQueryPrecise` unavailable; device creation failed |
-| Iris Complementary Reimagined day/default | Incomplete framebuffer errors; native replay reached its timeout |
-| Iris BSL day/default | WebGPU rejected vertex attribute types; native replay reached its timeout |
+| Iris Complementary Reimagined day/default | Replay completes on all three targets; three of four checkpoints have substantial rendering differences |
+| Iris BSL day/default | All four image comparisons pass on native, browser st and browser mt |
 | PPSSPP Vulkan | No accepted reference; default capture timed out; an unassisted-memory retry grew beyond the available disk space |
 
 The full 380-case campaign has **not passed**. Only two shaderpacks in one
 scene/preset have accepted references. Other scenes/presets and packs remain
 unrecorded, and five packs need publisher ZIPs. The local output is
-`build/wink-apps-validated/{report.html,results.json,junit.xml}`; the full run
-contains all 1,140 case/target results, including missing references. Accepted
+`build/wink-apps-validated/{report.html,results.json,junit.xml}`; the aggregate
+contains all 1,140 case/target results, including missing references. Eligible
 captures and earlier failed trials remain in the local output trees. Large
 unaccepted partial captures may be removed after preserving their hash,
 size, identity and failure logs.
+
+After these fixes, the aggregate has 15 passes, 15 unsupported results,
+6 incompatible-reference results, 3 rendering mismatches and 1,101 missing
+references. Native results and the full browser campaign are consolidated
+from the latest per-case `run-<target>-result.json` files, with reference
+admission checks reapplied. No image thresholds or accepted trace bytes were
+changed.
+
+The driver fixes cover copies between ranges sharing a WebGPU buffer,
+browser swapchain alpha configuration, native/browser GPU timestamps,
+integer vertex arrays feeding float shader inputs, signed normalized render
+targets, normalized 16-bit filtering, and persistent buffer synchronization.
+CPU-authored buffer copies now preserve known shadows, allowing the native
+Iris captures to complete instead of reading each vertex arena back on every
+translation. Shared native/st/mt GL and Vulkan smoke programs exercise these
+paths, including GPU-written buffers that still require readback.
 
 ## Harness checks
 
@@ -225,4 +267,5 @@ The tests cover channel-specific errors, thin/raw and strict-region defects,
 missing/incorrect images, validation errors, process failures, timeouts,
 altered captures and missing coverage in JSON/JUnit reports. They supplement
 real native/browser replay checks; they do not certify app coverage.
-The initial implementation passed all 22 harness checks.
+The current harness passes all 32 checks, including expired Vulkan
+attachments and software retracers that skip calls.
