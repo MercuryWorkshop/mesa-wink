@@ -1768,6 +1768,14 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
       case WVK_BINDING_UNIFORM:
       case WVK_BINDING_STORAGE:
       case WVK_BINDING_STORAGE_READ: {
+         /* A storage image's buffer of texels, for its atomics: the
+          * image's, made now if no shader did atomics on it before. */
+         if (d && d->atomic_image && wvk_image_atomic_buffer(dev, d->atomic_image)) {
+            e->buffer = d->atomic_image->atomic_buffer;
+            e->offset = 0;
+            e->size = binding_size(pdev, b, d);
+            break;
+         }
          /* None, or a null descriptor: the null buffer, as much of it as
           * a uniform block of the shader's wants. */
          if (!d || !d->buffer) {
@@ -1939,6 +1947,8 @@ sync_atomic_buffers(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout,
          uint32_t dynamic_index;
          const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
          if (!d || !d->atomic_image || d->atomic_image->atomic_in_buffer)
+            continue;
+         if (!wvk_image_atomic_buffer(wvk_cmd_buffer_device(cmd), d->atomic_image))
             continue;
          if (!ended) {
             wvk_replay_end_passes(replay);

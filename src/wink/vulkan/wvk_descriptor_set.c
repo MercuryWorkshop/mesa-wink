@@ -308,17 +308,17 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
          }
       }
       struct wvk_image *image = view ? wvk_image_view_image(view) : NULL;
-      if (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && image && image->atomic_buffer &&
+      if (type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && image && image->atomics &&
           wvk_format_has_atomics(view->vk.view_format)) {
          /* The view's texels in the image's buffer of them. */
          const uint32_t level = view->vk.base_mip_level;
          const VkExtent3D e = vk_image_mip_level_extent(&image->vk, level);
          const bool is_3d = image->vk.image_type == VK_IMAGE_TYPE_3D;
          const uint32_t row = image->atomic_pitch[level] / 4;
+         /* Its buffer is the image's, made when a shader does atomics on
+          * it: bind groups take it from there (wvk_image_atomic_buffer). */
          d->atomic_image = image;
          wvk_image_ref(image);
-         d->buffer = image->atomic_buffer;
-         wgpuBufferAddRef(d->buffer);
          d->offset = 0;
          d->size = image->atomic_size;
          d->atomic_meta[WVK_META_IMG_BASE] =

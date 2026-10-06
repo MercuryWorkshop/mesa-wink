@@ -88,6 +88,7 @@ struct wvk_image {
     * atomics use for all they do with it. Between barriers one or the
     * other is the image (wvk_replay_sync_atomic_images). */
    WGPUBuffer atomic_buffer;
+   bool atomics;
    uint64_t atomic_size;
    uint64_t atomic_offset[16];
    uint32_t atomic_pitch[16];
@@ -108,6 +109,9 @@ struct wvk_bound_alias {
    uint64_t offset;
 };
 
+/* A storage image's buffer of texels, which shaders doing atomics on it
+ * use: made the first time one does. NULL for an image of no atomics. */
+WGPUBuffer wvk_image_atomic_buffer(struct wvk_device *dev, struct wvk_image *image);
 void wvk_image_ref(struct wvk_image *image);
 void wvk_image_unref(struct wvk_image *image);
 

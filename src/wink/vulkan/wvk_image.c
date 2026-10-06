@@ -289,12 +289,12 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
          size += (uint64_t)image->atomic_pitch[l] * e.height *
                  (image->vk.image_type == VK_IMAGE_TYPE_3D ? e.depth : image->vk.array_layers);
       }
-      WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
-      bd.label = wvk_sv("VkImage atomics");
-      bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
-      bd.size = size;
+      /* The buffer itself made when a shader first does atomics on it
+       * (wvk_image_atomic_buffer): a storage image of a format atomics can
+       * be done on is not one they are done on, and it is as big as the
+       * image, more for the 256-byte rows of small levels. */
       image->atomic_size = size;
-      image->atomic_buffer = wgpuDeviceCreateBuffer(dev->wgpu, &bd);
+      image->atomics = true;
    }
 
    *pImage = wvk_image_to_handle(image);
@@ -490,9 +490,24 @@ wvk_image_make_current(struct wvk_device *dev, struct wvk_replay *replay, struct
    }
 }
 
+WGPUBuffer
+wvk_image_atomic_buffer(struct wvk_device *dev, struct wvk_image *image)
+{
+   if (!image->atomics || image->atomic_buffer)
+      return image->atomic_buffer;
+   WGPUBufferDescriptor bd = WGPU_BUFFER_DESCRIPTOR_INIT;
+   bd.label = wvk_sv("VkImage atomics");
+   bd.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+   bd.size = image->atomic_size;
+   image->atomic_buffer = wgpuDeviceCreateBuffer(dev->wgpu, &bd);
+   return image->atomic_buffer;
+}
+
 void
 wvk_image_copy_atomic(struct wvk_image *image, WGPUCommandEncoder encoder, bool to_buffer)
 {
+   if (!image->atomic_buffer)
+      return;
    for (uint32_t l = 0; l < image->vk.mip_levels && l < ARRAY_SIZE(image->atomic_offset); ++l) {
       const VkExtent3D e = vk_image_mip_level_extent(&image->vk, l);
       WGPUTexelCopyTextureInfo texture = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
@@ -661,7 +676,7 @@ static void
 bind_alias(struct wvk_device *dev, struct wvk_image *image, struct wvk_device_memory *mem, uint64_t offset)
 {
    if (!(image->vk.create_flags & VK_IMAGE_CREATE_ALIAS_BIT) || !image->texture || image->linear ||
-       image->layer_textures || image->shadow || image->atomic_buffer || !mem)
+       image->layer_textures || image->shadow || image->atomics || !mem)
       return;
    simple_mtx_lock(&dev->cache_lock);
    util_dynarray_foreach(&dev->bound_aliases, struct wvk_bound_alias, a) {
