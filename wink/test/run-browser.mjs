@@ -13,14 +13,16 @@
 // Needs Node 22+ (the global WebSocket).
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir, platform } from 'node:os';
-import { extname, join, normalize } from 'node:path';
+import { basename, dirname, extname, join, normalize } from 'node:path';
 
 const dir = process.argv[2];
 const timeout = Number((process.argv.find((a) => a.startsWith('--timeout=')) || '=120').split('=')[1]) * 1000;
 const pageArg = process.argv.find((a) => a.startsWith('--page=')) || '--page=index.html';
 const pageName = pageArg.slice(pageArg.indexOf('=') + 1);
+const resultArg = process.argv.find(a => a.startsWith('--result='));
+const resultPath = resultArg?.slice('--result='.length);
 // A page may take a query (vk.html?test=...): the file is what precedes it.
 if (!dir || !existsSync(join(dir, pageName.split('?')[0]))) {
   console.error('usage: run-browser.mjs <dir> [--page=index.html] [--timeout=SECONDS]');
@@ -139,8 +141,29 @@ try {
     }
     await new Promise((r) => setTimeout(r, 250));
   }
-  if (!result) console.log(`timed out after ${timeout / 1000}s`);
-  else code = result.pass ? 0 : 1;
+  if (!result) {
+    console.log(`timed out after ${timeout / 1000}s`);
+    if (resultPath) {
+      mkdirSync(dirname(resultPath), { recursive: true });
+      writeFileSync(resultPath, JSON.stringify({ pass: false, rc: -1, error: 'timeout', artifacts: [] }) + '\n');
+    }
+  }
+  else {
+    code = result.pass ? 0 : 1;
+    if (resultPath) {
+      mkdirSync(dirname(resultPath), { recursive: true });
+      const artifacts = [];
+      for (const item of result.artifacts || []) {
+        if (item.name !== basename(item.name) || !/^[A-Za-z0-9_.-]+\.png$/.test(item.name) || item.encoding !== 'base64') {
+          throw new Error('invalid browser replay artifact');
+        }
+        const bytes = Buffer.from(item.data, 'base64');
+        writeFileSync(join(dirname(resultPath), item.name), bytes);
+        artifacts.push({ name: item.name, bytes: bytes.length });
+      }
+      writeFileSync(resultPath, JSON.stringify({ ...result, artifacts }, null, 2) + '\n');
+    }
+  }
   console.log(result ? (result.pass ? 'PASS' : `FAIL (rc ${result.rc})`) : 'FAIL (no result)');
 } finally {
   ws.close();
