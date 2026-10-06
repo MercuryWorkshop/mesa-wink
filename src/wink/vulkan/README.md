@@ -313,6 +313,14 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   shader's are: the draw after it, of six vertices an index, reads its
   records by the list, bound as storage; after tessellation, an indirect
   draw the tessellator writes the count of.
+- **Precise occlusion queries** (occlusionQueryPrecise) count passing samples
+  rather than WebGPU's boolean Metal/browser results. A private R32Float
+  attachment adds one per passing sample; a compute reduction accumulates
+  into the query pool's 64-bit integer result. The attachment is reduced and
+  cleared between draws and pass restarts, with depth, stencil, discard,
+  sample masks and multisampling applied by rasterization. The driver reserves
+  one colour attachment and four bytes per sample in its advertised limits.
+  Native Dawn Vulkan uses its counting query backend.
 - **Pipeline statistics queries** (pipelineStatisticsQuery) are the
   driver's counts. The host knows most of each direct draw's from its
   counts and topology: its vertices and primitives, vertex shader
@@ -746,8 +754,13 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
 - An attribute larger than its binding's dynamic stride, which WebGPU
   cannot describe. Strips of 16-bit indices with primitive restart off
   still restart at 0xFFFF, as WebGPU's always do.
-- Precise occlusion queries: WebGPU's occlusion queries are boolean on
-  Dawn's Metal and D3D12 backends, and not precise on Vulkan.
+- Precise occlusion emulation has an exact per-pixel, per-sample counter
+  range of 2^24 passing fragments within one draw. Reduction between draws
+  prevents this bound from limiting the whole query, but greater single-draw
+  overdraw can lose counts. Explicit early fragment tests combined with
+  shader discard also differ: WGSL cannot preserve the early-test request,
+  so the private attachment counts samples surviving discard. These limits
+  do not apply to the native Dawn Vulkan counting query backend.
 - Pipeline statistics of indirect draws and dispatches in memory the host
   has no copy of, which are not counted.
 - Subgroups are one invocation each: Tint reads no subgroup operations from

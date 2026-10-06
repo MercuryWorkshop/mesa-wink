@@ -48,7 +48,11 @@
 /* WebGPU's Metal occlusion query is boolean. An extra R32Float attachment
  * adds one for every sample that survives rasterization, shader discard,
  * coverage, depth and stencil, including overlapping primitives. A compute
- * pass accumulates its samples into the query's 64-bit integer result. */
+ * pass accumulates its samples into the query's 64-bit integer result.
+ * Reduction between draws bounds the floating-point accumulation to one
+ * draw: counters are exact through 2^24 fragments per pixel/sample. Greater
+ * single-draw overdraw and forced early tests with discard remain limitations
+ * of this path (see README.md). */
 WGPUTextureView
 wvk_replay_precise_attachment(struct wvk_replay *replay)
 {
