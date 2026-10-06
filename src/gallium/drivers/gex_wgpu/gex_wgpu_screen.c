@@ -22576,9 +22576,11 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
     * history, because the readback below waits on a queue that may have
     * nothing left to submit it. Stale bytes are what a dropped frame looks
     * like; a hang is not. */
-   const bool gpu_written = !ctx->failed &&
-      (gex->gpu_written ||
-       (resource->bind & (PIPE_BIND_STREAM_OUTPUT | PIPE_BIND_SHADER_BUFFER)));
+   /* Bind flags describe possible uses, not writes. Mesa gives ordinary
+    * Minecraft vertex buffers shader/feedback binds too; treating those as
+    * dirty caused a synchronous GPU readback for every u_vbuf translation.
+    * Writable shader bindings, feedback and GPU copies set gpu_written. */
+   const bool gpu_written = !ctx->failed && gex->gpu_written;
    /* Only a map that actually reads the GPU has to wait for the recorded
     * draws. A write map is served from the shadow and reaches the device at
     * unmap, so flushing here would break the batch for every streamed vertex
@@ -26907,6 +26909,20 @@ gex_wgpu_copy_buffer_region(struct pipe_context *pipe,
    }
 
    if (((src_offset | dst_offset | size) & 3u) == 0) {
+      /* A CPU-authored persistent mapping takes the whole-shadow upload
+       * path until the GPU first writes it. The caller flushed that shadow
+       * before this copy. Remember it now: seeding the diff as "everything
+       * changed" on the next flush would upload the old shadow over the
+       * copy before the mapping can be refreshed. */
+      if ((gex_dst->persistent_usage & PIPE_MAP_WRITE) &&
+          gex_dst->shadow && !gex_dst->persistent_sent) {
+         const uint32_t bytes = (uint32_t)(gex_dst->allocation_size & ~3u);
+         gex_dst->persistent_sent = MALLOC(bytes);
+         if (!gex_dst->persistent_sent)
+            return false;
+         gex_dst->persistent_sent_size = bytes;
+         memcpy(gex_dst->persistent_sent, gex_dst->shadow, bytes);
+      }
       WGPUCommandEncoder encoder =
          gex_wgpu_local_encoder(screen);
       if (!encoder)
@@ -39804,9 +39820,7 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
          45,000 submits an STK run makes: measured, that cost 54.3 FPS against
          59.8. Same predicate as the read-back below, so the two halves agree
          about which buffers the device touches. */
-      if (!(gex->gpu_written ||
-            (ctx->persistent[i]->bind &
-             (PIPE_BIND_STREAM_OUTPUT | PIPE_BIND_SHADER_BUFFER)))) {
+      if (!gex->gpu_written) {
          wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow, size);
          if (gex->bytes_written < size)
             gex->bytes_written = size;
@@ -39884,8 +39898,7 @@ gex_wgpu_refresh_persistent_maps(struct gex_wgpu_context *ctx,
          a MemoryBarrier, which is the other caller. */
       if (coherent_only && !(gex->persistent_usage & PIPE_MAP_COHERENT))
          continue;
-      if (!(gex->gpu_written ||
-            (resource->bind & (PIPE_BIND_STREAM_OUTPUT | PIPE_BIND_SHADER_BUFFER))))
+      if (!gex->gpu_written)
          continue;
       const uint32_t size = (uint32_t)(gex->allocation_size & ~3u);
       if (!size)

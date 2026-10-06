@@ -80,7 +80,16 @@ note(const char *fmt, ...)
    X(void, GenBuffers, (GLsizei, GLuint *))                                     \
    X(void, BindBuffer, (GLenum, GLuint))                                        \
    X(void, BufferData, (GLenum, GLsizeiptr, const void *, GLenum))               \
+   X(void, BufferStorage, (GLenum, GLsizeiptr, const void *, GLbitfield))        \
+   X(void *, MapBufferRange, (GLenum, GLintptr, GLsizeiptr, GLbitfield))        \
+   X(GLboolean, UnmapBuffer, (GLenum))                                         \
+   X(void, Finish, (void))                                                     \
    X(void, DeleteBuffers, (GLsizei, const GLuint *))                            \
+   X(void, GetBufferSubData, (GLenum, GLintptr, GLsizeiptr, void *))             \
+   X(void, CopyBufferSubData, (GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr))  \
+   X(void, BindBufferBase, (GLenum, GLuint, GLuint))                            \
+   X(void, DispatchCompute, (GLuint, GLuint, GLuint))                          \
+   X(void, MemoryBarrier, (GLbitfield))                                        \
    X(void, EnableVertexAttribArray, (GLuint))                                   \
    X(void, VertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)) \
    X(void, VertexAttribIPointer, (GLuint, GLint, GLenum, GLsizei, const void *)) \
@@ -396,6 +405,75 @@ norm16_filtering(void)
 }
 
 static void
+buffer_read_sources(void)
+{
+   const uint32_t original[4] = {3, 11, 29, 47};
+   uint32_t data[4] = {0};
+   GLuint buffers[2];
+   p_glGenBuffers(2, buffers);
+   p_glBindBuffer(GL_COPY_READ_BUFFER, buffers[0]);
+   p_glBufferData(GL_COPY_READ_BUFFER, sizeof(original), original, GL_STATIC_DRAW);
+   p_glGetBufferSubData(GL_COPY_READ_BUFFER, 0, sizeof(data), data);
+   CHECK(memcmp(data, original, sizeof(data)) == 0, "CPU-authored buffer read");
+
+   p_glBindBuffer(GL_COPY_WRITE_BUFFER, buffers[1]);
+   p_glBufferData(GL_COPY_WRITE_BUFFER, sizeof(data), NULL, GL_STATIC_DRAW);
+   p_glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, sizeof(data));
+   p_glGetBufferSubData(GL_COPY_WRITE_BUFFER, 0, sizeof(data), data);
+   CHECK(memcmp(data, original, sizeof(data)) == 0, "GPU-copied buffer read");
+
+   static const char *cs =
+      "#version 430 core\n"
+      "layout(local_size_x=1) in;\n"
+      "layout(std430, binding=0) buffer Data { uint values[]; };\n"
+      "void main() { values[gl_GlobalInvocationID.x] += 17u; }\n";
+   GLuint shader = compile(GL_COMPUTE_SHADER, cs), prog = p_glCreateProgram();
+   p_glAttachShader(prog, shader);
+   p_glLinkProgram(prog);
+   GLint linked = 0;
+   p_glGetProgramiv(prog, GL_LINK_STATUS, &linked);
+   CHECK(linked, "buffer read compute program linked");
+   p_glUseProgram(prog);
+   p_glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffers[1]);
+   p_glDispatchCompute(4, 1, 1);
+   p_glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+   p_glGetBufferSubData(GL_COPY_WRITE_BUFFER, 0, sizeof(data), data);
+   for (unsigned i = 0; i < 4; ++i)
+      CHECK(data[i] == original[i] + 17, "GPU-written buffer read %u: %u", i, data[i]);
+
+   GLuint persistent;
+   p_glGenBuffers(1, &persistent);
+   p_glBindBuffer(GL_COPY_READ_BUFFER, persistent);
+   const GLbitfield flags = GL_MAP_READ_BIT | GL_MAP_WRITE_BIT |
+                            GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+   p_glBufferStorage(GL_COPY_READ_BUFFER, sizeof(data), original, flags);
+   uint32_t *mapped = p_glMapBufferRange(GL_COPY_READ_BUFFER, 0, sizeof(data), flags);
+   CHECK(mapped && memcmp(mapped, original, sizeof(data)) == 0, "CPU-authored persistent read");
+   if (mapped) {
+      p_glBindBuffer(GL_COPY_READ_BUFFER, buffers[1]);
+      p_glBindBuffer(GL_COPY_WRITE_BUFFER, persistent);
+      p_glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, sizeof(data));
+      p_glMemoryBarrier(GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT);
+      p_glFinish();
+      for (unsigned i = 0; i < 4; ++i)
+         CHECK(mapped[i] == original[i] + 17, "GPU-copied persistent read %u: %u", i, mapped[i]);
+      mapped[0] = 123;
+      p_glFinish();
+      p_glGetBufferSubData(GL_COPY_WRITE_BUFFER, 0, sizeof(data), data);
+      CHECK(data[0] == 123 && data[3] == original[3] + 17,
+            "persistent CPU write preserved GPU data: %u, %u", data[0], data[3]);
+      p_glUnmapBuffer(GL_COPY_WRITE_BUFFER);
+   }
+   p_glDeleteBuffers(1, &persistent);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "buffer reads: context failed");
+   p_glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, 0);
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+   p_glDeleteShader(shader);
+   p_glDeleteBuffers(2, buffers);
+}
+
+static void
 exercise(const char *label, int api, wink_surface *surface)
 {
    wink_context_attribs ca;
@@ -492,6 +570,7 @@ exercise(const char *label, int api, wink_surface *surface)
       vertex_input_types();
       snorm_attachments();
       norm16_filtering();
+      buffer_read_sources();
    }
 
    p_glBindVertexArray(0);
