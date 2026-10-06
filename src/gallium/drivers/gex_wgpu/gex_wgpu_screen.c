@@ -2766,7 +2766,9 @@ struct gex_wgpu_shader {
    uint32_t sampler_bindings[GEX_WGPU_MAX_SAMPLERS];
    WGPUSamplerBindingType sampler_types[GEX_WGPU_MAX_SAMPLERS];
    WGPUShaderModule module;
+   /* A vertex shader's y-flipped form, made when a draw first wants it. */
    WGPUShaderModule module_y_flipped;
+   bool module_y_flipped_failed;
    nir_shader *original_nir;
    /* A clone of the vertex shader kept for building transform feedback
     * compute variants, and the variants built from it so far. */
@@ -14231,10 +14233,6 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
                                  "out of memory cloning shader");
       return NULL;
    }
-   nir_shader *flipped = (expected_stage == MESA_SHADER_VERTEX &&
-                          !shader->integer_sampled_slots &&
-                          !shader->buftex_count)
-      ? nir_shader_clone(NULL, nir) : NULL;
    char *error = NULL;
    /* Integer sampling has to be lowered against the sampler state, which is
     * only known at draw time, so the base module is not built at all and the
@@ -14285,21 +14283,11 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    else
       shader->module = gex_wgpu_compile_nir(pipe, nir, expected_stage, false,
                                             false, &error);
-   if (shader->module && expected_stage == MESA_SHADER_VERTEX) {
-      if (flipped)
-         shader->module_y_flipped = gex_wgpu_compile_nir(
-            pipe, flipped, expected_stage, true, false, &error);
-      else
-         error = strdup("out of memory cloning vertex shader");
-      flipped = NULL;
-   }
-   if ((!shader->module && !deferred_integer_sampling) ||
-       (expected_stage == MESA_SHADER_VERTEX && !deferred_integer_sampling &&
-        !shader->module_y_flipped)) {
-      if (shader->module)
-         wgpuShaderModuleRelease(shader->module);
-      if (flipped && !shader->module_y_flipped)
-         ralloc_free(flipped);
+   /* A vertex shader's y-flipped form is made the first time a draw wants
+    * it (gex_wgpu_vs_base_module): of the two, an application drawing only
+    * to its window or only to framebuffer objects wants one, and each is a
+    * Tint run, a module and a translation kept. */
+   if (!shader->module && !deferred_integer_sampling) {
       if (shader->original_nir)
          ralloc_free(shader->original_nir);
       /* Name the stage. A rejection reaches the application as a link error
@@ -14378,6 +14366,18 @@ gex_wgpu_delete_shader_state(struct pipe_context *pipe, void *state)
       wgpuShaderModuleRelease(shader->module);
    if (shader->module_y_flipped)
       wgpuShaderModuleRelease(shader->module_y_flipped);
+   /* A vertex shader's variants for what it is drawn with, which were never
+    * let go of: a module or two each, for as long as the context lived. */
+   for (struct gex_wgpu_interp_variant *iv = shader->interp_variants; iv;) {
+      struct gex_wgpu_interp_variant *next = iv->next;
+      if (iv->module)
+         wgpuShaderModuleRelease(iv->module);
+      if (iv->module_y_flipped)
+         wgpuShaderModuleRelease(iv->module_y_flipped);
+      FREE(iv);
+      iv = next;
+   }
+   shader->interp_variants = NULL;
    struct gex_wgpu_shader_variant *variant = shader->variants;
    while (variant) {
       struct gex_wgpu_shader_variant *next = variant->next;
@@ -37404,6 +37404,29 @@ gex_wgpu_tess_draw(struct gex_wgpu_context *ctx,
  * variant is keyed on the fragment stage's whole interpolation signature and
  * carries both y-flip forms, because the caller picks between those after.
  */
+/* A vertex shader's base module, y flipped or not: the flipped one made of
+ * the shader's original NIR the first time a draw wants it, as the module
+ * was when the shader was made. */
+static WGPUShaderModule
+gex_wgpu_vs_base_module(struct gex_wgpu_context *ctx, struct gex_wgpu_shader *vs, bool flipped)
+{
+   if (!flipped || !vs->module)
+      return vs->module;
+   if (!vs->module_y_flipped && !vs->module_y_flipped_failed && vs->original_nir) {
+      nir_shader *clone = nir_shader_clone(NULL, vs->original_nir);
+      char *error = NULL;
+      vs->module_y_flipped = clone ? gex_wgpu_compile_nir(&ctx->base, clone, MESA_SHADER_VERTEX, true,
+                                                          false, &error) : NULL;
+      if (!vs->module_y_flipped) {
+         vs->module_y_flipped_failed = true;
+         fprintf(stderr, "gex-wgpu: the y-flipped vertex shader failed to compile: %s\n",
+                 error ? error : "out of memory");
+      }
+      FREE(error);
+   }
+   return vs->module_y_flipped;
+}
+
 static WGPUShaderModule
 gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
                             const float viewport[6],
@@ -37411,14 +37434,14 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
 {
    struct gex_wgpu_shader *vs = ctx->vs;
    struct gex_wgpu_shader *fs = ctx->fs;
-   WGPUShaderModule plain = flipped ? vs->module_y_flipped : vs->module;
+   /* The base module, made only where it is the answer (gex_wgpu_vs_base_module):
+    * not where a variant is. */
+#define GEX_PLAIN() (want_halfz ? NULL : gex_wgpu_vs_base_module(ctx, vs, flipped))
    /* ARB_clip_control's depth mode, which Gallium carries on the rasterizer
     * state. The base module was built with the default conversion applied, so
     * it is not a legal answer for a ZERO_TO_ONE draw -- exactly as it is not
     * for an unpacked vertex format or a wide point. */
    const bool want_halfz = ctx->rasterizer && ctx->rasterizer->clip_halfz;
-   if (want_halfz)
-      plain = NULL;
    const bool fold_viewport = viewport != NULL;
    /* A vertex format WebGPU cannot fetch is delivered as a raw dword and
     * unpacked in the shader, so the module depends on the bound vertex
@@ -37498,11 +37521,11 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    if ((!fs && !fold_viewport && !unpack_attribs && !lower_textures &&
         !wide && !has_buftex) || !vs->original_nir)
    {
-      if (!plain)
+      if (!GEX_PLAIN())
          gex_wgpu_say_no_base_module(vs, "vertex", __LINE__);
       return fold_viewport || unpack_attribs || lower_textures || wide ||
              has_buftex
-         ? NULL : plain;
+         ? NULL : GEX_PLAIN();
    }
 
    const uint64_t fs_mask = fs ? fs->varying_interp_mask : 0;
@@ -37541,9 +37564,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
        !vs->has_double_inputs &&
        !vs->query_only_slots && !ctx->primitive_id_verts)
    {
-      if (!plain)
+      if (!GEX_PLAIN())
          gex_wgpu_say_no_base_module(vs, "vertex", __LINE__);
-      return plain;
+      return GEX_PLAIN();
    }
 
    /* The identity fold, matching gex_wgpu_lower_viewport_transform's use of
@@ -37572,6 +37595,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    uint8_t want_buftex[GEX_WGPU_MAX_BUFFER_TEXTURES];
    gex_wgpu_buftex_words(vs->buftex_count, vs->buftex_slots,
                          ctx->vertex_sampler_views, want_buftex);
+   struct gex_wgpu_interp_variant *found = NULL;
    for (struct gex_wgpu_interp_variant *v = vs->interp_variants; v;
         v = v->next) {
       bool match = v->mask == fs_mask && v->sampler_mask == sampler_mask &&
@@ -37614,44 +37638,54 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
          match = match && memcmp(v->swizzles[slot], swizzle,
                                  sizeof(swizzle)) == 0;
       }
-      if (match)
-         return flipped ? v->module_y_flipped : v->module;
+      if (match) {
+         WGPUShaderModule m = flipped ? v->module_y_flipped : v->module;
+         if (m)
+            return m;
+         /* Its other form, made now: each is made the first time a draw
+          * wants it, not both with the variant. */
+         found = v;
+         break;
+      }
    }
 
    struct gex_wgpu_interp_variant *variant =
-      CALLOC_STRUCT(gex_wgpu_interp_variant);
+      found ? found : CALLOC_STRUCT(gex_wgpu_interp_variant);
    if (!variant)
    {
-      if (!plain)
+      if (!GEX_PLAIN())
          gex_wgpu_say_no_base_module(vs, "vertex", __LINE__);
       return fold_viewport || unpack_attribs || wide || has_buftex
-                ? NULL : plain;
+                ? NULL : GEX_PLAIN();
    }
-   variant->mask = fs_mask;
-   variant->clip_halfz = want_halfz;
-   variant->wide = *want_wide;
-   memcpy(variant->buftex_words, want_buftex, sizeof(variant->buftex_words));
-   memcpy(variant->viewport, want, sizeof(variant->viewport));
-   memcpy(variant->attrib_unpack, want_unpack,
-          sizeof(variant->attrib_unpack));
-   variant->sampler_mask = sampler_mask;
-   for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
-      if (!(sampler_mask & (UINT64_C(1) << slot)))
-         continue;
-      if (ctx->vertex_samplers[slot])
-         variant->sampler_keys[slot] = ctx->vertex_samplers[slot]->state;
-      for (unsigned channel = 0; channel < 4; ++channel)
-         variant->swizzles[slot][channel] = gex_wgpu_effective_view_swizzle(
-            ctx->vertex_sampler_views[slot], channel);
+   if (!found) {
+      variant->mask = fs_mask;
+      variant->clip_halfz = want_halfz;
+      variant->wide = *want_wide;
+      memcpy(variant->buftex_words, want_buftex, sizeof(variant->buftex_words));
+      memcpy(variant->viewport, want, sizeof(variant->viewport));
+      memcpy(variant->attrib_unpack, want_unpack,
+             sizeof(variant->attrib_unpack));
+      variant->sampler_mask = sampler_mask;
+      for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
+         if (!(sampler_mask & (UINT64_C(1) << slot)))
+            continue;
+         if (ctx->vertex_samplers[slot])
+            variant->sampler_keys[slot] = ctx->vertex_samplers[slot]->state;
+         for (unsigned channel = 0; channel < 4; ++channel)
+            variant->swizzles[slot][channel] = gex_wgpu_effective_view_swizzle(
+               ctx->vertex_sampler_views[slot], channel);
+      }
+      if (want_interp) {
+         memcpy(variant->interp, want_interp, sizeof(variant->interp));
+         memcpy(variant->aux, want_aux, sizeof(variant->aux));
+      }
+      if (want_components)
+         memcpy(variant->components, want_components,
+                sizeof(variant->components));
    }
-   if (want_interp) {
-      memcpy(variant->interp, want_interp, sizeof(variant->interp));
-      memcpy(variant->aux, want_aux, sizeof(variant->aux));
-   }
-   if (want_components)
-      memcpy(variant->components, want_components,
-             sizeof(variant->components));
-   for (unsigned pass = 0; pass < 2; ++pass) {
+   /* The form the draw wants, of y flipped or not. */
+   for (unsigned pass = flipped; pass == (unsigned)flipped; ++pass) {
       nir_shader *clone = nir_shader_clone(NULL, vs->original_nir);
       if (!clone)
          break;
@@ -37808,12 +37842,10 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       else
          variant->module_y_flipped = module;
    }
-   if (!variant->module || !variant->module_y_flipped) {
-      if (variant->module)
-         wgpuShaderModuleRelease(variant->module);
-      if (variant->module_y_flipped)
-         wgpuShaderModuleRelease(variant->module_y_flipped);
-      FREE(variant);
+   if (!(flipped ? variant->module_y_flipped : variant->module)) {
+      /* One kept in the list already keeps the form it has. */
+      if (!found)
+         FREE(variant);
       static bool said;
       if (!said) {
          said = true;
@@ -37821,21 +37853,24 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
                          "(interpolation, viewport, attribute unpack or "
                          "integer sampling)\n");
       }
-      if (!plain)
+      if (!GEX_PLAIN())
          gex_wgpu_say_no_base_module(vs, "vertex", __LINE__);
       return fold_viewport || unpack_attribs || lower_textures || wide ||
              has_buftex
-         ? NULL : plain;
+         ? NULL : GEX_PLAIN();
    }
-   variant->clip_dist_for = want_clip_dist;
-   variant->inv_w_location = want_inv_w;
-   variant->primitive_id_location = want_pid;
-   variant->primitive_id_verts = want_pid_verts;
-   variant->clip_carrier[0] = want_clip_carrier[0];
-   variant->clip_carrier[1] = want_clip_carrier[1];
-   variant->next = vs->interp_variants;
-   vs->interp_variants = variant;
+   if (!found) {
+      variant->clip_dist_for = want_clip_dist;
+      variant->inv_w_location = want_inv_w;
+      variant->primitive_id_location = want_pid;
+      variant->primitive_id_verts = want_pid_verts;
+      variant->clip_carrier[0] = want_clip_carrier[0];
+      variant->clip_carrier[1] = want_clip_carrier[1];
+      variant->next = vs->interp_variants;
+      vs->interp_variants = variant;
+   }
    return flipped ? variant->module_y_flipped : variant->module;
+#undef GEX_PLAIN
 }
 
 /* GL's default generic vertex attribute, (0, 0, 0, 1), in both a float and an
