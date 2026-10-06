@@ -1,0 +1,49 @@
+{
+  "godot-gles": {
+    "command": ["/opt/apps/godot", "--audio-driver", "Dummy", "--path", "/work/godot-project", "--rendering-method", "gl_compatibility", "--rendering-driver", "opengl3_es", "--fixed-fps", "30", "--disable-vsync"],
+    "required_log": ["WINK_FIXTURE godot complete", "OpenGL ES"],
+    "min_frames": 4
+  },
+  "godot-mobile": {
+    "command": ["/opt/apps/godot", "--audio-driver", "Dummy", "--path", "/work/godot-project", "--rendering-method", "mobile", "--rendering-driver", "vulkan", "--fixed-fps", "30", "--disable-vsync"],
+    "required_log": ["WINK_FIXTURE godot complete", "Vulkan"],
+    "checkpoints": "8,32,64,90"
+  },
+  "godot-forward-plus": {
+    "command": ["/opt/apps/godot", "--audio-driver", "Dummy", "--path", "/work/godot-project", "--rendering-method", "forward_plus", "--rendering-driver", "vulkan", "--fixed-fps", "30", "--disable-vsync"],
+    "required_log": ["WINK_FIXTURE godot complete", "Vulkan"],
+    "checkpoints": "8,32,64,90"
+  },
+  "qtquick-gles": {
+    "command": ["/opt/apps/wink-qt-fixture"],
+    "env": {"QSG_RHI_BACKEND": "opengl", "QT_XCB_GL_INTEGRATION": "xcb_egl", "QT_OPENGL": "es2", "QSG_INFO": "1"},
+    "required_log": ["WINK_FIXTURE qtquick complete"],
+    "min_frames": 4
+  },
+  "filament-gles": {
+    "command": ["/opt/apps/gltf_viewer", "--api", "opengl", "--headless", "--ibl", "/opt/apps/filament-assets/ibl/lightroom_14b", "--batch", "/fixtures/filament/batch.json", "--screenshot-as-ppm"],
+    "min_frames": 4
+  },
+  "filament-vulkan": {
+    "command": ["/opt/apps/gltf_viewer", "--api", "vulkan", "--ibl", "/opt/apps/filament-assets/ibl/lightroom_14b", "--batch", "/fixtures/filament/batch.json", "--screenshot-as-ppm"],
+    "checkpoints": "8,32,64,90"
+  },
+  "ppsspp-gles": {
+    "command": ["/opt/apps/PPSSPPSDL", "--appendconfig=/fixtures/ppsspp/gles.ini", "/opt/apps/psp-demos/3dstudio.prx"],
+    "env": {"WINK_FIXTURE_FRAMES": "96", "SDL_VIDEO_X11_FORCE_EGL": "1"},
+    "required_log": ["WINK_FIXTURE ppsspp complete backend=0"],
+    "min_frames": 4
+  },
+  "ppsspp-vulkan": {
+    "command": ["/opt/apps/PPSSPPSDL", "--appendconfig=/fixtures/ppsspp/vulkan.ini", "/opt/apps/psp-demos/3dstudio.prx"],
+    "env": {"WINK_FIXTURE_FRAMES": "96"},
+    "required_log": ["WINK_FIXTURE ppsspp complete backend=3"],
+    "checkpoints": "8,32,64,90"
+  },
+  "qtquick-vulkan": {
+    "command": ["/opt/apps/wink-qt-fixture"],
+    "env": {"QSG_RHI_BACKEND": "vulkan", "QSG_INFO": "1"},
+    "required_log": ["WINK_FIXTURE qtquick complete"],
+    "checkpoints": "8,16,32,48"
+  }
+}

@@ -1,0 +1,244 @@
+{
+  "schema": 1,
+  "minecraft": "1.21.1",
+  "assets": {
+    "iris": {
+      "project": "iris",
+      "version": "zsoi0dso",
+      "version_number": "1.8.8+1.21.1-fabric",
+      "filename": "iris-fabric-1.8.8+mc1.21.1.jar",
+      "url": "https://cdn.modrinth.com/data/YL57xq9U/versions/zsoi0dso/iris-fabric-1.8.8%2Bmc1.21.1.jar",
+      "hashes": {
+        "sha512": "2e6ba2ffa1e1a6799288245a7e0ac68ee8df1d41b98362189df58f535cae34fa9277801e4136633467341b7dae5be0e5c698011b480b3d91b66d3dd4f7567aa6"
+      },
+      "dependencies": [
+        {
+          "version_id": null,
+          "project_id": "AANobbMI",
+          "file_name": null,
+          "dependency_type": "required"
+        }
+      ]
+    },
+    "sodium": {
+      "project": "sodium",
+      "version": "u1OEbNKx",
+      "version_number": "mc1.21.1-0.6.13-fabric",
+      "filename": "sodium-fabric-0.6.13+mc1.21.1.jar",
+      "url": "https://cdn.modrinth.com/data/AANobbMI/versions/u1OEbNKx/sodium-fabric-0.6.13%2Bmc1.21.1.jar",
+      "hashes": {
+        "sha512": "13032e064c554fc8671573dadb07bc70e6ea2f68706c65c086c4feb1d2f664346a3414cbf9d1367b42b8d063a35e40f2f967ef9af31642e1f0093b852161fe91"
+      },
+      "dependencies": []
+    },
+    "fabric-api": {
+      "project": "fabric-api",
+      "version": "Mys3P7lK",
+      "version_number": "0.116.17+1.21.1",
+      "filename": "fabric-api-0.116.17+1.21.1.jar",
+      "url": "https://cdn.modrinth.com/data/P7dR8mSH/versions/Mys3P7lK/fabric-api-0.116.17%2B1.21.1.jar",
+      "hashes": {
+        "sha512": "98c478217da19181f0e4df3ea6c2da6bdbda271c7544a4aea048513a49b444f1ff5b71dc0df6303017c48e8ff69b7bb6af6179bdf0d0e09ab3c1ee08411857a8"
+      },
+      "dependencies": []
+    },
+    "complementary-reimagined": {
+      "project": "complementary-reimagined",
+      "version": "Bqen1mJX",
+      "version_number": "r5.9.3",
+      "filename": "ComplementaryReimagined_r5.9.3.zip",
+      "url": "https://cdn.modrinth.com/data/HVnmMxH1/versions/Bqen1mJX/ComplementaryReimagined_r5.9.3.zip",
+      "hashes": {
+        "sha512": "45304b1d7862afdb2177b7e6226fc9c6737911d17a4ad46cc9c519ca4deb935f05072cd337cd8b19a15bb8062b57b54eceec7bdee4cd572d94858e2946d37d85"
+      },
+      "dependencies": []
+    },
+    "complementary-unbound": {
+      "project": "complementary-unbound",
+      "version": "B1kyfoUZ",
+      "version_number": "r5.9.3",
+      "filename": "ComplementaryUnbound_r5.9.3.zip",
+      "url": "https://cdn.modrinth.com/data/R6NEzAwj/versions/B1kyfoUZ/ComplementaryUnbound_r5.9.3.zip",
+      "hashes": {
+        "sha512": "a085d1d8cda67cd17a2b414eeba48bbd809da069f269bab46246235ec8fe714a275013c70d0504527b0987d810deddddba4564332414ab3b3bd7435932ff808c"
+      },
+      "dependencies": []
+    },
+    "bsl-shaders": {
+      "project": "bsl-shaders",
+      "version": "Y68yiql9",
+      "version_number": "10.1.8",
+      "filename": "BSL_v10.1.8.zip",
+      "url": "https://cdn.modrinth.com/data/Q1vvjJYV/versions/Y68yiql9/BSL_v10.1.8.zip",
+      "hashes": {
+        "sha512": "94a3c25d6820868db624e11347873e6b572e7cd571967d9ac6f4690ca5d37ca302a7645d85eec800e0654541e3825fba14d37b5a25d3996aaf038178552be26f"
+      },
+      "dependencies": []
+    },
+    "sildurs-vibrant-shaders": {
+      "project": "sildurs-vibrant-shaders",
+      "version": "J4RlzpKF",
+      "version_number": "2.02",
+      "filename": "Sildur's Vibrant Shaders v2.02 Extreme.zip",
+      "url": "https://cdn.modrinth.com/data/z8EjLYqN/versions/J4RlzpKF/Sildur%27s%20Vibrant%20Shaders%20v2.02%20Extreme.zip",
+      "hashes": {
+        "sha512": "da6d9cfdfaedfe96741f7b61d69a650d4b2f7a02f744b9e0935873135b9b9fff74ea73c44c74c22c828e7a42783e25db767d5ef867d47f4d907e5aedb1294971"
+      },
+      "dependencies": []
+    },
+    "makeup-ultra-fast-shaders": {
+      "project": "makeup-ultra-fast-shaders",
+      "version": "pgb0JjoN",
+      "version_number": "9.5g",
+      "filename": "MakeUp-UltraFast-9.5g.zip",
+      "url": "https://cdn.modrinth.com/data/izsIPI7a/versions/pgb0JjoN/MakeUp-UltraFast-9.5g.zip",
+      "hashes": {
+        "sha512": "90a2f75eb073eaae5fe65f2ea5f8d656c122760c07ff75306728df4b162c42f88be531f026d174e035fea153f0ac5e227e8885d8b199335d3beadb6a58f79239"
+      },
+      "dependencies": []
+    },
+    "bliss-shader": {
+      "project": "bliss-shader",
+      "version": "kC2Y8q1P",
+      "version_number": "2.1.2",
+      "filename": "Bliss_v2.1.2_(Chocapic13_Shaders_edit).zip",
+      "url": "https://cdn.modrinth.com/data/ZvMtQlho/versions/kC2Y8q1P/Bliss_v2.1.2_%28Chocapic13_Shaders_edit%29.zip",
+      "hashes": {
+        "sha512": "dafc60be4980ec40f40edc0f2625cb0976f3c9ce5ed86383146a120480826bb1de70ef5e38b7f1437294ed4d38c6ef3c82ebef0ae4e00b8cee165788c9c18280"
+      },
+      "dependencies": []
+    },
+    "photon-shader": {
+      "project": "photon-shader",
+      "version": "gUv7fBPN",
+      "version_number": "v1.3b",
+      "filename": "photon_v1.3b.zip",
+      "url": "https://cdn.modrinth.com/data/lLqFfGNs/versions/gUv7fBPN/photon_v1.3b.zip",
+      "hashes": {
+        "sha512": "40bcbac9c656f2965f543e4b35cd0698723b2db8b67662f1b53c14223cfbef7d60d7fbf0176f73fcadd0d1e19ba60d951ed77e9eece8c8df7dca4d2be6315309"
+      },
+      "dependencies": []
+    },
+    "rethinking-voxels": {
+      "project": "rethinking-voxels",
+      "version": "cpD4esk9",
+      "version_number": "r0.1-beta9",
+      "filename": "rethinking-voxels_r0.1-beta9.zip",
+      "url": "https://cdn.modrinth.com/data/kmwfVOoi/versions/cpD4esk9/rethinking-voxels_r0.1-beta9.zip",
+      "hashes": {
+        "sha512": "1e32f41e67e527c3c60149677a05b61c6d305e440812e29abba745b8ed304954780ca48d58b834c49835790bc3c4d38f37c893c5cbdfea9edc07b72e1dabd296"
+      },
+      "dependencies": []
+    },
+    "solas-shader": {
+      "project": "solas-shader",
+      "version": "KcfQaN5J",
+      "version_number": "3.7b",
+      "filename": "Solas Shader V3.7b.zip",
+      "url": "https://cdn.modrinth.com/data/EpQFjzrQ/versions/KcfQaN5J/Solas%20Shader%20V3.7b.zip",
+      "hashes": {
+        "sha512": "5c184091c2d9b1d8ee0f4f7eb720fdcd9e2f4aea5a0d7a425927f205ee6d1a3577ad1411176d3705b5945e1f39d81a50cac479ed6f2054d49d90a6002f2878d9"
+      },
+      "dependencies": []
+    },
+    "astralex": {
+      "project": "astralex",
+      "version": "qSbtQS2o",
+      "version_number": "93.0",
+      "filename": "\u00a7r\u00a7lAstra\u00a74\u00a7lLex\u00a7r\u00a7l_By_LexBoosT_\u00a74\u00a7lV93.0\u00a7r\u00a7l.zip",
+      "url": "https://cdn.modrinth.com/data/RphJSnEs/versions/qSbtQS2o/%C2%A7r%C2%A7lAstra%C2%A74%C2%A7lLex%C2%A7r%C2%A7l_By_LexBoosT_%C2%A74%C2%A7lV93.0%C2%A7r%C2%A7l.zip",
+      "hashes": {
+        "sha512": "171131e16b65af67c3ed2fe75f3bde9d81f66b4e921ba3ca33187cff7c87b40e1f21637e95e2fa3a1567b0717374809b18adc240c5ef74622c8e9317ecc14f9d"
+      },
+      "dependencies": []
+    },
+    "nostalgia-shader": {
+      "project": "nostalgia-shader",
+      "version": "fzxeGgx7",
+      "version_number": "5.1",
+      "filename": "Nostalgia_v5.1.zip",
+      "url": "https://cdn.modrinth.com/data/xEItlMn3/versions/fzxeGgx7/Nostalgia_v5.1.zip",
+      "hashes": {
+        "sha512": "9a15161da2e360bcc446bfeb5163a2b4e70e49b46545ccbdde05540a46d861a7a378c243769faeabca76019e75cb1e55b1b2c04f74b8aaa23b86d436ebbb034c"
+      },
+      "dependencies": []
+    },
+    "super-duper-vanilla": {
+      "project": "super-duper-vanilla",
+      "version": "KB0sOLSc",
+      "version_number": "1.3.8",
+      "filename": "superDuperVanilla.zip",
+      "url": "https://cdn.modrinth.com/data/LMIZZNxZ/versions/KB0sOLSc/superDuperVanilla.zip",
+      "hashes": {
+        "sha512": "231b47716d5dab68fd1409c65750589c234d4d63312b3f8634342477686ae6db88edb9ecc3c5662fca245e71b16f16e2933e50751d13d5b06e7d3e26f8d9ebaf"
+      },
+      "dependencies": []
+    },
+    "shrimple": {
+      "project": "shrimple",
+      "version": "tAx0UOBX",
+      "version_number": "v0.12",
+      "filename": "Shrimple_v0.12.zip",
+      "url": "https://cdn.modrinth.com/data/BS9T99lD/versions/tAx0UOBX/Shrimple_v0.12.zip",
+      "hashes": {
+        "sha512": "f294a570889be5397e3b21bdf7376b0dfc30b3ab0adf03ce994e682605374484b6fea4d2d0f6c4b83c54f2787dcc6d2b3a8387fe3dc4b7cb5ca7915d21d1fcd1"
+      },
+      "dependencies": []
+    },
+    "vanilla-plus-shader": {
+      "project": "vanilla-plus-shader",
+      "version": "U3rhmRqW",
+      "version_number": "3.3",
+      "filename": "VanillaPlus_v3.3.zip",
+      "url": "https://cdn.modrinth.com/data/EPsIYDj1/versions/U3rhmRqW/VanillaPlus_v3.3.zip",
+      "hashes": {
+        "sha512": "b9ef99f06781fd0c0b867e4415bee2020dbc6ad4538c87f176c76e4b8528a1df56aaf22c0c30624f3c68a230970c83c70e1e04fdc733289f7acf1238abca66d9"
+      },
+      "dependencies": []
+    },
+    "miniature-shader": {
+      "project": "miniature-shader",
+      "version": "LWmZ94RG",
+      "version_number": "2.19",
+      "filename": "miniature-shader-2.19.zip",
+      "url": "https://cdn.modrinth.com/data/UaS8ROxa/versions/LWmZ94RG/miniature-shader-2.19.zip",
+      "hashes": {
+        "sha512": "bc2d9f3d135e8608f4735e5372b893e17cdc630b7536ec1e0b9a4d2734167d1a2102e60de60731d21d8a9741cec1a82530d03bf634b7e7cf9a0f107077c0e7fa"
+      },
+      "dependencies": []
+    },
+    "simply-upscaled": {
+      "project": "simply-upscaled",
+      "version": "5tWalPaN",
+      "version_number": "0.4.5",
+      "filename": "Simply_Upscaled (v0.4.5).zip",
+      "url": "https://cdn.modrinth.com/data/yhuqxlbn/versions/5tWalPaN/Simply_Upscaled%20%28v0.4.5%29.zip",
+      "hashes": {
+        "sha512": "8dbdcdba4174db552f4b457e5bb4ae2aa368987b828f14dd9aa496657598313ff861a6224f6fb83f5df46ea194612dd9af62771301cf3f25285df7c8c24e75bc"
+      },
+      "dependencies": []
+    },
+    "potato-shaders": {
+      "project": "potato-shaders",
+      "version": "eFL8xOji",
+      "version_number": "1.0d",
+      "filename": "PotatoShaders_v1.0d.zip",
+      "url": "https://cdn.modrinth.com/data/WX4iF5Cj/versions/eFL8xOji/PotatoShaders_v1.0d.zip",
+      "hashes": {
+        "sha512": "acac7b3bda7257a037378bb772c1d93fdc472c97097b6f5811f81ff490b5aa520a72048504ebd31f68756b457259aca7d2be4b8ddb0185584960de1fbfca2de9"
+      },
+      "dependencies": []
+    },
+    "drdestens-shaders": {
+      "project": "drdestens-shaders",
+      "version": "tAWPqD40",
+      "version_number": "2.1.5",
+      "filename": "DrDestens MinecraftShaders v2.1.5.zip",
+      "url": "https://cdn.modrinth.com/data/4kHmJd4i/versions/tAWPqD40/DrDestens%20MinecraftShaders%20v2.1.5.zip",
+      "hashes": {
+        "sha512": "2c3edabd70a2ea3bd074c1d0765df4f49dd14d56a647b35074b7ff3fca11b9a0bc7f27d6e45707672ccd75c953ba0c3a5f2fbd16a8bbff264f56df7a4f289eb6"
+      },
+      "dependencies": []
+    }
+  }
+}

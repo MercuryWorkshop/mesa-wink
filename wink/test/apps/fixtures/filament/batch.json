@@ -1,0 +1,5 @@
+[
+  {"name": "opaque", "base": {"view.postProcessingEnabled": true, "view.antiAliasing": "NONE"}},
+  {"name": "taa", "base": {"view.taa.enabled": true}},
+  {"name": "ssao", "base": {"view.ssao.enabled": true}}
+]

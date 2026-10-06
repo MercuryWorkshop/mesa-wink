@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "minecraft": "1.21.1",
+  "fabric_loader": "0.16.14",
+  "mods": ["iris", "sodium", "fabric-api"],
+  "mod_version_prefixes": {"sodium": "mc1.21.1-0.6."},
+  "shaderpacks": [
+    "complementary-reimagined", "complementary-unbound", "bsl-shaders",
+    "sildurs-vibrant-shaders",
+    "makeup-ultra-fast-shaders", "bliss-shader", "photon-shader", "rethinking-voxels",
+    "solas-shader", "astralex", "nostalgia-shader", "super-duper-vanilla",
+    "shrimple", "vanilla-plus-shader", "miniature-shader", "simply-upscaled",
+    "potato-shaders", "drdestens-shaders"
+  ],
+  "manual_shaderpacks": [
+    {"id": "sildurs-enhanced-default", "publisher": "https://sildurs-shaders.github.io/", "reason": "Supply publisher ZIP with --manual."},
+    {"id": "chocapic13-shaders", "publisher": "https://www.curseforge.com/minecraft/shaders/chocapic13-shaders", "reason": "Supply publisher ZIP with --manual."},
+    {"id": "seus-renewed", "publisher": "https://www.sonicether.com/seus/", "reason": "Publisher distribution; supply a local ZIP with --manual."},
+    {"id": "kuda", "publisher": "https://dedelner.net/", "reason": "Publisher distribution; supply a local ZIP with --manual."},
+    {"id": "projectluma", "publisher": "https://dedelner.net/", "reason": "Publisher distribution; supply a local ZIP with --manual."}
+  ],
+  "scenes": ["day", "night", "rain", "water", "nether", "end", "motion", "labpbr"],
+  "presets": ["default", "stress"],
+  "resolution": [640, 360],
+  "render_distance": 8,
+  "world_seed": 8675309,
+  "applications": [
+    {"id": "godot-gles", "api": "gles", "fixture": "godot", "args": ["--rendering-method", "gl_compatibility", "--rendering-driver", "opengl3_es"], "tier": "fast"},
+    {"id": "godot-mobile", "api": "vulkan", "fixture": "godot", "args": ["--rendering-method", "mobile", "--rendering-driver", "vulkan"], "tier": "fast"},
+    {"id": "godot-forward-plus", "api": "vulkan", "fixture": "godot", "args": ["--rendering-method", "forward_plus", "--rendering-driver", "vulkan"], "tier": "full"},
+    {"id": "filament-gles", "api": "gles", "fixture": "filament-renderdiff", "tier": "fast"},
+    {"id": "filament-vulkan", "api": "vulkan", "fixture": "filament-renderdiff", "tier": "fast"},
+    {"id": "ppsspp-gles", "api": "gles", "fixture": "pspautotests", "tier": "full"},
+    {"id": "ppsspp-vulkan", "api": "vulkan", "fixture": "pspautotests", "tier": "full"},
+    {"id": "qtquick-gles", "api": "gles", "fixture": "qtquick", "tier": "fast", "policy": {"regions": [{"name": "text", "box": [20,290,600,325]}, {"name": "clip-and-thin-border", "box": [370,60,590,210]}]}},
+    {"id": "qtquick-vulkan", "api": "vulkan", "fixture": "qtquick", "tier": "fast", "policy": {"regions": [{"name": "text", "box": [20,290,600,325]}, {"name": "clip-and-thin-border", "box": [370,60,590,210]}]}}
+  ]
+}

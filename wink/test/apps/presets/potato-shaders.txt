@@ -1,0 +1,7 @@
+# Options declared by the pinned Potato shaders/settings.glsl and waterWaves.glsl.
+DoFToggle=true
+DoFQuality=2
+motionblurToggle=true
+motionblurSamples=20
+waterNormalOctaves=8
+directionalSSAO=true
