@@ -5874,49 +5874,77 @@ pull_divided_attributes(nir_shader *nir, const struct vk_graphics_pipeline_state
 
 /* The viewport transform from the driver's data: a vertex shader's
  * position is scaled and moved to where Vulkan's viewport would have put
- * it, WebGPU's being kept inside the attachments. See set_viewport_scissor. */
+ * it, WebGPU's being kept inside the attachments. See set_viewport_scissor.
+ * And of the one rasterized, y negated -- Vulkan's being down, WebGPU's up
+ * -- but for a viewport of negative height, which flips it back, as the
+ * driver's data says: one shader for both, not one compiled for each.
+ *
+ * Of the position as the shader leaves it, once, at its end: not at each
+ * store, which a shader that stores it, reads it back and stores it again
+ * -- a mesh shader's draw's, putting culled primitives out of sight --
+ * had transformed twice, and flipped back. */
 static bool
-lower_viewport_transform(nir_shader *nir)
+lower_viewport_transform(nir_shader *nir, bool rasterized)
 {
    if (nir->info.stage != MESA_SHADER_VERTEX)
       return false;
-   bool progress = false;
-   nir_foreach_function_impl(impl, nir) {
-      nir_builder b = nir_builder_create(impl);
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr_safe(instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-            if (intr->intrinsic != nir_intrinsic_store_deref)
-               continue;
-            nir_variable *var = nir_intrinsic_get_var(intr, 0);
-            if (!var || var->data.mode != nir_var_shader_out || var->data.location != VARYING_SLOT_POS)
-               continue;
-            b.cursor = nir_before_instr(instr);
-            nir_def *t = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
-                                       nir_imm_int(&b, WVK_DRIVER_DATA_OFFSET), .align_mul = 16,
-                                       .access = ACCESS_NON_WRITEABLE);
-            nir_def *pos = intr->src[1].ssa;
-            nir_def *w = nir_channel(&b, pos, 3);
-            nir_def *x = nir_ffma(&b, nir_channel(&b, pos, 0), nir_channel(&b, t, 0),
-                                  nir_fmul(&b, w, nir_channel(&b, t, 1)));
-            nir_def *y = nir_ffma(&b, nir_channel(&b, pos, 1), nir_channel(&b, t, 2),
-                                  nir_fmul(&b, w, nir_channel(&b, t, 3)));
-            /* Depth: w - z where Vulkan's range is inverted, which WebGPU's
-             * cannot be. */
-            nir_def *d = nir_load_ssbo(&b, 2, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
-                                       nir_imm_int(&b, WVK_DRIVER_DEPTH_OFFSET), .align_mul = 16,
-                                       .access = ACCESS_NON_WRITEABLE);
-            nir_def *z = nir_ffma(&b, nir_channel(&b, pos, 2), nir_channel(&b, d, 0),
-                                  nir_fmul(&b, w, nir_channel(&b, d, 1)));
-            nir_src_rewrite(&intr->src[1], nir_vec4(&b, x, y, z, w));
-            progress = true;
+   nir_variable *var = nir_find_variable_with_location(nir, nir_var_shader_out, VARYING_SLOT_POS);
+   if (!var || glsl_get_components(var->type) != 4)
+      return false;
+   NIR_PASS(_, nir, nir_lower_returns);
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   /* The shader's position is a variable of its own, which what it stores
+    * and loads of it are of; the output is stored once, at the end, of
+    * that, transformed. What makes outputs records of a stage run as
+    * compute after this sees that one store, and no load of an output. */
+   /* None, of a stage run as compute whose outputs are its records by now:
+    * nothing to do, and no store to make its output live again. */
+   nir_variable *temp = NULL;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_deref)
+            continue;
+         nir_deref_instr *deref = nir_instr_as_deref(instr);
+         if (deref->deref_type == nir_deref_type_var) {
+            if (deref->var == var) {
+               if (!temp)
+                  temp = nir_local_variable_create(impl, var->type, "wvk_position");
+               deref->var = temp;
+               deref->modes = nir_var_function_temp;
+            }
+         } else if (temp && deref->deref_type != nir_deref_type_cast &&
+                    nir_deref_instr_get_variable(deref) == temp) {
+            deref->modes = nir_var_function_temp;
          }
       }
-      nir_progress(progress, impl, nir_metadata_control_flow);
    }
-   return progress;
+   if (!temp)
+      return nir_progress(true, impl, nir_metadata_none);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   nir_def *t = nir_load_ssbo(&b, 4, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                              nir_imm_int(&b, WVK_DRIVER_DATA_OFFSET), .align_mul = 16,
+                              .access = ACCESS_NON_WRITEABLE);
+   nir_def *pos = nir_load_var(&b, temp);
+   nir_def *w = nir_channel(&b, pos, 3);
+   nir_def *x = nir_ffma(&b, nir_channel(&b, pos, 0), nir_channel(&b, t, 0),
+                         nir_fmul(&b, w, nir_channel(&b, t, 1)));
+   nir_def *y = nir_ffma(&b, nir_channel(&b, pos, 1), nir_channel(&b, t, 2),
+                         nir_fmul(&b, w, nir_channel(&b, t, 3)));
+   if (rasterized) {
+      nir_def *unflipped = nir_load_ssbo(&b, 1, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                                         nir_imm_int(&b, WVK_DRIVER_UNFLIPPED), .align_mul = 4,
+                                         .access = ACCESS_NON_WRITEABLE);
+      y = nir_bcsel(&b, nir_ine_imm(&b, unflipped, 0), y, nir_fneg(&b, y));
+   }
+   /* Depth: w - z where Vulkan's range is inverted, which WebGPU's
+    * cannot be. */
+   nir_def *d = nir_load_ssbo(&b, 2, 32, driver_buffer(&b, WVK_DRIVER_SLOT_PUSH),
+                              nir_imm_int(&b, WVK_DRIVER_DEPTH_OFFSET), .align_mul = 16,
+                              .access = ACCESS_NON_WRITEABLE);
+   nir_def *z = nir_ffma(&b, nir_channel(&b, pos, 2), nir_channel(&b, d, 0),
+                         nir_fmul(&b, w, nir_channel(&b, d, 1)));
+   nir_store_var(&b, var, nir_vec4(&b, x, y, z, w), 0xf);
+   return nir_progress(true, impl, nir_metadata_none);
 }
 
 static bool
@@ -5946,7 +5974,9 @@ lower_buffers_to_words(nir_shader *nir, const struct vk_shader_compile_info *inf
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo | nir_var_mem_ssbo,
             nir_address_format_32bit_index_offset);
    NIR_PASS(_, nir, wvk_nir_lower_atomic64);
-   NIR_PASS(_, nir, lower_viewport_transform);
+   /* What runs as compute is not rasterized itself: what is after it is. */
+   NIR_PASS(_, nir, lower_viewport_transform,
+            !shader->key.runs && shader->key.geometry != 1 && shader->key.tess != 1);
    /* Before the draw parameters: pulling reads BaseInstance. */
    NIR_PASS(_, nir, pull_divided_attributes, state, shader);
    if (nir->info.stage == MESA_SHADER_VERTEX) {
@@ -8074,31 +8104,18 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
 
    shader->strict_math = has_no_contract(nir);
 
-   /* A vertex shader twice: as Vulkan's y needs, and flipped back for a
-    * viewport of negative height. */
-   nir_shader *unflipped = stage == MESA_SHADER_VERTEX ? nir_shader_clone(NULL, nir) : NULL;
+   /* Y is the driver's data's to flip, or not (lower_viewport_transform):
+    * a vertex shader is compiled once, for viewports of either sign. */
    struct gex_wgpu_wgsl_info wi;
    char *error = NULL;
-   shader->wgsl[WVK_SHADER_FLIPPED] =
-      gex_wgpu_nir_to_wgsl(nir, stage, stage == MESA_SHADER_VERTEX, true, &wi, &error);
+   shader->wgsl[WVK_SHADER_FLIPPED] = gex_wgpu_nir_to_wgsl(nir, stage, false, true, &wi, &error);
    nir = NULL;
    if (!shader->wgsl[WVK_SHADER_FLIPPED]) {
-      ralloc_free(unflipped);
       mesa_loge("wvk: %s shader compile failed: %s", _mesa_shader_stage_to_string(stage),
                 error ? error : "?");
       result = vk_errorf(dev, VK_ERROR_UNKNOWN, "shader compile failed: %s", error ? error : "?");
       free(error);
       goto fail;
-   }
-   if (unflipped) {
-      struct gex_wgpu_wgsl_info wi2;
-      shader->wgsl[WVK_SHADER_UNFLIPPED] =
-         gex_wgpu_nir_to_wgsl(unflipped, stage, false, true, &wi2, &error);
-      if (!shader->wgsl[WVK_SHADER_UNFLIPPED]) {
-         result = vk_errorf(dev, VK_ERROR_UNKNOWN, "shader compile failed: %s", error ? error : "?");
-         free(error);
-         goto fail;
-      }
    }
    util_dynarray_foreach(&bgra, uint32_t, at) {
       for (uint32_t i = 0; i < WVK_SHADER_VARIANTS; ++i)

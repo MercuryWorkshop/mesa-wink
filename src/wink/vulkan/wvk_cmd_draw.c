@@ -871,7 +871,7 @@ create_render_pipeline(struct wvk_device *dev, const struct wvk_render_key *k,
    WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
    desc.label = wvk_sv("wvk render pipeline");
    desc.layout = layout->layout;
-   desc.vertex.module = vs->module[k->variant] ? vs->module[k->variant] : vs->module[0];
+   desc.vertex.module = vs->module[0];
    desc.vertex.entryPoint = wvk_sv("main");
    desc.vertex.bufferCount = k->vb_count;
    desc.vertex.buffers = buffers;
@@ -2477,8 +2477,9 @@ build_render_key(struct wvk_cmd_buffer *cmd, bool indexed, struct wvk_render_key
    memset(k, 0, sizeof(*k));
    k->vs = st->vs->id;
    k->fs = st->fs ? st->fs->id : 0;
-   k->variant = dyn->vp.viewport_count && dyn->vp.viewports[0].height < 0 ? WVK_SHADER_UNFLIPPED
-                                                                        : WVK_SHADER_FLIPPED;
+   /* Of either sign of viewport: the vertex shader flips y as the
+    * driver's data says (set_viewport_scissor). */
+   k->variant = WVK_SHADER_FLIPPED;
 
    /* Vertex input: only what the shader reads, and bindings as WebGPU
     * slots of the same number. */
@@ -2695,6 +2696,13 @@ set_viewport_scissor(struct wvk_cmd_buffer *cmd, WGPURenderPassEncoder pass)
    const uint32_t index = cmd->replay->draw_viewport;
    if (memcmp(st->push + WVK_DRIVER_VIEWPORT, &index, 4)) {
       memcpy(st->push + WVK_DRIVER_VIEWPORT, &index, 4);
+      st->push_offset = UINT32_MAX;
+   }
+   /* Whether the vertex shader leaves y as it is, for a viewport of
+    * negative height (lower_viewport_transform). */
+   const uint32_t unflipped = !st->pipeline_flipped;
+   if (memcmp(st->push + WVK_DRIVER_UNFLIPPED, &unflipped, 4)) {
+      memcpy(st->push + WVK_DRIVER_UNFLIPPED, &unflipped, 4);
       st->push_offset = UINT32_MAX;
    }
    if (dyn->vp.viewport_count) {
@@ -3087,7 +3095,7 @@ flush_draw(struct wvk_cmd_buffer *cmd, bool indexed)
       wgpuRenderPassEncoderSetPipeline(pass, p->pipeline);
       st->pipeline = p->pipeline;
    }
-   st->pipeline_flipped = p->key.variant == WVK_SHADER_FLIPPED;
+   st->pipeline_flipped = !(dyn->vp.viewport_count && dyn->vp.viewports[0].height < 0);
    /* Before the bind groups: they write the driver's data among the push
     * constants. */
    set_viewport_scissor(cmd, pass);

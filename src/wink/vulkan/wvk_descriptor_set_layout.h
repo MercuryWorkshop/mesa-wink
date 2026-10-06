@@ -243,7 +243,9 @@ enum wvk_texel_type {
  *   - for points drawn as quads, 1 over the viewport's width and height,
  *     2 floats; and where an indexed draw's indices start in the index
  *     binding, in bytes, their size, 0 for a draw without, and whether
- *     its primitives restart, 3 uints;
+ *     its primitives restart, 3 uints; and whether the draw's viewport is
+ *     of negative height, which the vertex shader's y is not negated for
+ *     (WebGPU's y being up, Vulkan's down), a uint;
  *   - for a vertex shader's storage writes, done by it as compute before
  *     the draw: the draw's vertices an instance, its vertices in all, its
  *     first vertex or index, and whether it restarts primitives, 4 uints;
@@ -279,6 +281,7 @@ enum wvk_texel_type {
 #define WVK_DRIVER_DEPTH_BOUNDS (WVK_DRIVER_DATA_OFFSET + 112)
 #define WVK_DRIVER_POINT_SCALE (WVK_DRIVER_DATA_OFFSET + 120)
 #define WVK_DRIVER_POINT_INDEX (WVK_DRIVER_DATA_OFFSET + 128)
+#define WVK_DRIVER_UNFLIPPED (WVK_DRIVER_DATA_OFFSET + 140)
 #define WVK_DRIVER_VERTEX_RUN (WVK_DRIVER_DATA_OFFSET + 144)
 #define WVK_DRIVER_LINE (WVK_DRIVER_DATA_OFFSET + 160)
 #define WVK_DRIVER_GEOMETRY (WVK_DRIVER_DATA_OFFSET + 176)
