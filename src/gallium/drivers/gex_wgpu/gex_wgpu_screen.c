@@ -6382,6 +6382,28 @@ gex_wgpu_free_texture(WGPUTexture texture)
    wgpuTextureRelease(texture);
 }
 
+/* Read some of a mapped buffer into memory of the caller's, rather than
+ * through a pointer to the mapping: in a browser that pointer is a copy of
+ * the whole mapped range in the wasm heap, made for the asking, and the
+ * heap's peak is its size from then on. WebGPU reads at offsets of 8 and
+ * sizes of 4, so `offset` is 8-aligned and the mapping covers `size`
+ * rounded up to 4. */
+static bool
+gex_wgpu_read_mapped(WGPUBuffer buffer, size_t offset, void *dst, size_t size)
+{
+   const size_t whole = size & ~(size_t)7;
+   if (whole && wgpuBufferReadMappedRange(buffer, offset, dst, whole) != WGPUStatus_Success)
+      return false;
+   if (size > whole) {
+      uint8_t tail[8];
+      if (wgpuBufferReadMappedRange(buffer, offset + whole, tail, ALIGN_POT(size - whole, 4)) !=
+          WGPUStatus_Success)
+         return false;
+      memcpy((uint8_t *)dst + whole, tail, size - whole);
+   }
+   return true;
+}
+
 /* Destroy what no open encoder is older than. An encoder opened at serial
  * E may use what was let go of at serials up to E; whatever was let go of
  * after every open encoder began is no batch's. */
@@ -6624,14 +6646,8 @@ gex_wgpu_buffer_readback_locked(struct pipe_context *pipe,
       wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, size, callback);
       while (!state.done)
          gex_wgpu_jspi_wait();
-      if (state.status == WGPUMapAsyncStatus_Success) {
-         const void *mapped =
-            wgpuBufferGetConstMappedRange(staging, 0, size);
-         if (mapped) {
-            memcpy(dest, mapped, size);
-            ok = true;
-         }
-      }
+      if (state.status == WGPUMapAsyncStatus_Success)
+         ok = gex_wgpu_read_mapped(staging, 0, dest, size);
       wgpuBufferUnmap(staging);
       gex_wgpu_free_buffer(staging);
    }
@@ -19685,16 +19701,41 @@ gex_wgpu_clear_texture(struct pipe_context *pipe, struct pipe_resource *res,
       util_clear_texture_sw(pipe, res, level, box, data);
       return;
    }
-   uint8_t *fill = MALLOC((size_t)(texels * texel));
+   /* A band of rows of the value, a megabyte's at most, uploaded to each
+    * band of the box in turn: the whole box's was up to 64 MiB of the
+    * host's, which a browser's wasm heap keeps once it grew to it. A 1D
+    * array's rows are its layers, which the upload takes otherwise. */
+   const unsigned row = box->width * texel;
+   const bool bands = res->target != PIPE_TEXTURE_1D_ARRAY;
+   const unsigned rows = bands
+      ? MIN2((unsigned)box->height, MAX2(1u, (1u << 20) / MAX2(row, 1u)))
+      : (unsigned)box->height;
+   const unsigned slices = bands ? 1 : (unsigned)box->depth;
+   const uint64_t fill_texels = (uint64_t)box->width * rows * slices;
+   uint8_t *fill = MALLOC((size_t)(fill_texels * texel));
    if (!fill) {
       util_clear_texture_sw(pipe, res, level, box, data);
       return;
    }
-   for (uint64_t i = 0; i < texels; ++i)
+   for (uint64_t i = 0; i < fill_texels; ++i)
       memcpy(fill + i * texel, data, texel);
-   const unsigned row = box->width * texel;
-   gex_wgpu_texture_subdata(pipe, res, level, PIPE_MAP_WRITE, box, fill, row,
-                            (uintptr_t)row * box->height);
+   if (!bands) {
+      gex_wgpu_texture_subdata(pipe, res, level, PIPE_MAP_WRITE, box, fill, row,
+                               (uintptr_t)row * box->height);
+      FREE(fill);
+      return;
+   }
+   for (int z = 0; z < box->depth; ++z) {
+      for (int y = 0; y < box->height; y += rows) {
+         struct pipe_box band = *box;
+         band.y = box->y + y;
+         band.height = MIN2((int)rows, box->height - y);
+         band.z = box->z + z;
+         band.depth = 1;
+         gex_wgpu_texture_subdata(pipe, res, level, PIPE_MAP_WRITE, &band, fill,
+                                  row, (uintptr_t)row * band.height);
+      }
+   }
    FREE(fill);
 }
 
@@ -21729,8 +21770,8 @@ gex_wgpu_read_depth(struct gex_wgpu_context *ctx,
       gex_wgpu_local_encoder_release(screen, encoder);
    }
 
-   const float *depth_mapped = NULL;
-   const uint8_t *stencil_mapped = NULL;
+   /* Read a row at a time, out of the mappings: see gex_wgpu_read_mapped. */
+   bool depth_mapped = false, stencil_mapped = false;
    if (ok) {
       struct gex_wgpu_map_state state = {WGPUMapAsyncStatus_Success, false};
       WGPUBufferMapCallbackInfo callback = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
@@ -21740,9 +21781,8 @@ gex_wgpu_read_depth(struct gex_wgpu_context *ctx,
       wgpuBufferMapAsync(depth_buffer, WGPUMapMode_Read, 0, depth_size, callback);
       while (!state.done)
          gex_wgpu_jspi_wait();
-      depth_mapped = state.status == WGPUMapAsyncStatus_Success
-         ? wgpuBufferGetConstMappedRange(depth_buffer, 0, depth_size) : NULL;
-      ok = depth_mapped != NULL;
+      depth_mapped = state.status == WGPUMapAsyncStatus_Success;
+      ok = depth_mapped;
    }
    if (ok && has_stencil) {
       struct gex_wgpu_map_state state = {WGPUMapAsyncStatus_Success, false};
@@ -21754,19 +21794,29 @@ gex_wgpu_read_depth(struct gex_wgpu_context *ctx,
                          callback);
       while (!state.done)
          gex_wgpu_jspi_wait();
-      stencil_mapped = state.status == WGPUMapAsyncStatus_Success
-         ? wgpuBufferGetConstMappedRange(stencil_buffer, 0, stencil_size) : NULL;
-      ok = stencil_mapped != NULL;
+      stencil_mapped = state.status == WGPUMapAsyncStatus_Success;
+      ok = stencil_mapped;
    }
 
+   float *row = ok ? MALLOC(depth_row) : NULL;
+   uint8_t *stencil_bytes = ok && stencil_mapped ? MALLOC(stencil_row) : NULL;
+   if (!row || (stencil_mapped && !stencil_bytes))
+      ok = false;
    if (ok) {
-      for (int y = 0; y < box->height; ++y) {
-         const float *row =
-            (const float *)((const uint8_t *)depth_mapped + (size_t)y * depth_row);
+      for (int y = 0; y < box->height && ok; ++y) {
+         ok = gex_wgpu_read_mapped(depth_buffer, (size_t)y * depth_row, row,
+                                   (size_t)box->width * 4);
          /* Indexed from the level's origin, since the stencil buffer holds
           * the whole subresource rather than just the requested box. */
-         const uint8_t *srow = stencil_mapped
-            ? stencil_mapped + (size_t)(box->y + y) * stencil_row : NULL;
+         const uint8_t *srow = NULL;
+         if (ok && stencil_mapped) {
+            ok = gex_wgpu_read_mapped(stencil_buffer,
+                                      (size_t)(box->y + y) * stencil_row,
+                                      stencil_bytes, stencil_row);
+            srow = stencil_bytes;
+         }
+         if (!ok)
+            break;
          uint8_t *dst = out + (size_t)y * out_stride;
          for (int x = 0; x < box->width; ++x) {
             const float d = row[x];
@@ -21806,6 +21856,8 @@ gex_wgpu_read_depth(struct gex_wgpu_context *ctx,
       }
    }
 
+   FREE(row);
+   FREE(stencil_bytes);
    if (depth_mapped)
       wgpuBufferUnmap(depth_buffer);
    if (stencil_mapped)
@@ -22169,15 +22221,21 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
    while (!state.done)
       gex_wgpu_jspi_wait();
 
-   const uint8_t *mapped = state.status == WGPUMapAsyncStatus_Success
-      ? wgpuBufferGetConstMappedRange(readback, 0, readback_size) : NULL;
+   /* Read a row at a time out of the mapping: see gex_wgpu_read_mapped.
+    * Not all of it through a pointer, which in a browser is a copy of the
+    * whole readback in the wasm heap beside the transfer's own -- twice a
+    * frame's worth, which the heap keeps once it has grown to it. */
+   const bool mapped_ok = state.status == WGPUMapAsyncStatus_Success;
+   uint8_t *row_buf = mapped_ok ? MALLOC(bytes_per_row) : NULL;
+   const bool mapped = row_buf != NULL;
    struct gex_wgpu_transfer *transfer = NULL;
    if (mapped && util_format_is_depth_or_stencil(resource->format)) {
       /* Which depth resource was actually read, and its first bytes. A resolve
        * that reports success and a readback that returns zeros are only
        * reconcilable if the two are looking at different textures. */
       static bool said;
-      if (!said) {
+      uint8_t first[8] = {0};
+      if (!said && gex_wgpu_read_mapped(readback, 0, first, MIN2(8, readback_size))) {
          said = true;
          fprintf(stderr,
                  "gex-wgpu: depth read %s res=%p tex=%p %dx%d bytes "
@@ -22185,8 +22243,8 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
                  util_format_short_name(resource->format), (void *)resource,
                  (void *)gex_resource(resource)->texture,
                  box->width, box->height,
-                 mapped[0], mapped[1], mapped[2], mapped[3],
-                 mapped[4], mapped[5], mapped[6], mapped[7]);
+                 first[0], first[1], first[2], first[3],
+                 first[4], first[5], first[6], first[7]);
       }
    }
    if (mapped) {
@@ -22202,15 +22260,23 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
          transfer->base.layer_stride = (uint64_t)transfer_row * transfer_rows;
          transfer->data =
             MALLOC(transfer->base.layer_stride * copy_slices);
-         if (transfer->data && read_backing != PIPE_FORMAT_NONE)
-            for (uint32_t z = 0; z < copy_slices; ++z)
-               util_format_translate(
-                  resource->format,
-                  (uint8_t *)transfer->data + z * transfer->base.layer_stride,
-                  transfer->base.stride, 0, 0,
-                  read_backing, mapped + z * slice_bytes, bytes_per_row, 0, 0,
-                  (unsigned)box->width, (unsigned)box->height);
-         else if (transfer->data) {
+         bool read = transfer->data != NULL;
+         if (read && read_backing != PIPE_FORMAT_NONE) {
+            for (uint32_t z = 0; z < copy_slices && read; ++z)
+               for (unsigned row = 0; row < (unsigned)box->height && read; ++row) {
+                  read = gex_wgpu_read_mapped(
+                     readback, z * slice_bytes + (uint64_t)row * bytes_per_row,
+                     row_buf, tight_row);
+                  if (read)
+                     util_format_translate(
+                        resource->format,
+                        (uint8_t *)transfer->data + z * transfer->base.layer_stride +
+                           row * transfer->base.stride,
+                        transfer->base.stride, 0, 0,
+                        read_backing, row_buf, bytes_per_row, 0, 0,
+                        (unsigned)box->width, 1);
+               }
+         } else if (read) {
             /* The staging buffer holds `copy_width x copy_height` starting at
              * `copy_x, copy_y`, which for a depth read is the whole level
              * rather than the requested box -- so take the box out of it. For
@@ -22219,17 +22285,25 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
                (uint64_t)((uint32_t)box->x - copy_x) * gpu_pixel_bytes;
             const uint32_t skip_y = (uint32_t)box->y - copy_y;
             const uint32_t rows = transfer_rows;
-            for (uint32_t z = 0; z < copy_slices; ++z)
-               for (unsigned row = 0; row < rows; ++row)
-                  memcpy((uint8_t *)transfer->data +
-                            z * transfer->base.layer_stride +
-                            row * transfer->base.stride,
-                         mapped + z * slice_bytes +
-                            (uint64_t)(row + skip_y) * bytes_per_row + skip_x,
-                         transfer->base.stride);
+            for (uint32_t z = 0; z < copy_slices && read; ++z)
+               for (unsigned row = 0; row < rows && read; ++row) {
+                  read = gex_wgpu_read_mapped(
+                     readback, z * slice_bytes + (uint64_t)(row + skip_y) * bytes_per_row,
+                     row_buf, skip_x + transfer->base.stride);
+                  if (read)
+                     memcpy((uint8_t *)transfer->data +
+                               z * transfer->base.layer_stride +
+                               row * transfer->base.stride,
+                            row_buf + skip_x, transfer->base.stride);
+               }
+         }
+         if (!read) {
+            FREE(transfer->data);
+            transfer->data = NULL;
          }
       }
    }
+   FREE(row_buf);
    wgpuBufferUnmap(readback);
 
    if (!transfer || !transfer->data) {
@@ -22385,7 +22459,7 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
          gex_wgpu_local_encoder_release(screen, encoder);
 
       struct gex_wgpu_map_state state = {WGPUMapAsyncStatus_Success, false};
-      const void *mapped = NULL;
+      bool mapped = false;
       if (staging) {
          WGPUBufferMapCallbackInfo callback = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
          callback.mode = WGPUCallbackMode_AllowSpontaneous;
@@ -22394,15 +22468,21 @@ gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
          wgpuBufferMapAsync(staging, WGPUMapMode_Read, 0, size, callback);
          while (!state.done)
             gex_wgpu_jspi_wait();
-         if (state.status == WGPUMapAsyncStatus_Success)
-            mapped = wgpuBufferGetConstMappedRange(staging, 0, size);
+         mapped = state.status == WGPUMapAsyncStatus_Success;
       }
       if (mapped) {
-         transfer->data = MALLOC(box->width);
+         /* The words around the range, read out of the mapping rather than
+          * through a pointer to it (gex_wgpu_read_mapped), and moved down to
+          * where the range starts. */
+         transfer->data = MALLOC(size);
+         if (transfer->data && !gex_wgpu_read_mapped(staging, 0, transfer->data, size)) {
+            FREE(transfer->data);
+            transfer->data = NULL;
+         }
          if (transfer->data) {
-            memcpy(transfer->data,
-                   (const uint8_t *)mapped + ((uint32_t)box->x - offset),
-                   box->width);
+            memmove(transfer->data,
+                    (uint8_t *)transfer->data + ((uint32_t)box->x - offset),
+                    box->width);
             /* Keep the shadow consistent so a later write map does not
              * resurrect stale bytes -- when there is one. */
             if (gex->shadow)
@@ -23639,12 +23719,10 @@ gex_wgpu_occlusion_read(struct gex_wgpu_context *ctx, unsigned slot,
                       callback);
    while (!state.done)
       gex_wgpu_jspi_wait();
-   const void *mapped = state.status == WGPUMapAsyncStatus_Success
-      ? wgpuBufferGetConstMappedRange(ctx->occlusion_readback, 0, 8) : NULL;
-   if (mapped)
-      memcpy(out, mapped, sizeof(*out));
+   const bool mapped = state.status == WGPUMapAsyncStatus_Success &&
+                       gex_wgpu_read_mapped(ctx->occlusion_readback, 0, out, sizeof(*out));
    wgpuBufferUnmap(ctx->occlusion_readback);
-   return mapped != NULL;
+   return mapped;
 }
 
 /* Hand this query a slot of the occlusion set.
