@@ -16,7 +16,7 @@ def run(argv, **kw):
     subprocess.run(list(map(str, argv)), check=True, **kw)
 
 
-def checkout(root, name, pin):
+def checkout(root, name, pin, exclude_submodules=()):
     source = root / "deps" / name
     if not source.exists():
         source.mkdir(parents=True)
@@ -27,7 +27,12 @@ def checkout(root, name, pin):
     actual = subprocess.check_output(["git", "-C", source, "rev-parse", "HEAD"], text=True).strip()
     if actual != pin["commit"]:
         raise RuntimeError(f"{source}: wrong revision {actual}; expected {pin['commit']}")
-    run(["git", "-C", source, "submodule", "update", "--init", "--depth=1", "--recursive"])
+    command = ["git", "-C", source, "submodule", "update", "--init", "--depth=1", "--recursive"]
+    if exclude_submodules:
+        entries = subprocess.check_output(["git", "-C", source, "config", "--file", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$"], text=True)
+        paths = [line.split(maxsplit=1)[1] for line in entries.splitlines()]
+        command += ["--", *(path for path in paths if path not in exclude_submodules)]
+    run(command)
     return source
 
 
