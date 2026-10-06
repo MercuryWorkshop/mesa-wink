@@ -12,6 +12,8 @@
 #include "compiler/nir/nir_builder.h"
 #include "compiler/nir/nir_format_convert.h"
 #include "compiler/nir/nir_xfb_info.h"
+#include "compiler/nir/nir_serialize.h"
+#include "util/blob.h"
 #include "microsoft/compiler/dxil_nir_lower_int_cubemaps.h"
 #include "nir_to_spirv.h"
 #include "util/os_time.h"
@@ -2787,7 +2789,14 @@ struct gex_wgpu_shader {
    /* A vertex shader's y-flipped form, made when a draw first wants it. */
    WGPUShaderModule module_y_flipped;
    bool module_y_flipped_failed;
+   /* The shader as made, of what draws ask of it: its info and its
+    * variables, without its code (gex_wgpu_io_only). The whole of it, which
+    * variants are made of, serialized beside (gex_wgpu_original_clone): a
+    * live NIR of every shader for the life of the program was the most of
+    * the host's memory a big one kept. */
    nir_shader *original_nir;
+   void *original_blob;
+   size_t original_blob_size;
    /* A clone of the vertex shader kept for building transform feedback
     * compute variants, and the variants built from it so far. */
    nir_shader *capture_nir;
@@ -2812,8 +2821,12 @@ struct gex_wgpu_shader {
    struct gex_wgpu_capture_variant *captures;
    /* A clone kept for the compute variants that feed a geometry shader, and
     * those variants. Separate from capture_nir because a vertex shader can
-    * need one, the other, or both. */
-   nir_shader *varying_nir;
+    * need one, the other, or both. Serialized: every vertex shader keeps
+    * one, and few are drawn with a geometry or tessellation stage, the one
+    * use of it, which reads it back then (gex_wgpu_varying_variant_get). */
+   void *varying_nir;
+   size_t varying_nir_size;
+   const nir_shader_compiler_options *varying_nir_options;
    struct gex_wgpu_varying_variant *varyings;
    /* The same clone taken *before* gex_wgpu_strip_storage_writes, kept only
     * for a shader whose atomic result the strip would rewrite to zero.
@@ -12971,6 +12984,37 @@ gex_wgpu_lower_fs_layer_input(nir_shader *nir)
    return progress;
 }
 
+
+/* A shader's variables and info, without its code: what draws ask of a
+ * shader as made, at a few kilobytes rather than all of its NIR. */
+static nir_shader *
+gex_wgpu_io_only(const nir_shader *nir)
+{
+   nir_shader *io = nir_shader_clone(NULL, nir);
+   if (!io)
+      return NULL;
+   nir_foreach_function_impl(impl, io) {
+      nir_cf_list list;
+      nir_cf_extract(&list, nir_before_impl(impl), nir_after_impl(impl));
+      nir_cf_delete(&list);
+      exec_list_make_empty(&impl->locals);
+   }
+   nir_sweep(io);
+   return io;
+}
+
+/* The whole of a shader as made, which a variant is made of: read back
+ * from its serialization. */
+static nir_shader *
+gex_wgpu_original_clone(const struct gex_wgpu_shader *shader)
+{
+   if (!shader->original_blob || !shader->original_nir)
+      return NULL;
+   struct blob_reader reader;
+   blob_reader_init(&reader, shader->original_blob, shader->original_blob_size);
+   return nir_deserialize(NULL, shader->original_nir->options, &reader);
+}
+
 static struct gex_wgpu_shader *
 gex_wgpu_create_shader_state(struct pipe_context *pipe,
                              const struct pipe_shader_state *state,
@@ -13276,8 +13320,17 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    }
    /* And a clone for the compute variants that feed a geometry shader. Taken
     * unconditionally because whether one will be bound is not known here. */
-   if (expected_stage == MESA_SHADER_VERTEX)
-      shader->varying_nir = nir_shader_clone(NULL, nir);
+   if (expected_stage == MESA_SHADER_VERTEX) {
+      struct blob blob;
+      blob_init(&blob);
+      nir_serialize(&blob, nir, false);
+      if (!blob.out_of_memory) {
+         blob_finish_get_buffer(&blob, &shader->varying_nir, &shader->varying_nir_size);
+         shader->varying_nir_options = nir->options;
+      } else {
+         blob_finish(&blob);
+      }
+   }
 
    /* After both clones and before the module and its variants: the capture
     * keeps the real cull values -- that is what the cull is decided from --
@@ -14239,12 +14292,21 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          return NULL;
       }
    }
-   shader->original_nir =
-      (expected_stage == MESA_SHADER_FRAGMENT ||
-       expected_stage == MESA_SHADER_VERTEX)
-      ? nir_shader_clone(NULL, nir) : NULL;
+   if (expected_stage == MESA_SHADER_FRAGMENT ||
+       expected_stage == MESA_SHADER_VERTEX) {
+      struct blob blob;
+      blob_init(&blob);
+      nir_serialize(&blob, nir, false);
+      if (!blob.out_of_memory) {
+         blob_finish_get_buffer(&blob, &shader->original_blob, &shader->original_blob_size);
+         shader->original_nir = gex_wgpu_io_only(nir);
+      } else {
+         blob_finish(&blob);
+      }
+   }
    if ((expected_stage == MESA_SHADER_FRAGMENT ||
         expected_stage == MESA_SHADER_VERTEX) && !shader->original_nir) {
+      free(shader->original_blob);
       ralloc_free(nir);
       FREE(shader);
       gex_wgpu_set_compile_error(mutable_state,
@@ -14308,6 +14370,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    if (!shader->module && !deferred_integer_sampling) {
       if (shader->original_nir)
          ralloc_free(shader->original_nir);
+      free(shader->original_blob);
       /* Name the stage. A rejection reaches the application as a link error
        * with no indication of which shader was at fault, and the two stages
        * fail for different reasons -- notably integer sampling, which the
@@ -14422,8 +14485,7 @@ gex_wgpu_delete_shader_state(struct pipe_context *pipe, void *state)
    }
    if (shader->replay_nir)
       ralloc_free(shader->replay_nir);
-   if (shader->varying_nir)
-      ralloc_free(shader->varying_nir);
+   free(shader->varying_nir);
    struct gex_wgpu_capture_variant *capture = shader->captures;
    while (capture) {
       struct gex_wgpu_capture_variant *next = capture->next;
@@ -14436,6 +14498,7 @@ gex_wgpu_delete_shader_state(struct pipe_context *pipe, void *state)
       ralloc_free(shader->capture_nir);
    if (shader->original_nir)
       ralloc_free(shader->original_nir);
+   free(shader->original_blob);
    FREE(shader);
 }
 
@@ -15573,7 +15636,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    }
 
    nir_shader *variant = fs->original_nir
-      ? nir_shader_clone(NULL, fs->original_nir) : NULL;
+      ? gex_wgpu_original_clone(fs) : NULL;
    if (!variant) {
       gex_fail(ctx);
       return NULL;
@@ -28662,7 +28725,8 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
    /* `replay` picks the clone that still has its atomics -- see replay_nir --
     * and a cache list of its own, so a shader can hold both kinds at once
     * without one answering for the other. */
-   nir_shader *const source = replay ? vs->replay_nir : vs->varying_nir;
+   nir_shader *const source = replay ? vs->replay_nir : NULL;
+   const bool kept = replay ? source != NULL : vs->varying_nir != NULL;
    struct gex_wgpu_varying_variant **const cache =
       replay ? &vs->replay_varyings : &vs->varyings;
    /* A vertex shader that samples a texture cannot be run as compute here:
@@ -28727,13 +28791,20 @@ gex_wgpu_varying_variant_get(struct gex_wgpu_context *ctx,
       if (match)
          return v;
    }
-   if (!source) {
+   if (!kept) {
       if (getenv("GEX_WGPU_UNFILLED_LOG"))
          fprintf(stderr, "gex-wgpu: capture variant: no varying_nir kept\n");
       return NULL;
    }
 
-   nir_shader *nir = nir_shader_clone(NULL, source);
+   nir_shader *nir;
+   if (source) {
+      nir = nir_shader_clone(NULL, source);
+   } else {
+      struct blob_reader reader;
+      blob_reader_init(&reader, vs->varying_nir, vs->varying_nir_size);
+      nir = nir_deserialize(NULL, vs->varying_nir_options, &reader);
+   }
    if (!nir) {
       if (getenv("GEX_WGPU_UNFILLED_LOG"))
          fprintf(stderr, "gex-wgpu: capture variant: clone failed\n");
@@ -37495,7 +37566,7 @@ gex_wgpu_vs_base_module(struct gex_wgpu_context *ctx, struct gex_wgpu_shader *vs
    if (!flipped || !vs->module)
       return vs->module;
    if (!vs->module_y_flipped && !vs->module_y_flipped_failed && vs->original_nir) {
-      nir_shader *clone = nir_shader_clone(NULL, vs->original_nir);
+      nir_shader *clone = gex_wgpu_original_clone(vs);
       char *error = NULL;
       vs->module_y_flipped = clone ? gex_wgpu_compile_nir(&ctx->base, clone, MESA_SHADER_VERTEX, true,
                                                           false, &error) : NULL;
@@ -37768,7 +37839,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    }
    /* The form the draw wants, of y flipped or not. */
    for (unsigned pass = flipped; pass == (unsigned)flipped; ++pass) {
-      nir_shader *clone = nir_shader_clone(NULL, vs->original_nir);
+      nir_shader *clone = gex_wgpu_original_clone(vs);
       if (!clone)
          break;
       if (fs) {
