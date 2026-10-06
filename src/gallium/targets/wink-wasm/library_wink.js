@@ -137,7 +137,7 @@ var LibraryWink = {
       'maxStorageTexturesInFragmentStage': 8,
       'maxDynamicUniformBuffersPerPipelineLayout': 32,
       'maxDynamicStorageBuffersPerPipelineLayout': 16,
-      'maxSampledTexturesPerShaderStage': 16,
+      'maxSampledTexturesPerShaderStage': 48,
       'maxColorAttachmentBytesPerSample': 128,
       'maxComputeInvocationsPerWorkgroup': 1024,
       'maxComputeWorkgroupSizeX': 1024,

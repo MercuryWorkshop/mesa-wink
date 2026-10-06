@@ -1534,6 +1534,7 @@ struct gex_wgpu_screen {
     * must not declare a second blend source. */
    bool dual_source_blending;
    bool framebuffer_fetch;
+   bool software_framebuffer_fetch;
    bool timestamp_query;
    /* Optional WebGPU features the page may have been able to request.  Each
     * one gates a GL extension st/mesa derives from format support, so they
@@ -1659,7 +1660,7 @@ struct gex_wgpu_screen {
     * it has gone unused for a while (gex_wgpu_flush), not kept for good. */
    uint64_t flushes;
    uint64_t readback_staging_used;
-   /* Bumped whenever a cached bind group or pipeline is evicted and released.
+   /* handle_epoch is bumped when a bind group or pipeline is released.
     *
     * The per-pass "already emitted" state compares raw handles, and a handle
     * that has been freed can be handed back for a different object at the
@@ -1675,6 +1676,9 @@ struct gex_wgpu_screen {
    unsigned uniform_offset_alignment;
    unsigned storage_offset_alignment;
    uint64_t cache_epoch;
+   /* Reset emitted state on recycled handles without invalidating live cache
+    * entries. Resource destruction still uses cache_epoch above. */
+   uint64_t handle_epoch;
    uint64_t pass_serial;
    /* Everything above this line that a context may write.
     *
@@ -2259,6 +2263,8 @@ struct gex_wgpu_context {
    struct pipe_vertex_buffer
       vertex_buffer_state[GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS];
    struct pipe_framebuffer_state framebuffer;
+   struct pipe_resource *fetch_copies[8];
+   WGPUTextureView fetch_views[8];
    struct blitter_context *blitter;
    struct pipe_constant_buffer
       constant_buffers[MESA_SHADER_STAGES][GEX_WGPU_MAX_CONSTANT_BUFFERS];
@@ -2379,6 +2385,7 @@ struct gex_wgpu_context {
       bool scissor_set;
    } emitted;
    uint64_t emitted_epoch;
+   uint64_t emitted_handle_epoch;
    /* Everything those draws read or write. A map or an upload has to push the
     * batch out only if it lands on one of these -- and almost none of them
     * do: an application streaming geometry maps a fresh buffer every time.
@@ -2815,6 +2822,7 @@ struct gex_wgpu_shader {
     * the destination texel, and the draw has to bind a snapshot of it.
     * See gex_wgpu_lower_fb_fetch. */
    bool fb_fetch;
+   uint8_t fb_fetch_mask;
    /* Native raster-order colour inputs, specialized to attachment formats. */
    uint8_t fb_fetch_native;
    /* The rasterising copy of this vertex shader computes the wrong thing --
@@ -2927,6 +2935,7 @@ struct gex_wgpu_interp_variant {
 struct gex_wgpu_shader_variant {
    WGPUShaderModule module;
    enum pipe_format fetch_formats[8];
+   uint8_t fetch_samples;
    /* Framebuffer height baked into this variant's gl_FragCoord correction,
     * or 0 when the draw is not flipped and none was applied. */
    /* The colour output base type this variant declares, which has to match
@@ -6606,7 +6615,6 @@ static WGPUBuffer
 gex_wgpu_packed_image_write_header(struct gex_wgpu_context *ctx, unsigned slot,
                                    const uint32_t words[]);
 
-static bool gex_wgpu_lower_fb_fetch(nir_shader *nir);
 static WGPUBuffer gex_wgpu_packed_image_bind(struct gex_wgpu_context *ctx,
                                              unsigned slot,
                                              const struct pipe_image_view *iv,
@@ -14106,19 +14114,19 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * logic op's texture is created later still, on a variant, for the first
     * of those two reasons. */
    if (expected_stage == MESA_SHADER_FRAGMENT) {
-      if (gex_screen(pipe->screen)->framebuffer_fetch) {
-         nir_foreach_shader_out_variable(var, nir) {
-            if (var->data.fb_fetch_output) {
-               unsigned rt = var->data.location == FRAG_RESULT_COLOR ? 0 :
-                             var->data.location - FRAG_RESULT_DATA0;
-               unsigned slots = glsl_count_attribute_slots(var->type, false);
-               if (rt < 8)
-                  shader->fb_fetch_native |= BITFIELD_RANGE(rt, MIN2(slots, 8 - rt));
-            }
+      nir_foreach_shader_out_variable(var, nir) {
+         if (var->data.fb_fetch_output) {
+            unsigned rt = var->data.location == FRAG_RESULT_COLOR ? 0 :
+                          var->data.location - FRAG_RESULT_DATA0;
+            unsigned slots = glsl_count_attribute_slots(var->type, false);
+            if (rt < 8)
+               shader->fb_fetch_mask |= BITFIELD_RANGE(rt, MIN2(slots, 8 - rt));
          }
-      } else {
-         shader->fb_fetch = gex_wgpu_lower_fb_fetch(nir);
       }
+      if (gex_screen(pipe->screen)->framebuffer_fetch)
+         shader->fb_fetch_native = shader->fb_fetch_mask;
+      else
+         shader->fb_fetch = shader->fb_fetch_mask != 0;
    }
 
    /* layout(early_fragment_tests) in, which cannot be honoured here.
@@ -14373,7 +14381,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
        shader->ms_array_slots != 0 ||
        shader->reads_clip_dist || shader->reads_interp_offset ||
        shader->has_double_inputs ||
-       shader->reads_primitive_id || shader->fb_fetch_native) &&
+       shader->reads_primitive_id || shader->fb_fetch_mask) &&
       (expected_stage == MESA_SHADER_FRAGMENT ||
        expected_stage == MESA_SHADER_VERTEX);
    if (deferred_integer_sampling)
@@ -14655,64 +14663,6 @@ gex_wgpu_lower_logicop_store(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
-/* Framebuffer fetch: the destination texel, read by the fragment shader.
- *
- * Mesa's GLSL linker lowers KHR_blend_equation_advanced itself -- it writes
- * every one of the fourteen equations -- and asks the driver for one thing in
- * return: a readable output. It creates a `nir_var_shader_out` variable with
- * `data.fb_fetch_output` set and *loads* from it. That is the whole contract,
- * and this driver can meet it, because the same colour-attachment snapshot
- * that serves glLogicOp is exactly the destination texel.
- *
- * It shares the logic op's binding, which is safe rather than lucky: GL says
- * enabling GL_COLOR_LOGIC_OP disables blending, so no shader can want both.
- *
- * Non-coherent only. A snapshot is taken once per draw, so overlapping
- * primitives within one draw do not see each other -- which is precisely what
- * KHR_blend_equation_advanced without _coherent allows, and why it makes the
- * application call glBlendBarrier. Claiming the coherent form would be a lie
- * the snapshot cannot keep.
- */
-static bool
-gex_wgpu_lower_fb_fetch_load(nir_builder *b, nir_intrinsic_instr *intr,
-                             void *data)
-{
-   struct gex_wgpu_logicop_lowering *state = data;
-   if (intr->intrinsic != nir_intrinsic_load_deref)
-      return false;
-   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
-   nir_variable *var = deref ? nir_deref_instr_get_variable(deref) : NULL;
-   if (!var || var->data.mode != nir_var_shader_out ||
-       !var->data.fb_fetch_output)
-      return false;
-
-   b->cursor = nir_before_instr(&intr->instr);
-   /* Indexed by gl_FragCoord, as the logic op's fetch is, and for the same
-    * reason: the driver's y flip happens before the fragment stage. */
-   nir_def *coord = nir_f2i32(
-      b, nir_trim_vector(b, nir_load_frag_coord(b), 2));
-   nir_deref_instr *texture = nir_build_deref_var(b, state->texture);
-   nir_tex_instr *fetch = nir_tex_instr_create(b->shader, 3);
-   fetch->op = nir_texop_txf;
-   fetch->sampler_dim = GLSL_SAMPLER_DIM_2D;
-   fetch->is_array = false;
-   fetch->dest_type = nir_type_float32;
-   fetch->coord_components = 2;
-   fetch->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref,
-                                       &texture->def);
-   fetch->src[1] = nir_tex_src_for_ssa(nir_tex_src_coord, coord);
-   fetch->src[2] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(b, 0));
-   nir_def_init(&fetch->instr, &fetch->def, 4, 32);
-   nir_builder_instr_insert(b, &fetch->instr);
-   nir_def *value = &fetch->def;
-   if (intr->def.num_components != 4)
-      value = nir_trim_vector(b, value, intr->def.num_components);
-   nir_def_rewrite_uses(&intr->def, value);
-   nir_instr_remove(&intr->instr);
-   state->lowered = true;
-   return true;
-}
-
 static WGPUTextureFormat gex_wgpu_texture_format(enum pipe_format format);
 
 static unsigned
@@ -14755,39 +14705,21 @@ gex_wgpu_fetch_components(WGPUTextureFormat format)
 struct gex_wgpu_fetch_state {
    const enum pipe_format *formats;
    nir_variable *inputs[8];
+   nir_variable *outputs[8];
+   nir_variable *frag_coord;
+   nir_variable *sample_id;
    uint32_t locations;
+   bool snapshot;
+   unsigned samples;
 };
 
-static bool
-gex_wgpu_native_fetch_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+static nir_def *
+gex_wgpu_fetch_value(nir_builder *b, struct gex_wgpu_fetch_state *state, unsigned rt)
 {
-   struct gex_wgpu_fetch_state *state = data;
-   if (intr->intrinsic != nir_intrinsic_load_deref && intr->intrinsic != nir_intrinsic_store_deref)
-      return false;
-   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
-   nir_variable *var = nir_deref_instr_get_variable(deref);
-   if (!var || var->data.mode != nir_var_shader_out || !var->data.fb_fetch_output)
-      return false;
-   /* Coherence is provided by the raster-order attachment input. A colour
-    * output is not SPIR-V atomic memory, even when GLSL marked it coherent. */
-   if (intr->intrinsic == nir_intrinsic_store_deref) {
-      nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) & ~ACCESS_COHERENT);
-      return true;
-   }
-   unsigned rt = var->data.location == FRAG_RESULT_COLOR ? 0 :
-                 var->data.location - FRAG_RESULT_DATA0;
-   for (nir_deref_instr *d = deref; d->deref_type != nir_deref_type_var;
-        d = nir_deref_instr_parent(d)) {
-      if (d->deref_type != nir_deref_type_array || !nir_src_is_const(d->arr.index))
-         return false;
-      rt += nir_src_as_uint(d->arr.index);
-   }
-   if (rt >= 8 || state->formats[rt] == PIPE_FORMAT_NONE)
-      return false;
    const enum pipe_format format = state->formats[rt];
    const enum glsl_base_type base = util_format_is_pure_uint(format) ? GLSL_TYPE_UINT :
                                     util_format_is_pure_sint(format) ? GLSL_TYPE_INT : GLSL_TYPE_FLOAT;
-   const unsigned n = gex_wgpu_fetch_components(gex_wgpu_texture_format(format));
+   const unsigned n = state->snapshot ? 4 : gex_wgpu_fetch_components(gex_wgpu_texture_format(format));
    if (!state->inputs[rt]) {
       unsigned location = 31;
       while (location && (state->locations & BITFIELD_BIT(location)))
@@ -14795,15 +14727,41 @@ gex_wgpu_native_fetch_load(nir_builder *b, nir_intrinsic_instr *intr, void *data
       state->locations |= BITFIELD_BIT(location);
       char name[24];
       snprintf(name, sizeof(name), "wink_color_%u", rt);
-      nir_variable *input = nir_variable_create(b->shader, nir_var_shader_in,
-                                                glsl_vector_type(base, n), name);
-      input->data.location = VARYING_SLOT_VAR0 + location;
-      input->data.interpolation = INTERP_MODE_FLAT;
-      input->data.fb_fetch_output = true;
+      nir_variable *input;
+      if (state->snapshot) {
+         const enum glsl_sampler_dim dim = state->samples > 1 ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D;
+         input = nir_variable_create(b->shader, nir_var_uniform,
+                                      glsl_texture_type(dim, false, base), "gex_ordered_color");
+         input->data.descriptor_set = 0;
+         input->data.binding = GEX_WGPU_LOGICOP_BINDING + rt;
+         input->data.explicit_binding = true;
+      } else {
+         input = nir_variable_create(b->shader, nir_var_shader_in, glsl_vector_type(base, n), name);
+         input->data.location = VARYING_SLOT_VAR0 + location;
+         input->data.interpolation = INTERP_MODE_FLAT;
+         input->data.fb_fetch_output = true;
+      }
       state->inputs[rt] = input;
    }
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_def *value = nir_load_var(b, state->inputs[rt]);
+   nir_def *value;
+   if (state->snapshot) {
+      nir_tex_instr *tex = nir_tex_instr_create(b->shader, 3);
+      tex->op = state->samples > 1 ? nir_texop_txf_ms : nir_texop_txf;
+      tex->sampler_dim = state->samples > 1 ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D;
+      tex->dest_type = base == GLSL_TYPE_UINT ? nir_type_uint32 : base == GLSL_TYPE_INT ? nir_type_int32 : nir_type_float32;
+      tex->coord_components = 2;
+      tex->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, &nir_build_deref_var(b, state->inputs[rt])->def);
+      nir_def *position = state->frag_coord ? nir_load_var(b, state->frag_coord) : nir_load_frag_coord(b);
+      tex->src[1] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_f2i32(b, nir_trim_vector(b, position, 2)));
+      nir_def *sample = state->sample_id ? nir_load_var(b, state->sample_id) :
+                                          state->samples > 1 ? nir_load_sample_id(b) : nir_imm_int(b, 0);
+      tex->src[2] = nir_tex_src_for_ssa(state->samples > 1 ? nir_tex_src_ms_index : nir_tex_src_lod, sample);
+      nir_def_init(&tex->instr, &tex->def, 4, 32);
+      nir_builder_instr_insert(b, &tex->instr);
+      value = &tex->def;
+   } else {
+      value = nir_load_var(b, state->inputs[rt]);
+   }
    const unsigned channels = util_format_get_nr_components(format);
    nir_def *c[4];
    for (unsigned i = 0; i < 4; ++i) {
@@ -14814,16 +14772,97 @@ gex_wgpu_native_fetch_load(nir_builder *b, nir_intrinsic_instr *intr, void *data
       else
          c[i] = nir_imm_int(b, 0);
    }
-   value = nir_trim_vector(b, nir_vec(b, c, 4), intr->def.num_components);
+   return nir_vec(b, c, 4);
+}
+
+static nir_variable *
+gex_wgpu_fetch_output(nir_builder *b, struct gex_wgpu_fetch_state *state,
+                       nir_variable *original, unsigned rt)
+{
+   if (!state->outputs[rt]) {
+      const enum pipe_format format = state->formats[rt];
+      const unsigned n = gex_wgpu_fetch_components(gex_wgpu_texture_format(format));
+      const enum glsl_base_type base = util_format_is_pure_uint(format) ? GLSL_TYPE_UINT :
+                                       util_format_is_pure_sint(format) ? GLSL_TYPE_INT : GLSL_TYPE_FLOAT;
+      nir_variable *out = nir_variable_create(b->shader, nir_var_shader_out,
+                                                glsl_vector_type(base, n), "gex_fetch_out");
+      out->data = original->data;
+      out->data.location = FRAG_RESULT_DATA0 + rt;
+      out->data.access &= ~ACCESS_COHERENT;
+      out->data.fb_fetch_output = false;
+      state->outputs[rt] = out;
+   }
+   return state->outputs[rt];
+}
+
+static bool
+gex_wgpu_framebuffer_fetch_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct gex_wgpu_fetch_state *state = data;
+   if (intr->intrinsic != nir_intrinsic_load_deref && intr->intrinsic != nir_intrinsic_store_deref)
+      return false;
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   if (!var || var->data.mode != nir_var_shader_out || !var->data.fb_fetch_output)
+      return false;
+   /* Attachment coherence is not SPIR-V atomic memory. */
+   if (intr->intrinsic == nir_intrinsic_store_deref) {
+      nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) & ~ACCESS_COHERENT);
+      if (state->snapshot)
+         return true;
+   }
+   const unsigned first = var->data.location == FRAG_RESULT_COLOR ? 0 :
+                          var->data.location - FRAG_RESULT_DATA0;
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *index = nir_imm_int(b, first);
+   for (nir_deref_instr *d = deref; d->deref_type != nir_deref_type_var;
+        d = nir_deref_instr_parent(d)) {
+      if (d->deref_type != nir_deref_type_array)
+         return false;
+      index = nir_iadd(b, index, nir_imul_imm(b, d->arr.index.ssa,
+                                            glsl_count_attribute_slots(d->type, false)));
+   }
+   nir_def *value = nir_imm_zero(b, 4, 32);
+   const unsigned slots = glsl_count_attribute_slots(var->type, false);
+   if (intr->intrinsic == nir_intrinsic_store_deref) {
+      /* Metal requires the fetch input and colour output to have identical
+       * types. Split array outputs too, since their attachments can differ. */
+      for (unsigned rt = first; rt < MIN2(first + slots, 8); ++rt) {
+         if (state->formats[rt] == PIPE_FORMAT_NONE)
+            continue;
+         const enum pipe_format format = state->formats[rt];
+         const unsigned n = gex_wgpu_fetch_components(gex_wgpu_texture_format(format));
+         nir_variable *out = gex_wgpu_fetch_output(b, state, var, rt);
+         nir_push_if(b, nir_ieq_imm(b, index, rt));
+         nir_store_var(b, out, nir_trim_vector(b, intr->src[1].ssa, n),
+                       nir_intrinsic_write_mask(intr) & BITFIELD_MASK(n));
+         nir_pop_if(b, NULL);
+      }
+      nir_instr_remove(&intr->instr);
+      return true;
+   }
+   for (unsigned rt = first; rt < MIN2(first + slots, 8); ++rt) {
+      if (state->formats[rt] != PIPE_FORMAT_NONE)
+         value = nir_bcsel(b, nir_ieq_imm(b, index, rt),
+                           gex_wgpu_fetch_value(b, state, rt), value);
+   }
+   value = nir_trim_vector(b, value, intr->def.num_components);
+   if (intr->def.bit_size != 32)
+      value = nir_convert_to_bit_size(b, value, nir_get_nir_type_for_glsl_type(deref->type), intr->def.bit_size);
    nir_def_replace(&intr->def, value);
    return true;
 }
 
 static void
-gex_wgpu_lower_native_fetch(nir_shader *nir, const enum pipe_format *formats)
+gex_wgpu_lower_framebuffer_fetch(nir_shader *nir, const enum pipe_format *formats, bool snapshot, unsigned samples)
 {
-   struct gex_wgpu_fetch_state state = { .formats = formats };
+   struct gex_wgpu_fetch_state state = { .formats = formats, .snapshot = snapshot, .samples = samples };
+   nir_foreach_variable_with_modes(var, nir, nir_var_system_value)
+      if (var->data.location == SYSTEM_VALUE_SAMPLE_ID)
+         state.sample_id = var;
    nir_foreach_shader_in_variable(var, nir) {
+      if (var->data.location == VARYING_SLOT_POS)
+         state.frag_coord = var;
       if (var->data.location >= VARYING_SLOT_VAR0) {
          unsigned first = var->data.location - VARYING_SLOT_VAR0;
          unsigned slots = glsl_count_attribute_slots(var->type, false);
@@ -14831,94 +14870,42 @@ gex_wgpu_lower_native_fetch(nir_shader *nir, const enum pipe_format *formats)
             state.locations |= BITFIELD_RANGE(first, MIN2(slots, 32 - first));
       }
    }
-   nir_shader_intrinsics_pass(nir, gex_wgpu_native_fetch_load,
-                              nir_metadata_control_flow, &state);
-   nir_foreach_shader_out_variable(var, nir) {
-      if (var->data.fb_fetch_output)
-         var->data.access &= ~ACCESS_COHERENT;
+   nir_shader_intrinsics_pass(nir, gex_wgpu_framebuffer_fetch_load,
+                              snapshot ? nir_metadata_control_flow : nir_metadata_none, &state);
+   /* An inout colour left unwritten retains its fetched value. Filament
+    * reads HDR RT0 while writing its tonemapped result to RT1. */
+   nir_builder init = nir_builder_at(nir_before_impl(nir_shader_get_entrypoint(nir)));
+   nir_foreach_shader_out_variable_safe(var, nir) {
+      if (!var->data.fb_fetch_output)
+         continue;
+      const unsigned first = var->data.location == FRAG_RESULT_COLOR ? 0 :
+                             var->data.location - FRAG_RESULT_DATA0;
+      const unsigned slots = glsl_count_attribute_slots(var->type, false);
+      for (unsigned rt = first; rt < MIN2(first + slots, 8); ++rt) {
+         if (formats[rt] == PIPE_FORMAT_NONE)
+            continue;
+         nir_variable *out = snapshot ? var : gex_wgpu_fetch_output(&init, &state, var, rt);
+         nir_deref_instr *deref = nir_build_deref_var(&init, out);
+         unsigned offset = rt - first;
+         while (glsl_type_is_array(deref->type)) {
+            unsigned stride = glsl_count_attribute_slots(glsl_get_array_element(deref->type), false);
+            deref = nir_build_deref_array_imm(&init, deref, offset / stride);
+            offset %= stride;
+         }
+         unsigned n = glsl_get_vector_elements(deref->type);
+         nir_def *value = nir_trim_vector(&init, gex_wgpu_fetch_value(&init, &state, rt), n);
+         value = nir_convert_to_bit_size(&init, value, nir_get_nir_type_for_glsl_type(deref->type),
+                                         glsl_get_bit_size(deref->type));
+         nir_store_deref(&init, deref, value, BITFIELD_MASK(n));
+      }
+      var->data.access &= ~ACCESS_COHERENT;
       var->data.fb_fetch_output = false;
+      if (!snapshot) {
+         nir_remove_dead_derefs(nir);
+         exec_node_remove(&var->node);
+      }
    }
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-}
-
-static bool
-gex_wgpu_lower_fb_fetch(nir_shader *nir)
-{
-   bool wanted = false;
-   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
-      if (var->data.fb_fetch_output)
-         wanted = true;
-   if (!wanted)
-      return false;
-
-   struct gex_wgpu_logicop_lowering state = {0};
-   const struct glsl_type *type =
-      glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_FLOAT);
-   state.texture =
-      nir_variable_create(nir, nir_var_uniform, type, "gex_fb_fetch_dst");
-   if (!state.texture)
-      return false;
-   state.texture->data.descriptor_set = 0;
-   state.texture->data.binding = GEX_WGPU_LOGICOP_BINDING;
-   state.texture->data.explicit_binding = 1;
-   nir_shader_intrinsics_pass(nir, gex_wgpu_lower_fb_fetch_load,
-                              nir_metadata_control_flow, &state);
-   if (getenv("GEX_WGPU_FBFETCH_LOG")) {
-      unsigned loads = 0, derefs = 0;
-      nir_foreach_function_impl(impl, nir)
-         nir_foreach_block(block, impl)
-            nir_foreach_instr(instr, block) {
-               if (instr->type == nir_instr_type_deref) {
-                  nir_deref_instr *d = nir_instr_as_deref(instr);
-                  if (d->deref_type == nir_deref_type_var && d->var &&
-                      d->var->data.fb_fetch_output)
-                     ++derefs;
-               } else if (instr->type == nir_instr_type_intrinsic) {
-                  nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
-                  if (in->intrinsic == nir_intrinsic_load_deref ||
-                      in->intrinsic == nir_intrinsic_load_output)
-                     ++loads;
-               }
-            }
-      fprintf(stderr, "gex-fbfetch: lowered=%d derefs_left=%u loads=%u\n",
-              (int)state.lowered, derefs, loads);
-      nir_foreach_function_impl(impl, nir)
-         nir_foreach_block(block, impl)
-            nir_foreach_instr(instr, block) {
-               if (instr->type != nir_instr_type_deref)
-                  continue;
-               nir_deref_instr *d = nir_instr_as_deref(instr);
-               if (d->deref_type != nir_deref_type_var || !d->var ||
-                   !d->var->data.fb_fetch_output)
-                  continue;
-               nir_foreach_use(use, &d->def)
-                  fprintf(stderr, "gex-fbfetch:   used by instr type %d%s\n",
-                          (int)nir_src_use_instr(use)->type,
-                          nir_src_use_instr(use)->type ==
-                             nir_instr_type_intrinsic
-                             ? nir_intrinsic_infos[nir_instr_as_intrinsic(
-                                  nir_src_use_instr(use))->intrinsic].name
-                             : "");
-            }
-   }
-   if (!state.lowered) {
-      exec_node_remove(&state.texture->node);
-      return false;
-   }
-   /* The variable stays, and stays an output. That is the whole idiom: by the
-    * time the driver sees the shader, the framebuffer-fetch variable and the
-    * application's own colour output at the same location have been merged
-    * into one, so *reading* it is the destination -- which is what has just
-    * been rewritten -- and *writing* it is the colour this draw produces.
-    *
-    * Removing it, or removing the stores to it, was tried and emptied the
-    * fragment shader: `fn main_1() { return; }`, no output at all, and every
-    * pixel came back holding whatever the destination already had. Clearing
-    * the flag is enough, and stops anything downstream treating it specially. */
-   nir_foreach_variable_with_modes(var, nir, nir_var_shader_out)
-      var->data.fb_fetch_output = 0;
-   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-   return true;
 }
 
 static bool
@@ -15282,8 +15269,9 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    struct gex_wgpu_shader *fs = ctx->fs;
    enum pipe_format fetch_formats[8] = {0};
    for (unsigned i = 0; i < 8; ++i)
-      if ((fs->fb_fetch_native & BITFIELD_BIT(i)) && ctx->framebuffer.cbufs[i].texture)
+      if ((fs->fb_fetch_mask & BITFIELD_BIT(i)) && ctx->framebuffer.cbufs[i].texture)
          fetch_formats[i] = ctx->framebuffer.cbufs[i].format;
+   const unsigned fetch_samples = fs->fb_fetch_mask ? MAX2(ctx->fb_samples, 1) : 0;
    /* GL applies the multisample fragment operations only when SAMPLE_BUFFERS
     * is one, so a shader's gl_SampleMask write does nothing on an ordinary
     * framebuffer. WebGPU honours it whatever the sample count, so the write
@@ -15570,7 +15558,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * texture does: the shader has no base module when it reads one, so
     * falling through here returns NULL and the draw disappears without a
     * word -- `if (!fragment.module) return;` is a silent early exit. */
-   if (!fs->fb_fetch_native && !fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
+   if (!fs->fb_fetch_mask && !fs->texture_count && !retype_outputs && !coord_replace && !unproduced &&
        !want_stipple && point_coord_location == ~0u && !want_point_smooth &&
        line_edge_location == ~0u && !fs->buftex_count &&
        !want_sample_positions && !want_clip_dist && !want_logicop &&
@@ -15700,7 +15688,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * predicate, because a shader whose module was deferred always needs a
     * variant regardless of what is bound. */
    const bool needs_variant =
-      fs->integer_sampled_slots != 0 || fs->fb_fetch_native != 0 ||
+      fs->integer_sampled_slots != 0 || fs->fb_fetch_mask != 0 ||
       needs_sampler_variant || retype_outputs || coord_replace != 0 ||
       unproduced != 0 || want_stipple || point_coord_location != ~0u ||
       want_point_smooth || line_edge_location != ~0u ||
@@ -15720,7 +15708,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
 
    for (struct gex_wgpu_shader_variant *cached = fs->variants;
         cached; cached = cached->next) {
-      bool match = memcmp(cached->fetch_formats, fetch_formats, sizeof(fetch_formats)) == 0 &&
+      bool match = cached->fetch_samples == fetch_samples &&
+                   memcmp(cached->fetch_formats, fetch_formats, sizeof(fetch_formats)) == 0 &&
                    cached->sampler_mask == sampler_mask &&
                    memcmp(cached->buftex_words, want_buftex,
                           sizeof(cached->buftex_words)) == 0 &&
@@ -15871,8 +15860,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
          fprintf(stderr, "==== gex wide-point FS variant %u\n", told);
          nir_print_shader(variant, stderr); }
    }
-   if (fs->fb_fetch_native)
-      gex_wgpu_lower_native_fetch(variant, fetch_formats);
+   if (fs->fb_fetch_mask)
+      gex_wgpu_lower_framebuffer_fetch(variant, fetch_formats, !fs->fb_fetch_native, fetch_samples);
    if (want_ignore_sample_mask)
       gex_wgpu_ignore_sample_mask(variant);
    if (want_drop_color)
@@ -15969,6 +15958,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    }
    cached->module = module;
    memcpy(cached->fetch_formats, fetch_formats, sizeof(fetch_formats));
+   cached->fetch_samples = fetch_samples;
    memcpy(cached->buftex_words, want_buftex, sizeof(cached->buftex_words));
    cached->sampler_mask = sampler_mask;
    cached->color_output_type = wanted_output;
@@ -26949,6 +26939,72 @@ gex_wgpu_copy_texture_region(struct pipe_context *pipe,
  *
  * Returns the view to bind, or NULL to leave the slot alone.
  */
+static void gex_wgpu_blit_with_blitter(struct gex_wgpu_context *ctx, const struct pipe_blit_info *info);
+
+static WGPUTextureView
+gex_wgpu_fetch_snapshot(struct gex_wgpu_context *ctx, unsigned rt)
+{
+   struct pipe_resource *attachment = ctx->colors[rt];
+   if (!attachment)
+      return NULL;
+   const unsigned level = ctx->color_levels[rt];
+   const unsigned width = u_minify(attachment->width0, level);
+   const unsigned height = u_minify(attachment->height0, level);
+   const enum pipe_format format = ctx->color_formats[rt];
+   struct pipe_resource *copy = ctx->fetch_copies[rt];
+   if (copy && (copy->width0 != width || copy->height0 != height || copy->format != format ||
+                copy->nr_samples != attachment->nr_samples)) {
+      wgpuTextureViewRelease(ctx->fetch_views[rt]);
+      ctx->fetch_views[rt] = NULL;
+      pipe_resource_reference(&ctx->fetch_copies[rt], NULL);
+      copy = NULL;
+   }
+   if (!copy) {
+      struct pipe_resource templ = *attachment;
+      templ.target = PIPE_TEXTURE_2D;
+      templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+      templ.format = format;
+      templ.width0 = width;
+      templ.height0 = height;
+      templ.depth0 = templ.array_size = 1;
+      templ.last_level = 0;
+      copy = ctx->base.screen->resource_create(ctx->base.screen, &templ);
+      if (!copy)
+         return NULL;
+      ctx->fetch_copies[rt] = copy;
+      ctx->fetch_views[rt] = wgpuTextureCreateView(gex_resource(copy)->texture, NULL);
+   }
+   const struct pipe_box box = {.x = 0, .y = 0, .z = ctx->color_layers[rt],
+                                .width = width, .height = height, .depth = 1};
+   if (MAX2(attachment->nr_samples, 1) == 1) {
+      if (!gex_wgpu_copy_texture_region(&ctx->base, copy, 0, 0, 0, 0, attachment, level, &box, false))
+         return NULL;
+   } else {
+      /* The blitter's same-sample-count path copies each sample, rather
+       * than resolving it. Its draws are implementation work, not queried
+       * application primitives. */
+      struct gex_wgpu_query *queries[ARRAY_SIZE(ctx->active_queries)][ARRAY_SIZE(ctx->active_queries[0])];
+      memcpy(queries, ctx->active_queries, sizeof(queries));
+      memset(ctx->active_queries, 0, sizeof(ctx->active_queries));
+      const __typeof__(ctx->point_expand) saved_points = ctx->point_expand;
+      struct pipe_blit_info info = {0};
+      info.src.resource = attachment;
+      info.src.format = format;
+      info.src.level = level;
+      info.src.box = box;
+      info.dst.resource = copy;
+      info.dst.format = format;
+      info.dst.box = (struct pipe_box){.width = width, .height = height, .depth = 1};
+      info.mask = PIPE_MASK_RGBA;
+      info.filter = PIPE_TEX_FILTER_NEAREST;
+      info.sample0_only = false;
+      gex_wgpu_blit_with_blitter(ctx, &info);
+      memcpy(ctx->active_queries, queries, sizeof(queries));
+      ctx->point_expand = saved_points;
+   }
+   return ctx->fetch_views[rt];
+}
+
 static WGPUTextureView
 gex_wgpu_feedback_snapshot(struct gex_wgpu_context *ctx,
                            struct pipe_resource *attachment,
@@ -40405,6 +40461,7 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
        * -- bumping it would throw that away for nothing. The slot records the
        * epoch it was built under instead, just below. */
       wgpuRenderPipelineRelease(slot->pipeline);
+      ++screen->handle_epoch;
    }
    if (slot->key_capacity < length) {
       uint8_t *grown = realloc(slot->key, length);
@@ -40522,6 +40579,8 @@ gex_wgpu_release_retired_groups(struct gex_wgpu_screen *screen)
    simple_mtx_lock(&screen->cache_lock);
    for (unsigned i = 0; i < screen->retired_count; ++i)
       wgpuBindGroupRelease(screen->retired_groups[i]);
+   if (screen->retired_count)
+      ++screen->handle_epoch;
    screen->retired_count = 0;
    simple_mtx_unlock(&screen->cache_lock);
 }
@@ -40616,8 +40675,10 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
        * cheaply enough that the cache was never the wall it looked like. */
       if (screen->retired_count < ARRAY_SIZE(screen->retired_groups))
          screen->retired_groups[screen->retired_count++] = slot->group;
-      else
+      else {
          wgpuBindGroupRelease(slot->group);
+         ++screen->handle_epoch;
+      }
       /* The outgoing key stops naming these on the next line. */
       gex_wgpu_bg_entries_unref(slot->entries, slot->count);
    }
@@ -45567,27 +45628,28 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * fetch Mesa's advanced-blend lowering asks for -- and they share one
     * binding, which is safe rather than lucky: GL says enabling a logic op
     * disables blending, so no draw can want both. */
-   const bool wants_dst = logicop != 0 || ctx->fs->fb_fetch;
+   uint8_t dst_mask = logicop ? 1 : 0;
+   if (ctx->fs->fb_fetch)
+      for (unsigned i = 0; i < ctx->color_count; ++i)
+         if (ctx->colors[i] && (ctx->fs->fb_fetch_mask & BITFIELD_BIT(i)))
+            dst_mask |= BITFIELD_BIT(i);
+   const unsigned dst_count = util_bitcount(dst_mask);
+   const bool wants_dst = dst_count != 0;
+   const bool serial_fetch = ctx->fs->fb_fetch && screen->software_framebuffer_fetch;
    const bool needs_texture = ctx->fs->texture_count != 0 || wants_dst;
    /* Taken here rather than where the bind group is filled: the snapshot
     * copies a texture, which needs an encoder of its own, and by the time the
     * entries are built the render pass has begun -- calling it there took
     * Dawn's BeginRenderPass down with a segmentation fault. The feedback path
     * takes its own snapshot in this same stretch, for the same reason. */
-   WGPUTextureView logicop_view = NULL;
-   if (wants_dst) {
-      logicop_view = ctx->colors[0]
-         ? gex_wgpu_feedback_snapshot(ctx, ctx->colors[0],
-                                      ctx->color_levels[0])
-         : NULL;
-      if (!logicop_view) {
-         static bool said;
-         if (!said) {
-            said = true;
-            fprintf(stderr, "gex-wgpu: %s declined (no snapshot of the "
-                            "colour attachment)\n",
-                    logicop ? "logic op" : "framebuffer fetch");
-         }
+   WGPUTextureView dst_views[8] = {0};
+   for (unsigned rt = 0; rt < 8; ++rt) {
+      if (!(dst_mask & BITFIELD_BIT(rt)))
+         continue;
+      dst_views[rt] = logicop ? gex_wgpu_feedback_snapshot(ctx, ctx->colors[rt], ctx->color_levels[rt])
+                              : gex_wgpu_fetch_snapshot(ctx, rt);
+      if (!dst_views[rt]) {
+         fprintf(stderr, "gex-wgpu: framebuffer fetch snapshot failed for RT%u\n", rt);
          GEX_DRAW_DROP();
       }
    }
@@ -45991,7 +46053,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * gex_wgpu_trace_buffer_aliasing. */
    gex_wgpu_trace_buffer_aliasing_reset();
    WGPUBindGroupLayoutEntry
-      texture_layout_entries[GEX_WGPU_MAX_SAMPLERS * 2 + 1];
+      texture_layout_entries[GEX_WGPU_MAX_SAMPLERS * 2 + 8];
    /* Sized by the actual maxima, not a literal: raising
     * GEX_WGPU_MAX_CONSTANT_BUFFERS past 8 would otherwise overflow these on a
     * shader that declares enough uniform blocks. */
@@ -46055,20 +46117,19 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             !omitted && !demoted &&
             ((ctx->fs->multisampled_slots >> ctx->fs->texture_slots[i]) & 1);
       }
-      if (wants_dst) {
-         /* The colour attachment's copy, read by texelFetch, so
-          * unfilterable-float and no sampler beside it. */
-         const unsigned entry =
-            ctx->fs->texture_count + ctx->fs->sampler_count;
-         texture_layout_entries[entry] =
-            (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
-         texture_layout_entries[entry].binding = GEX_WGPU_LOGICOP_BINDING;
-         texture_layout_entries[entry].visibility = WGPUShaderStage_Fragment;
-         texture_layout_entries[entry].texture.sampleType =
-            WGPUTextureSampleType_UnfilterableFloat;
-         texture_layout_entries[entry].texture.viewDimension =
-            WGPUTextureViewDimension_2D;
-         texture_layout_entries[entry].texture.multisampled = false;
+      unsigned dst_entry = ctx->fs->texture_count + ctx->fs->sampler_count;
+      for (unsigned rt = 0; rt < 8; ++rt) {
+         if (!(dst_mask & BITFIELD_BIT(rt)))
+            continue;
+         WGPUBindGroupLayoutEntry *entry = &texture_layout_entries[dst_entry++];
+         *entry = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+         entry->binding = GEX_WGPU_LOGICOP_BINDING + rt;
+         entry->visibility = WGPUShaderStage_Fragment;
+         entry->texture.sampleType = logicop ? WGPUTextureSampleType_UnfilterableFloat :
+             (util_format_is_pure_uint(ctx->color_formats[rt]) ? WGPUTextureSampleType_Uint :
+              util_format_is_pure_sint(ctx->color_formats[rt]) ? WGPUTextureSampleType_Sint : WGPUTextureSampleType_UnfilterableFloat);
+         entry->texture.viewDimension = WGPUTextureViewDimension_2D;
+         entry->texture.multisampled = !logicop && MAX2(ctx->fb_samples, 1) > 1;
       }
       for (unsigned i = 0; i < ctx->fs->sampler_count; ++i) {
          const unsigned entry = ctx->fs->texture_count + i;
@@ -46436,7 +46497,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       if (group == 0 && needs_texture) {
          desc.entryCount =
             ctx->fs->texture_count + ctx->fs->sampler_count +
-            (wants_dst ? 1 : 0);
+            dst_count;
          desc.entries = texture_layout_entries;
       } else if (group == 1 && needs_vertex_constant) {
          desc.entryCount = vertex_group_count;
@@ -46673,7 +46734,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    struct gex_wgpu_dynamic_offsets dynamic[4] = {{0}, {0}, {0}, {0}};
    if (pipeline && needs_texture) {
       /* Zeroed whole: the cache hashes the padding with the fields. */
-      WGPUBindGroupEntry entries[GEX_WGPU_MAX_SAMPLERS * 2 + 1] = {0};
+      WGPUBindGroupEntry entries[GEX_WGPU_MAX_SAMPLERS * 2 + 8] = {0};
       for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
          const unsigned slot = ctx->fs->texture_slots[i];
          entries[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
@@ -46729,18 +46790,20 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                             ? WGPUSamplerBindingType_NonFiltering
                             : ctx->fs->sampler_types[i]);
       }
-      if (wants_dst) {
-         const unsigned entry =
-            ctx->fs->texture_count + ctx->fs->sampler_count;
-         entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
-         entries[entry].binding = GEX_WGPU_LOGICOP_BINDING;
-         entries[entry].textureView = logicop_view;
+      unsigned dst_entry = ctx->fs->texture_count + ctx->fs->sampler_count;
+      for (unsigned rt = 0; rt < 8; ++rt) {
+         if (!(dst_mask & BITFIELD_BIT(rt)))
+            continue;
+         WGPUBindGroupEntry *entry = &entries[dst_entry++];
+         *entry = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entry->binding = GEX_WGPU_LOGICOP_BINDING + rt;
+         entry->textureView = dst_views[rt];
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[0];
       bind_desc.entryCount =
          ctx->fs->texture_count + ctx->fs->sampler_count +
-            (wants_dst ? 1 : 0);
+            dst_count;
       bind_desc.entries = entries;
       bind_groups[0] = gex_wgpu_cached_bind_group(
          screen, group_label[0], bind_desc.layout, bind_desc.entries,
@@ -47472,384 +47535,443 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    /* A pass can only write occlusion results if it is told the query set up
     * front, so an active query has to be known before the pass begins. */
-   const bool counting =
-      ctx->active_queries[GEX_WGPU_QUERY_OCCLUSION][0] && ctx->occlusion_set;
-   if (counting)
-      pass_desc.occlusionQuerySet = ctx->occlusion_set;
-   if (gex_timing) gex_wgpu_time_bg += os_time_get_nano() - t_bg_start;
-   const int64_t t_begin_start = gex_timing ? os_time_get_nano() : 0;
-   /* Reuse the open pass when this draw wants exactly the same attachments.
-    * A counting draw never reuses one and never leaves one open, because the
-    * occlusion query index belongs to the pass. */
-   if (!reuse) {
-      gex_wgpu_end_pass(ctx);
-      gex_wgpu_cmd_note("BEGIN-PASS");
-      ctx->pending_pass =
-         wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
-      /* The descriptor, when the pass could not be begun.
-       *
-       * Dawn raises a validation error and returns an *invalid* object rather
-       * than NULL for a descriptor it rejects, so a NULL here is something
-       * else -- and with no Dawn message in the log there is nothing to go on
-       * but the descriptor itself. Printed once per shape. */
-      if (!ctx->pending_pass) {
-         GEX_SAY_ONCE_PER((uint32_t)pass_desc.colorAttachmentCount * 131u +
-                          (uint32_t)(pass_desc.depthStencilAttachment ? 1u : 0u) *
-                             17u +
-                          (uint32_t)(ctx->depth ? ctx->depth->format : 0)) {
-            fprintf(stderr,
-                    "gex-wgpu: beginRenderPass returned NULL: %zu colour "
-                    "attachment%s, occlusion=%s, depth=%s",
-                    (size_t)pass_desc.colorAttachmentCount,
-                    pass_desc.colorAttachmentCount == 1 ? "" : "s",
-                    pass_desc.occlusionQuerySet ? "yes" : "no",
-                    pass_desc.depthStencilAttachment ? "yes" : "no");
-            for (unsigned i = 0; i < pass_desc.colorAttachmentCount; ++i)
-               fprintf(stderr, " [%u view=%s load=%u store=%u]", i,
-                       pass_desc.colorAttachments[i].view ? "ok" : "NULL",
-                       (unsigned)pass_desc.colorAttachments[i].loadOp,
-                       (unsigned)pass_desc.colorAttachments[i].storeOp);
-            if (pass_desc.depthStencilAttachment)
+   const uint32_t ordered_vertices = info->index_size ? draws[0].count :
+                                      ctx->point_expand.active ? 6u : draws[0].count;
+   const uint32_t ordered_instances = ctx->point_expand.active ?
+                                      draws[0].count * info->instance_count : info->instance_count;
+   const bool ordered_strip = pipeline_desc.primitive.topology == WGPUPrimitiveTopology_TriangleStrip;
+   const unsigned primitive_size = pipeline_desc.primitive.topology == WGPUPrimitiveTopology_PointList ? 1 :
+                                    pipeline_desc.primitive.topology == WGPUPrimitiveTopology_LineList ||
+                                    pipeline_desc.primitive.topology == WGPUPrimitiveTopology_LineStrip ? 2 : 3;
+   const unsigned primitive_step = ordered_strip || pipeline_desc.primitive.topology == WGPUPrimitiveTopology_LineStrip ?
+                                    1 : primitive_size;
+   const uint32_t ordered_primitives = ordered_vertices >= primitive_size ?
+                                       (ordered_vertices - primitive_size) / primitive_step + 1 : 0;
+   const uint64_t ordered_draws = serial_fetch ? (uint64_t)ordered_primitives * ordered_instances : 1;
+   /* Multisample snapshots issue blitter draws between application
+    * primitives. Keep these objects alive across blitter cache evictions. */
+   if (serial_fetch) {
+      wgpuRenderPipelineAddRef(pipeline);
+      for (unsigned group = 0; group < ARRAY_SIZE(bind_groups); ++group)
+         if (bind_groups[group])
+            wgpuBindGroupAddRef(bind_groups[group]);
+   }
+   WGPURenderPipeline odd_pipeline = NULL;
+   bool odd_cached = false;
+   if (serial_fetch && ordered_strip && ordered_primitives > 1) {
+      WGPURenderPipelineDescriptor odd = pipeline_desc;
+      odd.primitive.frontFace = odd.primitive.frontFace == WGPUFrontFace_CCW ? WGPUFrontFace_CW : WGPUFrontFace_CCW;
+      odd_pipeline = gex_wgpu_cached_pipeline(screen, &odd, &odd_cached);
+      if (odd_pipeline && odd_cached)
+         wgpuRenderPipelineAddRef(odd_pipeline);
+   }
+   WGPURenderPassEncoder pass = NULL;
+   for (uint64_t ordered = 0; ordered < ordered_draws; ++ordered) {
+      const uint32_t ordered_primitive = serial_fetch ? ordered % ordered_primitives : 0;
+      const uint32_t ordered_instance = serial_fetch ? ordered / ordered_primitives : 0;
+      if (ordered) {
+         gex_wgpu_end_pass(ctx);
+         for (unsigned rt = 0; rt < 8; ++rt)
+            if (dst_mask & BITFIELD_BIT(rt))
+               gex_wgpu_fetch_snapshot(ctx, rt);
+         encoder = gex_wgpu_pending_encoder(ctx);
+      }
+      WGPURenderPipeline draw_pipeline = ordered_strip && (ordered_primitive & 1) ? odd_pipeline : pipeline;
+      const bool counting =
+         ctx->active_queries[GEX_WGPU_QUERY_OCCLUSION][0] && ctx->occlusion_set;
+      if (counting)
+         pass_desc.occlusionQuerySet = ctx->occlusion_set;
+      if (gex_timing) gex_wgpu_time_bg += os_time_get_nano() - t_bg_start;
+      const int64_t t_begin_start = gex_timing ? os_time_get_nano() : 0;
+      /* Reuse the open pass when this draw wants exactly the same attachments.
+       * A counting draw never reuses one and never leaves one open, because the
+       * occlusion query index belongs to the pass. */
+      if (!reuse || serial_fetch) {
+         gex_wgpu_end_pass(ctx);
+         gex_wgpu_cmd_note("BEGIN-PASS");
+         ctx->pending_pass =
+            wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+         /* The descriptor, when the pass could not be begun.
+          *
+          * Dawn raises a validation error and returns an *invalid* object rather
+          * than NULL for a descriptor it rejects, so a NULL here is something
+          * else -- and with no Dawn message in the log there is nothing to go on
+          * but the descriptor itself. Printed once per shape. */
+         if (!ctx->pending_pass) {
+            GEX_SAY_ONCE_PER((uint32_t)pass_desc.colorAttachmentCount * 131u +
+                             (uint32_t)(pass_desc.depthStencilAttachment ? 1u : 0u) *
+                                17u +
+                             (uint32_t)(ctx->depth ? ctx->depth->format : 0)) {
                fprintf(stderr,
-                       " depth[view=%s fmt=%s dload=%u dstore=%u dro=%d "
-                       "sload=%u sstore=%u sro=%d]",
-                       pass_desc.depthStencilAttachment->view ? "ok" : "NULL",
-                       ctx->depth
-                          ? util_format_short_name(ctx->depth->format) : "none",
-                       (unsigned)pass_desc.depthStencilAttachment->depthLoadOp,
-                       (unsigned)pass_desc.depthStencilAttachment->depthStoreOp,
-                       (int)pass_desc.depthStencilAttachment->depthReadOnly,
-                       (unsigned)pass_desc.depthStencilAttachment->stencilLoadOp,
-                       (unsigned)pass_desc.depthStencilAttachment->stencilStoreOp,
-                       (int)pass_desc.depthStencilAttachment->stencilReadOnly);
-            fprintf(stderr, "\n");
-         }
-      }
-      ++screen->pass_serial;
-      memset(&ctx->emitted, 0, sizeof(ctx->emitted));
-      if (!counting && ctx->pending_pass)
-         ctx->pending_pass_key = wanted_pass;
-   }
-   /* An eviction since the last draw may have recycled a handle this state
-    * still names; see gex_wgpu_screen::cache_epoch. */
-   if (ctx->emitted_epoch != screen->cache_epoch) {
-      memset(&ctx->emitted, 0, sizeof(ctx->emitted));
-      ctx->emitted_epoch = screen->cache_epoch;
-   }
-   WGPURenderPassEncoder pass = ctx->pending_pass;
-   if (gex_timing) gex_wgpu_time_begin += os_time_get_nano() - t_begin_start;
-   if (pass) {
-      /* Braced. The second `if` was indented as though it were inside the
-       * first and was not -- the shape gcc flags as -Wmisleading-indentation,
-       * and the same shape that once made a `return` unconditional here. The
-       * two conditions test almost the same thing, so the behaviour barely
-       * differed: only when an occlusion query is active and the query *set*
-       * failed to be created did this mark the query `counted` without
-       * anything having written it, after which the result path found no set
-       * and returned no result at all. Braced, that case answers the zero
-       * that is true of it. */
-      if (counting) {
-         struct gex_wgpu_query *counted_query =
-            ctx->active_queries[GEX_WGPU_QUERY_OCCLUSION][0];
-         /* Its own slot, not slot zero: two queries writing one slot is what
-          * made the earlier of them read back the later one's count. */
-         if (counted_query && counted_query->slot < GEX_WGPU_OCCLUSION_SLOTS) {
-            wgpuRenderPassEncoderBeginOcclusionQuery(pass, counted_query->slot);
-            counted_query->counted = true;
-         }
-      }
-      /* The pipeline by the state that built it, not by its handle: depth,
-       * cull, topology and target format are what decide whether geometry
-       * appears at all, and a handle normalised away for cross-run comparison
-       * tells you nothing about them. */
-      gex_wgpu_cmd_note("pipe depth=%d/%d/%d cull=%d ccw=%d topo=%u ms=%u "
-                        "cfmt=%d vp=%.0fx%.0f sc=%d",
-                        ctx->dsa ? (int)ctx->dsa->depth_enabled : -1,
-                        ctx->dsa ? (int)ctx->dsa->depth_func : -1,
-                        ctx->dsa ? (int)ctx->dsa->depth_writemask : -1,
-                        ctx->rasterizer ? (int)ctx->rasterizer->cull_face : -1,
-                        ctx->rasterizer ? (int)ctx->rasterizer->front_ccw : -1,
-                        (unsigned)info->mode, MAX2(1u, ctx->fb_samples),
-                        ctx->color_count ? (int)ctx->color_formats[0] : -1,
-                        viewport_width, viewport_height,
-                        (int)scissor_enabled);
-      if (ctx->emitted.pipeline != pipeline) {
-         wgpuRenderPassEncoderSetPipeline(pass, pipeline);
-         ctx->emitted.pipeline = pipeline;
-      }
-      if (ctx->depth &&
-          util_format_has_stencil(
-             util_format_description(ctx->depth->format)))
-         wgpuRenderPassEncoderSetStencilReference(
-            pass, ctx->stencil_ref.ref_value[gex_wgpu_stencil_back_drawn(ctx)]);
-      if (uses_blend_constant) {
-         const WGPUColor blend_color = gex_wgpu_blend_constant(ctx);
-         wgpuRenderPassEncoderSetBlendConstant(pass, &blend_color);
-      }
-      /* A one-pixel difference this driver does not correct, measured and
-       * left alone.
-       *
-       * GL measures window y from the bottom and WebGPU from the top, so a
-       * rasterisation tie that resolves one way in one API resolves the other
-       * way in the other -- and geometry exactly on a pixel boundary is
-       * exactly a tie. `tri-viewport` draws a grid every 25 pixels of a
-       * 250-pixel window: every *horizontal* line of it lands one row from
-       * where llvmpipe puts it and every vertical one is exact, which is 0.16
-       * RMSE with nothing animated behind it. A one-pixel point at an
-       * integral coordinate does the same in both axes (gl44-point-probe's
-       * `single` case reads 15,15 where llvmpipe reads 16,16).
-       *
-       * The obvious lever is the viewport, and it does not work: WebGPU
-       * requires the rectangle to lie inside the attachment, so it cannot be
-       * *translated* when it already fills the framebuffer -- only shrunk,
-       * which gives a shift that fades linearly to nothing at the far edge.
-       * Tried: it moved some of `tri-viewport`'s lines and not others (0.162
-       * -> 0.073 at a 64th of a pixel, 0.053 at half a pixel), which is worse
-       * than a consistent tie-break because it makes the answer depend on
-       * where on the screen the geometry is.
-       *
-       * A uniform translation has to happen in the shader, which means either
-       * a vertex variant keyed on the framebuffer height -- recompiled on
-       * every resize, for every shader -- or a uniform read by every vertex
-       * shader in the driver. Both are real costs for one pixel, and neither
-       * has been shown to be worth it. */
-      const float wanted_viewport[6] = { viewport_x, viewport_y,
-                                         viewport_width, viewport_height,
-                                         min_depth, max_depth };
-      if (memcmp(ctx->emitted.viewport, wanted_viewport,
-                 sizeof(wanted_viewport)) != 0) {
-         wgpuRenderPassEncoderSetViewport(pass, viewport_x, viewport_y,
-                                          viewport_width, viewport_height,
-                                          min_depth, max_depth);
-         memcpy(ctx->emitted.viewport, wanted_viewport,
-                sizeof(wanted_viewport));
-      }
-      /* A draw with the scissor disabled wants the whole attachment, and has
-       * to say so: the scissor belongs to the pass, and draws now share one,
-       * so leaving it alone means inheriting whatever rect the last draw
-       * asked for. SuperTuxKart's scrolling news ticker is clipped away from
-       * the icon bar beside it, and without this the two were drawn on top of
-       * each other -- the sort of thing that looks like a layout quirk until
-       * the same frame from softpipe is put next to it. */
-      uint32_t wanted_scissor[4];
-      if (scissor_enabled) {
-         wanted_scissor[0] = scissor_x;
-         wanted_scissor[1] = scissor_y;
-         wanted_scissor[2] = scissor_width;
-         wanted_scissor[3] = scissor_height;
-      } else {
-         /* The tile, not the whole attachment: with the scissor off a draw
-          * wants everything the framebuffer covers, and for a tiled
-          * multisampled array that is one layer's slice of a wider texture.
-          * Left at zero this let every draw write across all the layers. */
-         wanted_scissor[0] = ctx->ms_tile_x;
-         wanted_scissor[1] = 0;
-         wanted_scissor[2] = ctx->fb_width;
-         wanted_scissor[3] = ctx->fb_height;
-      }
-      if (!ctx->emitted.scissor_set ||
-          memcmp(ctx->emitted.scissor, wanted_scissor,
-                 sizeof(wanted_scissor)) != 0) {
-         wgpuRenderPassEncoderSetScissorRect(
-            pass, wanted_scissor[0], wanted_scissor[1],
-            wanted_scissor[2], wanted_scissor[3]);
-         memcpy(ctx->emitted.scissor, wanted_scissor, sizeof(wanted_scissor));
-         ctx->emitted.scissor_set = true;
-      }
-      for (unsigned group = 0; group < 4; ++group) {
-         if (!bind_groups[group])
-            continue;
-         const size_t offset_bytes = dynamic[group].count * sizeof(uint32_t);
-         /* By what the group *contains*, not by its handle. A handle is a
-          * fresh allocation each run, so normalising handles to compare two
-          * runs collapses every distinct group to the same token and hides
-          * precisely the thing worth looking for: a different resource
-          * bound. Dynamic offsets are numbers and stable; textures are named
-          * by size and format. */
-         if (gex_wgpu_cmd_logging()) {
-            gex_wgpu_cmd_note("bg%u n=%u", group, dynamic[group].count);
-            for (unsigned d = 0; d < dynamic[group].count; ++d)
-               gex_wgpu_cmd_note("dyn%u=%u", d, dynamic[group].offset[d]);
-            if (group == 1) {
-               for (unsigned t = 0; t < ctx->fs->texture_count; ++t) {
-                  const unsigned tslot = ctx->fs->texture_slots[t];
-                  const struct pipe_sampler_view *v = ctx->sampler_views[tslot];
-                  if (!v || !v->texture)
-                     gex_wgpu_cmd_note("t%u=none", tslot);
-                  else
-                     gex_wgpu_cmd_note("t%u=%ux%u/%u", tslot,
-                                       v->texture->width0, v->texture->height0,
-                                       (unsigned)v->format);
-               }
+                       "gex-wgpu: beginRenderPass returned NULL: %zu colour "
+                       "attachment%s, occlusion=%s, depth=%s",
+                       (size_t)pass_desc.colorAttachmentCount,
+                       pass_desc.colorAttachmentCount == 1 ? "" : "s",
+                       pass_desc.occlusionQuerySet ? "yes" : "no",
+                       pass_desc.depthStencilAttachment ? "yes" : "no");
+               for (unsigned i = 0; i < pass_desc.colorAttachmentCount; ++i)
+                  fprintf(stderr, " [%u view=%s load=%u store=%u]", i,
+                          pass_desc.colorAttachments[i].view ? "ok" : "NULL",
+                          (unsigned)pass_desc.colorAttachments[i].loadOp,
+                          (unsigned)pass_desc.colorAttachments[i].storeOp);
+               if (pass_desc.depthStencilAttachment)
+                  fprintf(stderr,
+                          " depth[view=%s fmt=%s dload=%u dstore=%u dro=%d "
+                          "sload=%u sstore=%u sro=%d]",
+                          pass_desc.depthStencilAttachment->view ? "ok" : "NULL",
+                          ctx->depth
+                             ? util_format_short_name(ctx->depth->format) : "none",
+                          (unsigned)pass_desc.depthStencilAttachment->depthLoadOp,
+                          (unsigned)pass_desc.depthStencilAttachment->depthStoreOp,
+                          (int)pass_desc.depthStencilAttachment->depthReadOnly,
+                          (unsigned)pass_desc.depthStencilAttachment->stencilLoadOp,
+                          (unsigned)pass_desc.depthStencilAttachment->stencilStoreOp,
+                          (int)pass_desc.depthStencilAttachment->stencilReadOnly);
+               fprintf(stderr, "\n");
             }
          }
-         if (ctx->emitted.groups[group] == bind_groups[group] &&
-             ctx->emitted.dynamic_count[group] == dynamic[group].count &&
-             memcmp(ctx->emitted.dynamic[group], dynamic[group].offset,
-                    offset_bytes) == 0)
-            continue;
-         wgpuRenderPassEncoderSetBindGroup(
-            pass, group, bind_groups[group], dynamic[group].count,
-            dynamic[group].count ? dynamic[group].offset : NULL);
-         ctx->emitted.groups[group] = bind_groups[group];
-         ctx->emitted.dynamic_count[group] = dynamic[group].count;
-         memcpy(ctx->emitted.dynamic[group], dynamic[group].offset,
-                offset_bytes);
+         ++screen->pass_serial;
+         memset(&ctx->emitted, 0, sizeof(ctx->emitted));
+         if (!counting && ctx->pending_pass)
+            ctx->pending_pass_key = wanted_pass;
       }
-      /* By dense slot, matching the pipeline's layout array. Binding by
-       * Gallium index instead both overran WebGPU's eight slots and walked
-       * into the empty ones a disabled vertex array leaves behind. */
-      for (unsigned slot = 0; slot < vb_slot_count; ++slot) {
-         const unsigned which = vb_buffer[slot];
-         /* A gathered slot is bound to the de-indexed copy instead, at offset
-          * zero: the gather already applied the buffer's own offset. */
-         const bool gathered =
-            ((ctx->point_gather_mask | ctx->deindex_gather_mask) &
-             (1u << which)) != 0;
-         struct pipe_resource *buffer = gathered
-            ? ctx->point_gathered[which] : ctx->vertex_buffers[which];
-         uint32_t offset =
-            gathered ? 0u : ctx->vertex_buffer_offsets[which];
-         /* glDrawArraysInstancedBaseInstance, and the reason ARB_base_instance
-          * can be advertised at all.
-          *
-          * WebGPU's draw takes a firstInstance and this used to pass GL's
-          * base through it -- which fetches the right attributes and gets
-          * gl_InstanceID wrong, because SPIR-V's InstanceIndex *counts from*
-          * firstInstance while GL's gl_InstanceID counts from zero. Moving
-          * the base onto the instance-stepped buffers' offsets satisfies both
-          * with no shader change: the fetch starts where GL says and the
-          * builtin still starts at zero.
-          *
-          * A gathered slot is left alone: the de-indexing gather has already
-          * resolved the draw's addressing. */
-         if (!gathered && vb_instanced[slot] && info->start_instance)
-            offset += info->start_instance * vb_stride[slot];
-         WGPUBuffer handle = gex_resource(buffer)->buffer;
-         if (ctx->emitted.vertex[slot] == handle &&
-             ctx->emitted.vertex_offset[slot] == offset) {
-            gex_wgpu_cmd_note("vb%u w0=%u+%u SKIPPED", slot, buffer->width0,
-                              offset);
-            continue;
+      /* An eviction since the last draw may have recycled a handle this state
+       * still names; see gex_wgpu_screen::cache_epoch. */
+      if (ctx->emitted_epoch != screen->cache_epoch ||
+          ctx->emitted_handle_epoch != screen->handle_epoch) {
+         memset(&ctx->emitted, 0, sizeof(ctx->emitted));
+         ctx->emitted_epoch = screen->cache_epoch;
+         ctx->emitted_handle_epoch = screen->handle_epoch;
+      }
+      pass = ctx->pending_pass;
+      if (gex_timing) gex_wgpu_time_begin += os_time_get_nano() - t_begin_start;
+      if (pass) {
+         /* Braced. The second `if` was indented as though it were inside the
+          * first and was not -- the shape gcc flags as -Wmisleading-indentation,
+          * and the same shape that once made a `return` unconditional here. The
+          * two conditions test almost the same thing, so the behaviour barely
+          * differed: only when an occlusion query is active and the query *set*
+          * failed to be created did this mark the query `counted` without
+          * anything having written it, after which the result path found no set
+          * and returned no result at all. Braced, that case answers the zero
+          * that is true of it. */
+         if (counting) {
+            struct gex_wgpu_query *counted_query =
+               ctx->active_queries[GEX_WGPU_QUERY_OCCLUSION][0];
+            /* Its own slot, not slot zero: two queries writing one slot is what
+             * made the earlier of them read back the later one's count. */
+            if (counted_query && counted_query->slot < GEX_WGPU_OCCLUSION_SLOTS) {
+               wgpuRenderPassEncoderBeginOcclusionQuery(pass, counted_query->slot);
+               counted_query->counted = true;
+            }
          }
-         gex_wgpu_cmd_note("vb%u w0=%u+%u", slot, buffer->width0, offset);
-         wgpuRenderPassEncoderSetVertexBuffer(
-            pass, slot, handle, offset, buffer->width0 - offset);
-         ctx->emitted.vertex[slot] = handle;
-         ctx->emitted.vertex_offset[slot] = offset;
-      }
-      if (point_corner_slot >= 0 && ctx->point_expand.corners) {
-         WGPUBuffer corners =
-            gex_resource(ctx->point_expand.corners)->buffer;
-         const uint32_t offset = ctx->point_expand.corner_offset;
-         /* Tracked like every other slot, and the uploader hands out a fresh
-          * region per draw, so this rebinds each time. */
-         wgpuRenderPassEncoderSetVertexBuffer(
-            pass, (uint32_t)point_corner_slot, corners, offset,
-            6 * 4 * sizeof(float));
-         ctx->emitted.vertex[point_corner_slot] = corners;
-         ctx->emitted.vertex_offset[point_corner_slot] = offset;
-      }
-      /* After the application's, because the slot it goes in may still hold a
-       * buffer bound for an earlier draw. */
-      if (default_attribute_slot >= 0) {
-         /* Tracked like any other slot: a later draw may put a real buffer
-          * here, and it must not look unchanged because this one was never
-          * recorded. */
-         WGPUBuffer defaults = gex_screen(pipe->screen)->default_attributes;
-         if (ctx->emitted.vertex[default_attribute_slot] != defaults ||
-             ctx->emitted.vertex_offset[default_attribute_slot] != 0) {
+         /* The pipeline by the state that built it, not by its handle: depth,
+          * cull, topology and target format are what decide whether geometry
+          * appears at all, and a handle normalised away for cross-run comparison
+          * tells you nothing about them. */
+         gex_wgpu_cmd_note("pipe depth=%d/%d/%d cull=%d ccw=%d topo=%u ms=%u "
+                           "cfmt=%d vp=%.0fx%.0f sc=%d",
+                           ctx->dsa ? (int)ctx->dsa->depth_enabled : -1,
+                           ctx->dsa ? (int)ctx->dsa->depth_func : -1,
+                           ctx->dsa ? (int)ctx->dsa->depth_writemask : -1,
+                           ctx->rasterizer ? (int)ctx->rasterizer->cull_face : -1,
+                           ctx->rasterizer ? (int)ctx->rasterizer->front_ccw : -1,
+                           (unsigned)info->mode, MAX2(1u, ctx->fb_samples),
+                           ctx->color_count ? (int)ctx->color_formats[0] : -1,
+                           viewport_width, viewport_height,
+                           (int)scissor_enabled);
+         if (ctx->emitted.pipeline != draw_pipeline) {
+            wgpuRenderPassEncoderSetPipeline(pass, draw_pipeline);
+            ctx->emitted.pipeline = draw_pipeline;
+         }
+         if (ctx->depth &&
+             util_format_has_stencil(
+                util_format_description(ctx->depth->format)))
+            wgpuRenderPassEncoderSetStencilReference(
+               pass, ctx->stencil_ref.ref_value[gex_wgpu_stencil_back_drawn(ctx)]);
+         if (uses_blend_constant) {
+            const WGPUColor blend_color = gex_wgpu_blend_constant(ctx);
+            wgpuRenderPassEncoderSetBlendConstant(pass, &blend_color);
+         }
+         /* A one-pixel difference this driver does not correct, measured and
+          * left alone.
+          *
+          * GL measures window y from the bottom and WebGPU from the top, so a
+          * rasterisation tie that resolves one way in one API resolves the other
+          * way in the other -- and geometry exactly on a pixel boundary is
+          * exactly a tie. `tri-viewport` draws a grid every 25 pixels of a
+          * 250-pixel window: every *horizontal* line of it lands one row from
+          * where llvmpipe puts it and every vertical one is exact, which is 0.16
+          * RMSE with nothing animated behind it. A one-pixel point at an
+          * integral coordinate does the same in both axes (gl44-point-probe's
+          * `single` case reads 15,15 where llvmpipe reads 16,16).
+          *
+          * The obvious lever is the viewport, and it does not work: WebGPU
+          * requires the rectangle to lie inside the attachment, so it cannot be
+          * *translated* when it already fills the framebuffer -- only shrunk,
+          * which gives a shift that fades linearly to nothing at the far edge.
+          * Tried: it moved some of `tri-viewport`'s lines and not others (0.162
+          * -> 0.073 at a 64th of a pixel, 0.053 at half a pixel), which is worse
+          * than a consistent tie-break because it makes the answer depend on
+          * where on the screen the geometry is.
+          *
+          * A uniform translation has to happen in the shader, which means either
+          * a vertex variant keyed on the framebuffer height -- recompiled on
+          * every resize, for every shader -- or a uniform read by every vertex
+          * shader in the driver. Both are real costs for one pixel, and neither
+          * has been shown to be worth it. */
+         const float wanted_viewport[6] = { viewport_x, viewport_y,
+                                            viewport_width, viewport_height,
+                                            min_depth, max_depth };
+         if (memcmp(ctx->emitted.viewport, wanted_viewport,
+                    sizeof(wanted_viewport)) != 0) {
+            wgpuRenderPassEncoderSetViewport(pass, viewport_x, viewport_y,
+                                             viewport_width, viewport_height,
+                                             min_depth, max_depth);
+            memcpy(ctx->emitted.viewport, wanted_viewport,
+                   sizeof(wanted_viewport));
+         }
+         /* A draw with the scissor disabled wants the whole attachment, and has
+          * to say so: the scissor belongs to the pass, and draws now share one,
+          * so leaving it alone means inheriting whatever rect the last draw
+          * asked for. SuperTuxKart's scrolling news ticker is clipped away from
+          * the icon bar beside it, and without this the two were drawn on top of
+          * each other -- the sort of thing that looks like a layout quirk until
+          * the same frame from softpipe is put next to it. */
+         uint32_t wanted_scissor[4];
+         if (scissor_enabled) {
+            wanted_scissor[0] = scissor_x;
+            wanted_scissor[1] = scissor_y;
+            wanted_scissor[2] = scissor_width;
+            wanted_scissor[3] = scissor_height;
+         } else {
+            /* The tile, not the whole attachment: with the scissor off a draw
+             * wants everything the framebuffer covers, and for a tiled
+             * multisampled array that is one layer's slice of a wider texture.
+             * Left at zero this let every draw write across all the layers. */
+            wanted_scissor[0] = ctx->ms_tile_x;
+            wanted_scissor[1] = 0;
+            wanted_scissor[2] = ctx->fb_width;
+            wanted_scissor[3] = ctx->fb_height;
+         }
+         if (!ctx->emitted.scissor_set ||
+             memcmp(ctx->emitted.scissor, wanted_scissor,
+                    sizeof(wanted_scissor)) != 0) {
+            wgpuRenderPassEncoderSetScissorRect(
+               pass, wanted_scissor[0], wanted_scissor[1],
+               wanted_scissor[2], wanted_scissor[3]);
+            memcpy(ctx->emitted.scissor, wanted_scissor, sizeof(wanted_scissor));
+            ctx->emitted.scissor_set = true;
+         }
+         for (unsigned group = 0; group < 4; ++group) {
+            if (!bind_groups[group])
+               continue;
+            const size_t offset_bytes = dynamic[group].count * sizeof(uint32_t);
+            /* By what the group *contains*, not by its handle. A handle is a
+             * fresh allocation each run, so normalising handles to compare two
+             * runs collapses every distinct group to the same token and hides
+             * precisely the thing worth looking for: a different resource
+             * bound. Dynamic offsets are numbers and stable; textures are named
+             * by size and format. */
+            if (gex_wgpu_cmd_logging()) {
+               gex_wgpu_cmd_note("bg%u n=%u", group, dynamic[group].count);
+               for (unsigned d = 0; d < dynamic[group].count; ++d)
+                  gex_wgpu_cmd_note("dyn%u=%u", d, dynamic[group].offset[d]);
+               if (group == 1) {
+                  for (unsigned t = 0; t < ctx->fs->texture_count; ++t) {
+                     const unsigned tslot = ctx->fs->texture_slots[t];
+                     const struct pipe_sampler_view *v = ctx->sampler_views[tslot];
+                     if (!v || !v->texture)
+                        gex_wgpu_cmd_note("t%u=none", tslot);
+                     else
+                        gex_wgpu_cmd_note("t%u=%ux%u/%u", tslot,
+                                          v->texture->width0, v->texture->height0,
+                                          (unsigned)v->format);
+                  }
+               }
+            }
+            if (ctx->emitted.groups[group] == bind_groups[group] &&
+                ctx->emitted.dynamic_count[group] == dynamic[group].count &&
+                memcmp(ctx->emitted.dynamic[group], dynamic[group].offset,
+                       offset_bytes) == 0)
+               continue;
+            wgpuRenderPassEncoderSetBindGroup(
+               pass, group, bind_groups[group], dynamic[group].count,
+               dynamic[group].count ? dynamic[group].offset : NULL);
+            ctx->emitted.groups[group] = bind_groups[group];
+            ctx->emitted.dynamic_count[group] = dynamic[group].count;
+            memcpy(ctx->emitted.dynamic[group], dynamic[group].offset,
+                   offset_bytes);
+         }
+         /* By dense slot, matching the pipeline's layout array. Binding by
+          * Gallium index instead both overran WebGPU's eight slots and walked
+          * into the empty ones a disabled vertex array leaves behind. */
+         for (unsigned slot = 0; slot < vb_slot_count; ++slot) {
+            const unsigned which = vb_buffer[slot];
+            /* A gathered slot is bound to the de-indexed copy instead, at offset
+             * zero: the gather already applied the buffer's own offset. */
+            const bool gathered =
+               ((ctx->point_gather_mask | ctx->deindex_gather_mask) &
+                (1u << which)) != 0;
+            struct pipe_resource *buffer = gathered
+               ? ctx->point_gathered[which] : ctx->vertex_buffers[which];
+            uint32_t offset =
+               gathered ? 0u : ctx->vertex_buffer_offsets[which];
+            /* glDrawArraysInstancedBaseInstance, and the reason ARB_base_instance
+             * can be advertised at all.
+             *
+             * WebGPU's draw takes a firstInstance and this used to pass GL's
+             * base through it -- which fetches the right attributes and gets
+             * gl_InstanceID wrong, because SPIR-V's InstanceIndex *counts from*
+             * firstInstance while GL's gl_InstanceID counts from zero. Moving
+             * the base onto the instance-stepped buffers' offsets satisfies both
+             * with no shader change: the fetch starts where GL says and the
+             * builtin still starts at zero.
+             *
+             * A gathered slot is left alone: the de-indexing gather has already
+             * resolved the draw's addressing. */
+            if (!gathered && vb_instanced[slot] && info->start_instance)
+               offset += info->start_instance * vb_stride[slot];
+            WGPUBuffer handle = gex_resource(buffer)->buffer;
+            if (ctx->emitted.vertex[slot] == handle &&
+                ctx->emitted.vertex_offset[slot] == offset) {
+               gex_wgpu_cmd_note("vb%u w0=%u+%u SKIPPED", slot, buffer->width0,
+                                 offset);
+               continue;
+            }
+            gex_wgpu_cmd_note("vb%u w0=%u+%u", slot, buffer->width0, offset);
             wgpuRenderPassEncoderSetVertexBuffer(
-               pass, (uint32_t)default_attribute_slot, defaults, 0, 32);
-            ctx->emitted.vertex[default_attribute_slot] = defaults;
-            ctx->emitted.vertex_offset[default_attribute_slot] = 0;
+               pass, slot, handle, offset, buffer->width0 - offset);
+            ctx->emitted.vertex[slot] = handle;
+            ctx->emitted.vertex_offset[slot] = offset;
          }
+         if (point_corner_slot >= 0 && ctx->point_expand.corners) {
+            WGPUBuffer corners =
+               gex_resource(ctx->point_expand.corners)->buffer;
+            const uint32_t offset = ctx->point_expand.corner_offset;
+            /* Tracked like every other slot, and the uploader hands out a fresh
+             * region per draw, so this rebinds each time. */
+            wgpuRenderPassEncoderSetVertexBuffer(
+               pass, (uint32_t)point_corner_slot, corners, offset,
+               6 * 4 * sizeof(float));
+            ctx->emitted.vertex[point_corner_slot] = corners;
+            ctx->emitted.vertex_offset[point_corner_slot] = offset;
+         }
+         /* After the application's, because the slot it goes in may still hold a
+          * buffer bound for an earlier draw. */
+         if (default_attribute_slot >= 0) {
+            /* Tracked like any other slot: a later draw may put a real buffer
+             * here, and it must not look unchanged because this one was never
+             * recorded. */
+            WGPUBuffer defaults = gex_screen(pipe->screen)->default_attributes;
+            if (ctx->emitted.vertex[default_attribute_slot] != defaults ||
+                ctx->emitted.vertex_offset[default_attribute_slot] != 0) {
+               wgpuRenderPassEncoderSetVertexBuffer(
+                  pass, (uint32_t)default_attribute_slot, defaults, 0, 32);
+               ctx->emitted.vertex[default_attribute_slot] = defaults;
+               ctx->emitted.vertex_offset[default_attribute_slot] = 0;
+            }
+         }
+         if (index_resource) {
+            WGPUBuffer index_handle = gex_resource(index_resource)->buffer;
+            const WGPUIndexFormat index_format = info->index_size == 2
+               ? WGPUIndexFormat_Uint16 : WGPUIndexFormat_Uint32;
+            gex_wgpu_cmd_note("ib w0=%u+%u fmt=%u", index_resource->width0,
+                              index_byte_offset, (unsigned)index_format);
+            if (ctx->emitted.index != index_handle ||
+                ctx->emitted.index_format != index_format ||
+                ctx->emitted.index_offset != index_byte_offset) {
+               wgpuRenderPassEncoderSetIndexBuffer(
+                  pass, index_handle, index_format, index_byte_offset,
+                  index_resource->width0 - index_byte_offset);
+               ctx->emitted.index = index_handle;
+               ctx->emitted.index_format = index_format;
+               ctx->emitted.index_offset = index_byte_offset;
+            }
+            ++gex_wgpu_draws_issued;
+            gex_wgpu_count_draw_vs(ctx->vs);
+            gex_wgpu_count_draw_target(
+               ctx->fb_width, ctx->fb_height,
+               ctx->color_count && ctx->colors[0]
+                  ? gex_resource(ctx->colors[0])->texture : NULL,
+               ctx->color_count ? ctx->color_formats[0] : PIPE_FORMAT_NONE);
+            if (ctx->color_count && ctx->colors[0] &&
+                gex_resource(ctx->colors[0])->texture ==
+                   gex_wgpu_presented_texture) {
+               ++gex_wgpu_draws_to_presented;
+               gex_wgpu_presented_note("draw ");
+            }
+            gex_wgpu_cmd_note("drawIndexed count=%u inst=%u first=%u bias=%d",
+                              draws[0].count, info->instance_count, first_index,
+                              draws[0].index_bias);
+            gex_wgpu_cmd_end();
+            /* Instance zero: the base has been folded into the
+             * instance-stepped buffers' offsets above, and passing it here as
+             * well would both double it and shift gl_InstanceID. */
+            wgpuRenderPassEncoderDrawIndexed(
+               pass, serial_fetch ? primitive_size : draws[0].count,
+               serial_fetch ? 1 : info->instance_count,
+               first_index + (serial_fetch ? ordered_primitive * primitive_step : 0),
+               draws[0].index_bias, serial_fetch ? ordered_instance : 0u);
+         } else {
+            ++gex_wgpu_draws_issued;
+            gex_wgpu_count_draw_vs(ctx->vs);
+            gex_wgpu_count_draw_target(
+               ctx->fb_width, ctx->fb_height,
+               ctx->color_count && ctx->colors[0]
+                  ? gex_resource(ctx->colors[0])->texture : NULL,
+               ctx->color_count ? ctx->color_formats[0] : PIPE_FORMAT_NONE);
+            /* An expanded point draw is six vertices by one instance per
+             * point, and firstInstance carries the draw's start -- which is
+             * also what makes WGSL's instance_index equal gl_VertexID, since it
+             * counts from firstInstance. */
+            const uint32_t vertices =
+               ctx->point_expand.active ? 6u : draws[0].count;
+            const uint32_t instances = ctx->point_expand.active
+               ? draws[0].count : info->instance_count;
+            const uint32_t first_vertex =
+               ctx->point_expand.active ? 0u : draws[0].start;
+            /* A de-indexed draw starts at zero: the gather put the vertices it
+             * referenced in draw order, so the draw's own start has already
+             * been applied. Passing it again asked for instances 7..12 of a
+             * six-vertex buffer --
+             *
+             *   Instance range (first: 7, count: 6) requires a larger buffer
+             *   (104) than the bound buffer size (48)
+             *
+             * -- which is a validation error, so the whole command buffer went
+             * with it and the second half of every restart-split point draw
+             * vanished. tests/gl44-probe.sh primrestart caught it. */
+            const uint32_t first_instance = !ctx->point_expand.active
+               ? 0u   /* folded into the vertex buffer offsets; see above */
+               : info->index_size ? 0u : draws[0].start;
+            gex_wgpu_cmd_note("draw count=%u inst=%u first=%u", vertices,
+                              instances, first_vertex);
+            gex_wgpu_cmd_end();
+            wgpuRenderPassEncoderDraw(pass, serial_fetch ? primitive_size : vertices,
+                                      serial_fetch ? 1 : instances,
+                                      first_vertex + (serial_fetch ? ordered_primitive * primitive_step : 0),
+                                      first_instance + (serial_fetch ? ordered_instance : 0));
+         }
+         if (counting)
+            wgpuRenderPassEncoderEndOcclusionQuery(pass);
+         const int64_t t_end_start = gex_timing ? os_time_get_nano() : 0;
+         /* Left open for the next draw. Whatever stops recording -- a different
+          * framebuffer, a clear, a map, the submit -- closes it. */
+         if (counting)
+            gex_wgpu_end_pass(ctx);
+         if (gex_timing) gex_wgpu_time_end += os_time_get_nano() - t_end_start;
       }
-      if (index_resource) {
-         WGPUBuffer index_handle = gex_resource(index_resource)->buffer;
-         const WGPUIndexFormat index_format = info->index_size == 2
-            ? WGPUIndexFormat_Uint16 : WGPUIndexFormat_Uint32;
-         gex_wgpu_cmd_note("ib w0=%u+%u fmt=%u", index_resource->width0,
-                           index_byte_offset, (unsigned)index_format);
-         if (ctx->emitted.index != index_handle ||
-             ctx->emitted.index_format != index_format ||
-             ctx->emitted.index_offset != index_byte_offset) {
-            wgpuRenderPassEncoderSetIndexBuffer(
-               pass, index_handle, index_format, index_byte_offset,
-               index_resource->width0 - index_byte_offset);
-            ctx->emitted.index = index_handle;
-            ctx->emitted.index_format = index_format;
-            ctx->emitted.index_offset = index_byte_offset;
-         }
-         ++gex_wgpu_draws_issued;
-         gex_wgpu_count_draw_vs(ctx->vs);
-         gex_wgpu_count_draw_target(
-            ctx->fb_width, ctx->fb_height,
-            ctx->color_count && ctx->colors[0]
-               ? gex_resource(ctx->colors[0])->texture : NULL,
-            ctx->color_count ? ctx->color_formats[0] : PIPE_FORMAT_NONE);
-         if (ctx->color_count && ctx->colors[0] &&
-             gex_resource(ctx->colors[0])->texture ==
-                gex_wgpu_presented_texture) {
-            ++gex_wgpu_draws_to_presented;
-            gex_wgpu_presented_note("draw ");
-         }
-         gex_wgpu_cmd_note("drawIndexed count=%u inst=%u first=%u bias=%d",
-                           draws[0].count, info->instance_count, first_index,
-                           draws[0].index_bias);
-         gex_wgpu_cmd_end();
-         /* Instance zero: the base has been folded into the
-          * instance-stepped buffers' offsets above, and passing it here as
-          * well would both double it and shift gl_InstanceID. */
-         wgpuRenderPassEncoderDrawIndexed(
-            pass, draws[0].count, info->instance_count, first_index,
-            draws[0].index_bias, 0u);
-      } else {
-         ++gex_wgpu_draws_issued;
-         gex_wgpu_count_draw_vs(ctx->vs);
-         gex_wgpu_count_draw_target(
-            ctx->fb_width, ctx->fb_height,
-            ctx->color_count && ctx->colors[0]
-               ? gex_resource(ctx->colors[0])->texture : NULL,
-            ctx->color_count ? ctx->color_formats[0] : PIPE_FORMAT_NONE);
-         /* An expanded point draw is six vertices by one instance per
-          * point, and firstInstance carries the draw's start -- which is
-          * also what makes WGSL's instance_index equal gl_VertexID, since it
-          * counts from firstInstance. */
-         const uint32_t vertices =
-            ctx->point_expand.active ? 6u : draws[0].count;
-         const uint32_t instances = ctx->point_expand.active
-            ? draws[0].count : info->instance_count;
-         const uint32_t first_vertex =
-            ctx->point_expand.active ? 0u : draws[0].start;
-         /* A de-indexed draw starts at zero: the gather put the vertices it
-          * referenced in draw order, so the draw's own start has already
-          * been applied. Passing it again asked for instances 7..12 of a
-          * six-vertex buffer --
-          *
-          *   Instance range (first: 7, count: 6) requires a larger buffer
-          *   (104) than the bound buffer size (48)
-          *
-          * -- which is a validation error, so the whole command buffer went
-          * with it and the second half of every restart-split point draw
-          * vanished. tests/gl44-probe.sh primrestart caught it. */
-         const uint32_t first_instance = !ctx->point_expand.active
-            ? 0u   /* folded into the vertex buffer offsets; see above */
-            : info->index_size ? 0u : draws[0].start;
-         gex_wgpu_cmd_note("draw count=%u inst=%u first=%u", vertices,
-                           instances, first_vertex);
-         gex_wgpu_cmd_end();
-         wgpuRenderPassEncoderDraw(pass, vertices, instances, first_vertex,
-                                   first_instance);
-      }
-      if (counting)
-         wgpuRenderPassEncoderEndOcclusionQuery(pass);
-      const int64_t t_end_start = gex_timing ? os_time_get_nano() : 0;
-      /* Left open for the next draw. Whatever stops recording -- a different
-       * framebuffer, a clear, a map, the submit -- closes it. */
-      if (counting)
-         gex_wgpu_end_pass(ctx);
-      if (gex_timing) gex_wgpu_time_end += os_time_get_nano() - t_end_start;
+   } /* ordered framebuffer-fetch primitives */
+   if (odd_pipeline)
+      wgpuRenderPipelineRelease(odd_pipeline);
+   if (serial_fetch || !pipeline_cached)
+      ++screen->handle_epoch;
+   if (serial_fetch) {
+      wgpuRenderPipelineRelease(pipeline);
+      for (unsigned group = 0; group < ARRAY_SIZE(bind_groups); ++group)
+         if (bind_groups[group])
+            wgpuBindGroupRelease(bind_groups[group]);
    }
    /* The views were recorded into the pass, which holds its own references,
     * so this draw is done with them even though nothing is submitted yet. */
@@ -48069,6 +48191,11 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    free(ctx->persistent);
+   for (unsigned rt = 0; rt < 8; ++rt) {
+      if (ctx->fetch_views[rt])
+         wgpuTextureViewRelease(ctx->fetch_views[rt]);
+      pipe_resource_reference(&ctx->fetch_copies[rt], NULL);
+   }
    ctx->persistent = NULL;
    ctx->persistent_count = ctx->persistent_capacity = 0;
    for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
@@ -48716,21 +48843,12 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    caps->anisotropic_filter = true;
    caps->max_texture_anisotropy = 16.0f;
    caps->polygon_offset_clamp = true;
-   /* Native Dawn's raster-order colour inputs provide coherent fetch for
-    * every attachment, including multisampling. Other devices keep the one
-    * readable colour attachment which
-    * KHR_blend_equation_advanced needs and all it needs: the extension
-    * applies to draw buffer zero only. Mesa's GLSL linker writes every one of
-    * the fourteen equations itself once HasFBFetch is set, and asks the
-    * driver for the destination texel -- which the colour-attachment snapshot
-    * already produces for glLogicOp. See gex_wgpu_lower_fb_fetch.
-    *
-    * The snapshot path is not coherent: the snapshot is
-    * taken once per draw, so overlapping primitives inside one draw do not
-    * see each other. That is exactly what the non-coherent form permits, and
-    * why it makes the application call glBlendBarrier. */
-   caps->fbfetch = screen->framebuffer_fetch ? 8 : 1;
-   caps->fbfetch_coherent = screen->framebuffer_fetch;
+   /* Native Dawn supplies raster-order attachment inputs. Other capable
+    * devices use typed snapshots between primitives and instances, including
+    * each MSAA sample, to provide the same coherent attachment ordering.
+    * Small devices retain the noncoherent one-target advanced-blend path. */
+   caps->fbfetch = screen->framebuffer_fetch || screen->software_framebuffer_fetch ? 8 : 1;
+   caps->fbfetch_coherent = screen->framebuffer_fetch || screen->software_framebuffer_fetch;
    /* Kept for the record: ARB_polygon_offset_clamp used to be *not* claimed,
     * worth keeping: every part of it is already here.
     * pipe_rasterizer_state::offset_clamp is carried through to
@@ -49695,6 +49813,12 @@ gex_wgpu_screen_create(WGPUDevice device)
 #ifndef __EMSCRIPTEN__
    screen->framebuffer_fetch = wgpuDeviceHasFeature(device, WGPUFeatureName_FramebufferFetch);
 #endif
+   const bool force_ordered_fetch = getenv("GEX_WGPU_FORCE_ORDERED_FETCH") != NULL;
+   if (force_ordered_fetch)
+      screen->framebuffer_fetch = false;
+   screen->software_framebuffer_fetch = !screen->framebuffer_fetch && got_limits &&
+      (limits.maxSampledTexturesPerShaderStage >=
+         GEX_WGPU_MAX_SAMPLERS + GEX_WGPU_MAX_SHADER_IMAGES + 8 || force_ordered_fetch);
    /* Real GPU timestamps, if the device has them. ARB_timer_query is one of
     * the two things GL 3.3 still wants, and the alternative -- answering from
     * the CPU clock -- measures the gap between commands being recorded rather

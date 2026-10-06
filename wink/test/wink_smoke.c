@@ -95,6 +95,10 @@ note(const char *fmt, ...)
    X(void, VertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)) \
    X(void, VertexAttribIPointer, (GLuint, GLint, GLenum, GLsizei, const void *)) \
    X(void, DrawArrays, (GLenum, GLint, GLsizei))                                 \
+   X(void, DrawArraysInstanced, (GLenum, GLint, GLsizei, GLsizei))               \
+   X(void, DrawElementsInstanced, (GLenum, GLsizei, GLenum, const void *, GLsizei)) \
+   X(void, Enable, (GLenum))                                                   \
+   X(void, Disable, (GLenum))                                                  \
    X(void, GenTextures, (GLsizei, GLuint *))                                     \
    X(void, BindTexture, (GLenum, GLuint))                                        \
    X(void, TexParameteri, (GLenum, GLenum, GLint))                               \
@@ -573,6 +577,23 @@ framebuffer_fetch(void)
    prog = p_glCreateProgram(); p_glAttachShader(prog,v); p_glAttachShader(prog,f); p_glLinkProgram(prog);
    p_glGetProgramiv(prog,GL_LINK_STATUS,&linked); CHECK(linked,"MRT fetch: link failed");
    p_glUseProgram(prog);
+   const char *array_fs = "#version 300 es\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; layout(location=0) inout vec4 c[2];"
+      "void main(){ int i=int(gl_FragCoord.x)&1; c[i]+=i==0?vec4(0.125,0,0,0):vec4(0,0.25,0,0); }";
+   GLuint array_prog=link_program(vs,array_fs,"array fetch");
+   const char *sample_vs = "#version 320 es\n"
+      "void main(){ int i=gl_VertexID%3; gl_Position=vec4(i==1?3.0:-1.0,i==2?3.0:-1.0,0,1); }";
+   const char *sample_fs = "#version 320 es\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; layout(location=0) inout vec4 c;"
+      "void main(){ c.r+=float(gl_SampleID+1)*0.125; }";
+   GLuint sample_prog=link_program(sample_vs,sample_fs,"per-sample fetch");
+   const char *readonly_fs = "#version 300 es\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; layout(location=0) inout vec4 source;"
+      "layout(location=1) out vec4 destination; void main(){ destination=source+vec4(0.125,0,0,0); }";
+   GLuint readonly_prog=link_program(vs,readonly_fs,"readonly fetch");
    const GLenum buffers[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
    GLuint fb[2], tex[3]; p_glGenFramebuffers(2,fb); p_glGenTextures(3,tex);
    p_glBindFramebuffer(GL_FRAMEBUFFER,fb[1]);
@@ -605,6 +626,33 @@ framebuffer_fetch(void)
                samples,i,px[0],px[1],px[2],px[3]);
          p_glBindFramebuffer(GL_FRAMEBUFFER,fb[0]);
       }
+      if (samples==1) {
+         p_glUseProgram(readonly_prog); p_glClearColor(0.25,0,0,1); p_glClear(GL_COLOR_BUFFER_BIT);
+         p_glDrawArrays(GL_TRIANGLES,0,9);
+         for (unsigned i=0;i<2;++i) {
+            p_glReadBuffer(buffers[i]); read_center(px,W,H);
+            CHECK(near(px,i==0?64:96,0,0),"readonly fetch RT%u: %u,%u,%u,%u",
+                  i,px[0],px[1],px[2],px[3]);
+         }
+         p_glClearColor(0,0,0,1);
+         p_glUseProgram(array_prog); p_glClear(GL_COLOR_BUFFER_BIT);
+         p_glDrawArrays(GL_TRIANGLES,0,9);
+         for (unsigned i=0;i<2;++i) {
+            p_glReadBuffer(buffers[i]);
+            p_glReadPixels(W/2+i,H/2,1,1,GL_RGBA,GL_UNSIGNED_BYTE,px);
+            CHECK(near(px,i==0?96:0,i==1?192:0,0),"array fetch RT%u: %u,%u,%u,%u",
+                  i,px[0],px[1],px[2],px[3]);
+         }
+         p_glUseProgram(prog);
+      } else {
+         p_glUseProgram(sample_prog); p_glClear(GL_COLOR_BUFFER_BIT);
+         p_glDrawArrays(GL_TRIANGLES,0,9);
+         p_glReadBuffer(GL_COLOR_ATTACHMENT0); p_glBindFramebuffer(GL_DRAW_FRAMEBUFFER,fb[1]);
+         p_glBlitFramebuffer(0,0,W,H,0,0,W,H,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+         p_glBindFramebuffer(GL_READ_FRAMEBUFFER,fb[1]); read_center(px,W,H);
+         CHECK(near(px,200,0,0),"per-sample fetch: %u,%u,%u,%u",px[0],px[1],px[2],px[3]);
+         p_glBindFramebuffer(GL_FRAMEBUFFER,fb[0]); p_glUseProgram(prog);
+      }
       p_glBindTexture(target,0);
       // A texture's target is immutable; make new objects for the MSAA pass.
       if (samples == 1) { p_glDeleteTextures(2,tex); p_glGenTextures(2,tex); }
@@ -613,6 +661,81 @@ framebuffer_fetch(void)
    p_glDeleteFramebuffers(2,fb); p_glDeleteTextures(3,tex);
    CHECK(p_glGetError()==GL_NO_ERROR && !wink_device_lost(),"MRT fetch context failed");
    p_glUseProgram(0); p_glDeleteProgram(prog); p_glDeleteShader(v); p_glDeleteShader(f);
+   p_glDeleteProgram(array_prog);
+   p_glDeleteProgram(sample_prog);
+   p_glDeleteProgram(readonly_prog);
+
+   const char *inst_vs = "#version 300 es\n"
+      "flat out int instance; void main(){ int i=gl_VertexID%3;"
+      "gl_Position=vec4(i==1?3.0:-1.0,i==2?3.0:-1.0,0,1); instance=gl_InstanceID; }";
+   const char *inst_fs = "#version 300 es\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; flat in int instance; layout(location=0) inout vec4 c;"
+      "void main(){ c.r=c.r*0.5+float(instance+1)*0.125; }";
+   prog = link_program(inst_vs, inst_fs, "instanced fetch");
+   p_glUseProgram(prog); p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glDrawArraysInstanced(GL_TRIANGLES,3,3,3); read_center(px,W,H);
+   CHECK(near(px,136,0,0),"instanced fetch: %u,%u,%u,%u",px[0],px[1],px[2],px[3]);
+   GLuint indices; const uint16_t elements[] = {3,4,5};
+   p_glGenBuffers(1,&indices); p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,indices);
+   p_glBufferData(GL_ELEMENT_ARRAY_BUFFER,sizeof(elements),elements,GL_STATIC_DRAW);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glDrawElementsInstanced(GL_TRIANGLES,3,GL_UNSIGNED_SHORT,NULL,3); read_center(px,W,H);
+   CHECK(near(px,136,0,0),"indexed instanced fetch: %u,%u,%u,%u",px[0],px[1],px[2],px[3]);
+   p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,0); p_glDeleteBuffers(1,&indices);
+   p_glDeleteProgram(prog);
+   const char *strip_fs = "#version 300 es\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; layout(location=0) inout vec4 c;"
+      "void main(){ c+=gl_FrontFacing?vec4(0.125,0,0,0):vec4(0,0,0.125,0); }";
+   prog = link_program(vs,strip_fs,"strip fetch"); p_glUseProgram(prog);
+   p_glClear(GL_COLOR_BUFFER_BIT); p_glDrawArrays(GL_TRIANGLE_STRIP,0,6); read_center(px,W,H);
+   CHECK(near(px,64,0,64),"strip fetch winding: %u,%u,%u,%u",px[0],px[1],px[2],px[3]);
+   p_glClear(GL_COLOR_BUFFER_BIT); p_glEnable(GL_CULL_FACE);
+   p_glDrawArrays(GL_TRIANGLE_STRIP,0,6); p_glDisable(GL_CULL_FACE); read_center(px,W,H);
+   CHECK(near(px,64,0,0),"strip fetch culling: %u,%u,%u,%u",px[0],px[1],px[2],px[3]);
+   p_glDeleteProgram(prog);
+
+   uint8_t gradient[W*H*4];
+   for (unsigned y=0;y<H;++y) for(unsigned x=0;x<W;++x) {
+      unsigned at=(y*W+x)*4;
+      gradient[at]=(y%4)*32; gradient[at+1]=(x%4)*32;
+      gradient[at+2]=0; gradient[at+3]=255;
+   }
+   p_glGenTextures(1,tex); p_glGenFramebuffers(1,fb);
+   p_glBindTexture(GL_TEXTURE_2D,tex[0]);
+   p_glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,W,H,0,GL_RGBA,GL_UNSIGNED_BYTE,gradient);
+   p_glBindFramebuffer(GL_FRAMEBUFFER,fb[0]);
+   p_glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,tex[0],0);
+   prog=link_program(vs,fs,"coordinate fetch"); p_glUseProgram(prog);
+   p_glDrawArrays(GL_TRIANGLES,0,9);
+   p_glReadPixels(9,10,1,1,GL_RGBA,GL_UNSIGNED_BYTE,px);
+   CHECK(near(px,160,32,0),"fetch coordinates: %u,%u,%u,%u",px[0],px[1],px[2],px[3]);
+   p_glDeleteProgram(prog);
+   const char *uint_fs = "#version 300 es\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; precision highp int; layout(location=0) inout uvec4 c;"
+      "void main(){ c.r+=1u; }";
+   uint32_t initial[W*H];
+   for (unsigned i=0;i<W*H;++i) initial[i]=1;
+   p_glTexImage2D(GL_TEXTURE_2D,0,GL_R32UI,W,H,0,GL_RED_INTEGER,GL_UNSIGNED_INT,initial);
+   prog=link_program(vs,uint_fs,"integer fetch"); p_glUseProgram(prog);
+   p_glDrawArrays(GL_TRIANGLES,0,9);
+   uint32_t integer=0; p_glReadPixels(9,10,1,1,GL_RED_INTEGER,GL_UNSIGNED_INT,&integer);
+   CHECK(integer==4,"integer fetch: %u, want 4",integer);
+   p_glDeleteProgram(prog);
+   uint8_t red[W*H]={0};
+   p_glTexImage2D(GL_TEXTURE_2D,0,GL_R8,W,H,0,GL_RED,GL_UNSIGNED_BYTE,red);
+   const char *red_fs = "#version 300 es\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; layout(location=0) inout vec4 c;"
+      "void main(){ c.r=(c.g==0.0&&c.b==0.0&&c.a==1.0)?c.r+0.125:0.0; }";
+   prog=link_program(vs,red_fs,"single channel fetch"); p_glUseProgram(prog);
+   p_glDrawArrays(GL_TRIANGLES,0,9); read_center(px,W,H);
+   CHECK(near(px,96,0,0),"single channel fetch: %u,%u,%u,%u",px[0],px[1],px[2],px[3]);
+   p_glBindFramebuffer(GL_FRAMEBUFFER,0); p_glDeleteFramebuffers(1,fb); p_glDeleteTextures(1,tex);
+   p_glUseProgram(0); p_glDeleteProgram(prog);
+   CHECK(p_glGetError()==GL_NO_ERROR && !wink_device_lost(),"ordered fetch context failed");
 }
 
 static void

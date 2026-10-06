@@ -372,7 +372,7 @@ create_device(void)
       /* And sampled textures, for the same reason: GL 3.3 wants sixteen per
        * stage, which is WebGPU's default, but a stage that also splits
        * combined samplers can name more. */
-      GEX_WANT(maxSampledTexturesPerShaderStage, 16);
+      GEX_WANT(maxSampledTexturesPerShaderStage, 48);
       /* Eight RGBA8 draw buffers is exactly WebGPU's default 32 bytes per
        * sample, so GL 3.2's eight draw buffers of any wider format fails on
        * it. */
