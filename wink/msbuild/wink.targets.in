@@ -19,6 +19,9 @@
   deeply, unless the app already chose one through EmccStackSize or a
   STACK_SIZE in EmccExtraLDFlags. GL runs on whichever thread the app calls it from, and
   that thread's stack is what matters: with WasmEnableThreads, a pthread's.
+  Those are 2MB each (DEFAULT_PTHREAD_STACK_SIZE), unless the app chose:
+  not the stack's 16MB for every thread. GL compiles in well under a
+  megabyte, and Tint goes to a stack of its own on a thread of less.
 -->
 <Project>
   <PropertyGroup>
@@ -34,6 +37,10 @@
     <NativeFileReference Include="$(WinkRoot)lib/libwink_webgpu.a" Condition="'$(WinkLinkWebGPUGlue)' != 'false'" />
     <NativeFileReference Include="$(WinkRoot)lib/libwink_tint.a" Condition="'$(WinkLinkTint)' != 'false'" />
   </ItemGroup>
+
+  <PropertyGroup Condition="'$(WinkVariant)' == 'mt' and !$(EmccExtraLDFlags.Contains('DEFAULT_PTHREAD_STACK_SIZE'))">
+    <EmccExtraLDFlags>$(EmccExtraLDFlags) -sDEFAULT_PTHREAD_STACK_SIZE=2MB</EmccExtraLDFlags>
+  </PropertyGroup>
 
   <PropertyGroup>
     <!-- In this order: library_webgpu.js is preprocessed with the three tables. -->

@@ -14,6 +14,7 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include <emscripten/emscripten.h>
+#include <emscripten/stack.h>
 #include <emscripten/threading.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -431,11 +432,37 @@ run_all(void)
    return failures;
 }
 
+/* How deep this thread's C stack went, which is what the manifest's
+ * STACK_SIZE and a GL thread's stack are sized by: what is below the
+ * stack pointer marked first, and what was written over found after. */
+#define STACK_MARK 0xa5
+static void
+mark_stack(void)
+{
+   const uintptr_t end = emscripten_stack_get_end(), here = emscripten_stack_get_current();
+   if (here > end + 8192)
+      memset((void *)end, STACK_MARK, here - end - 4096);
+}
+
+static void
+note_stack(void)
+{
+   const uintptr_t end = emscripten_stack_get_end(), base = emscripten_stack_get_base();
+   const uint8_t *p = (const uint8_t *)end;
+   while ((uintptr_t)p < base && *p == STACK_MARK)
+      ++p;
+   note("stack: %u KiB deep of %u KiB", (unsigned)((base - (uintptr_t)p) >> 10),
+        (unsigned)((base - end) >> 10));
+}
+
 EMSCRIPTEN_KEEPALIVE int
 wink_smoke_main(void)
 {
    wink_test_publish();
-   return run_all();
+   mark_stack();
+   const int failed = run_all();
+   note_stack();
+   return failed;
 }
 
 #ifdef __EMSCRIPTEN_PTHREADS__

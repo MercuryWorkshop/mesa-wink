@@ -115,7 +115,12 @@ Import it after the app's own properties. These knobs are read at import:
 The stack is raised to 16 MB unless the app already chose one, through
 `EmccStackSize` or a `STACK_SIZE` in `EmccExtraLDFlags`. GL runs on whatever
 thread calls it, and that thread's stack is the one that matters; with
-`WasmEnableThreads`, that is a pthread's.
+`WasmEnableThreads`, that is a pthread's. Those are 2 MB each in `mt`
+(`DEFAULT_PTHREAD_STACK_SIZE`, unless the app set it), rather than the 16 MB
+every thread otherwise gets: the GL ES 3 shader suite compiles natively in
+1 MB, and Tint, which recurses as deep as a shader's expressions nest, goes
+to a 16 MB stack of its own, made the first time it is wanted, on a thread
+of less than 4 MB free. The smoke test says how deep its stack went.
 
 Link flags, from the manifest:
 
@@ -125,7 +130,8 @@ Link flags, from the manifest:
   * `-sWASM_BIGINT=1`.
   * `-pthread` for `mt`.
 * **Recommended:** `-sSTACK_SIZE=16MB` (Tint recurses deeply), an initial
-  memory above that, `-sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB`.
+  memory above that, `-sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4GB`; and
+  for `mt`, `-sDEFAULT_PTHREAD_STACK_SIZE=2MB`.
 * **Forbidden:**
   * `-sUSE_WEBGPU=1`, a second and incompatible `webgpu.h` implementation.
   * JS-mode exceptions or longjmp.

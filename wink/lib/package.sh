@@ -79,7 +79,13 @@ mt = v == 'mt'
 js = e['WINK_JS_ORDER'].split()
 required = ['-fwasm-exceptions', '-sSUPPORT_LONGJMP=wasm', '-sWASM_BIGINT=1'] + (['-pthread'] if mt else [])
 # Tint's passes recurse deeply; a 16 MB stack needs an initial memory above it.
+# Every pthread's stack is DEFAULT_PTHREAD_STACK_SIZE, which is STACK_SIZE
+# unless set: 16 MB each of the program's threads. GL compiles its shaders
+# in well under a megabyte, and Tint goes to a stack of its own where the
+# thread's has less free than it may want (gex_wgpu_tint.cpp).
 recommended = ['-sALLOW_MEMORY_GROWTH=1', '-sMAXIMUM_MEMORY=4GB', '-sSTACK_SIZE=16MB', '-sINITIAL_MEMORY>=32MB']
+if mt:
+    recommended.append('-sDEFAULT_PTHREAD_STACK_SIZE=2MB')
 forbidden = ['-sUSE_WEBGPU=1', '-fexceptions (JS exceptions)', '-sDISABLE_EXCEPTION_CATCHING=0',
              '-sSUPPORT_LONGJMP=emscripten', '-fPIC objects in the same link']
 files = {}

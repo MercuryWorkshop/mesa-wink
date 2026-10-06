@@ -362,7 +362,7 @@ void set_error(char **error_out, const std::string& message)
 } // namespace
 
 static char *
-translate(const uint32_t *words, size_t word_count, char **error_out)
+translate_here(const uint32_t *words, size_t word_count, char **error_out)
 {
    if (error_out)
       *error_out = nullptr;
@@ -490,6 +490,55 @@ translate(const uint32_t *words, size_t word_count, char **error_out)
       set_error(error_out, "out of memory copying WGSL");
    return wgsl;
 }
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/stack.h>
+/* compiler-rt's (stack_ops.S): the wasm shadow stack's pointer. */
+extern "C" uintptr_t stackSave(void);
+extern "C" void stackRestore(uintptr_t sp);
+
+/* Tint's passes recurse as deep as a shader's expressions nest, and a
+ * thread's stack is the application's to size: every pthread's is
+ * DEFAULT_PTHREAD_STACK_SIZE, which defaults to STACK_SIZE, and setting
+ * that large enough for Tint made every thread of the program pay for it,
+ * a .NET program's thread pool too. So a translation on a thread of less
+ * stack free than it may want runs on a stack of its own instead: one, made
+ * when first wanted and kept, which translations take turns on. */
+namespace {
+constexpr size_t tint_stack_need = 4u << 20;
+constexpr size_t tint_stack_size = 16u << 20;
+std::mutex tint_stack_mutex;
+uint8_t *tint_stack;
+} // namespace
+
+static char *
+translate(const uint32_t *words, size_t word_count, char **error_out)
+{
+   if (emscripten_stack_get_free() >= tint_stack_need)
+      return translate_here(words, word_count, error_out);
+   std::lock_guard<std::mutex> lock(tint_stack_mutex);
+   if (!tint_stack)
+      tint_stack = static_cast<uint8_t *>(std::malloc(tint_stack_size));
+   if (!tint_stack)
+      return translate_here(words, word_count, error_out);
+   const uintptr_t base = emscripten_stack_get_base(), end = emscripten_stack_get_end();
+   const uintptr_t sp = stackSave();
+   const uintptr_t top = (reinterpret_cast<uintptr_t>(tint_stack) + tint_stack_size) & ~uintptr_t(15);
+   emscripten_stack_set_limits(reinterpret_cast<void *>(top), tint_stack);
+   stackRestore(top);
+   /* Built without exceptions: nothing leaves it but by returning. */
+   char *wgsl = translate_here(words, word_count, error_out);
+   stackRestore(sp);
+   emscripten_stack_set_limits(reinterpret_cast<void *>(base), reinterpret_cast<void *>(end));
+   return wgsl;
+}
+#else
+static char *
+translate(const uint32_t *words, size_t word_count, char **error_out)
+{
+   return translate_here(words, word_count, error_out);
+}
+#endif
 
 /* The translation cache: SPIR-V in, the WGSL Tint made of it out.
  *
