@@ -359,9 +359,10 @@ test_texture(VkBuffer vertices)
    const uint8_t texels[16] = { 255, 0, 0, 255,   0, 255, 0, 255,
                                 0, 0, 255, 255,   255, 255, 255, 255 };
    memcpy(staging.map, texels, sizeof(texels));
-   struct buffer ubo = make_buffer(256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, HOST);
+   struct buffer ubo = make_buffer_at(256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                                         VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST, 16);
    const float scale[4] = { 1.0f, 0.5f, 1.0f, 1.0f };
-   memcpy(ubo.map, scale, sizeof(scale));
+   memset(ubo.map, 0, sizeof(scale));
 
    VkSampler sampler;
    VK(vkCreateSampler(dev, &(VkSamplerCreateInfo){
@@ -420,6 +421,9 @@ test_texture(VkBuffer vertices)
    const VkDeviceSize zero = 0;
 
    VkCommandBuffer cmd = begin();
+   /* The aligned binding must copy the GPU's current bytes, rather than
+    * reading the zeroes from the mapped allocation. */
+   vkCmdUpdateBuffer(cmd, ubo.buffer, 0, sizeof(scale), scale);
    vkCmdCopyBufferToImage(cmd, staging.buffer, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                           &(VkBufferImageCopy){
       .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 2, 2, 1 },

@@ -103,7 +103,7 @@ struct buffer {
 #define HOST (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
 
 static struct buffer
-make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props)
+make_buffer_at(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props, VkDeviceSize offset)
 {
    struct buffer b = { 0 };
    VK(vkCreateBuffer(dev, &(VkBufferCreateInfo){
@@ -112,13 +112,23 @@ make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags p
    VkMemoryRequirements req;
    vkGetBufferMemoryRequirements(dev, b.buffer, &req);
    VK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
-      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size,
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size + offset,
       .memoryTypeIndex = memory_type(req.memoryTypeBits, props),
    }, NULL, &b.memory));
-   VK(vkBindBufferMemory(dev, b.buffer, b.memory, 0));
-   if (props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+   CHECK(offset % req.alignment == 0, "buffer memory offset %llu is not aligned to %llu",
+         (unsigned long long)offset, (unsigned long long)req.alignment);
+   VK(vkBindBufferMemory(dev, b.buffer, b.memory, offset));
+   if (props & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
       VK(vkMapMemory(dev, b.memory, 0, VK_WHOLE_SIZE, 0, &b.map));
+      b.map = (uint8_t *)b.map + offset;
+   }
    return b;
+}
+
+static struct buffer
+make_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props)
+{
+   return make_buffer_at(size, usage, props, 0);
 }
 
 static void

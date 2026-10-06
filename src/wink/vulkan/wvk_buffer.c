@@ -41,11 +41,11 @@ get_requirements(const struct wvk_device *dev, VkDeviceSize size, VkBufferUsageF
                  VkMemoryRequirements2 *pMemoryRequirements)
 {
    const struct wvk_physical_device *pdev = wvk_device_physical(dev);
-   /* A range bound as a uniform or storage buffer must start where WebGPU
-    * allows; anything else, on four bytes, which is what copies and vertex
-    * and index buffers need. */
+   /* Read-only uniform suballocations can be staged into aligned bindings
+    * by the command replay. Writable and other storage uses still need the
+    * WebGPU alignment. */
    uint64_t alignment = 16;
-   if (usage & (VK_BUFFER_USAGE_2_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT |
+   if (usage & (VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT |
                 VK_BUFFER_USAGE_2_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_2_STORAGE_TEXEL_BUFFER_BIT |
                 VK_BUFFER_USAGE_2_INDIRECT_BUFFER_BIT))
       alignment = MAX3(alignment, pdev->limits.minUniformBufferOffsetAlignment,

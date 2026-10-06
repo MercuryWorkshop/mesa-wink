@@ -2266,6 +2266,7 @@ struct buffer_use {
    WGPUBuffer buffer;
    uint64_t offset, size;
    bool write;
+   uint32_t alignment;
 };
 
 static uint32_t merge_buffers(const struct wvk_bound_state *st, uint32_t bind_point, WGPUBuffer *buffers,
@@ -2346,7 +2347,9 @@ gather_buffer_uses(struct wvk_device *dev, struct wvk_replay *replay, const stru
             continue;
          const uint32_t dynamic = b->dynamic && dynamic_index < WVK_MAX_DYNAMIC ? bound->dynamic_offsets[dynamic_index] : 0;
          out[n++] = (struct buffer_use){ g, b->binding, d->buffer, d->offset + dynamic, binding_size(pdev, b, d),
-                                         b->kind == WVK_BINDING_STORAGE };
+                                         b->kind == WVK_BINDING_STORAGE,
+                                         b->kind == WVK_BINDING_UNIFORM ? pdev->limits.minUniformBufferOffsetAlignment
+                                                                        : pdev->limits.minStorageBufferOffsetAlignment };
       }
    }
    return n;
@@ -2363,6 +2366,8 @@ writes_buffer(const struct buffer_use *uses, uint32_t n, WGPUBuffer buffer)
 }
 
 /* Copies of what the draw or dispatch reads of buffers it also writes,
+ * or read-only ranges whose suballocation cannot be bound at WebGPU's
+ * alignment. GPU copies preserve data produced by earlier commands too.
  * made here, outside any pass -- which ends one if it has to. True if it
  * made any. A shader reading what it writes of the same range, which
  * Vulkan lets it, sees what was there before. */
@@ -2372,7 +2377,8 @@ swap_conflicting_reads(struct wvk_device *dev, struct wvk_replay *replay, const 
    util_dynarray_clear(&replay->buffer_swaps);
    bool made = false;
    for (uint32_t i = 0; i < n; ++i) {
-      if (uses[i].write || !writes_buffer(uses, n, uses[i].buffer) || !uses[i].size)
+      const bool unaligned = uses[i].alignment && uses[i].offset % uses[i].alignment;
+      if (uses[i].write || (!unaligned && !writes_buffer(uses, n, uses[i].buffer)) || !uses[i].size)
          continue;
       WGPUBuffer copy = wvk_replay_temp_buffer(dev, replay, uses[i].size,
                                                WGPUBufferUsage_Uniform | WGPUBufferUsage_Storage |
