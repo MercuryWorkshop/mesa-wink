@@ -219,6 +219,9 @@ struct glthread_state
     */
    bool remote;
    thrd_t driver_thread;
+   /* The GL function the next wait is for, named by the remote-call macros
+    * and _mesa_glthread_finish_before; see _mesa_glthread_remote_census. */
+   const char *sync_why;
 
    /** Display lists. */
    GLenum16 ListMode; /**< Zero if not inside display list, else list mode. */
@@ -344,20 +347,34 @@ void _mesa_glthread_call_async(struct gl_context *ctx,
                                void (*fn)(struct gl_context *ctx, void *data),
                                void *data, struct util_queue_fence *fence);
 
+/* Every wait the application thread of a remote context made since the last
+ * call, by the GL function that made it ("12 GetIntegerv, 3 ReadPixels"), and
+ * the client-array draws copied rather than waited for; then starts again.
+ * The application thread's own census: call it there. */
+void _mesa_glthread_remote_census(char *out, size_t len, uint64_t *waits,
+                                  uint64_t *copies);
+/* Counted by the copying draw paths: draws copied, and client arrays a copied
+ * draw found no copy for and read live (must stay 0). */
+extern uint64_t _mesa_glthread_remote_copies;
+extern uint32_t _mesa_glthread_remote_unmatched;
+
 #define GLTHREAD_IS_REMOTE(ctx) unlikely((ctx)->GLThread.remote)
 /* Before a synchronous call glthread makes on the application thread: in a
  * remote context, make the named GL call on the driver thread and return. */
 #define GLTHREAD_REMOTE_CALL(ctx, name, ...)                                  \
    do {                                                                     \
       if (GLTHREAD_IS_REMOTE(ctx)) {                                        \
+         (ctx)->GLThread.sync_why = #name;                                  \
          _mesa_glthread_call_##name((ctx), __VA_ARGS__);                     \
          return;                                                            \
       }                                                                     \
    } while (0)
 #define GLTHREAD_REMOTE_CALL_RET(ctx, name, ...)                              \
    do {                                                                     \
-      if (GLTHREAD_IS_REMOTE(ctx))                                          \
+      if (GLTHREAD_IS_REMOTE(ctx)) {                                        \
+         (ctx)->GLThread.sync_why = #name;                                  \
          return _mesa_glthread_call_##name((ctx), __VA_ARGS__);              \
+      }                                                                     \
    } while (0)
 #else
 #define GLTHREAD_IS_REMOTE(ctx) false

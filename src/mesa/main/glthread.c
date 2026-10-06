@@ -33,6 +33,7 @@
  */
 
 #include "main/mtypes.h"
+#include <inttypes.h>
 #include "main/glthread.h"
 #include "main/glthread_marshal.h"
 #include "main/hash.h"
@@ -445,6 +446,10 @@ _mesa_glthread_flush_batch(struct gl_context *ctx)
    glthread->next_batch = &glthread->batches[glthread->next];
 }
 
+#if MESA_GLTHREAD_REMOTE
+static void glthread_remote_note_wait(struct glthread_state *glthread);
+#endif
+
 /**
  * Waits for all pending batches have been unmarshaled.
  *
@@ -479,7 +484,9 @@ _mesa_glthread_finish(struct gl_context *ctx)
       if (!util_queue_fence_is_signalled(&last->fence)) {
          util_queue_fence_wait(&last->fence);
          p_atomic_inc(&glthread->stats.num_syncs);
+         glthread_remote_note_wait(glthread);
       }
+      glthread->sync_why = NULL;
       return;
    }
 #endif
@@ -545,6 +552,73 @@ glthread_call_free(void *job, void *gdata, int thread_index)
    free(job);
 }
 
+/* Why the application thread of a remote context waited: see
+ * _mesa_glthread_remote_census. Keyed by the name's address, which is a
+ * string literal at every caller. Written only on application threads, and a
+ * census of the order of magnitude needs no lock. */
+#define GLTHREAD_REMOTE_REASONS 64
+static struct {
+   const char *why;
+   uint64_t count;
+} glthread_remote_reasons[GLTHREAD_REMOTE_REASONS];
+uint64_t _mesa_glthread_remote_copies;
+uint32_t _mesa_glthread_remote_unmatched;
+
+static void
+glthread_remote_note_wait(struct glthread_state *glthread)
+{
+   const char *why = glthread->sync_why ? glthread->sync_why : "(unnamed)";
+   glthread->sync_why = NULL;
+   for (unsigned i = 0; i < GLTHREAD_REMOTE_REASONS; ++i) {
+      if (!glthread_remote_reasons[i].why)
+         glthread_remote_reasons[i].why = why;
+      if (glthread_remote_reasons[i].why == why) {
+         glthread_remote_reasons[i].count++;
+         return;
+      }
+   }
+}
+
+void
+_mesa_glthread_remote_census(char *out, size_t len, uint64_t *waits,
+                             uint64_t *copies)
+{
+   uint64_t total = 0;
+   size_t used = 0;
+   if (len)
+      out[0] = 0;
+   for (unsigned pass = 0; pass < 2; ++pass) {
+      /* The largest first: a selection pass per entry over a short table. */
+      bool taken[GLTHREAD_REMOTE_REASONS] = {false};
+      for (unsigned n = 0; n < GLTHREAD_REMOTE_REASONS; ++n) {
+         int best = -1;
+         for (unsigned i = 0; i < GLTHREAD_REMOTE_REASONS; ++i)
+            if (glthread_remote_reasons[i].why && !taken[i] &&
+                glthread_remote_reasons[i].count &&
+                (best < 0 ||
+                 glthread_remote_reasons[i].count > glthread_remote_reasons[best].count))
+               best = (int)i;
+         if (best < 0)
+            break;
+         taken[best] = true;
+         if (pass == 0) {
+            total += glthread_remote_reasons[best].count;
+         } else if (used + 48 < len) {
+            int w = snprintf(out + used, len - used, "%s%" PRIu64 " %s",
+                             used ? ", " : "", glthread_remote_reasons[best].count,
+                             glthread_remote_reasons[best].why);
+            if (w > 0)
+               used += (size_t)w;
+         }
+      }
+   }
+   for (unsigned i = 0; i < GLTHREAD_REMOTE_REASONS; ++i)
+      glthread_remote_reasons[i].count = 0;
+   *waits = total;
+   *copies = _mesa_glthread_remote_copies;
+   _mesa_glthread_remote_copies = 0;
+}
+
 void
 _mesa_glthread_call(struct gl_context *ctx,
                     void (*fn)(struct gl_context *ctx, void *data),
@@ -570,6 +644,7 @@ _mesa_glthread_call(struct gl_context *ctx,
    util_queue_fence_wait(&fence);
    util_queue_fence_destroy(&fence);
    p_atomic_inc(&glthread->stats.num_syncs);
+   glthread_remote_note_wait(glthread);
 }
 
 void
@@ -590,6 +665,7 @@ _mesa_glthread_call_async(struct gl_context *ctx,
 void
 _mesa_glthread_finish_before(struct gl_context *ctx, const char *func)
 {
+   ctx->GLThread.sync_why = func;
    _mesa_glthread_finish(ctx);
 
    /* Uncomment this if you want to know where glthread syncs. */

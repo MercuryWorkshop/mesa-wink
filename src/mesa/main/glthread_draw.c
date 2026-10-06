@@ -27,12 +27,15 @@
  * index data, so that glthread doesn't have to execute synchronously.
  */
 
+#include <stdio.h>
 #include "c99_alloca.h"
 
 #include "api_exec_decl.h"
 #include "main/glthread_marshal.h"
 #include "dispatch.h"
 #include "main/varray.h"
+#include "state_tracker/st_atom.h"
+#include "util/u_atomic.h"
 
 static inline unsigned
 get_index_size(GLenum type)
@@ -335,12 +338,186 @@ struct marshal_cmd_DrawArraysUserBuf
    GLuint baseinstance;
    GLuint drawid;
    GLuint user_buffer_mask;
+   /* Remote contexts: how many struct glthread_remote_copy follow, in place of
+    * the buffers and offsets; see draw_arrays_remote_copy. */
+   GLuint copies;
 };
+
+#if MESA_GLTHREAD_REMOTE
+/* Client memory a remote draw reads, [lo, hi), and the copy of it that travels
+ * with the draw. The copies of one draw are one allocation, starting at the
+ * first one's. */
+struct glthread_remote_copy {
+   uintptr_t lo, hi;
+   uint8_t *copy;
+};
+
+/* MESA_GLTHREAD_REMOTE_COPY=0 waits for the driver thread instead. */
+static bool
+glthread_remote_copy_enabled(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("MESA_GLTHREAD_REMOTE_COPY");
+      on = !(v && *v == '0');
+   }
+   return on;
+}
+
+/* glDrawArrays from client arrays in a remote context. The driver thread reads
+ * the arrays itself and they may change the moment this returns, so the plain
+ * path waits for it -- a round trip through the driver thread's event loop per
+ * draw, and an OpenGL 1.x-style renderer draws nearly everything this way
+ * (Minecraft 1.16 its entities, text and GUI). This copies the bytes the draw
+ * reads -- per binding, measured as upload_vertices measures them -- into one
+ * block that travels with the draw; the driver thread points the arrays at it
+ * for that one draw and frees it (_mesa_unmarshal_DrawArraysUserBuf).
+ * Instanced arrays keep the wait. */
+static bool
+draw_arrays_remote_copy(struct gl_context *ctx, GLuint drawid, GLenum mode,
+                        GLint first, GLsizei count, GLsizei instance_count,
+                        GLuint baseinstance, unsigned user_buffer_mask)
+{
+   struct glthread_vao *vao = ctx->GLThread.CurrentVAO;
+   if (!glthread_remote_copy_enabled() ||
+       (vao->NonZeroDivisorMask & user_buffer_mask))
+      return false;
+
+   uint64_t start_offset[VERT_ATTRIB_MAX], end_offset[VERT_ATTRIB_MAX];
+   uint32_t buffer_mask = 0;
+   unsigned attrib_mask_iter = vao->Enabled;
+   while (attrib_mask_iter) {
+      const unsigned i = u_bit_scan(&attrib_mask_iter);
+      const unsigned b = vao->Attrib[i].BufferIndex;
+      if (!(user_buffer_mask & (1u << b)))
+         continue;
+      const uint64_t stride = vao->Attrib[b].Stride;
+      const uint64_t offset = vao->Attrib[i].RelativeOffset + stride * (uint64_t)first;
+      const uint64_t end = offset + stride * (uint64_t)(count - 1) +
+                           vao->Attrib[i].ElementSize;
+      /* Past any real array: let the driver thread raise whatever it raises. */
+      if (end > (1u << 30))
+         return false;
+      if (!(buffer_mask & (1u << b))) {
+         start_offset[b] = offset;
+         end_offset[b] = end;
+      } else {
+         start_offset[b] = MIN2(start_offset[b], offset);
+         end_offset[b] = MAX2(end_offset[b], end);
+      }
+      buffer_mask |= 1u << b;
+   }
+   if (!buffer_mask)
+      return false;
+
+   size_t total = 0;
+   for (uint32_t m = buffer_mask; m;) {
+      const unsigned b = u_bit_scan(&m);
+      total += align64(end_offset[b] - start_offset[b], 8);
+   }
+   uint8_t *mem = malloc(total);
+   if (!mem)
+      return false;
+   struct glthread_remote_copy blocks[VERT_ATTRIB_MAX];
+   unsigned n = 0;
+   uint8_t *at = mem;
+   for (uint32_t m = buffer_mask; m;) {
+      const unsigned b = u_bit_scan(&m);
+      const uint8_t *ptr = (const uint8_t *)vao->Attrib[b].Pointer;
+      const size_t size = end_offset[b] - start_offset[b];
+      memcpy(at, ptr + start_offset[b], size);
+      blocks[n].lo = (uintptr_t)ptr + start_offset[b];
+      blocks[n].hi = (uintptr_t)ptr + end_offset[b];
+      blocks[n].copy = at;
+      ++n;
+      at += align64(size, 8);
+   }
+
+   const int cmd_size = sizeof(struct marshal_cmd_DrawArraysUserBuf) +
+                        n * sizeof(blocks[0]);
+   struct marshal_cmd_DrawArraysUserBuf *cmd =
+      _mesa_glthread_allocate_command(ctx, DISPATCH_CMD_DrawArraysUserBuf,
+                                      cmd_size);
+   cmd->num_slots = align(cmd_size, 8) / 8;
+   cmd->mode = MIN2(mode, 0xff); /* clamped to 0xff (invalid enum) */
+   cmd->first = first;
+   cmd->count = count;
+   cmd->instance_count = instance_count;
+   cmd->baseinstance = baseinstance;
+   cmd->drawid = drawid;
+   cmd->user_buffer_mask = 0;
+   cmd->copies = n;
+   memcpy(cmd + 1, blocks, n * sizeof(blocks[0]));
+   if (!_mesa_glthread_remote_copies++) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "glthread: client-array draws copied rather than "
+                         "waited for (MESA_GLTHREAD_REMOTE_COPY)\n");
+      }
+   }
+   return true;
+}
+#endif
 
 uint32_t
 _mesa_unmarshal_DrawArraysUserBuf(struct gl_context *ctx,
                                   const struct marshal_cmd_DrawArraysUserBuf *restrict cmd)
 {
+#if MESA_GLTHREAD_REMOTE
+   /* draw_arrays_remote_copy: every client array this draw reads is pointed
+    * at a copy of its bytes for the length of the draw, keeping its distance
+    * from the copied range's start. The copy must hold everything the array
+    * reads, first element to the end of the last: two arrays glthread did not
+    * see as interleaved get a range each, and those overlap -- matching on the
+    * first element alone gave a colour array the position array's range, one
+    * element short. */
+   if (cmd->copies) {
+      const struct glthread_remote_copy *blocks =
+         (const struct glthread_remote_copy *)(cmd + 1);
+      struct gl_vertex_array_object *vao = ctx->Array.VAO;
+      const GLubyte *saved[VERT_ATTRIB_MAX];
+      GLbitfield moved = 0;
+      GLbitfield user = vao->Enabled & ~vao->VertexAttribBufferMask;
+      while (user) {
+         const unsigned a = u_bit_scan(&user);
+         struct gl_array_attributes *attr = &vao->VertexAttrib[a];
+         const struct gl_vertex_buffer_binding *binding =
+            &vao->BufferBinding[attr->BufferBindingIndex];
+         const uintptr_t lo = (uintptr_t)attr->Ptr +
+                              (uintptr_t)binding->Stride * (uintptr_t)cmd->first;
+         const uintptr_t hi = lo + (uintptr_t)binding->Stride *
+                                   (uintptr_t)(cmd->count - 1) +
+                              attr->Format._ElementSize;
+         for (unsigned k = 0; k < cmd->copies; ++k) {
+            if (blocks[k].lo <= lo && hi <= blocks[k].hi) {
+               saved[a] = attr->Ptr;
+               attr->Ptr = (const GLubyte *)((uintptr_t)attr->Ptr - blocks[k].lo +
+                                             (uintptr_t)blocks[k].copy);
+               moved |= 1u << a;
+               break;
+            }
+         }
+         /* Read live, as without the copy: MUST stay 0. */
+         if (!(moved & (1u << a)))
+            p_atomic_inc(&_mesa_glthread_remote_unmatched);
+      }
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_VERTEX_ARRAYS);
+      ctx->DrawID = cmd->drawid;
+      CALL_DrawArraysInstancedBaseInstance(ctx->Dispatch.Current,
+                                           (cmd->mode, cmd->first, cmd->count,
+                                            cmd->instance_count,
+                                            cmd->baseinstance));
+      ctx->DrawID = 0;
+      while (moved) {
+         const unsigned a = u_bit_scan(&moved);
+         vao->VertexAttrib[a].Ptr = saved[a];
+      }
+      ST_SET_STATE(ctx->NewDriverState, ST_NEW_VERTEX_ARRAYS);
+      free(blocks[0].copy);
+      return cmd->num_slots;
+   }
+#endif
    const GLuint user_buffer_mask = cmd->user_buffer_mask;
 
    /* Bind uploaded buffers if needed. */
@@ -406,6 +583,16 @@ draw_arrays(GLuint drawid, GLenum mode, GLint first, GLsizei count,
    unsigned user_buffer_mask =
       _mesa_is_desktop_gl_core(ctx) ? 0 : get_user_buffer_mask(ctx);
 
+#if MESA_GLTHREAD_REMOTE
+   if (user_buffer_mask && GLTHREAD_IS_REMOTE(ctx) && first >= 0 &&
+       count > 0 && instance_count > 0 && !ctx->GLThread.inside_begin_end &&
+       ctx->Dispatch.Current != ctx->Dispatch.ContextLost &&
+       !ctx->GLThread.ListMode &&
+       draw_arrays_remote_copy(ctx, drawid, mode, first, count, instance_count,
+                               baseinstance, user_buffer_mask))
+      return;
+#endif
+
    /* Fast path when nothing needs to be done.
     *
     * This is also an error path. Zero counts should still call the driver
@@ -443,7 +630,7 @@ draw_arrays(GLuint drawid, GLenum mode, GLint first, GLsizei count,
        * itself, in this same address space, and they may change the moment
        * this returns. */
       if (user_buffer_mask && GLTHREAD_IS_REMOTE(ctx))
-         _mesa_glthread_finish(ctx);
+         _mesa_glthread_finish_before(ctx, "DrawArrays: client arrays");
 #endif
       return;
    }
@@ -473,6 +660,7 @@ draw_arrays(GLuint drawid, GLenum mode, GLint first, GLsizei count,
    cmd->baseinstance = baseinstance;
    cmd->drawid = drawid;
    cmd->user_buffer_mask = user_buffer_mask;
+   cmd->copies = 0;
 
    if (user_buffer_mask) {
       char *variable_data = (char*)(cmd + 1);
@@ -551,6 +739,7 @@ _mesa_marshal_MultiDrawArrays(GLenum mode, const GLint *first,
    /* Nothing is uploaded for a remote context: its driver reads the client
     * arrays, and this thread waits until it has. */
    if (user_buffer_mask && GLTHREAD_IS_REMOTE(ctx)) {
+      ctx->GLThread.sync_why = "MultiDrawArrays: client arrays";
       _mesa_glthread_call_MultiDrawArrays(ctx, mode, first, count, draw_count);
       return;
    }
@@ -800,6 +989,7 @@ draw_elements(GLuint drawid, GLenum mode, GLsizei count, GLenum type,
    if (unlikely(compiled_into_dlist && ctx->GLThread.ListMode)) {
 #if MESA_GLTHREAD_REMOTE
       if (GLTHREAD_IS_REMOTE(ctx)) {
+         ctx->GLThread.sync_why = "DrawElements: compiled into a display list";
          if (basevertex)
             _mesa_glthread_call_DrawElementsBaseVertex(ctx, mode, count, type,
                                                        indices, basevertex);
@@ -917,7 +1107,7 @@ draw_elements(GLuint drawid, GLenum mode, GLsizei count, GLenum type,
       /* As for draw_arrays: the driver reads the client arrays and indices
        * itself, and this thread waits for it. */
       if ((user_buffer_mask || has_user_indices) && GLTHREAD_IS_REMOTE(ctx))
-         _mesa_glthread_finish(ctx);
+         _mesa_glthread_finish_before(ctx, "DrawElements: client arrays or indices");
 #endif
       return;
    }
@@ -1149,6 +1339,7 @@ multi_draw_elements_async(struct gl_context *ctx, GLenum mode,
       /* The call is too large, so sync and execute the unmarshal code here. */
 #if MESA_GLTHREAD_REMOTE
       if (GLTHREAD_IS_REMOTE(ctx)) {
+         ctx->GLThread.sync_why = "MultiDrawElementsBaseVertex: client memory";
          if (basevertex)
             _mesa_glthread_call_MultiDrawElementsBaseVertex(ctx, mode, count, type,
                                                             indices, draw_count,
@@ -1187,6 +1378,7 @@ _mesa_marshal_MultiDrawElementsBaseVertex(GLenum mode, const GLsizei *count,
    if (unlikely(ctx->GLThread.ListMode)) {
 #if MESA_GLTHREAD_REMOTE
       if (GLTHREAD_IS_REMOTE(ctx)) {
+         ctx->GLThread.sync_why = "MultiDrawElementsBaseVertex: client memory";
          if (basevertex)
             _mesa_glthread_call_MultiDrawElementsBaseVertex(ctx, mode, count, type,
                                                             indices, draw_count,
@@ -1236,6 +1428,7 @@ _mesa_marshal_MultiDrawElementsBaseVertex(GLenum mode, const GLsizei *count,
    /* A remote context uploads nothing; its driver reads the client memory. */
 #if MESA_GLTHREAD_REMOTE
    if (GLTHREAD_IS_REMOTE(ctx)) {
+      ctx->GLThread.sync_why = "MultiDrawElementsBaseVertex: client memory";
       if (basevertex)
          _mesa_glthread_call_MultiDrawElementsBaseVertex(ctx, mode, count, type,
                                                          indices, draw_count,
