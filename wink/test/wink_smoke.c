@@ -404,6 +404,44 @@ norm16_filtering(void)
    p_glDeleteTextures(1, &texture);
 }
 
+/* A comparison-enabled depth texture is still read as raw depth by
+ * texelFetch: this operation has no sampler. */
+static void
+raw_shadow_depth(void)
+{
+   const char *vs = "#version 330 core\n"
+      "void main() { vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+      "gl_Position=vec4(p*2.0-1.0,0,1); }\n";
+   const char *fs = "#version 330 core\n"
+      "uniform sampler2D depth; out vec4 color;"
+      "void main() { color=vec4(texelFetch(depth,ivec2(0),0).r,0,0,1); }\n";
+   GLuint tex, vao;
+   const float depth = 0.25f;
+   p_glGenTextures(1, &tex);
+   p_glBindTexture(GL_TEXTURE_2D, tex);
+   p_glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, 1, 1, 0,
+                 GL_DEPTH_COMPONENT, GL_FLOAT, &depth);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+   GLuint prog = link_program(vs, fs, "raw shadow depth");
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glUseProgram(prog);
+   p_glClearColor(0, 0, 0, 1);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glDrawArrays(GL_TRIANGLES, 0, 3);
+   uint8_t px[4];
+   read_center(px, W, H);
+   CHECK(near(px, 64, 0, 0), "raw shadow depth: read %u,%u,%u,%u", px[0], px[1], px[2], px[3]);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "raw shadow depth: context failed");
+   p_glUseProgram(0);
+   p_glBindVertexArray(0);
+   p_glDeleteProgram(prog);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glDeleteTextures(1, &tex);
+}
+
 static void
 buffer_read_sources(void)
 {
@@ -584,6 +622,7 @@ exercise(const char *label, int api, wink_surface *surface)
       vertex_input_types();
       snorm_attachments();
       norm16_filtering();
+      raw_shadow_depth();
       buffer_read_sources();
    }
 

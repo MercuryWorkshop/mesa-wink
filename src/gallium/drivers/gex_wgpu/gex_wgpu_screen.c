@@ -45644,9 +45644,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           * texture display -- compare=-1 filter=-1 in the message, meaning
           * there was no sampler rather than a wrong one. */
          if (actual_type == WGPUTextureSampleType_Depth &&
-             ctx->fs->texture_sample_types[i] == WGPUTextureSampleType_Float &&
-             (!sampler ||
-              sampler->state.compare_mode != PIPE_TEX_COMPARE_R_TO_TEXTURE)) {
+             ctx->fs->texture_sample_types[i] == WGPUTextureSampleType_Float) {
+            /* The shader operation determines whether this binding compares.
+             * In particular texelFetch has no sampler and reads raw depth even
+             * when the texture's comparison mode is enabled. Iris binds the
+             * same shadow image for comparison and raw loads in distinct
+             * slots; rejecting the latter loses the entire composite draw. */
             actual_type = WGPUTextureSampleType_Float;
             depth_as_float |= 1u << slot;
             /* Filtering is dropped rather than the draw.
