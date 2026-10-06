@@ -45,6 +45,18 @@ class GateTests(unittest.TestCase):
                 result = suite.execute(["replay"], Path(root) / "log", 1)
             self.assertEqual(result["status"], "timeout")
 
+    def test_timeout_preserves_errors_without_unbounded_report(self):
+        with tempfile.TemporaryDirectory() as root:
+            import subprocess
+            def failed(*args, **kwargs):
+                kwargs["stdout"].write("GL_INVALID_FRAMEBUFFER_OPERATION\n" * 120)
+                raise subprocess.TimeoutExpired("replay", 1)
+            with patch("suite.subprocess.run", side_effect=failed):
+                result = suite.execute(["replay"], Path(root) / "log", 1)
+            self.assertEqual(result["status"], "timeout")
+            self.assertEqual(result["error_count"], 120)
+            self.assertEqual(len(result["errors"]), 100)
+
     def test_missing_reference_fails(self):
         with tempfile.TemporaryDirectory() as root:
             result = suite.replay(None, {"id": "missing"}, Path(root), "st")

@@ -35,11 +35,18 @@ def execute(command, log, timeout, env=None):
                                timeout=timeout, env=env)
             rc = p.returncode
         except subprocess.TimeoutExpired:
-            return {"pass": False, "status": "timeout", "log": str(log)}
-    errors = [line for line in log.read_text(errors="replace").splitlines()
-              if line not in BENIGN_LOG_LINES and ERRORS.search(line)]
-    return {"pass": rc == 0 and not errors, "status": "pass" if rc == 0 and not errors else "replay-error",
-            "rc": rc, "errors": errors, "log": str(log)}
+            rc = None
+    errors, count = [], 0
+    with log.open(errors="replace") as source:
+        for line in source:
+            line = line.rstrip("\r\n")
+            if line not in BENIGN_LOG_LINES and ERRORS.search(line):
+                count += 1
+                if len(errors) < 100:
+                    errors.append(line)
+    return {"pass": rc == 0 and not count,
+            "status": "timeout" if rc is None else "pass" if rc == 0 and not count else "replay-error",
+            "rc": rc, "errors": errors, "error_count": count, "log": str(log)}
 
 
 def cases(a):
@@ -124,6 +131,14 @@ def record(a, case, root):
         settings = a.out / "presets" / (case["pack"] + ".txt")
         if not settings.is_file() or digest(settings) != case["settings_sha512"]:
             return {"status": "missing-assets", "pass": False, "error": "Stress preset missing or checksum changed"}
+    tools = None
+    if case.get("tools_manifest_sha256"):
+        manifest = a.tools.resolve() / "tools.lock.json" if a.tools else None
+        if not manifest or not manifest.is_file() or sha256(manifest) != case["tools_manifest_sha256"]:
+            return {"status": "missing-tools", "pass": False, "error": "Missing or changed pinned --tools manifest"}
+        tools = json.loads(manifest.read_text())
+        if any(sha256(a.tools.resolve() / name) != value for name, value in tools["files"].items()):
+            return {"status": "missing-tools", "pass": False, "error": "Pinned application tool changed"}
     arguments = ["probe" if case.get("probe") else "record", "--api", case["api"], "--out", "/work/cases/" + case["id"]]
     if case.get("checkpoints"):
         arguments += ["--checkpoints", case["checkpoints"]]
@@ -173,6 +188,8 @@ def record(a, case, root):
     identity = json.loads(subprocess.check_output(["container", "image", "inspect", a.image], text=True))
     lock["reference"]["image"] = a.image
     lock["reference"]["image_identity"] = identity
+    if tools:
+        lock["reference"]["application_tools"] = tools
     checkpoints = root / "checkpoints.json"
     if checkpoints.exists():
         lock["replay_checkpoints"] = ",".join(map(str, json.loads(checkpoints.read_text())["calls"]))
