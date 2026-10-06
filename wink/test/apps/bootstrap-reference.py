@@ -79,7 +79,7 @@ def main():
             archive.extractall(dest, filter="data")
         tar.unlink()
         marker.write_text(revision + "\n")
-    for name in ("Dockerfile", "reference.py", "probe.c", "vk-probe.c"):
+    for name in ("Dockerfile", "reference.py", "vulkan_lifetimes.py", "probe.c", "vk-probe.c"):
         shutil.copy2(HERE / "reference" / name, stage / name)
     # Apple container's incremental directory transfer can stall on large
     # source trees. Send one compressed file per pristine source checkout.
@@ -126,7 +126,7 @@ def main():
                 archive.add(stage / name, arcname=name)
     # Use an absolute context outside the ignored build directory.
     context = Path(tempfile.mkdtemp(prefix="wink-reference-context-", dir="/private/tmp"))
-    inputs = ["mesa.tar.gz", "apitrace.tar.gz", "gfxreconstruct.tar.gz", "probe.c", "vk-probe.c", "reference.py"]
+    inputs = ["mesa.tar.gz", "apitrace.tar.gz", "gfxreconstruct.tar.gz", "probe.c", "vk-probe.c", "reference.py", "vulkan_lifetimes.py"]
     if a.apps or a.extended:
         inputs.append("app-inputs.tar.gz")
     dockerfile = (stage / "Dockerfile").read_text()

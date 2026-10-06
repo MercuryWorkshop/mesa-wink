@@ -49,6 +49,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /opt/reference /opt/reference
 COPY --from=builder /opt/tools /opt/tools
 COPY reference.py /opt/tools/bin/reference.py
+COPY vulkan_lifetimes.py /opt/tools/bin/vulkan_lifetimes.py
 ENV PATH=/opt/tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     LD_LIBRARY_PATH=/opt/reference/lib:/opt/tools/lib \
     VK_LAYER_PATH=/opt/tools/share/vulkan/explicit_layer.d \

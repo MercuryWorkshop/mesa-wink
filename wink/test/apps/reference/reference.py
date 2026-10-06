@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from vulkan_lifetimes import audit_trace
 
 
 def run(cmd, cwd=None, env=None):
@@ -102,6 +103,11 @@ def main():
             selected = [tail[i] for i in sorted(set([len(tail)//8, len(tail)//3, 2*len(tail)//3, len(tail)-2]))]
         checkpoints = ",".join(map(str, selected))
         (a.out / "checkpoints.json").write_text(json.dumps({"calls": selected, "total_frames": len(calls)}))
+    if a.api == "vulkan":
+        audit = audit_trace(trace)
+        (a.out / "vulkan-lifetimes.json").write_text(json.dumps(audit, indent=2) + "\n")
+        if not audit["pass"]:
+            raise RuntimeError("Vulkan attachment lifetime validation error: " + json.dumps(audit["errors"][:3]))
     # Reference repeatability is required, independent of the candidate.
     for repeat in range(3):
         replay(a.api, trace, a.out / f"reference-{repeat}", checkpoints)

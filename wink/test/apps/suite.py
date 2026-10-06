@@ -107,6 +107,18 @@ def validate_reference(case, root):
     trace = root / ("capture.gfxr" if case["api"] == "vulkan" else "capture.trace")
     if lock["case_sha256"] != case_hash(case) or lock["trace_sha256"] != sha256(trace):
         return {"status": "reference-incompatible", "pass": False, "error": "Case or trace changed; record a fresh reference."}
+    if case["api"] == "vulkan":
+        audit_path = root / "vulkan-lifetimes.json"
+        if not audit_path.is_file():
+            return {"status": "reference-incompatible", "pass": False,
+                    "error": "Vulkan reference needs an attachment lifetime audit"}
+        audit = json.loads(audit_path.read_text())
+        if (audit.get("schema") != 1 or audit.get("pass") is not True or
+            audit.get("error_count") != 0 or audit.get("trace_sha256") != lock["trace_sha256"] or
+            audit.get("checker_sha256") != sha256(HERE / "reference/vulkan_lifetimes.py")):
+            return {"status": "reference-incompatible", "pass": False,
+                    "error": "Vulkan attachment lifetime audit failed or changed",
+                    "audit": audit, "artifacts": str(root)}
     if len(lock["checkpoints"]) < case.get("min_frames", 1) or any(
         sha256(root / "reference-0" / name) != value for name, value in lock["checkpoints"].items()
     ):
