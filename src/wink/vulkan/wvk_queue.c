@@ -74,11 +74,10 @@ retire_oldest(struct wvk_queue *queue)
    }
    for (uint32_t i = 0; i < p->readback_count; ++i) {
       struct wvk_readback *rb = &p->readbacks[i];
-      if (!rb->failed) {
-         const void *data = wgpuBufferGetConstMappedRange(rb->staging, 0, rb->size);
-         if (data)
-            memcpy((uint8_t *)rb->mem->host + rb->offset, data, rb->size);
-      }
+      /* Read into the host copy, not through a pointer to the mapping,
+       * which in a browser is a copy of it in the wasm heap. */
+      if (!rb->failed)
+         wgpuBufferReadMappedRange(rb->staging, 0, (uint8_t *)rb->mem->host + rb->offset, rb->size);
       wgpuBufferUnmap(rb->staging);
       wgpuBufferDestroy(rb->staging);
       wgpuBufferRelease(rb->staging);

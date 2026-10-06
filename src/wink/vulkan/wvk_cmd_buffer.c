@@ -168,11 +168,17 @@ wvk_replay_temp_buffer(struct wvk_device *dev, struct wvk_replay *replay, uint64
    if (!buffer)
       return NULL;
    if (data) {
-      void *p = wgpuBufferGetMappedRange(buffer, 0, desc.size);
-      if (p) {
-         memcpy(p, data, size);
-         if (desc.size > size)
-            memset((uint8_t *)p + size, 0, desc.size - size);
+      /* Written into the mapping, not through a pointer to it, which in a
+       * browser is a copy of all of it in the wasm heap, whose peak stays.
+       * At offsets of 8 and sizes of 4, as WebGPU maps; what is past the
+       * data is zero already. */
+      const uint64_t whole = size & ~7ull;
+      if (whole)
+         wgpuBufferWriteMappedRange(buffer, 0, data, whole);
+      if (size > whole) {
+         uint8_t tail[8] = { 0 };
+         memcpy(tail, (const uint8_t *)data + whole, size - whole);
+         wgpuBufferWriteMappedRange(buffer, whole, tail, align64(size - whole, 4));
       }
       wgpuBufferUnmap(buffer);
    }

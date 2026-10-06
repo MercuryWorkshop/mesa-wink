@@ -103,15 +103,23 @@ wvk_CmdFillBuffer(VkCommandBuffer commandBuffer, VkBuffer dstBuffer, VkDeviceSiz
       wgpuCommandEncoderClearBuffer(replay->encoder, buffer_wgpu(dst), off, size);
       return;
    }
-   /* A pattern needs a source to copy from. */
-   uint32_t *pattern = malloc(size);
+   /* A pattern needs a source to copy from: of at most a megabyte, copied
+    * as many times as the fill takes, not one as big as the fill -- which
+    * was that much of the host's memory twice over, the wasm heap's for
+    * good, and of the GPU's for the submit. */
+   const uint64_t chunk = MIN2(size, 1024 * 1024);
+   uint32_t *pattern = malloc(chunk);
    if (!pattern)
       return;
-   for (uint64_t i = 0; i < size / 4; ++i)
+   for (uint64_t i = 0; i < chunk / 4; ++i)
       pattern[i] = data;
-   WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay, size, WGPUBufferUsage_CopySrc, pattern);
+   WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay, chunk, WGPUBufferUsage_CopySrc, pattern);
    free(pattern);
-   wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, temp, 0, buffer_wgpu(dst), off, size);
+   if (!temp)
+      return;
+   for (uint64_t done = 0; done < size; done += chunk)
+      wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, temp, 0, buffer_wgpu(dst), off + done,
+                                           MIN2(chunk, size - done));
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1963,24 +1971,31 @@ clear_by_fill(struct wvk_cmd_buffer *cmd, struct wvk_image *image, const VkClear
          const struct copy_layout l = {
             .block_w = 1, .block_h = 1, .block_bytes = bpp, .row_bytes = align(w * bpp, 256), .rows_per_image = h,
          };
-         uint8_t *pattern = calloc(h, l.row_bytes);
+         /* Rows of the value, a megabyte's at most, copied to each band
+          * of rows in turn: not the whole level's, which was all of it on
+          * the host twice over. */
+         const uint32_t rows = MIN2(h, MAX2(1024 * 1024 / l.row_bytes, 1));
+         uint8_t *pattern = calloc(rows, l.row_bytes);
          if (!pattern)
             return;
          for (uint32_t x = 0; x < w; ++x)
             memcpy(pattern + x * bpp, texel, bpp);
-         for (uint32_t y = 1; y < h; ++y)
+         for (uint32_t y = 1; y < rows; ++y)
             memcpy(pattern + (size_t)y * l.row_bytes, pattern, w * bpp);
-         WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay, (uint64_t)h * l.row_bytes, WGPUBufferUsage_CopySrc,
+         WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay, (uint64_t)rows * l.row_bytes, WGPUBufferUsage_CopySrc,
                                                   pattern);
          free(pattern);
          if (!temp)
             return;
          for (uint32_t layer = 0; layer < layers; ++layer) {
-            WGPUTexelCopyTextureInfo tex = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
-            tex.texture = image->texture;
-            tex.mipLevel = level;
-            tex.origin.z = base + layer;
-            copy_buffer_texture(replay, true, temp, 0, &l, &tex, (WGPUExtent3D){ w, h, 1 });
+            for (uint32_t y = 0; y < h; y += rows) {
+               WGPUTexelCopyTextureInfo tex = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+               tex.texture = image->texture;
+               tex.mipLevel = level;
+               tex.origin.y = y;
+               tex.origin.z = base + layer;
+               copy_buffer_texture(replay, true, temp, 0, &l, &tex, (WGPUExtent3D){ w, MIN2(rows, h - y), 1 });
+            }
          }
       }
    }
