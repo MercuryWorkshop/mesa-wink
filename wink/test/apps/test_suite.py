@@ -76,6 +76,16 @@ class GateTests(unittest.TestCase):
             self.assertFalse(json.loads((a.out / "results.json").read_text())["pass"])
             self.assertIn('failures="1"', (a.out / "junit.xml").read_text())
 
+    def test_interrupted_run_with_passing_subset_fails_coverage(self):
+        with tempfile.TemporaryDirectory() as root:
+            a = SimpleNamespace(out=Path(root), action="run", tier="full", expected_results=2)
+            result = suite.report(a, [{"id": "probe-gl", "status": "pass", "pass": True, "target": "native"}])
+            self.assertEqual(result, 1)
+            report = json.loads((a.out / "results.json").read_text())
+            self.assertFalse(report["complete"])
+            self.assertFalse(report["pass"])
+            self.assertIn('type="incomplete-run"', (a.out / "junit.xml").read_text())
+
     def test_altered_trace_rejected_before_replay(self):
         with tempfile.TemporaryDirectory() as root:
             root = Path(root)

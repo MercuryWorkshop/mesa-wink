@@ -271,12 +271,18 @@ def replay(a, case, root, target):
 
 
 def report(a, results):
+    expected = getattr(a, "expected_results", len(results))
+    complete = len(results) == expected
     result = {"schema": 1, "action": a.action, "tier": a.tier, "results": results,
-              "pass": bool(results) and all(r["pass"] for r in results)}
+              "expected_results": expected, "complete": complete,
+              "pass": complete and bool(results) and all(r["pass"] for r in results)}
     a.out.mkdir(parents=True, exist_ok=True)
     (a.out / "results.json").write_text(json.dumps(result, indent=2) + "\n")
-    junit = ET.Element("testsuite", name="wink-apps", tests=str(len(results)),
-                       failures=str(sum(not r["pass"] for r in results)))
+    junit = ET.Element("testsuite", name="wink-apps", tests=str(len(results) + (not complete)),
+                       failures=str(sum(not r["pass"] for r in results) + (not complete)))
+    if not complete:
+        test = ET.SubElement(junit, "testcase", name="coverage-complete", classname="coverage")
+        ET.SubElement(test, "failure", type="incomplete-run").text = f"Completed {len(results)} of {expected} selected results"
     rows = []
     for r in results:
         test = ET.SubElement(junit, "testcase", name=r["id"], classname=r.get("target") or "reference")
@@ -286,7 +292,7 @@ def report(a, results):
         relative = os.path.relpath(artifact, a.out)
         rows.append(f'<tr><td>{html.escape(r["id"])}</td><td>{html.escape(r.get("target") or "reference")}</td><td>{html.escape(r["status"])}</td><td><a href="{html.escape(relative, quote=True)}/">artifacts</a></td></tr>')
     ET.ElementTree(junit).write(a.out / "junit.xml", encoding="unicode", xml_declaration=True)
-    (a.out / "report.html").write_text('<!doctype html><meta charset="utf-8"><title>Wink application correctness</title><style>body{font:16px system-ui}td,th{padding:8px;text-align:left}table{border-collapse:collapse}tr{border-bottom:1px solid #ddd}</style><h1>Wink application correctness</h1><p>All missing, unsupported and unstable cases fail the coverage gate.</p><table><tr><th>Case</th><th>Target</th><th>Result</th><th>Evidence</th></tr>' + "".join(rows) + '</table><p><a href="results.json">JSON details</a></p>')
+    (a.out / "report.html").write_text('<!doctype html><meta charset="utf-8"><title>Wink application correctness</title><style>body{font:16px system-ui}td,th{padding:8px;text-align:left}table{border-collapse:collapse}tr{border-bottom:1px solid #ddd}</style><h1>Wink application correctness</h1><p>All missing, unsupported and unstable cases fail the coverage gate.</p>' + f'<p>Completed {len(results)} of {expected} selected results. Gate: {"PASS" if result["pass"] else "FAIL"}.</p>' + '<table><tr><th>Case</th><th>Target</th><th>Result</th><th>Evidence</th></tr>' + "".join(rows) + '</table><p><a href="results.json">JSON details</a></p>')
     return 0 if result["pass"] else 1
 
 
@@ -315,6 +321,7 @@ def main():
     if a.action == "list":
         print(json.dumps(selected, indent=2))
         return 0
+    a.expected_results = len(selected) * (1 if a.action == "record" else len(a.target or ["native", "st"]))
     results = []
     for case in selected:
         root = a.out / "cases" / case["id"]
