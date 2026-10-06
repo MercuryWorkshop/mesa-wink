@@ -1299,6 +1299,14 @@ init_memory(struct wvk_physical_device *pdev)
       .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
    };
+   /* Optimal images' alone. Their memory is accounting, each a texture of
+    * its own, but buffer memory is a WGPUBuffer of all of it: an allocator
+    * that put both in one block made a buffer of the images' bytes too,
+    * which nothing used. Images of a type buffers cannot have keep the
+    * two apart. */
+   pdev->memory_types[WVK_MEMORY_IMAGE] = (VkMemoryType){
+      .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+   };
 }
 
 VkResult

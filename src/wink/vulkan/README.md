@@ -403,10 +403,14 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   filter for them. The runtime's nir_vk_lower_ycbcr_tex samples each plane
   and converts, before the shader's source is kept. Of optimal tiling,
   they have layers as any other image does (ycbcrImageArrays).
-- **Memory is one WGPUBuffer**, which the buffers bound to it share. WebGPU
-  lets a buffer written as storage have no other use in a usage scope --
-  a dispatch, or a whole render pass -- which suballocated memory has all
-  the time: a uniform buffer and a storage buffer of one allocation. What
+- **Memory is one WGPUBuffer**, made when a buffer is first bound to it,
+  which the buffers bound to it share. An optimal image is a texture of its
+  own and its memory only accounting, of a memory type of its own that no
+  buffer may have: an allocator's block of both made a WGPUBuffer of the
+  images' bytes too. WebGPU lets a buffer written as storage have no other
+  use in a usage scope -- a dispatch, or a whole render pass -- which
+  suballocated memory has all the time: a uniform buffer and a storage
+  buffer of one allocation. What
   a draw or dispatch reads of a buffer it writes, it reads from a copy
   made before it; and a draw at odds with what its pass used before
   begins the pass again.

@@ -16,12 +16,16 @@ struct wvk_instance;
 
 /* The memory types, by role; see wvk_physical_device.c. */
 enum wvk_memory_type {
-   WVK_MEMORY_DEVICE,          /* buffers and images */
+   WVK_MEMORY_DEVICE,          /* buffers and linear images */
    WVK_MEMORY_UPLOAD,          /* host-visible buffers */
    WVK_MEMORY_READBACK,        /* host-visible, cached buffers */
    WVK_MEMORY_DEVICE_UPLOAD,   /* device-local and host-visible buffers */
+   WVK_MEMORY_IMAGE,           /* optimal images, and only those */
    WVK_MEMORY_TYPE_COUNT,
 };
+
+/* The types buffers, and images that are their memory, may be bound to. */
+#define WVK_MEMORY_BUFFER_TYPES (BITFIELD_MASK(WVK_MEMORY_TYPE_COUNT) & ~BITFIELD_BIT(WVK_MEMORY_IMAGE))
 
 struct wvk_physical_device {
    struct vk_physical_device vk;

@@ -60,11 +60,8 @@ wvk_CreateQueryPool(VkDevice _device, const VkQueryPoolCreateInfo *pCreateInfo,
    pool->serial = calloc(pool->vk.query_count, sizeof(*pool->serial));
    VkResult result = pool->serial ? VK_SUCCESS : VK_ERROR_OUT_OF_HOST_MEMORY;
    if (result == VK_SUCCESS)
-      result = wvk_AllocateMemory(_device, &(VkMemoryAllocateInfo){
-         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-         .allocationSize = align64((uint64_t)pool->vk.query_count * pool->values * 8, 256),
-         .memoryTypeIndex = WVK_MEMORY_READBACK,
-      }, NULL, &pool->memory);
+      result = wvk_device_memory_allocate_internal(dev, align64((uint64_t)pool->vk.query_count * pool->values * 8, 256),
+                                                   WVK_MEMORY_READBACK, &pool->memory);
    if (result == VK_SUCCESS) {
       pool->mem = wvk_device_memory_from_handle(pool->memory);
       result = wvk_device_memory_get_buffer(dev, pool->mem, &pool->buffer);

@@ -32,11 +32,8 @@ wvk_cmd_bind_map_buffer(struct vk_command_buffer *vk_cmd, struct vk_meta_device 
    VkDevice device = wvk_device_to_handle(dev);
 
    VkDeviceMemory memory;
-   VkResult result = wvk_AllocateMemory(device, &(VkMemoryAllocateInfo){
-      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .allocationSize = align64(buffer->vk.size, 16),
-      .memoryTypeIndex = WVK_MEMORY_UPLOAD,
-   }, NULL, &memory);
+   VkResult result = wvk_device_memory_allocate_internal(dev, align64(buffer->vk.size, 16), WVK_MEMORY_UPLOAD,
+                                                         &memory);
    if (result != VK_SUCCESS)
       return result;
    util_dynarray_append(&cmd->replay->meta_memory, memory);

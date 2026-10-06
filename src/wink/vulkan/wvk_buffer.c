@@ -54,7 +54,7 @@ get_requirements(const struct wvk_device *dev, VkDeviceSize size, VkBufferUsageF
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){
       .size = align64(size, 4),
       .alignment = alignment,
-      .memoryTypeBits = BITFIELD_MASK(WVK_MEMORY_TYPE_COUNT),
+      .memoryTypeBits = WVK_MEMORY_BUFFER_TYPES,
    };
 
    vk_foreach_struct(stype, ext, pMemoryRequirements->pNext) {

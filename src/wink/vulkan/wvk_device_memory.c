@@ -37,11 +37,10 @@ wvk_device_memory_padding(const struct wvk_device *dev)
    return f->robustBufferAccess2 || f->nullDescriptor || f->pipelineRobustness ? WVK_MEMORY_ROBUST_PADDING : 256;
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL
-wvk_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
-                   const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMem)
+static VkResult
+allocate(struct wvk_device *dev, const VkMemoryAllocateInfo *pAllocateInfo,
+         const VkAllocationCallbacks *pAllocator, uint32_t padding, VkDeviceMemory *pMem)
 {
-   VK_FROM_HANDLE(wvk_device, dev, _device);
    struct wvk_physical_device *pdev = wvk_device_physical(dev);
 
    if (pAllocateInfo->memoryTypeIndex >= WVK_MEMORY_TYPE_COUNT)
@@ -52,10 +51,11 @@ wvk_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
    if (!mem)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   mem->padding = padding;
    if (is_host_visible(pdev, mem->vk.memory_type_index)) {
       /* Zeroed: an application may map and read before writing, and what
        * is uploaded should not be whatever the heap held. */
-      const uint64_t host_size = wvk_memory_buffer_size(mem->vk.size, wvk_device_memory_padding(dev));
+      const uint64_t host_size = wvk_memory_buffer_size(mem->vk.size, mem->padding);
       mem->host = os_malloc_aligned(host_size, 64);
       if (!mem->host) {
          vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
@@ -68,6 +68,25 @@ wvk_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
 
    *pMem = wvk_device_memory_to_handle(mem);
    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wvk_AllocateMemory(VkDevice _device, const VkMemoryAllocateInfo *pAllocateInfo,
+                   const VkAllocationCallbacks *pAllocator, VkDeviceMemory *pMem)
+{
+   VK_FROM_HANDLE(wvk_device, dev, _device);
+   return allocate(dev, pAllocateInfo, pAllocator, wvk_device_memory_padding(dev), pMem);
+}
+
+VkResult
+wvk_device_memory_allocate_internal(struct wvk_device *dev, uint64_t size, uint32_t type, VkDeviceMemory *out)
+{
+   const VkMemoryAllocateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .allocationSize = size,
+      .memoryTypeIndex = type,
+   };
+   return allocate(dev, &info, NULL, 256, out);
 }
 
 void
@@ -119,7 +138,7 @@ wvk_device_memory_get_buffer(struct wvk_device *dev, struct wvk_device_memory *m
 {
    if (!mem->buffer) {
       const struct wvk_physical_device *pdev = wvk_device_physical(dev);
-      const uint64_t size = wvk_memory_buffer_size(mem->vk.size, wvk_device_memory_padding(dev));
+      const uint64_t size = wvk_memory_buffer_size(mem->vk.size, mem->padding);
       if (size > pdev->limits.maxBufferSize)
          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
                           "%" PRIu64 " bytes of buffer memory is more than WebGPU's %" PRIu64,

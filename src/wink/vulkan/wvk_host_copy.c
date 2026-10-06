@@ -45,12 +45,7 @@ staging_create(struct wvk_device *dev, uint64_t size, uint32_t memory_type, stru
    VkResult result = wvk_CreateBuffer(device, &bci, NULL, &s->buffer);
    if (result != VK_SUCCESS)
       return result;
-   const VkMemoryAllocateInfo mai = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-      .allocationSize = align64(MAX2(size, 4), 256),
-      .memoryTypeIndex = memory_type,
-   };
-   result = wvk_AllocateMemory(device, &mai, NULL, &s->memory);
+   result = wvk_device_memory_allocate_internal(dev, align64(MAX2(size, 4), 256), memory_type, &s->memory);
    if (result == VK_SUCCESS) {
       const VkBindBufferMemoryInfo bind = {
          .sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,

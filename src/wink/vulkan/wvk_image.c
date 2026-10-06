@@ -570,7 +570,7 @@ get_image_requirements(VkFormat format, VkImageType type, VkImageTiling tiling, 
       .alignment = 256,
       /* Linear images are memory, and may be mapped; the rest are
        * textures of their own. */
-      .memoryTypeBits = linear ? BITFIELD_MASK(WVK_MEMORY_TYPE_COUNT) : BITFIELD_BIT(WVK_MEMORY_DEVICE),
+      .memoryTypeBits = linear ? WVK_MEMORY_BUFFER_TYPES : BITFIELD_BIT(WVK_MEMORY_IMAGE),
    };
    vk_foreach_struct(stype, ext, pMemoryRequirements->pNext) {
       switch (stype) {

@@ -25,6 +25,10 @@ struct wvk_device_memory {
 
    WGPUBuffer buffer;
    uint64_t buffer_size;
+   /* What the WGPUBuffer and host copy have past its size
+    * (wvk_device_memory_padding), of the application's memory; the
+    * driver's own has the least. */
+   uint32_t padding;
    /* Unique on the device, for caches that name the buffer. */
    uint64_t serial;
 
@@ -61,6 +65,11 @@ wvk_memory_buffer_size(uint64_t size, uint64_t padding)
  * bigger. */
 #define WVK_MEMORY_ROBUST_PADDING 65536
 uint64_t wvk_device_memory_padding(const struct wvk_device *dev);
+
+/* Host-visible memory of the driver's own, for buffers it binds whole:
+ * without the padding robustness gives the application's. */
+VkResult wvk_device_memory_allocate_internal(struct wvk_device *dev, uint64_t size, uint32_t type,
+                                             VkDeviceMemory *out);
 
 /* The WGPUBuffer behind buffer memory, made on first use. */
 VkResult wvk_device_memory_get_buffer(struct wvk_device *dev, struct wvk_device_memory *mem,
