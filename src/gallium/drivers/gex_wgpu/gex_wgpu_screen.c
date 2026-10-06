@@ -1650,6 +1650,11 @@ struct gex_wgpu_screen {
     * smaller keeps the larger buffer, which is the cheaper mistake. */
    WGPUBuffer readback_staging;
    uint64_t readback_staging_bytes;
+   /* Flushes so far, and the one it was last used at: a buffer as big as
+    * the biggest readback ever made -- a screenshot's -- is let go of once
+    * it has gone unused for a while (gex_wgpu_flush), not kept for good. */
+   uint64_t flushes;
+   uint64_t readback_staging_used;
    /* Bumped whenever a cached bind group or pipeline is evicted and released.
     *
     * The per-pass "already emitted" state compares raw handles, and a handle
@@ -1709,7 +1714,10 @@ struct gex_wgpu_screen {
       uint64_t epoch;
       uint32_t hash;
       unsigned key_length;
-      uint8_t key[GEX_WGPU_PIPELINE_KEY_MAX];
+      /* Of its own length, not GEX_WGPU_PIPELINE_KEY_MAX each: the slots
+       * were a megabyte of the screen's, used or not. */
+      uint8_t *key;
+      unsigned key_capacity;
       WGPURenderPipeline pipeline;
    } pipeline_cache[GEX_WGPU_PIPELINE_CACHE_SLOTS];
    uint64_t pipeline_cache_hits, pipeline_cache_misses;
@@ -22232,6 +22240,7 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
          screen->readback_staging_bytes = readback_size;
    }
    WGPUBuffer readback = screen->readback_staging;
+   screen->readback_staging_used = screen->flushes;
    WGPUCommandEncoder encoder = gex_wgpu_local_encoder(screen);
    if (!readback || !encoder) {
       if (encoder) gex_wgpu_local_encoder_release(screen, encoder);
@@ -40102,6 +40111,18 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
        * epoch it was built under instead, just below. */
       wgpuRenderPipelineRelease(slot->pipeline);
    }
+   if (slot->key_capacity < length) {
+      uint8_t *grown = realloc(slot->key, length);
+      if (!grown) {
+         slot->used = false;
+         *cached = false;
+         { const WGPURenderPipeline gex_ret = pipeline;
+           simple_mtx_unlock(&screen->cache_lock);
+           return gex_ret; }
+      }
+      slot->key = grown;
+      slot->key_capacity = length;
+   }
    slot->used = true;
    slot->epoch = screen->cache_epoch;
    slot->hash = hash;
@@ -47724,6 +47745,14 @@ gex_wgpu_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
    assert(gex_screen(pipe->screen)->local_encoders == 0);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    gex_wgpu_submit_pending(ctx);
+   struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
+   ++screen->flushes;
+   if (screen->readback_staging &&
+       screen->flushes - screen->readback_staging_used > 120) {
+      gex_wgpu_free_buffer(screen->readback_staging);
+      screen->readback_staging = NULL;
+      screen->readback_staging_bytes = 0;
+   }
    /* glFinish arrives here, and a coherent persistent mapping has to be
       current afterwards without the application asking for anything: that is
       what "coherent" means, and it is all KHR-GL44.buffer_storage's dispatch
@@ -48019,6 +48048,8 @@ gex_wgpu_screen_destroy(struct pipe_screen *base)
    simple_mtx_destroy(&gex_screen(base)->queue_lock);
    mtx_destroy(&gex_screen(base)->device_lock);
    struct gex_wgpu_screen *screen = gex_screen(base);
+   for (unsigned i = 0; i < GEX_WGPU_PIPELINE_CACHE_SLOTS; ++i)
+      free(screen->pipeline_cache[i].key);
    /* Every context is gone, and with it every open encoder. */
    util_dynarray_foreach(&screen->doomed, struct gex_wgpu_doomed, d) {
       gex_wgpu_free_buffer(d->buffer);
