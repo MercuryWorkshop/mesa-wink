@@ -15,7 +15,7 @@ import xml.etree.ElementTree as ET
 from compare import compare_directories, compare_images
 from build_replay_support import HERE, MESA, copy_artifact
 
-ERRORS = re.compile(r"error:|(?:\[|/)ERROR\]|\bE\[[A-Z0-9_]+\]:|\[gfxrecon\] ERROR|\bFATAL\b|GL_INVALID_|WebGPU error|validation error|device lost|unsupported:|unsupported \w+ call|failed to (?:compile|link|get snapshot)|FAIL\b", re.I)
+ERRORS = re.compile(r"error:|(?:\[|/)ERROR\]|\bE\[[A-Z0-9_]+\]:|\[gfxrecon\] ERROR|\bFATAL\b|GL_INVALID_|WebGPU error|validation error|device lost|unsupported:|unsupported \w+ call|ignoring call to unavailable function|failed to (?:compile|link|get snapshot)|FAIL\b", re.I)
 BENIGN_LOG_LINES = {"Errors from xkbcomp are not fatal to the X server"}
 
 
@@ -27,6 +27,18 @@ def sha256(path):
     return h.hexdigest()
 
 
+def log_errors(log):
+    errors, count = [], 0
+    with log.open(errors="replace") as source:
+        for line in source:
+            line = line.rstrip("\r\n")
+            if line not in BENIGN_LOG_LINES and ERRORS.search(line):
+                count += 1
+                if len(errors) < 100:
+                    errors.append(line)
+    return errors, count
+
+
 def execute(command, log, timeout, env=None):
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("w") as output:
@@ -36,14 +48,7 @@ def execute(command, log, timeout, env=None):
             rc = p.returncode
         except subprocess.TimeoutExpired:
             rc = None
-    errors, count = [], 0
-    with log.open(errors="replace") as source:
-        for line in source:
-            line = line.rstrip("\r\n")
-            if line not in BENIGN_LOG_LINES and ERRORS.search(line):
-                count += 1
-                if len(errors) < 100:
-                    errors.append(line)
+    errors, count = log_errors(log)
     return {"pass": rc == 0 and not count,
             "status": "timeout" if rc is None else "pass" if rc == 0 and not count else "replay-error",
             "rc": rc, "errors": errors, "error_count": count, "log": str(log)}
@@ -92,6 +97,13 @@ def validate_reference(case, root):
     if not lock_path.exists():
         return {"status": "missing-reference", "pass": False}
     lock = json.loads(lock_path.read_text())
+    log = root / "record.log"
+    if log.is_file():
+        errors, count = log_errors(log)
+        if count:
+            return {"status": "reference-incompatible", "pass": False,
+                    "error": "Reference recording or software replay reported failed/skipped calls",
+                    "errors": errors, "error_count": count, "log": str(log), "artifacts": str(root)}
     trace = root / ("capture.gfxr" if case["api"] == "vulkan" else "capture.trace")
     if lock["case_sha256"] != case_hash(case) or lock["trace_sha256"] != sha256(trace):
         return {"status": "reference-incompatible", "pass": False, "error": "Case or trace changed; record a fresh reference."}

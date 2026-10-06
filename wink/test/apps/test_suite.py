@@ -33,6 +33,21 @@ class GateTests(unittest.TestCase):
             result = suite.execute(["/bin/echo", "warning: unsupported eglCreatePlatformWindowSurface call"], Path(root) / "log", 5)
             self.assertFalse(result["pass"])
 
+    def test_unavailable_function_ignored_by_software_never_passes(self):
+        with tempfile.TemporaryDirectory() as root:
+            result = suite.execute(["/bin/echo", "warning: ignoring call to unavailable function glPolygonMode"], Path(root) / "log", 5)
+            self.assertFalse(result["pass"])
+
+    def test_old_reference_with_skipped_calls_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "capture.lock.json").write_text("{}")
+            (root / "record.log").write_text("warning: ignoring call to unavailable function glPolygonMode\n" * 120)
+            result = suite.replay(None, {"api": "gles"}, root, "native")
+            self.assertEqual(result["status"], "reference-incompatible")
+            self.assertEqual(result["error_count"], 120)
+            self.assertEqual(len(result["errors"]), 100)
+
     def test_minecraft_thread_error_never_passes(self):
         with tempfile.TemporaryDirectory() as root:
             result = suite.execute(["/bin/echo", "[Render thread/ERROR]: Shader compilation failed"], Path(root) / "log", 5)
