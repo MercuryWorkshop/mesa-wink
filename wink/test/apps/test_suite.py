@@ -124,6 +124,19 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(suite.record(a, case, out / "case")["status"], "missing-tools")
                 execute.assert_not_called()
 
+    def test_changed_fixture_rejected_before_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            (out / "reference.lock.json").write_text("{}")
+            scene = out / "scene.gd"
+            scene.write_text("original scene")
+            case = {"id": "godot", "api": "gles", "command": ["godot"],
+                    "inputs_sha256": {"/work/scene.gd": suite.sha256(scene)}}
+            scene.write_text("changed scene")
+            with patch("suite.shutil.disk_usage", return_value=SimpleNamespace(free=8 * 1024**3)), patch("suite.execute") as execute:
+                self.assertEqual(suite.record(SimpleNamespace(out=out), case, out / "case")["status"], "missing-assets")
+                execute.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

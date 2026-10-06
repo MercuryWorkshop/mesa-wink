@@ -70,6 +70,18 @@ def main():
     corpus = json.loads((HERE / "corpus.json").read_text())
     lock = json.loads((a.out / "assets/assets.lock.json").read_text())
     recipes = json.loads((HERE / "recipes.example.json").read_text())
+    for name, recipe in recipes.items():
+        inputs = []
+        if name.startswith("godot-"):
+            inputs = [(p, "/work/godot-project/" + str(p.relative_to(a.out / "godot-project")))
+                      for p in (a.out / "godot-project").rglob("*")
+                      if p.is_file() and ".godot" not in p.relative_to(a.out / "godot-project").parts]
+        if name.startswith("filament-"):
+            inputs = [(HERE / "fixtures/filament/batch.json", "/fixtures/filament/batch.json")]
+        if name.startswith("ppsspp-"):
+            ini = "gles.ini" if name.endswith("gles") else "vulkan.ini"
+            inputs = [(HERE / "fixtures/ppsspp" / file, "/fixtures/ppsspp/" + file) for file in (ini, "launch.py")]
+        recipe["inputs_sha256"] = {virtual: digest(path, "sha256") for path, virtual in sorted(inputs)}
     if a.tools:
         manifest = a.tools / "tools.lock.json"
         if not manifest.is_file():
@@ -113,6 +125,7 @@ def main():
                     shutil.copy2(a.resourcepack, a.out / a.resourcepack.name)
                     command += ["--resourcepack", "/work/" + a.resourcepack.name]
                 recipes[name] = {"command": command,
+                    "inputs_sha256": {"/suite/minecraft.py": digest(HERE / "minecraft.py", "sha256")},
                     "env": {"ALSOFT_DRIVERS": "null"},
                     "required_log": ["WINK_FIXTURE Iris active " + pack + " scene=" + scene, "WINK_FIXTURE minecraft complete"],
                     "asset_sha512": asset["hashes"]["sha512"],

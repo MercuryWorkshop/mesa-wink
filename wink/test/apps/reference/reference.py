@@ -43,6 +43,9 @@ def main():
     for value in a.env:
         key, value = value.split("=", 1)
         os.environ[key] = value
+    if Path("/reference-tools/bin").is_dir():
+        os.environ["PATH"] = "/reference-tools/bin:" + os.environ["PATH"]
+        os.environ["LD_LIBRARY_PATH"] = "/opt/reference/lib:/opt/tools/lib:/reference-tools/lib:" + os.environ.get("LD_LIBRARY_PATH", "")
     os.environ.setdefault("VK_LAYER_PATH", "/opt/tools/share/vulkan/explicit_layer.d")
     if a.action == "shell":
         return subprocess.call(a.command or ["/bin/bash"])

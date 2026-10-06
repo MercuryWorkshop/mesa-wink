@@ -71,12 +71,15 @@ def cases(a):
 
 def container_command(a, arguments, name=None):
     command = ["container", "run", "--rm", "--disable-progress-updates", "--cpus", "4", "--memory", "8g",
+               "--tmpfs", "/dev/shm",
                "--volume", f"{a.out}:/work", "--volume", f"{HERE / 'fixtures'}:/fixtures:ro",
                "--volume", f"{HERE}:/suite:ro", "--entrypoint", "python3"]
     if name:
         command += ["--name", name]
     if a.tools:
         command += ["--volume", f"{a.tools.resolve()}:/tools:ro"]
+    if getattr(a, "reference_tools", None):
+        command += ["--volume", f"{a.reference_tools.resolve()}:/reference-tools:ro"]
     return [*command, a.image, "/suite/reference/reference.py", *arguments]
 
 
@@ -121,6 +124,14 @@ def record(a, case, root):
     if not case.get("probe") and not case.get("command"):
         return {"status": "missing-assets", "pass": False, "error": "No pinned application recording command in --recipes."}
     from assets import digest
+    for virtual, expected in case.get("inputs_sha256", {}).items():
+        mounts = {"/work/": a.out, "/fixtures/": HERE / "fixtures", "/suite/": HERE}
+        prefix = next((p for p in mounts if virtual.startswith(p)), None)
+        if not prefix:
+            raise ValueError("Unknown recording input mount: " + virtual)
+        path = mounts[prefix] / virtual[len(prefix):]
+        if not path.is_file() or sha256(path) != expected:
+            return {"status": "missing-assets", "pass": False, "error": "Recording fixture changed: " + virtual}
     inputs = [(case.get("asset_sha512"), a.out / "assets/shaderpacks" / case.get("asset_filename", "missing"), "sha512"),
               (case.get("resourcepack_sha512"), a.out / (case.get("resourcepack_filename") or "missing"), "sha512"),
               (case.get("fixture_sha256"), a.out / "wink-fixture.jar", "sha256"),
@@ -140,6 +151,14 @@ def record(a, case, root):
         tools = json.loads(manifest.read_text())
         if any(sha256(a.tools.resolve() / name) != value for name, value in tools["files"].items()):
             return {"status": "missing-tools", "pass": False, "error": "Pinned application tool changed"}
+    reference_tools = None
+    if getattr(a, "reference_tools", None):
+        manifest = a.reference_tools.resolve() / "tools.lock.json"
+        reference_tools = json.loads(manifest.read_text())
+        if any(sha256(a.reference_tools.resolve() / name) != value for name, value in reference_tools["files"].items()):
+            return {"status": "missing-tools", "pass": False, "error": "Pinned CPU retracer changed"}
+        if reference_tools["image_identity"] != json.loads(subprocess.check_output(["container", "image", "inspect", a.image], text=True)):
+            return {"status": "missing-tools", "pass": False, "error": "CPU retracer base image changed"}
     arguments = ["probe" if case.get("probe") else "record", "--api", case["api"], "--out", "/work/cases/" + case["id"]]
     if case.get("checkpoints"):
         arguments += ["--checkpoints", case["checkpoints"]]
@@ -191,6 +210,8 @@ def record(a, case, root):
     lock["reference"]["image_identity"] = identity
     if tools:
         lock["reference"]["application_tools"] = tools
+    if reference_tools:
+        lock["reference"]["replay_tools"] = reference_tools
     checkpoints = root / "checkpoints.json"
     if checkpoints.exists():
         lock["replay_checkpoints"] = ",".join(map(str, json.loads(checkpoints.read_text())["calls"]))
@@ -279,6 +300,7 @@ def main():
     p.add_argument("--image", default="wink-reference")
     p.add_argument("--recipes", type=Path)
     p.add_argument("--tools", type=Path, help="pinned Linux ARM64 application tree mounted at /tools")
+    p.add_argument("--reference-tools", type=Path, help="pinned software retracers from build-reference-replay.py")
     p.add_argument("--replayers", type=Path, help="reuse retracer builds from another output directory")
     p.add_argument("--reuse-references", action="store_true", help="validate and reuse locked baselines while recording missing cases")
     p.add_argument("--timeout", type=int, default=900)
