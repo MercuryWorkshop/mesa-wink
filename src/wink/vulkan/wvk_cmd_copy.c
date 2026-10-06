@@ -45,6 +45,7 @@ wvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *pCopy
    VK_FROM_HANDLE(wvk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(wvk_buffer, src, pCopyBufferInfo->srcBuffer);
    VK_FROM_HANDLE(wvk_buffer, dst, pCopyBufferInfo->dstBuffer);
+   struct wvk_device *dev = wvk_cmd_buffer_device(cmd);
    struct wvk_replay *replay = cmd->replay;
 
    wvk_replay_end_passes(replay);
@@ -53,18 +54,34 @@ wvk_CmdCopyBuffer2(VkCommandBuffer commandBuffer, const VkCopyBufferInfo2 *pCopy
       const uint64_t so = buffer_offset(src, r->srcOffset), dof = buffer_offset(dst, r->dstOffset);
       wvk_replay_read(replay, src->mem, so, r->size);
       wvk_replay_write(replay, dst->mem, dof, r->size);
+      WGPUBuffer source = buffer_wgpu(src);
+      uint64_t source_offset = so;
+      if (source == buffer_wgpu(dst)) {
+         /* Vulkan permits non-overlapping ranges in the same allocation.
+          * WebGPU forbids copies within one buffer and aliased read/write
+          * storage bindings. Snapshot whole source words before either path. */
+         const uint64_t base = so & ~3ull;
+         const uint64_t bytes = align64(so - base + r->size, 4);
+         WGPUBuffer temp = wvk_replay_temp_buffer(dev, replay, bytes,
+            WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst | WGPUBufferUsage_Storage, NULL);
+         if (!temp)
+            return;
+         wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, source, base, temp, 0, bytes);
+         source = temp;
+         source_offset = so - base;
+      }
       if ((so | dof | r->size) & 3) {
          /* WebGPU copies whole words: the rest is a shader's, byte by
           * byte, in rows of what a dispatch reaches. */
          const uint32_t row = 65535 * 64;
          for (uint64_t at = 0; at < r->size; at += row) {
             const uint32_t n = (uint32_t)MIN2(row, r->size - at);
-            repack(wvk_cmd_buffer_device(cmd), replay, buffer_wgpu(src), so + at, n, n, buffer_wgpu(dst), dof + at,
+            repack(dev, replay, source, source_offset + at, n, n, buffer_wgpu(dst), dof + at,
                    n, n, n, 1, 1);
          }
          continue;
       }
-      wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, buffer_wgpu(src), so, buffer_wgpu(dst), dof, r->size);
+      wgpuCommandEncoderCopyBufferToBuffer(replay->encoder, source, source_offset, buffer_wgpu(dst), dof, r->size);
    }
 }
 

@@ -191,6 +191,28 @@ test_buffers(void)
    CHECK(out[0] == 255 && out[255] == 0 && words[4] == 1 && words[32] == 0xdeadbeef,
          "resubmitted: %u %u %u %08x", out[0], out[255], words[4], words[32]);
 
+   /* Disjoint ranges in a single allocation still share a WebGPU buffer.
+    * Exercise both one VkBuffer and a second VkBuffer bound to that memory. */
+   VkBuffer alias;
+   VK(vkCreateBuffer(dev, &(VkBufferCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 256,
+      .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+   }, NULL, &alias));
+   VK(vkBindBufferMemory(dev, alias, b.memory, 0));
+   VkCommandBuffer same = begin(0);
+   vkCmdCopyBuffer(same, a.buffer, b.buffer, 1, &(VkBufferCopy){ 0, 0, 256 });
+   vkCmdCopyBuffer(same, b.buffer, b.buffer, 1, &(VkBufferCopy){ 0, 64, 32 });
+   vkCmdCopyBuffer(same, b.buffer, alias, 1, &(VkBufferCopy){ 32, 128, 32 });
+   vkCmdCopyBuffer(same, b.buffer, alias, 1, &(VkBufferCopy){ 2, 193, 31 });
+   vkCmdCopyBuffer(same, b.buffer, c.buffer, 1, &(VkBufferCopy){ 0, 0, 256 });
+   VK(vkEndCommandBuffer(same));
+   submit_and_wait(same);
+   CHECK(memcmp(out + 64, a.map, 32) == 0 && memcmp(out + 128, (uint8_t *)a.map + 32, 32) == 0,
+         "same-allocation copies changed bytes");
+   CHECK(memcmp(out + 193, (uint8_t *)a.map + 2, 31) == 0 && out[192] == 63 && out[224] == 31,
+         "unaligned same-allocation copy changed bytes outside its range");
+   vkDestroyBuffer(dev, alias, NULL);
+
    free_buffer(&a);
    free_buffer(&b);
    free_buffer(&c);
