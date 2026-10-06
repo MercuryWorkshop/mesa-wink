@@ -162,6 +162,8 @@ def launch(a):
                         (natives / Path(member).name).write_bytes(jar.read(member))
     args = [a.java, "-Xmx3G", "-Djava.library.path=" + str(natives.resolve()),
             "-Dwink.fixture.scene=" + a.scene, "-Dwink.fixture.pack=" + a.pack]
+    if a.resourcepack:
+        args += ["-Dwink.fixture.resourcepack=file/" + a.resourcepack.name]
     if a.platform == "macos":
         args += ["-XstartOnFirstThread"]
     if a.wink:

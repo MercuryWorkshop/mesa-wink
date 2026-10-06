@@ -122,6 +122,8 @@ def main():
                     "settings_sha512": digest(settings) if preset == "stress" else None,
                     "resourcepack_sha512": digest(a.resourcepack) if scene == "labpbr" else None,
                     "resourcepack_filename": a.resourcepack.name if scene == "labpbr" else None}
+                if scene == "labpbr":
+                    recipes[name]["required_log"].append("WINK_FIXTURE LabPBR active file/" + a.resourcepack.name)
     (a.out / "recipes.json").write_text(json.dumps(recipes, indent=2) + "\n")
     (a.out / "missing-presets.json").write_text(json.dumps(missing, indent=2) + "\n")
     print(len(recipes), "recording recipes;", len(missing), "packs need curated stress settings")

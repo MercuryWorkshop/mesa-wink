@@ -51,6 +51,12 @@ public final class Fixture implements ClientModInitializer {
                     throw new IllegalStateException("Fixture dimension was not entered: " + scene);
                 if (scene.equals("water") && !client.player.isSubmergedInWater())
                     throw new IllegalStateException("Fixture camera is not underwater");
+                if (scene.equals("labpbr")) {
+                    String resourcePack = System.getProperty("wink.fixture.resourcepack");
+                    if (resourcePack == null || !client.getResourcePackManager().getEnabledIds().contains(resourcePack))
+                        throw new IllegalStateException("Fixture LabPBR resource pack is not active");
+                    System.out.println("WINK_FIXTURE LabPBR active " + resourcePack);
+                }
                 try {
                     Class<?> api = Class.forName("net.irisshaders.iris.api.v0.IrisApi");
                     Object instance = api.getMethod("getInstance").invoke(null);
