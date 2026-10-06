@@ -206,55 +206,90 @@ Browser replay preserves completed screenshots on a crash, while retaining
 the failed result. Driver environment settings are installed before replay
 starts for both API paths.
 
-## Initial local validation
+## Local validation
 
-The initial 2026-10-06 run on this Mac produced 13 locked references: all three API
+The 2026-10-06 run on this Mac has 13 admitted references: all three API
 proofs, all three Godot backends, both Filament backends, PPSSPP GLES, both
-Qt backends, and Complementary Reimagined/BSL day/default. Each reference
-matched three software replays exactly. The proofs also matched live pixel
-readback exactly. Subsequent admission checks reject Qt GLES (189 skipped
-`glPolygonMode` calls in the CPU retracer) and Filament Vulkan (27 uses of
-expired framebuffer attachments), leaving 11 eligible references. Their old
-captures and diagnostic replay results are preserved. Native, browser st and
-browser mt use identical captures and unchanged comparison thresholds.
+Qt backends, and Complementary Reimagined/BSL day/default. Each matches three
+software replays exactly. The proofs also match live pixel readback exactly.
+Native, browser st and browser mt use identical captures and unchanged
+comparison policies.
+
+The original Qt GLES capture contained invalid `glPolygonMode` calls, and
+Filament Vulkan used framebuffer attachments after destroying their images.
+Those captures remain rejected and preserved under `superseded-references`.
+Fresh captures use a Qt GLES profile that disables the desktop-only RHI
+function, a Qt Vulkan device enabling only the required features, and a
+source-pinned Filament adapter retaining framebuffer attachment owners.
+Every adapter and rebuilt tool is hashed in its reference's tool manifest.
+The accepted traces were recorded again after these application fixes.
 
 | Workload | Observed candidate result |
 | --- | --- |
 | GL, GLES and Vulkan API proofs | All nine target checks passed |
 | Godot GLES | Passed on all three targets |
 | Godot Mobile / Forward+ | Device creation failed; `VK_KHR_buffer_device_address` unavailable |
-| Filament GLES / PPSSPP GLES | Captured shaders require unsupported `GL_EXT_shader_framebuffer_fetch` |
-| Filament Vulkan | Reference rejected: framebuffer attachments used after image/view destruction. After the driver copy fix, a native diagnostic replay matches all four images; browser replay exposes the expired image. This is not an admitted correctness pass. |
-| Qt Quick GLES | Reference rejected: CPU retracer skipped captured `glPolygonMode` calls |
-| Qt Quick Vulkan | `occlusionQueryPrecise` unavailable; device creation failed |
-| Iris Complementary Reimagined day/default | Replay completes on all three targets; three of four checkpoints have substantial rendering differences |
-| Iris BSL day/default | All four image comparisons pass on native, browser st and browser mt |
-| PPSSPP Vulkan | No accepted reference; default capture timed out; an unassisted-memory retry grew beyond the available disk space |
+| Filament GLES / PPSSPP GLES | All four image comparisons passed on native, browser st and browser mt |
+| Filament Vulkan | Repaired reference passes attachment lifetime admission; all four comparisons passed on all three targets |
+| Qt Quick GLES / Vulkan | Fresh valid API profiles; all four comparisons passed on all three targets |
+| Iris Complementary Reimagined day/default | All four comparisons passed on all three targets after fixing raw loads from comparison-enabled depth textures |
+| Iris BSL day/default | All four comparisons passed on all three targets |
+| PPSSPP Vulkan | No accepted reference; capture attempts exceeded time or disk limits |
 
-The full 380-case campaign has **not passed**. Only two shaderpacks in one
-scene/preset have accepted references. Other scenes/presets and packs remain
-unrecorded, and five packs need publisher ZIPs. The local output is
-`build/wink-apps-validated/{report.html,results.json,junit.xml}`; the aggregate
-contains all 1,140 case/target results, including missing references. Eligible
-captures and earlier failed trials remain in the local output trees. Large
-unaccepted partial captures may be removed after preserving their hash,
-size, identity and failure logs.
+The aggregate has **33 passes, six unsupported results and 1,101 missing
+references**, covering all 1,140 case/target rows. The full 380-case campaign
+has **not passed**. Only two shaderpacks in one scene/preset have accepted
+references. Other scenes/presets and packs remain unrecorded, and five packs
+need publisher ZIPs. The local report is
+`build/wink-apps-validated/{report.html,results.json,junit.xml}`.
+Saved candidate results are consolidated with reference admission reapplied.
+No comparison thresholds were relaxed and no accepted capture was edited.
 
-After these fixes, the aggregate has 15 passes, 15 unsupported results,
-6 incompatible-reference results, 3 rendering mismatches and 1,101 missing
-references. Native results and the full browser campaign are consolidated
-from the latest per-case `run-<target>-result.json` files, with reference
-admission checks reapplied. No image thresholds or accepted trace bytes were
-changed.
+Framebuffer fetch uses native Dawn attachment inputs when available. Chrome
+uses ordered primitive replay with typed attachment snapshots, including
+multiple targets and individual MSAA samples; this path can be expensive for
+large draws. Vulkan precise occlusion counts passing samples using a private
+additive attachment and a 64-bit GPU reduction on backends with boolean
+queries. See the [query limits](../../../src/wink/vulkan/README.md) for its
+single-draw overdraw and early-test limitations. Unaligned, suballocated
+read-only Vulkan buffers are copied on the GPU into aligned bindings.
 
-The driver fixes cover copies between ranges sharing a WebGPU buffer,
-browser swapchain alpha configuration, native/browser GPU timestamps,
-integer vertex arrays feeding float shader inputs, signed normalized render
-targets, normalized 16-bit filtering, and persistent buffer synchronization.
-CPU-authored buffer copies now preserve known shadows, allowing the native
-Iris captures to complete instead of reading each vertex arena back on every
-translation. Shared native/st/mt GL and Vulkan smoke programs exercise these
-paths, including GPU-written buffers that still require readback.
+## Refresh an application reference
+
+Build corrected tools in a fresh output root. Filament reuses the individually
+hashed source archives from the extended tool build:
+
+```sh
+python wink/test/apps/build-qt.py --out build/wink-qt-fixed --image wink-reference-apps
+python wink/test/apps/build-filament.py --out build/wink-filament-fixed --image wink-reference-apps --sources build/wink-apps/reference-context --source-lock build/wink-apps/extended-tools/tools.lock.json
+```
+
+Generate recipes in the fresh recording root with `--qt-tools` or
+`--filament-tools` pointing to the builder's exported runtime tree. Record
+with `suite.py record` and replay the new captures on every target before
+installing them into an existing campaign. `--min-free-space-gib` adjusts the
+recording disk reserve for small fixtures; its default remains four GiB.
+For Qt, reuse the pinned base image provenance and checked CPU retracers:
+
+```sh
+cp build/wink-apps/reference.lock.json build/wink-qt-fixed/reference.lock.json
+python wink/test/apps/recipes.py --out build/wink-qt-fixed --qt-tools build/wink-qt-fixed/qt-tools
+python wink/test/apps/suite.py record --out build/wink-qt-fixed --recipes build/wink-qt-fixed/recipes.json --image wink-reference-apps --tools build/wink-qt-fixed/qt-tools --reference-tools build/wink-reference-tools/reference-tools --case qtquick-gles --case qtquick-vulkan
+python wink/test/apps/suite.py run --out build/wink-qt-fixed --recipes build/wink-qt-fixed/recipes.json --replayers build/wink-apps --case qtquick-gles --case qtquick-vulkan --target native --target st --target mt
+```
+
+Reference replacement is explicit and requires a reason:
+
+```sh
+python wink/test/apps/refresh-reference.py --source build/wink-qt-fixed --out build/wink-apps-validated --case qtquick-gles --case qtquick-vulkan --reason 'Correct desktop-only GLES calls and the Vulkan device feature profile' --dry-run
+python wink/test/apps/refresh-reference.py --source build/wink-qt-fixed --out build/wink-apps-validated --case qtquick-gles --case qtquick-vulkan --reason 'Correct desktop-only GLES calls and the Vulkan device feature profile'
+```
+
+The tool validates the whole selection before changing references, preserves
+comparison policy and minimum checkpoint coverage, archives superseded case
+directories, and records old/new capture hashes in `reference-refreshes.json`.
+Immutable captures and CPU checkpoints can share disk space through hard
+links; mutable candidate logs and results are copied independently.
 
 ## Harness checks
 
@@ -267,5 +302,5 @@ The tests cover channel-specific errors, thin/raw and strict-region defects,
 missing/incorrect images, validation errors, process failures, timeouts,
 altered captures and missing coverage in JSON/JUnit reports. They supplement
 real native/browser replay checks; they do not certify app coverage.
-The current harness passes all 32 checks, including expired Vulkan
+The current harness passes all 35 checks, including expired Vulkan
 attachments and software retracers that skip calls.

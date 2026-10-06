@@ -141,9 +141,10 @@ def record(a, case, root):
                     outcome["status"] = "reference-reused"
                 return outcome
             return {"status": "reference-exists", "pass": False, "error": "Use a fresh --out directory for an explicit reference refresh."}
-    if shutil.disk_usage(a.out).free < a.min_free_space_gib * 1024**3:
+    min_free_space_gib = getattr(a, "min_free_space_gib", 4)
+    if shutil.disk_usage(a.out).free < min_free_space_gib * 1024**3:
         return {"status": "resource-limit", "pass": False,
-                "error": f"Recording requires at least {a.min_free_space_gib:g} GiB free disk space"}
+                "error": f"Recording requires at least {min_free_space_gib:g} GiB free disk space"}
     if root.exists():
         root.rename(root.with_name(root.name + ".incomplete-" + str(time.time_ns())))
     root.mkdir(parents=True)
