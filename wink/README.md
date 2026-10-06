@@ -275,6 +275,22 @@ Driver switches worth knowing:
   feature, so st/mesa decodes on the CPU instead.
 * `GEX_WGPU_TIMING=1` shows the share of time spent in draws and in present.
 
+Memory:
+
+* Where the browser has no ETC2 (desktop Chrome on Windows and Linux),
+  st/mesa decodes those textures to RGBA8, four to eight times their size,
+  and keeps the compressed data too. `transcode_etc=true` (driconf's name,
+  in `winkEnv`) stores them as BC1/BC3 where the device has BC, about the
+  size they were: lossy -- the CTS's ETC cases fail at its threshold of 2
+  in 255 -- and each upload is a BC compression on the CPU.
+  (`transcode_astc`, st/mesa's compute pass for ASTC, does not work on this
+  driver yet.)
+* `GEX_WGSL_CACHE_BYTES` bounds the SPIR-V to WGSL translation cache
+  (32 MiB); the page can set it with `gex_wgsl_cache_budget(bytes)`.
+* Link with `-sMALLOC=dlmalloc` (the default) rather than mimalloc in `mt`:
+  mimalloc keeps memory for each thread that allocated, and the wasm heap
+  never shrinks, so what any thread held at its peak stays.
+
 ## Natively, on macOS
 
 Against native Dawn (the package `src/gallium/drivers/gex_wgpu/native/`
