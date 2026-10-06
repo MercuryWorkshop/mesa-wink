@@ -410,7 +410,14 @@ wgpu_alpha_mode(VkCompositeAlphaFlagBitsKHR mode)
    switch (mode) {
    case VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR: return WGPUCompositeAlphaMode_Premultiplied;
    case VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR: return WGPUCompositeAlphaMode_Unpremultiplied;
-   case VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR: return WGPUCompositeAlphaMode_Inherit;
+   case VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR:
+#ifdef __EMSCRIPTEN__
+      /* GPUCanvasContext has no inherited alpha mode. A canvas owned by
+       * this WSI has WebGPU's default opaque composition until configured. */
+      return WGPUCompositeAlphaMode_Opaque;
+#else
+      return WGPUCompositeAlphaMode_Inherit;
+#endif
    default: return WGPUCompositeAlphaMode_Opaque;
    }
 }
