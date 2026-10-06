@@ -89,7 +89,9 @@ def main():
         source_revision = revision if name == "mesa" else pins[name]["commit"]
         if name == "apitrace":
             from glreplay import adapt_wsi
-            source_revision += hashlib.sha256((HERE / "glreplay.py").read_bytes()).hexdigest()
+            source_revision += hashlib.sha256((HERE / "glreplay.py").read_bytes() +
+                (HERE / "replay/thread_context.hpp").read_bytes() +
+                (HERE / "replay/egl_sync.hpp").read_bytes()).hexdigest()
             if not (stage / name).exists():
                 with tarfile.open(archive_path) as archive:
                     archive.extractall(stage, filter="data")
