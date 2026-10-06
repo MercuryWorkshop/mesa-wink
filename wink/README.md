@@ -117,10 +117,11 @@ The stack is raised to 16 MB unless the app already chose one, through
 thread calls it, and that thread's stack is the one that matters; with
 `WasmEnableThreads`, that is a pthread's. Those are 2 MB each in `mt`
 (`DEFAULT_PTHREAD_STACK_SIZE`, unless the app set it), rather than the 16 MB
-every thread otherwise gets: the GL ES 3 shader suite compiles natively in
-1 MB, and Tint, which recurses as deep as a shader's expressions nest, goes
-to a 16 MB stack of its own, made the first time it is wanted, on a thread
-of less than 4 MB free. The smoke test says how deep its stack went.
+every thread otherwise gets: a sixth of dEQP-GLES3's shader cases, sampled
+evenly, compile natively in 1 MB as in 8, and Tint, which recurses as deep
+as a shader's expressions nest, goes to a 16 MB stack of its own, made the
+first time it is wanted, on a thread of less than 4 MB free. The smoke test
+says how deep its stack went.
 
 Link flags, from the manifest:
 
@@ -291,6 +292,9 @@ Memory:
   in 255 -- and each upload is a BC compression on the CPU.
   (`transcode_astc`, st/mesa's compute pass for ASTC, does not work on this
   driver yet.)
+* 16-bit normalized textures (`GL_R16`, `GL_RGBA16_SNORM`, ...) are stored
+  as they are where the browser has `texture-formats-tier1`, and as float32,
+  twice the size, where it does not.
 * `GEX_WGSL_CACHE_BYTES` bounds the SPIR-V to WGSL translation cache
   (32 MiB); the page can set it with `gex_wgsl_cache_budget(bytes)`.
 * Link with `-sMALLOC=dlmalloc` (the default) rather than mimalloc in `mt`:

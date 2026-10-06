@@ -118,8 +118,8 @@ var LibraryWink = {
       'depth32float-stencil8', 'rg11b10ufloat-renderable', 'depth-clip-control',
       'float32-filterable', 'float32-blendable', 'clip-distances',
       'dual-source-blending', 'timestamp-query', 'indirect-first-instance',
-      // More storage formats, and the 16-bit normalized ones: the Vulkan
-      // driver's (wvk_format.c).
+      // More storage formats, and the 16-bit normalized ones, which both
+      // drivers store as they are (wvk_format.c, gex_wgpu_native_unorm16).
       'texture-formats-tier1', 'texture-formats-tier2',
     ],
     // Raised to this, clamped to the adapter: WebGPU's defaults are far below
