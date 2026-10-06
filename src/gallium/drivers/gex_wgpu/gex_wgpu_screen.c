@@ -1459,6 +1459,8 @@ static_assert(GEX_WGPU_MAX_BUFFER_TEXTURES == GEX_WGPU_MAX_SAMPLERS,
 /* Big enough that Minecraft, which uploads about two constant buffers per
  * draw, wraps every few dozen frames rather than every few draws. */
 #define GEX_WGPU_CONSTANT_RING_BYTES (8u << 20)
+/* The host's window of it; see gex_wgpu_context::constant_staging. */
+#define GEX_WGPU_CONSTANT_STAGING_BYTES (256u << 10)
 #define GEX_WGPU_MAX_BATCHED_DRAWS 1024
 
 /* What a compressed texture of a size not whole blocks is sampled as: see
@@ -2270,8 +2272,16 @@ struct gex_wgpu_context {
     * Minecraft -- and one wgpuQueueWriteBuffer each costs more than all the
     * draws put together. They are memcpy'd here instead and handed to the
     * queue as a single write covering the whole dirty range, just before the
-    * batch that reads them is submitted. */
+    * batch that reads them is submitted.
+    *
+    * Not a mirror of the whole ring, which was 8 MiB of every context's in
+    * the wasm heap: a window of it, from `constant_window` in the ring, its
+    * dirty range relative to that. The ring is written forward between
+    * flushes, and wraps only after one, so what is dirty is one run, and a
+    * window full is written to the queue early -- which a submit is after
+    * all the same (gex_wgpu_ring_put). */
    uint8_t *constant_staging;
+   unsigned constant_window;
    unsigned constant_dirty_lo, constant_dirty_hi;
    /* Draws recorded into one command encoder, not yet submitted. */
    WGPUCommandEncoder pending_encoder;
@@ -17416,10 +17426,55 @@ gex_wgpu_flush_constant_ring(struct gex_wgpu_context *ctx)
    const unsigned lo = ctx->constant_dirty_lo & ~3u;
    const unsigned hi = ALIGN_POT(ctx->constant_dirty_hi, 4u);
    wgpuQueueWriteBuffer(gex_screen(ctx->base.screen)->queue,
-                        gex_resource(ctx->constant_ring)->buffer, lo,
+                        gex_resource(ctx->constant_ring)->buffer,
+                        ctx->constant_window + lo,
                         ctx->constant_staging + lo, hi - lo);
    ctx->constant_dirty_lo = 0;
    ctx->constant_dirty_hi = 0;
+}
+
+/* Bytes for the ring at `offset`, into the host's window of it: a new
+ * window where they are past this one, the old one's written first. More
+ * than a window's go to the queue as they are. Returns false if there is
+ * no memory for the window. */
+static bool
+gex_wgpu_ring_put(struct gex_wgpu_context *ctx, unsigned offset,
+                  const void *data, unsigned bytes)
+{
+   if (bytes > GEX_WGPU_CONSTANT_STAGING_BYTES) {
+      gex_wgpu_flush_constant_ring(ctx);
+      const unsigned whole = bytes & ~3u;
+      struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+      WGPUBuffer ring = gex_resource(ctx->constant_ring)->buffer;
+      wgpuQueueWriteBuffer(screen->queue, ring, offset, data, whole);
+      if (bytes > whole) {
+         uint8_t tail[4] = {0};
+         memcpy(tail, (const uint8_t *)data + whole, bytes - whole);
+         wgpuQueueWriteBuffer(screen->queue, ring, offset + whole, tail, 4);
+      }
+      return true;
+   }
+   if (!ctx->constant_staging) {
+      ctx->constant_staging = MALLOC(GEX_WGPU_CONSTANT_STAGING_BYTES);
+      if (!ctx->constant_staging)
+         return false;
+   }
+   const bool empty = ctx->constant_dirty_hi <= ctx->constant_dirty_lo;
+   if (empty || offset < ctx->constant_window ||
+       offset + bytes > ctx->constant_window + GEX_WGPU_CONSTANT_STAGING_BYTES) {
+      gex_wgpu_flush_constant_ring(ctx);
+      ctx->constant_window = offset & ~3u;
+   }
+   const unsigned at = offset - ctx->constant_window;
+   memcpy(ctx->constant_staging + at, data, bytes);
+   if (ctx->constant_dirty_hi <= ctx->constant_dirty_lo) {
+      ctx->constant_dirty_lo = at;
+      ctx->constant_dirty_hi = at + bytes;
+   } else {
+      ctx->constant_dirty_lo = MIN2(ctx->constant_dirty_lo, at);
+      ctx->constant_dirty_hi = MAX2(ctx->constant_dirty_hi, at + bytes);
+   }
+   return true;
 }
 
 /* Put a few words in the constant ring and return the dynamic offset they
@@ -17464,16 +17519,8 @@ gex_wgpu_stage_ring_words(struct gex_wgpu_context *ctx, const uint32_t *words,
       offset = 0;
    }
    ctx->constant_ring_offset = offset + bytes;
-   if (!ctx->constant_staging) {
-      ctx->constant_staging = MALLOC(GEX_WGPU_CONSTANT_RING_BYTES);
-      if (!ctx->constant_staging)
-         return ~0u;
-   }
-   memcpy(ctx->constant_staging + offset, words, bytes);
-   if (ctx->constant_dirty_hi == 0 || offset < ctx->constant_dirty_lo)
-      ctx->constant_dirty_lo = offset;
-   if (offset + bytes > ctx->constant_dirty_hi)
-      ctx->constant_dirty_hi = offset + bytes;
+   if (!gex_wgpu_ring_put(ctx, offset, words, bytes))
+      return ~0u;
    return offset;
 }
 
@@ -17673,19 +17720,11 @@ gex_wgpu_set_constant_buffer(struct pipe_context *pipe,
          offset = 0;
       }
       ctx->constant_ring_offset = offset + buffer->buffer_size;
-      if (!ctx->constant_staging) {
-         ctx->constant_staging = MALLOC(GEX_WGPU_CONSTANT_RING_BYTES);
-         if (!ctx->constant_staging) {
-            gex_fail(ctx);
-            return;
-         }
+      if (!gex_wgpu_ring_put(ctx, offset, buffer->user_buffer,
+                             buffer->buffer_size)) {
+         gex_fail(ctx);
+         return;
       }
-      memcpy(ctx->constant_staging + offset, buffer->user_buffer,
-             buffer->buffer_size);
-      if (ctx->constant_dirty_hi == 0 || offset < ctx->constant_dirty_lo)
-         ctx->constant_dirty_lo = offset;
-      if (offset + buffer->buffer_size > ctx->constant_dirty_hi)
-         ctx->constant_dirty_hi = offset + buffer->buffer_size;
       if (!ctx->failed) {
          struct pipe_constant_buffer uploaded = {
             .buffer = ctx->constant_ring,
@@ -44835,9 +44874,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                 * plain `uniform`, is the one thing the dump cannot show. */
                const uint8_t *bytes = r->shadow;
                unsigned base = pcb->buffer_offset;
+               /* The window of it the host has, if the slot is in it. */
                if (!bytes && pcb->buffer == ctx->constant_ring &&
-                   ctx->constant_staging) {
+                   ctx->constant_staging && base >= ctx->constant_window &&
+                   base + 384 <= ctx->constant_window +
+                                    GEX_WGPU_CONSTANT_STAGING_BYTES) {
                   bytes = ctx->constant_staging;
+                  base -= ctx->constant_window;
                }
                if (!bytes) {
                   fprintf(stderr, "gex-wgpu:   vs cb%u no shadow\n", cb);
