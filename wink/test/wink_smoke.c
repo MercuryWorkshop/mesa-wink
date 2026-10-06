@@ -13,11 +13,14 @@
  */
 #include <GL/gl.h>
 #include <GL/glext.h>
+#ifdef __EMSCRIPTEN__
 #include <emscripten/emscripten.h>
 #include <emscripten/stack.h>
 #include <emscripten/threading.h>
+#endif
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +75,13 @@ note(const char *fmt, ...)
    X(void, GenVertexArrays, (GLsizei, GLuint *))                                 \
    X(void, BindVertexArray, (GLuint))                                            \
    X(void, DeleteVertexArrays, (GLsizei, const GLuint *))                        \
+   X(void, GenBuffers, (GLsizei, GLuint *))                                     \
+   X(void, BindBuffer, (GLenum, GLuint))                                        \
+   X(void, BufferData, (GLenum, GLsizeiptr, const void *, GLenum))               \
+   X(void, DeleteBuffers, (GLsizei, const GLuint *))                            \
+   X(void, EnableVertexAttribArray, (GLuint))                                   \
+   X(void, VertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)) \
+   X(void, VertexAttribIPointer, (GLuint, GLint, GLenum, GLsizei, const void *)) \
    X(void, DrawArrays, (GLenum, GLint, GLsizei))                                 \
    X(void, GenTextures, (GLsizei, GLuint *))                                     \
    X(void, BindTexture, (GLenum, GLuint))                                        \
@@ -239,6 +249,66 @@ compressed(const char *label, wink_surface *surface)
 }
 
 static void
+vertex_input_types(void)
+{
+   static const char *vs =
+      "#version 330 core\n"
+      "layout(location=3) in vec2 value;\n"
+      "out vec2 data;\n"
+      "void main() {\n"
+      "  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+      "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+      "  data = value;\n"
+      "}\n";
+   static const char *fs =
+      "#version 330 core\n"
+      "in vec2 data; out vec4 color;\n"
+      "void main() { color = vec4(data, 0.0, 1.0); }\n";
+   GLuint prog = link_program(vs, fs, "vertex input types");
+   GLuint vao, buffer;
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glGenBuffers(1, &buffer);
+   p_glBindBuffer(GL_ARRAY_BUFFER, buffer);
+   p_glEnableVertexAttribArray(3);
+   p_glUseProgram(prog);
+
+   /* Iris uses glVertexAttribIPointer for a float input. GL leaves that
+    * value undefined; this tests our raw-bit policy and, especially, that
+    * the mismatch does not invalidate WebGPU or poison subsequent draws.
+    * Switch the same shader back to ordinary floats to exercise its cache. */
+   const GLenum types[] = {GL_FLOAT, GL_INT, GL_UNSIGNED_INT, GL_SHORT,
+                          GL_UNSIGNED_SHORT, GL_FLOAT};
+   const uint32_t float_bits[6] = {0x3f800000, 0x3f000000, 0x3f800000,
+                                  0x3f000000, 0x3f800000, 0x3f000000};
+   const uint16_t zeros[6] = {0};
+   for (unsigned i = 0; i < sizeof(types) / sizeof(types[0]); ++i) {
+      const bool short_type = types[i] == GL_SHORT || types[i] == GL_UNSIGNED_SHORT;
+      p_glBufferData(GL_ARRAY_BUFFER, short_type ? sizeof(zeros) : sizeof(float_bits),
+                     short_type ? (const void *)zeros : (const void *)float_bits,
+                     GL_STATIC_DRAW);
+      if (types[i] == GL_FLOAT)
+         p_glVertexAttribPointer(3, 2, types[i], GL_FALSE, 8, NULL);
+      else
+         p_glVertexAttribIPointer(3, 2, types[i], short_type ? 4 : 8, NULL);
+      p_glClearColor(0.0f, 0.0f, 1.0f, 1.0f);
+      p_glClear(GL_COLOR_BUFFER_BIT);
+      p_glDrawArrays(GL_TRIANGLES, 0, 3);
+      uint8_t px[4];
+      read_center(px, W, H);
+      CHECK(near(px, short_type ? 0 : 255, short_type ? 0 : 128, 0),
+            "vertex type 0x%x: read %u,%u,%u,%u", types[i], px[0], px[1], px[2], px[3]);
+      CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(),
+            "vertex type 0x%x: context failed", types[i]);
+   }
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glDeleteBuffers(1, &buffer);
+}
+
+static void
 exercise(const char *label, int api, wink_surface *surface)
 {
    wink_context_attribs ca;
@@ -331,6 +401,9 @@ exercise(const char *label, int api, wink_surface *surface)
    GLenum err = p_glGetError();
    CHECK(err == GL_NO_ERROR, "%s: GL error 0x%x", label, err);
 
+   if (api == WINK_API_OPENGL_CORE)
+      vertex_input_types();
+
    p_glBindVertexArray(0);
    p_glDeleteVertexArrays(1, &vao);
    p_glUseProgram(0);
@@ -341,7 +414,7 @@ exercise(const char *label, int api, wink_surface *surface)
    wink_context_destroy(ctx);
 }
 
-#ifndef __EMSCRIPTEN_PTHREADS__
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
 /* Linked with -Wl,--wrap=pthread_create in the st build: Mesa must never
  * try to start a thread there, and a stub that fails quietly would hide it. */
 int __real_pthread_create(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
@@ -386,6 +459,9 @@ run_pass(const char *label)
    sa.width = W;
    sa.height = H;
    sa.manage_canvas_size = 1;
+#ifndef __EMSCRIPTEN__
+   sa.offscreen = 1;
+#endif
    wink_surface *surface = wink_surface_create(&sa, &status);
    CHECK(surface, "surface: %s", wink_status_string(status));
    if (!surface)
@@ -432,6 +508,7 @@ run_all(void)
    return failures;
 }
 
+#ifdef __EMSCRIPTEN__
 /* How deep this thread's C stack went, which is what the manifest's
  * STACK_SIZE and a GL thread's stack are sized by: what is below the
  * stack pointer marked first, and what was written over found after. */
@@ -464,6 +541,13 @@ wink_smoke_main(void)
    note_stack();
    return failed;
 }
+#else
+int
+main(void)
+{
+   return run_all();
+}
+#endif
 
 #ifdef __EMSCRIPTEN_PTHREADS__
 /* The same suite from a worker, with GL executed on the main thread: this

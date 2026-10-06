@@ -16834,6 +16834,8 @@ enum {
    /* Three unsigned floats rather than a normalised or scaled integer, so it
     * shares nothing with the four above but the fetch. */
    GEX_WGPU_UNPACK_R11G11B10F,
+   GEX_WGPU_UNPACK_SINT_BITS,
+   GEX_WGPU_UNPACK_UINT_BITS,
    GEX_WGPU_UNPACK_KIND_MASK = 0x0f,
    GEX_WGPU_UNPACK_BGR = 0x10,
 };
@@ -17059,7 +17061,18 @@ gex_wgpu_lower_vertex_attrib_unpack(nir_shader *nir, const uint8_t *kinds)
    nir_foreach_variable_with_modes(var, nir, nir_var_shader_in) {
       const unsigned element = var->data.driver_location;
       if (element < GEX_WGPU_MAX_VERTEX_ELEMENTS && kinds[element]) {
-         var->type = glsl_uint_type();
+         const unsigned kind = kinds[element] & GEX_WGPU_UNPACK_KIND_MASK;
+         if (kind == GEX_WGPU_UNPACK_SINT_BITS ||
+             kind == GEX_WGPU_UNPACK_UINT_BITS) {
+            /* An integer array feeding a float input has undefined values
+             * in GL, but must not create an invalid WebGPU pipeline. Keep
+             * Mesa's raw-bit interpretation: ntv bitcasts at float uses. */
+            var->type = glsl_vector_type(
+               kind == GEX_WGPU_UNPACK_SINT_BITS ? GLSL_TYPE_INT : GLSL_TYPE_UINT,
+               glsl_get_vector_elements(var->type));
+         } else {
+            var->type = glsl_uint_type();
+         }
          any = true;
       }
    }
@@ -17098,6 +17111,11 @@ gex_wgpu_lower_vertex_attrib_unpack(nir_shader *nir, const uint8_t *kinds)
          /* What the shader asked for, before the load is narrowed. */
          const unsigned wanted = load->def.num_components;
          const uint8_t kind = kinds[element] & GEX_WGPU_UNPACK_KIND_MASK;
+         if (kind == GEX_WGPU_UNPACK_SINT_BITS ||
+             kind == GEX_WGPU_UNPACK_UINT_BITS) {
+            progress = true;
+            continue;
+         }
          const bool bgr = (kinds[element] & GEX_WGPU_UNPACK_BGR) != 0;
          const bool is_signed = kind == GEX_WGPU_UNPACK_SNORM ||
                                 kind == GEX_WGPU_UNPACK_SSCALED;
@@ -37601,18 +37619,32 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
     * elements as well as on the fragment stage. `plain` is not a legal answer
     * when this is set: it would read the dword as if it were the final
     * value. */
-   static const uint8_t no_unpack[GEX_WGPU_MAX_VERTEX_ELEMENTS] = {0};
    /* Wide points, which rewrite gl_Position and so have no base module
     * either -- `plain` is never a legal answer while this is set. */
    static const struct gex_wgpu_wide_point no_wide = {0};
    const struct gex_wgpu_wide_point *want_wide = wide ? wide : &no_wide;
    const struct gex_wgpu_vertex_elements *ve = ctx->vertex_elements;
-   const bool unpack_attribs = ve && ve->any_unpack;
+   uint8_t want_unpack[GEX_WGPU_MAX_VERTEX_ELEMENTS] = {0};
+   bool unpack_attribs = false;
+   if (ve) {
+      memcpy(want_unpack, ve->unpack, sizeof(want_unpack));
+      for (unsigned i = 0; i < ve->count; ++i) {
+         const unsigned location = vs->vertex_element_location[i];
+         const enum pipe_format format = ve->elements[i].src_format;
+         if (location < 64 && !vs->double_inputs[i] &&
+             !(vs->vertex_locations_sint & BITFIELD64_BIT(location)) &&
+             !(vs->vertex_locations_uint & BITFIELD64_BIT(location)) &&
+             util_format_is_pure_integer(format)) {
+            want_unpack[i] = util_format_is_pure_sint(format)
+               ? GEX_WGPU_UNPACK_SINT_BITS : GEX_WGPU_UNPACK_UINT_BITS;
+         }
+         unpack_attribs |= want_unpack[i] != GEX_WGPU_UNPACK_NONE;
+      }
+   }
    /* A shader with a buffer texture has no base module either: the fetch is
     * lowered here against the bound view's format, so `plain` would carry a
     * texture binding the layout does not provide. */
    const bool has_buftex = vs->buftex_count != 0;
-   const uint8_t *want_unpack = unpack_attribs ? ve->unpack : no_unpack;
    /* A vertex shader that samples an integer texture has no base module: its
     * sampling is lowered here against the bound sampler state, the way the
     * fragment stage does it. `plain` is NULL for those, so it is never a
