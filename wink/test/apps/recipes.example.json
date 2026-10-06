@@ -21,22 +21,22 @@
     "min_frames": 4
   },
   "filament-gles": {
-    "command": ["/opt/apps/gltf_viewer", "--api", "opengl", "--headless", "--ibl", "/opt/apps/filament-assets/ibl/lightroom_14b", "--batch", "/fixtures/filament/batch.json", "--screenshot-as-ppm"],
+    "command": ["/opt/apps/gltf_viewer-gles", "--api", "opengl", "--headless", "--ibl", "/opt/apps/filament-assets/ibl/lightroom_14b", "--batch", "/fixtures/filament/batch.json", "--screenshot-as-ppm"],
     "min_frames": 4
   },
   "filament-vulkan": {
-    "command": ["/opt/apps/gltf_viewer", "--api", "vulkan", "--ibl", "/opt/apps/filament-assets/ibl/lightroom_14b", "--batch", "/fixtures/filament/batch.json", "--screenshot-as-ppm"],
+    "command": ["/opt/apps/gltf_viewer-vulkan", "--api", "vulkan", "--ibl", "/opt/apps/filament-assets/ibl/lightroom_14b", "--batch", "/fixtures/filament/batch.json", "--screenshot-as-ppm"],
     "checkpoints": "8,32,64,90"
   },
   "ppsspp-gles": {
-    "command": ["/opt/apps/PPSSPPSDL", "--appendconfig=/fixtures/ppsspp/gles.ini", "/opt/apps/psp-demos/3dstudio.prx"],
-    "env": {"WINK_FIXTURE_FRAMES": "96", "SDL_VIDEO_X11_FORCE_EGL": "1"},
+    "command": ["python3", "/fixtures/ppsspp/launch.py", "/opt/apps/PPSSPPSDL", "--appendconfig=/fixtures/ppsspp/gles.ini", "/opt/apps/psp-demos/3dstudio.prx"],
+    "env": {"WINK_FIXTURE_FRAMES": "96", "SDL_VIDEO_X11_FORCE_EGL": "1", "SDL_AUDIODRIVER": "dummy"},
     "required_log": ["WINK_FIXTURE ppsspp complete backend=0"],
     "min_frames": 4
   },
   "ppsspp-vulkan": {
-    "command": ["/opt/apps/PPSSPPSDL", "--appendconfig=/fixtures/ppsspp/vulkan.ini", "/opt/apps/psp-demos/3dstudio.prx"],
-    "env": {"WINK_FIXTURE_FRAMES": "96"},
+    "command": ["python3", "/fixtures/ppsspp/launch.py", "/opt/apps/PPSSPPSDL", "--appendconfig=/fixtures/ppsspp/vulkan.ini", "/opt/apps/psp-demos/3dstudio.prx"],
+    "env": {"WINK_FIXTURE_FRAMES": "96", "WINK_REFERENCE_CPU": "1", "SDL_AUDIODRIVER": "dummy"},
     "required_log": ["WINK_FIXTURE ppsspp complete backend=3"],
     "checkpoints": "8,32,64,90"
   },

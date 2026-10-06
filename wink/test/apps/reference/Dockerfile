@@ -81,14 +81,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /opt/extended-inputs /src/
 RUN CC=clang CXX=clang++ cmake -S /src/filament -B /build/filament -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DFILAMENT_BUILD_FILAMAT=ON -DFILAMENT_BUILD_GLTFIO=ON \
-    -DFILAMENT_SUPPORTS_VULKAN=ON -DFILAMENT_BUILD_JAVA=OFF -DFILAMENT_SUPPORTS_EGL_ON_LINUX=ON && \
+    -DFILAMENT_SUPPORTS_VULKAN=ON -DFILAMENT_BUILD_JAVA=OFF -DFILAMENT_SUPPORTS_EGL_ON_LINUX=ON \
+    -DFILAMENT_LINUX_IS_MOBILE=ON -DIS_HOST_PLATFORM=TRUE -DWINK_REFERENCE_GLES=ON && \
     cmake --build /build/filament --target gltf_viewer -j4 && \
-    cp /build/filament/samples/gltf_viewer /opt/apps/ && \
+    cp /build/filament/samples/gltf_viewer /opt/apps/gltf_viewer-gles && \
     mkdir -p /opt/apps/filament-assets /opt/apps/assets && \
     cp -r /build/filament/samples/assets/ibl /opt/apps/filament-assets/ && \
     cp -r /build/filament/samples/assets/fonts /opt/apps/assets/
+RUN CC=clang CXX=clang++ cmake -S /src/filament -B /build/filament-vulkan -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DFILAMENT_BUILD_FILAMAT=ON -DFILAMENT_BUILD_GLTFIO=ON \
+    -DFILAMENT_SUPPORTS_VULKAN=ON -DFILAMENT_BUILD_JAVA=OFF && \
+    cmake --build /build/filament-vulkan --target gltf_viewer -j4 && \
+    cp /build/filament-vulkan/samples/gltf_viewer /opt/apps/gltf_viewer-vulkan
 RUN cmake -S /src/ppsspp -B /build/ppsspp -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    -DUSING_GLES2=ON -DUSING_EGL=ON -DUSE_SYSTEM_FFMPEG=ON -DUNITTEST=OFF && \
+    -DUSING_GLES2=ON -DUSING_EGL=OFF -DUSE_SYSTEM_FFMPEG=ON -DUNITTEST=OFF && \
     cmake --build /build/ppsspp --target PPSSPPSDL -j4 && \
     cp /build/ppsspp/PPSSPPSDL /opt/apps/ && cp -r /src/ppsspp/assets /opt/apps/
 RUN cp -r /src/pspautotests/demos /opt/apps/psp-demos

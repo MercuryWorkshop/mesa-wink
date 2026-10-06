@@ -23,6 +23,7 @@ def main():
     p.add_argument("--out", type=Path, default=MESA / "build/wink-apps")
     p.add_argument("--image", default="wink-reference-apps")
     p.add_argument("--source-lock", type=Path, help="reuse archives from a previously verified extended context")
+    p.add_argument("--sources", type=Path, help="reuse a verified reference-context directory from another output root")
     p.add_argument("--resume", help="resume a failed wink-app-tools VM using its existing compilation cache")
     a = p.parse_args()
     a.out = a.out.resolve()
@@ -34,7 +35,9 @@ def main():
     if shutil.disk_usage(a.out).free < (1 if a.resume else 4 if a.source_lock else 12) * 1024**3:
         raise RuntimeError("Insufficient disk space for the fresh app build VM")
     pins = json.loads((HERE / "pins.json").read_text())
-    stage = a.out / "reference-context"
+    stage = a.sources.resolve() if a.sources else a.out / "reference-context"
+    if a.sources and not a.source_lock:
+        p.error("--sources requires --source-lock")
     if a.source_lock:
         lock = json.loads(a.source_lock.read_text())
         if lock["pins"]["applications"] != pins["applications"]:

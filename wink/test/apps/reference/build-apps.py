@@ -55,28 +55,73 @@ target_link_libraries(sdl2 INTERFACE SDL2::SDL2)
 '''
 (scratch / "filament/third_party/libsdl2/tnt/CMakeLists.txt").write_text(sdl_adapter)
 spec["system_sdl_adapter"] = sdl_adapter
+headers = scratch / "filament/filament/backend/src/opengl/gl_headers.h"
+original = "#if defined(__ANDROID__) || defined(FILAMENT_USE_EXTERNAL_GLES3) || defined(__EMSCRIPTEN__)"
+replacement = original + " || defined(WINK_REFERENCE_GLES)"
+content = headers.read_text()
+if replacement not in content:
+    if content.count(original) != 1:
+        raise RuntimeError("Filament GLES header selection changed upstream")
+    headers.write_text(content.replace(original, replacement))
+backend = scratch / "filament/filament/backend/CMakeLists.txt"
+gles_adapter = "\nif(WINK_REFERENCE_GLES)\n  target_compile_definitions(backend PRIVATE WINK_REFERENCE_GLES)\n  target_link_libraries(backend PUBLIC GLESv2)\nendif()\n"
+if gles_adapter not in backend.read_text():
+    backend.write_text(backend.read_text() + gles_adapter)
+spec["gles_header_adapter"] = replacement
+spec["gles_link_adapter"] = gles_adapter
+material = scratch / "filament/libs/gltfio/src/JitShaderProvider.cpp"
+content = material.read_text()
+# The desktop viewer's JIT defaults to desktop-only material packages.
+# Include both shader models so the GLES engine selects the mobile variant.
+if "builder.platform(MaterialBuilder::Platform::ALL);" not in content:
+    material.write_text(content.replace("    builder.name(name)",
+        "    builder.platform(MaterialBuilder::Platform::ALL);\n    builder.name(name)"))
+platform = scratch / "filament/filament/backend/src/opengl/platforms/PlatformEGLHeadless.cpp"
+content = platform.read_text()
+if "#ifndef WINK_REFERENCE_GLES" not in content:
+    content = content.replace("    int bindBlueGL = bluegl::bind();", "#ifndef WINK_REFERENCE_GLES\n    int bindBlueGL = bluegl::bind();")
+    content = content.replace("    return PlatformEGL::createDriver(sharedContext, driverConfig);", "#endif\n    return PlatformEGL::createDriver(sharedContext, driverConfig);")
+    platform.write_text(content)
 filament = scratch / "filament-build"
 run(["cmake", "-S", scratch / "filament", "-B", filament, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
      "-DFILAMENT_BUILD_FILAMAT=ON", "-DFILAMENT_BUILD_GLTFIO=ON", "-DFILAMENT_SUPPORTS_VULKAN=ON",
-     "-DFILAMENT_BUILD_JAVA=OFF", "-DFILAMENT_SUPPORTS_EGL_ON_LINUX=ON"], env)
+     "-DFILAMENT_BUILD_JAVA=OFF", "-DFILAMENT_SUPPORTS_EGL_ON_LINUX=ON", "-DFILAMENT_LINUX_IS_MOBILE=ON",
+     "-DIS_HOST_PLATFORM=TRUE", "-DWINK_REFERENCE_GLES=ON"], env)
 run(["cmake", "--build", filament, "--target", "gltf_viewer", "-j4"])
+filament_vk = scratch / "filament-vulkan-build"
+run(["cmake", "-S", scratch / "filament", "-B", filament_vk, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+     "-DFILAMENT_BUILD_FILAMAT=ON", "-DFILAMENT_BUILD_GLTFIO=ON", "-DFILAMENT_SUPPORTS_VULKAN=ON",
+     "-DFILAMENT_BUILD_JAVA=OFF", "-DFILAMENT_SUPPORTS_EGL_ON_LINUX=OFF"], env)
+run(["cmake", "--build", filament_vk, "--target", "gltf_viewer", "-j4"])
 ppsspp = scratch / "ppsspp-build"
+main = scratch / "ppsspp/SDL/SDLMain.cpp"
+content = main.read_text()
+main.write_text(content.replace("g_RefreshRate = displayMode.refresh_rate;",
+    "g_RefreshRate = displayMode.refresh_rate > 0 ? displayMode.refresh_rate : 60;"))
+loader = scratch / "ppsspp/Common/GPU/Vulkan/VulkanLoader.cpp"
+content = loader.read_text()
+if 'getenv("WINK_REFERENCE_CPU")' not in content:
+    loader.write_text(content.replace("\t\tcase VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:",
+        '\t\tcase VK_PHYSICAL_DEVICE_TYPE_CPU:\n\t\t\tif (getenv("WINK_REFERENCE_CPU")) anyGood = true;\n\t\t\tbreak;\n\t\tcase VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:'))
+if "#include <cstdlib>" not in loader.read_text():
+    loader.write_text(loader.read_text().replace("#include <cstring>", "#include <cstring>\n#include <cstdlib>"))
 run(["cmake", "-S", scratch / "ppsspp", "-B", ppsspp, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
-     "-DUSING_GLES2=ON", "-DUSING_EGL=ON", "-DUSE_SYSTEM_FFMPEG=ON", "-DUNITTEST=OFF"])
+     "-DUSING_GLES2=ON", "-DUSING_EGL=OFF", "-DUSE_SYSTEM_FFMPEG=ON", "-DUNITTEST=OFF"])
 run(["cmake", "--build", ppsspp, "--target", "PPSSPPSDL", "-j4"])
 out = Path("/work/extended-tools")
 temporary = out.with_name("extended-tools.partial")
 if temporary.exists():
     shutil.rmtree(temporary)
 temporary.mkdir()
-shutil.copy2(filament / "samples/gltf_viewer", temporary)
+shutil.copy2(filament / "samples/gltf_viewer", temporary / "gltf_viewer-gles")
+shutil.copy2(filament_vk / "samples/gltf_viewer", temporary / "gltf_viewer-vulkan")
 shutil.copytree(filament / "samples/assets/ibl", temporary / "filament-assets/ibl")
 shutil.copy2(ppsspp / "PPSSPPSDL", temporary)
 shutil.copytree(scratch / "ppsspp/assets", temporary / "assets")
 shutil.copytree(filament / "samples/assets/fonts", temporary / "assets/fonts", dirs_exist_ok=True)
 shutil.copytree(scratch / "pspautotests/demos", temporary / "psp-demos")
 (temporary / "lib").mkdir()
-for binary in (temporary / "gltf_viewer", temporary / "PPSSPPSDL"):
+for binary in (temporary / "gltf_viewer-gles", temporary / "gltf_viewer-vulkan", temporary / "PPSSPPSDL"):
     libraries = subprocess.check_output(["ldd", binary], text=True)
     for name in re.findall(r"=> (/\S+)", libraries):
         source = Path(name)

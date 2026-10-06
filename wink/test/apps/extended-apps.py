@@ -24,12 +24,31 @@ endif()""")
             file = "filament/backend/src/opengl/platforms/PlatformEGLHeadless.cpp"
             patch(source, file, "return  true;", "return false;")
             patch(source, file, "eglBindAPI(EGL_OPENGL_API)", "eglBindAPI(EGL_OPENGL_ES_API)")
+            patch(source, file, "    int bindBlueGL = bluegl::bind();",
+                  "#ifndef WINK_REFERENCE_GLES\n    int bindBlueGL = bluegl::bind();")
+            patch(source, file, "    return PlatformEGL::createDriver(sharedContext, driverConfig);",
+                  "#endif\n    return PlatformEGL::createDriver(sharedContext, driverConfig);")
+            condition = "#if defined(__ANDROID__) || defined(FILAMENT_USE_EXTERNAL_GLES3) || defined(__EMSCRIPTEN__)"
+            patch(source, "filament/backend/src/opengl/gl_headers.h", condition,
+                  condition + " || defined(WINK_REFERENCE_GLES)")
+            backend = source / "filament/backend/CMakeLists.txt"
+            gles = "\nif(WINK_REFERENCE_GLES)\n  target_compile_definitions(backend PRIVATE WINK_REFERENCE_GLES)\n  target_link_libraries(backend PUBLIC GLESv2)\nendif()\n"
+            if gles not in backend.read_text():
+                backend.write_text(backend.read_text() + gles)
+            patch(source, "libs/gltfio/src/JitShaderProvider.cpp", "    builder.name(name)",
+                  "    builder.platform(MaterialBuilder::Platform::ALL);\n    builder.name(name)")
             patch(source, "samples/gltf_viewer.cpp", "options.sleepDuration = 0.0;",
                   "options.sleepDuration = 0.0;\n            options.minFrameCount = 32;")
             patch(source, "samples/gltf_viewer.cpp",
                   "filamentApp.run(app.config, setup, cleanup, gui, preRender, postRender);",
                   "filamentApp.run(app.config, setup, cleanup, gui, preRender, postRender, 640, 360);")
         if name == "ppsspp":
+            patch(source, "SDL/SDLMain.cpp", "g_RefreshRate = displayMode.refresh_rate;",
+                  "g_RefreshRate = displayMode.refresh_rate > 0 ? displayMode.refresh_rate : 60;")
+            patch(source, "Common/GPU/Vulkan/VulkanLoader.cpp", "\t\tcase VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:",
+                  "\t\tcase VK_PHYSICAL_DEVICE_TYPE_CPU:\n\t\t\tif (getenv(\"WINK_REFERENCE_CPU\")) anyGood = true;\n\t\t\tbreak;\n\t\tcase VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:")
+            patch(source, "Common/GPU/Vulkan/VulkanLoader.cpp", "#include <cstring>",
+                  "#include <cstring>\n#include <cstdlib>")
             patch(source, "SDL/SDLMain.cpp", "\t\tUpdateTextFocus();\n\t\tUpdateSDLCursor();", """\t\t// Bounded public-homebrew fixture; only count emulated gameplay frames.
         if (const char *limit = getenv("WINK_FIXTURE_FRAMES")) {
             static unsigned fixture_frames = 0;
