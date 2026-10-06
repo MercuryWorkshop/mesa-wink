@@ -173,8 +173,10 @@ void vk_free_queue(struct vk_cmd_queue *queue);
 static inline void
 vk_cmd_queue_init(struct vk_cmd_queue *queue)
 {
+   /* The first block is every command buffer's, recorded or not: 16 KiB of
+    * it rather than 64, more coming as commands need it. */
    linear_opts opts = {
-      .min_buffer_size = 64 * 1024
+      .min_buffer_size = 16 * 1024
    };
    queue->ctx = linear_context_with_opts(NULL, &opts);
    list_inithead(&queue->cmds);
