@@ -2248,6 +2248,8 @@ struct buffer_use {
 
 static uint32_t merge_buffers(const struct wvk_bound_state *st, uint32_t bind_point, WGPUBuffer *buffers,
                               struct wvk_device_memory **mems);
+static void note_merged(struct wvk_replay *replay, const struct wvk_bound_state *st, uint32_t bind_point,
+                        uint32_t merged, bool written);
 static void upload_inline_blocks(struct wvk_device *dev, struct wvk_descriptor_set *set);
 
 /* The WGPUBuffers the layout's merged bindings are of (bound_merges), all
@@ -2455,12 +2457,8 @@ bind_groups(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_layout
              b->binding < WVK_DRIVER_SLOT_MERGED + WVK_MAX_MERGED_BUFFERS) {
             /* A merged binding reads and writes where its buffers are. */
             const uint32_t m = b->binding - WVK_DRIVER_SLOT_MERGED;
-            if (st->merged_mem[m]) {
-               const struct wvk_descriptor all = {
-                  .mem = st->merged_mem[m], .buffer = st->merged[m].buffer, .size = st->merged[m].size,
-               };
-               note_buffer(replay, &all, b->kind == WVK_BINDING_STORAGE);
-            }
+            if (st->merged_mem[m])
+               note_merged(replay, st, bind_point, m, b->kind == WVK_BINDING_STORAGE);
             continue;
          }
          if (g == WVK_DRIVER_GROUP && b->binding >= WVK_DRIVER_SLOT_BASE) {
@@ -3907,6 +3905,49 @@ merge_buffers(const struct wvk_bound_state *st, uint32_t bind_point, WGPUBuffer 
       }
    }
    return n;
+}
+
+/* What a merged binding reads and writes of its memory: from the first of
+ * the buffers bound in it to the end of the last, which is as far as a
+ * shader goes in it -- bounded to each one's range with robustness, and
+ * undefined past it without. Not all of the memory, whose host copy would
+ * go up, and whose GPU copy come back through a staging buffer as big, at
+ * every submit. */
+static void
+note_merged(struct wvk_replay *replay, const struct wvk_bound_state *st, uint32_t bind_point, uint32_t merged,
+            bool written)
+{
+   const WGPUBuffer buffer = st->merged[merged].buffer;
+   uint64_t read_lo = UINT64_MAX, read_hi = 0, write_lo = UINT64_MAX, write_hi = 0;
+   for (uint32_t g = 0; g < WVK_MAX_GROUPS; ++g) {
+      const struct wvk_bound_set *bound = &st->sets[bind_point][g];
+      const struct wvk_descriptor_set *set = bound->set;
+      for (uint32_t slot = 0; set && slot < set->layout->slot_count; ++slot) {
+         const VkDescriptorType type = set->layout->bindings[set->layout->slots[slot].binding].type;
+         if (!is_merged_type(type))
+            continue;
+         bool sampler;
+         uint32_t dynamic_index;
+         const struct wvk_descriptor *d = slot_descriptor(set, slot, &sampler, &dynamic_index);
+         if (!d || d->buffer != buffer)
+            continue;
+         uint64_t offset = d->offset;
+         if ((type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) &&
+             dynamic_index < WVK_MAX_DYNAMIC)
+            offset += bound->dynamic_offsets[dynamic_index];
+         read_lo = MIN2(read_lo, offset);
+         read_hi = MAX2(read_hi, offset + d->size);
+         if (written && (type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC ||
+                         type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)) {
+            write_lo = MIN2(write_lo, offset);
+            write_hi = MAX2(write_hi, offset + d->size);
+         }
+      }
+   }
+   if (read_hi > read_lo)
+      wvk_replay_read(replay, st->merged_mem[merged], read_lo, read_hi - read_lo);
+   if (write_hi > write_lo)
+      wvk_replay_write(replay, st->merged_mem[merged], write_lo, write_hi - write_lo);
 }
 
 /* The merges of a stage of more storage and texel buffers than WebGPU
