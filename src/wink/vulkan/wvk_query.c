@@ -313,14 +313,22 @@ wvk_replay_resolve_queries(struct wvk_replay *replay)
 void
 wvk_replay_finish_queries(struct wvk_replay *replay)
 {
-   if (replay->query_set)
+   if (replay->query_set) {
+      wgpuQuerySetDestroy(replay->query_set);
       wgpuQuerySetRelease(replay->query_set);
-   if (replay->query_resolve)
+   }
+   if (replay->query_resolve) {
+      wgpuBufferDestroy(replay->query_resolve);
       wgpuBufferRelease(replay->query_resolve);
-   if (replay->timestamp_set)
+   }
+   if (replay->timestamp_set) {
+      wgpuQuerySetDestroy(replay->timestamp_set);
       wgpuQuerySetRelease(replay->timestamp_set);
-   if (replay->timestamp_resolve)
+   }
+   if (replay->timestamp_resolve) {
+      wgpuBufferDestroy(replay->timestamp_resolve);
       wgpuBufferRelease(replay->timestamp_resolve);
+   }
    util_dynarray_fini(&replay->pass_queries);
 }
 

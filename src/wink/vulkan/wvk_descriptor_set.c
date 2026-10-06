@@ -186,8 +186,10 @@ wvk_descriptor_set_destroy(struct wvk_device *dev, struct wvk_descriptor_set *se
    wvk_descriptor_set_invalidate(set);
    for (uint32_t i = 0; i < set->layout->descriptor_count; ++i)
       clear_descriptor(&set->descriptors[i], false);
-   if (set->inline_buffer)
+   if (set->inline_buffer) {
+      wgpuBufferDestroy(set->inline_buffer);
       wgpuBufferRelease(set->inline_buffer);
+   }
    free(set->inline_data);
    list_del(&set->link);
    vk_descriptor_set_layout_unref(&dev->vk, &set->layout->vk);

@@ -53,6 +53,7 @@ struct wvk_replay {
    struct util_dynarray reads;      /* struct wvk_mem_range */
    struct util_dynarray writes;     /* struct wvk_mem_range */
    struct util_dynarray releases;   /* WGPUBuffer, destroyed after */
+   struct util_dynarray textures;   /* WGPUTexture, destroyed after */
    struct util_dynarray views;      /* WGPUTextureView, released after */
 
    /* The attachments of the current pass: for vkCmdClearAttachments, and
@@ -386,5 +387,10 @@ bool wvk_replay_written(const struct wvk_replay *replay, const struct wvk_device
  * destroyed once the submit ran. */
 WGPUBuffer wvk_replay_temp_buffer(struct wvk_device *dev, struct wvk_replay *replay,
                                   uint64_t size, WGPUBufferUsage usage, const void *data);
+/* A texture made for this submit alone, the caller's reference to it the
+ * submit's now: destroyed once the submit ran. Destroyed, not released:
+ * in a browser, the last release only lets JavaScript collect the texture,
+ * whenever it collects, and its memory is the GPU's until then. */
+void wvk_replay_temp_texture(struct wvk_replay *replay, WGPUTexture texture);
 
 #endif

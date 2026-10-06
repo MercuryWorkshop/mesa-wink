@@ -1022,8 +1022,10 @@ wvk_replay_finish_state(struct wvk_device *dev, struct wvk_replay *replay)
       wvk_descriptor_set_destroy(dev, *set);
    util_dynarray_fini(&replay->push_sets);
    util_dynarray_fini(&replay->push_data);
-   util_dynarray_foreach(&replay->push_buffers, struct wvk_push_buffer, old)
+   util_dynarray_foreach(&replay->push_buffers, struct wvk_push_buffer, old) {
+      wgpuBufferDestroy(old->buffer);
       wgpuBufferRelease(old->buffer);
+   }
    util_dynarray_fini(&replay->push_buffers);
    free(replay->state);
    replay->state = NULL;
@@ -1036,12 +1038,11 @@ wvk_replay_upload_push_constants(struct wvk_device *dev, struct wvk_replay *repl
    const uint8_t *data = util_dynarray_begin(&replay->push_data);
    if (size && dev->push_buffer)
       wgpuQueueWriteBuffer(dev->queue.wgpu, dev->push_buffer, 0, data, MIN2(size, dev->push_buffer_size));
+   /* Destroyed after the submit (wvk_replay_finish_state). */
    util_dynarray_foreach(&replay->push_buffers, struct wvk_push_buffer, old) {
       if (size)
          wgpuQueueWriteBuffer(dev->queue.wgpu, old->buffer, 0, data, MIN2(size, old->size));
-      wgpuBufferRelease(old->buffer);
    }
-   util_dynarray_clear(&replay->push_buffers);
 }
 
 /* The push buffer, big enough for `size` bytes of this submit's push
@@ -2840,7 +2841,7 @@ snapshot_logic_op(struct wvk_cmd_buffer *cmd)
       WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
       vd.format = view->format;
       WGPUTextureView v = wgpuTextureCreateView(copy, td.viewFormatCount ? &vd : NULL);
-      wgpuTextureRelease(copy);
+      wvk_replay_temp_texture(replay, copy);
       if (!v)
          continue;
       util_dynarray_append(&replay->views, v);
@@ -2912,7 +2913,7 @@ prepare_depth_bounds(struct wvk_cmd_buffer *cmd)
       vd.baseArrayLayer = ds->vk.base_array_layer + replay->pass_layer;
       vd.arrayLayerCount = 1;
       WGPUTextureView v = wgpuTextureCreateView(copy, &vd);
-      wgpuTextureRelease(copy);
+      wvk_replay_temp_texture(replay, copy);
       if (v) {
          util_dynarray_append(&replay->views, v);
          replay->depth_bounds_view = v;
@@ -6451,7 +6452,7 @@ swap_sampled_storage(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout
             WGPUTexture copy = wvk_image_snapshot(dev->wgpu, d->view_image, d->view_texture, replay->encoder);
             if (copy) {
                v = wgpuTextureCreateView(copy, &vd);
-               wgpuTextureRelease(copy);
+               wvk_replay_temp_texture(replay, copy);
             }
          }
          if (!v)

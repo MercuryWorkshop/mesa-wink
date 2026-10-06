@@ -180,6 +180,13 @@ wvk_replay_temp_buffer(struct wvk_device *dev, struct wvk_replay *replay, uint64
    return buffer;
 }
 
+void
+wvk_replay_temp_texture(struct wvk_replay *replay, WGPUTexture texture)
+{
+   if (texture)
+      util_dynarray_append(&replay->textures, texture);
+}
+
 static int
 compare_ranges(const void *a, const void *b)
 {
@@ -482,6 +489,7 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    util_dynarray_init(&replay.reads, NULL);
    util_dynarray_init(&replay.writes, NULL);
    util_dynarray_init(&replay.releases, NULL);
+   util_dynarray_init(&replay.textures, NULL);
    util_dynarray_init(&replay.views, NULL);
    util_dynarray_init(&replay.push_data, NULL);
    util_dynarray_init(&replay.push_buffers, NULL);
@@ -561,13 +569,22 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
    wgpuCommandBufferRelease(commands);
    wvk_queue_commit(queue, serial, readbacks, readback_count);
 
-   util_dynarray_foreach(&replay.releases, WGPUBuffer, b)
+   /* Destroyed, which WebGPU lets the submitted work outlive: a release
+    * alone would leave the memory to a browser's garbage collector. */
+   util_dynarray_foreach(&replay.releases, WGPUBuffer, b) {
+      wgpuBufferDestroy(*b);
       wgpuBufferRelease(*b);
+   }
    util_dynarray_foreach(&replay.views, WGPUTextureView, v)
       wgpuTextureViewRelease(*v);
+   util_dynarray_foreach(&replay.textures, WGPUTexture, t) {
+      wgpuTextureDestroy(*t);
+      wgpuTextureRelease(*t);
+   }
    util_dynarray_fini(&replay.reads);
    util_dynarray_fini(&replay.writes);
    util_dynarray_fini(&replay.releases);
+   util_dynarray_fini(&replay.textures);
    util_dynarray_fini(&replay.views);
    wvk_replay_finish_state(dev, &replay);
    wvk_replay_free_meta_memory(dev, &replay);
@@ -581,9 +598,9 @@ wvk_cmd_buffers_submit(struct wvk_device *dev, struct wvk_queue *queue,
 void
 wvk_replay_drop_snapshots(struct wvk_replay *replay)
 {
-   /* What was encoded has them still. */
+   /* What was encoded has them still: they go with the submit. */
    util_dynarray_foreach(&replay->snapshots, struct wvk_snapshot, s)
-      wgpuTextureRelease(s->texture);
+      wvk_replay_temp_texture(replay, s->texture);
    util_dynarray_clear(&replay->snapshots);
    for (uint32_t i = 0; i < replay->rendering.color_count; ++i) {
       struct wvk_image_view *view = replay->rendering.color[i];
