@@ -13,7 +13,7 @@ import subprocess
 import time
 import xml.etree.ElementTree as ET
 from compare import compare_directories, compare_images
-from build_replay_support import HERE, MESA
+from build_replay_support import HERE, MESA, copy_artifact
 
 ERRORS = re.compile(r"error:|(?:\[|/)ERROR\]|\[gfxrecon\] ERROR|\bFATAL\b|GL_INVALID_|WebGPU error|validation error|device lost|unsupported:|unsupported \w+ call|failed to (?:compile|link|get snapshot)|FAIL\b", re.I)
 BENIGN_LOG_LINES = {"Errors from xkbcomp are not fatal to the X server"}
@@ -208,11 +208,11 @@ def replay(a, case, root, target):
         for suffix in ("js", "wasm", "worker.js", "worker.mjs"):
             source = next((p for p in (build / (executable + "." + suffix), build / "bin" / (executable + "." + suffix), build / "tools/replay" / (executable + "." + suffix)) if p.is_file()), None)
             if source:
-                shutil.copy2(source, output)
+                copy_artifact(source, output / source.name)
             elif suffix in ("js", "wasm"):
                 return {"status": "missing-tools", "pass": False, "error": "Build browser " + api + " replay first"}
         shutil.copy2(HERE / "replay/replay.html", output / "index.html")
-        shutil.copy2(trace, output / trace.name)
+        copy_artifact(trace, output / trace.name)
         query = urlencode({"api": case["api"], "trace": trace.name, "checkpoints": checkpoints})
         outcome = execute(["node", MESA / "wink/test/run-browser.mjs", output,
                            "--page=index.html?" + query, f"--timeout={a.timeout}", "--result=" + str(output / "browser.json")],
