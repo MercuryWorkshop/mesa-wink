@@ -13,13 +13,10 @@ Capture on wink, so that the application only chose what wink offers:
 The host driver (RADV, say) is the reference: it replays with the portability
 subset removed and resources rebound to its own requirements.
 
-Two GPUs legitimately disagree along primitive edges -- a pixel either side
-of where an edge lands, the last bit of an interpolation -- and never across
-a region's interior. So the per-pixel difference mask is eroded: a differing
-pixel counts only if everything within --erode of it differs too, which no
-edge fringe does. What is left is a defect (a dropped draw, a wrong texture,
-a bad blend), and its count is what should be zero. This is gex's
-tools/surface-diff.py, for gfxreconstruct's screenshots.
+The tolerance applies to the worst RGB channel. Erosion helps identify broad
+interior defects, but can hide thin geometry and does not prove correctness.
+For coverage gates with raw-pixel limits, strict regions, repeatable CPU
+references and identical browser replay, use wink/test/apps/suite.py.
 """
 import argparse
 import os
@@ -47,7 +44,11 @@ def compare(a_path, b_path, tolerance, erode, mask_path):
     b = Image.open(b_path).convert("RGB")
     if a.size != b.size:
         return None, f"sizes differ: {a.size} vs {b.size}"
-    diff = ImageChops.difference(a, b).convert("L")
+    # Luminance hides errors confined to blue (and attenuates red errors).
+    # The declared tolerance is per-channel, so reduce by the worst channel.
+    diff = Image.new("L", a.size)
+    for channel in ImageChops.difference(a, b).split():
+        diff = ImageChops.lighter(diff, channel)
     raw = diff.point(lambda v: 255 if v > tolerance else 0)
     differing = raw.histogram()[255]
     eroded = raw.filter(ImageFilter.MinFilter(2 * erode + 1)) if erode else raw
@@ -83,7 +84,7 @@ def main():
         if rc or err:
             print(f"{name} replay: exit {rc}", *err, sep="\n  ")
 
-    bad = 0
+    bad = int(bool(ref_rc or ref_err or wink_rc or wink_err))
     shots = sorted(f for f in os.listdir(os.path.join(out, "host")) if f.endswith(".png"))
     for shot in shots:
         wink = os.path.join(out, "wink", shot)
