@@ -482,6 +482,9 @@ _mesa_glthread_Enable(struct gl_context *ctx, GLenum cap)
    case GL_LIGHTING:
       ctx->GLThread.Lighting = true;
       break;
+   case GL_FOG:
+      ctx->GLThread.Fog.enabled = true;
+      break;
    case GL_POLYGON_STIPPLE:
       ctx->GLThread.PolygonStipple = true;
       break;
@@ -527,6 +530,9 @@ _mesa_glthread_Disable(struct gl_context *ctx, GLenum cap)
    case GL_LIGHTING:
       ctx->GLThread.Lighting = false;
       break;
+   case GL_FOG:
+      ctx->GLThread.Fog.enabled = false;
+      break;
    case GL_POLYGON_STIPPLE:
       ctx->GLThread.PolygonStipple = false;
       break;
@@ -563,6 +569,9 @@ _mesa_glthread_IsEnabled(struct gl_context *ctx, GLenum cap)
       return ctx->GLThread.DepthTest;
    case GL_LIGHTING:
       return ctx->GLThread.Lighting;
+   case GL_FOG:
+      return ctx->GLThread.Fog.known && ctx->API != API_OPENGL_CORE &&
+             ctx->API != API_OPENGLES2 ? ctx->GLThread.Fog.enabled : -1;
    case GL_POLYGON_STIPPLE:
       return ctx->GLThread.PolygonStipple;
    case GL_VERTEX_ARRAY:
@@ -613,22 +622,55 @@ _mesa_glthread_PushAttrib(struct gl_context *ctx, GLbitfield mask)
    if (mask & GL_TRANSFORM_BIT)
       attr->MatrixMode = ctx->GLThread.MatrixMode;
 
-   if (mask & GL_FOG_BIT) {
-      attr->FogMode = ctx->GLThread.FogMode;
-      attr->FogModeKnown = ctx->GLThread.FogModeKnown;
+   if (mask & GL_FOG_BIT)
+      attr->Fog = ctx->GLThread.Fog;
+
+   if (mask & (GL_FOG_BIT | GL_ENABLE_BIT)) {
+      attr->FogEnabled = ctx->GLThread.Fog.enabled;
+      /* What was unknown when pushed is unknown when popped. */
+      attr->Fog.known = ctx->GLThread.Fog.known;
+   }
+}
+
+/* glFog*: `ints` says whether the values came from glFogi[v], whose color is
+ * converted in a way not repeated here -- that makes the state unknown. */
+static inline void
+_mesa_glthread_Fog(struct gl_context *ctx, GLenum pname, const GLfloat *v,
+                   bool ints)
+{
+   if (ctx->GLThread.ListMode == GL_COMPILE || !v)
+      return;
+
+   struct glthread_fog *fog = &ctx->GLThread.Fog;
+   switch (pname) {
+   case GL_FOG_MODE:
+      fog->mode = MIN2((GLuint)v[0], 0xffff);
+      break;
+   case GL_FOG_START:
+      fog->start = v[0];
+      break;
+   case GL_FOG_END:
+      fog->end = v[0];
+      break;
+   case GL_FOG_DENSITY:
+      fog->density = v[0];
+      break;
+   case GL_FOG_COLOR:
+      if (ints)
+         fog->known = false;
+      else
+         memcpy(fog->color, v, sizeof(fog->color));
+      break;
    }
 }
 
 static inline void
-_mesa_glthread_Fog(struct gl_context *ctx, GLenum pname, GLint value)
+_mesa_glthread_Fogi(struct gl_context *ctx, GLenum pname, const GLint *v)
 {
-   if (ctx->GLThread.ListMode == GL_COMPILE)
+   if (!v)
       return;
-
-   if (pname == GL_FOG_MODE) {
-      ctx->GLThread.FogMode = MIN2((GLuint)value, 0xffff);
-      ctx->GLThread.FogModeKnown = true;
-   }
+   const GLfloat f = (GLfloat)v[0];
+   _mesa_glthread_Fog(ctx, pname, &f, true);
 }
 
 static inline void
@@ -656,8 +698,14 @@ _mesa_glthread_PopAttrib(struct gl_context *ctx)
       ctx->GLThread.DepthTest = attr->DepthTest;
 
    if (mask & GL_FOG_BIT) {
-      ctx->GLThread.FogMode = attr->FogMode;
-      ctx->GLThread.FogModeKnown = attr->FogModeKnown;
+      const bool known = ctx->GLThread.Fog.known;
+      ctx->GLThread.Fog = attr->Fog;
+      ctx->GLThread.Fog.known = known && attr->Fog.known;
+   }
+
+   if (mask & (GL_FOG_BIT | GL_ENABLE_BIT)) {
+      ctx->GLThread.Fog.enabled = attr->FogEnabled;
+      ctx->GLThread.Fog.known = ctx->GLThread.Fog.known && attr->Fog.known;
    }
 
    if (mask & (GL_LIGHTING_BIT | GL_ENABLE_BIT))
@@ -811,7 +859,7 @@ _mesa_glthread_CallList(struct gl_context *ctx, GLuint list)
       return;
 
    /* glthread does not see what a list does to the fog. */
-   ctx->GLThread.FogModeKnown = false;
+   ctx->GLThread.Fog.known = false;
 
    /* Wait for all glEndList and glDeleteLists calls to finish to ensure that
     * all display lists are up to date and the driver thread is not

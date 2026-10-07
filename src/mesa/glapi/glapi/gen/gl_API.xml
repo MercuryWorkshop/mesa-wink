@@ -1976,14 +1976,14 @@
     </function>
 
     <function name="Fogf" es1="1.0" deprecated="3.1" exec="dlist"
-              marshal_call_after="_mesa_glthread_Fog(ctx, pname, (GLint)param);">
+              marshal_call_after="_mesa_glthread_Fog(ctx, pname, &amp;param, false);">
         <param name="pname" type="GLenum"/>
         <param name="param" type="GLfloat"/>
         <glx rop="80"/>
     </function>
 
     <function name="Fogfv" es1="1.0" deprecated="3.1" exec="dlist"
-              marshal_call_after="_mesa_glthread_Fog(ctx, pname, params ? (GLint)params[0] : 0);">
+              marshal_call_after="_mesa_glthread_Fog(ctx, pname, params, false);">
         <param name="pname" type="GLenum"/>
         <param name="params" type="const GLfloat *" variable_param="pname"
                marshal_count="_mesa_fog_enum_to_count(pname)"/>
@@ -1991,14 +1991,14 @@
     </function>
 
     <function name="Fogi" deprecated="3.1" exec="dlist"
-              marshal_call_after="_mesa_glthread_Fog(ctx, pname, param);">
+              marshal_call_after="_mesa_glthread_Fogi(ctx, pname, &amp;param);">
         <param name="pname" type="GLenum"/>
         <param name="param" type="GLint"/>
         <glx rop="82"/>
     </function>
 
     <function name="Fogiv" deprecated="3.1" exec="dlist"
-              marshal_call_after="_mesa_glthread_Fog(ctx, pname, params ? params[0] : 0);">
+              marshal_call_after="_mesa_glthread_Fogi(ctx, pname, params);">
         <param name="pname" type="GLenum"/>
         <param name="params" type="const GLint *" variable_param="pname"
                marshal_count="_mesa_fog_enum_to_count(pname)"/>
@@ -2695,7 +2695,7 @@
         <glx rop="173" large="true"/>
     </function>
 
-    <function name="GetBooleanv" es1="1.1" es2="2.0">
+    <function name="GetBooleanv" es1="1.1" es2="2.0" marshal="custom">
         <param name="pname" type="GLenum"/>
         <param name="params" type="GLboolean *" output="true" variable_param="pname"/>
         <glx sop="112" handcode="client"/>
@@ -2718,7 +2718,7 @@
         <glx sop="115" handcode="client"/>
     </function>
 
-    <function name="GetFloatv" es1="1.1" es2="2.0">
+    <function name="GetFloatv" es1="1.1" es2="2.0" marshal="custom">
         <param name="pname" type="GLenum"/>
         <param name="params" type="GLfloat *" output="true" variable_param="pname"/>
         <glx sop="116" handcode="client"/>

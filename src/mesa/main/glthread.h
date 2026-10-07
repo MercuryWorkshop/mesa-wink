@@ -172,13 +172,24 @@ struct glthread_client_attrib {
    bool Valid;
 };
 
+/* The fog state glthread keeps so that queries need not wait for the driver
+ * thread: Sodium reads GL_FOG, GL_FOG_START, GL_FOG_END and GL_FOG_COLOR for
+ * every pass of every frame. The color is as set; queries clamp it to [0, 1],
+ * which is what the driver answers for a fixed-point framebuffer. */
+struct glthread_fog {
+   bool known;     /* everything below matches the driver's state */
+   bool enabled;   /* GL_FOG */
+   GLenum16 mode;
+   GLfloat start, end, density, color[4];
+};
+
 /* For glPushAttrib / glPopAttrib. */
 struct glthread_attrib_node {
    GLbitfield Mask;
    int ActiveTexture;
    GLenum16 MatrixMode;
-   GLenum16 FogMode;
-   bool FogModeKnown;
+   struct glthread_fog Fog;      /* GL_FOG_BIT */
+   bool FogEnabled;              /* GL_ENABLE_BIT */
    bool Blend;
    bool CullFace;
    bool DepthTest;
@@ -294,10 +305,9 @@ struct glthread_state
    int ActiveTexture;
    GLenum16 MatrixMode;
    gl_matrix_index MatrixIndex;
-   /* GL_FOG_MODE, for glGetIntegerv without a sync: Sodium reads it every
-    * frame. Unknown after a display list runs, until it is set or read. */
-   GLenum16 FogMode;
-   bool FogModeKnown;
+   /* Fog, for queries without a sync; unknown after a display list runs, and
+    * then fetched once by the next fog query (glthread_get.c). */
+   struct glthread_fog Fog;
    struct glthread_attrib_node AttribStack[MAX_ATTRIB_STACK_DEPTH];
    int AttribStackDepth;
    int MatrixStackDepth[M_NUM_MATRIX_STACKS];

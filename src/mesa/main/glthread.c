@@ -292,8 +292,11 @@ glthread_init_state(struct gl_context *ctx)
    _mesa_InitHashTable(&glthread->VAOs);
    _mesa_glthread_reset_vao(&glthread->DefaultVAO);
    glthread->CurrentVAO = &glthread->DefaultVAO;
-   glthread->FogMode = GL_EXP;
-   glthread->FogModeKnown = true;
+   /* GL's initial fog state. */
+   glthread->Fog = (struct glthread_fog){
+      .known = true, .enabled = false, .mode = GL_EXP,
+      .start = 0.0f, .end = 1.0f, .density = 1.0f,
+   };
 
    ctx->MarshalExec = _mesa_alloc_dispatch_table(true);
    if (!ctx->MarshalExec) {

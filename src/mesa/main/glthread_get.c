@@ -24,6 +24,142 @@
 #include "main/glthread_marshal.h"
 #include "dispatch.h"
 
+/* Driver thread (or the application thread with glthread idle): the fog state
+ * glthread lost track of, from the context itself. */
+static void
+glthread_fetch_fog(struct gl_context *ctx, void *unused)
+{
+   struct glthread_fog *fog = &ctx->GLThread.Fog;
+   fog->enabled = ctx->Fog.Enabled;
+   fog->mode = ctx->Fog.Mode;
+   fog->start = ctx->Fog.Start;
+   fog->end = ctx->Fog.End;
+   fog->density = ctx->Fog.Density;
+   memcpy(fog->color, ctx->Fog.ColorUnclamped, sizeof(fog->color));
+   fog->known = true;
+}
+
+/* Whether this context's fog state can answer a query here. Fog is gone from
+ * core and ES 2+, where a query is an error to report; elsewhere a state lost
+ * to a display list is fetched once, in one wait, and kept. */
+static bool
+glthread_fog_ready(struct gl_context *ctx)
+{
+   if (ctx->GLThread.inside_begin_end || ctx->API == API_OPENGL_CORE ||
+       ctx->API == API_OPENGLES2)
+      return false;
+   if (ctx->GLThread.Fog.known)
+      return true;
+#if MESA_GLTHREAD_REMOTE
+   if (GLTHREAD_IS_REMOTE(ctx)) {
+      ctx->GLThread.sync_why = "fog state, refetched";
+      _mesa_glthread_call(ctx, glthread_fetch_fog, NULL);
+      return ctx->GLThread.Fog.known;
+   }
+#endif
+   _mesa_glthread_finish_before(ctx, "fog state, refetched");
+   glthread_fetch_fog(ctx, NULL);
+   return true;
+}
+
+static bool
+glthread_is_fog_pname(GLenum pname)
+{
+   switch (pname) {
+   case GL_FOG:
+   case GL_FOG_MODE:
+   case GL_FOG_START:
+   case GL_FOG_END:
+   case GL_FOG_DENSITY:
+   case GL_FOG_COLOR:
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* The fog query as floats; GetBooleanv and GetIntegerv convert. */
+static void
+glthread_fog_values(struct gl_context *ctx, GLenum pname, GLfloat *out,
+                    unsigned *count)
+{
+   const struct glthread_fog *fog = &ctx->GLThread.Fog;
+   *count = 1;
+   switch (pname) {
+   case GL_FOG:       out[0] = fog->enabled ? 1.0f : 0.0f; break;
+   case GL_FOG_MODE:  out[0] = (GLfloat)fog->mode; break;
+   case GL_FOG_START: out[0] = fog->start; break;
+   case GL_FOG_END:   out[0] = fog->end; break;
+   case GL_FOG_DENSITY: out[0] = fog->density; break;
+   case GL_FOG_COLOR:
+      for (unsigned i = 0; i < 4; ++i)
+         out[i] = CLAMP(fog->color[i], 0.0f, 1.0f);
+      *count = 4;
+      break;
+   }
+}
+
+uint32_t
+_mesa_unmarshal_GetFloatv(struct gl_context *ctx,
+                          const struct marshal_cmd_GetFloatv *restrict cmd)
+{
+   UNREACHABLE("never executed");
+   return 0;
+}
+
+void GLAPIENTRY
+_mesa_marshal_GetFloatv(GLenum pname, GLfloat *p)
+{
+   GET_CURRENT_CONTEXT(ctx);
+
+   if (glthread_is_fog_pname(pname) && glthread_fog_ready(ctx)) {
+      unsigned n;
+      glthread_fog_values(ctx, pname, p, &n);
+      return;
+   }
+#if MESA_GLTHREAD_REMOTE
+   if (GLTHREAD_IS_REMOTE(ctx)) {
+      ctx->GLThread.sync_why = _mesa_glthread_remote_pname_name("GetFloatv", pname);
+      _mesa_glthread_call_GetFloatv(ctx, pname, p);
+      return;
+   }
+#endif
+   _mesa_glthread_finish_before(ctx, "GetFloatv");
+   CALL_GetFloatv(ctx->Dispatch.Current, (pname, p));
+}
+
+uint32_t
+_mesa_unmarshal_GetBooleanv(struct gl_context *ctx,
+                            const struct marshal_cmd_GetBooleanv *restrict cmd)
+{
+   UNREACHABLE("never executed");
+   return 0;
+}
+
+void GLAPIENTRY
+_mesa_marshal_GetBooleanv(GLenum pname, GLboolean *p)
+{
+   GET_CURRENT_CONTEXT(ctx);
+
+   if (glthread_is_fog_pname(pname) && glthread_fog_ready(ctx)) {
+      GLfloat v[4];
+      unsigned n;
+      glthread_fog_values(ctx, pname, v, &n);
+      for (unsigned i = 0; i < n; ++i)
+         p[i] = v[i] != 0.0f ? GL_TRUE : GL_FALSE;
+      return;
+   }
+#if MESA_GLTHREAD_REMOTE
+   if (GLTHREAD_IS_REMOTE(ctx)) {
+      ctx->GLThread.sync_why = _mesa_glthread_remote_pname_name("GetBooleanv", pname);
+      _mesa_glthread_call_GetBooleanv(ctx, pname, p);
+      return;
+   }
+#endif
+   _mesa_glthread_finish_before(ctx, "GetBooleanv");
+   CALL_GetBooleanv(ctx->Dispatch.Current, (pname, p));
+}
+
 uint32_t
 _mesa_unmarshal_GetIntegerv(struct gl_context *ctx,
                             const struct marshal_cmd_GetIntegerv *restrict cmd)
@@ -131,11 +267,11 @@ _mesa_marshal_GetIntegerv(GLenum pname, GLint *p)
    case GL_VERTEX_ARRAY_BINDING:
       *p = ctx->GLThread.CurrentVAO->Name;
       return;
+   case GL_FOG:
    case GL_FOG_MODE:
-      /* Fog is gone from core and ES 2+, where this is an error to report. */
-      if (ctx->GLThread.FogModeKnown && ctx->API != API_OPENGL_CORE &&
-          ctx->API != API_OPENGLES2) {
-         *p = ctx->GLThread.FogMode;
+      if (glthread_fog_ready(ctx)) {
+         *p = pname == GL_FOG ? ctx->GLThread.Fog.enabled
+                              : ctx->GLThread.Fog.mode;
          return;
       }
       break;
@@ -153,11 +289,6 @@ sync:
    {
       _mesa_glthread_finish_before(ctx, "GetIntegerv");
       CALL_GetIntegerv(ctx->Dispatch.Current, (pname, p));
-   }
-   /* Known again once asked. */
-   if (pname == GL_FOG_MODE) {
-      ctx->GLThread.FogMode = MIN2((GLuint)*p, 0xffff);
-      ctx->GLThread.FogModeKnown = true;
    }
 }
 
