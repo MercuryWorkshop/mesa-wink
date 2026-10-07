@@ -98,6 +98,10 @@ class PrintCode(gl_XML.gl_print_base):
         out('#if MESA_GLTHREAD_REMOTE')
         out('if (unlikely(ctx->GLThread.remote)) {')
         with indent():
+            # Named for _mesa_glthread_remote_census: every wait is one round
+            # trip through the driver thread, and which calls make them is the
+            # question the census answers.
+            out('ctx->GLThread.sync_why = "{0}";'.format(func.name))
             if func.return_type != 'void':
                 out('return {0};'.format(call))
             else:

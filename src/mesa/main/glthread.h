@@ -177,6 +177,8 @@ struct glthread_attrib_node {
    GLbitfield Mask;
    int ActiveTexture;
    GLenum16 MatrixMode;
+   GLenum16 FogMode;
+   bool FogModeKnown;
    bool Blend;
    bool CullFace;
    bool DepthTest;
@@ -292,6 +294,10 @@ struct glthread_state
    int ActiveTexture;
    GLenum16 MatrixMode;
    gl_matrix_index MatrixIndex;
+   /* GL_FOG_MODE, for glGetIntegerv without a sync: Sodium reads it every
+    * frame. Unknown after a display list runs, until it is set or read. */
+   GLenum16 FogMode;
+   bool FogModeKnown;
    struct glthread_attrib_node AttribStack[MAX_ATTRIB_STACK_DEPTH];
    int AttribStackDepth;
    int MatrixStackDepth[M_NUM_MATRIX_STACKS];

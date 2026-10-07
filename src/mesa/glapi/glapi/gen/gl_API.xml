@@ -1975,26 +1975,30 @@
         <glx rop="79"/>
     </function>
 
-    <function name="Fogf" es1="1.0" deprecated="3.1" exec="dlist">
+    <function name="Fogf" es1="1.0" deprecated="3.1" exec="dlist"
+              marshal_call_after="_mesa_glthread_Fog(ctx, pname, (GLint)param);">
         <param name="pname" type="GLenum"/>
         <param name="param" type="GLfloat"/>
         <glx rop="80"/>
     </function>
 
-    <function name="Fogfv" es1="1.0" deprecated="3.1" exec="dlist">
+    <function name="Fogfv" es1="1.0" deprecated="3.1" exec="dlist"
+              marshal_call_after="_mesa_glthread_Fog(ctx, pname, params ? (GLint)params[0] : 0);">
         <param name="pname" type="GLenum"/>
         <param name="params" type="const GLfloat *" variable_param="pname"
                marshal_count="_mesa_fog_enum_to_count(pname)"/>
         <glx rop="81"/>
     </function>
 
-    <function name="Fogi" deprecated="3.1" exec="dlist">
+    <function name="Fogi" deprecated="3.1" exec="dlist"
+              marshal_call_after="_mesa_glthread_Fog(ctx, pname, param);">
         <param name="pname" type="GLenum"/>
         <param name="param" type="GLint"/>
         <glx rop="82"/>
     </function>
 
-    <function name="Fogiv" deprecated="3.1" exec="dlist">
+    <function name="Fogiv" deprecated="3.1" exec="dlist"
+              marshal_call_after="_mesa_glthread_Fog(ctx, pname, params ? params[0] : 0);">
         <param name="pname" type="GLenum"/>
         <param name="params" type="const GLint *" variable_param="pname"
                marshal_count="_mesa_fog_enum_to_count(pname)"/>

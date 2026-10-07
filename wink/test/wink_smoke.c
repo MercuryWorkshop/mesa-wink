@@ -115,6 +115,9 @@ note(const char *fmt, ...)
    X(void, CompressedTexImage2D, (GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *)) \
    X(void, DeleteTextures, (GLsizei, const GLuint *))                             \
    X(void, BufferSubData, (GLenum, GLintptr, GLsizeiptr, const void *))          \
+   X(void, Fogi, (GLenum, GLint))                                                \
+   X(void, PushAttrib, (GLbitfield))                                             \
+   X(void, PopAttrib, (void))                                                    \
    X(void, VertexAttribDivisor, (GLuint, GLuint))                                \
    X(void, MultiDrawArrays, (GLenum, const GLint *, const GLsizei *, GLsizei))   \
    X(void, MultiDrawArraysIndirect, (GLenum, const void *, GLsizei, GLsizei))  \
@@ -1001,6 +1004,48 @@ big_uploads(const char *label, wink_surface *surface)
    wink_context_destroy(ctx);
 }
 
+/* State glthread answers itself rather than asking the driver thread: with GL
+ * on the main thread a wrong answer here is a wrong cached value, not a wait. */
+static void
+glthread_queries(const char *label, wink_surface *surface)
+{
+   wink_context_attribs ca;
+   wink_context_attribs_default(&ca);
+   ca.api = WINK_API_OPENGL_COMPAT;
+   int status = 0;
+   wink_context *ctx = wink_context_create(&ca, &status);
+   CHECK(ctx, "%s: compat context: %s", label, wink_status_string(status));
+   if (!ctx)
+      return;
+   wink_make_current(ctx, surface, surface);
+   GLint v = -1;
+   p_glGetIntegerv(GL_FOG_MODE, &v);
+   CHECK(v == GL_EXP, "%s: initial fog mode 0x%x", label, v);
+   p_glFogi(GL_FOG_MODE, GL_LINEAR);
+   p_glGetIntegerv(GL_FOG_MODE, &v);
+   CHECK(v == GL_LINEAR, "%s: fog mode 0x%x after glFogi", label, v);
+   p_glPushAttrib(GL_FOG_BIT);
+   p_glFogi(GL_FOG_MODE, GL_EXP2);
+   p_glGetIntegerv(GL_FOG_MODE, &v);
+   CHECK(v == GL_EXP2, "%s: fog mode 0x%x inside push", label, v);
+   p_glPopAttrib();
+   p_glGetIntegerv(GL_FOG_MODE, &v);
+   CHECK(v == GL_LINEAR, "%s: fog mode 0x%x after pop", label, v);
+   GLuint vao = 0;
+   p_glGenVertexArrays(1, &vao);
+   p_glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &v);
+   CHECK(v == 0, "%s: vertex array binding %d, want 0", label, v);
+   p_glBindVertexArray(vao);
+   p_glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &v);
+   CHECK(v == (GLint)vao, "%s: vertex array binding %d, want %u", label, v, vao);
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+   GLenum err = p_glGetError();
+   CHECK(err == GL_NO_ERROR, "%s glthread queries: GL error 0x%x", label, err);
+   wink_make_current(NULL, NULL, NULL);
+   wink_context_destroy(ctx);
+}
+
 static void
 exercise(const char *label, int api, wink_surface *surface)
 {
@@ -1183,6 +1228,7 @@ run_pass(const char *label)
    multidraw_quads(label, surface);
    client_arrays(label, surface);
    big_uploads(label, surface);
+   glthread_queries(label, surface);
 
    /* A version that does not exist is refused, not quietly lowered. */
    wink_context_attribs ca;

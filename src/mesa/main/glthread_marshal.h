@@ -612,6 +612,23 @@ _mesa_glthread_PushAttrib(struct gl_context *ctx, GLbitfield mask)
 
    if (mask & GL_TRANSFORM_BIT)
       attr->MatrixMode = ctx->GLThread.MatrixMode;
+
+   if (mask & GL_FOG_BIT) {
+      attr->FogMode = ctx->GLThread.FogMode;
+      attr->FogModeKnown = ctx->GLThread.FogModeKnown;
+   }
+}
+
+static inline void
+_mesa_glthread_Fog(struct gl_context *ctx, GLenum pname, GLint value)
+{
+   if (ctx->GLThread.ListMode == GL_COMPILE)
+      return;
+
+   if (pname == GL_FOG_MODE) {
+      ctx->GLThread.FogMode = MIN2((GLuint)value, 0xffff);
+      ctx->GLThread.FogModeKnown = true;
+   }
 }
 
 static inline void
@@ -637,6 +654,11 @@ _mesa_glthread_PopAttrib(struct gl_context *ctx)
 
    if (mask & (GL_DEPTH_BUFFER_BIT | GL_ENABLE_BIT))
       ctx->GLThread.DepthTest = attr->DepthTest;
+
+   if (mask & GL_FOG_BIT) {
+      ctx->GLThread.FogMode = attr->FogMode;
+      ctx->GLThread.FogModeKnown = attr->FogModeKnown;
+   }
 
    if (mask & (GL_LIGHTING_BIT | GL_ENABLE_BIT))
       ctx->GLThread.Lighting = attr->Lighting;
@@ -787,6 +809,9 @@ _mesa_glthread_CallList(struct gl_context *ctx, GLuint list)
 {
    if (ctx->GLThread.ListMode == GL_COMPILE)
       return;
+
+   /* glthread does not see what a list does to the fog. */
+   ctx->GLThread.FogModeKnown = false;
 
    /* Wait for all glEndList and glDeleteLists calls to finish to ensure that
     * all display lists are up to date and the driver thread is not

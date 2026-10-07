@@ -128,6 +128,17 @@ _mesa_marshal_GetIntegerv(GLenum pname, GLint *p)
    case GL_POINT_SIZE_ARRAY_OES:
       *p = (ctx->GLThread.CurrentVAO->UserEnabled & (1 << VERT_ATTRIB_POINT_SIZE)) != 0;
       return;
+   case GL_VERTEX_ARRAY_BINDING:
+      *p = ctx->GLThread.CurrentVAO->Name;
+      return;
+   case GL_FOG_MODE:
+      /* Fog is gone from core and ES 2+, where this is an error to report. */
+      if (ctx->GLThread.FogModeKnown && ctx->API != API_OPENGL_CORE &&
+          ctx->API != API_OPENGLES2) {
+         *p = ctx->GLThread.FogMode;
+         return;
+      }
+      break;
    }
 
 sync:
@@ -137,11 +148,17 @@ sync:
    if (GLTHREAD_IS_REMOTE(ctx)) {
       ctx->GLThread.sync_why = _mesa_glthread_remote_pname_name("GetIntegerv", pname);
       _mesa_glthread_call_GetIntegerv(ctx, pname, p);
-      return;
-   }
+   } else
 #endif
-   _mesa_glthread_finish_before(ctx, "GetIntegerv");
-   CALL_GetIntegerv(ctx->Dispatch.Current, (pname, p));
+   {
+      _mesa_glthread_finish_before(ctx, "GetIntegerv");
+      CALL_GetIntegerv(ctx->Dispatch.Current, (pname, p));
+   }
+   /* Known again once asked. */
+   if (pname == GL_FOG_MODE) {
+      ctx->GLThread.FogMode = MIN2((GLuint)*p, 0xffff);
+      ctx->GLThread.FogModeKnown = true;
+   }
 }
 
 /* TODO: Implement glGetBooleanv, glGetFloatv, etc. if needed */

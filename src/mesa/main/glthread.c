@@ -289,6 +289,8 @@ glthread_init_state(struct gl_context *ctx)
    _mesa_InitHashTable(&glthread->VAOs);
    _mesa_glthread_reset_vao(&glthread->DefaultVAO);
    glthread->CurrentVAO = &glthread->DefaultVAO;
+   glthread->FogMode = GL_EXP;
+   glthread->FogModeKnown = true;
 
    ctx->MarshalExec = _mesa_alloc_dispatch_table(true);
    if (!ctx->MarshalExec) {
