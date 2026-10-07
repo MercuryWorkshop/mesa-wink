@@ -6771,6 +6771,11 @@ gex_wgpu_buffer_readback(struct pipe_context *pipe,
  * in it. Recovering them costs one readback per buffer, not per map: the
  * shadow is then kept, and SuperTuxKart's 1.19 million read maps touch only
  * 1.4 MB of buffers between them. */
+/* CPU reads that had to fetch a buffer back from the GPU -- a submit and a wait
+ * each. wink's main-thread census reports them a frame; the first few are
+ * named, so a buffer that should have kept a shadow can be told apart. */
+uint64_t gex_wgpu_readbacks;
+
 static uint8_t *
 gex_wgpu_shadow_for_read(struct pipe_context *pipe,
                          struct gex_wgpu_resource *gex)
@@ -6780,10 +6785,18 @@ gex_wgpu_shadow_for_read(struct pipe_context *pipe,
    const bool needs_contents = gex->bytes_written != 0 || gex->gpu_written;
    if (!gex_wgpu_shadow_ensure(gex))
       return NULL;
-   if (needs_contents &&
-       !gex_wgpu_buffer_readback(pipe, gex, 0,
-                                 (uint32_t)gex->allocation_size, gex->shadow))
-      return NULL;
+   if (needs_contents) {
+      if (gex_wgpu_readbacks++ < 16)
+         fprintf(stderr, "gex-wgpu: readback #%llu: a %u-byte buffer, bind 0x%x, "
+                 "%llu bytes written by the CPU, gpu_written %d\n",
+                 (unsigned long long)gex_wgpu_readbacks, gex->base.width0,
+                 gex->base.bind, (unsigned long long)gex->bytes_written,
+                 (int)gex->gpu_written);
+      if (!gex_wgpu_buffer_readback(pipe, gex, 0,
+                                    (uint32_t)gex->allocation_size,
+                                    gex->shadow))
+         return NULL;
+   }
    return gex->shadow;
 }
 
@@ -20058,8 +20071,9 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
     * before which it holds zeros -- leaves a shadow taken from the data, for
     * the buffers the driver reads on the CPU itself: indirect commands
     * (util_draw_indirect_read) and, since an application may fill those
-    * through another binding, any buffer of 16 KiB or less. Without one, the
-    * first CPU read is a GPU readback -- a submit and a wait for the GPU --
+    * through another binding, any buffer of 64 KiB or less (Sodium fills its
+    * ~16.5-17.5 KiB command buffers through GL_ARRAY_BUFFER, R479). Without one,
+    * the first CPU read is a GPU readback -- a submit and a wait for the GPU --
     * and a buffer re-specified at a new size is a new resource with no
     * shadow: Sodium re-specifies its indirect commands before every
     * glMultiDrawArraysIndirect, so every one of those draws waited for the
@@ -20076,7 +20090,7 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
        ((offset == 0 && size == resource->width0) ||
         (!gex->bytes_written && !gex->gpu_written)) &&
        ((resource->bind & PIPE_BIND_COMMAND_ARGS_BUFFER) ||
-        resource->width0 <= 16384) &&
+        resource->width0 <= 65536) &&
        gex_wgpu_shadow_ensure(gex)) {
       /* Falls through to the shadowed path below, which copies the data in
        * and uploads from the shadow. */
