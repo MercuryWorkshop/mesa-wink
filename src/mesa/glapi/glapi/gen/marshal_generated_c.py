@@ -98,10 +98,19 @@ class PrintCode(gl_XML.gl_print_base):
         out('#if MESA_GLTHREAD_REMOTE')
         out('if (unlikely(ctx->GLThread.remote)) {')
         with indent():
+            # A client-memory image upload is sent along as a copy when it can
+            # be (glthread.c); only what that cannot take waits.
+            if func.name in ('TexImage2D', 'TexSubImage2D'):
+                out('if (_mesa_glthread_remote_{0}(ctx, {1}))'.format(func.name, args))
+                out('   return;')
             # Named for _mesa_glthread_remote_census: every wait is one round
             # trip through the driver thread, and which calls make them is the
-            # question the census answers.
-            out('ctx->GLThread.sync_why = "{0}";'.format(func.name))
+            # question the census answers -- by pname where there is one.
+            if any(p.name == 'pname' and p.type_string() == 'GLenum'
+                   for p in func.parameters):
+                out('ctx->GLThread.sync_why = _mesa_glthread_remote_pname_name("{0}", pname);'.format(func.name))
+            else:
+                out('ctx->GLThread.sync_why = "{0}";'.format(func.name))
             if func.return_type != 'void':
                 out('return {0};'.format(call))
             else:

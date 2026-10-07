@@ -37,6 +37,9 @@
 #include "main/glthread.h"
 #include "main/glthread_marshal.h"
 #include "main/hash.h"
+#include "main/image.h"
+#include "main/glformats.h"
+#include "dispatch.h"
 #include "main/pixelstore.h"
 #include "util/u_atomic.h"
 #include "util/u_thread.h"
@@ -636,6 +639,117 @@ _mesa_glthread_remote_census(char *out, size_t len, uint64_t *waits,
    *waits = total;
    *copies = _mesa_glthread_remote_copies;
    _mesa_glthread_remote_copies = 0;
+}
+
+/* glTexImage2D / glTexSubImage2D from client memory, in a remote context:
+ * the driver thread reads the pixels, which the application may rewrite the
+ * moment the call returns, so the generated path waits. Minecraft uploads its
+ * animated sprites and its lightmap this way, ~10 a frame. The bytes the
+ * driver will read -- the span the unpack state addresses, which glthread
+ * tracks -- are copied up to 16 MiB, and the call runs on the driver thread
+ * with its pixel pointer moved into the copy by the same distance, under the
+ * same unpack state, since everything before it has run there. A NULL
+ * TexImage2D reads nothing and needs no copy. MESA_GLTHREAD_REMOTE_COPY=0
+ * waits, as for client arrays. */
+struct glthread_remote_image {
+   bool sub;
+   GLenum target, format, type;
+   GLint level, a, b, internalformat, border;
+   GLsizei width, height;
+   const GLvoid *pixels;
+   /* the copied span follows */
+};
+
+static void
+glthread_remote_image_run(struct gl_context *ctx, void *p)
+{
+   struct glthread_remote_image *im = p;
+   if (im->sub)
+      CALL_TexSubImage2D(ctx->Dispatch.Current,
+                         (im->target, im->level, im->a, im->b, im->width,
+                          im->height, im->format, im->type, im->pixels));
+   else
+      CALL_TexImage2D(ctx->Dispatch.Current,
+                      (im->target, im->level, im->internalformat, im->width,
+                       im->height, im->border, im->format, im->type,
+                       im->pixels));
+   free(im);
+}
+
+static bool
+glthread_remote_image(struct gl_context *ctx, struct glthread_remote_image *args)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("MESA_GLTHREAD_REMOTE_COPY");
+      on = !(v && *v == '0');
+   }
+   if (!on || args->width < 0 || args->height < 0)
+      return false;
+   const GLubyte *first = NULL;
+   size_t span = 0;
+   if (args->pixels && args->width && args->height) {
+      const struct gl_pixelstore_attrib *unpack = &ctx->GLThread.Unpack;
+      const GLint bpp = _mesa_bytes_per_pixel(args->format, args->type);
+      if (bpp <= 0)
+         return false;
+      first = _mesa_image_address2d(unpack, args->pixels, args->width,
+                                    args->height, args->format, args->type,
+                                    0, 0);
+      const GLubyte *last =
+         _mesa_image_address2d(unpack, args->pixels, args->width,
+                               args->height, args->format, args->type,
+                               args->height - 1, 0);
+      if (!first || !last || last < first)
+         return false;
+      span = (size_t)(last - first) + (size_t)args->width * (size_t)bpp;
+      if (span > (16u << 20))
+         return false;
+   }
+   struct glthread_remote_image *im = malloc(sizeof(*im) + span);
+   if (!im)
+      return false;
+   *im = *args;
+   if (span) {
+      uint8_t *copy = (uint8_t *)(im + 1);
+      memcpy(copy, first, span);
+      im->pixels = (const GLvoid *)((uintptr_t)args->pixels - (uintptr_t)first +
+                                    (uintptr_t)copy);
+      _mesa_glthread_remote_uploads++;
+      _mesa_glthread_remote_upload_bytes += span;
+   }
+   _mesa_glthread_call_async(ctx, glthread_remote_image_run, im, NULL);
+   return true;
+}
+
+bool
+_mesa_glthread_remote_TexImage2D(struct gl_context *ctx, GLenum target,
+                                 GLint level, GLint internalformat,
+                                 GLsizei width, GLsizei height, GLint border,
+                                 GLenum format, GLenum type,
+                                 const GLvoid *pixels)
+{
+   struct glthread_remote_image args = {
+      .sub = false, .target = target, .format = format, .type = type,
+      .level = level, .internalformat = internalformat, .border = border,
+      .width = width, .height = height, .pixels = pixels,
+   };
+   return glthread_remote_image(ctx, &args);
+}
+
+bool
+_mesa_glthread_remote_TexSubImage2D(struct gl_context *ctx, GLenum target,
+                                    GLint level, GLint xoffset, GLint yoffset,
+                                    GLsizei width, GLsizei height,
+                                    GLenum format, GLenum type,
+                                    const GLvoid *pixels)
+{
+   struct glthread_remote_image args = {
+      .sub = true, .target = target, .format = format, .type = type,
+      .level = level, .a = xoffset, .b = yoffset,
+      .width = width, .height = height, .pixels = pixels,
+   };
+   return glthread_remote_image(ctx, &args);
 }
 
 void

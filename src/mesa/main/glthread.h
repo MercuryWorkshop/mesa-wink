@@ -369,6 +369,18 @@ extern uint64_t _mesa_glthread_remote_uploads, _mesa_glthread_remote_upload_byte
 /* "GetIntegerv 0x8b8d": one stable string per (function, pname), for the
  * census's sync_why. */
 const char *_mesa_glthread_remote_pname_name(const char *func, unsigned pname);
+/* glTexImage2D / glTexSubImage2D from client memory in a remote context, sent
+ * along as a copy; false when the call has to wait instead. */
+bool _mesa_glthread_remote_TexImage2D(struct gl_context *ctx, GLenum target,
+                                      GLint level, GLint internalformat,
+                                      GLsizei width, GLsizei height,
+                                      GLint border, GLenum format, GLenum type,
+                                      const GLvoid *pixels);
+bool _mesa_glthread_remote_TexSubImage2D(struct gl_context *ctx, GLenum target,
+                                         GLint level, GLint xoffset,
+                                         GLint yoffset, GLsizei width,
+                                         GLsizei height, GLenum format,
+                                         GLenum type, const GLvoid *pixels);
 
 #define GLTHREAD_IS_REMOTE(ctx) unlikely((ctx)->GLThread.remote)
 /* Before a synchronous call glthread makes on the application thread: in a
