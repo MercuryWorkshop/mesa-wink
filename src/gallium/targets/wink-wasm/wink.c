@@ -1278,11 +1278,16 @@ wink_swap_buffers(wink_surface *s)
          char why[640];
          uint64_t waits, copies;
          _mesa_glthread_remote_census(why, sizeof(why), &waits, &copies);
+         const uint64_t uploads = _mesa_glthread_remote_uploads;
+         const uint64_t upload_kib = _mesa_glthread_remote_upload_bytes >> 10;
+         _mesa_glthread_remote_uploads = 0;
+         _mesa_glthread_remote_upload_bytes = 0;
          fprintf(stderr, "wink: the GL thread waited for the main thread %.1f "
                  "times a frame over 240 frames (%s); %.1f client-array draws "
-                 "a frame copied instead, %u read live\n", waits / 240.0,
-                 why[0] ? why : "none", copies / 240.0,
-                 _mesa_glthread_remote_unmatched);
+                 "and %.1f big buffer uploads (%" PRIu64 " KiB in all) a frame "
+                 "copied instead, %u read live\n", waits / 240.0,
+                 why[0] ? why : "none", copies / 240.0, uploads / 240.0,
+                 upload_kib, _mesa_glthread_remote_unmatched);
       }
       return WINK_OK;
    }

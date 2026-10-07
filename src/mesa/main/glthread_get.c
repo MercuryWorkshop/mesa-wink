@@ -131,7 +131,15 @@ _mesa_marshal_GetIntegerv(GLenum pname, GLint *p)
    }
 
 sync:
-   GLTHREAD_REMOTE_CALL(ctx, GetIntegerv, pname, p);
+#if MESA_GLTHREAD_REMOTE
+   /* The census names this wait by pname: which queries glthread cannot answer
+    * itself is the whole question about them. */
+   if (GLTHREAD_IS_REMOTE(ctx)) {
+      ctx->GLThread.sync_why = _mesa_glthread_remote_pname_name("GetIntegerv", pname);
+      _mesa_glthread_call_GetIntegerv(ctx, pname, p);
+      return;
+   }
+#endif
    _mesa_glthread_finish_before(ctx, "GetIntegerv");
    CALL_GetIntegerv(ctx->Dispatch.Current, (pname, p));
 }

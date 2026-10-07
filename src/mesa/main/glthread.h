@@ -357,6 +357,12 @@ void _mesa_glthread_remote_census(char *out, size_t len, uint64_t *waits,
  * draw found no copy for and read live (must stay 0). */
 extern uint64_t _mesa_glthread_remote_copies;
 extern uint32_t _mesa_glthread_remote_unmatched;
+/* Buffer uploads too big for one command, sent along as a copy instead of
+ * waited for, and their bytes (reset by the census). */
+extern uint64_t _mesa_glthread_remote_uploads, _mesa_glthread_remote_upload_bytes;
+/* "GetIntegerv 0x8b8d": one stable string per (function, pname), for the
+ * census's sync_why. */
+const char *_mesa_glthread_remote_pname_name(const char *func, unsigned pname);
 
 #define GLTHREAD_IS_REMOTE(ctx) unlikely((ctx)->GLThread.remote)
 /* Before a synchronous call glthread makes on the application thread: in a

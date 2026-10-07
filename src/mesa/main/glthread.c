@@ -563,6 +563,23 @@ static struct {
 } glthread_remote_reasons[GLTHREAD_REMOTE_REASONS];
 uint64_t _mesa_glthread_remote_copies;
 uint32_t _mesa_glthread_remote_unmatched;
+uint64_t _mesa_glthread_remote_uploads, _mesa_glthread_remote_upload_bytes;
+
+const char *
+_mesa_glthread_remote_pname_name(const char *func, unsigned pname)
+{
+   static struct { const char *func; unsigned pname; char name[40]; } names[32];
+   static unsigned used;
+   for (unsigned i = 0; i < used; ++i)
+      if (names[i].func == func && names[i].pname == pname)
+         return names[i].name;
+   if (used == ARRAY_SIZE(names))
+      return func;
+   names[used].func = func;
+   names[used].pname = pname;
+   snprintf(names[used].name, sizeof(names[used].name), "%s 0x%04x", func, pname);
+   return names[used++].name;
+}
 
 static void
 glthread_remote_note_wait(struct glthread_state *glthread)

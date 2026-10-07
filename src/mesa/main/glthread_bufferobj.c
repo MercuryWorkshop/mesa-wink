@@ -21,6 +21,7 @@
  * IN THE SOFTWARE.
  */
 
+#include <stdio.h>
 #include "main/glthread_marshal.h"
 #include "dispatch.h"
 #include "main/bufferobj.h"
@@ -383,6 +384,82 @@ _mesa_unmarshal_NamedBufferDataEXT(struct gl_context *ctx,
    return 0;
 }
 
+#if MESA_GLTHREAD_REMOTE
+/* glBufferData / glBufferSubData whose data is too big for one command, in a
+ * remote context. The driver thread reads the data, which the application may
+ * reuse the moment the call returns, so the plain path waits for the driver
+ * thread -- and Sodium uploads its meshes and per-frame buffers this way, ~43
+ * waits a frame (R477). Data up to 16 MiB is copied into one block that the
+ * driver thread uploads from, in order, and frees. A transient copy, not a
+ * shadow: it lives until the driver thread reaches it. */
+struct glthread_remote_upload {
+   GLuint target_or_name;
+   GLintptr offset;
+   GLsizeiptr size;
+   GLenum usage;
+   bool named, sub;
+   /* size bytes of data follow */
+};
+
+static void
+glthread_remote_upload_run(struct gl_context *ctx, void *p)
+{
+   struct glthread_remote_upload *u = p;
+   const void *data = u + 1;
+   if (u->sub) {
+      if (u->named)
+         CALL_NamedBufferSubData(ctx->Dispatch.Current,
+                                 (u->target_or_name, u->offset, u->size, data));
+      else
+         CALL_BufferSubData(ctx->Dispatch.Current,
+                            (u->target_or_name, u->offset, u->size, data));
+   } else {
+      if (u->named)
+         CALL_NamedBufferData(ctx->Dispatch.Current,
+                              (u->target_or_name, u->size, data, u->usage));
+      else
+         CALL_BufferData(ctx->Dispatch.Current,
+                         (u->target_or_name, u->size, data, u->usage));
+   }
+   free(u);
+}
+
+static bool
+glthread_remote_upload(struct gl_context *ctx, GLuint target_or_name,
+                       GLintptr offset, GLsizeiptr size, const void *data,
+                       GLenum usage, bool named, bool sub)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("MESA_GLTHREAD_REMOTE_COPY");
+      on = !(v && *v == '0');
+   }
+   if (!on || !data || size <= 0 || size > (16 << 20) ||
+       (named && target_or_name == 0))
+      return false;
+   struct glthread_remote_upload *u = malloc(sizeof(*u) + (size_t)size);
+   if (!u)
+      return false;
+   u->target_or_name = target_or_name;
+   u->offset = offset;
+   u->size = size;
+   u->usage = usage;
+   u->named = named;
+   u->sub = sub;
+   memcpy(u + 1, data, (size_t)size);
+   _mesa_glthread_call_async(ctx, glthread_remote_upload_run, u, NULL);
+   static bool said;
+   if (!said) {
+      said = true;
+      fprintf(stderr, "glthread: big buffer uploads copied rather than waited "
+                      "for (MESA_GLTHREAD_REMOTE_COPY)\n");
+   }
+   _mesa_glthread_remote_uploads++;
+   _mesa_glthread_remote_upload_bytes += (uint64_t)size;
+   return true;
+}
+#endif
+
 static void
 _mesa_marshal_BufferData_merged(GLuint target_or_name, GLsizeiptr size,
                                 const GLvoid *data, GLenum usage, bool named,
@@ -398,6 +475,11 @@ _mesa_marshal_BufferData_merged(GLuint target_or_name, GLsizeiptr size,
                 (named && target_or_name == 0))) {
 #if MESA_GLTHREAD_REMOTE
       if (GLTHREAD_IS_REMOTE(ctx)) {
+         if (size <= INT_MAX && !external_mem &&
+             glthread_remote_upload(ctx, target_or_name, 0, size, data, usage,
+                                    named, false))
+            return;
+         ctx->GLThread.sync_why = "BufferData: too big for a command";
          if (named)
             _mesa_glthread_call_NamedBufferData(ctx, target_or_name, size, data, usage);
          else
@@ -549,6 +631,11 @@ _mesa_marshal_BufferSubData_merged(GLuint target_or_name, GLintptr offset,
                 (named && target_or_name == 0))) {
 #if MESA_GLTHREAD_REMOTE
       if (GLTHREAD_IS_REMOTE(ctx)) {
+         if (size <= INT_MAX && offset >= 0 &&
+             glthread_remote_upload(ctx, target_or_name, offset, size, data, 0,
+                                    named, true))
+            return;
+         ctx->GLThread.sync_why = "BufferSubData: too big for a command";
          if (named)
             _mesa_glthread_call_NamedBufferSubData(ctx, target_or_name, offset, size, data);
          else
