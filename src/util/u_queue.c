@@ -610,10 +610,12 @@ util_queue_add_job_locked(struct util_queue *queue,
          queue->max_jobs = new_max_jobs;
       } else {
          /* Wait until there is a free slot. */
+         const int64_t wait_start = os_time_get_nano();
          while (queue->num_queued == queue->max_jobs) {
             util_perfetto_thread_flush();
             cnd_wait(&queue->has_space_cond, &queue->lock);
          }
+         queue->full_wait_ns += (uint64_t)(os_time_get_nano() - wait_start);
       }
    }
 
@@ -645,8 +647,16 @@ util_queue_add_job(struct util_queue *queue,
 {
    util_queue_add_job_locked(queue, job, fence, execute, cleanup, job_size,
                              false);
-   if (queue->flags & UTIL_QUEUE_INIT_EXTERNAL_EXECUTOR)
+   /* Only the first job since the executor last started a run wakes it: the
+    * run that wakeup starts drains everything queued before it. Both sides use
+    * a sequentially consistent exchange -- a plain or release store clearing
+    * the flag could become visible after the executor's empty read of the
+    * queue, and that wakeup would be lost. */
+   if ((queue->flags & UTIL_QUEUE_INIT_EXTERNAL_EXECUTOR) &&
+       !__atomic_exchange_n(&queue->kick_pending, 1, __ATOMIC_SEQ_CST)) {
+      queue->kicks++;
       queue->kick(queue);
+   }
 }
 
 bool
@@ -698,6 +708,8 @@ util_queue_run_external(struct util_queue *queue)
    unsigned ran = 0;
    assert(queue->flags & UTIL_QUEUE_INIT_EXTERNAL_EXECUTOR);
 
+   /* Before reading the queue: a job queued after this kicks again. */
+   __atomic_exchange_n(&queue->kick_pending, 0, __ATOMIC_SEQ_CST);
    mtx_lock(&queue->lock);
    const bool nested = queue->external_running;
    queue->external_running = true;

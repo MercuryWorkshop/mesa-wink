@@ -45,6 +45,7 @@
 #include "util/u_atomic.h"
 #include "util/u_inlines.h"
 #include "util/u_queue.h"
+#include "util/os_time.h"
 #include "gex_wgpu_public.h"
 
 #ifdef __EMSCRIPTEN__
@@ -1266,10 +1267,13 @@ wink_swap_buffers(wink_surface *s)
        * one before it has been presented. */
       const unsigned i = s->swap_index;
       s->swap_index ^= 1;
+      static uint64_t swap_wait_ns;
       util_queue_fence_wait(&s->swap_fence[i]);
       _mesa_glthread_call_async(tls_current->st->ctx, swap_glthread, s,
                                 &s->swap_fence[i]);
+      const int64_t t1 = os_time_get_nano();
       util_queue_fence_wait(&s->swap_fence[i ^ 1]);
+      swap_wait_ns += (uint64_t)(os_time_get_nano() - t1);
       /* Every 240 frames: how often this thread waited for the main thread
        * between swaps, and for which GL calls -- each wait is a round trip
        * through the main thread's event loop. */
@@ -1282,12 +1286,30 @@ wink_swap_buffers(wink_surface *s)
          const uint64_t upload_kib = _mesa_glthread_remote_upload_bytes >> 10;
          _mesa_glthread_remote_uploads = 0;
          _mesa_glthread_remote_upload_bytes = 0;
+         /* And how long it was held back without asking anything: by the
+          * swap, which waits for the frame before this one to be presented,
+          * and by glthread's queue, which holds a few batches at most. */
+         static uint64_t last_full_ns, last_readbacks, last_kicks;
+         extern uint64_t gex_wgpu_readbacks;
+         const uint64_t full_ns = tls_current->st->ctx->GLThread.queue.full_wait_ns;
+         const uint64_t readbacks = gex_wgpu_readbacks;
+         const uint64_t kicks = tls_current->st->ctx->GLThread.queue.kicks;
          fprintf(stderr, "wink: the GL thread waited for the main thread %.1f "
                  "times a frame over 240 frames (%s); %.1f client-array draws "
                  "and %.1f big buffer uploads (%" PRIu64 " KiB in all) a frame "
-                 "copied instead, %u read live\n", waits / 240.0,
+                 "copied instead, %u read live; blocked %.2f ms a frame on the "
+                 "swap, %.2f on a full queue of %d batches; %.2f GPU readbacks "
+                 "and %.1f wakeups a frame on main\n", waits / 240.0,
                  why[0] ? why : "none", copies / 240.0, uploads / 240.0,
-                 upload_kib, _mesa_glthread_remote_unmatched);
+                 upload_kib, _mesa_glthread_remote_unmatched,
+                 swap_wait_ns / 240.0 / 1e6, (full_ns - last_full_ns) / 240.0 / 1e6,
+                 (int)tls_current->st->ctx->GLThread.queue.max_jobs + 2,
+                 (readbacks - last_readbacks) / 240.0,
+                 (kicks - last_kicks) / 240.0);
+         swap_wait_ns = 0;
+         last_full_ns = full_ns;
+         last_readbacks = readbacks;
+         last_kicks = kicks;
       }
       return WINK_OK;
    }

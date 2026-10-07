@@ -44,6 +44,7 @@
 #include "util/u_atomic.h"
 #include "util/u_thread.h"
 #include "util/u_cpu_detect.h"
+#include "util/u_debug.h"
 #include "util/thread_sched.h"
 
 #include "state_tracker/st_context.h"
@@ -262,10 +263,17 @@ _mesa_glthread_init_remote(struct gl_context *ctx, util_queue_kick_func kick,
    struct glthread_state *glthread = &ctx->GLThread;
    assert(!glthread->enabled);
 
+   /* WINK_GLTHREAD_BATCHES: how many of the MARSHAL_MAX_BATCHES batches the
+    * application thread may have in flight, so the queue depth can be A/B'd
+    * within one binary (R479). Clamped to [4, MARSHAL_MAX_BATCHES]. */
+   const int64_t batches = CLAMP(debug_get_num_option("WINK_GLTHREAD_BATCHES",
+                                                      MARSHAL_MAX_BATCHES),
+                                 4, MARSHAL_MAX_BATCHES);
+
    /* No map_unsynchronized_thread_safe requirement: nothing is mapped on the
     * application thread, because a remote context never uploads. */
    if (!util_queue_init_external(&glthread->queue, "gl",
-                                 MARSHAL_MAX_BATCHES - 2, 0, NULL,
+                                 (unsigned)batches - 2, 0, NULL,
                                  kick, kick_data))
       return false;
 

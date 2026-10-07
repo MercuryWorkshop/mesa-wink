@@ -252,6 +252,15 @@ struct util_queue {
    util_queue_kick_func kick;
    void *kick_data;
    bool external_running;
+   /* Time adders spent waiting for a free slot, in ns: for an external queue,
+    * how long the application thread was held back by its executor. */
+   uint64_t full_wait_ns;
+   /* External executor: 1 while a kick is outstanding, so a burst of jobs costs
+    * the executor one wakeup, not one each (a proxied call and a postMessage on
+    * the web); the executor clears it before it reads the queue. kicks counts
+    * the wakeups actually sent. */
+   uint32_t kick_pending;
+   uint64_t kicks;
    thrd_t external_thread;
 
    /* for cleanup at exit(), protected by exit_mutex */

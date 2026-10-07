@@ -46,7 +46,16 @@
  * waiting batches. There must be at least 1 slot for a waiting batch,
  * so the minimum number of batches is 3.
  */
+#if MESA_GLTHREAD_REMOTE
+/* A remote context's executor is a browser's main thread, which runs batches
+ * only when its event loop gets to them, so it drains in bursts: with 8, a
+ * ~9 ms Minecraft frame still waited 0.35 ms a frame for queue space (and 4.4
+ * ms while a GPU readback stalled main once a frame, R479). 64 batches of 8 KiB
+ * is 512 KiB per context. */
+#define MARSHAL_MAX_BATCHES 64
+#else
 #define MARSHAL_MAX_BATCHES 8
+#endif
 
 /* Special value for glEnableClientState(GL_PRIMITIVE_RESTART_NV). */
 #define VERT_ATTRIB_PRIMITIVE_RESTART_NV -1
