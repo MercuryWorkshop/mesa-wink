@@ -114,12 +114,7 @@ note(const char *fmt, ...)
    X(void, BlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum)) \
    X(void, CompressedTexImage2D, (GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *)) \
    X(void, DeleteTextures, (GLsizei, const GLuint *))                             \
-   X(void, GenBuffers, (GLsizei, GLuint *))                                      \
-   X(void, BindBuffer, (GLenum, GLuint))                                         \
-   X(void, BufferData, (GLenum, GLsizeiptr, const void *, GLenum))               \
-   X(void, DeleteBuffers, (GLsizei, const GLuint *))                             \
-   X(void, VertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)) \
-   X(void, EnableVertexAttribArray, (GLuint))                                    \
+   X(void, BufferSubData, (GLenum, GLintptr, GLsizeiptr, const void *))          \
    X(void, VertexAttribDivisor, (GLuint, GLuint))                                \
    X(void, MultiDrawArrays, (GLenum, const GLint *, const GLsizei *, GLsizei))   \
    X(void, MultiDrawArraysIndirect, (GLenum, const void *, GLsizei, GLsizei))  \
@@ -938,6 +933,74 @@ framebuffer_fetch(void)
    CHECK(p_glGetError()==GL_NO_ERROR && !wink_device_lost(),"ordered fetch context failed");
 }
 
+/* Buffer uploads bigger than one glthread command (8 KiB): with GL on the main
+ * thread they are sent along as a copy, and the application rewrites its memory
+ * the moment each call returns, as here. A 64 KiB vertex buffer filled with
+ * glBufferData (left and right quads), drawn; then a 20 KiB glBufferSubData
+ * that also places a middle quad at vertex 1000, drawn again. */
+static void
+big_uploads(const char *label, wink_surface *surface)
+{
+   wink_context_attribs ca;
+   wink_context_attribs_default(&ca);
+   ca.api = WINK_API_OPENGL_COMPAT;
+   int status = 0;
+   wink_context *ctx = wink_context_create(&ca, &status);
+   CHECK(ctx, "%s: compat context: %s", label, wink_status_string(status));
+   if (!ctx)
+      return;
+   wink_make_current(ctx, surface, surface);
+   char name[96];
+   enum { N = 64 * 1024 / (5 * sizeof(float)) };
+   const size_t bytes = N * 5 * sizeof(float);
+   float *v = calloc(N * 5, sizeof(float));
+   GLuint buf = 0;
+   p_glUseProgram(0);
+   p_glBindVertexArray(0);
+   p_glGenBuffers(1, &buf);
+   p_glBindBuffer(GL_ARRAY_BUFFER, buf);
+   p_glViewport(0, 0, W, H);
+   p_glClearColor(0, 0, 0, 1);
+   p_glEnableClientState(GL_VERTEX_ARRAY);
+   p_glEnableClientState(GL_COLOR_ARRAY);
+   p_glVertexPointer(2, GL_FLOAT, 5 * sizeof(float), (const void *)0);
+   p_glColorPointer(3, GL_FLOAT, 5 * sizeof(float),
+                    (const void *)(2 * sizeof(float)));
+
+   client_quad(v, 0, 1, 0, 0);          /* vertices 0..3: left, red */
+   client_quad(v + 4 * 5, 2, 0, 1, 0);  /* 4..7: right, green */
+   p_glBufferData(GL_ARRAY_BUFFER, bytes, v, GL_STREAM_DRAW);
+   memset(v, 0xff, bytes);              /* rewritten after the call */
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glDrawArrays(GL_QUADS, 0, 8);
+   static const int want_data[3][3] = { {255, 0, 0}, {0, 0, 0}, {0, 255, 0} };
+   snprintf(name, sizeof(name), "%s big BufferData", label);
+   check_thirds(name, want_data);
+
+   memset(v, 0, bytes);
+   client_quad(v, 0, 1, 0, 0);
+   client_quad(v + 4 * 5, 2, 0, 1, 0);
+   client_quad(v + 1000 * 5, 1, 1, 1, 0);   /* 1000..1003: middle, yellow */
+   p_glBufferSubData(GL_ARRAY_BUFFER, 0, 1004 * 5 * sizeof(float), v);
+   memset(v, 0xff, bytes);                  /* rewritten after the call */
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glDrawArrays(GL_QUADS, 0, 8);
+   p_glDrawArrays(GL_QUADS, 1000, 4);
+   static const int want_sub[3][3] = { {255, 0, 0}, {255, 255, 0}, {0, 255, 0} };
+   snprintf(name, sizeof(name), "%s big BufferSubData", label);
+   check_thirds(name, want_sub);
+
+   GLenum err = p_glGetError();
+   CHECK(err == GL_NO_ERROR, "%s big uploads: GL error 0x%x", label, err);
+   p_glDisableClientState(GL_COLOR_ARRAY);
+   p_glDisableClientState(GL_VERTEX_ARRAY);
+   p_glBindBuffer(GL_ARRAY_BUFFER, 0);
+   p_glDeleteBuffers(1, &buf);
+   free(v);
+   wink_make_current(NULL, NULL, NULL);
+   wink_context_destroy(ctx);
+}
+
 static void
 exercise(const char *label, int api, wink_surface *surface)
 {
@@ -1119,6 +1182,7 @@ run_pass(const char *label)
    compressed(label, surface);
    multidraw_quads(label, surface);
    client_arrays(label, surface);
+   big_uploads(label, surface);
 
    /* A version that does not exist is refused, not quietly lowered. */
    wink_context_attribs ca;
