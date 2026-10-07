@@ -116,6 +116,8 @@ note(const char *fmt, ...)
    X(void, DeleteTextures, (GLsizei, const GLuint *))                             \
    X(void, BufferSubData, (GLenum, GLintptr, GLsizeiptr, const void *))          \
    X(void, Fogi, (GLenum, GLint))                                                \
+   X(void, PixelStorei, (GLenum, GLint))                                         \
+   X(void, TexSubImage2D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *)) \
    X(void, PushAttrib, (GLbitfield))                                             \
    X(void, PopAttrib, (void))                                                    \
    X(void, VertexAttribDivisor, (GLuint, GLuint))                                \
@@ -1046,6 +1048,85 @@ glthread_queries(const char *label, wink_surface *surface)
    wink_context_destroy(ctx);
 }
 
+/* Texture uploads from client memory, the way Minecraft uploads its animated
+ * sprites and lightmap: with GL on the main thread they are sent along as a
+ * copy, and the application rewrites its pixels the moment each call returns.
+ * A row length and skip make the copied span differ from the image. */
+static void
+client_textures(const char *label, wink_surface *surface)
+{
+   static const char *vs =
+      "#version 330 core\n"
+      "void main() {\n"
+      "  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+      "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+      "}\n";
+   static const char *fs =
+      "#version 330 core\n"
+      "uniform sampler2D tex;\n"
+      "out vec4 color;\n"
+      "void main() { color = texture(tex, vec2(0.5)); }\n";
+   wink_context_attribs ca;
+   wink_context_attribs_default(&ca);
+   ca.api = WINK_API_OPENGL_COMPAT;
+   int status = 0;
+   wink_context *ctx = wink_context_create(&ca, &status);
+   CHECK(ctx, "%s: compat context: %s", label, wink_status_string(status));
+   if (!ctx)
+      return;
+   wink_make_current(ctx, surface, surface);
+   char name[96];
+   GLuint prog = link_program(vs, fs, label);
+   GLuint vao = 0, tex = 0;
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glGenTextures(1, &tex);
+   p_glBindTexture(GL_TEXTURE_2D, tex);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+   p_glUseProgram(prog);
+   p_glViewport(0, 0, W, H);
+   /* 8x8 RGBA, every texel the same colour. */
+   static uint8_t px[16 * 16 * 4];
+   for (int i = 0; i < 8 * 8; ++i) {
+      px[i * 4 + 0] = 255; px[i * 4 + 1] = 0; px[i * 4 + 2] = 0; px[i * 4 + 3] = 255;
+   }
+   p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+   memset(px, 0x80, sizeof(px));             /* rewritten after the call */
+   p_glDrawArrays(GL_TRIANGLES, 0, 3);
+   uint8_t got[4];
+   read_center(got, W, H);
+   snprintf(name, sizeof(name), "%s client TexImage2D", label);
+   CHECK(near(got, 255, 0, 0), "%s read %u,%u,%u, want 255,0,0", name, got[0], got[1], got[2]);
+
+   /* A 16-wide source, skipping 4 rows and 2 texels, into the whole texture. */
+   for (int i = 0; i < 16 * 16; ++i) {
+      px[i * 4 + 0] = 0; px[i * 4 + 1] = 255; px[i * 4 + 2] = 0; px[i * 4 + 3] = 255;
+   }
+   p_glPixelStorei(GL_UNPACK_ROW_LENGTH, 16);
+   p_glPixelStorei(GL_UNPACK_SKIP_ROWS, 4);
+   p_glPixelStorei(GL_UNPACK_SKIP_PIXELS, 2);
+   p_glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 8, 8, GL_RGBA, GL_UNSIGNED_BYTE, px);
+   memset(px, 0x80, sizeof(px));             /* rewritten after the call */
+   p_glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+   p_glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+   p_glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+   p_glDrawArrays(GL_TRIANGLES, 0, 3);
+   read_center(got, W, H);
+   snprintf(name, sizeof(name), "%s client TexSubImage2D", label);
+   CHECK(near(got, 0, 255, 0), "%s read %u,%u,%u, want 0,255,0", name, got[0], got[1], got[2]);
+
+   GLenum err = p_glGetError();
+   CHECK(err == GL_NO_ERROR, "%s client textures: GL error 0x%x", label, err);
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glDeleteTextures(1, &tex);
+   wink_make_current(NULL, NULL, NULL);
+   wink_context_destroy(ctx);
+}
+
 static void
 exercise(const char *label, int api, wink_surface *surface)
 {
@@ -1229,6 +1310,7 @@ run_pass(const char *label)
    client_arrays(label, surface);
    big_uploads(label, surface);
    glthread_queries(label, surface);
+   client_textures(label, surface);
 
    /* A version that does not exist is refused, not quietly lowered. */
    wink_context_attribs ca;
