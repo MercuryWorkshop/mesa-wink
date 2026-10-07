@@ -116,6 +116,11 @@ note(const char *fmt, ...)
    X(void, DeleteTextures, (GLsizei, const GLuint *))                             \
    X(void, BufferSubData, (GLenum, GLintptr, GLsizeiptr, const void *))          \
    X(void, Fogi, (GLenum, GLint))                                                \
+   X(void, Fogf, (GLenum, GLfloat))                                              \
+   X(void, Fogfv, (GLenum, const GLfloat *))                                     \
+   X(void, GetFloatv, (GLenum, GLfloat *))                                       \
+   X(void, GetBooleanv, (GLenum, GLboolean *))                                   \
+   X(GLboolean, IsEnabled, (GLenum))                                             \
    X(void, PixelStorei, (GLenum, GLint))                                         \
    X(void, TexSubImage2D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *)) \
    X(void, PushAttrib, (GLbitfield))                                             \
@@ -1033,6 +1038,33 @@ glthread_queries(const char *label, wink_surface *surface)
    p_glPopAttrib();
    p_glGetIntegerv(GL_FOG_MODE, &v);
    CHECK(v == GL_LINEAR, "%s: fog mode 0x%x after pop", label, v);
+
+   /* The parameters and the enable Sodium reads every pass. */
+   GLfloat f[4] = {0};
+   GLboolean b = GL_TRUE;
+   p_glGetBooleanv(GL_FOG, &b);
+   CHECK(b == GL_FALSE && !p_glIsEnabled(GL_FOG), "%s: fog enabled at start", label);
+   static const GLfloat color[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+   p_glEnable(GL_FOG);
+   p_glFogf(GL_FOG_START, 16.0f);
+   p_glFogf(GL_FOG_END, 192.0f);
+   p_glFogfv(GL_FOG_COLOR, color);
+   p_glGetBooleanv(GL_FOG, &b);
+   CHECK(b == GL_TRUE && p_glIsEnabled(GL_FOG), "%s: fog not enabled after glEnable", label);
+   p_glGetFloatv(GL_FOG_START, f);
+   CHECK(f[0] == 16.0f, "%s: fog start %f", label, f[0]);
+   p_glGetFloatv(GL_FOG_END, f);
+   CHECK(f[0] == 192.0f, "%s: fog end %f", label, f[0]);
+   p_glGetFloatv(GL_FOG_COLOR, f);
+   CHECK(f[0] == 0.25f && f[1] == 0.5f && f[2] == 0.75f && f[3] == 1.0f,
+         "%s: fog color %f,%f,%f,%f", label, f[0], f[1], f[2], f[3]);
+   p_glPushAttrib(GL_FOG_BIT);
+   p_glDisable(GL_FOG);
+   p_glFogf(GL_FOG_END, 8.0f);
+   p_glPopAttrib();
+   p_glGetFloatv(GL_FOG_END, f);
+   CHECK(f[0] == 192.0f && p_glIsEnabled(GL_FOG), "%s: fog end %f / enable after pop", label, f[0]);
+   p_glDisable(GL_FOG);
    GLuint vao = 0;
    p_glGenVertexArrays(1, &vao);
    p_glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &v);
