@@ -2589,14 +2589,16 @@ emit_load_const(struct ntv_context *ctx, nir_load_const_instr *load_const)
              * constant and an implicit bitcast, so ntv emitted
              * `OpBitcast %float %const` at the use site and Tint folded that
              * straight back into the constant it rejects. */
-            if (bit_size == 32 && !gex_bits_are_finite_float((uint32_t)tmp))
+            if (bit_size == 32 && (!gex_bits_are_finite_float((uint32_t)tmp) ||
+                                   (uint32_t)tmp == 0x80000000u))
                nonfinite = true;
             components[i] = emit_uint_const(ctx, bit_size, tmp);
             break;
          }
          case nir_type_int: {
             int64_t tmp = nir_const_value_as_int(load_const->value[i], bit_size);
-            if (bit_size == 32 && !gex_bits_are_finite_float((uint32_t)tmp))
+            if (bit_size == 32 && (!gex_bits_are_finite_float((uint32_t)tmp) ||
+                                   (uint32_t)tmp == 0x80000000u))
                nonfinite = true;
             components[i] = emit_int_const(ctx, bit_size, tmp);
             break;
@@ -2621,7 +2623,17 @@ emit_load_const(struct ntv_context *ctx, nir_load_const_instr *load_const)
              * work: spirv_builder_const_composite takes constant ids and an
              * OpBitcast is an instruction, so the cast has to be applied once
              * to the assembled composite. */
-            if (!isfinite(tmp)) {
+            /* Negative zero takes the same road. Tint's constant manager
+             * dedups scalars by value, and -0.0 == 0.0, so a module with both
+             * gets one of them for the other: Unity's fragment shaders carry
+             * a vec2(-0.01, -0.0) and later index a uniform array with
+             * floatBitsToUint(0.0), which Tint folded as the bits of -0.0 and
+             * rejected -- "index 2147483648 out of bounds [0..33]" (Muck's
+             * menu in the page). An integer OR-ed with an unfoldable zero
+             * never becomes a float constant, so the two stay apart. The
+             * integer cases above treat the bit pattern 0x80000000 the same,
+             * since a bitcast of it would fold into the same -0.0. */
+            if (!isfinite(tmp) || (tmp == 0.0 && signbit(tmp))) {
                /* Left for the second pass below, which needs every component
                 * of the vector to be an integer at once. Emitting the float
                 * constant here would put a non-finite OpConstant in the
