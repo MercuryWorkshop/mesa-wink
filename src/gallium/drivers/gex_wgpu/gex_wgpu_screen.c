@@ -1704,6 +1704,12 @@ struct gex_wgpu_screen {
    /* Reset emitted state on recycled handles without invalidating live cache
     * entries. Resource destruction still uses cache_epoch above. */
    uint64_t handle_epoch;
+   /* The pipeline cache's own epoch: what can reuse an address its keys name
+    * (a shader module). cache_epoch also moves for every sampler view and
+    * sampler state deleted and every buffer that grows, which matters to
+    * bind groups but not to pipelines, and Unity deletes some every frame:
+    * with the one epoch its menu rebuilt a dozen render pipelines a frame. */
+   uint64_t pipeline_epoch;
    uint64_t pass_serial;
    /* Everything above this line that a context may write.
     *
@@ -14556,7 +14562,8 @@ gex_wgpu_delete_shader_state(struct pipe_context *pipe, void *state)
     * are compiled at load -- so the cost is a cold cache at exactly the
     * moment the old entries were about to become wrong. */
    if (pipe && pipe->screen)
-      ++gex_screen(pipe->screen)->cache_epoch;
+      ++gex_screen(pipe->screen)->cache_epoch,
+      ++gex_screen(pipe->screen)->pipeline_epoch;
    if (shader->module)
       wgpuShaderModuleRelease(shader->module);
    if (shader->module_y_flipped)
@@ -40658,7 +40665,7 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
     * address and an address is reused once the module behind it is released.
     * Without this the cache returned a pipeline built from a deleted
     * shader. */
-   if (slot->used && slot->epoch == screen->cache_epoch &&
+   if (slot->used && slot->epoch == screen->pipeline_epoch &&
        slot->hash == hash && slot->key_length == length &&
        memcmp(slot->key, key, length) == 0) {
       ++screen->pipeline_cache_hits;
@@ -40700,7 +40707,7 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
       slot->key_capacity = length;
    }
    slot->used = true;
-   slot->epoch = screen->cache_epoch;
+   slot->epoch = screen->pipeline_epoch;
    slot->hash = hash;
    slot->key_length = length;
    memcpy(slot->key, key, length);
