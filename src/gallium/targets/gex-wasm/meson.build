@@ -187,6 +187,8 @@ if gex_emdawn_dir != ''
         '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_setenv,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_gex_wgsl_cache_load,_gex_wgsl_cache_dump,_gex_wgsl_cache_stats,_gex_wgsl_cache_stats2,_gex_wgsl_cache_budget,_malloc,_free',
         '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
       ],
+      # std::span, which emdawnwebgpu's webgpu.cpp uses since v20250822.
+      override_options : ['cpp_std=c++20'],
       install : false,
     )
   endif
@@ -220,6 +222,8 @@ if gex_emdawn_dir != ''
         '-sENVIRONMENT=web,worker',
         '-sEXPORTED_FUNCTIONS=_gex_wgpu_smoke',
       ],
+      # std::span, which emdawnwebgpu's webgpu.cpp uses since v20250822.
+      override_options : ['cpp_std=c++20'],
       install : false,
     )
   endif
