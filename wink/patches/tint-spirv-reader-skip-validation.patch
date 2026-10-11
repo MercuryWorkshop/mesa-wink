@@ -26,3 +26,16 @@
          success_ = false;
          return false;
      }
+@@ -348,7 +358,11 @@
+         optimizer.RegisterPass(spvtools::CreateSplitCombinedImageSamplerPass());
+         optimizer.RegisterPass(spvtools::CreateResolveBindingConflictsPass());
+         std::vector<uint32_t> new_binary;
+-        if (!optimizer.Run(spv_binary_.data(), spv_binary_.size(), &new_binary)) {
++        // wink: Optimizer::Run validates its input first, the same check
++        // again; it follows TINT_SPIRV_VALIDATE too.
++        spvtools::OptimizerOptions opt_options;
++        opt_options.set_run_validator(validate);
++        if (!optimizer.Run(spv_binary_.data(), spv_binary_.size(), &new_binary, opt_options)) {
+             return false;
+         }
+         spv_binary_ = std::move(new_binary);
