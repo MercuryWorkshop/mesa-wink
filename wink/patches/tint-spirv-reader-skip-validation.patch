@@ -1,0 +1,28 @@
+--- a/src/tint/lang/spirv/reader/ast_parser/ast_parser.cc
++++ b/src/tint/lang/spirv/reader/ast_parser/ast_parser.cc
+@@ -28,6 +28,7 @@
+ #include "src/tint/lang/spirv/reader/ast_parser/ast_parser.h"
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <limits>
+ #include <string_view>
+ #include <utility>
+@@ -334,7 +335,16 @@
+ 
+     // Only consider modules valid for Vulkan 1.0.  On failure, the message
+     // consumer will set the error status.
+-    if (!spv_tools.Validate(spv_binary_)) {
++    //
++    // wink: the SPIR-V here is the driver's own (zink's emitter), and checking
++    // it took a third of a megabyte of SPIRV-Tools and time on every shader
++    // compile. TINT_SPIRV_VALIDATE=1 in the environment turns the check back
++    // on, for debugging the emitter.
++    static const bool validate = [] {
++        const char* v = getenv("TINT_SPIRV_VALIDATE");
++        return v && *v && *v != '0';
++    }();
++    if (validate && !spv_tools.Validate(spv_binary_)) {
+         success_ = false;
+         return false;
+     }

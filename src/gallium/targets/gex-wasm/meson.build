@@ -35,6 +35,9 @@ gex_mesa_smoke = executable(
 gex_root = join_paths(meson.project_source_root(), '..', '..')
 gex_decoder = join_paths(gex_root, 'web', 'mobilegl', 'gexgl-mobilegl.cpp')
 gex_jspi_js = join_paths(gex_root, 'web', 'gex-wgpu-jspi.js')
+# The loader for the replay's cold part (gex: docs/mesa-wasm-size.md), which
+# the build splits off with wasm-split after the link (SPLIT_MODULE below).
+gex_split_js = join_paths(gex_root, 'web', 'gex-wgpu-split.js')
 # Both live in gex, which holds this tree at third_party/mesa. Anywhere else
 # the targets built from them are skipped rather than failing configuration.
 have_gex_decoder = fs.exists(gex_decoder)
@@ -169,21 +172,38 @@ if gex_emdawn_dir != ''
         dep_thread,
         dep_clock,
       ],
-      link_depends : gex_emdawn_js + [gex_jspi_js],
+      link_depends : gex_emdawn_js + [gex_jspi_js, gex_split_js],
       link_args : gex_emdawn_link_args + [
         '--no-entry',
         '-sWASM_BIGINT=1',
         '-sSTACK_SIZE=16MB',
         gex_wgpu_initial_memory,
         '-sALLOW_MEMORY_GROWTH=1',
-        '-sASSERTIONS=2',
+        # No ASSERTIONS: at 2 they put a stack-limit check on each of the
+        # 15,695 stack-pointer updates (gex: docs/mesa-wasm-size.md). The
+        # main stack goes first instead, so overflowing it wraps below
+        # address 0 and traps; a pthread's 16 MB stack has no such guard.
+        '-sASSERTIONS=0',
+        '-Wl,--stack-first',
         '-sMODULARIZE=1',
         '-sEXPORT_ES6=1',
         '-sEXPORT_NAME=createGexWgpuReplay',
         '-sENVIRONMENT=web,worker',
         # Keep the name section: st/mesa calling a hook this driver leaves NULL
-        # is the expected failure here, and an index is not a diagnosis.
+        # is the expected failure here, and an index is not a diagnosis. gex's
+        # split step needs the names too; its dists strip them.
         '--profiling-funcs',
+        # Emscripten's glue for a module split in two: the link also writes an
+        # instrumented .wasm and the plain one as .wasm.orig, which gex's build
+        # (web/mesa-split.py) splits into the module the page loads and the
+        # cold part it loads only when a function there first runs.
+        '-sSPLIT_MODULE=1',
+        '--pre-js=' + gex_split_js,
+        # Binaryen inlines a function with one caller whatever its size, which
+        # folded gex's 2,520 generated per-command decoders (noinline in C++)
+        # back into one 1.2 MB `one()`. Kept apart, each is its own function
+        # the split can place, and the module compresses better.
+        '-sBINARYEN_EXTRA_PASSES=--one-caller-inline-max-function-size=0',
         '-sEXPORTED_FUNCTIONS=_gex_gl_init,_gex_gl_set_api,_gex_gl_setenv,_gex_gl_submit,_gex_gl_reply_len,_gex_gl_reply_data,_gex_gl_display,_gex_gl_presented,_gex_gl_produced,_gex_wgsl_cache_load,_gex_wgsl_cache_dump,_gex_wgsl_cache_stats,_gex_wgsl_cache_stats2,_gex_wgsl_cache_budget,_malloc,_free',
         '-sEXPORTED_RUNTIME_METHODS=HEAPU8',
       ],

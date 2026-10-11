@@ -5,7 +5,9 @@
 # been linking into .NET 10 on 3.1.56 in both thread variants: Dawn (now
 # cdda346, the last revision with the AST SPIR-V reader wink uses) with every
 # backend off, patches/dawn-tint-emscripten.patch,
-# patches/tint-spirv-reader-texel-formats.patch, and SPIRV-Tools
+# patches/tint-spirv-reader-texel-formats.patch,
+# patches/tint-spirv-reader-skip-validation.patch (the AST reader's SPIR-V
+# validation only with TINT_SPIRV_VALIDATE=1), and SPIRV-Tools
 # and SPIRV-Headers re-pinned to the revisions glslang's known_good names. The
 # re-pin is what lets a single link carry Tint and glslang/shaderc with one
 # copy of SPIRV-Tools; WINK_SPIRV_TOOLS_REV= (empty) keeps Dawn's own.
@@ -28,7 +30,8 @@ tint_fetch_at() {  # <dir> <url> <rev>
 tint_source() {
   local patch="$WINK_DIR/patches/dawn-tint-emscripten.patch"
   local formats="$WINK_DIR/patches/tint-spirv-reader-texel-formats.patch"
-  local key="dawn=$WINK_DAWN_REF patch=$(hash_file "$patch") formats=$(hash_file "$formats") spvtools=$WINK_SPIRV_TOOLS_REV spvheaders=$WINK_SPIRV_HEADERS_REV"
+  local novalidate="$WINK_DIR/patches/tint-spirv-reader-skip-validation.patch"
+  local key="dawn=$WINK_DAWN_REF patch=$(hash_file "$patch") formats=$(hash_file "$formats") novalidate=$(hash_file "$novalidate") spvtools=$WINK_SPIRV_TOOLS_REV spvheaders=$WINK_SPIRV_HEADERS_REV"
   WINK_DAWN_SRC="$WINK_CACHE/dawn/src-$(hash_str "$key")"
   stamp_ok "$WINK_DAWN_SRC" "$key" && return 0
 
@@ -36,6 +39,7 @@ tint_source() {
   tint_fetch_at "$WINK_DAWN_SRC" "$WINK_DAWN_REPO" "$WINK_DAWN_REF"
   apply_patch_once "$WINK_DAWN_SRC" "$patch"
   apply_patch_once "$WINK_DAWN_SRC" "$formats"
+  apply_patch_once "$WINK_DAWN_SRC" "$novalidate"
   log "fetching Dawn's dependencies"
   run "$WINK_PY" "$WINK_DAWN_SRC/tools/fetch_dawn_dependencies.py" -d "$WINK_DAWN_SRC" -s >/dev/null
   if [ -n "$WINK_SPIRV_TOOLS_REV" ]; then
@@ -62,7 +66,7 @@ tint_setup() {  # <variant>
 
   local flags=""
   [ "$variant" = mt ] && flags="-pthread"
-  local key="variant=$variant emcc=$WINK_EMCC_VERSION_LINE dawn=$WINK_DAWN_REF patch=$(hash_file "$WINK_DIR/patches/dawn-tint-emscripten.patch") formats=$(hash_file "$WINK_DIR/patches/tint-spirv-reader-texel-formats.patch") spvtools=$WINK_SPIRV_TOOLS_REV flags=$flags"
+  local key="variant=$variant emcc=$WINK_EMCC_VERSION_LINE dawn=$WINK_DAWN_REF patch=$(hash_file "$WINK_DIR/patches/dawn-tint-emscripten.patch") formats=$(hash_file "$WINK_DIR/patches/tint-spirv-reader-texel-formats.patch") novalidate=$(hash_file "$WINK_DIR/patches/tint-spirv-reader-skip-validation.patch") spvtools=$WINK_SPIRV_TOOLS_REV flags=$flags"
   WINK_TINT="$WINK_CACHE/tint/$variant-em$WINK_EMSDK_VERSION-$(hash_str "$key")"
   stamp_ok "$WINK_TINT" "$key" && { log "cached at $WINK_TINT"; return 0; }
 
