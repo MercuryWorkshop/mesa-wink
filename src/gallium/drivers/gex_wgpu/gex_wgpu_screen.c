@@ -45298,6 +45298,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
           !uploaded_index_resource && first_index == 0) {
          last_vertex = draws[0].count >= 6
             ? (uint64_t)(draws[0].count / 6) * 4 - 1 : 0;
+      } else if (index_resource && info->index_bounds_valid) {
+         last_vertex = (uint64_t)info->max_index;
+      } else if (index_resource && !GEX_GETENV_ONCE("GEX_WGPU_BOUNDS_CHECK")) {
+         /* The scan below reads every index of every draw on the CPU to feed
+          * a diagnostic; opt in to it. */
+         bounds_known = false;
+         goto bounds_done;
       } else if (index_resource) {
          last_vertex = 0;
          const uint8_t *shadow = gex_resource(index_resource)->shadow;
