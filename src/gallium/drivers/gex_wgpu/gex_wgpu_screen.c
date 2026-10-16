@@ -1923,6 +1923,10 @@ struct gex_wgpu_resource {
    WGPUBuffer rt_scratch_staging;
    enum pipe_format rt_scratch_format;
    unsigned rt_scratch_level;
+   /* A layer of the scratch for each layer (or 3D slice) of the level, so
+    * that two layers attached together -- Blender's G-buffer closures, two
+    * layers of one array -- are two attachments rather than one twice. */
+   uint32_t rt_scratch_layers;
    uint32_t rt_scratch_width, rt_scratch_height, rt_scratch_row_bytes;
    uint64_t rt_scratch_bytes;
    /* Where a packed shader image's texels land before they are copied into
@@ -23689,10 +23693,9 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
    if (clear_scratch) {
       clear_view.baseMipLevel = 0;
       clear_view.mipLevelCount = 1;
-      if (!clear_three_d) {
-         clear_view.baseArrayLayer = 0;
-         clear_view.arrayLayerCount = 1;
-      }
+      clear_view.dimension = WGPUTextureViewDimension_2D;
+      clear_view.baseArrayLayer = dst->first_layer;
+      clear_view.arrayLayerCount = 1;
    }
    WGPUTextureView view =
       wgpuTextureCreateView(clear_scratch ? gex_resource(resource)->rt_scratch
@@ -23714,7 +23717,7 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
    }
    WGPURenderPassColorAttachment attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
    attachment.view = view;
-   if (clear_three_d)
+   if (clear_three_d && !clear_scratch)
       attachment.depthSlice = dst->first_layer;
    attachment.loadOp = WGPULoadOp_Clear;
    attachment.storeOp = WGPUStoreOp_Store;
@@ -26709,8 +26712,11 @@ gex_wgpu_rt_scratch_ensure(struct gex_wgpu_context *ctx,
    struct gex_wgpu_resource *gex = gex_resource(resource);
    const uint32_t width = u_minify(resource->width0, level);
    const uint32_t height = u_minify(resource->height0, level);
+   const uint32_t layers = resource->target == PIPE_TEXTURE_3D
+      ? MAX2(u_minify(resource->depth0, level), 1u)
+      : MAX2(resource->array_size, 1u);
    if (gex->rt_scratch && gex->rt_scratch_format == format &&
-       gex->rt_scratch_level == level &&
+       gex->rt_scratch_level == level && gex->rt_scratch_layers == layers &&
        gex->rt_scratch_width == width && gex->rt_scratch_height == height)
       return gex->rt_scratch;
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
@@ -26720,7 +26726,7 @@ gex_wgpu_rt_scratch_ensure(struct gex_wgpu_context *ctx,
    gex->rt_scratch_staging = NULL;
    WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
    desc.dimension = WGPUTextureDimension_2D;
-   desc.size = (WGPUExtent3D){width, height, 1};
+   desc.size = (WGPUExtent3D){width, height, layers};
    desc.format = gex_wgpu_texture_format(format);
    desc.mipLevelCount = 1;
    desc.sampleCount = 1;
@@ -26758,6 +26764,7 @@ gex_wgpu_rt_scratch_ensure(struct gex_wgpu_context *ctx,
    }
    gex->rt_scratch_format = format;
    gex->rt_scratch_level = level;
+   gex->rt_scratch_layers = layers;
    gex->rt_scratch_width = width;
    gex->rt_scratch_height = height;
    return gex->rt_scratch;
@@ -26788,7 +26795,7 @@ gex_wgpu_rt_scratch_copy(struct gex_wgpu_context *ctx,
    WGPUTexelCopyTextureInfo scratch = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
    scratch.texture = gex->rt_scratch;
    scratch.mipLevel = 0;
-   scratch.origin = (WGPUOrigin3D){0, 0, 0};
+   scratch.origin = (WGPUOrigin3D){0, 0, MIN2(layer, gex->rt_scratch_layers - 1)};
    scratch.aspect = WGPUTextureAspect_All;
    WGPUTexelCopyBufferInfo staging = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
    staging.buffer = gex->rt_scratch_staging;
@@ -47288,7 +47295,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             color_view.dimension = WGPUTextureViewDimension_2D;
             color_view.baseMipLevel = 0;
             color_view.mipLevelCount = 1;
-            color_view.baseArrayLayer = 0;
+            color_view.baseArrayLayer = ctx->color_layers[i];
             color_view.arrayLayerCount = 1;
             scratch_attached[i] = true;
          } else {
