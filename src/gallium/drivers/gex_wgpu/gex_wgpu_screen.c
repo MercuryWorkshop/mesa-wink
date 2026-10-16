@@ -1498,6 +1498,11 @@ enum gex_wgpu_decode_format {
    GEX_WGPU_DECODE_R16F,
    GEX_WGPU_DECODE_RG16F,
    GEX_WGPU_DECODE_RGBA16F,
+   /* Not decompression: two 16-bit normalized channels unpacked from the
+    * four bytes of a 32-bit texture's texel into the float32 pair this
+    * driver stores the format as (gex_wgpu_norm16_wgsl's sampled half). */
+   GEX_WGPU_DECODE_RG16_UNORM_OF_32,
+   GEX_WGPU_DECODE_RG16_SNORM_OF_32,
    GEX_WGPU_DECODE_FORMATS,
 };
 
@@ -1573,6 +1578,9 @@ struct gex_wgpu_screen {
     * blend a float32 attachment, both of which are optional features. */
    bool float32_filterable;
    bool texture_formats_tier1;
+   /* gex_wgpu_norm16_convert's two pipelines and their layout, made once. */
+   WGPUBindGroupLayout norm16_layout;
+   WGPUComputePipeline norm16_pack, norm16_unpack;
    bool float32_blendable;
    /* WebGPU bounds the total bytes per sample across colour attachments.
     *
@@ -1953,6 +1961,13 @@ struct gex_wgpu_resource {
    uint32_t image_alias_width;
    uint32_t image_alias_height;
    uint32_t image_alias_layers;
+   /* An alias whose texels are not the texture's bytes (gex_wgpu_norm16_*):
+    * 1 for 2x16 unorm, 2 for 2x16 snorm, packed through image_alias_narrow
+    * (the texture's four bytes a texel) with image_alias_params' layout. */
+   uint8_t image_alias_convert;
+   WGPUBuffer image_alias_narrow;
+   WGPUBuffer image_alias_params;
+   uint32_t image_alias_narrow_row_bytes;
 };
 
 struct gex_wgpu_query;
@@ -19839,6 +19854,8 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
    gex_wgpu_doom_buffer(gscreen, gex->packed_image_header);
    gex_wgpu_doom_texture(gscreen, gex->image_alias);
    gex_wgpu_doom_buffer(gscreen, gex->image_alias_staging);
+   gex_wgpu_doom_buffer(gscreen, gex->image_alias_narrow);
+   gex_wgpu_doom_buffer(gscreen, gex->image_alias_params);
    if (gex->shadow) {
       gex_wgpu_shadow_live -= gex->allocation_size;
       --gex_wgpu_buffers_live;
@@ -20560,6 +20577,8 @@ static const WGPUTextureFormat gex_wgpu_decode_wgpu_format[GEX_WGPU_DECODE_FORMA
    [GEX_WGPU_DECODE_R16F] = WGPUTextureFormat_R16Float,
    [GEX_WGPU_DECODE_RG16F] = WGPUTextureFormat_RG16Float,
    [GEX_WGPU_DECODE_RGBA16F] = WGPUTextureFormat_RGBA16Float,
+   [GEX_WGPU_DECODE_RG16_UNORM_OF_32] = WGPUTextureFormat_RG32Float,
+   [GEX_WGPU_DECODE_RG16_SNORM_OF_32] = WGPUTextureFormat_RG32Float,
 };
 
 static struct pipe_sampler_view *
@@ -20781,7 +20800,21 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
     * nothing in the GL error path. Blender's EEVEE asks for this. Against the
     * *stored* format, because a promoted texture holds more bytes per texel
     * than its Gallium format says. */
-   if (templ->format != texture->format &&
+   /* Except a norm16 view over a 32-bit texel, which the decode pass below
+    * unpacks into a scratch of the view's stored format. */
+   const int norm16_decode =
+      templ->format != texture->format &&
+      util_format_get_blocksize(templ->format) == 4 &&
+      util_format_get_blocksize(texture->format) == 4 &&
+      util_format_get_blocksize(gex_wgpu_stored_format(templ->format)) == 8 &&
+      util_format_get_blocksize(gex_wgpu_stored_format(texture->format)) == 4 &&
+      texture->target != PIPE_TEXTURE_3D && templ->target != PIPE_TEXTURE_3D &&
+      !util_format_is_pure_integer(texture->format) &&
+      !util_format_is_depth_or_stencil(texture->format)
+         ? (templ->format == PIPE_FORMAT_R16G16_UNORM ? 1
+            : templ->format == PIPE_FORMAT_R16G16_SNORM ? 2 : 0)
+         : 0;
+   if (templ->format != texture->format && !norm16_decode &&
        util_format_get_blocksize(gex_wgpu_stored_format(templ->format)) !=
           util_format_get_blocksize(gex_wgpu_stored_format(texture->format))) {
       GEX_SAMPLER_VIEW_REFUSED("view format has a different stored texel size");
@@ -20876,7 +20909,7 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
       (gex_resource(texture)->texture_usage & WGPUTextureUsage_StorageBinding) &&
       gex_wgpu_storage_texture_format(templ->format) ==
          WGPUTextureFormat_Undefined;
-   const bool reinterpreting =
+   const bool reinterpreting = !norm16_decode &&
       (util_format_linear(templ->format) != util_format_linear(texture->format) ||
        storage_forbids_view) &&
       !gex_wgpu_is_stencil_only_format(templ->format) &&
@@ -20966,11 +20999,17 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
     * texture, as it was. */
    const uint32_t block_w = util_format_get_blockwidth(texture->format);
    const uint32_t block_h = util_format_get_blockheight(texture->format);
-   if (!reinterpreting && gex_wgpu_is_compressed_format(texture->format) &&
-       texture->target != PIPE_TEXTURE_3D && templ->target != PIPE_TEXTURE_3D &&
-       (texture->width0 % block_w || texture->height0 % block_h)) {
+   if (norm16_decode ||
+       (!reinterpreting && gex_wgpu_is_compressed_format(texture->format) &&
+        texture->target != PIPE_TEXTURE_3D && templ->target != PIPE_TEXTURE_3D &&
+        (texture->width0 % block_w || texture->height0 % block_h))) {
       const enum gex_wgpu_decode_format which =
-         gex_wgpu_decode_format_of(templ->format);
+         norm16_decode == 1 ? GEX_WGPU_DECODE_RG16_UNORM_OF_32
+         : norm16_decode == 2 ? GEX_WGPU_DECODE_RG16_SNORM_OF_32
+         : gex_wgpu_decode_format_of(templ->format);
+      /* The decode pass reads the texture as what it is. */
+      if (norm16_decode)
+         desc.format = gex_wgpu_texture_format(texture->format);
       WGPUTextureDescriptor scratch_desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
       scratch_desc.label = (WGPUStringView){"gex decoded", WGPU_STRLEN};
       scratch_desc.dimension = WGPUTextureDimension_2D;
@@ -26491,14 +26530,28 @@ gex_wgpu_decode_pipeline(struct gex_wgpu_screen *screen,
       "}\n"
       "@fragment fn fs(@builtin(position) pos: vec4<f32>)"
       " -> @location(0) vec4<f32> {\n"
-      "  return textureLoad(src, vec2<i32>(pos.xy), 0);\n"
+      "  return DECODE(textureLoad(src, vec2<i32>(pos.xy), 0));\n"
       "}\n";
+   const char *decode =
+      which == GEX_WGPU_DECODE_RG16_UNORM_OF_32
+         ? "fn DECODE(t: vec4<f32>) -> vec4<f32> {"
+           " return vec4<f32>(unpack2x16unorm(bitcast<u32>(t.x)), 0.0, 1.0); }\n"
+      : which == GEX_WGPU_DECODE_RG16_SNORM_OF_32
+         ? "fn DECODE(t: vec4<f32>) -> vec4<f32> {"
+           " return vec4<f32>(unpack2x16snorm(bitcast<u32>(t.x)), 0.0, 1.0); }\n"
+         : "fn DECODE(t: vec4<f32>) -> vec4<f32> { return t; }\n";
+   char *full = malloc(strlen(decode) + sizeof(wgsl));
+   if (!full)
+      return NULL;
+   strcpy(full, decode);
+   strcat(full, wgsl);
    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
-   source.code = (WGPUStringView){wgsl, WGPU_STRLEN};
+   source.code = (WGPUStringView){full, WGPU_STRLEN};
    WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
    module_desc.nextInChain = &source.chain;
    WGPUShaderModule module =
       wgpuDeviceCreateShaderModule(screen->device, &module_desc);
+   free(full);
    if (!module)
       return NULL;
    WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
@@ -39936,6 +39989,106 @@ gex_wgpu_image_also_sampled(const struct gex_wgpu_context *ctx,
    return false;
 }
 
+/* Two 16-bit normalized channels, between the four bytes GL keeps a texel
+ * in and the float32 pair this driver stores the format as in a browser
+ * (gex_wgpu_format_backing): an RG16 image view of an R32F texture -- one
+ * format class in GL, which Blender's EEVEE binds its G-buffer normals as --
+ * has no byte correspondence for gex_wgpu_image_alias to copy, so the copy
+ * through the staging buffer is converted on the way, by a compute pass
+ * between two buffers laid out as the texture copies lay them out. */
+static const char gex_wgpu_norm16_wgsl[] =
+   "struct P { width: u32, rows: u32, wide_row: u32, narrow_row: u32, mode: u32 };\n"
+   "@group(0) @binding(0) var<storage, read_write> wide: array<u32>;\n"
+   "@group(0) @binding(1) var<storage, read_write> narrow: array<u32>;\n"
+   "@group(0) @binding(2) var<uniform> p: P;\n"
+   "@compute @workgroup_size(64) fn pack(@builtin(global_invocation_id) g: vec3u) {\n"
+   "  if (g.x >= p.width || g.y >= p.rows) { return; }\n"
+   "  let w = g.y * p.wide_row + g.x * 2u;\n"
+   "  let v = vec2f(bitcast<f32>(wide[w]), bitcast<f32>(wide[w + 1u]));\n"
+   "  narrow[g.y * p.narrow_row + g.x] = select(pack2x16unorm(v), pack2x16snorm(v), p.mode == 2u);\n"
+   "}\n"
+   "@compute @workgroup_size(64) fn unpack(@builtin(global_invocation_id) g: vec3u) {\n"
+   "  if (g.x >= p.width || g.y >= p.rows) { return; }\n"
+   "  let b = narrow[g.y * p.narrow_row + g.x];\n"
+   "  let v = select(unpack2x16unorm(b), unpack2x16snorm(b), p.mode == 2u);\n"
+   "  let w = g.y * p.wide_row + g.x * 2u;\n"
+   "  wide[w] = bitcast<u32>(v.x);\n"
+   "  wide[w + 1u] = bitcast<u32>(v.y);\n"
+   "}\n";
+
+static bool
+gex_wgpu_norm16_pipelines(struct gex_wgpu_screen *screen)
+{
+   if (screen->norm16_pack)
+      return true;
+   WGPUBindGroupLayoutEntry entries[3];
+   for (unsigned i = 0; i < 3; ++i) {
+      entries[i] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entries[i].binding = i;
+      entries[i].visibility = WGPUShaderStage_Compute;
+      entries[i].buffer.type = i < 2 ? WGPUBufferBindingType_Storage
+                                     : WGPUBufferBindingType_Uniform;
+   }
+   WGPUBindGroupLayoutDescriptor layout_desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+   layout_desc.entryCount = 3;
+   layout_desc.entries = entries;
+   screen->norm16_layout = wgpuDeviceCreateBindGroupLayout(screen->device, &layout_desc);
+   WGPUPipelineLayoutDescriptor pl_desc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+   pl_desc.bindGroupLayoutCount = 1;
+   pl_desc.bindGroupLayouts = &screen->norm16_layout;
+   WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(screen->device, &pl_desc);
+   WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
+   wgsl.code = (WGPUStringView){gex_wgpu_norm16_wgsl, WGPU_STRLEN};
+   WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+   module_desc.nextInChain = &wgsl.chain;
+   WGPUShaderModule module = wgpuDeviceCreateShaderModule(screen->device, &module_desc);
+   WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+   desc.layout = pl;
+   desc.compute.module = module;
+   desc.compute.entryPoint = (WGPUStringView){"pack", WGPU_STRLEN};
+   screen->norm16_pack = wgpuDeviceCreateComputePipeline(screen->device, &desc);
+   desc.compute.entryPoint = (WGPUStringView){"unpack", WGPU_STRLEN};
+   screen->norm16_unpack = wgpuDeviceCreateComputePipeline(screen->device, &desc);
+   wgpuShaderModuleRelease(module);
+   wgpuPipelineLayoutRelease(pl);
+   return screen->norm16_pack && screen->norm16_unpack;
+}
+
+/* Record the conversion of an alias's staged texels onto `encoder`, outside
+ * any pass: pack (alias -> texture) or unpack (texture -> alias). */
+static void
+gex_wgpu_norm16_convert(struct gex_wgpu_screen *screen,
+                        struct gex_wgpu_resource *gex,
+                        WGPUCommandEncoder encoder, bool pack)
+{
+   if (!gex_wgpu_norm16_pipelines(screen))
+      return;
+   WGPUBindGroupEntry bindings[3];
+   const WGPUBuffer buffers[3] = {gex->image_alias_staging, gex->image_alias_narrow,
+                                  gex->image_alias_params};
+   for (unsigned i = 0; i < 3; ++i) {
+      bindings[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      bindings[i].binding = i;
+      bindings[i].buffer = buffers[i];
+      bindings[i].size = WGPU_WHOLE_SIZE;
+   }
+   WGPUBindGroupDescriptor group_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   group_desc.layout = screen->norm16_layout;
+   group_desc.entryCount = 3;
+   group_desc.entries = bindings;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(screen->device, &group_desc);
+   WGPUComputePassDescriptor pass_desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder, &pass_desc);
+   wgpuComputePassEncoderSetPipeline(pass, pack ? screen->norm16_pack : screen->norm16_unpack);
+   wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuComputePassEncoderDispatchWorkgroups(
+      pass, DIV_ROUND_UP(gex->image_alias_width, 64),
+      gex->image_alias_height * gex->image_alias_layers, 1);
+   wgpuComputePassEncoderEnd(pass);
+   wgpuComputePassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+}
+
 /* A texture of the *image's* format standing in for one bound at another
  * format in the same GL format class, or for one this draw also samples.
  *
@@ -39975,8 +40128,17 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
     * from a copy whose two ends disagreed. */
    const uint32_t bytes =
       util_format_get_blocksize(gex_wgpu_stored_format(iv->format));
-   if (bytes !=
-       util_format_get_blocksize(gex_wgpu_stored_format(resource->format))) {
+   const uint32_t texture_bytes =
+      util_format_get_blocksize(gex_wgpu_stored_format(resource->format));
+   /* Unless the difference is the norm16 widening over a four-byte texel,
+    * which gex_wgpu_norm16_convert undoes on the way through. */
+   const uint8_t convert =
+      bytes == 8 && texture_bytes == 4 &&
+      util_format_get_blocksize(iv->format) == 4
+         ? (iv->format == PIPE_FORMAT_R16G16_UNORM ? 1
+            : iv->format == PIPE_FORMAT_R16G16_SNORM ? 2 : 0)
+         : 0;
+   if (bytes != texture_bytes && !convert) {
       static bool said;
       if (!said) {
          said = true;
@@ -39997,6 +40159,7 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
    const uint32_t layers =
       MAX2(iv->u.tex.last_layer - iv->u.tex.first_layer + 1, 1);
    const uint32_t row_bytes = align(width * bytes, 256);
+   const uint32_t narrow_row_bytes = align(width * texture_bytes, 256);
 
    if (gex->image_alias &&
        (gex->image_alias_format != iv->format ||
@@ -40006,6 +40169,10 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
       gex->image_alias = NULL;
       gex_wgpu_doom_buffer(screen, gex->image_alias_staging);
       gex->image_alias_staging = NULL;
+      gex_wgpu_doom_buffer(screen, gex->image_alias_narrow);
+      gex->image_alias_narrow = NULL;
+      gex_wgpu_doom_buffer(screen, gex->image_alias_params);
+      gex->image_alias_params = NULL;
    }
    if (!gex->image_alias) {
       WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
@@ -40039,7 +40206,8 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
          return NULL;
       WGPUBufferDescriptor staging = WGPU_BUFFER_DESCRIPTOR_INIT;
       staging.size = (uint64_t)row_bytes * height * layers;
-      staging.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+      staging.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst |
+                      (convert ? WGPUBufferUsage_Storage : 0);
       gex->image_alias_staging =
          wgpuDeviceCreateBuffer(screen->device, &staging);
       if (!gex->image_alias_staging) {
@@ -40052,6 +40220,28 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
       gex->image_alias_width = width;
       gex->image_alias_height = height;
       gex->image_alias_layers = layers;
+      gex->image_alias_convert = convert;
+      if (convert) {
+         WGPUBufferDescriptor narrow = WGPU_BUFFER_DESCRIPTOR_INIT;
+         narrow.size = (uint64_t)narrow_row_bytes * height * layers;
+         narrow.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst |
+                        WGPUBufferUsage_Storage;
+         gex->image_alias_narrow = wgpuDeviceCreateBuffer(screen->device, &narrow);
+         const uint32_t params[8] = {width, height * layers, row_bytes / 4,
+                                     narrow_row_bytes / 4, convert, 0, 0, 0};
+         WGPUBufferDescriptor pd = WGPU_BUFFER_DESCRIPTOR_INIT;
+         pd.size = sizeof(params);
+         pd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+         gex->image_alias_params = wgpuDeviceCreateBuffer(screen->device, &pd);
+         if (!gex->image_alias_narrow || !gex->image_alias_params) {
+            gex_wgpu_free_texture(gex->image_alias);
+            gex->image_alias = NULL;
+            return NULL;
+         }
+         wgpuQueueWriteBuffer(screen->queue, gex->image_alias_params, 0,
+                              params, sizeof(params));
+         gex->image_alias_narrow_row_bytes = narrow_row_bytes;
+      }
    }
 
    /* Seeded whatever the access says, and *not* only when the image is read.
@@ -40082,6 +40272,14 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
          through.layout.bytesPerRow = row_bytes;
          through.layout.rowsPerImage = height;
          const WGPUExtent3D extent = {width, height, layers};
+         if (gex->image_alias_convert) {
+            WGPUTexelCopyBufferInfo narrow = through;
+            narrow.buffer = gex->image_alias_narrow;
+            narrow.layout.bytesPerRow = gex->image_alias_narrow_row_bytes;
+            wgpuCommandEncoderCopyTextureToBuffer(encoder, &from, &narrow,
+                                                  &extent);
+            gex_wgpu_norm16_convert(screen, gex, encoder, false);
+         } else
          wgpuCommandEncoderCopyTextureToBuffer(encoder, &from, &through,
                                                &extent);
          WGPUTexelCopyTextureInfo into = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
@@ -40158,6 +40356,11 @@ gex_wgpu_flush_image_aliases(struct gex_wgpu_context *ctx,
       into.origin =
          (WGPUOrigin3D){0, 0, ctx->alias_copies[i].first_layer};
       into.aspect = WGPUTextureAspect_All;
+      if (gex->image_alias_convert) {
+         gex_wgpu_norm16_convert(gex_screen(ctx->base.screen), gex, encoder, true);
+         through.buffer = gex->image_alias_narrow;
+         through.layout.bytesPerRow = gex->image_alias_narrow_row_bytes;
+      }
       wgpuCommandEncoderCopyBufferToTexture(encoder, &through, &into, &extent);
       ++gex->write_serial;
    }
