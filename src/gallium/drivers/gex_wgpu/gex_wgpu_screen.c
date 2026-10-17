@@ -19170,13 +19170,21 @@ gex_wgpu_is_format_supported(struct pipe_screen *screen,
     * PIPE_TEXTURE_2D refused every layered framebuffer at the point st asked
     * whether the *texture* could exist, long before anything drew.
     *
-    * Not 3D: WebGPU has no 2D view of one slice of a volume, so a 3D texture
-    * still cannot be attached. That is a real gap and it declines by name in
-    * the view path rather than being claimed here. */
+    * 1D and 1D arrays as well: this driver creates them as 2D textures one
+    * row tall, so they render exactly as a 2D (array) target does. And 3D: a
+    * slice is attached with the colour attachment's depthSlice (the draw path
+    * sets it from color_layers). Framebuffer completeness never asked this
+    * per target -- st validates attachments as PIPE_TEXTURE_2D -- so a 1D or
+    * 3D attachment was already complete and drew; only the per-target query
+    * (glGetInternalformativ GL_FRAMEBUFFER_RENDERABLE, ARB_internalformat_
+    * query2) said no. wined3d trusts that query over attaching, so every
+    * format lost its render-target cap for D3D 1D and 3D textures and
+    * D3D11's CreateTexture1D of a render target failed (Hades). */
    const bool renderable_target =
+      target == PIPE_TEXTURE_1D || target == PIPE_TEXTURE_1D_ARRAY ||
       target == PIPE_TEXTURE_2D || target == PIPE_TEXTURE_RECT ||
-      target == PIPE_TEXTURE_2D_ARRAY || target == PIPE_TEXTURE_CUBE ||
-      target == PIPE_TEXTURE_CUBE_ARRAY;
+      target == PIPE_TEXTURE_2D_ARRAY || target == PIPE_TEXTURE_3D ||
+      target == PIPE_TEXTURE_CUBE || target == PIPE_TEXTURE_CUBE_ARRAY;
    /* PIPE_BIND_BLENDABLE, which this driver had never accounted for at all --
     * the constant appeared nowhere in it, so every query carrying the bit was
     * refused as "bad binds" however ordinary the format.
