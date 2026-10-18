@@ -1902,6 +1902,15 @@ struct gex_wgpu_resource {
     * and reads as all zeros is either an application uploading zeros or an
     * upload that never arrived, and only this tells the two apart. */
    uint64_t bytes_written;
+   /* The last buffer_subdata that went straight to the device (no shadow):
+    * its range, a hash of its bytes and bytes_written just after it. A later
+    * subdata of the same range with the same bytes, while bytes_written has
+    * not moved and nothing wrote the buffer on the GPU, is skipped
+    * (gex_wgpu_subdata_repeat). */
+   bool last_sub_valid;
+   uint32_t last_sub_offset, last_sub_size;
+   uint64_t last_sub_hash[2];
+   uint64_t last_sub_bytes_written;
    /* Whether anything ever read this buffer's CPU shadow -- a CPU map, the
     * index scan in the draw path, or an unaligned subdata needing the bytes
     * around its range. A shadow nothing reads is pure wasm heap. */
@@ -20008,6 +20017,98 @@ gex_wgpu_log_upload(const char *via, unsigned width0, uint32_t offset,
  *
  * Only for a 4-aligned range the staging buffer has room for; anything else
  * takes the submit as before. Returns whether it took the write. */
+/* A buffer_subdata that rewrites a range with the bytes it already holds.
+ *
+ * wined3d (D3D9 on GL) re-sends a dynamic vertex buffer's whole range before
+ * draws that did not change it: Katana ZERO's title uploads one 576 KiB range
+ * of a 64 MiB chunk ten times a frame, nine of them with the bytes the buffer
+ * already has -- 5.9 of the 8.3 MB written per frame, and the browser's GPU
+ * process, which copies every queue write, at 100% of a core (38 fps).
+ *
+ * Only the last direct upload of each buffer is remembered: its range, a
+ * 128-bit hash of its bytes and bytes_written just after it. Every CPU write
+ * moves bytes_written (subdata, a write map, a shadowed copy) and every GPU
+ * write sets gpu_written, so an equal range and hash with neither moved means
+ * the device already holds these bytes. Buffers with a shadow or a persistent
+ * mapping are left alone (their writes are tracked elsewhere), and so are
+ * small writes, which cost less than the hash. GEX_WGPU_NO_SUBDATA_DEDUP=1
+ * turns it off. */
+#define GEX_WGPU_SUBDATA_DEDUP_MIN 4096u
+
+static void
+gex_wgpu_subdata_hash(const void *data, unsigned size, uint64_t out[2])
+{
+   const uint8_t *p = data;
+   uint64_t a = 0x9e3779b97f4a7c15ull ^ size, b = 0xc2b2ae3d27d4eb4full + size;
+   unsigned i = 0;
+   for (; i + 16 <= size; i += 16) {
+      uint64_t x, y;
+      memcpy(&x, p + i, 8);
+      memcpy(&y, p + i + 8, 8);
+      a = (a ^ x) * 0xff51afd7ed558ccdull;
+      a ^= a >> 29;
+      b = (b ^ y) * 0xc4ceb9fe1a85ec53ull;
+      b ^= b >> 31;
+   }
+   for (; i < size; ++i) {
+      a = (a ^ p[i]) * 0x100000001b3ull;
+      b = (b + p[i]) * 0x9e3779b97f4a7c15ull;
+   }
+   a ^= b >> 17;
+   b ^= a >> 23;
+   out[0] = a * 0xff51afd7ed558ccdull;
+   out[1] = b * 0xc4ceb9fe1a85ec53ull;
+}
+
+static bool
+gex_wgpu_subdata_dedup_on(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("GEX_WGPU_NO_SUBDATA_DEDUP");
+      on = !(v && *v && *v != '0');
+   }
+   return on != 0;
+}
+
+/* Whether this write may be skipped; otherwise *hash is filled for
+ * gex_wgpu_subdata_note (when *hashed). */
+static bool
+gex_wgpu_subdata_repeat(struct gex_wgpu_resource *gex, unsigned usage,
+                        unsigned offset, unsigned size, const void *data,
+                        uint64_t hash[2], bool *hashed)
+{
+   *hashed = false;
+   if (size < GEX_WGPU_SUBDATA_DEDUP_MIN || !data || gex->shadow ||
+       gex->persistent_usage || gex->gpu_written ||
+       (usage & PIPE_MAP_READ) || gex->base.target != PIPE_BUFFER ||
+       !gex->buffer || !gex_wgpu_subdata_dedup_on())
+      return false;
+   gex_wgpu_subdata_hash(data, size, hash);
+   *hashed = true;
+   return gex->last_sub_valid && gex->last_sub_offset == offset &&
+          gex->last_sub_size == size &&
+          gex->last_sub_bytes_written == gex->bytes_written &&
+          gex->last_sub_hash[0] == hash[0] && gex->last_sub_hash[1] == hash[1];
+}
+
+/* After a direct write: remember it, or forget the last one. */
+static void
+gex_wgpu_subdata_note(struct gex_wgpu_resource *gex, unsigned offset,
+                      unsigned size, const uint64_t hash[2], bool hashed)
+{
+   gex->last_sub_valid = hashed && !gex->shadow && !gex->gpu_written;
+   if (!gex->last_sub_valid)
+      return;
+   gex->last_sub_offset = offset;
+   gex->last_sub_size = size;
+   gex->last_sub_hash[0] = hash[0];
+   gex->last_sub_hash[1] = hash[1];
+   gex->last_sub_bytes_written = gex->bytes_written;
+}
+
+static unsigned long gex_wgpu_subdata_skipped, gex_wgpu_subdata_skipped_bytes;
+
 static bool
 gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
                           struct pipe_resource *resource, unsigned usage,
@@ -20052,6 +20153,18 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   uint64_t sub_hash[2];
+   bool sub_hashed;
+   if (resource != ctx->constant_ring &&
+       gex_wgpu_subdata_repeat(gex_resource(resource), usage, offset, size,
+                               data, sub_hash, &sub_hashed)) {
+      if (!gex_wgpu_subdata_skipped++)
+         fprintf(stderr, "gex-wgpu: a buffer_subdata of the bytes a buffer "
+                         "already holds is skipped (GEX_WGPU_NO_SUBDATA_DEDUP=1 "
+                         "sends them)\n");
+      gex_wgpu_subdata_skipped_bytes += size;
+      return;
+   }
    /* A write reaches the queue where it is *called*, so anything already
     * recorded has to go first or it would read the new bytes. The constant
     * ring is the exception and the reason the ring exists: it hands out a
@@ -20060,8 +20173,11 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
     * batch for them would leave nothing batched at all. */
    if (resource != ctx->constant_ring &&
        gex_wgpu_batch_conflicts_usage(ctx, resource, usage)) {
-      if (gex_wgpu_subdata_in_batch(ctx, resource, usage, offset, size, data))
+      if (gex_wgpu_subdata_in_batch(ctx, resource, usage, offset, size, data)) {
+         gex_wgpu_subdata_note(gex_resource(resource), offset, size, sub_hash,
+                               sub_hashed);
          return;
+      }
       gex_wgpu_submit_pending(ctx);
    }
    struct gex_wgpu_resource *gex = gex_resource(resource);
@@ -20146,6 +20262,7 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
          wgpuQueueWriteBuffer(gex_screen(pipe->screen)->queue, gex->buffer,
                               offset + whole, tail, 4);
       }
+      gex_wgpu_subdata_note(gex, offset, size, sub_hash, sub_hashed);
       return;
    }
    /* Everything else keeps the shadow, and if the buffer already has contents
@@ -20175,6 +20292,7 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
       return;
    }
    gex->bytes_written += size;
+   gex->last_sub_valid = false;
    if (!size)
       return;
    memcpy(gex->shadow + offset, data, size);
