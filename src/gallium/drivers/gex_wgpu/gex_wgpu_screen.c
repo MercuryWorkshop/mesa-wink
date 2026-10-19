@@ -44,6 +44,8 @@
 
 #include "util/u_screen.h"
 #include "util/u_upload_mgr.h"
+#define XXH_INLINE_ALL
+#include "util/xxhash.h"
 
 #include <stdbool.h>
 #include <math.h>
@@ -38980,12 +38982,12 @@ gex_wgpu_timing_enabled(void)
 static uint32_t
 gex_wgpu_cache_hash(const void *data, size_t bytes)
 {
-   const uint8_t *p = data;
-   uint32_t h = 2166136261u;
-   for (size_t i = 0; i < bytes; ++i) {
-      h ^= p[i];
-      h *= 16777619u;
-   }
+   /* XXH3 rather than a byte-at-a-time FNV-1a. Every draw hashes its bind
+    * group layouts and its whole serialised pipeline descriptor -- kilobytes
+    * -- and with a dependent multiply per byte that was a third of the render
+    * thread for a shaderpack's few thousand draws a frame. */
+   const uint64_t h64 = XXH3_64bits(data, bytes);
+   const uint32_t h = (uint32_t)(h64 ^ (h64 >> 32));
    return h ? h : 1u;
 }
 
