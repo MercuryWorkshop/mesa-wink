@@ -423,6 +423,40 @@ create_device(void)
 #undef GEX_WANT_LOW
 #undef GEX_WANT_STAGE
 #undef GEX_WANT
+      /* GEX_WGPU_CAP_LIMITS="maxInterStageShaderVariables=16,..." lowers what
+       * is asked for, so a desktop run sees what a browser adapter grants:
+       * the GL caps, and so the extensions and the MC_GL_* paths a
+       * shaderpack takes, follow these. */
+      const char *cap = getenv("GEX_WGPU_CAP_LIMITS");
+      while (cap && *cap) {
+         char name[64];
+         unsigned value;
+         int used = 0;
+         if (sscanf(cap, "%63[^=]=%u%n", name, &value, &used) != 2)
+            break;
+#define GEX_CAP(field)                                                      \
+         if (!strcmp(name, #field)) limits.field = MIN2(limits.field, value);
+#define GEX_CAP_STAGE(field)                                                \
+         if (!strcmp(name, #field)) GEX_STAGE.field = MIN2(GEX_STAGE.field, value);
+         GEX_CAP(maxUniformBuffersPerShaderStage)
+         GEX_CAP(maxInterStageShaderVariables)
+         GEX_CAP(maxVertexAttributes)
+         GEX_CAP(maxStorageBuffersPerShaderStage)
+         GEX_CAP_STAGE(maxStorageBuffersInVertexStage)
+         GEX_CAP_STAGE(maxStorageBuffersInFragmentStage)
+         GEX_CAP(maxStorageTexturesPerShaderStage)
+         GEX_CAP_STAGE(maxStorageTexturesInVertexStage)
+         GEX_CAP_STAGE(maxStorageTexturesInFragmentStage)
+         GEX_CAP(maxDynamicUniformBuffersPerPipelineLayout)
+         GEX_CAP(maxDynamicStorageBuffersPerPipelineLayout)
+         GEX_CAP(maxSampledTexturesPerShaderStage)
+         GEX_CAP(maxColorAttachmentBytesPerSample)
+#undef GEX_CAP_STAGE
+#undef GEX_CAP
+         cap += used;
+         if (*cap == ',')
+            ++cap;
+      }
       if (getenv("GEX_WGPU_LIMIT_TRACE"))
          fprintf(stderr, "gex-limits: adapter vertex attributes %u "
                  "(asked %u)\n", adapter_limits.maxVertexAttributes,
