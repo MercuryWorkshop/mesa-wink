@@ -44112,8 +44112,29 @@ gex_wgpu_repeat_emit(struct gex_wgpu_context *ctx, WGPURenderPassEncoder pass,
                      unsigned vb_slot_count, const uint8_t *vb_buffer,
                      const bool *vb_instanced, const uint32_t *vb_stride)
 {
+   /* The base instance the bound instance-stepped offsets already carry.
+    * Where the vertex shader never reads gl_InstanceID, a later command's
+    * own base is passed to drawIndexed relative to that, instead of
+    * rebinding every instance-stepped buffer at a new offset first: one call
+    * a command rather than two, and Sodium issues a command per chunk
+    * section. A shader that reads it keeps the rebinding, which is what
+    * keeps instance_index counting from zero as gl_InstanceID does. */
+   uint32_t bound_instance = ctx->repeat.cmds[0].start_instance;
+   const bool by_first_instance =
+      ctx->vs && ctx->vs->original_nir &&
+      !BITSET_TEST(ctx->vs->original_nir->info.system_values_read,
+                   SYSTEM_VALUE_INSTANCE_ID);
    for (unsigned k = 1; k < ctx->repeat.count; ++k) {
       const struct gex_wgpu_repeat_cmd *c = &ctx->repeat.cmds[k];
+      if (by_first_instance && c->start_instance >= bound_instance) {
+         ++gex_wgpu_draws_issued;
+         wgpuRenderPassEncoderDrawIndexed(pass, c->index_count,
+                                          c->instance_count, c->first_index,
+                                          c->base_vertex,
+                                          c->start_instance - bound_instance);
+         continue;
+      }
+      bound_instance = c->start_instance;
       for (unsigned slot = 0; slot < vb_slot_count; ++slot) {
          if (!vb_instanced[slot])
             continue;
