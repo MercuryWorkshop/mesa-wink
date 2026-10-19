@@ -1545,6 +1545,16 @@ struct gex_wgpu_screen {
    /* The passes decoding a compressed texture into a sampler view's scratch
     * (gex_wgpu_sampler_view_refresh), one per scratch format. */
    WGPURenderPipeline decode_pipelines[GEX_WGPU_DECODE_FORMATS];
+   /* glGenerateMipmap's box filter (gex_wgpu_generate_mipmap): one pipeline
+    * per destination format, sharing a layout and a module. */
+   struct {
+      WGPUTextureFormat format;
+      WGPURenderPipeline pipeline;
+   } mip_pipelines[16];
+   unsigned mip_pipeline_count;
+   WGPUShaderModule mip_module;
+   WGPUBindGroupLayout mip_bgl;
+   WGPUPipelineLayout mip_layout;
    /* The multisampled-depth resolve, one pipeline per depth format. Distinct
     * from `depth_resolve` above, which turns a packed depth texture into
     * something readable: this one turns 4x samples into one. WebGPU resolves
@@ -26754,6 +26764,205 @@ gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
    view->reinterpret_serial = source->write_serial;
 }
 
+/* ---- glGenerateMipmap ----
+ *
+ * Without this, st/mesa reaches util_gen_mipmap, which is a pipe->blit per
+ * level, each one a u_blitter draw with its own state save and restore,
+ * sampler view and surface -- and gex_wgpu_blit submits whatever is pending
+ * before it starts. A shaderpack mipmaps several full-screen colour targets
+ * every frame (Complementary: colortex0, 3 and 5), which was some thirty
+ * queue submits a frame for this alone.
+ *
+ * Here the chain is recorded into the pending encoder behind whatever the
+ * frame has drawn: one small render pass per level and layer, reading the
+ * level above with textureLoad and writing the 2x2 average. No submit, and
+ * the batch carries on. textureLoad rather than a filtering sampler so that
+ * unfilterable float formats are served too; the result is the box filter
+ * util_gen_mipmap's linear sampling also amounts to for even sizes (GL leaves
+ * the filter to the implementation).
+ *
+ * Declines -- returning false sends st/mesa to util_gen_mipmap as before --
+ * anything but a single-sampled 2D, array or cube colour texture with float
+ * sampling, rendered and sampled as its own format; and a texture kept in a
+ * render-target scratch, whose bytes reach the texture only at submit. */
+static WGPURenderPipeline
+gex_wgpu_mip_pipeline(struct gex_wgpu_screen *screen, WGPUTextureFormat format)
+{
+   for (unsigned i = 0; i < screen->mip_pipeline_count; ++i)
+      if (screen->mip_pipelines[i].format == format)
+         return screen->mip_pipelines[i].pipeline;
+   if (screen->mip_pipeline_count >= ARRAY_SIZE(screen->mip_pipelines))
+      return NULL;
+   if (!screen->mip_module) {
+      static const char wgsl[] =
+         "@group(0) @binding(0) var src: texture_2d<f32>;\n"
+         "@vertex fn vs(@builtin(vertex_index) i: u32)"
+         " -> @builtin(position) vec4<f32> {\n"
+         "  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0),"
+         " vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));\n"
+         "  return vec4<f32>(p[i], 0.0, 1.0);\n"
+         "}\n"
+         "@fragment fn fs(@builtin(position) pos: vec4<f32>)"
+         " -> @location(0) vec4<f32> {\n"
+         "  let m = vec2<i32>(textureDimensions(src, 0)) - vec2<i32>(1);\n"
+         "  let d = vec2<i32>(pos.xy) * 2;\n"
+         "  let a = textureLoad(src, min(d, m), 0);\n"
+         "  let b = textureLoad(src, min(d + vec2<i32>(1, 0), m), 0);\n"
+         "  let c = textureLoad(src, min(d + vec2<i32>(0, 1), m), 0);\n"
+         "  let e = textureLoad(src, min(d + vec2<i32>(1, 1), m), 0);\n"
+         "  return (a + b + c + e) * 0.25;\n"
+         "}\n";
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = (WGPUStringView){wgsl, WGPU_STRLEN};
+      WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      module_desc.nextInChain = &source.chain;
+      module_desc.label = (WGPUStringView){"gex mipmap", WGPU_STRLEN};
+      screen->mip_module =
+         wgpuDeviceCreateShaderModule(screen->device, &module_desc);
+      WGPUBindGroupLayoutEntry entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry.binding = 0;
+      entry.visibility = WGPUShaderStage_Fragment;
+      entry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+      entry.texture.viewDimension = WGPUTextureViewDimension_2D;
+      WGPUBindGroupLayoutDescriptor bgl_desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+      bgl_desc.entryCount = 1;
+      bgl_desc.entries = &entry;
+      screen->mip_bgl = wgpuDeviceCreateBindGroupLayout(screen->device, &bgl_desc);
+      WGPUPipelineLayoutDescriptor layout_desc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+      layout_desc.bindGroupLayoutCount = 1;
+      layout_desc.bindGroupLayouts = &screen->mip_bgl;
+      screen->mip_layout =
+         wgpuDeviceCreatePipelineLayout(screen->device, &layout_desc);
+   }
+   if (!screen->mip_module || !screen->mip_bgl || !screen->mip_layout)
+      return NULL;
+   WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+   target.format = format;
+   target.writeMask = WGPUColorWriteMask_All;
+   WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+   fragment.module = screen->mip_module;
+   fragment.entryPoint = (WGPUStringView){"fs", WGPU_STRLEN};
+   fragment.targetCount = 1;
+   fragment.targets = &target;
+   WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+   desc.label = (WGPUStringView){"gex mipmap", WGPU_STRLEN};
+   desc.layout = screen->mip_layout;
+   desc.vertex.module = screen->mip_module;
+   desc.vertex.entryPoint = (WGPUStringView){"vs", WGPU_STRLEN};
+   desc.fragment = &fragment;
+   desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+   desc.multisample.count = 1;
+   desc.multisample.mask = 0xffffffffu;
+   WGPURenderPipeline pipeline =
+      wgpuDeviceCreateRenderPipeline(screen->device, &desc);
+   if (!pipeline)
+      return NULL;
+   screen->mip_pipelines[screen->mip_pipeline_count].format = format;
+   screen->mip_pipelines[screen->mip_pipeline_count].pipeline = pipeline;
+   ++screen->mip_pipeline_count;
+   return pipeline;
+}
+
+/* Mipmap levels built by gex_wgpu_generate_mipmap rather than u_blitter. */
+uint64_t gex_wgpu_mip_levels;
+
+static bool
+gex_wgpu_generate_mipmap(struct pipe_context *pipe,
+                         struct pipe_resource *resource,
+                         enum pipe_format format, unsigned base_level,
+                         unsigned last_level, unsigned first_layer,
+                         unsigned last_layer)
+{
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
+   struct gex_wgpu_resource *gex = gex_resource(resource);
+   if (ctx->failed || !gex->texture || gex->rt_scratch ||
+       GEX_GETENV_ONCE("GEX_WGPU_NO_MIPMAP"))
+      return false;
+   if (format != resource->format || MAX2(resource->nr_samples, 1) != 1 ||
+       (resource->target != PIPE_TEXTURE_2D &&
+        resource->target != PIPE_TEXTURE_2D_ARRAY &&
+        resource->target != PIPE_TEXTURE_CUBE &&
+        resource->target != PIPE_TEXTURE_CUBE_ARRAY))
+      return false;
+   const struct util_format_description *fmt = util_format_description(format);
+   if (!fmt || util_format_is_depth_or_stencil(format) ||
+       util_format_is_pure_integer(format) ||
+       util_format_is_compressed(format) ||
+       fmt->colorspace == UTIL_FORMAT_COLORSPACE_YUV)
+      return false;
+   const WGPUTextureUsage needed =
+      WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+   if ((gex->texture_usage & needed) != needed)
+      return false;
+   const WGPUTextureFormat wgpu_format = gex_wgpu_texture_format(format);
+   if (wgpu_format == WGPUTextureFormat_Undefined)
+      return false;
+   if (last_level <= base_level)
+      return true;
+   WGPURenderPipeline pipeline = gex_wgpu_mip_pipeline(screen, wgpu_format);
+   if (!pipeline)
+      return false;
+   gex_wgpu_end_pass(ctx);
+   WGPUCommandEncoder encoder = gex_wgpu_pending_encoder(ctx);
+   if (!encoder)
+      return false;
+   for (unsigned layer = first_layer; layer <= last_layer; ++layer) {
+      for (unsigned level = base_level; level < last_level; ++level) {
+         WGPUTextureViewDescriptor view_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+         view_desc.format = wgpu_format;
+         view_desc.dimension = WGPUTextureViewDimension_2D;
+         view_desc.mipLevelCount = 1;
+         view_desc.baseArrayLayer = layer;
+         view_desc.arrayLayerCount = 1;
+         view_desc.aspect = WGPUTextureAspect_All;
+         view_desc.baseMipLevel = level;
+         WGPUTextureView from = wgpuTextureCreateView(gex->texture, &view_desc);
+         view_desc.baseMipLevel = level + 1;
+         WGPUTextureView into = wgpuTextureCreateView(gex->texture, &view_desc);
+         WGPUBindGroup group = NULL;
+         if (from) {
+            WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+            entry.binding = 0;
+            entry.textureView = from;
+            WGPUBindGroupDescriptor bg_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            bg_desc.layout = screen->mip_bgl;
+            bg_desc.entryCount = 1;
+            bg_desc.entries = &entry;
+            group = wgpuDeviceCreateBindGroup(screen->device, &bg_desc);
+         }
+         if (into && group) {
+            WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            color.view = into;
+            /* Every texel of the level is written, so nothing is loaded. */
+            color.loadOp = WGPULoadOp_Clear;
+            color.storeOp = WGPUStoreOp_Store;
+            WGPURenderPassDescriptor pass_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            pass_desc.colorAttachmentCount = 1;
+            pass_desc.colorAttachments = &color;
+            WGPURenderPassEncoder pass =
+               wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+            wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+            wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+            wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+            wgpuRenderPassEncoderEnd(pass);
+            wgpuRenderPassEncoderRelease(pass);
+            ++gex_wgpu_mip_levels;
+         }
+         if (group) wgpuBindGroupRelease(group);
+         if (from) wgpuTextureViewRelease(from);
+         if (into) wgpuTextureViewRelease(into);
+      }
+   }
+   /* Written by this batch: a CPU upload or read of it has to wait for the
+    * submit, and views copied from it have to refresh. */
+   gex_wgpu_batch_touch(ctx, resource);
+   gex->texture_written = true;
+   gex->write_serial++;
+   return true;
+}
+
 /* ---- A colour target whose surface format is not the texture's ----
  *
  * GL attaches a texture through a *surface* that may name another format, and
@@ -49380,6 +49589,7 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.set_sample_mask = gex_wgpu_set_sample_mask;
    ctx->base.resource_copy_region = gex_wgpu_resource_copy_region;
    ctx->base.blit = gex_wgpu_blit;
+   ctx->base.generate_mipmap = gex_wgpu_generate_mipmap;
    ctx->base.set_polygon_stipple = gex_wgpu_set_polygon_stipple;
    ctx->base.set_min_samples = gex_wgpu_set_min_samples;
    ctx->base.set_clip_state = gex_wgpu_set_clip_state;
@@ -49934,6 +50144,8 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * a driver that orders every command on the WebGPU queue is exactly that
     * guarantee, not an approximation of it. */
    caps->texture_barrier = true;
+   /* gex_wgpu_generate_mipmap, which declines what it cannot do. */
+   caps->generate_mipmap = true;
    /* ARB_derivative_control, a third of the five. zink's emitter has
     * SpvOpDPdxFine/Coarse and declares the DerivativeControl capability for
     * them, and Tint takes those as WGSL's dpdxFine/dpdxCoarse -- so the whole
