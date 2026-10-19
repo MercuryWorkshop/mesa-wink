@@ -1853,6 +1853,11 @@ struct gex_wgpu_screen {
     * texture -- so this bounds the writable count rather than the declared
     * one; see GEX_WGPU_MAX_SHADER_IMAGES. */
    uint32_t max_storage_textures;
+   /* Samplers the device grants per stage. Chrome grants sixteen in every
+    * limit tier, against up to 48 sampled textures, so a fragment shader
+    * using more units than this shares sampler bindings between units that
+    * bind the same sampler; see gex_wgpu_fs_share_samplers. */
+   uint32_t max_samplers;
    uint32_t max_storage_buffer_size;
    /* Buffers and textures let go of, destroyed once nothing recorded may
     * still use them: see gex_wgpu_doom. `doom_serial` counts them, and
@@ -3138,6 +3143,10 @@ struct gex_wgpu_shader_variant {
     * answers. Both are part of the key for the obvious reason. */
    uint32_t query_only_slots;
    uint32_t query_only_geom[GEX_WGPU_MAX_SAMPLERS][5];
+   /* Sampler slots whose derefs this variant points at another slot's
+    * sampler, and which slot that is (gex_wgpu_fs_share_samplers). */
+   uint32_t shared_samplers;
+   uint8_t sampler_share[GEX_WGPU_MAX_SAMPLERS];
    /* The polygon offset this variant computes itself, and the state it baked
     * in as immediates; see gex_wgpu_lower_polygon_offset_clamp. All four are
     * part of the key because all four are constants in the shader. */
@@ -15421,10 +15430,198 @@ gex_wgpu_say_no_base_module(const struct gex_wgpu_shader *shader,
    }
 }
 
+static WGPUSampler
+gex_wgpu_default_sampler(struct gex_wgpu_screen *screen,
+                         WGPUSamplerBindingType type);
+static WGPUTextureSampleType
+gex_wgpu_format_sample_type(enum pipe_format format);
+
+/* The fragment slots whose depth view the draw will read as float -- the
+ * same test gex_wgpu_draw_vbo_inner makes when it builds `depth_as_float`,
+ * for the decisions that have to be taken before it runs. */
+static uint32_t
+gex_wgpu_fs_depth_as_float(const struct gex_wgpu_context *ctx,
+                           uint32_t omitted)
+{
+   uint32_t mask = 0;
+   for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
+      const unsigned slot = ctx->fs->texture_slots[i];
+      const struct pipe_sampler_view *view = ctx->sampler_views[slot];
+      if (view && !((omitted >> slot) & 1) &&
+          gex_wgpu_format_sample_type(view->format) ==
+             WGPUTextureSampleType_Depth &&
+          ctx->fs->texture_sample_types[i] == WGPUTextureSampleType_Float)
+         mask |= 1u << slot;
+   }
+   return mask;
+}
+
+/* What fragment sampler `i` (an index into fs->sampler_slots) binds: the
+ * sampler object group 0's entry carries, and the binding type its layout
+ * entry declares. One function for both, so that the sharing decision and
+ * the bind group cannot come to different answers. */
+static WGPUSampler
+gex_wgpu_fs_sampler_binding(struct gex_wgpu_context *ctx, unsigned i,
+                            uint32_t depth_as_float,
+                            WGPUSamplerBindingType *type)
+{
+   const unsigned slot = ctx->fs->sampler_slots[i];
+   const bool as_float = (depth_as_float >> slot) & 1;
+   /* A slot whose depth view is read as float declares a non-filtering
+    * sampler, so the nearest twin is what may be bound to it. */
+   *type = as_float ? WGPUSamplerBindingType_NonFiltering
+                    : ctx->fs->sampler_types[i];
+   const struct gex_wgpu_sampler *sampler = ctx->samplers[slot];
+   if (!sampler)
+      return gex_wgpu_default_sampler(gex_screen(ctx->base.screen), *type);
+   return as_float && sampler->nonfiltering
+      ? gex_wgpu_sampler_nonfiltering(sampler)
+      : gex_wgpu_sampler_matching(sampler, ctx->fs->sampler_types[i]);
+}
+
+/* Sampler bindings for a fragment shader with more sampler slots than the
+ * device has samplers.
+ *
+ * GL gives every texture unit its own sampler state; WebGPU counts sampler
+ * *bindings* against maxSamplersPerShaderStage, which Chrome holds at sixteen
+ * in every limit tier while granting up to 48 sampled textures. The states
+ * themselves are few -- an Iris composite pass reads a dozen colour buffers
+ * through two or three -- so a slot that would bind the same sampler object
+ * as the same binding type as an earlier slot borrows that slot's binding
+ * instead of declaring its own. `share[slot]` names the slot whose binding
+ * it uses (itself when it keeps its own) and `shared` has a bit for each
+ * slot that borrows. False when even that leaves more bindings than the
+ * device has.
+ *
+ * An omitted slot keeps its own binding and lends it to nobody: the variant
+ * removes what read it, so its sampler variable may be gone. */
+static bool
+gex_wgpu_fs_share_samplers(struct gex_wgpu_context *ctx, uint32_t omitted,
+                           uint8_t share[GEX_WGPU_MAX_SAMPLERS],
+                           uint32_t *shared)
+{
+   const struct gex_wgpu_shader *fs = ctx->fs;
+   const unsigned limit = gex_screen(ctx->base.screen)->max_samplers;
+   for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot)
+      share[slot] = slot;
+   *shared = 0;
+   if (fs->sampler_count <= limit)
+      return true;
+   const uint32_t depth_as_float = gex_wgpu_fs_depth_as_float(ctx, omitted);
+   WGPUSampler handle[GEX_WGPU_MAX_SAMPLERS];
+   WGPUSamplerBindingType type[GEX_WGPU_MAX_SAMPLERS];
+   unsigned bindings = 0;
+   for (unsigned i = 0; i < fs->sampler_count; ++i) {
+      const unsigned slot = fs->sampler_slots[i];
+      handle[i] = gex_wgpu_fs_sampler_binding(ctx, i, depth_as_float,
+                                              &type[i]);
+      unsigned lender = i;
+      if (!((omitted >> slot) & 1) && handle[i]) {
+         for (unsigned j = 0; j < i; ++j) {
+            const unsigned other = fs->sampler_slots[j];
+            if (!((omitted >> other) & 1) && share[other] == other &&
+                handle[j] == handle[i] && type[j] == type[i]) {
+               lender = j;
+               break;
+            }
+         }
+      }
+      if (lender != i) {
+         share[slot] = fs->sampler_slots[lender];
+         *shared |= 1u << slot;
+      } else {
+         ++bindings;
+      }
+   }
+   static bool said;
+   if (!said && *shared) {
+      said = true;
+      fprintf(stderr, "gex-wgpu: %u fragment sampler slots share %u sampler "
+              "bindings (the device has %u)\n", fs->sampler_count, bindings,
+              limit);
+   }
+   return bindings <= limit;
+}
+
+static bool
+gex_wgpu_is_shared_sampler_var(nir_variable *var, void *data)
+{
+   const uint32_t shared = *(const uint32_t *)data;
+   return glsl_type_is_bare_sampler(var->type) &&
+          var->data.driver_location < GEX_WGPU_MAX_SAMPLERS &&
+          ((shared >> var->data.driver_location) & 1);
+}
+
+/* Points the sampler derefs of each slot that borrows (see
+ * gex_wgpu_fs_share_samplers) at the sampler of the slot it borrows from.
+ *
+ * Run last, just before the variant is compiled: the lowerings before it find
+ * a slot's sampler state and view through the sampler deref's
+ * driver_location, and must still find the slot's own. The lender's variable
+ * is made again if a lowering left it unused and it was removed, so the
+ * borrowed binding is always declared. */
+static void
+gex_wgpu_apply_sampler_sharing(nir_shader *nir, const uint8_t *share,
+                               uint32_t shared)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl || !shared)
+      return;
+   nir_variable *by_slot[GEX_WGPU_MAX_SAMPLERS] = {0};
+   unsigned set = 0;
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      if (glsl_type_is_bare_sampler(var->type) &&
+          var->data.driver_location < GEX_WGPU_MAX_SAMPLERS) {
+         by_slot[var->data.driver_location] = var;
+         set = var->data.descriptor_set;
+      }
+   }
+   nir_builder b = nir_builder_create(impl);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_tex)
+            continue;
+         nir_tex_instr *tex = nir_instr_as_tex(instr);
+         const int at = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+         if (at < 0)
+            continue;
+         nir_variable *var =
+            nir_deref_instr_get_variable(nir_src_as_deref(tex->src[at].src));
+         if (!var || !glsl_type_is_bare_sampler(var->type))
+            continue;
+         const unsigned slot = var->data.driver_location;
+         if (slot >= GEX_WGPU_MAX_SAMPLERS || !((shared >> slot) & 1))
+            continue;
+         const unsigned lender = share[slot];
+         if (!by_slot[lender]) {
+            char name[32];
+            snprintf(name, sizeof(name), "gex_sampler%u", lender);
+            nir_variable *made = nir_variable_create(
+               nir, nir_var_uniform, glsl_bare_sampler_type(), name);
+            made->data.descriptor_set = set;
+            made->data.driver_location = lender;
+            made->data.binding = 2 * lender + 1;
+            by_slot[lender] = made;
+         }
+         b.cursor = nir_before_instr(instr);
+         nir_src_rewrite(&tex->src[at].src,
+                         &nir_build_deref_var(&b, by_slot[lender])->def);
+      }
+   }
+   nir_progress(true, impl, nir_metadata_control_flow);
+   nir_opt_dce(nir);
+   nir_remove_dead_variables_options options = {
+      .can_remove_var = gex_wgpu_is_shared_sampler_var,
+      .can_remove_var_data = &shared,
+   };
+   nir_remove_dead_variables(nir, nir_var_uniform, &options);
+}
+
 static WGPUShaderModule
 gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                          bool drawing_triangles,
-                         uint32_t *omitted_out, uint32_t *demoted_out)
+                         uint32_t *omitted_out, uint32_t *demoted_out,
+                         uint32_t *shared_out, uint8_t *share_out)
 {
    /* Declining, not latching. This returns NULL and draw_vbo checks it, so
     * the caller already learns of the failure -- latching on top ended the
@@ -15492,6 +15689,22 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    const uint32_t want_demote_ms = gex_wgpu_demotable_ms_slots(ctx);
    if (demoted_out)
       *demoted_out = want_demote_ms;
+   /* Sampler slots past the device's sampler count, folded onto the bindings
+    * of slots that bind the same sampler; see gex_wgpu_fs_share_samplers.
+    * Above both early returns like the masks before it, though only a shader
+    * with textures can need it and the first return is for one without. */
+   uint8_t want_share[GEX_WGPU_MAX_SAMPLERS];
+   uint32_t want_shared = 0;
+   if (!gex_wgpu_fs_share_samplers(ctx, want_omit_slots | want_query_only,
+                                   want_share, &want_shared)) {
+      GEX_FS_DECLINE("more distinct samplers than the device has sampler "
+                     "bindings");
+      return NULL;
+   }
+   if (shared_out)
+      *shared_out = want_shared;
+   if (share_out)
+      memcpy(share_out, want_share, sizeof(want_share));
    uint32_t want_tiled_geom[GEX_WGPU_MAX_SAMPLERS][3];
    const uint32_t want_tiled_ms =
       gex_wgpu_tiled_ms_slots(ctx, want_tiled_geom);
@@ -15871,7 +16084,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       want_omit_slots != 0 ||
       want_demote_ms != 0 || want_tiled_ms != 0 || fs->ms_array_slots != 0 ||
       want_frag_tile_x != 0 || want_query_only != 0 || want_offset_clamp ||
-      fs->unformatted_images != 0;
+      fs->unformatted_images != 0 || want_shared != 0;
    if (!needs_variant && !fs->buftex_count)
       {
          if (!fs->module)
@@ -15909,6 +16122,10 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->tiled_ms_slots == want_tiled_ms &&
                    cached->frag_tile_x == want_frag_tile_x &&
                    cached->query_only_slots == want_query_only &&
+                   cached->shared_samplers == want_shared &&
+                   (!want_shared ||
+                    memcmp(cached->sampler_share, want_share,
+                           sizeof(want_share)) == 0) &&
                    memcmp(cached->query_only_geom, want_query_geom,
                           sizeof(cached->query_only_geom)) == 0 &&
                    memcmp(cached->tiled_ms_geom, want_tiled_geom,
@@ -16104,6 +16321,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
          return NULL;
       }
    }
+   gex_wgpu_apply_sampler_sharing(variant, want_share, want_shared);
    char *error = NULL;
    WGPUShaderModule module = gex_wgpu_compile_nir(
       &ctx->base, variant, MESA_SHADER_FRAGMENT, false, false, &error);
@@ -16157,6 +16375,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->tiled_ms_slots = want_tiled_ms;
    cached->frag_tile_x = want_frag_tile_x;
    cached->query_only_slots = want_query_only;
+   cached->shared_samplers = want_shared;
+   memcpy(cached->sampler_share, want_share, sizeof(want_share));
    memcpy(cached->query_only_geom, want_query_geom,
           sizeof(cached->query_only_geom));
    memcpy(cached->tiled_ms_geom, want_tiled_geom,
@@ -46148,6 +46368,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * their declaration; their bindings must be left out of the group too. */
    uint32_t omitted_texture_slots = 0;
    uint32_t demoted_ms_slots = 0;
+   /* Sampler slots this variant folded onto another slot's binding, and
+    * which; their entries are left out of group 0. */
+   uint32_t shared_samplers = 0;
+   uint8_t sampler_share[GEX_WGPU_MAX_SAMPLERS];
    /* Who derives gl_PrimitiveID for this draw, decided here because this is
     * where the topology is final: the strip and unsupported-topology rewrites
     * re-enter this function, so an earlier answer would describe the
@@ -46167,7 +46391,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       ctx, fs_topology == WGPUPrimitiveTopology_PointList,
       fs_topology == WGPUPrimitiveTopology_TriangleList ||
       fs_topology == WGPUPrimitiveTopology_TriangleStrip,
-      &omitted_texture_slots, &demoted_ms_slots);
+      &omitted_texture_slots, &demoted_ms_slots, &shared_samplers,
+      sampler_share);
    if (gex_timing) gex_wgpu_time_fsmod += os_time_get_nano() - t_fsmod_start;
    if (!fragment.module)
       GEX_DRAW_DROP();
@@ -47407,6 +47632,38 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                * read-only header and the texel data */
                               3 * GEX_WGPU_MAX_SHADER_IMAGES +
                               GEX_WGPU_MAX_BUFFER_TEXTURES];
+   /* The sharing decision predicted `depth_as_float` before it was computed
+    * above; hold every borrowed binding to the real one. A slot borrowing a
+    * binding of another type is a rejected pipeline, and one of another
+    * sampler object is a wrong texel. */
+   for (unsigned i = 0; shared_samplers && i < ctx->fs->sampler_count; ++i) {
+      const unsigned slot = ctx->fs->sampler_slots[i];
+      if (!((shared_samplers >> slot) & 1))
+         continue;
+      unsigned j = 0;
+      while (j < ctx->fs->sampler_count &&
+             ctx->fs->sampler_slots[j] != sampler_share[slot])
+         ++j;
+      WGPUSamplerBindingType mine_type = WGPUSamplerBindingType_Undefined;
+      WGPUSamplerBindingType lent_type = WGPUSamplerBindingType_Undefined;
+      const WGPUSampler mine =
+         gex_wgpu_fs_sampler_binding(ctx, i, depth_as_float, &mine_type);
+      const WGPUSampler lent = j < ctx->fs->sampler_count
+         ? gex_wgpu_fs_sampler_binding(ctx, j, depth_as_float, &lent_type)
+         : NULL;
+      if (!lent || lent != mine || lent_type != mine_type) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: draw dropped (fragment slot %u cannot "
+                    "share slot %u's sampler)\n", slot,
+                    (unsigned)sampler_share[slot]);
+         }
+         GEX_DRAW_DROP();
+      }
+   }
+   const unsigned fs_sampler_entries =
+      ctx->fs ? ctx->fs->sampler_count - util_bitcount(shared_samplers) : 0;
    if (needs_texture) {
       for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
          texture_layout_entries[i] =
@@ -47447,7 +47704,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             !omitted && !demoted &&
             ((ctx->fs->multisampled_slots >> ctx->fs->texture_slots[i]) & 1);
       }
-      unsigned dst_entry = ctx->fs->texture_count + ctx->fs->sampler_count;
+      unsigned dst_entry = ctx->fs->texture_count + fs_sampler_entries;
       for (unsigned rt = 0; rt < 8; ++rt) {
          if (!(dst_mask & BITFIELD_BIT(rt)))
             continue;
@@ -47461,8 +47718,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entry->texture.viewDimension = WGPUTextureViewDimension_2D;
          entry->texture.multisampled = !logicop && MAX2(ctx->fb_samples, 1) > 1;
       }
+      /* Packed: a slot that borrows another's sampler binding has no entry
+       * of its own, because the layout's sampler count is what WebGPU holds
+       * against maxSamplersPerShaderStage. */
+      unsigned next_sampler_entry = ctx->fs->texture_count;
       for (unsigned i = 0; i < ctx->fs->sampler_count; ++i) {
-         const unsigned entry = ctx->fs->texture_count + i;
+         if ((shared_samplers >> ctx->fs->sampler_slots[i]) & 1)
+            continue;
+         const unsigned entry = next_sampler_entry++;
          texture_layout_entries[entry] =
             (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
          texture_layout_entries[entry].binding =
@@ -47838,8 +48101,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
       if (group == 0 && needs_texture) {
          desc.entryCount =
-            ctx->fs->texture_count + ctx->fs->sampler_count +
-            dst_count;
+            ctx->fs->texture_count + fs_sampler_entries + dst_count;
          desc.entries = texture_layout_entries;
       } else if (group == 1 && needs_vertex_constant) {
          desc.entryCount = vertex_group_count;
@@ -48113,26 +48375,19 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             GEX_DRAW_DROP();
          }
       }
+      unsigned next_sampler_entry = ctx->fs->texture_count;
       for (unsigned i = 0; i < ctx->fs->sampler_count; ++i) {
-         const unsigned slot = ctx->fs->sampler_slots[i];
-         const unsigned entry = ctx->fs->texture_count + i;
+         /* Packed as the layout is: a borrowing slot has no entry. */
+         if ((shared_samplers >> ctx->fs->sampler_slots[i]) & 1)
+            continue;
+         const unsigned entry = next_sampler_entry++;
          entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[entry].binding = ctx->fs->sampler_bindings[i];
-         /* A slot whose depth view is being read as float declares a
-          * non-filtering sampler in the layout above, so the nearest twin is
-          * what may be bound to it. */
-         entries[entry].sampler = ctx->samplers[slot]
-            ? ((depth_as_float & (1u << slot)) &&
-               ctx->samplers[slot]->nonfiltering
-                  ? gex_wgpu_sampler_nonfiltering(ctx->samplers[slot])
-                  : gex_wgpu_sampler_matching(ctx->samplers[slot],
-                                              ctx->fs->sampler_types[i]))
-            : gex_wgpu_default_sampler(
-                 screen, (depth_as_float & (1u << slot))
-                            ? WGPUSamplerBindingType_NonFiltering
-                            : ctx->fs->sampler_types[i]);
+         WGPUSamplerBindingType type;
+         entries[entry].sampler =
+            gex_wgpu_fs_sampler_binding(ctx, i, depth_as_float, &type);
       }
-      unsigned dst_entry = ctx->fs->texture_count + ctx->fs->sampler_count;
+      unsigned dst_entry = ctx->fs->texture_count + fs_sampler_entries;
       for (unsigned rt = 0; rt < 8; ++rt) {
          if (!(dst_mask & BITFIELD_BIT(rt)))
             continue;
@@ -48144,8 +48399,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[0];
       bind_desc.entryCount =
-         ctx->fs->texture_count + ctx->fs->sampler_count +
-            dst_count;
+         ctx->fs->texture_count + fs_sampler_entries + dst_count;
       bind_desc.entries = entries;
       bind_groups[0] = gex_wgpu_cached_bind_group(
          screen, group_label[0], bind_desc.layout, bind_desc.entries,
@@ -50990,6 +51244,7 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->max_inter_stage = GEX_WGPU_MAX_RASTER_VARYINGS;
    screen->max_raster_varyings = GEX_WGPU_MAX_RASTER_VARYINGS;
    screen->max_storage_textures = GEX_WGPU_MAX_SHADER_IMAGES;
+   screen->max_samplers = GEX_WGPU_MAX_STAGE_SAMPLERS;
    screen->max_storage_buffer_size = 0;
    screen->uniform_offset_alignment = 256;   /* WebGPU's default, the worst */
    screen->storage_offset_alignment = 256;
@@ -51086,6 +51341,15 @@ gex_wgpu_screen_create(WGPUDevice device)
          limits.maxStorageTexturesPerShaderStage == WGPU_LIMIT_U32_UNDEFINED
             ? GEX_WGPU_MAX_SHADER_IMAGES
             : limits.maxStorageTexturesPerShaderStage;
+      if (limits.maxSamplersPerShaderStage != WGPU_LIMIT_U32_UNDEFINED &&
+          limits.maxSamplersPerShaderStage >= GEX_WGPU_MAX_STAGE_SAMPLERS)
+         screen->max_samplers = limits.maxSamplersPerShaderStage;
+      /* Lowers the count sampler sharing works to, below what WebGPU lets a
+       * device grant, so the sharing path can be exercised anywhere. */
+      const char *samplers_cap = getenv("GEX_WGPU_FS_SAMPLERS");
+      if (samplers_cap && atoi(samplers_cap) > 0)
+         screen->max_samplers =
+            MIN2(screen->max_samplers, (uint32_t)atoi(samplers_cap));
       screen->max_storage_buffer_size =
          limits.maxStorageBufferBindingSize == WGPU_LIMIT_U64_UNDEFINED
             ? 0 : (uint32_t)MIN2(limits.maxStorageBufferBindingSize,
