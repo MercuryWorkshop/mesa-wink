@@ -3784,6 +3784,23 @@ gex_wgpu_sampler_matching(const struct gex_wgpu_sampler *sampler,
    return sampler->sampler;
 }
 
+/* The nearest twin for a NonFiltering binding. That binding is never a
+ * comparison one, and `nonfiltering` keeps the state's comparison, so a state
+ * that compares has to give its flipped twin instead -- nearest, and
+ * comparing nothing. Binding `nonfiltering` there was a validation error
+ * ("Comparison sampler is incompatible with non-comparison sampler binding")
+ * that invalidated every command buffer it reached: Iris turns comparison on
+ * for the shadow maps, and Sildur's Vibrant also reads shadowtex as plain
+ * depth, so most of each frame was lost. */
+static WGPUSampler
+gex_wgpu_sampler_nonfiltering(const struct gex_wgpu_sampler *sampler)
+{
+   if (sampler->state.compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE &&
+       sampler->flipped_comparison)
+      return sampler->flipped_comparison;
+   return sampler->nonfiltering;
+}
+
 struct gex_wgpu_sampler_view {
    struct pipe_sampler_view base;
    WGPUTextureView view;
@@ -26291,7 +26308,9 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
        * above. */
       bindings[count].sampler = sampler
          ? ((compute_depth_as_float & (1u << slot)) && sampler->nonfiltering
-               ? sampler->nonfiltering : sampler->sampler)
+               ? gex_wgpu_sampler_nonfiltering(sampler)
+               : gex_wgpu_sampler_matching(sampler,
+                                           entries[count].sampler.type))
          : NULL;
       if (!bindings[count].sampler) {
          /* GL's default sampler state, which is what st/mesa would have sent
@@ -33723,8 +33742,9 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       if (sampler)
          wgpu_sampler =
             (sampler_type == WGPUSamplerBindingType_NonFiltering &&
-             sampler->nonfiltering) ? sampler->nonfiltering
-                                    : sampler->sampler;
+             sampler->nonfiltering)
+               ? gex_wgpu_sampler_nonfiltering(sampler)
+               : gex_wgpu_sampler_matching(sampler, sampler_type);
       if (!texture_view || !wgpu_sampler) {
          static bool said;
          if (!said) {
@@ -34265,7 +34285,8 @@ gex_wgpu_bind_textures_from(struct pipe_context *pipe,
          group->sampler_type[at] == WGPUSamplerBindingType_NonFiltering;
       group->sampler[at] = sampler
          ? (wants_nonfiltering && sampler->nonfiltering
-               ? sampler->nonfiltering : sampler->sampler)
+               ? gex_wgpu_sampler_nonfiltering(sampler)
+               : gex_wgpu_sampler_matching(sampler, group->sampler_type[at]))
          : NULL;
       if (!group->sampler[at]) {
          if (GEX_GETENV_ONCE("GEX_WGPU_STAGE_TEXTURE_LOG"))
@@ -48042,7 +48063,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entries[entry].sampler = ctx->samplers[slot]
             ? ((depth_as_float & (1u << slot)) &&
                ctx->samplers[slot]->nonfiltering
-                  ? ctx->samplers[slot]->nonfiltering
+                  ? gex_wgpu_sampler_nonfiltering(ctx->samplers[slot])
                   : gex_wgpu_sampler_matching(ctx->samplers[slot],
                                               ctx->fs->sampler_types[i]))
             : gex_wgpu_default_sampler(
@@ -48656,8 +48677,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const bool nonfiltering =
             ctx->vs->sampler_types[i] == WGPUSamplerBindingType_NonFiltering;
          entries[entry].sampler = ctx->vertex_samplers[slot]
-            ? (nonfiltering ? ctx->vertex_samplers[slot]->nonfiltering
-                            : ctx->vertex_samplers[slot]->sampler)
+            ? (nonfiltering
+                  ? gex_wgpu_sampler_nonfiltering(ctx->vertex_samplers[slot])
+                  : gex_wgpu_sampler_matching(ctx->vertex_samplers[slot],
+                                              ctx->vs->sampler_types[i]))
             : gex_wgpu_default_sampler(screen, ctx->vs->sampler_types[i]);
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
