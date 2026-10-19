@@ -21154,19 +21154,27 @@ static void
 gex_wgpu_sampler_view_release(struct pipe_context *pipe,
                               struct pipe_sampler_view *base);
 
+static void gex_wgpu_bg_cache_forget(struct gex_wgpu_screen *screen,
+                                     const void *const *handles,
+                                     unsigned count);
+
 static void
 gex_wgpu_sampler_view_destroy(struct pipe_context *pipe,
                               struct pipe_sampler_view *base)
 {
-   /* The bind group cache keys on the entry bytes, and those name
-    * this object by address -- which Dawn hands straight back for the
-    * next one. Retire every cached binding rather than let a key match
-    * a view that no longer exists. */
-   ++gex_screen(pipe->screen)->cache_epoch;
+   struct gex_wgpu_sampler_view *view = (struct gex_wgpu_sampler_view *)base;
+   /* The bind groups naming this view are retired, and only those. Bumping
+    * cache_epoch instead threw away every cached group, and st/mesa destroys
+    * views all the time -- a few a frame under Iris -- so every bind group
+    * was created again every frame, each one across the JS boundary in the
+    * browser. A live key cannot match a recycled handle anyway: the cache
+    * holds a reference to each object its keys name (gex_wgpu_bg_entries_ref),
+    * so the address is not handed out again while the entry exists. */
+   const void *handles[2] = {view->view, view->array_view};
+   gex_wgpu_bg_cache_forget(gex_screen(pipe->screen), handles, 2);
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
    (void)pipe;
-   struct gex_wgpu_sampler_view *view = (struct gex_wgpu_sampler_view *)base;
    pipe_resource_reference(&view->base.texture, NULL);
    if (view->view)
       wgpuTextureViewRelease(view->view);
@@ -21515,14 +21523,16 @@ gex_wgpu_bind_sampler_states(struct pipe_context *pipe,
 static void
 gex_wgpu_delete_sampler_state(struct pipe_context *pipe, void *state)
 {
-   /* The bind group cache keys on the entry bytes, and those name
-    * this object by address -- which Dawn hands straight back for the
-    * next one. Retire every cached binding rather than let a key match
-    * a sampler that no longer exists. */
-   ++gex_screen(pipe->screen)->cache_epoch;
+   struct gex_wgpu_sampler *sampler = state;
+   /* Only the bind groups naming this sampler; see
+    * gex_wgpu_sampler_view_destroy. */
+   if (sampler) {
+      const void *handles[3] = {sampler->sampler, sampler->nonfiltering,
+                                sampler->flipped_comparison};
+      gex_wgpu_bg_cache_forget(gex_screen(pipe->screen), handles, 3);
+   }
    GEX_ENTRY_TIMER();
    (void)pipe;
-   struct gex_wgpu_sampler *sampler = state;
    if (sampler && sampler->flipped_comparison)
       wgpuSamplerRelease(sampler->flipped_comparison);
    if (sampler && sampler->nonfiltering)
@@ -41381,7 +41391,6 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
          slot = candidate;
    }
    ++screen->bg_cache_misses;
-
    WGPUBindGroupDescriptor desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
    desc.layout = layout;
    desc.entryCount = count;
@@ -41438,6 +41447,45 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    { const WGPUBindGroup gex_ret = group;
      simple_mtx_unlock(&screen->cache_lock);
      return gex_ret; }
+}
+
+/* Retire the cached bind groups whose entries name any of `handles` (views,
+ * samplers or buffers; NULLs are skipped), leaving every other entry live. */
+static void
+gex_wgpu_bg_cache_forget(struct gex_wgpu_screen *screen,
+                         const void *const *handles, unsigned count)
+{
+   bool any = false;
+   for (unsigned h = 0; h < count; ++h)
+      any |= handles[h] != NULL;
+   if (!any)
+      return;
+   simple_mtx_lock(&screen->cache_lock);
+   for (unsigned i = 0; i < GEX_WGPU_BG_CACHE_SLOTS; ++i) {
+      struct gex_wgpu_bg_cache_slot *slot = &screen->bg_cache[i];
+      if (!slot->used)
+         continue;
+      bool names = false;
+      for (unsigned e = 0; e < slot->count && !names; ++e) {
+         const WGPUBindGroupEntry *entry = &slot->entries[e];
+         for (unsigned h = 0; h < count && !names; ++h)
+            names = handles[h] &&
+                    (handles[h] == (const void *)entry->textureView ||
+                     handles[h] == (const void *)entry->sampler ||
+                     handles[h] == (const void *)entry->buffer);
+      }
+      if (!names)
+         continue;
+      if (screen->retired_count < ARRAY_SIZE(screen->retired_groups))
+         screen->retired_groups[screen->retired_count++] = slot->group;
+      else {
+         wgpuBindGroupRelease(slot->group);
+         ++screen->handle_epoch;
+      }
+      gex_wgpu_bg_entries_unref(slot->entries, slot->count);
+      slot->used = false;
+   }
+   simple_mtx_unlock(&screen->cache_lock);
 }
 
 static WGPUBuffer
