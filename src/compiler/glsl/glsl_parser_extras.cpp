@@ -526,6 +526,17 @@ _mesa_glsl_parse_state::process_version_directive(YYLTYPE *locp, int version,
    if (!this->es_shader && this->language_version < 130 &&
        this->api == API_OPENGL_COMPAT && this->exts->EXT_gpu_shader4)
       this->EXT_gpu_shader4_enable = true;
+
+   /* And 1.30's switch statement and built-in functions, for the same
+    * shaders and the same reason: Simply Upscaled has a `switch` and
+    * textureSize() under `#version 120`, which this compiler otherwise
+    * refuses ("illegal use of reserved word `switch'", "no function with name
+    * `textureSize'"). Both are additions a valid 1.10/1.20 shader cannot
+    * collide with: `switch` and `default` are reserved words there (`case` is
+    * the one new keyword), and a desktop shader's own function of a
+    * built-in's name hides the built-in rather than being an error. */
+   this->compat_130 = !this->es_shader && this->language_version < 130 &&
+                      this->api == API_OPENGL_COMPAT;
 }
 
 
