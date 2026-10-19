@@ -11359,6 +11359,9 @@ struct gex_wgpu_capture_pack {
    { 1, 4, {0,0,0,0}, {0,8,16,24}, {8,8,8,8}, (c) }
 #define GEX_CAPTURE_8888_BGRA(c) \
    { 1, 4, {0,0,0,0}, {16,8,0,24}, {8,8,8,8}, (c) }
+/* Three 8-bit components in one word; fetched four wide by the render path. */
+#define GEX_CAPTURE_888(c) \
+   { 1, 3, {0,0,0,0}, {0,8,16,0}, {8,8,8,0}, (c) }
 /* Four 16-bit components across two words. */
 #define GEX_CAPTURE_16161616(c) \
    { 2, 4, {0,0,1,1}, {0,16,0,16}, {16,16,16,16}, (c) }
@@ -11465,6 +11468,10 @@ gex_wgpu_capture_pack_for(enum pipe_format format,
       { PIPE_FORMAT_R16G16B16_UNORM,      GEX_CAPTURE_161616(GEX_CAPTURE_UNORM) },
       { PIPE_FORMAT_R16G16B16_SNORM,      GEX_CAPTURE_161616(GEX_CAPTURE_SNORM) },
       { PIPE_FORMAT_R16G16B16_FLOAT,      GEX_CAPTURE_161616(GEX_CAPTURE_FLOAT16) },
+      { PIPE_FORMAT_R8G8B8_UNORM,         GEX_CAPTURE_888(GEX_CAPTURE_UNORM) },
+      { PIPE_FORMAT_R8G8B8_SNORM,         GEX_CAPTURE_888(GEX_CAPTURE_SNORM) },
+      { PIPE_FORMAT_R8G8B8_USCALED,       GEX_CAPTURE_888(GEX_CAPTURE_USCALED) },
+      { PIPE_FORMAT_R8G8B8_SSCALED,       GEX_CAPTURE_888(GEX_CAPTURE_SSCALED) },
       { PIPE_FORMAT_R11G11B10_FLOAT,     GEX_CAPTURE_PACKED3 },
    };
    for (unsigned i = 0; i < ARRAY_SIZE(table); ++i)
@@ -17054,6 +17061,22 @@ gex_wgpu_vertex_format(enum pipe_format format, unsigned *size,
       *size = 8; *alignment = 2; return WGPUVertexFormat_Snorm16x4;
    case PIPE_FORMAT_R16G16B16_FLOAT:
       *size = 8; *alignment = 2; return WGPUVertexFormat_Float16x4;
+   /* Three 8-bit components, which WebGPU has no format for either: fetched
+    * four wide the same way, the fourth byte being the padding the stride
+    * already holds (u_vbuf moves anything not 4-byte aligned), and w set to
+    * GL's 1 in the shader. Declined, these were translated by u_vbuf at every
+    * draw -- and Iris's Sodium terrain carries its normal as R8G8B8_SNORM, so
+    * each multi-draw of chunk geometry read the whole GPU vertex buffer back,
+    * converted it on the CPU and uploaded it again. Complementary's MEDIUM
+    * profile ran at 10 fps natively for that alone, against 75 without it. */
+   case PIPE_FORMAT_R8G8B8_UNORM:
+      *size = 4; *alignment = 1; return WGPUVertexFormat_Unorm8x4;
+   case PIPE_FORMAT_R8G8B8_SNORM:
+      *size = 4; *alignment = 1; return WGPUVertexFormat_Snorm8x4;
+   case PIPE_FORMAT_R8G8B8_USCALED:
+      *size = 4; *alignment = 1; return WGPUVertexFormat_Uint8x4;
+   case PIPE_FORMAT_R8G8B8_SSCALED:
+      *size = 4; *alignment = 1; return WGPUVertexFormat_Sint8x4;
    case PIPE_FORMAT_R8G8_UNORM:
       *size = 2; *alignment = 1; return WGPUVertexFormat_Unorm8x2;
    case PIPE_FORMAT_R8G8B8A8_UNORM:
@@ -17170,6 +17193,16 @@ gex_wgpu_vertex_unpack_kind(enum pipe_format format)
    case PIPE_FORMAT_R16G16B16_SNORM:
    case PIPE_FORMAT_R16G16B16_FLOAT:
       return GEX_WGPU_UNPACK_W1 | GEX_WGPU_UNPACK_XYZ;
+   /* The 8-bit three-component forms, fetched four wide the same way. The
+    * scaled ones come back as integers and are converted like the 16-bit
+    * scaled ones are: the conversion does not care about the width. */
+   case PIPE_FORMAT_R8G8B8_UNORM:
+   case PIPE_FORMAT_R8G8B8_SNORM:
+      return GEX_WGPU_UNPACK_W1 | GEX_WGPU_UNPACK_XYZ;
+   case PIPE_FORMAT_R8G8B8_USCALED:
+      return GEX_WGPU_UNPACK_U16 | GEX_WGPU_UNPACK_XYZ;
+   case PIPE_FORMAT_R8G8B8_SSCALED:
+      return GEX_WGPU_UNPACK_S16 | GEX_WGPU_UNPACK_XYZ;
    default:                              return GEX_WGPU_UNPACK_NONE;
    }
 }
