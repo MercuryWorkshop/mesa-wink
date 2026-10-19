@@ -5406,9 +5406,18 @@ gex_wgpu_apply_packed_images(nir_shader *nir, unsigned count,
    if (!count)
       return true;
    struct gex_wgpu_packed_image_lowering state = {0};
-   /* One header block for the whole stage, at one binding. */
-   nir_variable *block = gex_wgpu_packed_image_header_block(
-      nir, "gex_packed_image_heads", GEX_WGPU_PACKED_IMAGE_FIRST_BINDING);
+   /* One header block for the whole stage, at one binding -- the one an
+    * earlier call made, when a compute variant packs its unformatted images
+    * on top of the shader's own packed ones (dyn_packed). A second block at
+    * the same binding is two declarations of one resource. */
+   nir_variable *block = NULL;
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_ubo) {
+      if (var->name && !strcmp(var->name, "gex_packed_image_heads"))
+         block = var;
+   }
+   if (!block)
+      block = gex_wgpu_packed_image_header_block(
+         nir, "gex_packed_image_heads", GEX_WGPU_PACKED_IMAGE_FIRST_BINDING);
    if (!block)
       return false;
    for (unsigned i = 0; i < count; ++i) {
@@ -25035,6 +25044,13 @@ struct gex_wgpu_compute_state {
     * layout entry per image the way the graphics stages do. The table is
     * shared with the compute-emulated stages, which need the same one. */
    struct gex_wgpu_stage_images images;
+   /* The unformatted images this dispatch serves through a packed buffer,
+    * by position in `images`: their unit resolved to a format WebGPU has no
+    * storage texture for (r16f, r8, rg16f, ...). Set per dispatch by
+    * gex_wgpu_resolve_unformatted_images and implied by the resolved
+    * formats, which key the module variant -- so the variant, the layout and
+    * the bindings all read the same answer. */
+   uint16_t dyn_packed;
    /* Sampled textures, which a compute shader may have like any other stage.
     * GL 4.3's compute shaders sample as freely as a fragment shader does, and
     * a renderer doing its post-processing in compute does little else. This
@@ -25633,6 +25649,7 @@ static bool
 gex_wgpu_resolve_unformatted_images(struct gex_wgpu_context *ctx,
                                     struct gex_wgpu_compute_state *compute)
 {
+   compute->dyn_packed = 0;
    for (unsigned i = 0; i < compute->images.count; ++i) {
       if (!(compute->images.unformatted & ((uint16_t)1u << i)))
          continue;
@@ -25640,6 +25657,30 @@ gex_wgpu_resolve_unformatted_images(struct gex_wgpu_context *ctx,
          &ctx->shader_images[MESA_SHADER_COMPUTE][compute->images.slots[i]];
       enum pipe_format format =
          iv->resource ? iv->format : PIPE_FORMAT_R8G8B8A8_UNORM;
+      /* A unit WebGPU has no storage texture for is served the way a
+       * declared r16f or r8 image already is: through a buffer the shader
+       * packs, copied into the texture after the pass. The image is
+       * write-only (GLSL allows no qualifier on anything else), so the
+       * packer needs nothing but the format, which is known now.
+       *
+       * Declining was the alternative, and it cost the whole dispatch:
+       * Unity's MultiScaleVO declares its RWTexture2D<float> outputs with no
+       * format and binds r16f and r8 textures to them, so its ambient
+       * occlusion was never written and every lit surface in Muck rendered
+       * black from GL 4.3 up. */
+      if (gex_wgpu_storage_texture_format(format) ==
+             WGPUTextureFormat_Undefined &&
+          iv->resource && gex_resource(iv->resource)->texture &&
+          compute->images.dimensions[i] != WGPUTextureViewDimension_Undefined &&
+          gex_wgpu_image_is_packed(
+             format, true, false,
+             compute->images.dimensions[i] == WGPUTextureViewDimension_3D
+                ? GLSL_SAMPLER_DIM_3D : GLSL_SAMPLER_DIM_2D,
+             true, false)) {
+         compute->dyn_packed |= (uint16_t)1u << i;
+         compute->images.formats[i] = format;
+         continue;
+      }
       if (gex_wgpu_storage_texture_format(format) ==
           WGPUTextureFormat_Undefined) {
          static bool said;
@@ -25719,6 +25760,37 @@ gex_wgpu_compute_module(struct gex_wgpu_context *ctx,
             if ((compute->images.unformatted & ((uint16_t)1u << i)) &&
                 compute->images.slots[i] == var->data.driver_location)
                var->data.image.format = compute->images.formats[i];
+      }
+   }
+   /* And the ones resolved to a format with no storage texture become
+    * packed images in this variant; see dyn_packed. */
+   if (compute->dyn_packed) {
+      uint8_t slots[GEX_WGPU_MAX_SHADER_IMAGES];
+      uint32_t bindings[GEX_WGPU_MAX_SHADER_IMAGES];
+      enum pipe_format formats[GEX_WGPU_MAX_SHADER_IMAGES];
+      bool writes[GEX_WGPU_MAX_SHADER_IMAGES];
+      unsigned n = 0;
+      for (unsigned i = 0; i < compute->images.count; ++i) {
+         if (!(compute->dyn_packed & ((uint16_t)1u << i)))
+            continue;
+         slots[n] = compute->images.slots[i];
+         bindings[n] = GEX_WGPU_PACKED_IMAGE_FIRST_BINDING;
+         formats[n] = compute->images.formats[i];
+         writes[n] = true;
+         ++n;
+      }
+      char why[176] = {0};
+      if (!gex_wgpu_apply_packed_images(clone, n, slots, bindings, formats,
+                                        writes, MESA_SHADER_COMPUTE, why,
+                                        sizeof(why))) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: dispatch declined (packing an "
+                    "unformatted image: %s)\n", why[0] ? why : "failed");
+         }
+         ralloc_free(clone);
+         return NULL;
       }
    }
    if (!gex_wgpu_lower_texture_variant(clone, compute->texture_count,
@@ -26056,6 +26128,9 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
    for (unsigned i = 0; i < compute->images.count; ++i) {
       WGPUTextureView image_view = NULL;
       bool owned = false;
+      /* Bound as a packed image below instead; see dyn_packed. */
+      if (compute->dyn_packed & ((uint16_t)1u << i))
+         continue;
       if (!gex_wgpu_stage_image_view(ctx, MESA_SHADER_COMPUTE,
                                      &compute->images, i, "dispatch",
                                      &image_view, &owned))
@@ -26157,8 +26232,34 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
     * each, and unlike the draw path a read image is served here: the copy
     * into the buffer goes on the encoder before the dispatch, where there is
     * no pass to break open. */
+   /* The shader's own packed images, then this dispatch's unformatted ones
+    * (dyn_packed), as one list: they share the header block, whose entry is
+    * emitted once. */
+   unsigned packed_total = compute->images.packed_count;
+   uint8_t packed_slot_of[2 * GEX_WGPU_MAX_SHADER_IMAGES];
+   enum pipe_format packed_format_of[2 * GEX_WGPU_MAX_SHADER_IMAGES];
+   bool packed_read_of[2 * GEX_WGPU_MAX_SHADER_IMAGES];
+   bool packed_write_of[2 * GEX_WGPU_MAX_SHADER_IMAGES];
    for (unsigned i = 0; i < compute->images.packed_count; ++i) {
-      const unsigned slot = compute->images.packed_slots[i];
+      packed_slot_of[i] = compute->images.packed_slots[i];
+      packed_format_of[i] = compute->images.packed_formats[i];
+      packed_read_of[i] = compute->images.packed_read[i];
+      packed_write_of[i] = compute->images.packed_write[i];
+   }
+   for (unsigned i = 0; i < compute->images.count; ++i) {
+      if (!(compute->dyn_packed & ((uint16_t)1u << i)))
+         continue;
+      packed_slot_of[packed_total] = compute->images.slots[i];
+      packed_format_of[packed_total] = compute->images.formats[i];
+      /* Seeded, although the shader never reads it: the copy back writes
+       * the whole subresource, and GL says a store touches only its texel
+       * (gex_wgpu_image_alias has the case that showed it). */
+      packed_read_of[packed_total] = true;
+      packed_write_of[packed_total] = true;
+      ++packed_total;
+   }
+   for (unsigned i = 0; i < packed_total; ++i) {
+      const unsigned slot = packed_slot_of[i];
       const struct pipe_image_view *iv =
          &ctx->shader_images[MESA_SHADER_COMPUTE][slot];
       WGPUBuffer buffer = NULL, header = NULL;
@@ -26169,8 +26270,8 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
          size = GEX_WGPU_PACKED_IMAGE_HEADERS_BYTES;
       } else {
          buffer = gex_wgpu_packed_image_bind(
-            ctx, slot, iv, compute->images.packed_formats[i],
-            compute->images.packed_read[i], &size, &header, &data_offset);
+            ctx, slot, iv, packed_format_of[i],
+            packed_read_of[i], &size, &header, &data_offset);
       }
       if (!buffer || !header) {
          static bool said;
@@ -26190,11 +26291,11 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
             (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
          entries[count].binding = half
             ? GEX_WGPU_PACKED_IMAGE_DATA_FIRST_BINDING + slot
-            : compute->images.packed_bindings[i];
+            : GEX_WGPU_PACKED_IMAGE_FIRST_BINDING;
          entries[count].visibility = WGPUShaderStage_Compute;
          entries[count].buffer.type =
             !half ? WGPUBufferBindingType_Uniform
-            : compute->images.packed_write[i]
+            : packed_write_of[i]
                ? WGPUBufferBindingType_Storage
                : WGPUBufferBindingType_ReadOnlyStorage;
          entries[count].buffer.hasDynamicOffset = false;
