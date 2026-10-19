@@ -1480,8 +1480,10 @@ static_assert(GEX_WGPU_MAX_BUFFER_TEXTURES == GEX_WGPU_MAX_SAMPLERS,
 #define GEX_WGPU_CACHE_MAX_ENTRIES (2 * GEX_WGPU_MAX_SAMPLERS)
 #define GEX_WGPU_BGL_CACHE_SLOTS 64
 #define GEX_WGPU_PL_CACHE_SLOTS 64
-#define GEX_WGPU_BG_CACHE_SLOTS 512
-#define GEX_WGPU_PIPELINE_CACHE_SLOTS 256
+#define GEX_WGPU_BG_CACHE_SLOTS 1024
+#define GEX_WGPU_BG_CACHE_WAYS 4
+#define GEX_WGPU_PIPELINE_CACHE_SLOTS 1024
+#define GEX_WGPU_PIPELINE_CACHE_WAYS 4
 #define GEX_WGPU_PIPELINE_KEY_MAX 4096
 /* Big enough that Minecraft, which uploads about two constant buffers per
  * draw, wraps every few dozen frames rather than every few draws. */
@@ -1674,8 +1676,10 @@ struct gex_wgpu_screen {
       unsigned count;
       WGPUBindGroupEntry entries[GEX_WGPU_CACHE_MAX_ENTRIES];
       WGPUBindGroup group;
+      uint64_t last_used;
    } bg_cache[GEX_WGPU_BG_CACHE_SLOTS];
    uint64_t bg_cache_hits, bg_cache_misses;
+   uint64_t bg_cache_clock;
    /* One readback staging buffer, reused. Every texture_map(PIPE_MAP_READ)
     * created one and released it again, and presentation goes through that
     * path once a frame -- so an ordinary windowed application allocated and
@@ -1765,9 +1769,11 @@ struct gex_wgpu_screen {
        * were a megabyte of the screen's, used or not. */
       uint8_t *key;
       unsigned key_capacity;
+      uint64_t last_used;
       WGPURenderPipeline pipeline;
    } pipeline_cache[GEX_WGPU_PIPELINE_CACHE_SLOTS];
    uint64_t pipeline_cache_hits, pipeline_cache_misses;
+   uint64_t pipeline_cache_clock;
    /* Device limits, so caps report what this device can honour rather than
     * what the driver was compiled to hold. Advertising more than the device
     * allows does not fail here -- it fails later, at pipeline creation, on
@@ -40899,8 +40905,17 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
       return fresh;
    }
    const uint32_t hash = gex_wgpu_cache_hash(key, length);
-   struct gex_wgpu_pipeline_cache_slot *slot =
-      &screen->pipeline_cache[hash % GEX_WGPU_PIPELINE_CACHE_SLOTS];
+   /* Set-associative, GEX_WGPU_PIPELINE_CACHE_WAYS to a set, least recently
+    * used out. Direct-mapped, two live pipelines whose hashes met in a slot
+    * evicted each other every time a frame alternated between them -- a
+    * steady few re-creations a frame even in vanilla, and each one a backend
+    * pipeline compile in the browser's GPU process, because the evicted
+    * pipeline had been released and Dawn's own cache let it go. */
+   struct gex_wgpu_pipeline_cache_slot *set =
+      &screen->pipeline_cache[(hash % (GEX_WGPU_PIPELINE_CACHE_SLOTS /
+                                       GEX_WGPU_PIPELINE_CACHE_WAYS)) *
+                              GEX_WGPU_PIPELINE_CACHE_WAYS];
+   const uint64_t now = ++screen->pipeline_cache_clock;
    *cached = true;
    /* The epoch, as the bind group cache does. Serialising the descriptor
     * keeps every *field* in the key, which is what the note above is about,
@@ -40908,13 +40923,30 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
     * address and an address is reused once the module behind it is released.
     * Without this the cache returned a pipeline built from a deleted
     * shader. */
-   if (slot->used && slot->epoch == screen->pipeline_epoch &&
-       slot->hash == hash && slot->key_length == length &&
-       memcmp(slot->key, key, length) == 0) {
-      ++screen->pipeline_cache_hits;
-      { const WGPURenderPipeline gex_ret = slot->pipeline;
-        simple_mtx_unlock(&screen->cache_lock);
-        return gex_ret; }
+   struct gex_wgpu_pipeline_cache_slot *slot = NULL;
+   for (unsigned way = 0; way < GEX_WGPU_PIPELINE_CACHE_WAYS; ++way) {
+      struct gex_wgpu_pipeline_cache_slot *candidate = &set[way];
+      if (candidate->used && candidate->epoch == screen->pipeline_epoch &&
+          candidate->hash == hash && candidate->key_length == length &&
+          memcmp(candidate->key, key, length) == 0) {
+         candidate->last_used = now;
+         ++screen->pipeline_cache_hits;
+         { const WGPURenderPipeline gex_ret = candidate->pipeline;
+           simple_mtx_unlock(&screen->cache_lock);
+           return gex_ret; }
+      }
+      /* The victim, should this miss: an empty way, then one from a past
+       * epoch (it can never hit again), then the least recently used. */
+      if (!slot)
+         slot = candidate;
+      else if (slot->used &&
+               (!candidate->used ||
+                (candidate->epoch != screen->pipeline_epoch &&
+                 slot->epoch == screen->pipeline_epoch) ||
+                ((candidate->epoch == screen->pipeline_epoch) ==
+                    (slot->epoch == screen->pipeline_epoch) &&
+                 candidate->last_used < slot->last_used)))
+         slot = candidate;
    }
    ++screen->pipeline_cache_misses;
 
@@ -40953,6 +40985,7 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
    slot->epoch = screen->pipeline_epoch;
    slot->hash = hash;
    slot->key_length = length;
+   slot->last_used = now;
    memcpy(slot->key, key, length);
    slot->pipeline = pipeline;
    { const WGPURenderPipeline gex_ret = pipeline;
@@ -41100,16 +41133,39 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
       hash ^= gex_wgpu_cache_hash(key, sizeof(key)) * (i + 1u);
    }
 
-   struct gex_wgpu_bg_cache_slot *slot =
-      &screen->bg_cache[hash % GEX_WGPU_BG_CACHE_SLOTS];
-   if (slot->used && slot->epoch == screen->cache_epoch &&
-       slot->hash == hash && slot->layout == layout &&
-       slot->count == count &&
-       gex_wgpu_bg_entries_equal(slot->entries, entries, count)) {
-      ++screen->bg_cache_hits;
-      { const WGPUBindGroup gex_ret = slot->group;
-        simple_mtx_unlock(&screen->cache_lock);
-        return gex_ret; }
+   /* Set-associative with LRU, as the pipeline cache is, and for the same
+    * reason: direct-mapped, two groups a frame alternates between evicted each
+    * other whenever their hashes met in a slot, and a bind group is created
+    * across the JS boundary in the browser. */
+   struct gex_wgpu_bg_cache_slot *set =
+      &screen->bg_cache[(hash % (GEX_WGPU_BG_CACHE_SLOTS /
+                                 GEX_WGPU_BG_CACHE_WAYS)) *
+                        GEX_WGPU_BG_CACHE_WAYS];
+   const uint64_t now = ++screen->bg_cache_clock;
+   struct gex_wgpu_bg_cache_slot *slot = NULL;
+   for (unsigned way = 0; way < GEX_WGPU_BG_CACHE_WAYS; ++way) {
+      struct gex_wgpu_bg_cache_slot *candidate = &set[way];
+      if (candidate->used && candidate->epoch == screen->cache_epoch &&
+          candidate->hash == hash && candidate->layout == layout &&
+          candidate->count == count &&
+          gex_wgpu_bg_entries_equal(candidate->entries, entries, count)) {
+         candidate->last_used = now;
+         ++screen->bg_cache_hits;
+         { const WGPUBindGroup gex_ret = candidate->group;
+           simple_mtx_unlock(&screen->cache_lock);
+           return gex_ret; }
+      }
+      /* The victim: an empty way, then a stale one, then the oldest. */
+      if (!slot)
+         slot = candidate;
+      else if (slot->used &&
+               (!candidate->used ||
+                (candidate->epoch != screen->cache_epoch &&
+                 slot->epoch == screen->cache_epoch) ||
+                ((candidate->epoch == screen->cache_epoch) ==
+                    (slot->epoch == screen->cache_epoch) &&
+                 candidate->last_used < slot->last_used)))
+         slot = candidate;
    }
    ++screen->bg_cache_misses;
 
@@ -41161,6 +41217,7 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    slot->hash = hash;
    slot->layout = layout;
    slot->count = count;
+   slot->last_used = now;
    gex_wgpu_bg_entries_store(slot->entries, entries, count);
    /* Held until this slot is evicted; see gex_wgpu_bg_entries_ref. */
    gex_wgpu_bg_entries_ref(slot->entries, slot->count);
