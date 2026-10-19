@@ -16969,7 +16969,38 @@ gex_wgpu_set_scissor_states(struct pipe_context *pipe, unsigned start_slot,
    }
 }
 
-/* The same vertex format with the signedness the shader asked for.
+/* The integer format of the same width as a float, normalized or packed
+ * one, for gex_wgpu_vertex_format_signed_as; anything else is unchanged. */
+static WGPUVertexFormat
+gex_wgpu_vertex_format_as_uint(WGPUVertexFormat format)
+{
+   switch (format) {
+   case WGPUVertexFormat_Float32:   return WGPUVertexFormat_Uint32;
+   case WGPUVertexFormat_Float32x2: return WGPUVertexFormat_Uint32x2;
+   case WGPUVertexFormat_Float32x3: return WGPUVertexFormat_Uint32x3;
+   case WGPUVertexFormat_Float32x4: return WGPUVertexFormat_Uint32x4;
+   case WGPUVertexFormat_Float16:
+   case WGPUVertexFormat_Unorm16:
+   case WGPUVertexFormat_Snorm16:   return WGPUVertexFormat_Uint16;
+   case WGPUVertexFormat_Float16x2:
+   case WGPUVertexFormat_Unorm16x2:
+   case WGPUVertexFormat_Snorm16x2: return WGPUVertexFormat_Uint16x2;
+   case WGPUVertexFormat_Float16x4:
+   case WGPUVertexFormat_Unorm16x4:
+   case WGPUVertexFormat_Snorm16x4: return WGPUVertexFormat_Uint16x4;
+   case WGPUVertexFormat_Unorm8:
+   case WGPUVertexFormat_Snorm8:    return WGPUVertexFormat_Uint8;
+   case WGPUVertexFormat_Unorm8x2:
+   case WGPUVertexFormat_Snorm8x2:  return WGPUVertexFormat_Uint8x2;
+   case WGPUVertexFormat_Unorm8x4:
+   case WGPUVertexFormat_Snorm8x4:
+   case WGPUVertexFormat_Unorm8x4BGRA: return WGPUVertexFormat_Uint8x4;
+   case WGPUVertexFormat_Unorm10_10_10_2: return WGPUVertexFormat_Uint32;
+   default: return format;
+   }
+}
+
+/* The same vertex format with the base type the shader asked for.
  *
  * GL lets an integer attribute's buffer type and its shader declaration
  * disagree in signedness: `glVertexAttribIPointer(..., GL_UNSIGNED_SHORT, ...)`
@@ -16980,9 +17011,16 @@ gex_wgpu_set_scissor_states(struct pipe_context *pipe, unsigned start_slot,
  *   shader's base type (Sint) in location (0).
  *
  * Since the two formats differ only in how the same bytes are read, naming the
- * one the shader declared is the whole fix. Anything that is not an integer
- * pair is returned unchanged -- a float format against an integer input is a
- * real mismatch GL would not have allowed.
+ * one the shader declared is the whole fix.
+ *
+ * A float or normalized array feeding an integer input is the same mismatch
+ * one step further: GL does not refuse it, it leaves the values undefined,
+ * so the bytes are fetched as integers of the same width. MakeUp declares
+ * `attribute int blockEntityId`, which Iris 1.4.5 never binds, and the linker
+ * placed it where Iris's own arrays are (a Float32 and a Snorm8x4). The
+ * pipeline was invalid at every such draw, and so was each command buffer it
+ * reached. The opposite case, an integer array feeding a float input, is the
+ * shader's to resolve (GEX_WGPU_UNPACK_SINT_BITS).
  */
 static WGPUVertexFormat
 gex_wgpu_vertex_format_signed_as(WGPUVertexFormat format, bool want_sint,
@@ -16990,6 +17028,7 @@ gex_wgpu_vertex_format_signed_as(WGPUVertexFormat format, bool want_sint,
 {
    if (want_sint == want_uint)
       return format;                   /* neither, or a shader that is both */
+   format = gex_wgpu_vertex_format_as_uint(format);
    if (want_sint) {
       switch (format) {
       case WGPUVertexFormat_Uint8:    return WGPUVertexFormat_Sint8;
@@ -38456,6 +38495,13 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       for (unsigned i = 0; i < ve->count; ++i) {
          const unsigned location = vs->vertex_element_location[i];
          const enum pipe_format format = ve->elements[i].src_format;
+         /* An integer input takes its element's bytes as integers whatever
+          * the array's type (see gex_wgpu_vertex_format_signed_as), so a
+          * conversion to float meant for this format must not retype it. */
+         if (location < 64 &&
+             ((vs->vertex_locations_sint | vs->vertex_locations_uint) &
+              BITFIELD64_BIT(location)))
+            want_unpack[i] = GEX_WGPU_UNPACK_NONE;
          if (location < 64 && !vs->double_inputs[i] &&
              !(vs->vertex_locations_sint & BITFIELD64_BIT(location)) &&
              !(vs->vertex_locations_uint & BITFIELD64_BIT(location)) &&
