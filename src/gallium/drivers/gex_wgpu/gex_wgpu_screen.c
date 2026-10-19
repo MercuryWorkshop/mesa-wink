@@ -50056,6 +50056,17 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * next person does not spend the afternoon on it. */
    caps->max_vertex_buffers = 8;
    caps->max_vertex_attrib_stride = 2048;
+   /* And so no dynamic VAO fast path. With it st/mesa gives every enabled
+    * attribute a vertex buffer of its own instead of folding interleaved
+    * attributes into one binding, which is free on hardware with thirty-two
+    * slots and a cliff with eight: a ninth attribute and u_vbuf marks *every*
+    * element incompatible ("more vertex buffers are used than the hardware
+    * supports"), reads the GPU buffer back, repacks it on the CPU and uploads
+    * it again, at every draw. Iris's Sodium terrain is nine attributes in one
+    * interleaved buffer -- with Complementary on, that was most of the render
+    * thread, waiting on readbacks that grow with the render distance. Folded,
+    * it is two bindings: the vertices and the per-instance chunk offset. */
+   caps->allow_dynamic_vao_fastpath = false;
    /* Per-instance vertex attributes, which is ARB_instanced_arrays.
     *
     * Left false, st/mesa never exposed the extension, so every
