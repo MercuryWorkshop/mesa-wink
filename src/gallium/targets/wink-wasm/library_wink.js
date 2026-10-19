@@ -149,7 +149,9 @@ var LibraryWink = {
       'maxComputeWorkgroupSizeX': 1024,
       'maxComputeWorkgroupSizeY': 1024,
       'maxComputeWorkgroupSizeZ': 64,
-      'maxComputeWorkgroupStorageSize': 32768,
+      // GL_MAX_COMPUTE_SHARED_MEMORY_SIZE is this; Photon wants 36 KiB, and
+      // Intel and most desktop adapters offer 48 or 64.
+      'maxComputeWorkgroupStorageSize': 65536,
       'maxTextureDimension1D': 16384,
       'maxTextureDimension2D': 16384,
       'maxTextureDimension3D': 2048,

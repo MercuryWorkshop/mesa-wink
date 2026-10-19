@@ -400,7 +400,12 @@ create_device(void)
       GEX_WANT(maxComputeWorkgroupSizeX, 1024);
       GEX_WANT(maxComputeWorkgroupSizeY, 1024);
       GEX_WANT(maxComputeWorkgroupSizeZ, 64);
-      GEX_WANT(maxComputeWorkgroupStorageSize, 32768);
+      /* GL's minimum is 32 KiB, but GL_MAX_COMPUTE_SHARED_MEMORY_SIZE is
+       * whatever this grants, and shaders written against a desktop driver
+       * use more: Photon's deferred4_a declares 36 KiB and failed to link
+       * ("Too much shared memory used (36860/32768)") on an adapter that
+       * offers 48. As much as the adapter has, up to WebGPU's top tier. */
+      GEX_WANT(maxComputeWorkgroupStorageSize, 65536);
       /* Textures, because the *GL version* depends on them and nothing else
        * does: the 4.1 rung of _mesa_compute_version requires a 16384 texture
        * and 2048 array layers where WebGPU guarantees 8192 and 256. A device
