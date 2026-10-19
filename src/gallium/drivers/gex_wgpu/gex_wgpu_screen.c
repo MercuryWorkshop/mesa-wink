@@ -115,10 +115,11 @@ extern void gex_wgpu_jspi_signal(void);
  * 0..3", and a shader with several ordinary textures and one samplerBuffer
  * puts it well past unit 3. KHR-GL44's compute_shader.resource-texture uses
  * unit 6, and it failed with "slot=6 count=0 max=4" -- a message that reads
- * like a capacity problem and is not one. Sixteen is the sampler-unit count,
- * so any declaration fits; the bindings after this are all derived from it
- * and move with it. */
-#define GEX_WGPU_MAX_BUFFER_TEXTURES 16
+ * like a capacity problem and is not one. This is the sampler-unit count
+ * (GEX_WGPU_MAX_SAMPLERS, spelled out because it is used here before that is
+ * defined), so any declaration fits; the bindings after this are all derived
+ * from it and move with it. */
+#define GEX_WGPU_MAX_BUFFER_TEXTURES 32
 /* ARB_shader_draw_parameters: gl_BaseVertexARB, gl_BaseInstanceARB and
  * gl_DrawIDARB, which WGSL has no builtin for.
  *
@@ -1216,11 +1217,22 @@ gex_wgpu_topology(enum mesa_prim mode)
    default: return WGPUPrimitiveTopology_TriangleList;
    }
 }
-/* Sixteen, not eight: GL 3.1 requires MAX_VERTEX_TEXTURE_IMAGE_UNITS >= 16,
- * and WebGPU's default maxSampledTexturesPerShaderStage and
- * maxSamplersPerShaderStage are both exactly that. The slot masks below are
- * sized to match; an eight-bit mask silently dropped slots 8 and up. */
-#define GEX_WGPU_MAX_SAMPLERS 16
+/* Room for Mesa's 32 units (MAX_TEXTURE_IMAGE_UNITS), which is what every
+ * per-slot array and mask is sized by. How many a stage *offers* is a cap:
+ * GEX_WGPU_MAX_STAGE_SAMPLERS for all but the fragment stage, and for the
+ * fragment stage whatever the device's sampled-texture limit leaves room for.
+ * Sixteen was the ceiling while it was also WebGPU's default
+ * maxSampledTexturesPerShaderStage -- and that is the shaderpack wall: Iris
+ * sizes its pool from GL_MAX_TEXTURE_IMAGE_UNITS, and Complementary's HIGH
+ * profile asks for a seventeenth. The masks are 32-bit; an eight-bit one
+ * once silently dropped slots 8 and up, and a sixteen-bit one would have
+ * dropped 16 and up out of the variant keys. */
+#define GEX_WGPU_MAX_SAMPLERS 32
+/* The units every stage but the fragment stage offers. GL 3.1 requires
+ * MAX_VERTEX_TEXTURE_IMAGE_UNITS >= 16 and wants no more; the compute-run
+ * stages bind a texture *and* a sampler for every unit into a group whose
+ * masks are 64-bit (GEX_WGPU_MAX_GROUP_BINDINGS), so they stay here. */
+#define GEX_WGPU_MAX_STAGE_SAMPLERS 16
 
 /* The three stages this driver runs as compute passes and which therefore
  * keep their sampler state in gex_wgpu_context::stage_sampler_views. */
@@ -1478,8 +1490,11 @@ gex_wgpu_collect_stage_images(nir_shader *nir,
 static_assert(GEX_WGPU_MAX_BUFFER_TEXTURES == GEX_WGPU_MAX_SAMPLERS,
               "a buffer texture is indexed by its sampler unit");
 /* The widest bind group any of the four can have: the fragment texture group
- * carries a texture and a sampler per slot. */
-#define GEX_WGPU_CACHE_MAX_ENTRIES (2 * GEX_WGPU_MAX_SAMPLERS)
+ * carries a texture and a sampler per slot, and a colour-attachment copy per
+ * render target for framebuffer fetch and logic ops (GEX_WGPU_LOGICOP_BINDING
+ * + rt). Without those eight a draw that used every unit and read the
+ * framebuffer would have found no cache slot wide enough. */
+#define GEX_WGPU_CACHE_MAX_ENTRIES (2 * GEX_WGPU_MAX_SAMPLERS + 8)
 #define GEX_WGPU_BGL_CACHE_SLOTS 64
 #define GEX_WGPU_PL_CACHE_SLOTS 64
 #define GEX_WGPU_BG_CACHE_SLOTS 1024
@@ -2793,9 +2808,9 @@ struct gex_wgpu_shader {
     * found no input variables, and the caller falls back to the element
     * index. */
    uint8_t vertex_element_location[GEX_WGPU_MAX_VERTEX_ELEMENTS];
-   uint16_t integer_sampled_slots;
+   uint32_t integer_sampled_slots;
    /* Texture slots whose shader declaration is multisampled. */
-   uint16_t multisampled_slots;
+   uint32_t multisampled_slots;
    /* Slots whose *every* use is a query -- textureSize, textureQueryLevels or
     * textureSamples -- and never a sample.
     *
@@ -2809,7 +2824,7 @@ struct gex_wgpu_shader {
     * A query-only slot needs no binding at all, though: every answer is a
     * property of the bound view, so the variant replaces the queries with
     * immediates and the declaration falls out as dead code. */
-   uint16_t query_only_slots;
+   uint32_t query_only_slots;
    /* And which of those are *arrays*. WGSL has no multisampled array texture
     * and Dawn will not create one either, so the driver holds a GL
     * 2D_MULTISAMPLE_ARRAY as one wide multisampled 2D texture with the layers
@@ -2817,7 +2832,7 @@ struct gex_wgpu_shader {
     * cannot be rewritten here, because the tile width comes from the bound
     * texture, so it is deferred to the variant exactly as integer sampling
     * is: no base module is built for such a shader. */
-   uint16_t ms_array_slots;
+   uint32_t ms_array_slots;
    /* Whether the shader reads gl_DrawID. Only then does a non-zero
     * drawid_offset change what it computes. */
    bool reads_draw_id;
@@ -3010,7 +3025,7 @@ struct gex_wgpu_interp_variant {
     * filters, wrap modes and view swizzles, so two draws with different
     * sampler state need different modules -- exactly as the fragment stage
     * keys its own variants. */
-   uint16_t sampler_mask;
+   uint32_t sampler_mask;
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
    /* The vertex-element unpack signature this module was built for. A vertex
@@ -3044,7 +3059,7 @@ struct gex_wgpu_shader_variant {
    /* The colour output base type this variant declares, which has to match
     * the bound target's. */
    nir_alu_type color_output_type;
-   uint16_t sampler_mask;
+   uint32_t sampler_mask;
    /* The GL_COORD_REPLACE mask this variant substituted, which is zero for
     * every draw that is not points -- so a points variant and a triangles
     * variant of the same shader are distinct and neither is reused for the
@@ -3103,25 +3118,25 @@ struct gex_wgpu_shader_variant {
    bool drop_color;
    /* Texture slots removed from this variant because the bound state could
     * not satisfy their declaration; see gex_wgpu_unusable_texture_slots. */
-   uint16_t omitted_slots;
+   uint32_t omitted_slots;
    /* Slots this variant rewrote from a multisampled declaration to an
     * ordinary one, because the bound texture has a single sample. Part of the
     * key: the same shader against a real multisample texture is a different
     * module. */
-   uint16_t demoted_ms_slots;
+   uint32_t demoted_ms_slots;
    /* Slots this variant read as a tiled multisampled array, and the geometry
     * it baked in as immediates. Both are part of the key: the width decides
     * every rewritten coordinate and the layer count decides what textureSize
     * answers, so the same shader against a differently shaped array is a
     * different module. */
-   uint16_t tiled_ms_slots;
+   uint32_t tiled_ms_slots;
    uint32_t tiled_ms_geom[GEX_WGPU_MAX_SAMPLERS][3];
    /* The tile offset this variant subtracted from gl_FragCoord, baked in as
     * an immediate and so part of the key. */
    uint32_t frag_tile_x;
    /* Slots whose queries this variant answered with immediates, and the
     * answers. Both are part of the key for the obvious reason. */
-   uint16_t query_only_slots;
+   uint32_t query_only_slots;
    uint32_t query_only_geom[GEX_WGPU_MAX_SAMPLERS][5];
    /* The polygon offset this variant computes itself, and the state it baked
     * in as immediates; see gex_wgpu_lower_polygon_offset_clamp. All four are
@@ -3333,7 +3348,7 @@ struct gex_wgpu_gs {
    /* Which of those are sampled as integers, and the modules built for them.
     * Empty for almost every shader, in which case the base module is used
     * directly and none of this costs anything. */
-   uint16_t integer_sampled_slots;
+   uint32_t integer_sampled_slots;
    struct gex_wgpu_gs_variant *variants;
    /* And the images. GL 4.2 puts image uniforms in every stage, and this one
     * runs as a compute pass, where WebGPU allows a writable storage texture
@@ -3461,7 +3476,7 @@ struct gex_wgpu_tcs {
    /* Which of those are sampled as integers, and the modules built for them.
     * Empty for almost every shader, and then `module` below is the only one
     * and none of this costs anything. */
-   uint16_t integer_sampled_slots;
+   uint32_t integer_sampled_slots;
    struct gex_wgpu_tcs_variant *variants;
    /* Kept only when there are integer-sampled slots, because then the
     * variants are the only modules this shader ever has and each is built
@@ -3534,7 +3549,7 @@ struct gex_wgpu_tes {
    struct gex_wgpu_stage_textures textures;
    /* Which of those are sampled as integers. Empty for almost every shader,
     * and then none of the variant's texture key is looked at. */
-   uint16_t integer_sampled_slots;
+   uint32_t integer_sampled_slots;
    /* And its images; see gex_wgpu_collect_stage_images. This stage
     * runs as a compute pass too, so a writable storage texture is
     * legal in it for the same reason it is in the geometry one. */
@@ -9382,7 +9397,7 @@ gex_wgpu_lower_integer_txd(const nir_tex_instr *tex, const void *data)
  * float cases.
  */
 struct gex_wgpu_omit_textures {
-   uint16_t slots;
+   uint32_t slots;
    bool progress;
 };
 
@@ -9423,7 +9438,7 @@ gex_wgpu_omit_texture_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 static bool
-gex_wgpu_omit_textures(nir_shader *nir, uint16_t slots)
+gex_wgpu_omit_textures(nir_shader *nir, uint32_t slots)
 {
    struct gex_wgpu_omit_textures state = {.slots = slots};
    nir_shader_instructions_pass(nir, gex_wgpu_omit_texture_instr,
@@ -9454,7 +9469,7 @@ gex_wgpu_omit_textures(nir_shader *nir, uint16_t slots)
  * KHR-GL44.sample_variables' nine remaining failures are that, all of them
  * rgba32f, which is exactly the format WebGPU will not multisample. */
 struct gex_wgpu_demote_ms {
-   uint16_t slots;
+   uint32_t slots;
    bool progress;
 };
 
@@ -9467,8 +9482,8 @@ gex_wgpu_demote_ms_instr(nir_builder *b, nir_instr *instr, void *data)
    nir_tex_instr *tex = nir_instr_as_tex(instr);
    if (tex->sampler_dim != GLSL_SAMPLER_DIM_MS)
       return false;
-   if (tex->texture_index >= 16 ||
-       !(state->slots & (uint16_t)(1u << tex->texture_index)))
+   if (tex->texture_index >= GEX_WGPU_MAX_SAMPLERS ||
+       !(state->slots & (uint32_t)(1u << tex->texture_index)))
       return false;
    tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
    /* The sample index has no meaning once the texture has one sample, and
@@ -9501,7 +9516,7 @@ gex_wgpu_demote_ms_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 static bool
-gex_wgpu_demote_ms_textures(nir_shader *nir, uint16_t slots)
+gex_wgpu_demote_ms_textures(nir_shader *nir, uint32_t slots)
 {
    struct gex_wgpu_demote_ms state = {.slots = slots};
    nir_shader_instructions_pass(nir, gex_wgpu_demote_ms_instr,
@@ -9530,7 +9545,7 @@ gex_wgpu_demote_ms_textures(nir_shader *nir, uint16_t slots)
        * dropped the sample index. Tint says so exactly: "Image Operand Sample
        * is required for operation on multi-sampled image". */
       const unsigned at = var->data.driver_location;
-      if (at >= 16 || !(slots & (uint16_t)(1u << at)))
+      if (at >= GEX_WGPU_MAX_SAMPLERS || !(slots & (uint32_t)(1u << at)))
          continue;
       const bool is_array = glsl_sampler_type_is_array(type);
       const struct glsl_type *flat = sampler
@@ -9577,7 +9592,7 @@ gex_wgpu_demote_ms_textures(nir_shader *nir, uint16_t slots)
  * disagree about. The same move as the multisampled-array textureSize, which
  * cannot be read off the flattened texture either. */
 struct gex_wgpu_query_const {
-   uint16_t slots;
+   uint32_t slots;
    /* width, height, layers-or-depth, levels, samples -- per slot */
    const uint32_t (*geom)[5];
    bool progress;
@@ -9594,7 +9609,7 @@ gex_wgpu_lower_query_only_instr(nir_builder *b, nir_instr *instr, void *data)
        tex->op != nir_texop_texture_samples)
       return false;
    if (tex->texture_index >= GEX_WGPU_MAX_SAMPLERS ||
-       !(state->slots & (uint16_t)(1u << tex->texture_index)))
+       !(state->slots & (uint32_t)(1u << tex->texture_index)))
       return false;
    const uint32_t *g = state->geom[tex->texture_index];
    b->cursor = nir_before_instr(instr);
@@ -9642,7 +9657,7 @@ gex_wgpu_lower_query_only_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 static bool
-gex_wgpu_lower_query_only(nir_shader *nir, uint16_t slots,
+gex_wgpu_lower_query_only(nir_shader *nir, uint32_t slots,
                           const uint32_t (*geom)[5])
 {
    struct gex_wgpu_query_const state = {.slots = slots, .geom = geom};
@@ -9739,7 +9754,7 @@ gex_wgpu_lower_frag_coord_tile(nir_shader *nir, uint32_t tile_x)
  * and a single layer, so textureSize would answer for the wrong thing. That
  * makes it part of the variant key. */
 struct gex_wgpu_tiled_ms {
-   uint16_t slots;
+   uint32_t slots;
    const uint32_t (*geom)[3];   /* width, height, layers -- per slot */
    bool progress;
 };
@@ -9754,7 +9769,7 @@ gex_wgpu_flatten_ms_array_instr(nir_builder *b, nir_instr *instr, void *data)
    if (tex->sampler_dim != GLSL_SAMPLER_DIM_MS || !tex->is_array)
       return false;
    if (tex->texture_index >= GEX_WGPU_MAX_SAMPLERS ||
-       !(state->slots & (uint16_t)(1u << tex->texture_index)))
+       !(state->slots & (uint32_t)(1u << tex->texture_index)))
       return false;
    const uint32_t width = state->geom[tex->texture_index][0];
    const uint32_t height = state->geom[tex->texture_index][1];
@@ -9792,7 +9807,7 @@ gex_wgpu_flatten_ms_array_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 static bool
-gex_wgpu_flatten_ms_array(nir_shader *nir, uint16_t slots,
+gex_wgpu_flatten_ms_array(nir_shader *nir, uint32_t slots,
                           const uint32_t (*geom)[3])
 {
    struct gex_wgpu_tiled_ms state = {.slots = slots, .geom = geom};
@@ -9815,7 +9830,7 @@ gex_wgpu_flatten_ms_array(nir_shader *nir, uint16_t slots,
           !glsl_sampler_type_is_array(type))
          continue;
       const unsigned at = var->data.driver_location;
-      if (at >= GEX_WGPU_MAX_SAMPLERS || !(slots & (uint16_t)(1u << at)))
+      if (at >= GEX_WGPU_MAX_SAMPLERS || !(slots & (uint32_t)(1u << at)))
          continue;
       const struct glsl_type *flat = sampler
          ? glsl_sampler_type(GLSL_SAMPLER_DIM_MS, false, false,
@@ -9841,7 +9856,7 @@ static bool
 gex_wgpu_lower_texture_variant(nir_shader *nir,
                                unsigned texture_count,
                                const uint8_t *texture_slots,
-                               uint16_t integer_sampled_slots,
+                               uint32_t integer_sampled_slots,
                                struct gex_wgpu_sampler *const *samplers,
                                struct pipe_sampler_view *const *views)
 {
@@ -14041,7 +14056,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
           * gex_wgpu_flatten_ms_array rewrites the fetches to match once the
           * tile width is known. */
          if (multisampled && is_array)
-            shader->ms_array_slots |= (uint16_t)(1u << slot);
+            shader->ms_array_slots |= (uint32_t)(1u << slot);
          shader->texture_dimensions[shader->texture_count] =
             (multisampled && is_array) ? WGPUTextureViewDimension_2D
                                        : view_dimension;
@@ -14091,7 +14106,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          "gex_wgpu requires collision-free texture and sampler declarations");
       return NULL;
    }
-   uint16_t texture_slots_used = 0, sampler_slots_used = 0;
+   uint32_t texture_slots_used = 0, sampler_slots_used = 0;
    /* One bit per sampler slot, so these must be as wide as the slot space.
     * They were uint8_t, and `1u << slot` for slots 8..15 was truncated away
     * silently: every unit from eight up kept the default Float sample type,
@@ -14100,10 +14115,10 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * rewrote its fetches to zero. A `usampler2D s[16]` read units 0..7 and
     * zero above -- and so did
     * KHR-GL45.geometry_shader.limits.max_combined_texture_units. */
-   uint16_t shadow_slots = 0, float_slots = 0, uint_slots = 0, sint_slots = 0;
+   uint32_t shadow_slots = 0, float_slots = 0, uint_slots = 0, sint_slots = 0;
    /* Queries and samples tracked apart, so a slot that only ever asks about
     * the texture can be told from one that reads it. */
-   uint16_t query_slots = 0, sampled_slots = 0;
+   uint32_t query_slots = 0, sampled_slots = 0;
    /* Which texture op made the metadata invalid, if one did. The masks alone
     * cannot say: the refusals below happen before a slot is recorded, so a
     * rejected shader printed three perfectly consistent masks. Numeric
@@ -14220,9 +14235,9 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    descriptors_valid &= !(shadow_slots & (float_slots | uint_slots | sint_slots));
    descriptors_valid &= !(float_slots & (uint_slots | sint_slots));
    descriptors_valid &= !(uint_slots & sint_slots);
-   shader->query_only_slots = (uint16_t)(query_slots & ~sampled_slots);
+   shader->query_only_slots = (uint32_t)(query_slots & ~sampled_slots);
    for (unsigned i = 0; i < shader->texture_count; ++i) {
-      const uint16_t slot_bit = 1u << shader->texture_slots[i];
+      const uint32_t slot_bit = 1u << shader->texture_slots[i];
       if (shadow_slots & slot_bit)
          shader->texture_sample_types[i] = WGPUTextureSampleType_Depth;
       else if (uint_slots & slot_bit)
@@ -14239,7 +14254,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          shader->texture_dimensions[i] = WGPUTextureViewDimension_2DArray;
    }
    for (unsigned i = 0; i < shader->sampler_count; ++i) {
-      const uint16_t slot_bit = 1u << shader->sampler_slots[i];
+      const uint32_t slot_bit = 1u << shader->sampler_slots[i];
       if (shadow_slots & slot_bit)
          shader->sampler_types[i] = WGPUSamplerBindingType_Comparison;
       else if ((uint_slots | sint_slots) & slot_bit)
@@ -15204,11 +15219,11 @@ static WGPUTextureSampleType gex_wgpu_format_sample_type(enum pipe_format fmt);
  * that, and serving it is better than removing the sampler, because the
  * shader may go on to use the result.
  */
-static uint16_t
+static uint32_t
 gex_wgpu_unusable_texture_slots(struct gex_wgpu_context *ctx)
 {
    const struct gex_wgpu_shader *fs = ctx->fs;
-   uint16_t mask = 0;
+   uint32_t mask = 0;
    if (!fs)
       return 0;
    for (unsigned i = 0; i < fs->texture_count; ++i) {
@@ -15249,13 +15264,13 @@ gex_wgpu_unusable_texture_slots(struct gex_wgpu_context *ctx)
 /* Slots whose bound texture is a multisampled array held as one wide
  * multisampled 2D texture, with the geometry the shader has to bake in.
  * See gex_wgpu_flatten_ms_array. */
-static uint16_t
+static uint32_t
 gex_wgpu_tiled_ms_slots_for(const struct gex_wgpu_shader *fs,
                             struct pipe_sampler_view *const *views,
                             uint32_t geom[GEX_WGPU_MAX_SAMPLERS][3])
 {
    memset(geom, 0, sizeof(uint32_t) * GEX_WGPU_MAX_SAMPLERS * 3);
-   uint16_t mask = 0;
+   uint32_t mask = 0;
    if (!fs)
       return 0;
    for (unsigned i = 0; i < fs->texture_count; ++i) {
@@ -15272,7 +15287,7 @@ gex_wgpu_tiled_ms_slots_for(const struct gex_wgpu_shader *fs,
       geom[slot][0] = res->ms_tile_width;
       geom[slot][1] = view->texture->height0;
       geom[slot][2] = res->ms_tile_layers;
-      mask |= (uint16_t)(1u << slot);
+      mask |= (uint32_t)(1u << slot);
    }
    return mask;
 }
@@ -15280,13 +15295,13 @@ gex_wgpu_tiled_ms_slots_for(const struct gex_wgpu_shader *fs,
 /* The answers a query-only slot needs, read off the bound view. Only slots
  * that actually have one: with nothing bound there is no answer to bake in,
  * and the unusable-slot machinery already covers that case. */
-static uint16_t
+static uint32_t
 gex_wgpu_query_only_geom(const struct gex_wgpu_shader *sh,
                          struct pipe_sampler_view *const *views,
                          uint32_t geom[GEX_WGPU_MAX_SAMPLERS][5])
 {
    memset(geom, 0, sizeof(uint32_t) * GEX_WGPU_MAX_SAMPLERS * 5);
-   uint16_t mask = 0;
+   uint32_t mask = 0;
    if (!sh || !sh->query_only_slots)
       return 0;
    for (unsigned i = 0; i < sh->texture_count; ++i) {
@@ -15311,12 +15326,12 @@ gex_wgpu_query_only_geom(const struct gex_wgpu_shader *sh,
          : (view->target == PIPE_TEXTURE_CUBE_ARRAY ? layers / 6u : layers);
       geom[slot][3] = view->u.tex.last_level - first + 1;
       geom[slot][4] = MAX2(1u, (unsigned)t->nr_samples);
-      mask |= (uint16_t)(1u << slot);
+      mask |= (uint32_t)(1u << slot);
    }
    return mask;
 }
 
-static uint16_t
+static uint32_t
 gex_wgpu_tiled_ms_slots(struct gex_wgpu_context *ctx,
                         uint32_t geom[GEX_WGPU_MAX_SAMPLERS][3])
 {
@@ -15326,11 +15341,11 @@ gex_wgpu_tiled_ms_slots(struct gex_wgpu_context *ctx,
 /* Slots the shader declared multisampled where the bound texture has exactly
  * one sample. Legal GL, unrepresentable as a WebGPU multisampled binding, and
  * served by gex_wgpu_demote_ms_textures rewriting the declaration. */
-static uint16_t
+static uint32_t
 gex_wgpu_demotable_ms_slots(struct gex_wgpu_context *ctx)
 {
    const struct gex_wgpu_shader *fs = ctx->fs;
-   uint16_t mask = 0;
+   uint32_t mask = 0;
    if (!fs)
       return 0;
    for (unsigned i = 0; i < fs->texture_count; ++i) {
@@ -15409,7 +15424,7 @@ gex_wgpu_say_no_base_module(const struct gex_wgpu_shader *shader,
 static WGPUShaderModule
 gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                          bool drawing_triangles,
-                         uint16_t *omitted_out, uint16_t *demoted_out)
+                         uint32_t *omitted_out, uint32_t *demoted_out)
 {
    /* Declining, not latching. This returns NULL and draw_vbo checks it, so
     * the caller already learns of the failure -- latching on top ended the
@@ -15460,7 +15475,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    /* Slots the bound state cannot satisfy; their samplers are removed from
     * this variant and their bindings left out of the group. Decided here for
     * the same reason as the line above: there are two early returns below. */
-   const uint16_t want_omit_slots = gex_wgpu_unusable_texture_slots(ctx);
+   const uint32_t want_omit_slots = gex_wgpu_unusable_texture_slots(ctx);
    /* Query-only slots are omitted in exactly the same sense, and have to be
     * reported through the same mask: the binding validation and the bind
     * group both read the *base* shader's recorded slots, which a variant
@@ -15468,17 +15483,17 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * texture and the draw was still declined for the one it used to have --
     * "sample type differs from the shader's", naming a slot nothing sampled. */
    uint32_t want_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
-   const uint16_t want_query_only =
+   const uint32_t want_query_only =
       gex_wgpu_query_only_geom(fs, ctx->sampler_views, want_query_geom);
    if (omitted_out)
-      *omitted_out = (uint16_t)(want_omit_slots | want_query_only);
+      *omitted_out = (uint32_t)(want_omit_slots | want_query_only);
    /* Decided here for the same reason the omit mask is: this function has two
     * early returns below and a variant reason must sit above both. */
-   const uint16_t want_demote_ms = gex_wgpu_demotable_ms_slots(ctx);
+   const uint32_t want_demote_ms = gex_wgpu_demotable_ms_slots(ctx);
    if (demoted_out)
       *demoted_out = want_demote_ms;
    uint32_t want_tiled_geom[GEX_WGPU_MAX_SAMPLERS][3];
-   const uint16_t want_tiled_ms =
+   const uint32_t want_tiled_ms =
       gex_wgpu_tiled_ms_slots(ctx, want_tiled_geom);
    /* Only when something is actually rendering into a tile. A pass whose
     * attachments are ordinary leaves gl_FragCoord alone, which is every pass
@@ -15731,7 +15746,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
             gex_wgpu_say_no_base_module(fs, "fragment", __LINE__);
          return fs->module;
       }
-   uint16_t sampler_mask = 0;
+   uint32_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
     * the texture specialization. Folding the two together made every retyped
     * shader run sampler lowering it never asked for, which then refused. */
@@ -25086,7 +25101,7 @@ struct gex_wgpu_compute_state {
    WGPUTextureSampleType texture_sample_types[GEX_WGPU_MAX_SAMPLERS];
    /* Which of those slots the shader declared multisampled, so the bind
       group layout can say so; see the note at its use. */
-   uint16_t multisampled_slots;
+   uint32_t multisampled_slots;
    unsigned sampler_count;
    uint8_t sampler_slots[GEX_WGPU_MAX_SAMPLERS];
    uint32_t sampler_bindings[GEX_WGPU_MAX_SAMPLERS];
@@ -25102,7 +25117,7 @@ struct gex_wgpu_compute_state {
     * Nonzero is the whole condition. A compute shader without integer
     * sampling keeps the old path exactly -- one module, built once, at
     * creation. */
-   uint16_t integer_sampled_slots;
+   uint32_t integer_sampled_slots;
    /* Images the shader declared with no format qualifier, as a bit per index
     * into image_slots. GLSL allows that only on a `writeonly` image, and GL
     * then says the store converts to the *image unit's* format -- so the
@@ -29093,7 +29108,7 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
  */
 static bool
 gex_wgpu_stage_wants_texture_variant(
-   unsigned count, const uint8_t *slots, uint16_t integer_sampled_slots,
+   unsigned count, const uint8_t *slots, uint32_t integer_sampled_slots,
    struct gex_wgpu_sampler *const *samplers,
    struct pipe_sampler_view *const *views)
 {
@@ -34173,7 +34188,7 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
  * and a sampler for every unit. The masks below are 64-bit for this reason. */
 #define GEX_WGPU_MAX_GROUP_BINDINGS \
    (GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_IMAGES + \
-    2 * GEX_WGPU_MAX_SAMPLERS)
+    2 * GEX_WGPU_MAX_STAGE_SAMPLERS)
 struct gex_wgpu_bindings {
    unsigned count;
    uint64_t storage_mask;
@@ -38530,7 +38545,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
     * position from gl_VertexID), so 225 of its cases read the source's red
     * channel unswizzled. Silently wrong is worse than refused, and it is the
     * reason every fragment-stage reduction of that failure passed. */
-   uint16_t sampler_mask = 0;
+   uint32_t sampler_mask = 0;
    bool lower_textures = false;
    for (unsigned i = 0; i < vs->texture_count; ++i) {
       const unsigned slot = vs->texture_slots[i];
@@ -38853,7 +38868,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
        * the vertex stage. */
       if (vs->query_only_slots) {
          uint32_t vs_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
-         const uint16_t vs_query = gex_wgpu_query_only_geom(
+         const uint32_t vs_query = gex_wgpu_query_only_geom(
             vs, ctx->vertex_sampler_views, vs_query_geom);
          if (vs_query)
             gex_wgpu_lower_query_only(clone, vs_query, vs_query_geom);
@@ -46131,8 +46146,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    const int64_t t_fsmod_start = gex_timing ? os_time_get_nano() : 0;
    /* Slots this variant dropped because the bound state could not satisfy
     * their declaration; their bindings must be left out of the group too. */
-   uint16_t omitted_texture_slots = 0;
-   uint16_t demoted_ms_slots = 0;
+   uint32_t omitted_texture_slots = 0;
+   uint32_t demoted_ms_slots = 0;
    /* Who derives gl_PrimitiveID for this draw, decided here because this is
     * where the topology is final: the strip and unsupported-topology rewrites
     * re-enter this function, so an earlier answer would describe the
@@ -50814,8 +50829,8 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
       caps->max_const_buffers =
          MIN2(GEX_WGPU_MAX_CONSTANT_BUFFERS,
               screen->max_uniform_buffers + screen->max_storage_buffers_vertex);
-      caps->max_texture_samplers = GEX_WGPU_MAX_SAMPLERS;
-      caps->max_sampler_views = GEX_WGPU_MAX_SAMPLERS;
+      caps->max_texture_samplers = GEX_WGPU_MAX_STAGE_SAMPLERS;
+      caps->max_sampler_views = GEX_WGPU_MAX_STAGE_SAMPLERS;
       /* Shader storage buffers, the first rung above GL 3.3: st_extensions
        * exposes ARB_shader_storage_buffer_object on the strength of the
        * fragment stage's count alone, and gates image load/store and compute
@@ -51173,7 +51188,7 @@ gex_wgpu_screen_create(WGPUDevice device)
       screen->framebuffer_fetch = false;
    screen->software_framebuffer_fetch = !screen->framebuffer_fetch && got_limits &&
       (limits.maxSampledTexturesPerShaderStage >=
-         GEX_WGPU_MAX_SAMPLERS + GEX_WGPU_MAX_SHADER_IMAGES + 8 || force_ordered_fetch);
+         GEX_WGPU_MAX_STAGE_SAMPLERS + GEX_WGPU_MAX_SHADER_IMAGES + 8 || force_ordered_fetch);
    /* Real GPU timestamps, if the device has them. ARB_timer_query is one of
     * the two things GL 3.3 still wants, and the alternative -- answering from
     * the CPU clock -- measures the gap between commands being recorded rather
