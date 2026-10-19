@@ -2506,8 +2506,10 @@ struct gex_wgpu_context {
    struct primconvert_context *primconvert;
    /* GEX_WGPU_QUAD_IB: the cached quads-as-triangles index buffers, [0] for the
     * last-vertex convention and [1] for the first, and how many quads each covers. */
-   struct pipe_resource *quad_ib[2];
-   unsigned quad_ib_quads[2];
+   /* By triangulation: GL's last-vertex convention, the first-vertex one,
+    * and the last with each triangle turned so that vertex comes first. */
+   struct pipe_resource *quad_ib[3];
+   unsigned quad_ib_quads[3];
    /* GEX_WGPU_REPEAT: the commands of one multi-draw after its first, handed to
     * the emit of that first command, which -- when nothing it built depends on
     * the command -- records them as further drawIndexed calls on the pipeline,
@@ -43629,10 +43631,49 @@ gex_wgpu_quad_ib_enabled(void)
    return on;
 }
 
-static struct pipe_resource *
-gex_wgpu_quad_ib(struct gex_wgpu_context *ctx, unsigned quads, bool first)
+enum gex_wgpu_quad_order {
+   GEX_WGPU_QUADS_LAST = 0,      /* (0,1,3),(1,2,3): u_primconvert's, PV last */
+   GEX_WGPU_QUADS_FIRST = 1,     /* (0,1,2),(0,2,3): u_primconvert's, PV first */
+   /* (3,0,1),(3,1,2): the last-vertex triangulation with each triangle turned
+    * so GL's provoking vertex -- the quad's fourth -- is the one WebGPU's flat
+    * interpolation takes. Turning a triangle keeps its winding. */
+   GEX_WGPU_QUADS_LAST_AS_FIRST = 2,
+};
+
+/* Whether a GL_QUADS draw should be triangulated with GL's provoking vertex
+ * already first, rather than drawn with the last-vertex order and then have
+ * its indices rewritten by gex_wgpu_draw_provoking_last.
+ *
+ * The same test that path is entered by, less what a quad draw cannot be (a
+ * point, a patch, an indirect or multi-draw that the rewrite would take one
+ * command at a time). That rewrite is a CPU translation and an index upload
+ * per draw, and an uploaded index list cannot carry a multi-draw's other
+ * commands as repeats -- so a shaderpack, whose flat varyings are on nearly
+ * every program, sent each of Sodium's chunk sections through the whole draw
+ * path with its own rewritten indices. Built into the quad index buffer, the
+ * rotation costs nothing per draw.
+ *
+ * Not where the rewrite does more than rotate: a vertex shader whose side
+ * effects run against the application's own vertices (transform feedback,
+ * storage writes, an unrasterisable shader's replay) keeps the old path. */
+static bool
+gex_wgpu_quads_provoking_first(const struct gex_wgpu_context *ctx)
 {
-   const unsigned k = first ? 1 : 0;
+   return !GEX_GETENV_ONCE("GEX_WGPU_NO_PROVOKING") &&
+          ctx->fs && ctx->rasterizer &&
+          !ctx->rasterizer->flatshade_first &&
+          ctx->rasterizer->fill_mode == PIPE_POLYGON_MODE_FILL &&
+          !ctx->tcs && !ctx->tes && !ctx->gs &&
+          !ctx->so_target_count &&
+          !(ctx->vs && (ctx->vs->raster_invalid || ctx->vs->writes_storage)) &&
+          gex_wgpu_shader_has_flat_varying(ctx->fs);
+}
+
+static struct pipe_resource *
+gex_wgpu_quad_ib(struct gex_wgpu_context *ctx, unsigned quads,
+                 enum gex_wgpu_quad_order order)
+{
+   const unsigned k = order;
    if (ctx->quad_ib[k] && ctx->quad_ib_quads[k] >= quads)
       return ctx->quad_ib[k];
    unsigned n = MAX2(ctx->quad_ib_quads[k] * 2, 16384u);
@@ -43647,8 +43688,10 @@ gex_wgpu_quad_ib(struct gex_wgpu_context *ctx, unsigned quads, bool first)
    for (unsigned q = 0; q < n; ++q) {
       const uint32_t b = q * 4;
       uint32_t *o = idx + (size_t)q * 6;
-      if (first) {
+      if (order == GEX_WGPU_QUADS_FIRST) {
          o[0] = b; o[1] = b + 1; o[2] = b + 2; o[3] = b; o[4] = b + 2; o[5] = b + 3;
+      } else if (order == GEX_WGPU_QUADS_LAST_AS_FIRST) {
+         o[0] = b + 3; o[1] = b; o[2] = b + 1; o[3] = b + 3; o[4] = b + 1; o[5] = b + 2;
       } else {
          o[0] = b; o[1] = b + 1; o[2] = b + 3; o[3] = b + 1; o[4] = b + 2; o[5] = b + 3;
       }
@@ -43675,12 +43718,15 @@ gex_wgpu_draw_quads_indexed(struct gex_wgpu_context *ctx,
 {
    const struct gex_wgpu_rasterizer *rasterizer = ctx->rasterizer;
    const bool first = rasterizer && rasterizer->flatshade_first;
+   const bool pv_first = !first && gex_wgpu_quads_provoking_first(ctx);
    unsigned maxq = 0;
    for (unsigned i = 0; i < num_draws; ++i)
       maxq = MAX2(maxq, draws[i].count / 4);
    if (!maxq)
       return true;
-   struct pipe_resource *ib = gex_wgpu_quad_ib(ctx, maxq, first);
+   struct pipe_resource *ib = gex_wgpu_quad_ib(
+      ctx, maxq, first ? GEX_WGPU_QUADS_FIRST
+                 : pv_first ? GEX_WGPU_QUADS_LAST_AS_FIRST : GEX_WGPU_QUADS_LAST);
    if (!ib)
       return false;
    struct pipe_draw_start_count_bias stack[64];
@@ -43704,7 +43750,11 @@ gex_wgpu_draw_quads_indexed(struct gex_wgpu_context *ctx,
    ni.max_index = ~0u;
    ni.primitive_restart = false;
    ni.index_bias_varies = num_draws > 1;
+   /* Already in GL's provoking order: the rewrite must not turn it again. */
+   const bool saved_rewritten = ctx->provoking_rewritten;
+   ctx->provoking_rewritten |= pv_first;
    ctx->base.draw_vbo(&ctx->base, &ni, drawid_offset, NULL, nd, num_draws);
+   ctx->provoking_rewritten = saved_rewritten;
    if (nd != stack)
       free(nd);
    return true;
@@ -43858,10 +43908,16 @@ gex_wgpu_draw_quads_indirect(struct gex_wgpu_context *ctx,
       return n == 0;   /* no commands; a failed read goes to primconvert */
    const struct gex_wgpu_rasterizer *rasterizer = ctx->rasterizer;
    const bool first = rasterizer && rasterizer->flatshade_first;
+   const bool pv_first = !first && gex_wgpu_quads_provoking_first(ctx);
    unsigned maxq = 0;
    for (unsigned i = 0; i < n; ++i)
       maxq = MAX2(maxq, cmds[i].draw.count / 4);
-   struct pipe_resource *ib = maxq ? gex_wgpu_quad_ib(ctx, maxq, first) : NULL;
+   struct pipe_resource *ib = maxq
+      ? gex_wgpu_quad_ib(ctx, maxq,
+                         first ? GEX_WGPU_QUADS_FIRST
+                         : pv_first ? GEX_WGPU_QUADS_LAST_AS_FIRST
+                                    : GEX_WGPU_QUADS_LAST)
+      : NULL;
    if (maxq && !ib) {
       free(cmds);
       return false;
@@ -43899,6 +43955,9 @@ gex_wgpu_draw_quads_indirect(struct gex_wgpu_context *ctx,
     * reissues does; see own_draw_params. */
    const unsigned saved_resolve_at = ctx->indirect_resolve_at;
    ctx->indirect_resolve_at = ctx->draw_depth;
+   /* Already in GL's provoking order; see gex_wgpu_quads_provoking_first. */
+   const bool saved_rewritten = ctx->provoking_rewritten;
+   ctx->provoking_rewritten |= pv_first;
    for (unsigned k = 0; k < live && !ctx->failed;) {
       struct pipe_draw_info ni = cmds[which[k]].info;
       ni.mode = MESA_PRIM_TRIANGLES;
@@ -43921,6 +43980,7 @@ gex_wgpu_draw_quads_indirect(struct gex_wgpu_context *ctx,
                          1);
       k += gex_wgpu_repeat_disarm(ctx) ? live - k : 1;
    }
+   ctx->provoking_rewritten = saved_rewritten;
    ctx->indirect_resolve_at = saved_resolve_at;
    if (rc != stack_cmd)
       free(rc);
@@ -45386,7 +45446,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * skips reading back every index of every Sodium draw. */
       if (index_resource &&
           (index_resource == ctx->quad_ib[0] ||
-           index_resource == ctx->quad_ib[1]) &&
+           index_resource == ctx->quad_ib[1] ||
+           index_resource == ctx->quad_ib[2]) &&
           !uploaded_index_resource && first_index == 0) {
          last_vertex = draws[0].count >= 6
             ? (uint64_t)(draws[0].count / 6) * 4 - 1 : 0;
@@ -49148,6 +49209,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
       util_primconvert_destroy(ctx->primconvert);
    pipe_resource_reference(&ctx->quad_ib[0], NULL);
    pipe_resource_reference(&ctx->quad_ib[1], NULL);
+   pipe_resource_reference(&ctx->quad_ib[2], NULL);
    FREE(ctx->facing_pass);
    pipe_resource_reference(&ctx->facing_vs_out, NULL);
    util_copy_framebuffer_state(&ctx->framebuffer, NULL);
