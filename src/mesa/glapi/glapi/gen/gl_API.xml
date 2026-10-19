@@ -2371,7 +2371,8 @@
         <glx rop="134"/>
     </function>
 
-    <function name="DepthMask" es1="1.0" es2="2.0" exec="dlist">
+    <function name="DepthMask" es1="1.0" es2="2.0" exec="dlist"
+              marshal_call_after="_mesa_glthread_DepthMask(ctx, flag);">
         <param name="flag" type="GLboolean"/>
         <glx rop="135"/>
     </function>
@@ -2599,7 +2600,8 @@
         <glx rop="163"/>
     </function>
 
-    <function name="DepthFunc" es1="1.0" es2="2.0" no_error="true" exec="dlist">
+    <function name="DepthFunc" es1="1.0" es2="2.0" no_error="true" exec="dlist"
+              marshal_call_after="_mesa_glthread_DepthFunc(ctx, func);">
         <param name="func" type="GLenum"/>
         <glx rop="164"/>
     </function>

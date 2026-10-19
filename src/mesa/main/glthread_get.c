@@ -99,6 +99,65 @@ glthread_fog_values(struct gl_context *ctx, GLenum pname, GLfloat *out,
    }
 }
 
+/* State glthread keeps for itself (glthread_marshal.h) that a Get can return
+ * without waiting for the driver thread. Each wait drains everything queued
+ * before it, so with the browser's main thread as the driver thread a query
+ * in the middle of a frame serialises the two threads: Minecraft and its mods
+ * read the copy buffer bindings and save the lighting and depth state around
+ * their overlays, a few times a frame. False where the value, or the error,
+ * has to come from the driver. */
+static bool
+glthread_local_get(struct gl_context *ctx, GLenum pname, GLint *out)
+{
+   if (ctx->GLThread.inside_begin_end)
+      return false;
+   const bool compat = ctx->API == API_OPENGL_COMPAT;
+   switch (pname) {
+   case GL_COPY_READ_BUFFER_BINDING:
+      if (!_mesa_is_desktop_gl(ctx) && ctx->Version < 30)
+         return false;
+      *out = ctx->GLThread.CurrentCopyReadBufferName;
+      return true;
+   case GL_COPY_WRITE_BUFFER_BINDING:
+      if (!_mesa_is_desktop_gl(ctx) && ctx->Version < 30)
+         return false;
+      *out = ctx->GLThread.CurrentCopyWriteBufferName;
+      return true;
+   case GL_DEPTH_FUNC:
+      *out = ctx->GLThread.DepthFunc;
+      return true;
+   case GL_DEPTH_WRITEMASK:
+      *out = ctx->GLThread.DepthMask;
+      return true;
+   case GL_DEPTH_TEST:
+      *out = ctx->GLThread.DepthTest;
+      return true;
+   case GL_LIGHTING:
+   case GL_RESCALE_NORMAL:
+   case GL_COLOR_MATERIAL: {
+      const int v = compat ? _mesa_glthread_IsEnabled(ctx, pname) : -1;
+      if (v < 0)
+         return false;
+      *out = v;
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+/* MESA_GLTHREAD_VERIFY_GETS=1: every query glthread_local_get answers is
+ * asked of the driver too, and a disagreement is printed. The driver's value
+ * is the one returned, so the check changes nothing but the speed. */
+static bool
+glthread_verify_gets(void)
+{
+   static int on = -1;
+   if (on < 0)
+      on = getenv("MESA_GLTHREAD_VERIFY_GETS") ? 1 : 0;
+   return on;
+}
+
 uint32_t
 _mesa_unmarshal_GetFloatv(struct gl_context *ctx,
                           const struct marshal_cmd_GetFloatv *restrict cmd)
@@ -149,15 +208,25 @@ _mesa_marshal_GetBooleanv(GLenum pname, GLboolean *p)
          p[i] = v[i] != 0.0f ? GL_TRUE : GL_FALSE;
       return;
    }
+   GLint local;
+   const bool have_local = glthread_local_get(ctx, pname, &local);
+   if (have_local && !glthread_verify_gets()) {
+      *p = local ? GL_TRUE : GL_FALSE;
+      return;
+   }
 #if MESA_GLTHREAD_REMOTE
    if (GLTHREAD_IS_REMOTE(ctx)) {
       ctx->GLThread.sync_why = _mesa_glthread_remote_pname_name("GetBooleanv", pname);
       _mesa_glthread_call_GetBooleanv(ctx, pname, p);
-      return;
-   }
+   } else
 #endif
-   _mesa_glthread_finish_before(ctx, "GetBooleanv");
-   CALL_GetBooleanv(ctx->Dispatch.Current, (pname, p));
+   {
+      _mesa_glthread_finish_before(ctx, "GetBooleanv");
+      CALL_GetBooleanv(ctx->Dispatch.Current, (pname, p));
+   }
+   if (have_local && (local ? GL_TRUE : GL_FALSE) != *p)
+      fprintf(stderr, "glthread: GetBooleanv 0x%x answered %d, driver %d\n",
+              pname, local, *p);
 }
 
 uint32_t
@@ -172,6 +241,8 @@ void GLAPIENTRY
 _mesa_marshal_GetIntegerv(GLenum pname, GLint *p)
 {
    GET_CURRENT_CONTEXT(ctx);
+   bool have_local = false;
+   GLint local = 0;
 
    /* This will generate GL_INVALID_OPERATION, as it should. */
    if (ctx->GLThread.inside_begin_end)
@@ -181,6 +252,12 @@ _mesa_marshal_GetIntegerv(GLenum pname, GLint *p)
     * - CONST(
     * - CONTEXT_[A-Z]*(Const
     */
+
+   have_local = glthread_local_get(ctx, pname, &local);
+   if (have_local && !glthread_verify_gets()) {
+      *p = local;
+      return;
+   }
 
    switch (pname) {
    case GL_ACTIVE_TEXTURE:
@@ -290,6 +367,9 @@ sync:
       _mesa_glthread_finish_before(ctx, "GetIntegerv");
       CALL_GetIntegerv(ctx->Dispatch.Current, (pname, p));
    }
+   if (have_local && local != *p)
+      fprintf(stderr, "glthread: GetIntegerv 0x%x answered %d, driver %d\n",
+              pname, local, *p);
 }
 
 /* TODO: Implement glGetBooleanv, glGetFloatv, etc. if needed */

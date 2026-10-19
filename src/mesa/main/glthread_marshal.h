@@ -488,6 +488,12 @@ _mesa_glthread_Enable(struct gl_context *ctx, GLenum cap)
    case GL_POLYGON_STIPPLE:
       ctx->GLThread.PolygonStipple = true;
       break;
+   case GL_RESCALE_NORMAL:
+      ctx->GLThread.RescaleNormal = true;
+      break;
+   case GL_COLOR_MATERIAL:
+      ctx->GLThread.ColorMaterial = true;
+      break;
    case GL_VERTEX_ARRAY:
    case GL_NORMAL_ARRAY:
    case GL_COLOR_ARRAY:
@@ -536,6 +542,12 @@ _mesa_glthread_Disable(struct gl_context *ctx, GLenum cap)
    case GL_POLYGON_STIPPLE:
       ctx->GLThread.PolygonStipple = false;
       break;
+   case GL_RESCALE_NORMAL:
+      ctx->GLThread.RescaleNormal = false;
+      break;
+   case GL_COLOR_MATERIAL:
+      ctx->GLThread.ColorMaterial = false;
+      break;
    case GL_VERTEX_ARRAY:
    case GL_NORMAL_ARRAY:
    case GL_COLOR_ARRAY:
@@ -574,6 +586,10 @@ _mesa_glthread_IsEnabled(struct gl_context *ctx, GLenum cap)
              ctx->API != API_OPENGLES2 ? ctx->GLThread.Fog.enabled : -1;
    case GL_POLYGON_STIPPLE:
       return ctx->GLThread.PolygonStipple;
+   case GL_RESCALE_NORMAL:
+      return ctx->API == API_OPENGL_COMPAT ? ctx->GLThread.RescaleNormal : -1;
+   case GL_COLOR_MATERIAL:
+      return ctx->API == API_OPENGL_COMPAT ? ctx->GLThread.ColorMaterial : -1;
    case GL_VERTEX_ARRAY:
       return !!(ctx->GLThread.CurrentVAO->UserEnabled & VERT_BIT_POS);
    case GL_NORMAL_ARRAY:
@@ -586,6 +602,24 @@ _mesa_glthread_IsEnabled(struct gl_context *ctx, GLenum cap)
    default:
       return -1; /* sync and call _mesa_IsEnabled. */
    }
+}
+
+static inline void
+_mesa_glthread_DepthFunc(struct gl_context *ctx, GLenum func)
+{
+   if (ctx->GLThread.ListMode == GL_COMPILE)
+      return;
+   /* An invalid enum is refused by the driver and leaves the state alone. */
+   if (func >= GL_NEVER && func <= GL_ALWAYS)
+      ctx->GLThread.DepthFunc = func;
+}
+
+static inline void
+_mesa_glthread_DepthMask(struct gl_context *ctx, GLboolean flag)
+{
+   if (ctx->GLThread.ListMode == GL_COMPILE)
+      return;
+   ctx->GLThread.DepthMask = !!flag;
 }
 
 static inline void
@@ -613,8 +647,18 @@ _mesa_glthread_PushAttrib(struct gl_context *ctx, GLbitfield mask)
    if (mask & (GL_DEPTH_BUFFER_BIT | GL_ENABLE_BIT))
       attr->DepthTest = ctx->GLThread.DepthTest;
 
-   if (mask & (GL_LIGHTING_BIT | GL_ENABLE_BIT))
+   if (mask & (GL_LIGHTING_BIT | GL_ENABLE_BIT)) {
       attr->Lighting = ctx->GLThread.Lighting;
+      attr->ColorMaterial = ctx->GLThread.ColorMaterial;
+   }
+
+   if (mask & (GL_TRANSFORM_BIT | GL_ENABLE_BIT))
+      attr->RescaleNormal = ctx->GLThread.RescaleNormal;
+
+   if (mask & GL_DEPTH_BUFFER_BIT) {
+      attr->DepthFunc = ctx->GLThread.DepthFunc;
+      attr->DepthMask = ctx->GLThread.DepthMask;
+   }
 
    if (mask & GL_TEXTURE_BIT)
       attr->ActiveTexture = ctx->GLThread.ActiveTexture;
@@ -708,8 +752,18 @@ _mesa_glthread_PopAttrib(struct gl_context *ctx)
       ctx->GLThread.Fog.known = ctx->GLThread.Fog.known && attr->Fog.known;
    }
 
-   if (mask & (GL_LIGHTING_BIT | GL_ENABLE_BIT))
+   if (mask & (GL_LIGHTING_BIT | GL_ENABLE_BIT)) {
       ctx->GLThread.Lighting = attr->Lighting;
+      ctx->GLThread.ColorMaterial = attr->ColorMaterial;
+   }
+
+   if (mask & (GL_TRANSFORM_BIT | GL_ENABLE_BIT))
+      ctx->GLThread.RescaleNormal = attr->RescaleNormal;
+
+   if (mask & GL_DEPTH_BUFFER_BIT) {
+      ctx->GLThread.DepthFunc = attr->DepthFunc;
+      ctx->GLThread.DepthMask = attr->DepthMask;
+   }
 
    if (mask & GL_TEXTURE_BIT)
       ctx->GLThread.ActiveTexture = attr->ActiveTexture;

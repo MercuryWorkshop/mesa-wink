@@ -204,6 +204,10 @@ struct glthread_attrib_node {
    bool DepthTest;
    bool Lighting;
    bool PolygonStipple;
+   bool RescaleNormal;           /* GL_TRANSFORM_BIT, GL_ENABLE_BIT */
+   bool ColorMaterial;           /* GL_LIGHTING_BIT, GL_ENABLE_BIT */
+   GLenum16 DepthFunc;           /* GL_DEPTH_BUFFER_BIT */
+   bool DepthMask;               /* GL_DEPTH_BUFFER_BIT */
 };
 
 typedef enum {
@@ -297,6 +301,8 @@ struct glthread_state
    GLuint CurrentPixelPackBufferName;
    GLuint CurrentPixelUnpackBufferName;
    GLuint CurrentQueryBufferName;
+   GLuint CurrentCopyReadBufferName;
+   GLuint CurrentCopyWriteBufferName;
 
    /**
     * The batch index of the last occurence of glLinkProgram or
@@ -328,6 +334,12 @@ struct glthread_state
    bool DebugOutputSynchronous;
    bool Lighting;
    bool PolygonStipple;
+   /* Kept for queries, which otherwise wait for the driver thread: Minecraft
+    * mods save and restore these around their overlays. */
+   bool RescaleNormal;
+   bool ColorMaterial;
+   GLenum16 DepthFunc;
+   bool DepthMask;
 
    GLuint CurrentDrawFramebuffer;
    GLuint CurrentReadFramebuffer;

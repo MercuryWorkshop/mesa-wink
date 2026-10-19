@@ -228,6 +228,12 @@ _mesa_glthread_BindBuffer(struct gl_context *ctx, GLenum target, GLuint buffer)
    case GL_QUERY_BUFFER:
       glthread->CurrentQueryBufferName = buffer;
       break;
+   case GL_COPY_READ_BUFFER:
+      glthread->CurrentCopyReadBufferName = buffer;
+      break;
+   case GL_COPY_WRITE_BUFFER:
+      glthread->CurrentCopyWriteBufferName = buffer;
+      break;
    }
 }
 
@@ -321,6 +327,10 @@ _mesa_glthread_DeleteBuffers(struct gl_context *ctx, GLsizei n,
          _mesa_glthread_BindBuffer(ctx, GL_PIXEL_PACK_BUFFER, 0);
       if (id == glthread->CurrentPixelUnpackBufferName)
          _mesa_glthread_BindBuffer(ctx, GL_PIXEL_UNPACK_BUFFER, 0);
+      if (id == glthread->CurrentCopyReadBufferName)
+         _mesa_glthread_BindBuffer(ctx, GL_COPY_READ_BUFFER, 0);
+      if (id == glthread->CurrentCopyWriteBufferName)
+         _mesa_glthread_BindBuffer(ctx, GL_COPY_WRITE_BUFFER, 0);
    }
 }
 
