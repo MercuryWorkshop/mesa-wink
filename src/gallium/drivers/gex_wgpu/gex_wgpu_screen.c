@@ -1858,6 +1858,11 @@ struct gex_wgpu_screen {
     * using more units than this shares sampler bindings between units that
     * bind the same sampler; see gex_wgpu_fs_share_samplers. */
    uint32_t max_samplers;
+   /* Texture units the fragment stage offers: what the device's
+    * sampled-texture limit leaves after the read-only images and the
+    * framebuffer copies, between GEX_WGPU_MAX_STAGE_SAMPLERS and
+    * GEX_WGPU_MAX_SAMPLERS. See where it is set. */
+   uint32_t max_fs_samplers;
    uint32_t max_storage_buffer_size;
    /* Buffers and textures let go of, destroyed once nothing recorded may
     * still use them: see gex_wgpu_doom. `doom_serial` counts them, and
@@ -51083,8 +51088,9 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
       caps->max_const_buffers =
          MIN2(GEX_WGPU_MAX_CONSTANT_BUFFERS,
               screen->max_uniform_buffers + screen->max_storage_buffers_vertex);
-      caps->max_texture_samplers = GEX_WGPU_MAX_STAGE_SAMPLERS;
-      caps->max_sampler_views = GEX_WGPU_MAX_STAGE_SAMPLERS;
+      caps->max_texture_samplers = stages[i] == MESA_SHADER_FRAGMENT
+         ? screen->max_fs_samplers : GEX_WGPU_MAX_STAGE_SAMPLERS;
+      caps->max_sampler_views = caps->max_texture_samplers;
       /* Shader storage buffers, the first rung above GL 3.3: st_extensions
        * exposes ARB_shader_storage_buffer_object on the strength of the
        * fragment stage's count alone, and gates image load/store and compute
@@ -51245,6 +51251,7 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->max_raster_varyings = GEX_WGPU_MAX_RASTER_VARYINGS;
    screen->max_storage_textures = GEX_WGPU_MAX_SHADER_IMAGES;
    screen->max_samplers = GEX_WGPU_MAX_STAGE_SAMPLERS;
+   screen->max_fs_samplers = GEX_WGPU_MAX_STAGE_SAMPLERS;
    screen->max_storage_buffer_size = 0;
    screen->uniform_offset_alignment = 256;   /* WebGPU's default, the worst */
    screen->storage_offset_alignment = 256;
@@ -51450,9 +51457,39 @@ gex_wgpu_screen_create(WGPUDevice device)
    const bool force_ordered_fetch = getenv("GEX_WGPU_FORCE_ORDERED_FETCH") != NULL;
    if (force_ordered_fetch)
       screen->framebuffer_fetch = false;
+   /* The fragment stage's texture units, from what the device grants.
+    *
+    * Every unit is a sampled texture, and so is every read-only image
+    * (GEX_WGPU_MAX_SHADER_IMAGES of them) and each of the eight colour
+    * attachment copies framebuffer fetch and logic ops bind
+    * (GEX_WGPU_LOGICOP_BINDING + rt); a shader may use all three at once, so
+    * the units are what is left after the other two. WebGPU's default of
+    * sixteen leaves the sixteen GL 3.x requires; Chrome's 48 leaves 24, and a
+    * device granting 56 or more gets all 32. Iris sizes its sampler pool
+    * from GL_MAX_TEXTURE_IMAGE_UNITS -- the fragment stage's figure -- and
+    * Complementary's HIGH profile and Photon both ask for more than sixteen.
+    * Samplers are a separate limit, sixteen in all of Chrome's tiers;
+    * gex_wgpu_fs_share_samplers lets units bind more textures than that.
+    * GEX_WGPU_FS_UNITS lowers it, for comparisons. */
+   {
+      const uint32_t reserved = GEX_WGPU_MAX_SHADER_IMAGES + 8;
+      const uint32_t granted =
+         got_limits &&
+         limits.maxSampledTexturesPerShaderStage != WGPU_LIMIT_U32_UNDEFINED
+            ? limits.maxSampledTexturesPerShaderStage : 0;
+      uint32_t units = granted > reserved ? granted - reserved : 0;
+      const char *cap = getenv("GEX_WGPU_FS_UNITS");
+      if (cap && *cap)
+         units = MIN2(units, (uint32_t)atoi(cap));
+      screen->max_fs_samplers =
+         CLAMP(units, GEX_WGPU_MAX_STAGE_SAMPLERS, GEX_WGPU_MAX_SAMPLERS);
+      fprintf(stderr, "gex-wgpu: fragment texture units %u (sampled textures "
+              "%u, samplers %u)\n", screen->max_fs_samplers, granted,
+              screen->max_samplers);
+   }
    screen->software_framebuffer_fetch = !screen->framebuffer_fetch && got_limits &&
       (limits.maxSampledTexturesPerShaderStage >=
-         GEX_WGPU_MAX_STAGE_SAMPLERS + GEX_WGPU_MAX_SHADER_IMAGES + 8 || force_ordered_fetch);
+         screen->max_fs_samplers + GEX_WGPU_MAX_SHADER_IMAGES + 8 || force_ordered_fetch);
    /* Real GPU timestamps, if the device has them. ARB_timer_query is one of
     * the two things GL 3.3 still wants, and the alternative -- answering from
     * the CPU clock -- measures the gap between commands being recorded rather

@@ -137,7 +137,13 @@ var LibraryWink = {
       'maxStorageTexturesInFragmentStage': 8,
       'maxDynamicUniformBuffersPerPipelineLayout': 32,
       'maxDynamicStorageBuffersPerPipelineLayout': 16,
-      'maxSampledTexturesPerShaderStage': 48,
+      // 32 fragment texture units plus the read-only images and framebuffer
+      // copies the driver reserves beside them (max_fs_samplers); Chrome
+      // grants at most 48, Firefox 64.
+      'maxSampledTexturesPerShaderStage': 56,
+      // Never asked for before, so every device had the default sixteen.
+      // Past it the driver shares sampler bindings between units.
+      'maxSamplersPerShaderStage': 32,
       'maxColorAttachmentBytesPerSample': 128,
       'maxComputeInvocationsPerWorkgroup': 1024,
       'maxComputeWorkgroupSizeX': 1024,

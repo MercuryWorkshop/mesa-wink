@@ -363,16 +363,25 @@ create_device(void)
        * -- and that "supports a higher maximum" is the whole point: nobody
        * had asked. Blender's EEVEE binds five in one dispatch and
        * KHR-GL44.shader_image_load_store's allTargets cases want seven. */
-      /* 8 and 16 are GEX_WGPU_MAX_SHADER_IMAGES and
-       * GEX_WGPU_MAX_SAMPLERS, which live in gex_wgpu_screen.c and are
-       * not visible here; keep them in step. */
+      /* 8 is GEX_WGPU_MAX_SHADER_IMAGES' writable share, and the 56 and 32
+       * below are GEX_WGPU_MAX_SAMPLERS plus the reserve the fragment unit
+       * count is taken from, and GEX_WGPU_MAX_SAMPLERS; they live in
+       * gex_wgpu_screen.c and are not visible here, so keep them in step. */
       GEX_WANT(maxStorageTexturesPerShaderStage, 8);
       GEX_WANT_STAGE(maxStorageTexturesInVertexStage, 8);
       GEX_WANT_STAGE(maxStorageTexturesInFragmentStage, 8);
       /* And sampled textures, for the same reason: GL 3.3 wants sixteen per
        * stage, which is WebGPU's default, but a stage that also splits
-       * combined samplers can name more. */
-      GEX_WANT(maxSampledTexturesPerShaderStage, 48);
+       * combined samplers can name more -- and the fragment stage's unit
+       * count is what this leaves after the read-only images and the
+       * framebuffer copies (gex_wgpu_screen.c, max_fs_samplers), so 56 is
+       * what all 32 units cost. */
+      GEX_WANT(maxSampledTexturesPerShaderStage, 56);
+      /* Samplers, which nobody asked for, so every device had WebGPU's
+       * sixteen. Dawn grants no more than that in any case, and the
+       * fragment stage shares bindings past it; an implementation granting
+       * more (Firefox's wgpu offers 64) needs no sharing at all. */
+      GEX_WANT(maxSamplersPerShaderStage, 32);
       /* Eight RGBA8 draw buffers is exactly WebGPU's default 32 bytes per
        * sample, so GL 3.2's eight draw buffers of any wider format fails on
        * it. */
@@ -450,6 +459,7 @@ create_device(void)
          GEX_CAP(maxDynamicUniformBuffersPerPipelineLayout)
          GEX_CAP(maxDynamicStorageBuffersPerPipelineLayout)
          GEX_CAP(maxSampledTexturesPerShaderStage)
+         GEX_CAP(maxSamplersPerShaderStage)
          GEX_CAP(maxColorAttachmentBytesPerSample)
 #undef GEX_CAP_STAGE
 #undef GEX_CAP
