@@ -41019,26 +41019,13 @@ gex_wgpu_end_pass(struct gex_wgpu_context *ctx)
  * the shader wrote into the same buffer, and a buffer that is both
  * persistently mapped and written by a shader is precisely what an atomic
  * counter or an SSBO under ARB_buffer_storage is. The increments landed and
- * the next submit wiped them. */
-/* GEX_WGPU_PERSIST_EXPLICIT=1 (EXPERIMENT, off unless set): a FLUSH_EXPLICIT,
- * non-coherent persistent mapping is not re-sent here -- glFlushMappedBufferRange
- * already uploaded what the application named (gex_wgpu_transfer_flush_region),
- * and GL leaves an unflushed write undefined -- and every other write mapping
- * takes the diff below instead of a whole-shadow upload. Minecraft 26.2 maps
- * Sodium 0.9's 32,000,000-byte region staging buffer this way: 32.7 MiB re-sent
- * at each of ~8 calls a frame, ~260 MiB a frame through queue.writeBuffer on
- * the main thread, 16 fps against 108 with this on (ikvmcraft, 2026-10-19,
- * n=1 per arm; runtime repo scratchpad MINECRAFT-FINDINGS.md R509). */
-static bool
-gex_wgpu_persist_explicit(void)
-{
-   static int on = -1;
-   if (on < 0) {
-      const char *v = getenv("GEX_WGPU_PERSIST_EXPLICIT");
-      on = v && *v != '0';
-   }
-   return on != 0;
-}
+ * the next submit wiped them.
+ *
+ * A FLUSH_EXPLICIT, non-coherent persistent mapping is not re-sent here:
+ * glFlushMappedBufferRange already uploaded what the application named
+ * (gex_wgpu_transfer_flush_region), and GL leaves an unflushed write undefined.
+ * Every other write mapping takes the diff below instead of a whole-shadow
+ * upload. */
 
 /* The first byte at which a and b differ, or size; eight bytes a step. */
 static uint32_t
@@ -41088,13 +41075,11 @@ static void
 gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
 {
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
-   const bool explicit_only = gex_wgpu_persist_explicit();
    if (ctx->persistent_count && ++gex_wgpu_persist_calls % 2000 == 0) {
       fprintf(stderr, "gex-wgpu: persistent mappings sent %.2f MiB a submit "
-              "over the last 2000 submits (%u mapped; "
-              "GEX_WGPU_PERSIST_EXPLICIT=%d)\n",
+              "over the last 2000 submits (%u mapped)\n",
               gex_wgpu_persist_bytes / 2000.0 / 1048576.0,
-              ctx->persistent_count, explicit_only);
+              ctx->persistent_count);
       gex_wgpu_persist_bytes = 0;
    }
    for (unsigned i = 0; i < ctx->persistent_count; ++i) {
@@ -41115,32 +41100,15 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
        * glCopyNamedBufferSubData, waits on a fence and reads. The trace ran
        * `PERSIST upload [0,16)` and then `PERSIST refresh`, in that order, so
        * the test read the zeroed shadow back and reported [0, 0] against a
-       * reference of [3, 1415927]. Nothing in the driver said a word.
-       *
-       * The upload was reached because the copy had set gpu_written, which
-       * sends this down the diff path, where a freshly allocated
-       * persistent_sent is deliberately seeded to "everything differs". */
+       * reference of [3, 1415927]. Nothing in the driver said a word. */
       if (!(gex->persistent_usage & PIPE_MAP_WRITE))
          continue;
       const uint32_t size = (uint32_t)(gex->allocation_size & ~3u);
       if (!size)
          continue;
-      if (explicit_only && (gex->persistent_usage & PIPE_MAP_FLUSH_EXPLICIT) &&
+      if ((gex->persistent_usage & PIPE_MAP_FLUSH_EXPLICIT) &&
           !(gex->persistent_usage & PIPE_MAP_COHERENT))
          continue;
-      /* The diff exists to keep the *shader's* writes to this buffer, and a
-         buffer no shader writes has none to keep. st/mesa's own uploader is
-         one of those and it is a megabyte, re-scanned at every one of the
-         45,000 submits an STK run makes: measured, that cost 54.3 FPS against
-         59.8. Same predicate as the read-back below, so the two halves agree
-         about which buffers the device touches. */
-      if (!gex->gpu_written && !explicit_only) {
-         wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow, size);
-         gex_wgpu_persist_bytes += size;
-         if (gex->bytes_written < size)
-            gex->bytes_written = size;
-         continue;
-      }
       if (gex->persistent_sent && gex->persistent_sent_size != size) {
          FREE(gex->persistent_sent);
          gex->persistent_sent = NULL;
