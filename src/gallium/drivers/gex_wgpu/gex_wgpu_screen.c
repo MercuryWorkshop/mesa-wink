@@ -20372,6 +20372,15 @@ gex_wgpu_clear_texture(struct pipe_context *pipe, struct pipe_resource *res,
       util_clear_texture_sw(pipe, res, level, box, data);
       return;
    }
+   /* A multisampled texture takes no copy at all in WebGPU, so it is cleared
+    * the way the default does it: by rendering. wined3d clears its 1x1
+    * multisample dummy textures with glClearTexImage at device creation, and
+    * the upload below was a WriteTexture into a texture created without
+    * CopyDst -- a validation error, twice per D3D device. */
+   if (res->nr_samples > 1) {
+      u_default_clear_texture(pipe, res, level, box, data);
+      return;
+   }
    const unsigned texel = util_format_get_blocksize(res->format);
    const uint64_t texels = (uint64_t)box->width * box->height * box->depth;
    if (!texel || !texels || texels > (64u << 20) / MAX2(1u, texel)) {
@@ -20425,6 +20434,19 @@ gex_wgpu_texture_subdata(struct pipe_context *pipe,
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
+   /* WebGPU copies into no multisampled texture, and the texture was made
+    * without CopyDst for that reason: the write would be a validation error.
+    * Declined, and said once. */
+   if (resource && resource->nr_samples > 1) {
+      static bool said;
+      if (!said) {
+         said = true;
+         fprintf(stderr, "gex-wgpu: upload into a multisampled %s texture "
+                 "declined (WebGPU copies into none)\n",
+                 util_format_short_name(resource->format));
+      }
+      return;
+   }
    if (gex_wgpu_batch_conflicts_usage((struct gex_wgpu_context *)pipe,
                                      resource, usage))
       gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
