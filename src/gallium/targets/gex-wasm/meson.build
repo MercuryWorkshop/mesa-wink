@@ -28,12 +28,10 @@ gex_mesa_smoke = executable(
   install : false,
 )
 
-# Compile gex's existing wire decoder unchanged against Mesa.  The source is
-# intentionally owned by gex rather than vendored into Mesa: this makes the
-# MobileGL differential backend and the Mesa production backend consume the
-# same packet implementation.
+# Compile gex's wire decoder against Mesa.  The source is owned by gex rather
+# than vendored into Mesa, so the wire format and its decoder change together.
 gex_root = join_paths(meson.project_source_root(), '..', '..')
-gex_decoder = join_paths(gex_root, 'web', 'mobilegl', 'gexgl-mobilegl.cpp')
+gex_decoder = join_paths(gex_root, 'web', 'mesa', 'gexgl-mesa.cpp')
 gex_jspi_js = join_paths(gex_root, 'web', 'gex-wgpu-jspi.js')
 # The loader for the replay's cold part (gex: docs/mesa-wasm-size.md), which
 # the build splits off with wasm-split after the link (SPLIT_MODULE below).

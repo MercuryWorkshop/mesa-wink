@@ -40,7 +40,7 @@ libgex_wgpu = static_library(
   ],
   # Not gex_tint: a static library's dependencies travel to everything that
   # links it, and wink ships Tint as its own archive so a consumer that
-  # already links the same Tint (MobileGL's, from the same Dawn revision) can
+  # already links the same Tint (from the same Dawn revision) can
   # leave one copy out. driver_gex_wgpu below still carries it.
   dependencies : [idep_mesautil, idep_nir, idep_wink_compiler],
   gnu_symbol_visibility : 'hidden',

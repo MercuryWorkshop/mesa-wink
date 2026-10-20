@@ -13,7 +13,7 @@
                               carry fixes a stock copy lacks. Defaults to
                               WinkLinkWebGPUGlue.
     WinkLinkTint=false        the app already links the same Tint
-                              (MobileGL's, from the same Dawn revision)
+                              (from the same Dawn revision)
 
   The stack is raised to 16MB, since Tint and the GLSL compiler recurse
   deeply, unless the app already chose one through EmccStackSize or a
