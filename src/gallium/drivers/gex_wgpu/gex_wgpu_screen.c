@@ -40506,10 +40506,63 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
          45,000 submits an STK run makes: measured, that cost 54.3 FPS against
          59.8. Same predicate as the read-back below, so the two halves agree
          about which buffers the device touches. */
+      if (gex->persistent_sent && gex->persistent_sent_size != size) {
+         FREE(gex->persistent_sent);
+         gex->persistent_sent = NULL;
+      }
+      /* A buffer no shader writes still wants the diff, for cost alone.
+       * st/mesa's immediate-mode buffer (vbo_exec) is one: 512 KiB, mapped
+       * persistent and coherent for the life of the context once
+       * ARB_buffer_storage is on, and sent whole at every submit whether or
+       * not anything was drawn through it. Muck at GL 4.6 on edger: 46 of
+       * those a frame, 24.3 MB and 14.6 ms of writeBuffer per frame; with
+       * the diff, 0.76 MB and 0.8 ms, and 28.1 presents/s against 22.6.
+       * Comparing costs one pass over memory; the upload costs that plus a
+       * copy into the GPU process and the GPU's own copy. With no shader
+       * writes to keep, any granularity is safe, so this compares in blocks
+       * and sends each run of changed blocks on its own: a ring's few
+       * written spans, not the span from the first change to the last. */
       if (!gex->gpu_written) {
-         wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow, size);
-         if (gex->bytes_written < size)
-            gex->bytes_written = size;
+         if (!gex->persistent_sent) {
+            gex->persistent_sent = MALLOC(size);
+            if (!gex->persistent_sent) {
+               wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow,
+                                    size);
+               if (gex->bytes_written < size)
+                  gex->bytes_written = size;
+               continue;
+            }
+            gex->persistent_sent_size = size;
+            wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow,
+                                 size);
+            memcpy(gex->persistent_sent, gex->shadow, size);
+            if (gex->bytes_written < size)
+               gex->bytes_written = size;
+            continue;
+         }
+         const uint32_t block = 4096;
+         uint32_t run = UINT32_MAX;
+         for (uint32_t at = 0;; at += block) {
+            const uint32_t n = at < size ? MIN2(block, size - at) : 0;
+            const bool dirty =
+               n && memcmp(gex->shadow + at, gex->persistent_sent + at, n);
+            if (dirty && run == UINT32_MAX)
+               run = at;
+            if (!dirty && run != UINT32_MAX) {
+               const uint32_t end = MIN2(at, size);
+               if (gex_wgpu_persist_log())
+                  fprintf(stderr, "PERSIST upload res=%p [%u,%u) of %u\n",
+                          (void *)&gex->base, run, end, size);
+               wgpuQueueWriteBuffer(screen->queue, gex->buffer, run,
+                                    gex->shadow + run, end - run);
+               memcpy(gex->persistent_sent + run, gex->shadow + run, end - run);
+               if (gex->bytes_written < size)
+                  gex->bytes_written = size;
+               run = UINT32_MAX;
+            }
+            if (!n)
+               break;
+         }
          continue;
       }
       if (gex->persistent_sent && gex->persistent_sent_size != size) {
