@@ -110,7 +110,7 @@ Import it after the app's own properties. These knobs are read at import:
 | --- | --- |
 | `WinkLinkWebGPUGlue=false` | the app already links emdawnwebgpu's `webgpu.cpp` |
 | `WinkLinkWebGPUJs=false` | the app passes its own four `library_webgpu*.js` (defaults to the glue knob). They must be the same emdawnwebgpu release, and wink's copies carry fixes a stock copy lacks |
-| `WinkLinkTint=false` | the app already links the same Tint (MobileGL's, from the same Dawn revision) |
+| `WinkLinkTint=false` | the app already links the same Tint (from the same Dawn revision) |
 
 The stack is raised to 16 MB unless the app already chose one, through
 `EmccStackSize` or a `STACK_SIZE` in `EmccExtraLDFlags`. GL runs on whatever

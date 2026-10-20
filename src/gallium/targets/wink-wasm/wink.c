@@ -2,7 +2,7 @@
 /*
  * wink: st/mesa on gex_wgpu, driven directly -- no EGL, no DRI, no winsys.
  *
- * The shape is gex's wire decoder's (web/mobilegl/gexgl-mobilegl.cpp in the
+ * The shape is gex's wire decoder's (web/mesa/gexgl-mesa.cpp in the
  * gex repository), which has run this frontend on this driver in a browser
  * for a long time: a pipe_frontend_drawable whose attachments are plain
  * textures this file owns, st_api_create_context for the context, and a

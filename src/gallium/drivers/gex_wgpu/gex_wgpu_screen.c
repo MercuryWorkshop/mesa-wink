@@ -49923,7 +49923,7 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
    /* dest_surface_srgb_control is deliberately not set. st/mesa gates
     * EXT_framebuffer_sRGB on it, and 1909 "FBO is not complete ... with
     * sizedFormat: GL_SRGB8_ALPHA8" made it look like the missing piece --
-    * a defect that is ours, since the MobileGL backend logs none of them.
+    * a defect that is ours.
     * Setting it changes the run not at all -- measured twice, and the second
     * time with the module healthy: 169 failures either way, zero throws
     * either way. (The completeness failures it was meant to fix turned out to
