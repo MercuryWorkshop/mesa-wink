@@ -131,7 +131,11 @@ note(const char *fmt, ...)
    X(void, EnableClientState, (GLenum))                                          \
    X(void, DisableClientState, (GLenum))                                         \
    X(void, VertexPointer, (GLint, GLenum, GLsizei, const void *))                \
-   X(void, ColorPointer, (GLint, GLenum, GLsizei, const void *))
+   X(void, ColorPointer, (GLint, GLenum, GLsizei, const void *))                 \
+   X(void, BlendFunc, (GLenum, GLenum))                                          \
+   X(GLint, GetUniformLocation, (GLuint, const GLchar *))                        \
+   X(void, Uniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat))               \
+   X(void, ClearTexImage, (GLuint, GLint, GLenum, GLenum, const void *))
 
 #define DECLARE(ret, name, args) static ret (*p_gl##name) args;
 GL_FUNCS(DECLARE)
@@ -1159,6 +1163,109 @@ client_textures(const char *label, wink_surface *surface)
    wink_context_destroy(ctx);
 }
 
+#ifdef __EMSCRIPTEN__
+/* library_wink_test.js: WebGPU errors so far, which no GL call reports. */
+int wink_test_webgpu_errors(void);
+#else
+static int wink_test_webgpu_errors(void) { return 0; }
+#endif
+
+/* Targets without alpha, as wined3d uses them: a GL_RGB8 colour buffer is an
+ * RGBX format, stored as RGBA because WebGPU has none without alpha, and GL
+ * says its destination alpha reads as one whatever the bytes hold. A draw
+ * with alpha 0 and no blending fills the stored alpha with zero; a draw
+ * blended by GL_DST_ALPHA must still come out at full strength. (st/mesa
+ * rewrites the factors itself for a base format without alpha, so this
+ * holds today; it is here so it keeps holding.)
+ *
+ * And glClearTexImage on a multisampled texture, which wined3d does to its
+ * 1x1 dummy textures: WebGPU copies into no multisampled texture, so a clear
+ * done as an upload is a validation error that no GL call reports. */
+static void
+alphaless_targets(const char *label, wink_surface *surface)
+{
+   static const char *vs =
+      "#version 330 core\n"
+      "void main() {\n"
+      "  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n"
+      "  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+      "}\n";
+   static const char *fs =
+      "#version 330 core\n"
+      "uniform vec4 c;\n"
+      "out vec4 color;\n"
+      "void main() { color = c; }\n";
+   wink_context_attribs ca;
+   wink_context_attribs_default(&ca);
+   ca.api = WINK_API_OPENGL_CORE;
+   int status = 0;
+   wink_context *ctx = wink_context_create(&ca, &status);
+   CHECK(ctx, "%s: core context: %s", label, wink_status_string(status));
+   if (!ctx)
+      return;
+   wink_make_current(ctx, surface, surface);
+   const int errors_before = wink_test_webgpu_errors();
+   GLuint prog = link_program(vs, fs, label);
+   const GLint c = p_glGetUniformLocation(prog, "c");
+   GLuint vao = 0, tex = 0, fbo = 0;
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glGenTextures(1, &tex);
+   p_glBindTexture(GL_TEXTURE_2D, tex);
+   p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, W, H, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+   p_glGenFramebuffers(1, &fbo);
+   p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+   p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+   CHECK(p_glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE,
+         "%s: RGB8 framebuffer incomplete", label);
+   p_glViewport(0, 0, W, H);
+   p_glUseProgram(prog);
+   p_glDisable(GL_BLEND);
+   p_glUniform4f(c, 0.0f, 0.0f, 1.0f, 0.0f);
+   p_glDrawArrays(GL_TRIANGLES, 0, 3);
+   p_glEnable(GL_BLEND);
+   p_glBlendFunc(GL_DST_ALPHA, GL_ZERO);
+   p_glUniform4f(c, 1.0f, 0.5f, 0.25f, 1.0f);
+   p_glDrawArrays(GL_TRIANGLES, 0, 3);
+   uint8_t got[4];
+   read_center(got, W, H);
+   CHECK(near(got, 255, 128, 64), "%s: RGB8 target blended by GL_DST_ALPHA read %u,%u,%u, want 255,128,64",
+         label, got[0], got[1], got[2]);
+   /* ONE_MINUS_DST_ALPHA is zero there: the colour is kept as it was. */
+   p_glBlendFunc(GL_ONE_MINUS_DST_ALPHA, GL_ONE);
+   p_glUniform4f(c, 0.0f, 1.0f, 0.0f, 1.0f);
+   p_glDrawArrays(GL_TRIANGLES, 0, 3);
+   read_center(got, W, H);
+   CHECK(near(got, 255, 128, 64), "%s: RGB8 target blended by GL_ONE_MINUS_DST_ALPHA read %u,%u,%u, want 255,128,64",
+         label, got[0], got[1], got[2]);
+   p_glDisable(GL_BLEND);
+   p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+   GLuint ms = 0;
+   p_glGenTextures(1, &ms);
+   p_glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, ms);
+   p_glTexStorage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, 4, GL_RGBA8, 1, 1, GL_TRUE);
+   static const uint8_t black[4] = {0, 0, 0, 255};
+   p_glClearTexImage(ms, 0, GL_RGBA, GL_UNSIGNED_BYTE, black);
+   /* A readback, not glFinish: it waits for the GPU on the event loop, which
+    * is where the error event is delivered. */
+   read_center(got, W, H);
+   GLenum err = p_glGetError();
+   CHECK(err == GL_NO_ERROR, "%s: alpha-less targets: GL error 0x%x", label, err);
+   const int errors = wink_test_webgpu_errors() - errors_before;
+   CHECK(errors == 0, "%s: glClearTexImage of a multisampled texture: %d WebGPU errors", label, errors);
+
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glDeleteFramebuffers(1, &fbo);
+   p_glDeleteTextures(1, &tex);
+   p_glDeleteTextures(1, &ms);
+   wink_make_current(NULL, NULL, NULL);
+   wink_context_destroy(ctx);
+}
+
 static void
 exercise(const char *label, int api, wink_surface *surface)
 {
@@ -1343,6 +1450,7 @@ run_pass(const char *label)
    big_uploads(label, surface);
    glthread_queries(label, surface);
    client_textures(label, surface);
+   alphaless_targets(label, surface);
 
    /* A version that does not exist is refused, not quietly lowered. */
    wink_context_attribs ca;
