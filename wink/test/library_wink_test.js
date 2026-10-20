@@ -22,5 +22,13 @@ var LibraryWinkTest = {
       run()['catch'](function (e) { err('wink test: ' + name + ' failed: ' + (e && e.stack || e)); });
     }, 0);
   },
+
+  // WebGPU errors nobody captured so far (library_wink.js counts them): a
+  // validation error fails no GL call, so a test that provokes one looks
+  // for it here.
+  wink_test_webgpu_errors__deps: ['$WINK'],
+  wink_test_webgpu_errors: function () {
+    return WINK.errors | 0;
+  },
 };
 mergeInto(LibraryManager.library, LibraryWinkTest);
