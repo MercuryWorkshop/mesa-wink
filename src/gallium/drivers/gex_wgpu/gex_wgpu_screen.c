@@ -2377,6 +2377,19 @@ struct gex_wgpu_context {
    struct pipe_framebuffer_state framebuffer;
    struct pipe_resource *fetch_copies[8];
    WGPUTextureView fetch_views[8];
+   /* Render-pass attachment views, kept (gex_wgpu_attachment_view): a draw
+    * that begins a pass used to create a view per attachment and release it
+    * after recording -- a GPUTextureView object, and the garbage behind it,
+    * for most of a scene's draws, which change targets every few draws. */
+   struct gex_wgpu_attachment_view {
+      WGPUTexture texture;
+      WGPUTextureView view;
+      uint64_t epoch;
+      WGPUTextureFormat format;
+      WGPUTextureViewDimension dimension;
+      uint32_t level, layer;
+   } attachment_views[32];
+   unsigned attachment_view_next;
    struct blitter_context *blitter;
    struct pipe_constant_buffer
       constant_buffers[MESA_SHADER_STAGES][GEX_WGPU_MAX_CONSTANT_BUFFERS];
@@ -6587,13 +6600,57 @@ gex_wgpu_free_buffer(WGPUBuffer buffer)
    wgpuBufferRelease(buffer);
 }
 
+/* Bumped whenever a texture is let go of: its handle may name a new texture
+ * after, so a view kept for it (gex_wgpu_attachment_view) is not used again. */
+static uint64_t gex_wgpu_texture_epoch;
+
 static void
 gex_wgpu_free_texture(WGPUTexture texture)
 {
    if (!texture)
       return;
+   p_atomic_inc(&gex_wgpu_texture_epoch);
    wgpuTextureDestroy(texture);
    wgpuTextureRelease(texture);
+}
+
+/* A view of one level and one layer of `texture` for a render-pass
+ * attachment, as `desc` describes it, made once and kept by the context
+ * until a texture is let go of anywhere (the epoch) or the slot is wanted for
+ * another. Borrowed: the caller does not release it. A pass holds its own
+ * reference, so replacing a slot while a pass records is fine. */
+static WGPUTextureView
+gex_wgpu_attachment_view(struct gex_wgpu_context *ctx, WGPUTexture texture,
+                         const WGPUTextureViewDescriptor *desc)
+{
+   const uint64_t epoch = p_atomic_read(&gex_wgpu_texture_epoch);
+   struct gex_wgpu_attachment_view *slot = NULL;
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->attachment_views); ++i) {
+      struct gex_wgpu_attachment_view *e = &ctx->attachment_views[i];
+      if (!e->view || e->epoch != epoch) {
+         if (!slot)
+            slot = e;
+         continue;
+      }
+      if (e->texture == texture && e->format == desc->format &&
+          e->dimension == desc->dimension && e->level == desc->baseMipLevel &&
+          e->layer == desc->baseArrayLayer)
+         return e->view;
+   }
+   WGPUTextureView view = wgpuTextureCreateView(texture, desc);
+   if (!view)
+      return NULL;
+   if (!slot) {
+      slot = &ctx->attachment_views[ctx->attachment_view_next];
+      ctx->attachment_view_next =
+         (ctx->attachment_view_next + 1) % ARRAY_SIZE(ctx->attachment_views);
+   }
+   if (slot->view)
+      wgpuTextureViewRelease(slot->view);
+   *slot = (struct gex_wgpu_attachment_view){
+      texture, view, epoch, desc->format, desc->dimension,
+      desc->baseMipLevel, desc->baseArrayLayer};
+   return view;
 }
 
 /* Read some of a mapped buffer into memory of the caller's, rather than
@@ -48642,7 +48699,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             }
          }
       }
-      views[i] = wgpuTextureCreateView(attach, &color_view);
+      views[i] = gex_wgpu_attachment_view(ctx, attach, &color_view);
       missing_view |= !views[i];
    }
    if (!reuse && ctx->depth) {
@@ -48662,8 +48719,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       view_desc.mipLevelCount = 1;
       view_desc.baseArrayLayer = ctx->depth_layer;
       view_desc.arrayLayerCount = 1;
-      depth_view = wgpuTextureCreateView(gex_resource(ctx->depth)->texture,
-                                         &view_desc);
+      depth_view = gex_wgpu_attachment_view(ctx,
+                                            gex_resource(ctx->depth)->texture,
+                                            &view_desc);
    }
    if (gex_timing) gex_wgpu_time_views += os_time_get_nano() - t_record_start;
    const int64_t t_encoder_start = gex_timing ? os_time_get_nano() : 0;
@@ -49393,9 +49451,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
               encoder ? "ok" : "failed",
               !bind_failed ? "ok" : "failed");
       if (pipeline && !pipeline_cached) wgpuRenderPipelineRelease(pipeline);
-      for (unsigned i = 0; i < ctx->color_count; ++i)
-         if (views[i]) wgpuTextureViewRelease(views[i]);
-      if (depth_view) wgpuTextureViewRelease(depth_view);
+      /* The attachment views are the context's (gex_wgpu_attachment_view). */
       /* encoder is ctx->pending_encoder, which gex_fail tears down. */
       gex_fail(ctx);
       GEX_DRAW_DROP();
@@ -49928,14 +49984,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          if (bind_groups[group])
             wgpuBindGroupRelease(bind_groups[group]);
    }
-   /* The views were recorded into the pass, which holds its own references,
-    * so this draw is done with them even though nothing is submitted yet. */
-   /* Null on the reuse path, where no views were made. */
-   for (unsigned i = 0; i < ctx->color_count; ++i)
-      if (views[i])
-         wgpuTextureViewRelease(views[i]);
-   if (depth_view)
-      wgpuTextureViewRelease(depth_view);
+   /* The attachment views are the context's (gex_wgpu_attachment_view):
+    * nothing to release here. */
    if (!pipeline_cached)
       wgpuRenderPipelineRelease(pipeline);
    /* bind_groups[] and, when cached, the pipeline belong to the screen. */
@@ -50151,6 +50201,9 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
          wgpuTextureViewRelease(ctx->fetch_views[rt]);
       pipe_resource_reference(&ctx->fetch_copies[rt], NULL);
    }
+   for (unsigned i = 0; i < ARRAY_SIZE(ctx->attachment_views); ++i)
+      if (ctx->attachment_views[i].view)
+         wgpuTextureViewRelease(ctx->attachment_views[i].view);
    ctx->persistent = NULL;
    ctx->persistent_count = ctx->persistent_capacity = 0;
    for (unsigned i = 0; i < GEX_WGPU_MAX_SO_BUFFERS; ++i) {
