@@ -45575,8 +45575,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       viewport_y = ctx->viewport.translate[1] - fabsf(sy);
       viewport_width = 2.0f * sx;
       viewport_height = 2.0f * fabsf(sy);
-      min_depth = ctx->viewport.translate[2] - sz;
-      max_depth = ctx->viewport.translate[2] + sz;
+      /* Gallium's depth transform is z * scale + translate, over the clip
+       * volume's z: [-1, 1], or [0, 1] when the rasterizer says clip_halfz
+       * (D3D, glClipControl's GL_ZERO_TO_ONE), whose range is then
+       * translate .. translate + scale. */
+      if (ctx->rasterizer && ctx->rasterizer->clip_halfz) {
+         min_depth = ctx->viewport.translate[2];
+         max_depth = ctx->viewport.translate[2] + sz;
+      } else {
+         min_depth = ctx->viewport.translate[2] - sz;
+         max_depth = ctx->viewport.translate[2] + sz;
+      }
       if (sy > 0.0f)
          vertex_flipped = true;
       /* WebGPU takes a depth range inside [0, 1]. glDepthRange clamps to that
