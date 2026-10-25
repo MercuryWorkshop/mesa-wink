@@ -939,6 +939,13 @@ option(
 )
 
 option(
+  'gex-dirk-dir',
+  type : 'string',
+  value : '',
+  description : 'gex Wasm target: a dirk package (lib/libdirk.a, include/) to link the D3D device into gex-wgpu-replay beside the GL one. Empty: GL only.'
+)
+
+option(
   'gex-sanitize',
   type : 'boolean',
   value : false,

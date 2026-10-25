@@ -144,10 +144,28 @@ if gex_emdawn_dir != ''
   # Gallium driver.  Same source and same exported ABI as gex-mesa-replay, so
   # one recorded guest stream runs against softpipe and WebGPU unchanged and
   # the two can be compared directly.
+  # The D3D device beside the GL one (gex: web/mesa/gexd3d-mesa.cpp), on
+  # a dirk package. dirk is DXVK's front end and uses C++ exceptions, so the
+  # link has them; Mesa's own objects are compiled as without it.
+  gex_dirk_dir = get_option('gex-dirk-dir')
+  gex_dirk_sources = []
+  gex_dirk_args = []
+  gex_dirk_link_args = []
+  gex_dirk_include = []
+  gex_dirk_depends = []
+  if gex_dirk_dir != ''
+    gex_dirk_sources = [join_paths(gex_root, 'web', 'mesa', 'gexd3d-mesa.cpp')]
+    gex_dirk_args = ['-DGEX_MESA_DIRK=1']
+    gex_dirk_link_args = [join_paths(gex_dirk_dir, 'lib', 'libdirk.a'), '-fwasm-exceptions']
+    gex_dirk_include = include_directories(join_paths(gex_dirk_dir, 'include'))
+    gex_dirk_depends = [join_paths(gex_dirk_dir, 'lib', 'libdirk.a')]
+  endif
+
   if have_gex_decoder and have_gex_jspi
     gex_wgpu_replay = executable(
       'gex-wgpu-replay',
       gex_decoder,
+      gex_dirk_sources,
       join_paths(gex_emdawn_dir, 'webgpu', 'src', 'webgpu.cpp'),
       include_directories : [
         inc_include,
@@ -158,8 +176,9 @@ if gex_emdawn_dir != ''
         inc_gallium_winsys,
         inc_gallium_drivers,
         gex_emdawn_include,
+        gex_dirk_include,
       ],
-      cpp_args : ['-DGEX_MESA_WASM=1', '-DGEX_MESA_WGPU=1'],
+      cpp_args : ['-DGEX_MESA_WASM=1', '-DGEX_MESA_WGPU=1'] + gex_dirk_args,
       link_whole : [libglapi_bridge],
       link_with : [libglapi, libgallium, libmesa],
       dependencies : [
@@ -170,8 +189,8 @@ if gex_emdawn_dir != ''
         dep_thread,
         dep_clock,
       ],
-      link_depends : gex_emdawn_js + [gex_jspi_js, gex_split_js],
-      link_args : gex_emdawn_link_args + [
+      link_depends : gex_emdawn_js + [gex_jspi_js, gex_split_js] + gex_dirk_depends,
+      link_args : gex_emdawn_link_args + gex_dirk_link_args + [
         '--no-entry',
         '-sWASM_BIGINT=1',
         '-sSTACK_SIZE=16MB',
