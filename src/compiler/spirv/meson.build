@@ -45,6 +45,10 @@ files_libvtn = files(
   'vtn_variables.c',
 )
 
+# gex's D3D device (gex-dirk-dir) links with wasm exceptions, so setjmp is
+# lowered the wasm way: spirv_to_nir's setjmp needs the feature too.
+vtn_eh_args = get_option('gex-dirk-dir') != '' ? ['-mexception-handling'] : []
+
 libvtn = static_library(
   'vtn',
   [files_libvtn,
@@ -53,7 +57,7 @@ libvtn = static_library(
    vtn_generator_ids_h,
   ],
   include_directories : [inc_include, inc_src],
-  c_args : [c_msvc_compat_args, soong_compat_c_args, no_override_init_args],
+  c_args : [c_msvc_compat_args, soong_compat_c_args, no_override_init_args, vtn_eh_args],
   gnu_symbol_visibility : 'hidden',
   dependencies : [dep_spirv_tools, idep_nir, dep_valgrind],
   build_by_default : false,
