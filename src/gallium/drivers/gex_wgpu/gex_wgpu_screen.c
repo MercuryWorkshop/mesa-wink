@@ -20713,6 +20713,9 @@ gex_wgpu_batch_let_go(struct gex_wgpu_resource *gex, uint32_t bit)
          v->readers[i] &= ~bit;
 }
 
+/* What renames upload: the shadow rewrites the whole buffer, the others
+ * only the write. */
+static uint64_t gex_wgpu_renamed_upload_bytes;
 static unsigned long gex_wgpu_renamed, gex_wgpu_renamed_bytes,
    gex_wgpu_renamed_carried, gex_wgpu_staged_in_batch;
 /* Buffer versions made by renames and let go of with their resource, for
@@ -20727,7 +20730,7 @@ static uint64_t gex_wgpu_versions_made, gex_wgpu_versions_made_bytes,
 enum { GEX_WGPU_NORENAME_BIND, GEX_WGPU_NORENAME_GPU, GEX_WGPU_NORENAME_BIG,
        GEX_WGPU_NORENAME_STAGED, GEX_WGPU_NORENAME_UNALIGNED,
        GEX_WGPU_NORENAME_FULL, GEX_WGPU_NORENAME_CONTEXTS,
-       GEX_WGPU_NORENAME_OTHER,
+       GEX_WGPU_NORENAME_REWRITE, GEX_WGPU_NORENAME_OTHER,
        GEX_WGPU_NORENAME_COUNT };
 static unsigned long gex_wgpu_norename[GEX_WGPU_NORENAME_COUNT];
 
@@ -20774,6 +20777,10 @@ gex_wgpu_refuse_rename(unsigned why)
  * is the only thing that could have a copy into it, which staged_by rules
  * out. Capped, since every carried write copies the whole buffer. */
 #define GEX_WGPU_RENAME_CARRY_MAX_BYTES (1u << 20)
+/* A write rewrites its whole buffer from the shadow only up to this, or
+ * when the buffer is at most this many times the write. */
+#define GEX_WGPU_RENAME_REWRITE_FREE_BYTES (64u << 10)
+#define GEX_WGPU_RENAME_REWRITE_RATIO 4
 
 static bool
 gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
@@ -20811,6 +20818,14 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
    const bool carry = !gex->shadow && !whole;
    if (words > gex->gpu_size || (gex->shadow && words > gex->allocation_size))
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
+   /* From the shadow the whole buffer goes up again for one write: under
+    * wined3d, Hades renamed about 160 two-megabyte buffers a second this way,
+    * over 300 MB/s of queue writes, and ran at 18 fps against 32 staging
+    * them. Only where the buffer is small, or not much bigger than the
+    * write. */
+   if (gex->shadow && !whole && words > GEX_WGPU_RENAME_REWRITE_FREE_BYTES &&
+       words > (uint64_t)size * GEX_WGPU_RENAME_REWRITE_RATIO)
+      return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_REWRITE);
    if (carry) {
       if (gex->gpu_size > GEX_WGPU_RENAME_CARRY_MAX_BYTES)
          return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIG);
@@ -20893,8 +20908,10 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
    } else if (gex->shadow) {
       memcpy(gex->shadow + offset, data, size);
       wgpuQueueWriteBuffer(screen->queue, to, 0, gex->shadow, words);
+      gex_wgpu_renamed_upload_bytes += words;
    } else {
       wgpuQueueWriteBuffer(screen->queue, to, 0, data, size);
+      gex_wgpu_renamed_upload_bytes += size;
    }
    gex->buffer = to;
    gex->bytes_written += size;
@@ -40215,7 +40232,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
             const double f = gex_wgpu_presents > was_presents
                                 ? (double)(gex_wgpu_presents - was_presents) : 1.0;
 #define GEX_PER(field) ((m->field - was.field) / f)
-            static uint64_t was_ver[2];
+            static uint64_t was_ver[2], was_rb[2];
             static unsigned long was_rn[5], was_not[GEX_WGPU_NORENAME_COUNT];
 #define GEX_NOT(why) ((gex_wgpu_norename[why] - was_not[why]) / f)
             fprintf(stderr,
@@ -40226,9 +40243,11 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                     "render passes %.1f; queue: %.1f buffer writes (%.1f KiB), "
                     "%.1f texture writes, %.1f submits; writes to a buffer the "
                     "batch reads: %.1f direct beside its ranges (%.1f overlapped), "
-                    "%.1f renamed (%.1f carried), %.1f staged, "
+                    "%.1f renamed (%.1f carried; %.0f KiB written, %.0f KiB "
+                    "uploaded), %.1f staged, "
                     "not renamed: bind %.1f, gpu %.1f, big %.1f, staged %.1f, "
-                    "unaligned %.1f, full %.1f, contexts %.1f, other %.1f; "
+                    "unaligned %.1f, full %.1f, contexts %.1f, rewrite %.1f, "
+                    "other %.1f; "
                     "contexts live %u; buffer versions %.1f made, %.1f freed, "
                     "%llu alive (%.1f MiB)\n",
                     gex_wgpu_presents > was_presents ? f : 0.0,
@@ -40243,17 +40262,21 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                     (gex_wgpu_range_overlap - was_rn[4]) / f,
                     (gex_wgpu_renamed - was_rn[0]) / f,
                     (gex_wgpu_renamed_carried - was_rn[1]) / f,
+                    (gex_wgpu_renamed_bytes - was_rb[0]) / f / 1024,
+                    (gex_wgpu_renamed_upload_bytes - was_rb[1]) / f / 1024,
                     (gex_wgpu_staged_in_batch - was_rn[2]) / f,
                     GEX_NOT(GEX_WGPU_NORENAME_BIND), GEX_NOT(GEX_WGPU_NORENAME_GPU),
                     GEX_NOT(GEX_WGPU_NORENAME_BIG), GEX_NOT(GEX_WGPU_NORENAME_STAGED),
                     GEX_NOT(GEX_WGPU_NORENAME_UNALIGNED),
                     GEX_NOT(GEX_WGPU_NORENAME_FULL), GEX_NOT(GEX_WGPU_NORENAME_CONTEXTS),
-                    GEX_NOT(GEX_WGPU_NORENAME_OTHER),
+                    GEX_NOT(GEX_WGPU_NORENAME_REWRITE), GEX_NOT(GEX_WGPU_NORENAME_OTHER),
                     sc->live_contexts,
                     (gex_wgpu_versions_made - was_ver[0]) / f,
                     (gex_wgpu_versions_freed - was_ver[1]) / f,
                     (unsigned long long)(gex_wgpu_versions_made - gex_wgpu_versions_freed),
                     (gex_wgpu_versions_made_bytes - gex_wgpu_versions_freed_bytes) / 1048576.0);
+            was_rb[0] = gex_wgpu_renamed_bytes;
+            was_rb[1] = gex_wgpu_renamed_upload_bytes;
             was_ver[0] = gex_wgpu_versions_made;
             was_ver[1] = gex_wgpu_versions_freed;
             {
