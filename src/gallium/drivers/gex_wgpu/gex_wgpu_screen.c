@@ -52,6 +52,34 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* What the driver asks WebGPU to make and write, counted for the
+ * GEX_WGPU_TIMING report: per frame in steady state, a creation count in the
+ * hundreds is a cache that does not hold. An increment each, so always on. */
+static struct gex_wgpu_made {
+   uint64_t render_pipelines, compute_pipelines, shader_modules, bind_groups,
+      bind_group_layouts, pipeline_layouts, samplers, buffers, textures, views,
+      write_buffers, write_buffer_bytes, write_textures, submits, encoders,
+      render_passes;
+} gex_wgpu_made;
+#define GEX_WGPU_MADE(field, call) (++gex_wgpu_made.field, (call))
+#define wgpuDeviceCreateRenderPipeline(...) GEX_WGPU_MADE(render_pipelines, wgpuDeviceCreateRenderPipeline(__VA_ARGS__))
+#define wgpuDeviceCreateComputePipeline(...) GEX_WGPU_MADE(compute_pipelines, wgpuDeviceCreateComputePipeline(__VA_ARGS__))
+#define wgpuDeviceCreateShaderModule(...) GEX_WGPU_MADE(shader_modules, wgpuDeviceCreateShaderModule(__VA_ARGS__))
+#define wgpuDeviceCreateBindGroup(...) GEX_WGPU_MADE(bind_groups, wgpuDeviceCreateBindGroup(__VA_ARGS__))
+#define wgpuDeviceCreateBindGroupLayout(...) GEX_WGPU_MADE(bind_group_layouts, wgpuDeviceCreateBindGroupLayout(__VA_ARGS__))
+#define wgpuDeviceCreatePipelineLayout(...) GEX_WGPU_MADE(pipeline_layouts, wgpuDeviceCreatePipelineLayout(__VA_ARGS__))
+#define wgpuDeviceCreateSampler(...) GEX_WGPU_MADE(samplers, wgpuDeviceCreateSampler(__VA_ARGS__))
+#define wgpuDeviceCreateBuffer(...) GEX_WGPU_MADE(buffers, wgpuDeviceCreateBuffer(__VA_ARGS__))
+#define wgpuDeviceCreateTexture(...) GEX_WGPU_MADE(textures, wgpuDeviceCreateTexture(__VA_ARGS__))
+#define wgpuTextureCreateView(...) GEX_WGPU_MADE(views, wgpuTextureCreateView(__VA_ARGS__))
+#define wgpuQueueWriteTexture(...) GEX_WGPU_MADE(write_textures, wgpuQueueWriteTexture(__VA_ARGS__))
+#define wgpuQueueSubmit(...) GEX_WGPU_MADE(submits, wgpuQueueSubmit(__VA_ARGS__))
+#define wgpuDeviceCreateCommandEncoder(...) GEX_WGPU_MADE(encoders, wgpuDeviceCreateCommandEncoder(__VA_ARGS__))
+#define wgpuCommandEncoderBeginRenderPass(...) GEX_WGPU_MADE(render_passes, wgpuCommandEncoderBeginRenderPass(__VA_ARGS__))
+#define wgpuQueueWriteBuffer(queue, buffer, offset, data, size) \
+   (++gex_wgpu_made.write_buffers, gex_wgpu_made.write_buffer_bytes += (size), \
+    wgpuQueueWriteBuffer(queue, buffer, offset, data, size))
+
 extern void gex_wgpu_jspi_wait(void);
 extern void gex_wgpu_jspi_signal(void);
 
@@ -39427,6 +39455,44 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                  (unsigned long long)sc->bg_cache_misses,
                  pl ? 100.0 * sc->pipeline_cache_hits / pl : 0.0,
                  (unsigned long long)sc->pipeline_cache_misses);
+         {
+            static struct gex_wgpu_made was;
+            static uint64_t was_presents;
+            const struct gex_wgpu_made *m = &gex_wgpu_made;
+            const double f = gex_wgpu_presents > was_presents
+                                ? (double)(gex_wgpu_presents - was_presents) : 1.0;
+#define GEX_PER(field) ((m->field - was.field) / f)
+            fprintf(stderr,
+                    "gex-wgpu: per frame (%.0f frames) -- made: render pipelines %.1f, "
+                    "compute pipelines %.1f, shader modules %.1f, bind groups %.1f, "
+                    "bind group layouts %.1f, pipeline layouts %.1f, samplers %.1f, "
+                    "buffers %.1f, textures %.1f, views %.1f, encoders %.1f, "
+                    "render passes %.1f; queue: %.1f buffer writes (%.1f KiB), "
+                    "%.1f texture writes, %.1f submits\n",
+                    gex_wgpu_presents > was_presents ? f : 0.0,
+                    GEX_PER(render_pipelines), GEX_PER(compute_pipelines),
+                    GEX_PER(shader_modules), GEX_PER(bind_groups),
+                    GEX_PER(bind_group_layouts), GEX_PER(pipeline_layouts),
+                    GEX_PER(samplers), GEX_PER(buffers), GEX_PER(textures),
+                    GEX_PER(views), GEX_PER(encoders), GEX_PER(render_passes),
+                    GEX_PER(write_buffers), GEX_PER(write_buffer_bytes) / 1024,
+                    GEX_PER(write_textures), GEX_PER(submits));
+            static uint64_t was_pl[2], was_bg[2];
+            fprintf(stderr,
+                    "gex-wgpu: per frame -- pipeline cache %.1f hits, %.1f misses; "
+                    "bind group cache %.1f hits, %.1f misses\n",
+                    (sc->pipeline_cache_hits - was_pl[0]) / f,
+                    (sc->pipeline_cache_misses - was_pl[1]) / f,
+                    (sc->bg_cache_hits - was_bg[0]) / f,
+                    (sc->bg_cache_misses - was_bg[1]) / f);
+            was_pl[0] = sc->pipeline_cache_hits;
+            was_pl[1] = sc->pipeline_cache_misses;
+            was_bg[0] = sc->bg_cache_hits;
+            was_bg[1] = sc->bg_cache_misses;
+#undef GEX_PER
+            was = *m;
+            was_presents = gex_wgpu_presents;
+         }
          fprintf(stderr,
                  "gex-wgpu: %llu draws recorded, %llu handed to another path, "
                  "%llu dropped\n",
