@@ -1774,6 +1774,11 @@ struct gex_wgpu_screen {
    /* Every context is driven from one thread (gex_wgpu_screen_one_thread):
     * a second context does not need the device lock. */
    bool one_thread;
+   /* The batch bits handed to this screen's contexts
+    * (gex_wgpu_context::batch_bit), and how many live contexts share
+    * GEX_WGPU_SHARED_BATCH_BIT. */
+   uint32_t batch_bits_used;
+   unsigned batch_bit_shared;
    /* Render pipelines, keyed on the bytes of their descriptor and everything
     * it points at. Serialising rather than enumerating the fields on purpose:
     * a field left out of an enumerated key returns the *wrong* pipeline,
@@ -1922,12 +1927,13 @@ struct gex_wgpu_resource {
     * reinterprets the format keeps a copy of the bytes in another format and
     * uses this to know when that copy is stale. */
    uint64_t write_serial;
-   /* One more than the context's batch_serial when a write to this buffer
-    * was last staged in the batch: a copy the batch has yet to run, which a
-    * carry ahead of the batch would miss. */
-   uint64_t staged_batch;
-   /* Touched by a draw that is recorded but not yet submitted. */
-   bool in_batch;
+   /* The contexts (their batch_bit) whose pending batch has a staged write
+    * to this buffer: a copy the batch has yet to run, which a carry ahead of
+    * another batch would miss. */
+   uint32_t staged_by;
+   /* The contexts (their batch_bit) with a draw that touched this resource
+    * recorded and not yet submitted. */
+   uint32_t in_batch;
    /* A snapshot of this texture, taken when a draw both renders to it and
     * samples it, and sampled in its place. Kept on the resource so it is
     * reused rather than reallocated every draw; rebuilt if the texture's
@@ -2521,10 +2527,13 @@ struct gex_wgpu_context {
    struct pipe_resource *batch_touched[4096];
    unsigned batch_touched_count;
    bool batch_touched_overflowed;
-   /* Moves each time the touched list is let go of: a buffer version last
-    * bound under an older value is read by no recorded draw, and a queue
-    * write to it runs after the submits that did. */
+   /* Moves each time the touched list is let go of. */
    uint64_t batch_serial;
+   /* This context's bit in a resource's in_batch and staged_by and a buffer
+    * version's readers. A screen driven from one thread gives each context
+    * its own; otherwise every context shares GEX_WGPU_SHARED_BATCH_BIT, and
+    * one context's submit clears them all, as a single flag did. */
+   uint32_t batch_bit;
    /* Linked into gex_wgpu_screen::open_encoders while pending_encoder is
     * open, which it opened at `encoder_serial` (gex_wgpu_doom). */
    struct list_head open_link;
@@ -18082,6 +18091,12 @@ gex_wgpu_stage_ring_words(struct gex_wgpu_context *ctx, const uint32_t *words,
    return offset;
 }
 
+#define GEX_WGPU_SHARED_BATCH_BIT (1u << 31)
+
+static void gex_wgpu_versions_note_read(struct gex_wgpu_resource *gex,
+                                        uint32_t bit);
+static void gex_wgpu_batch_let_go(struct gex_wgpu_resource *gex, uint32_t bit);
+
 static void
 gex_wgpu_batch_touch(struct gex_wgpu_context *ctx,
                      struct pipe_resource *resource)
@@ -18089,7 +18104,7 @@ gex_wgpu_batch_touch(struct gex_wgpu_context *ctx,
    if (!resource)
       return;
    struct gex_wgpu_resource *gex = gex_resource(resource);
-   if (gex->in_batch)
+   if (gex->in_batch & ctx->batch_bit)
       return;
    if (ctx->batch_touched_count >= ARRAY_SIZE(ctx->batch_touched)) {
       /* Nowhere left to hold a reference, so the batch can no longer promise
@@ -18098,7 +18113,9 @@ gex_wgpu_batch_touch(struct gex_wgpu_context *ctx,
       ctx->batch_touched_overflowed = true;
       return;
    }
-   gex->in_batch = true;
+   gex->in_batch |= ctx->batch_bit;
+   if (gex->versions)
+      gex_wgpu_versions_note_read(gex, ctx->batch_bit);
    struct pipe_resource **slot = &ctx->batch_touched[ctx->batch_touched_count];
    *slot = NULL;
    pipe_resource_reference(slot, resource);
@@ -18119,7 +18136,7 @@ gex_wgpu_batch_conflicts(struct gex_wgpu_context *ctx,
     * error. Overflow has to mean "assume everything conflicts". */
    return ctx->pending_encoder &&
           (!resource || ctx->batch_touched_overflowed ||
-           gex_resource(resource)->in_batch);
+           (gex_resource(resource)->in_batch & ctx->batch_bit));
 }
 
 /* The same question for a transfer, which can answer it itself.
@@ -20268,7 +20285,7 @@ gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
    wgpuCommandEncoderCopyBufferToBuffer(ctx->pending_encoder,
                                         ctx->subdata_stage, at, gex->buffer,
                                         offset, size);
-   gex->staged_batch = ctx->batch_serial + 1;
+   gex->staged_by |= ctx->batch_bit;
    /* The shadow, where there is one, mirrors the buffer as the draws after
     * this see it. */
    if (gex->shadow)
@@ -20310,9 +20327,34 @@ gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
 struct gex_wgpu_versions {
    unsigned count;
    WGPUBuffer buffer[GEX_WGPU_RENAME_VERSIONS];
-   /* The context's batch_serial when the version was last bound. */
-   uint64_t batch[GEX_WGPU_RENAME_VERSIONS];
+   /* The contexts (their batch_bit) whose pending batch reads the version:
+    * taken when a batch first touches the buffer, and for the version a
+    * rename makes current, by every batch already holding the buffer, since
+    * their later draws bind it without touching it again. A version no
+    * pending batch reads is free to be written by the queue. */
+   uint32_t readers[GEX_WGPU_RENAME_VERSIONS];
 };
+
+static void
+gex_wgpu_versions_note_read(struct gex_wgpu_resource *gex, uint32_t bit)
+{
+   struct gex_wgpu_versions *v = gex->versions;
+   for (unsigned i = 0; i < v->count; ++i)
+      if (v->buffer[i] == gex->buffer)
+         v->readers[i] |= bit;
+}
+
+/* A batch that touched the resource has been submitted or dropped. */
+static void
+gex_wgpu_batch_let_go(struct gex_wgpu_resource *gex, uint32_t bit)
+{
+   gex->in_batch &= ~bit;
+   gex->staged_by &= ~bit;
+   struct gex_wgpu_versions *v = gex->versions;
+   if (v)
+      for (unsigned i = 0; i < v->count; ++i)
+         v->readers[i] &= ~bit;
+}
 
 static unsigned long gex_wgpu_renamed, gex_wgpu_renamed_bytes,
    gex_wgpu_renamed_carried, gex_wgpu_staged_in_batch;
@@ -20364,9 +20406,9 @@ gex_wgpu_refuse_rename(unsigned why)
  * contents over on the GPU: a copy of the old buffer into the new one, then
  * of the write's bytes from the stage, recorded in the prologue that is
  * submitted just ahead of the batch. The old buffer cannot change between
- * here and there -- later writes go to the new one, and the batch is the
- * only thing that could have a copy into it pending, which staged_batch
- * rules out. Capped, since every carried write copies the whole buffer. */
+ * here and there -- later writes go to the new one, and a pending batch
+ * is the only thing that could have a copy into it, which staged_by rules
+ * out. Capped, since every carried write copies the whole buffer. */
 #define GEX_WGPU_RENAME_CARRY_MAX_BYTES (1u << 20)
 
 static bool
@@ -20384,8 +20426,13 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
        resource->target != PIPE_BUFFER || !gex->buffer ||
        (uint64_t)offset + size > resource->width0)
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
-   if (screen->live_contexts > 1)
+   /* Versions are shared out by the contexts' pending batches, which only a
+    * screen driven from one thread can tell apart; elsewhere one context. */
+   if (screen->one_thread ? screen->batch_bit_shared != 0
+                          : screen->live_contexts > 1)
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_CONTEXTS);
+   if (ctx->batch_touched_overflowed)
+      return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
    if (resource->bind & ~binds)
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIND);
    if (gex->gpu_written || gex->persistent_usage)
@@ -20403,7 +20450,7 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
    if (carry) {
       if (gex->gpu_size > GEX_WGPU_RENAME_CARRY_MAX_BYTES)
          return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIG);
-      if (gex->staged_batch == ctx->batch_serial + 1)
+      if (gex->staged_by)
          return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_STAGED);
       if ((offset | size) & 3u)
          return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_UNALIGNED);
@@ -20439,11 +20486,12 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
          now = i;
    if (now == v->count)
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
-   /* The pending batch reads the one it has now: that is why this was asked. */
-   v->batch[now] = ctx->batch_serial;
+   /* The pending batches holding the buffer read the one it has now: that
+    * is why this was asked. */
+   v->readers[now] |= gex->in_batch;
    unsigned pick = v->count;
    for (unsigned i = 0; i < v->count; ++i)
-      if (i != now && v->batch[i] != ctx->batch_serial) {
+      if (i != now && !v->readers[i]) {
          pick = i;
          break;
       }
@@ -20459,8 +20507,9 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
       v->buffer[pick] = made;
       ++v->count;
    }
-   /* Bound by the draws after this, so taken for this batch already. */
-   v->batch[pick] = ctx->batch_serial;
+   /* Bound by the later draws of every batch holding the buffer, which do
+    * not touch it again: taken for them already. */
+   v->readers[pick] = gex->in_batch | ctx->batch_bit;
    WGPUBuffer from = v->buffer[now], to = v->buffer[pick];
    if (carry) {
       const uint32_t at = ctx->subdata_stage_offset;
@@ -41212,7 +41261,8 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
     * nothing recorded, so nothing can still need the batch to keep these
     * alive. */
    for (unsigned i = 0; i < ctx->batch_touched_count; ++i) {
-      gex_resource(ctx->batch_touched[i])->in_batch = false;
+      gex_wgpu_batch_let_go(gex_resource(ctx->batch_touched[i]),
+                            ctx->batch_bit);
       pipe_resource_reference(&ctx->batch_touched[i], NULL);
    }
    ctx->batch_touched_count = 0;
@@ -41232,7 +41282,8 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
    ctx->pending_encoder = NULL;
    ctx->pending_draws = 0;
    for (unsigned i = 0; i < ctx->batch_touched_count; ++i) {
-      gex_resource(ctx->batch_touched[i])->in_batch = false;
+      gex_wgpu_batch_let_go(gex_resource(ctx->batch_touched[i]),
+                            ctx->batch_bit);
       pipe_resource_reference(&ctx->batch_touched[i], NULL);
    }
    ctx->batch_touched_count = 0;
@@ -49591,6 +49642,13 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
       struct gex_wgpu_screen *gex = gex_screen(pipe->screen);
       simple_mtx_lock(&gex->cache_lock);
       --gex->live_contexts;
+      struct gex_wgpu_context *dying = (struct gex_wgpu_context *)pipe;
+      if (dying->batch_bit == GEX_WGPU_SHARED_BATCH_BIT) {
+         if (gex->one_thread)
+            --gex->batch_bit_shared;
+      } else {
+         gex->batch_bits_used &= ~dying->batch_bit;
+      }
       simple_mtx_unlock(&gex->cache_lock);
    }
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
@@ -49723,6 +49781,21 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    }
    (void)flags;
    struct gex_wgpu_context *ctx = CALLOC_STRUCT(gex_wgpu_context);
+   if (ctx) {
+      struct gex_wgpu_screen *gex = gex_screen(screen);
+      simple_mtx_lock(&gex->cache_lock);
+      const uint32_t free_bits =
+         ~gex->batch_bits_used & ~GEX_WGPU_SHARED_BATCH_BIT;
+      if (gex->one_thread && free_bits) {
+         ctx->batch_bit = free_bits & -free_bits;
+         gex->batch_bits_used |= ctx->batch_bit;
+      } else {
+         ctx->batch_bit = GEX_WGPU_SHARED_BATCH_BIT;
+         if (gex->one_thread)
+            ++gex->batch_bit_shared;
+      }
+      simple_mtx_unlock(&gex->cache_lock);
+   }
    /* Explicit rather than relying on calloc's zero, which happens to work
     * only because draw_depth is also zero there. */
    if (ctx)
