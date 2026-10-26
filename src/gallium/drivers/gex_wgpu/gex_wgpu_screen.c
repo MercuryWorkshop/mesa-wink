@@ -40113,10 +40113,27 @@ static uint64_t gex_wgpu_submit_cause_count[GEX_WGPU_SUBMIT_CAUSES];
 /* The periodic rolling report. Called from the draw path whether or not the
  * draw is issued, so GEX_WGPU_NO_DRAW still reports a frame rate. */
 static void
+gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc);
+
+/* What writing the report costs, said in the next one: a report is a few
+ * hundred frames apart, so this is what it adds to the frame it lands in. */
+static int64_t gex_wgpu_report_emit_nanos;
+
+static void
 gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
 {
    if (++gex_wgpu_timed_draws % 20000 != 0)
       return;
+   const int64_t t0 = gex_wgpu_clock();
+   gex_wgpu_report_timing_emit(sc);
+   gex_wgpu_report_emit_nanos = gex_wgpu_clock() - t0;
+}
+
+static void
+gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
+{
+   fprintf(stderr, "gex-wgpu: the previous report took %.2f ms to write\n",
+           gex_wgpu_report_emit_nanos / 1e6);
 
          const int64_t wall = gex_wgpu_clock() - gex_wgpu_time_origin;
          const uint64_t n = gex_wgpu_timed_draws;
