@@ -25,6 +25,11 @@ WGPUTexture gex_wgpu_resource_texture(struct pipe_resource *resource);
  * commands on the same one rather than being handed a second. */
 WGPUDevice gex_wgpu_screen_device(struct pipe_screen *screen);
 
+/* Every context the screen will have is driven from one thread, so a second
+ * context does not make it take the device lock. Called before the first
+ * context is made. */
+void gex_wgpu_screen_one_thread(struct pipe_screen *screen);
+
 /* A screen for an ordinary desktop application: creates a device from native
  * Dawn and presents through Mesa's software winsys. Declared here rather than
  * in a winsys header because the driver is what implements it. */

@@ -1769,6 +1769,11 @@ struct gex_wgpu_screen {
    mtx_t device_lock;
    bool device_lock_needed;
    unsigned context_count;
+   /* Contexts not yet destroyed (context_count never goes down). */
+   unsigned live_contexts;
+   /* Every context is driven from one thread (gex_wgpu_screen_one_thread):
+    * a second context does not need the device lock. */
+   bool one_thread;
    /* Render pipelines, keyed on the bytes of their descriptor and everything
     * it points at. Serialising rather than enumerating the fields on purpose:
     * a field left out of an enumerated key returns the *wrong* pipeline,
@@ -19030,6 +19035,16 @@ gex_wgpu_screen_device(struct pipe_screen *screen)
    return screen ? gex_screen(screen)->device : NULL;
 }
 
+void
+gex_wgpu_screen_one_thread(struct pipe_screen *screen)
+{
+   struct gex_wgpu_screen *gex = gex_screen(screen);
+   simple_mtx_lock(&gex->cache_lock);
+   gex->one_thread = true;
+   gex->device_lock_needed = false;
+   simple_mtx_unlock(&gex->cache_lock);
+}
+
 static bool
 gex_wgpu_is_format_supported(struct pipe_screen *screen,
                              enum pipe_format format,
@@ -20303,10 +20318,12 @@ static unsigned long gex_wgpu_renamed, gex_wgpu_renamed_bytes,
    gex_wgpu_renamed_carried, gex_wgpu_staged_in_batch;
 /* Why a write into a buffer the batch reads was not renamed, for the timing
  * report: what the buffer is bound as or written by, its size, a carry the
- * batch would miss, an unaligned partial write, or no version left. */
+ * batch would miss, an unaligned partial write, no version left, or another
+ * live context whose batch may read a version this one would reuse. */
 enum { GEX_WGPU_NORENAME_BIND, GEX_WGPU_NORENAME_GPU, GEX_WGPU_NORENAME_BIG,
        GEX_WGPU_NORENAME_STAGED, GEX_WGPU_NORENAME_UNALIGNED,
-       GEX_WGPU_NORENAME_FULL, GEX_WGPU_NORENAME_OTHER,
+       GEX_WGPU_NORENAME_FULL, GEX_WGPU_NORENAME_CONTEXTS,
+       GEX_WGPU_NORENAME_OTHER,
        GEX_WGPU_NORENAME_COUNT };
 static unsigned long gex_wgpu_norename[GEX_WGPU_NORENAME_COUNT];
 
@@ -20365,8 +20382,10 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
       return false;
    if (!size || !data || (usage & PIPE_MAP_READ) ||
        resource->target != PIPE_BUFFER || !gex->buffer ||
-       screen->context_count > 1 || (uint64_t)offset + size > resource->width0)
+       (uint64_t)offset + size > resource->width0)
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
+   if (screen->live_contexts > 1)
+      return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_CONTEXTS);
    if (resource->bind & ~binds)
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIND);
    if (gex->gpu_written || gex->persistent_usage)
@@ -39729,7 +39748,8 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                     "%.1f texture writes, %.1f submits; writes to a buffer the "
                     "batch reads: %.1f renamed (%.1f carried), %.1f staged, "
                     "not renamed: bind %.1f, gpu %.1f, big %.1f, staged %.1f, "
-                    "unaligned %.1f, full %.1f, other %.1f\n",
+                    "unaligned %.1f, full %.1f, contexts %.1f, other %.1f; "
+                    "contexts live %u\n",
                     gex_wgpu_presents > was_presents ? f : 0.0,
                     GEX_PER(render_pipelines), GEX_PER(compute_pipelines),
                     GEX_PER(shader_modules), GEX_PER(bind_groups),
@@ -39744,7 +39764,9 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                     GEX_NOT(GEX_WGPU_NORENAME_BIND), GEX_NOT(GEX_WGPU_NORENAME_GPU),
                     GEX_NOT(GEX_WGPU_NORENAME_BIG), GEX_NOT(GEX_WGPU_NORENAME_STAGED),
                     GEX_NOT(GEX_WGPU_NORENAME_UNALIGNED),
-                    GEX_NOT(GEX_WGPU_NORENAME_FULL), GEX_NOT(GEX_WGPU_NORENAME_OTHER));
+                    GEX_NOT(GEX_WGPU_NORENAME_FULL), GEX_NOT(GEX_WGPU_NORENAME_CONTEXTS),
+                    GEX_NOT(GEX_WGPU_NORENAME_OTHER),
+                    sc->live_contexts);
             {
                /* The same frames, in ms of this thread's wall time per frame
                 * (GEX_WGPU_TIMING's own clock reads included). */
@@ -49565,6 +49587,12 @@ static void
 gex_wgpu_context_destroy(struct pipe_context *pipe)
 {
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
+   {
+      struct gex_wgpu_screen *gex = gex_screen(pipe->screen);
+      simple_mtx_lock(&gex->cache_lock);
+      --gex->live_contexts;
+      simple_mtx_unlock(&gex->cache_lock);
+   }
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    free(ctx->persistent);
    for (unsigned rt = 0; rt < 8; ++rt) {
@@ -49688,8 +49716,9 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    {
       struct gex_wgpu_screen *gex = gex_screen(screen);
       simple_mtx_lock(&gex->cache_lock);
-      if (++gex->context_count > 1)
+      if (++gex->context_count > 1 && !gex->one_thread)
          gex->device_lock_needed = true;
+      ++gex->live_contexts;
       simple_mtx_unlock(&gex->cache_lock);
    }
    (void)flags;
