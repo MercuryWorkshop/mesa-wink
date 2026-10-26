@@ -1877,6 +1877,10 @@ struct gex_wgpu_resource {
    uint32_t ms_tile_layers;
    uint32_t ms_tile_width;
    WGPUBuffer buffer;
+   /* The buffers `buffer` takes turns being when a write lands on a buffer
+    * the pending batch reads (GEX_WGPU_RENAME, gex_wgpu_subdata_rename).
+    * Made on the first such write; NULL for nearly every resource. */
+   struct gex_wgpu_versions *versions;
    uint8_t *shadow;
    /* ARB_buffer_storage: a copy of what was last handed to the device for a
     * persistently mapped buffer, so the bytes the application changed can be
@@ -2504,6 +2508,10 @@ struct gex_wgpu_context {
    struct pipe_resource *batch_touched[4096];
    unsigned batch_touched_count;
    bool batch_touched_overflowed;
+   /* Moves each time the touched list is let go of: a buffer version last
+    * bound under an older value is read by no recorded draw, and a queue
+    * write to it runs after the submits that did. */
+   uint64_t batch_serial;
    /* Linked into gex_wgpu_screen::open_encoders while pending_encoder is
     * open, which it opened at `encoder_serial` (gex_wgpu_doom). */
    struct list_head open_link;
@@ -19909,6 +19917,9 @@ gex_wgpu_resource_create(struct pipe_screen *screen,
    return &resource->base;
 }
 
+static void gex_wgpu_versions_free(struct gex_wgpu_screen *screen,
+                                   struct gex_wgpu_resource *gex);
+
 static void
 gex_wgpu_resource_destroy(struct pipe_screen *screen,
                           struct pipe_resource *resource)
@@ -19930,6 +19941,7 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
    gex_wgpu_doom_texture(gscreen, gex->texture);
    gex_wgpu_doom_texture(gscreen, gex->rt_scratch);
    gex_wgpu_doom_buffer(gscreen, gex->rt_scratch_staging);
+   gex_wgpu_versions_free(gscreen, gex);
    gex_wgpu_doom_buffer(gscreen, gex->buffer);
    /* The aliasing snapshot is created lazily and was never released, which
       leaked one whole allocation per resource that took part in a mixed pair
@@ -20240,6 +20252,144 @@ gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
    return true;
 }
 
+/* Buffer renaming for writes into a buffer the pending batch reads.
+ *
+ * The staged copy above has to be recorded outside a render pass, so every
+ * such write ends the pass it lands in. D3D11 rewrites its dynamic constant
+ * and vertex buffers between draws (Map with DISCARD, UpdateSubresource):
+ * through dirk, Hades made about 1,040 of these writes a frame and closed
+ * about 510 render passes for them, which saturated both the thread running
+ * this driver and the browser's GPU process.
+ *
+ * Instead, the resource moves to another buffer of the same size that no
+ * recorded draw reads, and the bytes go to it straight through the queue: the
+ * draws already recorded keep the buffer they bound, the ones after bind the
+ * new one, and the pass stays open. A buffer becomes free again once the batch
+ * that read it is submitted -- a queue write is ordered after every submit
+ * before it -- so each resource cycles through a few buffers, whose handles
+ * recur from one batch to the next and keep the bind group cache hitting.
+ *
+ * Only where the new buffer's whole contents are known on the CPU: a write of
+ * all of it, or a resource with a shadow, which mirrors the buffer as the
+ * draws after the write see it. Not for a buffer the GPU writes (its contents
+ * are not here), a persistently mapped one, one bound as anything but vertex,
+ * index or constant data (a view or a binding made from the handle could
+ * outlive the switch), or with a second context recording batches of its
+ * own. GEX_WGPU_RENAME=1 turns it on. */
+#define GEX_WGPU_RENAME_VERSIONS 16
+#define GEX_WGPU_RENAME_MAX_BYTES (4u << 20)
+
+struct gex_wgpu_versions {
+   unsigned count;
+   WGPUBuffer buffer[GEX_WGPU_RENAME_VERSIONS];
+   /* The context's batch_serial when the version was last bound. */
+   uint64_t batch[GEX_WGPU_RENAME_VERSIONS];
+};
+
+static unsigned long gex_wgpu_renamed, gex_wgpu_renamed_bytes,
+   gex_wgpu_staged_in_batch;
+
+static bool
+gex_wgpu_rename_on(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("GEX_WGPU_RENAME");
+      on = v && *v && *v != '0';
+   }
+   return on != 0;
+}
+
+/* Let go of the versions the resource is not using now. */
+static void
+gex_wgpu_versions_free(struct gex_wgpu_screen *screen,
+                       struct gex_wgpu_resource *gex)
+{
+   struct gex_wgpu_versions *v = gex->versions;
+   if (!v)
+      return;
+   for (unsigned i = 0; i < v->count; ++i)
+      if (v->buffer[i] != gex->buffer)
+         gex_wgpu_doom_buffer(screen, v->buffer[i]);
+   FREE(v);
+   gex->versions = NULL;
+}
+
+static bool
+gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
+                        struct pipe_resource *resource, unsigned usage,
+                        unsigned offset, unsigned size, const void *data)
+{
+   struct gex_wgpu_resource *gex = gex_resource(resource);
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   const unsigned binds = PIPE_BIND_VERTEX_BUFFER | PIPE_BIND_INDEX_BUFFER |
+                          PIPE_BIND_CONSTANT_BUFFER;
+   if (!gex_wgpu_rename_on() || !size || !data || (usage & PIPE_MAP_READ) ||
+       resource->target != PIPE_BUFFER || !gex->buffer || gex->gpu_written ||
+       gex->persistent_usage || (resource->bind & ~binds) ||
+       screen->context_count > 1 || gex->gpu_size > GEX_WGPU_RENAME_MAX_BYTES ||
+       (uint64_t)offset + size > resource->width0)
+      return false;
+   /* What the new buffer is written with: the shadow, updated first, or the
+    * data when it is all of the buffer. Whole words either way. */
+   const uint64_t words = ALIGN_POT((uint64_t)resource->width0, 4);
+   const bool whole = offset == 0 && size >= resource->width0 && !(size & 3u);
+   if (!gex->shadow && !whole)
+      return false;
+   if (words > gex->gpu_size || (gex->shadow && words > gex->allocation_size))
+      return false;
+   struct gex_wgpu_versions *v = gex->versions;
+   if (!v) {
+      v = CALLOC_STRUCT(gex_wgpu_versions);
+      if (!v)
+         return false;
+      v->buffer[0] = gex->buffer;
+      v->count = 1;
+      gex->versions = v;
+   }
+   unsigned now = v->count;
+   for (unsigned i = 0; i < v->count; ++i)
+      if (v->buffer[i] == gex->buffer)
+         now = i;
+   if (now == v->count)
+      return false;
+   /* The pending batch reads the one it has now: that is why this was asked. */
+   v->batch[now] = ctx->batch_serial;
+   unsigned pick = v->count;
+   for (unsigned i = 0; i < v->count; ++i)
+      if (i != now && v->batch[i] != ctx->batch_serial) {
+         pick = i;
+         break;
+      }
+   if (pick == v->count) {
+      if (v->count == GEX_WGPU_RENAME_VERSIONS)
+         return false;
+      WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+      desc.usage = gex->buffer_usage;
+      desc.size = gex->gpu_size;
+      WGPUBuffer made = wgpuDeviceCreateBuffer(screen->device, &desc);
+      if (!made)
+         return false;
+      v->buffer[pick] = made;
+      ++v->count;
+   }
+   /* Bound by the draws after this, so taken for this batch already. */
+   v->batch[pick] = ctx->batch_serial;
+   WGPUBuffer to = v->buffer[pick];
+   if (gex->shadow) {
+      memcpy(gex->shadow + offset, data, size);
+      wgpuQueueWriteBuffer(screen->queue, to, 0, gex->shadow, words);
+   } else {
+      wgpuQueueWriteBuffer(screen->queue, to, 0, data, size);
+   }
+   gex->buffer = to;
+   gex->bytes_written += size;
+   ++gex_wgpu_renamed;
+   gex_wgpu_renamed_bytes += size;
+   gex_wgpu_log_upload("sub-rename", resource->width0, offset, data, size);
+   return true;
+}
+
 static void
 gex_wgpu_buffer_subdata(struct pipe_context *pipe,
                         struct pipe_resource *resource, unsigned usage,
@@ -20267,7 +20417,13 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
     * batch for them would leave nothing batched at all. */
    if (resource != ctx->constant_ring &&
        gex_wgpu_batch_conflicts_usage(ctx, resource, usage)) {
+      if (gex_wgpu_subdata_rename(ctx, resource, usage, offset, size, data)) {
+         gex_wgpu_subdata_note(gex_resource(resource), offset, size, sub_hash,
+                               sub_hashed);
+         return;
+      }
       if (gex_wgpu_subdata_in_batch(ctx, resource, usage, offset, size, data)) {
+         ++gex_wgpu_staged_in_batch;
          gex_wgpu_subdata_note(gex_resource(resource), offset, size, sub_hash,
                                sub_hashed);
          return;
@@ -39489,6 +39645,16 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
             was_pl[1] = sc->pipeline_cache_misses;
             was_bg[0] = sc->bg_cache_hits;
             was_bg[1] = sc->bg_cache_misses;
+            static unsigned long was_rn[3];
+            fprintf(stderr,
+                    "gex-wgpu: per frame -- writes to a buffer the batch reads: "
+                    "%.1f renamed (%.1f KiB), %.1f staged in the batch\n",
+                    (gex_wgpu_renamed - was_rn[0]) / f,
+                    (gex_wgpu_renamed_bytes - was_rn[1]) / f / 1024,
+                    (gex_wgpu_staged_in_batch - was_rn[2]) / f);
+            was_rn[0] = gex_wgpu_renamed;
+            was_rn[1] = gex_wgpu_renamed_bytes;
+            was_rn[2] = gex_wgpu_staged_in_batch;
 #undef GEX_PER
             was = *m;
             was_presents = gex_wgpu_presents;
@@ -40886,6 +41052,7 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
    }
    ctx->batch_touched_count = 0;
    ctx->batch_touched_overflowed = false;
+   ++ctx->batch_serial;
    if (!ctx->pending_encoder)
       return;
    for (unsigned i = 0; i < GEX_WGPU_SUBMIT_CAUSES; ++i) {
@@ -41457,6 +41624,8 @@ gex_wgpu_grow_buffer_for_block(struct gex_wgpu_context *ctx,
       gex_wgpu_queue_submit(screen, 1, &commands);
       wgpuCommandBufferRelease(commands);
    }
+   /* The versions are of the old size. */
+   gex_wgpu_versions_free(screen, gex);
    gex_wgpu_doom_buffer(screen, gex->buffer);
    gex->buffer = grown;
    gex->gpu_size = want;
