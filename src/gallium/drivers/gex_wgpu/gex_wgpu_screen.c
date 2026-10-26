@@ -1917,6 +1917,10 @@ struct gex_wgpu_resource {
     * reinterprets the format keeps a copy of the bytes in another format and
     * uses this to know when that copy is stale. */
    uint64_t write_serial;
+   /* One more than the context's batch_serial when a write to this buffer
+    * was last staged in the batch: a copy the batch has yet to run, which a
+    * carry ahead of the batch would miss. */
+   uint64_t staged_batch;
    /* Touched by a draw that is recorded but not yet submitted. */
    bool in_batch;
    /* A snapshot of this texture, taken when a draw both renders to it and
@@ -2398,6 +2402,10 @@ struct gex_wgpu_context {
    unsigned constant_dirty_lo, constant_dirty_hi;
    /* Draws recorded into one command encoder, not yet submitted. */
    WGPUCommandEncoder pending_encoder;
+   /* Copies that have to run before the pending batch: a renamed buffer's
+    * old contents carried into its new one (gex_wgpu_subdata_rename).
+    * Submitted with it, ahead of it. */
+   WGPUCommandEncoder prologue_encoder;
    /* Packed shader images whose buffers this pass has to copy into their
     * textures when it ends -- see GEX_WGPU_PACKED_IMAGE_FIRST_BINDING. A
     * texture copy cannot be recorded inside a render pass, so the copy is
@@ -20243,6 +20251,7 @@ gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
    wgpuCommandEncoderCopyBufferToBuffer(ctx->pending_encoder,
                                         ctx->subdata_stage, at, gex->buffer,
                                         offset, size);
+   gex->staged_batch = ctx->batch_serial + 1;
    /* The shadow, where there is one, mirrors the buffer as the draws after
     * this see it. */
    if (gex->shadow)
@@ -20269,9 +20278,11 @@ gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
  * before it -- so each resource cycles through a few buffers, whose handles
  * recur from one batch to the next and keep the bind group cache hitting.
  *
- * Only where the new buffer's whole contents are known on the CPU: a write of
- * all of it, or a resource with a shadow, which mirrors the buffer as the
- * draws after the write see it. Not for a buffer the GPU writes (its contents
+ * The new buffer is written whole: from the write itself when it covers all
+ * of the buffer, from the shadow where there is one (it mirrors the buffer as
+ * the draws after the write see it), or else with the old contents carried
+ * over on the GPU (see GEX_WGPU_RENAME_CARRY_MAX_BYTES). Not for a buffer the
+ * GPU writes (its contents
  * are not here), a persistently mapped one, one bound as anything but vertex,
  * index or constant data (a view or a binding made from the handle could
  * outlive the switch), or with a second context recording batches of its
@@ -20287,7 +20298,15 @@ struct gex_wgpu_versions {
 };
 
 static unsigned long gex_wgpu_renamed, gex_wgpu_renamed_bytes,
-   gex_wgpu_staged_in_batch;
+   gex_wgpu_renamed_carried, gex_wgpu_staged_in_batch;
+/* Why a write into a buffer the batch reads was not renamed, for the timing
+ * report: what the buffer is bound as or written by, its size, a carry the
+ * batch would miss, an unaligned partial write, or no version left. */
+enum { GEX_WGPU_NORENAME_BIND, GEX_WGPU_NORENAME_GPU, GEX_WGPU_NORENAME_BIG,
+       GEX_WGPU_NORENAME_STAGED, GEX_WGPU_NORENAME_UNALIGNED,
+       GEX_WGPU_NORENAME_FULL, GEX_WGPU_NORENAME_OTHER,
+       GEX_WGPU_NORENAME_COUNT };
+static unsigned long gex_wgpu_norename[GEX_WGPU_NORENAME_COUNT];
 
 static bool
 gex_wgpu_rename_on(void)
@@ -20316,6 +20335,22 @@ gex_wgpu_versions_free(struct gex_wgpu_screen *screen,
 }
 
 static bool
+gex_wgpu_refuse_rename(unsigned why)
+{
+   ++gex_wgpu_norename[why];
+   return false;
+}
+
+/* A write of part of a buffer with no shadow carries the rest of the old
+ * contents over on the GPU: a copy of the old buffer into the new one, then
+ * of the write's bytes from the stage, recorded in the prologue that is
+ * submitted just ahead of the batch. The old buffer cannot change between
+ * here and there -- later writes go to the new one, and the batch is the
+ * only thing that could have a copy into it pending, which staged_batch
+ * rules out. Capped, since every carried write copies the whole buffer. */
+#define GEX_WGPU_RENAME_CARRY_MAX_BYTES (1u << 20)
+
+static bool
 gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
                         struct pipe_resource *resource, unsigned usage,
                         unsigned offset, unsigned size, const void *data)
@@ -20324,25 +20359,55 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
    const unsigned binds = PIPE_BIND_VERTEX_BUFFER | PIPE_BIND_INDEX_BUFFER |
                           PIPE_BIND_CONSTANT_BUFFER;
-   if (!gex_wgpu_rename_on() || !size || !data || (usage & PIPE_MAP_READ) ||
-       resource->target != PIPE_BUFFER || !gex->buffer || gex->gpu_written ||
-       gex->persistent_usage || (resource->bind & ~binds) ||
-       screen->context_count > 1 || gex->gpu_size > GEX_WGPU_RENAME_MAX_BYTES ||
-       (uint64_t)offset + size > resource->width0)
+   if (!gex_wgpu_rename_on())
       return false;
-   /* What the new buffer is written with: the shadow, updated first, or the
-    * data when it is all of the buffer. Whole words either way. */
+   if (!size || !data || (usage & PIPE_MAP_READ) ||
+       resource->target != PIPE_BUFFER || !gex->buffer ||
+       screen->context_count > 1 || (uint64_t)offset + size > resource->width0)
+      return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
+   if (resource->bind & ~binds)
+      return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIND);
+   if (gex->gpu_written || gex->persistent_usage)
+      return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_GPU);
+   if (gex->gpu_size > GEX_WGPU_RENAME_MAX_BYTES)
+      return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIG);
+   /* What the new buffer is written with: the shadow, updated first; the
+    * data when it is all of the buffer; or the old contents carried over and
+    * the data on top. Whole words every way. */
    const uint64_t words = ALIGN_POT((uint64_t)resource->width0, 4);
    const bool whole = offset == 0 && size >= resource->width0 && !(size & 3u);
-   if (!gex->shadow && !whole)
-      return false;
+   const bool carry = !gex->shadow && !whole;
    if (words > gex->gpu_size || (gex->shadow && words > gex->allocation_size))
-      return false;
+      return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
+   if (carry) {
+      if (gex->gpu_size > GEX_WGPU_RENAME_CARRY_MAX_BYTES)
+         return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIG);
+      if (gex->staged_batch == ctx->batch_serial + 1)
+         return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_STAGED);
+      if ((offset | size) & 3u)
+         return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_UNALIGNED);
+      if (size > GEX_WGPU_SUBDATA_STAGE_BYTES - ctx->subdata_stage_offset)
+         return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_FULL);
+      if (!ctx->subdata_stage) {
+         WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+         desc.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+         desc.size = GEX_WGPU_SUBDATA_STAGE_BYTES;
+         ctx->subdata_stage = wgpuDeviceCreateBuffer(screen->device, &desc);
+         if (!ctx->subdata_stage)
+            return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
+      }
+      if (!ctx->prologue_encoder) {
+         ctx->prologue_encoder =
+            wgpuDeviceCreateCommandEncoder(screen->device, NULL);
+         if (!ctx->prologue_encoder)
+            return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
+      }
+   }
    struct gex_wgpu_versions *v = gex->versions;
    if (!v) {
       v = CALLOC_STRUCT(gex_wgpu_versions);
       if (!v)
-         return false;
+         return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
       v->buffer[0] = gex->buffer;
       v->count = 1;
       gex->versions = v;
@@ -20352,7 +20417,7 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
       if (v->buffer[i] == gex->buffer)
          now = i;
    if (now == v->count)
-      return false;
+      return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
    /* The pending batch reads the one it has now: that is why this was asked. */
    v->batch[now] = ctx->batch_serial;
    unsigned pick = v->count;
@@ -20363,20 +20428,30 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
       }
    if (pick == v->count) {
       if (v->count == GEX_WGPU_RENAME_VERSIONS)
-         return false;
+         return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_FULL);
       WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
       desc.usage = gex->buffer_usage;
       desc.size = gex->gpu_size;
       WGPUBuffer made = wgpuDeviceCreateBuffer(screen->device, &desc);
       if (!made)
-         return false;
+         return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
       v->buffer[pick] = made;
       ++v->count;
    }
    /* Bound by the draws after this, so taken for this batch already. */
    v->batch[pick] = ctx->batch_serial;
-   WGPUBuffer to = v->buffer[pick];
-   if (gex->shadow) {
+   WGPUBuffer from = v->buffer[now], to = v->buffer[pick];
+   if (carry) {
+      const uint32_t at = ctx->subdata_stage_offset;
+      ctx->subdata_stage_offset = at + size;
+      wgpuQueueWriteBuffer(screen->queue, ctx->subdata_stage, at, data, size);
+      wgpuCommandEncoderCopyBufferToBuffer(ctx->prologue_encoder, from, 0, to,
+                                           0, gex->gpu_size & ~(uint64_t)3);
+      wgpuCommandEncoderCopyBufferToBuffer(ctx->prologue_encoder,
+                                           ctx->subdata_stage, at, to, offset,
+                                           size);
+      ++gex_wgpu_renamed_carried;
+   } else if (gex->shadow) {
       memcpy(gex->shadow + offset, data, size);
       wgpuQueueWriteBuffer(screen->queue, to, 0, gex->shadow, words);
    } else {
@@ -39618,13 +39693,18 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
             const double f = gex_wgpu_presents > was_presents
                                 ? (double)(gex_wgpu_presents - was_presents) : 1.0;
 #define GEX_PER(field) ((m->field - was.field) / f)
+            static unsigned long was_rn[3], was_not[GEX_WGPU_NORENAME_COUNT];
+#define GEX_NOT(why) ((gex_wgpu_norename[why] - was_not[why]) / f)
             fprintf(stderr,
                     "gex-wgpu: per frame (%.0f frames) -- made: render pipelines %.1f, "
                     "compute pipelines %.1f, shader modules %.1f, bind groups %.1f, "
                     "bind group layouts %.1f, pipeline layouts %.1f, samplers %.1f, "
                     "buffers %.1f, textures %.1f, views %.1f, encoders %.1f, "
                     "render passes %.1f; queue: %.1f buffer writes (%.1f KiB), "
-                    "%.1f texture writes, %.1f submits\n",
+                    "%.1f texture writes, %.1f submits; writes to a buffer the "
+                    "batch reads: %.1f renamed (%.1f carried), %.1f staged, "
+                    "not renamed: bind %.1f, gpu %.1f, big %.1f, staged %.1f, "
+                    "unaligned %.1f, full %.1f, other %.1f\n",
                     gex_wgpu_presents > was_presents ? f : 0.0,
                     GEX_PER(render_pipelines), GEX_PER(compute_pipelines),
                     GEX_PER(shader_modules), GEX_PER(bind_groups),
@@ -39632,7 +39712,19 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                     GEX_PER(samplers), GEX_PER(buffers), GEX_PER(textures),
                     GEX_PER(views), GEX_PER(encoders), GEX_PER(render_passes),
                     GEX_PER(write_buffers), GEX_PER(write_buffer_bytes) / 1024,
-                    GEX_PER(write_textures), GEX_PER(submits));
+                    GEX_PER(write_textures), GEX_PER(submits),
+                    (gex_wgpu_renamed - was_rn[0]) / f,
+                    (gex_wgpu_renamed_carried - was_rn[1]) / f,
+                    (gex_wgpu_staged_in_batch - was_rn[2]) / f,
+                    GEX_NOT(GEX_WGPU_NORENAME_BIND), GEX_NOT(GEX_WGPU_NORENAME_GPU),
+                    GEX_NOT(GEX_WGPU_NORENAME_BIG), GEX_NOT(GEX_WGPU_NORENAME_STAGED),
+                    GEX_NOT(GEX_WGPU_NORENAME_UNALIGNED),
+                    GEX_NOT(GEX_WGPU_NORENAME_FULL), GEX_NOT(GEX_WGPU_NORENAME_OTHER));
+            was_rn[0] = gex_wgpu_renamed;
+            was_rn[1] = gex_wgpu_renamed_carried;
+            was_rn[2] = gex_wgpu_staged_in_batch;
+            memcpy(was_not, gex_wgpu_norename, sizeof(was_not));
+#undef GEX_NOT
             static uint64_t was_pl[2], was_bg[2];
             fprintf(stderr,
                     "gex-wgpu: per frame -- pipeline cache %.1f hits, %.1f misses; "
@@ -39645,16 +39737,6 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
             was_pl[1] = sc->pipeline_cache_misses;
             was_bg[0] = sc->bg_cache_hits;
             was_bg[1] = sc->bg_cache_misses;
-            static unsigned long was_rn[3];
-            fprintf(stderr,
-                    "gex-wgpu: per frame -- writes to a buffer the batch reads: "
-                    "%.1f renamed (%.1f KiB), %.1f staged in the batch\n",
-                    (gex_wgpu_renamed - was_rn[0]) / f,
-                    (gex_wgpu_renamed_bytes - was_rn[1]) / f / 1024,
-                    (gex_wgpu_staged_in_batch - was_rn[2]) / f);
-            was_rn[0] = gex_wgpu_renamed;
-            was_rn[1] = gex_wgpu_renamed_bytes;
-            was_rn[2] = gex_wgpu_staged_in_batch;
 #undef GEX_PER
             was = *m;
             was_presents = gex_wgpu_presents;
@@ -41075,9 +41157,17 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
    /* The staged subdata goes with this batch; a later queue write to the
     * staging buffer runs after it. */
    ctx->subdata_stage_offset = 0;
+   WGPUCommandBuffer prologue = NULL;
+   if (ctx->prologue_encoder) {
+      prologue = wgpuCommandEncoderFinish(ctx->prologue_encoder, NULL);
+      wgpuCommandEncoderRelease(ctx->prologue_encoder);
+      ctx->prologue_encoder = NULL;
+   }
    WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, NULL);
    wgpuCommandEncoderRelease(encoder);
    if (!command) {
+      if (prologue)
+         wgpuCommandBufferRelease(prologue);
       gex_wgpu_pending_encoder_closed(ctx);
       gex_fail(ctx);
       return;
@@ -41087,7 +41177,15 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
    /* Every uniform these draws read went on the queue above, before the
     * early return, which is what makes it true for a compute dispatch as
     * well as for this submit. */
-   gex_wgpu_queue_submit(gex_screen(ctx->base.screen), 1, &command);
+   if (prologue) {
+      /* One submit, in this order: the carried contents are in place
+       * before any draw of the batch reads them. */
+      WGPUCommandBuffer both[2] = {prologue, command};
+      gex_wgpu_queue_submit(gex_screen(ctx->base.screen), 2, both);
+      wgpuCommandBufferRelease(prologue);
+   } else {
+      gex_wgpu_queue_submit(gex_screen(ctx->base.screen), 1, &command);
+   }
    wgpuCommandBufferRelease(command);
    /* What the batch used and was let go of meanwhile can go now. */
    gex_wgpu_pending_encoder_closed(ctx);
