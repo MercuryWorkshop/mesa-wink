@@ -60,9 +60,12 @@
  * straight: os_time_get_nano goes through clock_gettime and WASI's
  * clock_time_get, which adds the time origin and stores a BigInt, several
  * times dearer per read. */
+static uint64_t gex_wgpu_clock_reads;
+
 static inline int64_t
 gex_wgpu_clock(void)
 {
+   ++gex_wgpu_clock_reads;
 #ifdef __EMSCRIPTEN__
    return (int64_t)(emscripten_get_now() * 1e6);
 #else
@@ -40284,6 +40287,8 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                   ws[k] = gex_wgpu_time_set[k];
                   wc[k] = gex_wgpu_set_calls[k];
                }
+               static uint64_t was_reads;
+               const uint64_t reads_now = gex_wgpu_clock_reads;
                const int64_t c0 = gex_wgpu_clock();
                int64_t sink = 0;
                for (unsigned i = 0; i < 64; ++i)
@@ -40300,8 +40305,8 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                        "bind group sets %.2f ms (%.1f: constant buffers, "
                        "samplers, views), vertex buffers %.2f ms (%.1f), index "
                        "buffer %.2f ms (%.1f), draw calls %.2f ms (%.1f); a "
-                       "clock read %.2f us (os_time_get_nano %.2f us), timed one "
-                       "in %u%s\n",
+                       "clock read %.2f us (os_time_get_nano %.2f us), %.0f "
+                       "timer reads, timed one in %u%s\n",
                        gex_wgpu_presents > was_presents ? f : 0.0,
                        ms[GEX_SET_PIPELINE], calls[GEX_SET_PIPELINE],
                        ms[GEX_SET_DYNAMIC], calls[GEX_SET_DYNAMIC],
@@ -40309,7 +40314,9 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                        ms[GEX_SET_VERTEX], calls[GEX_SET_VERTEX],
                        ms[GEX_SET_INDEX], calls[GEX_SET_INDEX],
                        ms[GEX_SET_DRAW], calls[GEX_SET_DRAW], clock_us, os_clock_us,
+                       (reads_now - was_reads) / f,
                        gex_wgpu_timing_every(), sink == 1 ? " " : "");
+               was_reads = gex_wgpu_clock_reads;
                if (&dirk_index_bounds_calls && &dirk_index_bounds_indices &&
                    &dirk_index_bounds_ns) {
                   /* The D3D front end's index scans, which give indexed
