@@ -6531,6 +6531,14 @@ static int64_t gex_wgpu_time_entry;
 /* And in buffer_subdata, every way a write goes. */
 static int64_t gex_wgpu_time_subdata;
 static bool gex_wgpu_timing_enabled(void);
+static bool gex_wgpu_timing_sample(void);
+static unsigned gex_wgpu_timing_every(void);
+/* draw_vbo's state setting, by kind (GEX_WGPU_TIMING): the time and the
+ * calls made. */
+enum { GEX_SET_PIPELINE, GEX_SET_DYNAMIC, GEX_SET_BIND_GROUPS,
+       GEX_SET_VERTEX, GEX_SET_INDEX, GEX_SET_DRAW, GEX_SET_KINDS };
+static int64_t gex_wgpu_time_set[GEX_SET_KINDS];
+static uint64_t gex_wgpu_set_calls[GEX_SET_KINDS];
 
 struct gex_wgpu_entry_timer { int64_t start; };
 static inline void
@@ -20737,13 +20745,14 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
                                  true);
       return;
    }
-   if (!gex_wgpu_timing_enabled()) {
+   if (!gex_wgpu_timing_sample()) {
       gex_wgpu_buffer_subdata_inner(pipe, resource, usage, offset, size, data);
       return;
    }
    const int64_t start = os_time_get_nano();
    gex_wgpu_buffer_subdata_inner(pipe, resource, usage, offset, size, data);
-   gex_wgpu_time_subdata += os_time_get_nano() - start;
+   gex_wgpu_time_subdata +=
+      (os_time_get_nano() - start) * gex_wgpu_timing_every();
 }
 
 static void
@@ -39722,6 +39731,28 @@ gex_wgpu_timing_enabled(void)
    return enabled != 0;
 }
 
+/* GEX_WGPU_TIMING_EVERY=N (default 16): the draws and buffer writes timed
+ * are one in N, their times counted N-fold. A clock read here is a call out
+ * to JavaScript, which reading one per step of every draw made cost more
+ * than the steps it timed. 1 times every one. */
+static unsigned
+gex_wgpu_timing_every(void)
+{
+   static unsigned every;
+   if (!every) {
+      const char *value = getenv("GEX_WGPU_TIMING_EVERY");
+      every = value && atoi(value) > 0 ? (unsigned)atoi(value) : 16;
+   }
+   return every;
+}
+
+static bool
+gex_wgpu_timing_sample(void)
+{
+   static unsigned n;
+   return gex_wgpu_timing_enabled() && ++n % gex_wgpu_timing_every() == 0;
+}
+
 /* --- cached bind group layouts, pipeline layouts and bind groups --------
  *
  * All three are keyed on the bytes of their descriptor's entry array. The
@@ -40043,6 +40074,40 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                           GEX_MS(14));
 #undef GEX_MS
                memcpy(w, now, sizeof(w));
+            }
+            {
+               /* draw_vbo's state setting by kind, and what one clock read
+                * costs on this thread, measured here. */
+               static int64_t ws[GEX_SET_KINDS];
+               static uint64_t wc[GEX_SET_KINDS];
+               double ms[GEX_SET_KINDS], calls[GEX_SET_KINDS];
+               for (unsigned k = 0; k < GEX_SET_KINDS; ++k) {
+                  ms[k] = (gex_wgpu_time_set[k] - ws[k]) / f / 1e6;
+                  calls[k] = (gex_wgpu_set_calls[k] - wc[k]) / f;
+                  ws[k] = gex_wgpu_time_set[k];
+                  wc[k] = gex_wgpu_set_calls[k];
+               }
+               const int64_t c0 = os_time_get_nano();
+               int64_t sink = 0;
+               for (unsigned i = 0; i < 64; ++i)
+                  sink += os_time_get_nano();
+               const double clock_us = (os_time_get_nano() - c0) / 65.0 / 1e3;
+               fprintf(stderr,
+                       "gex-wgpu: setters per frame (%.0f frames) -- pipeline "
+                       "%.2f ms (%.1f sets), dynamic state %.2f ms (%.1f: "
+                       "viewport, scissor, stencil reference, blend constant), "
+                       "bind group sets %.2f ms (%.1f: constant buffers, "
+                       "samplers, views), vertex buffers %.2f ms (%.1f), index "
+                       "buffer %.2f ms (%.1f), draw calls %.2f ms (%.1f); a "
+                       "clock read %.2f us, timed one in %u%s\n",
+                       gex_wgpu_presents > was_presents ? f : 0.0,
+                       ms[GEX_SET_PIPELINE], calls[GEX_SET_PIPELINE],
+                       ms[GEX_SET_DYNAMIC], calls[GEX_SET_DYNAMIC],
+                       ms[GEX_SET_BIND_GROUPS], calls[GEX_SET_BIND_GROUPS],
+                       ms[GEX_SET_VERTEX], calls[GEX_SET_VERTEX],
+                       ms[GEX_SET_INDEX], calls[GEX_SET_INDEX],
+                       ms[GEX_SET_DRAW], calls[GEX_SET_DRAW], clock_us,
+                       gex_wgpu_timing_every(), sink == 1 ? " " : "");
             }
             was_rn[0] = gex_wgpu_renamed;
             was_rn[1] = gex_wgpu_renamed_carried;
@@ -44671,8 +44736,23 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* The whole call, so that the pipeline and submit figures below can be
     * read as fractions of the driver's own cost rather than of wall clock,
     * which also contains the application and the frame readback. */
-   const bool gex_timing = gex_wgpu_timing_enabled();
+   const bool gex_timing = gex_wgpu_timing_sample();
+   const bool gex_counting = gex_wgpu_timing_enabled();
    const int64_t t_draw_start = gex_timing ? os_time_get_nano() : 0;
+   int64_t t_set = 0;
+#define GEX_SET_MARK(kind)                                                    \
+   do {                                                                       \
+      if (gex_timing) {                                                       \
+         const int64_t t_ = os_time_get_nano();                               \
+         gex_wgpu_time_set[kind] += (t_ - t_set) * gex_wgpu_timing_every();   \
+         t_set = t_;                                                          \
+      }                                                                       \
+   } while (0)
+#define GEX_SET_CALL(kind)                                                    \
+   do {                                                                       \
+      if (gex_counting)                                                       \
+         ++gex_wgpu_set_calls[kind];                                          \
+   } while (0)
    /* GEX_WGPU_NO_DRAW=1 drops every draw on the floor. Not useful output --
     * the point is the frame rate it leaves, which is the ceiling everything
     * above this driver imposes: the application's own CPU work and st/mesa's.
@@ -46212,7 +46292,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          }
       }
    }
-   if (gex_timing) gex_wgpu_time_bounds += os_time_get_nano() - t_bounds_start;
+   if (gex_timing) gex_wgpu_time_bounds += (os_time_get_nano() - t_bounds_start) * gex_wgpu_timing_every();
 
    float viewport_x = 0.0f;
    float viewport_y = 0.0f;
@@ -46466,7 +46546,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       fs_topology == WGPUPrimitiveTopology_TriangleList ||
       fs_topology == WGPUPrimitiveTopology_TriangleStrip,
       &omitted_texture_slots, &demoted_ms_slots);
-   if (gex_timing) gex_wgpu_time_fsmod += os_time_get_nano() - t_fsmod_start;
+   if (gex_timing) gex_wgpu_time_fsmod += (os_time_get_nano() - t_fsmod_start) * gex_wgpu_timing_every();
    if (!fragment.module)
       GEX_DRAW_DROP();
    fragment.entryPoint = (WGPUStringView){"main", WGPU_STRLEN};
@@ -48187,7 +48267,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * does, because "the driver is slow" is not actionable and the three have
     * completely different fixes. Off by default; one clock read per draw when
     * on. */
-   if (gex_timing) gex_wgpu_time_bind += os_time_get_nano() - t_bind_start;
+   if (gex_timing) gex_wgpu_time_bind += (os_time_get_nano() - t_bind_start) * gex_wgpu_timing_every();
    const int64_t t_pipeline_start = gex_timing ? os_time_get_nano() : 0;
    bool pipeline_cached = false;
    /* Safe against the pipeline cache without any further thought:
@@ -48198,7 +48278,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    WGPURenderPipeline pipeline =
       gex_wgpu_cached_pipeline(screen, &pipeline_desc, &pipeline_cached);
    if (gex_timing)
-      gex_wgpu_time_pipeline += os_time_get_nano() - t_pipeline_start;
+      gex_wgpu_time_pipeline += (os_time_get_nano() - t_pipeline_start) * gex_wgpu_timing_every();
    const int64_t t_record_start = gex_timing ? os_time_get_nano() : 0;
    /* Can this draw go into the pass that is already open?
     *
@@ -48354,14 +48434,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                             gex_resource(ctx->depth)->texture,
                                             &view_desc);
    }
-   if (gex_timing) gex_wgpu_time_views += os_time_get_nano() - t_record_start;
+   if (gex_timing) gex_wgpu_time_views += (os_time_get_nano() - t_record_start) * gex_wgpu_timing_every();
    const int64_t t_encoder_start = gex_timing ? os_time_get_nano() : 0;
    /* Joins whatever draws are already recorded rather than starting its own
     * command buffer; see gex_wgpu_submit_pending. */
    gex_wgpu_pending_encoder(ctx);
    WGPUCommandEncoder encoder = ctx->pending_encoder;
    const int64_t t_bg_start = gex_timing ? os_time_get_nano() : 0;
-   if (gex_timing) gex_wgpu_time_encoder += t_bg_start - t_encoder_start;
+   if (gex_timing) gex_wgpu_time_encoder += (t_bg_start - t_encoder_start) * gex_wgpu_timing_every();
    WGPUBindGroup bind_groups[4] = {NULL, NULL, NULL, NULL};
    /* Storage-texture views built for this draw's shader images. The bind
     * group retains what it names, so these are released once it exists --
@@ -49220,7 +49300,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          ctx->active_queries[GEX_WGPU_QUERY_OCCLUSION][0] && ctx->occlusion_set;
       if (counting)
          pass_desc.occlusionQuerySet = ctx->occlusion_set;
-      if (gex_timing) gex_wgpu_time_bg += os_time_get_nano() - t_bg_start;
+      if (gex_timing) gex_wgpu_time_bg += (os_time_get_nano() - t_bg_start) * gex_wgpu_timing_every();
       const int64_t t_begin_start = gex_timing ? os_time_get_nano() : 0;
       /* Reuse the open pass when this draw wants exactly the same attachments.
        * A counting draw never reuses one and never leaves one open, because the
@@ -49283,7 +49363,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          ctx->emitted_handle_epoch = screen->handle_epoch;
       }
       pass = ctx->pending_pass;
-      if (gex_timing) gex_wgpu_time_begin += os_time_get_nano() - t_begin_start;
+      if (gex_timing) gex_wgpu_time_begin += (os_time_get_nano() - t_begin_start) * gex_wgpu_timing_every();
+      if (gex_timing)
+         t_set = os_time_get_nano();
       if (pass) {
          /* Braced. The second `if` was indented as though it were inside the
           * first and was not -- the shape gcc flags as -Wmisleading-indentation,
@@ -49322,15 +49404,21 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          if (ctx->emitted.pipeline != draw_pipeline) {
             wgpuRenderPassEncoderSetPipeline(pass, draw_pipeline);
             ctx->emitted.pipeline = draw_pipeline;
+            GEX_SET_CALL(GEX_SET_PIPELINE);
          }
+         GEX_SET_MARK(GEX_SET_PIPELINE);
          if (ctx->depth &&
              util_format_has_stencil(
                 util_format_description(ctx->depth->format)))
+         {
             wgpuRenderPassEncoderSetStencilReference(
                pass, ctx->stencil_ref.ref_value[gex_wgpu_stencil_back_drawn(ctx)]);
+            GEX_SET_CALL(GEX_SET_DYNAMIC);
+         }
          if (uses_blend_constant) {
             const WGPUColor blend_color = gex_wgpu_blend_constant(ctx);
             wgpuRenderPassEncoderSetBlendConstant(pass, &blend_color);
+            GEX_SET_CALL(GEX_SET_DYNAMIC);
          }
          /* A one-pixel difference this driver does not correct, measured and
           * left alone.
@@ -49369,6 +49457,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                              min_depth, max_depth);
             memcpy(ctx->emitted.viewport, wanted_viewport,
                    sizeof(wanted_viewport));
+            GEX_SET_CALL(GEX_SET_DYNAMIC);
          }
          /* A draw with the scissor disabled wants the whole attachment, and has
           * to say so: the scissor belongs to the pass, and draws now share one,
@@ -49401,7 +49490,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                wanted_scissor[2], wanted_scissor[3]);
             memcpy(ctx->emitted.scissor, wanted_scissor, sizeof(wanted_scissor));
             ctx->emitted.scissor_set = true;
+            GEX_SET_CALL(GEX_SET_DYNAMIC);
          }
+         GEX_SET_MARK(GEX_SET_DYNAMIC);
          for (unsigned group = 0; group < 4; ++group) {
             if (!bind_groups[group])
                continue;
@@ -49437,11 +49528,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             wgpuRenderPassEncoderSetBindGroup(
                pass, group, bind_groups[group], dynamic[group].count,
                dynamic[group].count ? dynamic[group].offset : NULL);
+            GEX_SET_CALL(GEX_SET_BIND_GROUPS);
             ctx->emitted.groups[group] = bind_groups[group];
             ctx->emitted.dynamic_count[group] = dynamic[group].count;
             memcpy(ctx->emitted.dynamic[group], dynamic[group].offset,
                    offset_bytes);
          }
+         GEX_SET_MARK(GEX_SET_BIND_GROUPS);
          /* By dense slot, matching the pipeline's layout array. Binding by
           * Gallium index instead both overran WebGPU's eight slots and walked
           * into the empty ones a disabled vertex array leaves behind. */
@@ -49481,6 +49574,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             gex_wgpu_cmd_note("vb%u w0=%u+%u", slot, buffer->width0, offset);
             wgpuRenderPassEncoderSetVertexBuffer(
                pass, slot, handle, offset, buffer->width0 - offset);
+            GEX_SET_CALL(GEX_SET_VERTEX);
             ctx->emitted.vertex[slot] = handle;
             ctx->emitted.vertex_offset[slot] = offset;
          }
@@ -49511,6 +49605,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                ctx->emitted.vertex_offset[default_attribute_slot] = 0;
             }
          }
+         GEX_SET_MARK(GEX_SET_VERTEX);
          if (index_resource) {
             WGPUBuffer index_handle = gex_resource(index_resource)->buffer;
             const WGPUIndexFormat index_format = info->index_size == 2
@@ -49526,7 +49621,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                ctx->emitted.index = index_handle;
                ctx->emitted.index_format = index_format;
                ctx->emitted.index_offset = index_byte_offset;
+               GEX_SET_CALL(GEX_SET_INDEX);
             }
+            GEX_SET_MARK(GEX_SET_INDEX);
             ++gex_wgpu_draws_issued;
             gex_wgpu_count_draw_vs(ctx->vs);
             gex_wgpu_count_draw_target(
@@ -49603,12 +49700,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          }
          if (counting)
             wgpuRenderPassEncoderEndOcclusionQuery(pass);
+         GEX_SET_CALL(GEX_SET_DRAW);
+         GEX_SET_MARK(GEX_SET_DRAW);
          const int64_t t_end_start = gex_timing ? os_time_get_nano() : 0;
          /* Left open for the next draw. Whatever stops recording -- a different
           * framebuffer, a clear, a map, the submit -- closes it. */
          if (counting)
             gex_wgpu_end_pass(ctx);
-         if (gex_timing) gex_wgpu_time_end += os_time_get_nano() - t_end_start;
+         if (gex_timing) gex_wgpu_time_end += (os_time_get_nano() - t_end_start) * gex_wgpu_timing_every();
       }
    } /* ordered framebuffer-fetch primitives */
    if (odd_pipeline)
@@ -49690,7 +49789,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    const int64_t t_submit_start = gex_timing ? os_time_get_nano() : 0;
    if (gex_timing)
-      gex_wgpu_time_record += t_submit_start - t_record_start;
+      gex_wgpu_time_record += (t_submit_start - t_record_start) * gex_wgpu_timing_every();
    /* Everything this draw reads or writes, so a later map or upload knows
     * whether it has to wait for it. */
    for (unsigned i = 0; i < ctx->color_count; ++i)
@@ -49802,8 +49901,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        ctx->batch_touched_overflowed)
       gex_wgpu_submit_pending(ctx);
    if (gex_timing) {
-      gex_wgpu_time_submit += os_time_get_nano() - t_submit_start;
-      gex_wgpu_time_draw += os_time_get_nano() - t_draw_start;
+      gex_wgpu_time_submit += (os_time_get_nano() - t_submit_start) * gex_wgpu_timing_every();
+      gex_wgpu_time_draw += (os_time_get_nano() - t_draw_start) * gex_wgpu_timing_every();
       gex_wgpu_report_timing(screen);
    }
 }
