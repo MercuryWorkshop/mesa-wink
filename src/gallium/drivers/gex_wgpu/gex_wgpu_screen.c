@@ -20712,6 +20712,11 @@ gex_wgpu_batch_let_go(struct gex_wgpu_resource *gex, uint32_t bit)
 
 static unsigned long gex_wgpu_renamed, gex_wgpu_renamed_bytes,
    gex_wgpu_renamed_carried, gex_wgpu_staged_in_batch;
+/* Buffer versions made by renames and let go of with their resource, for
+ * the timing report: what the renaming holds on to. The first version of a
+ * resource is its own buffer, counted as neither. */
+static uint64_t gex_wgpu_versions_made, gex_wgpu_versions_made_bytes,
+   gex_wgpu_versions_freed, gex_wgpu_versions_freed_bytes;
 /* Why a write into a buffer the batch reads was not renamed, for the timing
  * report: what the buffer is bound as or written by, its size, a carry the
  * batch would miss, an unaligned partial write, no version left, or another
@@ -20745,6 +20750,8 @@ gex_wgpu_versions_free(struct gex_wgpu_screen *screen,
    for (unsigned i = 0; i < v->count; ++i)
       if (v->buffer[i] != gex->buffer)
          gex_wgpu_doom_buffer(screen, v->buffer[i]);
+   gex_wgpu_versions_freed += v->count - 1;
+   gex_wgpu_versions_freed_bytes += (uint64_t)(v->count - 1) * gex->gpu_size;
    FREE(v);
    gex->versions = NULL;
 }
@@ -20860,6 +20867,8 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
          return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
       v->buffer[pick] = made;
       ++v->count;
+      ++gex_wgpu_versions_made;
+      gex_wgpu_versions_made_bytes += gex->gpu_size;
    }
    /* Bound by the later draws of every batch holding the buffer, which do
     * not touch it again: taken for them already. */
@@ -40186,6 +40195,7 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
             const double f = gex_wgpu_presents > was_presents
                                 ? (double)(gex_wgpu_presents - was_presents) : 1.0;
 #define GEX_PER(field) ((m->field - was.field) / f)
+            static uint64_t was_ver[2];
             static unsigned long was_rn[5], was_not[GEX_WGPU_NORENAME_COUNT];
 #define GEX_NOT(why) ((gex_wgpu_norename[why] - was_not[why]) / f)
             fprintf(stderr,
@@ -40199,7 +40209,8 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                     "%.1f renamed (%.1f carried), %.1f staged, "
                     "not renamed: bind %.1f, gpu %.1f, big %.1f, staged %.1f, "
                     "unaligned %.1f, full %.1f, contexts %.1f, other %.1f; "
-                    "contexts live %u\n",
+                    "contexts live %u; buffer versions %.1f made, %.1f freed, "
+                    "%llu alive (%.1f MiB)\n",
                     gex_wgpu_presents > was_presents ? f : 0.0,
                     GEX_PER(render_pipelines), GEX_PER(compute_pipelines),
                     GEX_PER(shader_modules), GEX_PER(bind_groups),
@@ -40218,7 +40229,13 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                     GEX_NOT(GEX_WGPU_NORENAME_UNALIGNED),
                     GEX_NOT(GEX_WGPU_NORENAME_FULL), GEX_NOT(GEX_WGPU_NORENAME_CONTEXTS),
                     GEX_NOT(GEX_WGPU_NORENAME_OTHER),
-                    sc->live_contexts);
+                    sc->live_contexts,
+                    (gex_wgpu_versions_made - was_ver[0]) / f,
+                    (gex_wgpu_versions_freed - was_ver[1]) / f,
+                    (unsigned long long)(gex_wgpu_versions_made - gex_wgpu_versions_freed),
+                    (gex_wgpu_versions_made_bytes - gex_wgpu_versions_freed_bytes) / 1048576.0);
+            was_ver[0] = gex_wgpu_versions_made;
+            was_ver[1] = gex_wgpu_versions_freed;
             {
                /* The same frames, in ms of this thread's wall time per frame
                 * (GEX_WGPU_TIMING's own clock reads included). */
