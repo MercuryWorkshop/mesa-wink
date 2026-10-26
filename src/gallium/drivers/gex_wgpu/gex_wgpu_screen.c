@@ -18350,6 +18350,10 @@ gex_wgpu_ranges_on(void)
 }
 
 static unsigned long gex_wgpu_range_direct, gex_wgpu_range_overlap;
+/* The D3D front end's index-bounds scans, where it is linked in. */
+extern uint64_t dirk_index_bounds_calls __attribute__((weak));
+extern uint64_t dirk_index_bounds_indices __attribute__((weak));
+extern int64_t dirk_index_bounds_ns __attribute__((weak));
 
 static void
 gex_wgpu_note_range(struct gex_wgpu_resource *gex, uint32_t bit, uint64_t lo,
@@ -40289,6 +40293,21 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                        ms[GEX_SET_INDEX], calls[GEX_SET_INDEX],
                        ms[GEX_SET_DRAW], calls[GEX_SET_DRAW], clock_us, os_clock_us,
                        gex_wgpu_timing_every(), sink == 1 ? " " : "");
+               if (&dirk_index_bounds_calls && &dirk_index_bounds_indices &&
+                   &dirk_index_bounds_ns) {
+                  /* The D3D front end's index scans, which give indexed
+                   * draws their bounds for GEX_WGPU_RANGES. */
+                  static uint64_t wib[3];
+                  fprintf(stderr,
+                          "gex-wgpu: index bounds per frame -- %.1f scans, %.0f "
+                          "indices, %.1f us (one in 16 timed)\n",
+                          (dirk_index_bounds_calls - wib[0]) / f,
+                          (dirk_index_bounds_indices - wib[1]) / f,
+                          (dirk_index_bounds_ns - (int64_t)wib[2]) / f / 1e3);
+                  wib[0] = dirk_index_bounds_calls;
+                  wib[1] = dirk_index_bounds_indices;
+                  wib[2] = (uint64_t)dirk_index_bounds_ns;
+               }
             }
             was_rn[0] = gex_wgpu_renamed;
             was_rn[1] = gex_wgpu_renamed_carried;
