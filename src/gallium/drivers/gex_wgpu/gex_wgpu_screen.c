@@ -40299,8 +40299,9 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                    * draws their bounds for GEX_WGPU_RANGES. */
                   static uint64_t wib[3];
                   fprintf(stderr,
-                          "gex-wgpu: index bounds per frame -- %.1f scans, %.0f "
-                          "indices, %.1f us (one in 16 timed)\n",
+                          "gex-wgpu: index bounds per frame -- %.1f indexed draws, "
+                          "%.0f indices scanned, %.1f us scanning (one scan in "
+                          "16 timed, less the clock read)\n",
                           (dirk_index_bounds_calls - wib[0]) / f,
                           (dirk_index_bounds_indices - wib[1]) / f,
                           (dirk_index_bounds_ns - (int64_t)wib[2]) / f / 1e3);
