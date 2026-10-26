@@ -6502,6 +6502,8 @@ static void gex_wgpu_map_callback(WGPUMapAsyncStatus status,
  * "the rest of the frame" can be split into the driver's share and the
  * application's. Compiled to nothing unless GEX_WGPU_TIMING is on. */
 static int64_t gex_wgpu_time_entry;
+/* And in buffer_subdata, every way a write goes. */
+static int64_t gex_wgpu_time_subdata;
 static bool gex_wgpu_timing_enabled(void);
 
 struct gex_wgpu_entry_timer { int64_t start; };
@@ -20466,9 +20468,28 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
 }
 
 static void
+gex_wgpu_buffer_subdata_inner(struct pipe_context *pipe,
+                              struct pipe_resource *resource, unsigned usage,
+                              unsigned offset, unsigned size, const void *data);
+
+static void
 gex_wgpu_buffer_subdata(struct pipe_context *pipe,
                         struct pipe_resource *resource, unsigned usage,
                         unsigned offset, unsigned size, const void *data)
+{
+   if (!gex_wgpu_timing_enabled()) {
+      gex_wgpu_buffer_subdata_inner(pipe, resource, usage, offset, size, data);
+      return;
+   }
+   const int64_t start = os_time_get_nano();
+   gex_wgpu_buffer_subdata_inner(pipe, resource, usage, offset, size, data);
+   gex_wgpu_time_subdata += os_time_get_nano() - start;
+}
+
+static void
+gex_wgpu_buffer_subdata_inner(struct pipe_context *pipe,
+                              struct pipe_resource *resource, unsigned usage,
+                              unsigned offset, unsigned size, const void *data)
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
@@ -39365,6 +39386,10 @@ static int64_t gex_wgpu_time_end;
 static int64_t gex_wgpu_time_bg;
 static int64_t gex_wgpu_time_encoder;
 uint64_t gex_wgpu_presents;
+/* Wall time an embedder spends replaying a command stream into this driver
+ * (the D3D device's submits), which the timing report splits by what the
+ * driver itself spent of it. Kept by the embedder. */
+int64_t gex_wgpu_time_replay;
 /* Which draw of the current frame is about to be recorded, and how many of
  * them to keep.
  *
@@ -39720,6 +39745,42 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                     GEX_NOT(GEX_WGPU_NORENAME_BIG), GEX_NOT(GEX_WGPU_NORENAME_STAGED),
                     GEX_NOT(GEX_WGPU_NORENAME_UNALIGNED),
                     GEX_NOT(GEX_WGPU_NORENAME_FULL), GEX_NOT(GEX_WGPU_NORENAME_OTHER));
+            {
+               /* The same frames, in ms of this thread's wall time per frame
+                * (GEX_WGPU_TIMING's own clock reads included). */
+               static int64_t w[16];
+               const int64_t now[16] = {
+                  gex_wgpu_time_replay, gex_wgpu_time_draw, gex_wgpu_time_bind,
+                  gex_wgpu_time_pipeline, gex_wgpu_time_bg, gex_wgpu_time_begin,
+                  gex_wgpu_time_end,
+                  gex_wgpu_time_record - gex_wgpu_time_views -
+                     gex_wgpu_time_finish - gex_wgpu_time_begin -
+                     gex_wgpu_time_end - gex_wgpu_time_bg -
+                     gex_wgpu_time_encoder,
+                  gex_wgpu_time_views, gex_wgpu_time_encoder,
+                  gex_wgpu_time_finish, gex_wgpu_time_submit,
+                  gex_wgpu_time_entry, gex_wgpu_time_subdata,
+                  (int64_t)gex_wgpu_present_nanos,
+                  gex_wgpu_time_bounds + gex_wgpu_time_fsmod};
+#define GEX_MS(i) ((now[i] - w[i]) / f / 1e6)
+               fprintf(stderr,
+                       "gex-wgpu: host ms per frame (%.0f frames) -- replay "
+                       "%.2f; draw_vbo "
+                       "%.2f (layouts+bind groups %.2f, pipeline %.2f, bind "
+                       "group sets %.2f, pass begin %.2f, pass end %.2f, "
+                       "setters %.2f, views %.2f, encoder %.2f, finish %.2f, "
+                       "submit %.2f, bounds+fs %.2f); state calls %.2f; "
+                       "writes %.2f; present %.2f; replay outside these %.2f\n",
+                       gex_wgpu_presents > was_presents ? f : 0.0,
+                       GEX_MS(0), GEX_MS(1), GEX_MS(2), GEX_MS(3), GEX_MS(4),
+                       GEX_MS(5), GEX_MS(6), GEX_MS(7), GEX_MS(8), GEX_MS(9),
+                       GEX_MS(10), GEX_MS(11), GEX_MS(15), GEX_MS(12),
+                       GEX_MS(13), GEX_MS(14),
+                       GEX_MS(0) - GEX_MS(1) - GEX_MS(12) - GEX_MS(13) -
+                          GEX_MS(14));
+#undef GEX_MS
+               memcpy(w, now, sizeof(w));
+            }
             was_rn[0] = gex_wgpu_renamed;
             was_rn[1] = gex_wgpu_renamed_carried;
             was_rn[2] = gex_wgpu_staged_in_batch;
