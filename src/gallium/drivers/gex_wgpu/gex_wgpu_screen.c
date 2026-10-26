@@ -1931,6 +1931,12 @@ struct gex_wgpu_resource {
     * to this buffer: a copy the batch has yet to run, which a carry ahead of
     * another batch would miss. */
    uint32_t staged_by;
+   /* GEX_WGPU_RENAME_VERIFY: the bytes buffer_subdata has written, while
+    * nothing else has written the buffer (verify_written still matches
+    * bytes_written). */
+   uint8_t *verify_copy;
+   uint64_t verify_written;
+   bool verify_bad;
    /* The contexts (their batch_bit) with a draw that touched this resource
     * recorded and not yet submitted. */
    uint32_t in_batch;
@@ -2534,6 +2540,12 @@ struct gex_wgpu_context {
     * its own; otherwise every context shares GEX_WGPU_SHARED_BATCH_BIT, and
     * one context's submit clears them all, as a single flag did. */
    uint32_t batch_bit;
+   /* GEX_WGPU_RENAME_VERIFY: the batch's copies of renamed buffers as its
+    * draws bound them, and what each should hold. */
+   WGPUBuffer verify_readback;
+   uint32_t verify_used;
+   struct gex_wgpu_verify_range *verify_ranges;
+   unsigned verify_count, verify_cap;
    /* Linked into gex_wgpu_screen::open_encoders while pending_encoder is
     * open, which it opened at `encoder_serial` (gex_wgpu_doom). */
    struct list_head open_link;
@@ -6906,6 +6918,177 @@ gex_wgpu_buffer_readback(struct pipe_context *pipe,
 {
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    return gex_wgpu_buffer_readback_locked(pipe, gex, offset, size, dest);
+}
+
+/* GEX_WGPU_RENAME_VERIFY=1 (`?mesaenv=`, a debugging switch): every buffer a
+ * draw reads that has been renamed is copied, as the draw bound it, into a
+ * readback buffer inside the batch (ending the render pass to do so), and
+ * after the submit compared with the bytes buffer_subdata wrote to it. What
+ * the draws saw, so a version written while a pending batch still read it
+ * shows up in that batch. A buffer something other than buffer_subdata has
+ * written is not checked (counted as unchecked). */
+struct gex_wgpu_verify_range {
+   uint8_t *want;
+   uint32_t at, size, width;
+};
+
+#define GEX_WGPU_VERIFY_READBACK_BYTES (4u << 20)
+
+static uint64_t gex_wgpu_verify_checked, gex_wgpu_verify_bytes,
+   gex_wgpu_verify_differ, gex_wgpu_verify_unchecked;
+
+static bool
+gex_wgpu_rename_verify_on(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("GEX_WGPU_RENAME_VERIFY");
+      on = v && *v && *v != '0';
+   }
+   return on != 0;
+}
+
+static void
+gex_wgpu_verify_say(void)
+{
+   fprintf(stderr, "gex-wgpu: rename verify: %llu ranges (%llu KiB), %llu differ, "
+           "%llu unchecked\n", (unsigned long long)gex_wgpu_verify_checked,
+           (unsigned long long)(gex_wgpu_verify_bytes >> 10),
+           (unsigned long long)gex_wgpu_verify_differ,
+           (unsigned long long)gex_wgpu_verify_unchecked);
+}
+
+/* Before a write by buffer_subdata, and after it with `data`. */
+static void
+gex_wgpu_verify_note_write(struct gex_wgpu_resource *gex, unsigned offset,
+                           unsigned size, const void *data, bool after)
+{
+   if (gex->base.target != PIPE_BUFFER || gex->verify_bad)
+      return;
+   if (!after) {
+      if (!gex->verify_copy) {
+         gex->verify_copy = CALLOC(1, ALIGN_POT(gex->base.width0, 4) + 4);
+         gex->verify_written = gex->bytes_written;
+         if (!gex->verify_copy || gex->bytes_written || gex->gpu_written)
+            gex->verify_bad = true;
+      } else if (gex->verify_written != gex->bytes_written || gex->gpu_written) {
+         gex->verify_bad = true;
+      }
+      return;
+   }
+   if ((uint64_t)offset + size <= gex->base.width0 && data)
+      memcpy(gex->verify_copy + offset, data, size);
+   gex->verify_written = gex->bytes_written;
+}
+
+/* After a draw: copy what it bound of a renamed buffer, to check at submit. */
+static void
+gex_wgpu_verify_capture(struct gex_wgpu_context *ctx,
+                        struct pipe_resource *resource)
+{
+   if (!resource || resource->target != PIPE_BUFFER || !ctx->pending_encoder)
+      return;
+   struct gex_wgpu_resource *gex = (struct gex_wgpu_resource *)resource;
+   if (!gex->versions || !gex->buffer)
+      return;
+   const uint32_t size = ALIGN_POT(resource->width0, 4);
+   if (gex->verify_bad || !gex->verify_copy || gex->gpu_written ||
+       gex->verify_written != gex->bytes_written || size > gex->gpu_size ||
+       size > GEX_WGPU_VERIFY_READBACK_BYTES - ctx->verify_used) {
+      ++gex_wgpu_verify_unchecked;
+      return;
+   }
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   if (!ctx->verify_readback) {
+      WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+      desc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+      desc.size = GEX_WGPU_VERIFY_READBACK_BYTES;
+      ctx->verify_readback = wgpuDeviceCreateBuffer(screen->device, &desc);
+      if (!ctx->verify_readback) {
+         ++gex_wgpu_verify_unchecked;
+         return;
+      }
+   }
+   if (ctx->verify_count == ctx->verify_cap) {
+      const unsigned cap = ctx->verify_cap ? ctx->verify_cap * 2 : 64;
+      struct gex_wgpu_verify_range *grown =
+         REALLOC(ctx->verify_ranges, ctx->verify_cap * sizeof(*grown),
+                 cap * sizeof(*grown));
+      if (!grown) {
+         ++gex_wgpu_verify_unchecked;
+         return;
+      }
+      ctx->verify_ranges = grown;
+      ctx->verify_cap = cap;
+   }
+   struct gex_wgpu_verify_range *r = &ctx->verify_ranges[ctx->verify_count];
+   r->want = MALLOC(size);
+   if (!r->want) {
+      ++gex_wgpu_verify_unchecked;
+      return;
+   }
+   memcpy(r->want, gex->verify_copy, size);
+   r->at = ctx->verify_used;
+   r->size = size;
+   r->width = resource->width0;
+   ++ctx->verify_count;
+   ctx->verify_used += ALIGN_POT(size, 256);
+   gex_wgpu_end_pass(ctx);
+   wgpuCommandEncoderCopyBufferToBuffer(ctx->pending_encoder, gex->buffer, 0,
+                                        ctx->verify_readback, r->at, size);
+}
+
+/* After the submit that carried the copies: read them back and compare. */
+static void
+gex_wgpu_verify_check(struct gex_wgpu_context *ctx)
+{
+   if (!ctx->verify_count)
+      return;
+   struct gex_wgpu_map_state state = {WGPUMapAsyncStatus_Success, false};
+   WGPUBufferMapCallbackInfo callback = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+   callback.mode = WGPUCallbackMode_AllowSpontaneous;
+   callback.callback = gex_wgpu_map_callback;
+   callback.userdata1 = &state;
+   wgpuBufferMapAsync(ctx->verify_readback, WGPUMapMode_Read, 0,
+                      ctx->verify_used, callback);
+   while (!state.done)
+      gex_wgpu_jspi_wait();
+   const uint64_t was = gex_wgpu_verify_checked;
+   uint8_t *have = NULL;
+   if (state.status == WGPUMapAsyncStatus_Success)
+      have = MALLOC(ctx->verify_used);
+   if (have && gex_wgpu_read_mapped(ctx->verify_readback, 0, have,
+                                    ctx->verify_used)) {
+      for (unsigned i = 0; i < ctx->verify_count; ++i) {
+         const struct gex_wgpu_verify_range *r = &ctx->verify_ranges[i];
+         const uint8_t *got = have + r->at;
+         ++gex_wgpu_verify_checked;
+         gex_wgpu_verify_bytes += r->size;
+         if (!memcmp(got, r->want, r->width))
+            continue;
+         unsigned at = 0;
+         while (got[at] == r->want[at])
+            ++at;
+         if (gex_wgpu_verify_differ++ < 16)
+            fprintf(stderr, "gex-wgpu: rename verify: a %u-byte buffer differs "
+                    "from byte %u (0x%02x, written 0x%02x)\n", r->width, at,
+                    got[at], r->want[at]);
+      }
+   } else {
+      gex_wgpu_verify_unchecked += ctx->verify_count;
+   }
+   FREE(have);
+   if (state.status == WGPUMapAsyncStatus_Success)
+      wgpuBufferUnmap(ctx->verify_readback);
+   for (unsigned i = 0; i < ctx->verify_count; ++i)
+      FREE(ctx->verify_ranges[i].want);
+   ctx->verify_count = 0;
+   ctx->verify_used = 0;
+   for (uint64_t n = was + 1; n <= gex_wgpu_verify_checked; ++n)
+      if ((n >= 16 && !(n & (n - 1))) || n % 4096 == 0) {
+         gex_wgpu_verify_say();
+         break;
+      }
 }
 
 /* A shadow that something is about to read, with the buffer's current contents
@@ -19984,6 +20167,7 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
    gex_wgpu_doom_texture(gscreen, gex->rt_scratch);
    gex_wgpu_doom_buffer(gscreen, gex->rt_scratch_staging);
    gex_wgpu_versions_free(gscreen, gex);
+   FREE(gex->verify_copy);
    gex_wgpu_doom_buffer(gscreen, gex->buffer);
    /* The aliasing snapshot is created lazily and was never released, which
       leaked one whole allocation per resource that took part in a mixed pair
@@ -20545,6 +20729,14 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
                         struct pipe_resource *resource, unsigned usage,
                         unsigned offset, unsigned size, const void *data)
 {
+   if (gex_wgpu_rename_verify_on()) {
+      gex_wgpu_verify_note_write(gex_resource(resource), offset, size, data,
+                                 false);
+      gex_wgpu_buffer_subdata_inner(pipe, resource, usage, offset, size, data);
+      gex_wgpu_verify_note_write(gex_resource(resource), offset, size, data,
+                                 true);
+      return;
+   }
    if (!gex_wgpu_timing_enabled()) {
       gex_wgpu_buffer_subdata_inner(pipe, resource, usage, offset, size, data);
       return;
@@ -41321,6 +41513,7 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
       gex_wgpu_queue_submit(gex_screen(ctx->base.screen), 1, &command);
    }
    wgpuCommandBufferRelease(command);
+   gex_wgpu_verify_check(ctx);
    /* What the batch used and was let go of meanwhile can go now. */
    gex_wgpu_pending_encoder_closed(ctx);
    gex_wgpu_batched_submits++;
@@ -49581,6 +49774,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       gex_wgpu_batch_touch(
          ctx,
          ctx->shader_images[MESA_SHADER_FRAGMENT][ctx->fs->image_slots[i]].resource);
+   if (gex_wgpu_rename_verify_on()) {
+      gex_wgpu_verify_capture(ctx, index_resource);
+      for (unsigned slot = 0; slot < vb_slot_count; ++slot)
+         gex_wgpu_verify_capture(ctx, ctx->vertex_buffers[vb_buffer[slot]]);
+      for (unsigned i = 0; i < ctx->vs->ubo_count; ++i)
+         gex_wgpu_verify_capture(
+            ctx, ctx->constant_buffers[MESA_SHADER_VERTEX][ctx->vs->ubo_slots[i]].buffer);
+      for (unsigned i = 0; i < ctx->fs->ubo_count; ++i)
+         gex_wgpu_verify_capture(
+            ctx, ctx->constant_buffers[MESA_SHADER_FRAGMENT][ctx->fs->ubo_slots[i]].buffer);
+   }
    /* Bounded, so one command buffer cannot grow without limit and the GPU
     * always has something to be getting on with -- and submitted at once if
     * the batch ran out of room to keep this draw's resources alive. */
@@ -49691,6 +49895,11 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    pipe_resource_reference(&ctx->constant_ring, NULL);
    pipe_resource_reference(&ctx->placeholder_storage, NULL);
    FREE(ctx->constant_staging);
+   if (ctx->verify_readback) {
+      gex_wgpu_verify_say();
+      gex_wgpu_free_buffer(ctx->verify_readback);
+   }
+   FREE(ctx->verify_ranges);
    /* The scratch the geometry path runs through. */
    pipe_resource_reference(&ctx->gs_vs_out, NULL);
    pipe_resource_reference(&ctx->gs_vertices, NULL);
