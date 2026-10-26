@@ -52,6 +52,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/emscripten.h>
+#endif
+
+/* The clock GEX_WGPU_TIMING reads, in ns. In the browser, performance.now()
+ * straight: os_time_get_nano goes through clock_gettime and WASI's
+ * clock_time_get, which adds the time origin and stores a BigInt, several
+ * times dearer per read. */
+static inline int64_t
+gex_wgpu_clock(void)
+{
+#ifdef __EMSCRIPTEN__
+   return (int64_t)(emscripten_get_now() * 1e6);
+#else
+   return os_time_get_nano();
+#endif
+}
+
 /* What the driver asks WebGPU to make and write, counted for the
  * GEX_WGPU_TIMING report: per frame in steady state, a creation count in the
  * hundreds is a cache that does not hold. An increment each, so always on. */
@@ -1931,12 +1949,21 @@ struct gex_wgpu_resource {
     * to this buffer: a copy the batch has yet to run, which a carry ahead of
     * another batch would miss. */
    uint32_t staged_by;
+   /* GEX_WGPU_RANGES: the byte ranges pending batches have draws reading
+    * (or staged copies writing), by the contexts' batch bits, and the
+    * contexts whose batch touched it with no known extent. */
+   struct gex_wgpu_read_range { uint32_t lo, hi, bits; } read_ranges[8];
+   uint8_t read_range_count;
+   uint32_t read_whole;
    /* GEX_WGPU_RENAME_VERIFY: the bytes buffer_subdata has written, while
     * nothing else has written the buffer (verify_written still matches
     * bytes_written). */
    uint8_t *verify_copy;
    uint64_t verify_written;
    bool verify_bad;
+   /* Took a direct write while a pending batch read other bytes of it
+    * (GEX_WGPU_RANGES); verify then checks the bytes each draw read. */
+   bool range_written;
    /* The contexts (their batch_bit) with a draw that touched this resource
     * recorded and not yet submitted. */
    uint32_t in_batch;
@@ -2540,6 +2567,8 @@ struct gex_wgpu_context {
     * its own; otherwise every context shares GEX_WGPU_SHARED_BATCH_BIT, and
     * one context's submit clears them all, as a single flag did. */
    uint32_t batch_bit;
+   /* gex_wgpu_batch_touch_range is touching: the range is noted by it. */
+   bool touch_ranged;
    /* GEX_WGPU_RENAME_VERIFY: the batch's copies of renamed buffers as its
     * draws bound them, and what each should hold. */
    WGPUBuffer verify_readback;
@@ -6545,7 +6574,7 @@ static inline void
 gex_wgpu_entry_timer_end(struct gex_wgpu_entry_timer *timer)
 {
    if (timer->start)
-      gex_wgpu_time_entry += os_time_get_nano() - timer->start;
+      gex_wgpu_time_entry += gex_wgpu_clock() - timer->start;
 }
 /* GEX_WGPU_TIMING=2, not 1: two clock reads in a call this small cost about
  * as much as the call, so leaving it on halves the frame rate and makes the
@@ -6554,7 +6583,7 @@ static bool gex_wgpu_entry_timing_enabled(void);
 #define GEX_ENTRY_TIMER()                                                     \
    struct gex_wgpu_entry_timer gex_entry_timer                                \
       __attribute__((cleanup(gex_wgpu_entry_timer_end))) = {                  \
-         gex_wgpu_entry_timing_enabled() ? os_time_get_nano() : 0 }
+         gex_wgpu_entry_timing_enabled() ? gex_wgpu_clock() : 0 }
 
 static void gex_wgpu_reap(struct gex_wgpu_screen *screen);
 
@@ -6937,7 +6966,7 @@ gex_wgpu_buffer_readback(struct pipe_context *pipe,
  * written is not checked (counted as unchecked). */
 struct gex_wgpu_verify_range {
    uint8_t *want;
-   uint32_t at, size, width;
+   uint32_t at, size, width, skip, from;
 };
 
 #define GEX_WGPU_VERIFY_READBACK_BYTES (4u << 20)
@@ -6989,19 +7018,32 @@ gex_wgpu_verify_note_write(struct gex_wgpu_resource *gex, unsigned offset,
    gex->verify_written = gex->bytes_written;
 }
 
-/* After a draw: copy what it bound of a renamed buffer, to check at submit. */
+/* After a draw: copy what it bound of a renamed buffer, to check at submit.
+ * A buffer that took direct writes beside a pending batch's reads is copied
+ * only over [lo, hi), the bytes this draw read (all of it when hi <= lo):
+ * writes after the draw land before the batch runs, so only the bytes the
+ * batch reads must still hold what they held at the draw. */
 static void
 gex_wgpu_verify_capture(struct gex_wgpu_context *ctx,
-                        struct pipe_resource *resource)
+                        struct pipe_resource *resource, uint64_t lo,
+                        uint64_t hi)
 {
    if (!resource || resource->target != PIPE_BUFFER || !ctx->pending_encoder)
       return;
    struct gex_wgpu_resource *gex = (struct gex_wgpu_resource *)resource;
-   if (!gex->versions || !gex->buffer)
+   if ((!gex->versions && !gex->range_written) || !gex->buffer)
       return;
-   const uint32_t size = ALIGN_POT(resource->width0, 4);
+   uint32_t from = 0, width = resource->width0;
+   if (!gex->versions && hi > lo && lo < resource->width0) {
+      from = lo;
+      width = MIN2(hi, (uint64_t)resource->width0) - lo;
+   }
+   const uint32_t skip = from & 3;
+   from -= skip;
+   const uint32_t size =
+      MIN2(ALIGN_POT(from + skip + width, 4), ALIGN_POT(resource->width0, 4)) - from;
    if (gex->verify_bad || !gex->verify_copy || gex->gpu_written ||
-       gex->verify_written != gex->bytes_written || size > gex->gpu_size ||
+       gex->verify_written != gex->bytes_written || (uint64_t)from + size > gex->gpu_size ||
        size > GEX_WGPU_VERIFY_READBACK_BYTES - ctx->verify_used) {
       ++gex_wgpu_verify_unchecked;
       return;
@@ -7035,14 +7077,16 @@ gex_wgpu_verify_capture(struct gex_wgpu_context *ctx,
       ++gex_wgpu_verify_unchecked;
       return;
    }
-   memcpy(r->want, gex->verify_copy, size);
+   memcpy(r->want, gex->verify_copy + from, size);
    r->at = ctx->verify_used;
    r->size = size;
-   r->width = resource->width0;
+   r->width = width;
+   r->skip = skip;
+   r->from = from;
    ++ctx->verify_count;
    ctx->verify_used += ALIGN_POT(size, 256);
    gex_wgpu_end_pass(ctx);
-   wgpuCommandEncoderCopyBufferToBuffer(ctx->pending_encoder, gex->buffer, 0,
+   wgpuCommandEncoderCopyBufferToBuffer(ctx->pending_encoder, gex->buffer, from,
                                         ctx->verify_readback, r->at, size);
 }
 
@@ -7069,18 +7113,19 @@ gex_wgpu_verify_check(struct gex_wgpu_context *ctx)
                                     ctx->verify_used)) {
       for (unsigned i = 0; i < ctx->verify_count; ++i) {
          const struct gex_wgpu_verify_range *r = &ctx->verify_ranges[i];
-         const uint8_t *got = have + r->at;
+         const uint8_t *got = have + r->at + r->skip;
+         const uint8_t *want = r->want + r->skip;
          ++gex_wgpu_verify_checked;
          gex_wgpu_verify_bytes += r->size;
-         if (!memcmp(got, r->want, r->width))
+         if (!memcmp(got, want, r->width))
             continue;
          unsigned at = 0;
-         while (got[at] == r->want[at])
+         while (got[at] == want[at])
             ++at;
          if (gex_wgpu_verify_differ++ < 16)
-            fprintf(stderr, "gex-wgpu: rename verify: a %u-byte buffer differs "
-                    "from byte %u (0x%02x, written 0x%02x)\n", r->width, at,
-                    got[at], r->want[at]);
+            fprintf(stderr, "gex-wgpu: rename verify: %u bytes at %u differ "
+                    "from byte %u (0x%02x, written 0x%02x)\n", r->width,
+                    r->from + r->skip, at, got[at], want[at]);
       }
    } else {
       gex_wgpu_verify_unchecked += ctx->verify_count;
@@ -18288,6 +18333,92 @@ static void gex_wgpu_versions_note_read(struct gex_wgpu_resource *gex,
                                         uint32_t bit);
 static void gex_wgpu_batch_let_go(struct gex_wgpu_resource *gex, uint32_t bit);
 
+/* GEX_WGPU_RANGES=1 (off by default): a write into a buffer the pending
+ * batch reads goes straight to the queue when no draw of any pending batch
+ * reads (and no staged copy writes) the bytes it writes. A queue write lands
+ * ahead of the whole batch, so the draws recorded before it, which read
+ * other bytes, cannot see it, and the ones after it should. */
+static bool
+gex_wgpu_ranges_on(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("GEX_WGPU_RANGES");
+      on = v && *v && *v != '0';
+   }
+   return on != 0;
+}
+
+static unsigned long gex_wgpu_range_direct, gex_wgpu_range_overlap;
+
+static void
+gex_wgpu_note_range(struct gex_wgpu_resource *gex, uint32_t bit, uint64_t lo,
+                    uint64_t hi)
+{
+   if (hi > gex->base.width0)
+      hi = gex->base.width0;
+   if (lo >= hi)
+      return;
+   struct gex_wgpu_read_range *r = gex->read_ranges;
+   /* Grown in place where it touches a range of the same contexts: a ring
+    * appended to draw by draw stays one range. */
+   for (unsigned i = 0; i < gex->read_range_count; ++i)
+      if (r[i].bits == bit && lo <= r[i].hi && hi >= r[i].lo) {
+         r[i].lo = MIN2(r[i].lo, (uint32_t)lo);
+         r[i].hi = MAX2(r[i].hi, (uint32_t)hi);
+         return;
+      }
+   if (gex->read_range_count < ARRAY_SIZE(gex->read_ranges)) {
+      r[gex->read_range_count++] =
+         (struct gex_wgpu_read_range){(uint32_t)lo, (uint32_t)hi, bit};
+      return;
+   }
+   /* Full: fold it into the nearest, which only ever widens what counts as
+    * read. */
+   unsigned best = 0;
+   uint64_t gap = UINT64_MAX;
+   for (unsigned i = 0; i < gex->read_range_count; ++i) {
+      const uint64_t g = lo > r[i].hi ? lo - r[i].hi
+                         : r[i].lo > hi ? r[i].lo - hi : 0;
+      if (g < gap) {
+         gap = g;
+         best = i;
+      }
+   }
+   r[best].lo = MIN2(r[best].lo, (uint32_t)lo);
+   r[best].hi = MAX2(r[best].hi, (uint32_t)hi);
+   r[best].bits |= bit;
+}
+
+static void
+gex_wgpu_ranges_let_go(struct gex_wgpu_resource *gex, uint32_t bit)
+{
+   gex->read_whole &= ~bit;
+   unsigned kept = 0;
+   for (unsigned i = 0; i < gex->read_range_count; ++i) {
+      gex->read_ranges[i].bits &= ~bit;
+      if (gex->read_ranges[i].bits)
+         gex->read_ranges[kept++] = gex->read_ranges[i];
+   }
+   gex->read_range_count = kept;
+}
+
+/* Whether nothing pending reads or writes [lo, hi) of the buffer. */
+static bool
+gex_wgpu_range_free(struct gex_wgpu_context *ctx,
+                    struct gex_wgpu_resource *gex, uint64_t lo, uint64_t hi)
+{
+   if (!gex_wgpu_ranges_on() || gex->base.target != PIPE_BUFFER ||
+       gex->read_whole || gex->gpu_written || gex->persistent_usage ||
+       ctx->batch_touched_overflowed ||
+       !gex_screen(ctx->base.screen)->one_thread)
+      return false;
+   for (unsigned i = 0; i < gex->read_range_count; ++i)
+      if (lo < gex->read_ranges[i].hi && hi > gex->read_ranges[i].lo)
+         return false;
+   return true;
+}
+
 static void
 gex_wgpu_batch_touch(struct gex_wgpu_context *ctx,
                      struct pipe_resource *resource)
@@ -18295,6 +18426,9 @@ gex_wgpu_batch_touch(struct gex_wgpu_context *ctx,
    if (!resource)
       return;
    struct gex_wgpu_resource *gex = gex_resource(resource);
+   /* Read with no known extent: all of it. */
+   if (!ctx->touch_ranged && gex_wgpu_ranges_on())
+      gex->read_whole |= ctx->batch_bit;
    if (gex->in_batch & ctx->batch_bit)
       return;
    if (ctx->batch_touched_count >= ARRAY_SIZE(ctx->batch_touched)) {
@@ -18311,6 +18445,26 @@ gex_wgpu_batch_touch(struct gex_wgpu_context *ctx,
    *slot = NULL;
    pipe_resource_reference(slot, resource);
    ++ctx->batch_touched_count;
+}
+
+/* A draw's read of [lo, hi) of a buffer; hi below lo for all of it. */
+static void
+gex_wgpu_batch_touch_range(struct gex_wgpu_context *ctx,
+                           struct pipe_resource *resource, uint64_t lo,
+                           uint64_t hi)
+{
+   if (!resource)
+      return;
+   if (gex_wgpu_ranges_on() && resource->target == PIPE_BUFFER) {
+      struct gex_wgpu_resource *gex = gex_resource(resource);
+      if (hi > lo)
+         gex_wgpu_note_range(gex, ctx->batch_bit, lo, hi);
+      else
+         gex->read_whole |= ctx->batch_bit;
+   }
+   ctx->touch_ranged = true;
+   gex_wgpu_batch_touch(ctx, resource);
+   ctx->touch_ranged = false;
 }
 
 /* Whether an operation on this resource has to wait for the recorded draws. */
@@ -20478,6 +20632,8 @@ gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
                                         ctx->subdata_stage, at, gex->buffer,
                                         offset, size);
    gex->staged_by |= ctx->batch_bit;
+   if (gex_wgpu_ranges_on())
+      gex_wgpu_note_range(gex, ctx->batch_bit, offset, (uint64_t)offset + size);
    /* The shadow, where there is one, mirrors the buffer as the draws after
     * this see it. */
    if (gex->shadow)
@@ -20542,6 +20698,8 @@ gex_wgpu_batch_let_go(struct gex_wgpu_resource *gex, uint32_t bit)
 {
    gex->in_batch &= ~bit;
    gex->staged_by &= ~bit;
+   if (gex->read_range_count || gex->read_whole)
+      gex_wgpu_ranges_let_go(gex, bit);
    struct gex_wgpu_versions *v = gex->versions;
    if (v)
       for (unsigned i = 0; i < v->count; ++i)
@@ -20713,6 +20871,9 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
                                            ctx->subdata_stage, at, to, offset,
                                            size);
       ++gex_wgpu_renamed_carried;
+      /* The prologue writes all of the new version ahead of the batch,
+       * after any queue write: none may go to it directly now. */
+      gex->read_whole |= ctx->batch_bit;
    } else if (gex->shadow) {
       memcpy(gex->shadow + offset, data, size);
       wgpuQueueWriteBuffer(screen->queue, to, 0, gex->shadow, words);
@@ -20749,10 +20910,10 @@ gex_wgpu_buffer_subdata(struct pipe_context *pipe,
       gex_wgpu_buffer_subdata_inner(pipe, resource, usage, offset, size, data);
       return;
    }
-   const int64_t start = os_time_get_nano();
+   const int64_t start = gex_wgpu_clock();
    gex_wgpu_buffer_subdata_inner(pipe, resource, usage, offset, size, data);
    gex_wgpu_time_subdata +=
-      (os_time_get_nano() - start) * gex_wgpu_timing_every();
+      (gex_wgpu_clock() - start) * gex_wgpu_timing_every();
 }
 
 static void
@@ -20780,8 +20941,20 @@ gex_wgpu_buffer_subdata_inner(struct pipe_context *pipe,
     * fresh chunk every time, so its writes never touch bytes a recorded draw
     * still has to read -- and there are two of them per draw, so breaking the
     * batch for them would leave nothing batched at all. */
-   if (resource != ctx->constant_ring &&
-       gex_wgpu_batch_conflicts_usage(ctx, resource, usage)) {
+   bool conflicts = resource != ctx->constant_ring &&
+                    gex_wgpu_batch_conflicts_usage(ctx, resource, usage);
+   if (conflicts && gex_wgpu_ranges_on()) {
+      if (gex_wgpu_range_free(ctx, gex_resource(resource), offset,
+                              (uint64_t)offset + size)) {
+         ++gex_wgpu_range_direct;
+         gex_resource(resource)->range_written = true;
+         gex_wgpu_log_upload("sub-range", resource->width0, offset, data, size);
+         conflicts = false;
+      } else {
+         ++gex_wgpu_range_overlap;
+      }
+   }
+   if (conflicts) {
       if (gex_wgpu_subdata_rename(ctx, resource, usage, offset, size, data)) {
          gex_wgpu_subdata_note(gex_resource(resource), offset, size, sub_hash,
                                sub_hashed);
@@ -39726,7 +39899,7 @@ gex_wgpu_timing_enabled(void)
       const char *value = getenv("GEX_WGPU_TIMING");
       enabled = value && *value && *value != '0';
       if (enabled)
-         gex_wgpu_time_origin = os_time_get_nano();
+         gex_wgpu_time_origin = gex_wgpu_clock();
    }
    return enabled != 0;
 }
@@ -39929,7 +40102,7 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
    if (++gex_wgpu_timed_draws % 20000 != 0)
       return;
 
-         const int64_t wall = os_time_get_nano() - gex_wgpu_time_origin;
+         const int64_t wall = gex_wgpu_clock() - gex_wgpu_time_origin;
          const uint64_t n = gex_wgpu_timed_draws;
          /* Since the previous report, not since the start: an application
           * spends its first minute loading, and an average over that says
@@ -40009,7 +40182,7 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
             const double f = gex_wgpu_presents > was_presents
                                 ? (double)(gex_wgpu_presents - was_presents) : 1.0;
 #define GEX_PER(field) ((m->field - was.field) / f)
-            static unsigned long was_rn[3], was_not[GEX_WGPU_NORENAME_COUNT];
+            static unsigned long was_rn[5], was_not[GEX_WGPU_NORENAME_COUNT];
 #define GEX_NOT(why) ((gex_wgpu_norename[why] - was_not[why]) / f)
             fprintf(stderr,
                     "gex-wgpu: per frame (%.0f frames) -- made: render pipelines %.1f, "
@@ -40018,7 +40191,8 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                     "buffers %.1f, textures %.1f, views %.1f, encoders %.1f, "
                     "render passes %.1f; queue: %.1f buffer writes (%.1f KiB), "
                     "%.1f texture writes, %.1f submits; writes to a buffer the "
-                    "batch reads: %.1f renamed (%.1f carried), %.1f staged, "
+                    "batch reads: %.1f direct beside its ranges (%.1f overlapped), "
+                    "%.1f renamed (%.1f carried), %.1f staged, "
                     "not renamed: bind %.1f, gpu %.1f, big %.1f, staged %.1f, "
                     "unaligned %.1f, full %.1f, contexts %.1f, other %.1f; "
                     "contexts live %u\n",
@@ -40030,6 +40204,8 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                     GEX_PER(views), GEX_PER(encoders), GEX_PER(render_passes),
                     GEX_PER(write_buffers), GEX_PER(write_buffer_bytes) / 1024,
                     GEX_PER(write_textures), GEX_PER(submits),
+                    (gex_wgpu_range_direct - was_rn[3]) / f,
+                    (gex_wgpu_range_overlap - was_rn[4]) / f,
                     (gex_wgpu_renamed - was_rn[0]) / f,
                     (gex_wgpu_renamed_carried - was_rn[1]) / f,
                     (gex_wgpu_staged_in_batch - was_rn[2]) / f,
@@ -40087,11 +40263,15 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                   ws[k] = gex_wgpu_time_set[k];
                   wc[k] = gex_wgpu_set_calls[k];
                }
-               const int64_t c0 = os_time_get_nano();
+               const int64_t c0 = gex_wgpu_clock();
                int64_t sink = 0;
                for (unsigned i = 0; i < 64; ++i)
+                  sink += gex_wgpu_clock();
+               const int64_t c1 = gex_wgpu_clock();
+               for (unsigned i = 0; i < 64; ++i)
                   sink += os_time_get_nano();
-               const double clock_us = (os_time_get_nano() - c0) / 65.0 / 1e3;
+               const double clock_us = (c1 - c0) / 65.0 / 1e3;
+               const double os_clock_us = (gex_wgpu_clock() - c1) / 65.0 / 1e3;
                fprintf(stderr,
                        "gex-wgpu: setters per frame (%.0f frames) -- pipeline "
                        "%.2f ms (%.1f sets), dynamic state %.2f ms (%.1f: "
@@ -40099,19 +40279,22 @@ gex_wgpu_report_timing(const struct gex_wgpu_screen *sc)
                        "bind group sets %.2f ms (%.1f: constant buffers, "
                        "samplers, views), vertex buffers %.2f ms (%.1f), index "
                        "buffer %.2f ms (%.1f), draw calls %.2f ms (%.1f); a "
-                       "clock read %.2f us, timed one in %u%s\n",
+                       "clock read %.2f us (os_time_get_nano %.2f us), timed one "
+                       "in %u%s\n",
                        gex_wgpu_presents > was_presents ? f : 0.0,
                        ms[GEX_SET_PIPELINE], calls[GEX_SET_PIPELINE],
                        ms[GEX_SET_DYNAMIC], calls[GEX_SET_DYNAMIC],
                        ms[GEX_SET_BIND_GROUPS], calls[GEX_SET_BIND_GROUPS],
                        ms[GEX_SET_VERTEX], calls[GEX_SET_VERTEX],
                        ms[GEX_SET_INDEX], calls[GEX_SET_INDEX],
-                       ms[GEX_SET_DRAW], calls[GEX_SET_DRAW], clock_us,
+                       ms[GEX_SET_DRAW], calls[GEX_SET_DRAW], clock_us, os_clock_us,
                        gex_wgpu_timing_every(), sink == 1 ? " " : "");
             }
             was_rn[0] = gex_wgpu_renamed;
             was_rn[1] = gex_wgpu_renamed_carried;
             was_rn[2] = gex_wgpu_staged_in_batch;
+            was_rn[3] = gex_wgpu_range_direct;
+            was_rn[4] = gex_wgpu_range_overlap;
             memcpy(was_not, gex_wgpu_norename, sizeof(was_not));
 #undef GEX_NOT
             static uint64_t was_pl[2], was_bg[2];
@@ -44738,12 +44921,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * which also contains the application and the frame readback. */
    const bool gex_timing = gex_wgpu_timing_sample();
    const bool gex_counting = gex_wgpu_timing_enabled();
-   const int64_t t_draw_start = gex_timing ? os_time_get_nano() : 0;
+   const int64_t t_draw_start = gex_timing ? gex_wgpu_clock() : 0;
    int64_t t_set = 0;
 #define GEX_SET_MARK(kind)                                                    \
    do {                                                                       \
       if (gex_timing) {                                                       \
-         const int64_t t_ = os_time_get_nano();                               \
+         const int64_t t_ = gex_wgpu_clock();                               \
          gex_wgpu_time_set[kind] += (t_ - t_set) * gex_wgpu_timing_every();   \
          t_set = t_;                                                          \
       }                                                                       \
@@ -46162,7 +46345,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    const unsigned first_index = uploaded_index_resource ? 0u : draws[0].start;
    const unsigned index_byte_offset =
       uploaded_index_resource ? index_upload_offset : 0u;
-   const int64_t t_bounds_start = gex_timing ? os_time_get_nano() : 0;
+   const int64_t t_bounds_start = gex_timing ? gex_wgpu_clock() : 0;
    if (ctx->vertex_elements) {
       uint64_t last_vertex = (uint64_t)draws[0].start + draws[0].count - 1;
       /* Whether the highest index this draw reads is knowable at all. It is
@@ -46292,7 +46475,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          }
       }
    }
-   if (gex_timing) gex_wgpu_time_bounds += (os_time_get_nano() - t_bounds_start) * gex_wgpu_timing_every();
+   if (gex_timing) gex_wgpu_time_bounds += (gex_wgpu_clock() - t_bounds_start) * gex_wgpu_timing_every();
 
    float viewport_x = 0.0f;
    float viewport_y = 0.0f;
@@ -46521,7 +46704,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                 gex_wgpu_factor_is_constant_color(factors[f]);
    }
    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
-   const int64_t t_fsmod_start = gex_timing ? os_time_get_nano() : 0;
+   const int64_t t_fsmod_start = gex_timing ? gex_wgpu_clock() : 0;
    /* Slots this variant dropped because the bound state could not satisfy
     * their declaration; their bindings must be left out of the group too. */
    uint16_t omitted_texture_slots = 0;
@@ -46546,7 +46729,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       fs_topology == WGPUPrimitiveTopology_TriangleList ||
       fs_topology == WGPUPrimitiveTopology_TriangleStrip,
       &omitted_texture_slots, &demoted_ms_slots);
-   if (gex_timing) gex_wgpu_time_fsmod += (os_time_get_nano() - t_fsmod_start) * gex_wgpu_timing_every();
+   if (gex_timing) gex_wgpu_time_fsmod += (gex_wgpu_clock() - t_fsmod_start) * gex_wgpu_timing_every();
    if (!fragment.module)
       GEX_DRAW_DROP();
    fragment.entryPoint = (WGPUStringView){"main", WGPU_STRLEN};
@@ -48184,7 +48367,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    const unsigned group_count = needs_vertex_texture ? 4
       : needs_fragment_constant ? 3
       : needs_vertex_constant ? 2 : needs_texture ? 1 : 0;
-   const int64_t t_bind_start = gex_timing ? os_time_get_nano() : 0;
+   const int64_t t_bind_start = gex_timing ? gex_wgpu_clock() : 0;
    /* Names the draw for every WebGPU message about the objects below. The
     * two shader names are what tell one program's draw from another's, which
     * is the question a validation message otherwise leaves open. Locals,
@@ -48267,8 +48450,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
     * does, because "the driver is slow" is not actionable and the three have
     * completely different fixes. Off by default; one clock read per draw when
     * on. */
-   if (gex_timing) gex_wgpu_time_bind += (os_time_get_nano() - t_bind_start) * gex_wgpu_timing_every();
-   const int64_t t_pipeline_start = gex_timing ? os_time_get_nano() : 0;
+   if (gex_timing) gex_wgpu_time_bind += (gex_wgpu_clock() - t_bind_start) * gex_wgpu_timing_every();
+   const int64_t t_pipeline_start = gex_timing ? gex_wgpu_clock() : 0;
    bool pipeline_cached = false;
    /* Safe against the pipeline cache without any further thought:
     * gex_wgpu_pipeline_key already clears head.label before hashing, so the
@@ -48278,8 +48461,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    WGPURenderPipeline pipeline =
       gex_wgpu_cached_pipeline(screen, &pipeline_desc, &pipeline_cached);
    if (gex_timing)
-      gex_wgpu_time_pipeline += (os_time_get_nano() - t_pipeline_start) * gex_wgpu_timing_every();
-   const int64_t t_record_start = gex_timing ? os_time_get_nano() : 0;
+      gex_wgpu_time_pipeline += (gex_wgpu_clock() - t_pipeline_start) * gex_wgpu_timing_every();
+   const int64_t t_record_start = gex_timing ? gex_wgpu_clock() : 0;
    /* Can this draw go into the pass that is already open?
     *
     * Everything the pass descriptor is built from goes in the key. An
@@ -48434,13 +48617,13 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                             gex_resource(ctx->depth)->texture,
                                             &view_desc);
    }
-   if (gex_timing) gex_wgpu_time_views += (os_time_get_nano() - t_record_start) * gex_wgpu_timing_every();
-   const int64_t t_encoder_start = gex_timing ? os_time_get_nano() : 0;
+   if (gex_timing) gex_wgpu_time_views += (gex_wgpu_clock() - t_record_start) * gex_wgpu_timing_every();
+   const int64_t t_encoder_start = gex_timing ? gex_wgpu_clock() : 0;
    /* Joins whatever draws are already recorded rather than starting its own
     * command buffer; see gex_wgpu_submit_pending. */
    gex_wgpu_pending_encoder(ctx);
    WGPUCommandEncoder encoder = ctx->pending_encoder;
-   const int64_t t_bg_start = gex_timing ? os_time_get_nano() : 0;
+   const int64_t t_bg_start = gex_timing ? gex_wgpu_clock() : 0;
    if (gex_timing) gex_wgpu_time_encoder += (t_bg_start - t_encoder_start) * gex_wgpu_timing_every();
    WGPUBindGroup bind_groups[4] = {NULL, NULL, NULL, NULL};
    /* Storage-texture views built for this draw's shader images. The bind
@@ -49300,8 +49483,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          ctx->active_queries[GEX_WGPU_QUERY_OCCLUSION][0] && ctx->occlusion_set;
       if (counting)
          pass_desc.occlusionQuerySet = ctx->occlusion_set;
-      if (gex_timing) gex_wgpu_time_bg += (os_time_get_nano() - t_bg_start) * gex_wgpu_timing_every();
-      const int64_t t_begin_start = gex_timing ? os_time_get_nano() : 0;
+      if (gex_timing) gex_wgpu_time_bg += (gex_wgpu_clock() - t_bg_start) * gex_wgpu_timing_every();
+      const int64_t t_begin_start = gex_timing ? gex_wgpu_clock() : 0;
       /* Reuse the open pass when this draw wants exactly the same attachments.
        * A counting draw never reuses one and never leaves one open, because the
        * occlusion query index belongs to the pass. */
@@ -49363,9 +49546,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          ctx->emitted_handle_epoch = screen->handle_epoch;
       }
       pass = ctx->pending_pass;
-      if (gex_timing) gex_wgpu_time_begin += (os_time_get_nano() - t_begin_start) * gex_wgpu_timing_every();
+      if (gex_timing) gex_wgpu_time_begin += (gex_wgpu_clock() - t_begin_start) * gex_wgpu_timing_every();
       if (gex_timing)
-         t_set = os_time_get_nano();
+         t_set = gex_wgpu_clock();
       if (pass) {
          /* Braced. The second `if` was indented as though it were inside the
           * first and was not -- the shape gcc flags as -Wmisleading-indentation,
@@ -49702,12 +49885,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             wgpuRenderPassEncoderEndOcclusionQuery(pass);
          GEX_SET_CALL(GEX_SET_DRAW);
          GEX_SET_MARK(GEX_SET_DRAW);
-         const int64_t t_end_start = gex_timing ? os_time_get_nano() : 0;
+         const int64_t t_end_start = gex_timing ? gex_wgpu_clock() : 0;
          /* Left open for the next draw. Whatever stops recording -- a different
           * framebuffer, a clear, a map, the submit -- closes it. */
          if (counting)
             gex_wgpu_end_pass(ctx);
-         if (gex_timing) gex_wgpu_time_end += (os_time_get_nano() - t_end_start) * gex_wgpu_timing_every();
+         if (gex_timing) gex_wgpu_time_end += (gex_wgpu_clock() - t_end_start) * gex_wgpu_timing_every();
       }
    } /* ordered framebuffer-fetch primitives */
    if (odd_pipeline)
@@ -49787,7 +49970,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       gex_decline(ctx);
       GEX_DRAW_DROP();
    }
-   const int64_t t_submit_start = gex_timing ? os_time_get_nano() : 0;
+   const int64_t t_submit_start = gex_timing ? gex_wgpu_clock() : 0;
    if (gex_timing)
       gex_wgpu_time_record += (t_submit_start - t_record_start) * gex_wgpu_timing_every();
    /* Everything this draw reads or writes, so a later map or upload knows
@@ -49795,9 +49978,63 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    for (unsigned i = 0; i < ctx->color_count; ++i)
       gex_wgpu_batch_touch(ctx, ctx->colors[i]);
    gex_wgpu_batch_touch(ctx, ctx->depth);
-   gex_wgpu_batch_touch(ctx, index_resource);
-   for (unsigned slot = 0; slot < vb_slot_count; ++slot)
-      gex_wgpu_batch_touch(ctx, ctx->vertex_buffers[vb_buffer[slot]]);
+   uint64_t ilo = 0, ihi = 0;
+   uint64_t vb_lo[GEX_WGPU_MAX_VERTEX_BUFFERS] = {0},
+            vb_hi[GEX_WGPU_MAX_VERTEX_BUFFERS] = {0};
+   {
+      /* The bytes of each buffer this draw reads, where they are known
+       * (GEX_WGPU_RANGES): one direct draw with no emulation in between. An
+       * empty range is all of the buffer. */
+      const bool exact = !indirect && num_draws == 1 &&
+                         !ctx->point_expand.active && !vs_records &&
+                         !(ctx->point_gather_mask | ctx->deindex_gather_mask);
+      if (exact && index_resource && !uploaded_index_resource) {
+         ilo = (uint64_t)first_index * info->index_size;
+         ihi = ilo + (uint64_t)draws[0].count * info->index_size;
+      }
+      gex_wgpu_batch_touch_range(ctx, index_resource, ilo, ihi);
+      /* The vertices: from the draw, or for an indexed one from the bounds
+       * the frontend gave. */
+      int64_t first_vertex = -1, last_vertex = -1;
+      if (exact && !info->index_size) {
+         first_vertex = draws[0].start;
+         last_vertex = (int64_t)draws[0].start + draws[0].count - 1;
+      } else if (exact && info->index_bounds_valid) {
+         first_vertex = (int64_t)info->min_index + draws[0].index_bias;
+         last_vertex = (int64_t)info->max_index + draws[0].index_bias;
+      }
+      /* How far into a vertex its attributes reach, which can pass the
+       * stride. */
+      uint32_t vb_reach[GEX_WGPU_MAX_VERTEX_BUFFERS] = {0};
+      for (unsigned i = 0; exact && ctx->vertex_elements &&
+                           i < ctx->vertex_elements->count; ++i) {
+         const struct pipe_vertex_element *e = &ctx->vertex_elements->elements[i];
+         if (e->vertex_buffer_index >= GEX_WGPU_MAX_BOUND_VERTEX_BUFFERS)
+            continue;
+         const int at = vb_slot[e->vertex_buffer_index][e->instance_divisor ? 1 : 0];
+         if (at >= 0)
+            vb_reach[at] = MAX2(vb_reach[at],
+                               e->src_offset + util_format_get_blocksize(e->src_format));
+      }
+      for (unsigned slot = 0; slot < vb_slot_count; ++slot) {
+         const unsigned which = vb_buffer[slot];
+         const uint64_t base = ctx->vertex_buffer_offsets[which];
+         const uint32_t stride = vb_stride[slot];
+         int64_t first = first_vertex, last = last_vertex;
+         if (vb_instanced[slot]) {
+            first = exact ? (int64_t)info->start_instance : -1;
+            last = exact ? (int64_t)info->start_instance +
+                              MAX2(info->instance_count, 1u) - 1 : -1;
+         }
+         if (stride && first >= 0 && last >= first) {
+            vb_lo[slot] = base + (uint64_t)first * stride;
+            vb_hi[slot] = base + (uint64_t)last * stride +
+                          MAX2(vb_reach[slot], stride);
+         }
+         gex_wgpu_batch_touch_range(ctx, ctx->vertex_buffers[which],
+                                    vb_lo[slot], vb_hi[slot]);
+      }
+   }
    /* An emulated stage's records, which this draw reads. They used to be
     * tracked by the loop above, as vertex buffer zero; a storage binding is
     * no less a read, and a resource the batch does not hold can be
@@ -49807,14 +50044,18 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                  ctx->deindex_records_gathered)
                                    ? ctx->point_gathered_records
                                    : ctx->passthrough_records);
-   for (unsigned i = 0; i < ctx->vs->ubo_count; ++i)
-      gex_wgpu_batch_touch(
-         ctx,
-         ctx->constant_buffers[MESA_SHADER_VERTEX][ctx->vs->ubo_slots[i]].buffer);
-   for (unsigned i = 0; i < ctx->fs->ubo_count; ++i)
-      gex_wgpu_batch_touch(
-         ctx,
-         ctx->constant_buffers[MESA_SHADER_FRAGMENT][ctx->fs->ubo_slots[i]].buffer);
+   for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
+      const struct pipe_constant_buffer *cb =
+         &ctx->constant_buffers[MESA_SHADER_VERTEX][ctx->vs->ubo_slots[i]];
+      gex_wgpu_batch_touch_range(ctx, cb->buffer, cb->buffer_offset,
+                                 (uint64_t)cb->buffer_offset + cb->buffer_size);
+   }
+   for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
+      const struct pipe_constant_buffer *cb =
+         &ctx->constant_buffers[MESA_SHADER_FRAGMENT][ctx->fs->ubo_slots[i]];
+      gex_wgpu_batch_touch_range(ctx, cb->buffer, cb->buffer_offset,
+                                 (uint64_t)cb->buffer_offset + cb->buffer_size);
+   }
    for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
       const unsigned slot = ctx->fs->texture_slots[i];
       if (ctx->sampler_views[slot])
@@ -49874,15 +50115,22 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          ctx,
          ctx->shader_images[MESA_SHADER_FRAGMENT][ctx->fs->image_slots[i]].resource);
    if (gex_wgpu_rename_verify_on()) {
-      gex_wgpu_verify_capture(ctx, index_resource);
+      gex_wgpu_verify_capture(ctx, index_resource, ilo, ihi);
       for (unsigned slot = 0; slot < vb_slot_count; ++slot)
-         gex_wgpu_verify_capture(ctx, ctx->vertex_buffers[vb_buffer[slot]]);
-      for (unsigned i = 0; i < ctx->vs->ubo_count; ++i)
-         gex_wgpu_verify_capture(
-            ctx, ctx->constant_buffers[MESA_SHADER_VERTEX][ctx->vs->ubo_slots[i]].buffer);
-      for (unsigned i = 0; i < ctx->fs->ubo_count; ++i)
-         gex_wgpu_verify_capture(
-            ctx, ctx->constant_buffers[MESA_SHADER_FRAGMENT][ctx->fs->ubo_slots[i]].buffer);
+         gex_wgpu_verify_capture(ctx, ctx->vertex_buffers[vb_buffer[slot]],
+                                 vb_lo[slot], vb_hi[slot]);
+      for (unsigned i = 0; i < ctx->vs->ubo_count; ++i) {
+         const struct pipe_constant_buffer *cb =
+            &ctx->constant_buffers[MESA_SHADER_VERTEX][ctx->vs->ubo_slots[i]];
+         gex_wgpu_verify_capture(ctx, cb->buffer, cb->buffer_offset,
+                                 (uint64_t)cb->buffer_offset + cb->buffer_size);
+      }
+      for (unsigned i = 0; i < ctx->fs->ubo_count; ++i) {
+         const struct pipe_constant_buffer *cb =
+            &ctx->constant_buffers[MESA_SHADER_FRAGMENT][ctx->fs->ubo_slots[i]];
+         gex_wgpu_verify_capture(ctx, cb->buffer, cb->buffer_offset,
+                                 (uint64_t)cb->buffer_offset + cb->buffer_size);
+      }
    }
    /* Bounded, so one command buffer cannot grow without limit and the GPU
     * always has something to be getting on with -- and submitted at once if
@@ -49901,8 +50149,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        ctx->batch_touched_overflowed)
       gex_wgpu_submit_pending(ctx);
    if (gex_timing) {
-      gex_wgpu_time_submit += (os_time_get_nano() - t_submit_start) * gex_wgpu_timing_every();
-      gex_wgpu_time_draw += (os_time_get_nano() - t_draw_start) * gex_wgpu_timing_every();
+      gex_wgpu_time_submit += (gex_wgpu_clock() - t_submit_start) * gex_wgpu_timing_every();
+      gex_wgpu_time_draw += (gex_wgpu_clock() - t_draw_start) * gex_wgpu_timing_every();
       gex_wgpu_report_timing(screen);
    }
 }
