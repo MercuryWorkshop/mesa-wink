@@ -22172,16 +22172,22 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
     * --anisotropic=0 for exactly that reason.
     *
     * WebGPU requires all three filters to be linear when maxAnisotropy is
-    * above one, and GL treats anisotropy as a quality hint rather than a
-    * promise, so a sampler that is not fully linear takes one instead of
-    * being turned away. 16 is what the cap advertises and what Dawn allows;
+    * above one. With no mip filtering, clamp LOD to zero so a linear mip
+    * filter still reads only the base level and allows anisotropy
+    * within that level. A nearest spatial or mip filter keeps anisotropy at
+    * one. 16 is what the cap advertises and what Dawn allows;
     * clamping keeps a larger request from being a validation error. */
    const bool fully_linear =
       state->mag_img_filter == PIPE_TEX_FILTER_LINEAR &&
       state->min_img_filter == PIPE_TEX_FILTER_LINEAR &&
-      state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR;
+      state->min_mip_filter != PIPE_TEX_MIPFILTER_NEAREST;
    desc.maxAnisotropy = fully_linear && state->max_anisotropy > 1
       ? (uint16_t)MIN2(16u, (unsigned)state->max_anisotropy) : 1;
+   if (desc.maxAnisotropy > 1) {
+      desc.mipmapFilter = WGPUMipmapFilterMode_Linear;
+      if (state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE)
+         desc.lodMaxClamp = 0.0f;
+   }
    if (comparison)
       desc.compare = gex_wgpu_compare(state->compare_func);
    struct gex_wgpu_sampler *sampler = CALLOC_STRUCT(gex_wgpu_sampler);

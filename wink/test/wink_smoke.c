@@ -943,6 +943,78 @@ mipmap_full_image(void)
    CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "mipmap full image context failed");
 }
 
+/* Anisotropy must still filter within a level when mipmapping is disabled.
+ * The phase puts isotropic samples on black stripes; a 16-texel anisotropic
+ * footprint averages black and white. A green mip catches accidental mip
+ * interpolation when WebGPU's required linear mip filter is enabled. */
+static void
+base_level_anisotropy(void)
+{
+   const char *vs = "#version 300 es\nvoid main(){"
+      "vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+      "gl_Position=vec4(p*2.0-1.0,0,1);}";
+   GLuint vao, texture;
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glGenTextures(1, &texture);
+   p_glActiveTexture(GL_TEXTURE0);
+   p_glBindTexture(GL_TEXTURE_2D, texture);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 1);
+   p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+   p_glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+   for (unsigned axis = 0; axis < 2; ++axis) {
+      uint8_t pixels[64 * 32 * 4];
+      for (unsigned y = 0; y < 32; ++y) {
+         for (unsigned x = 0; x < 64; ++x) {
+            unsigned i = 4 * (y * 64 + x);
+            pixels[i] = ((axis ? y : x) & 1) * 255;
+            pixels[i+1] = 20; pixels[i+2] = 80; pixels[i+3] = 255;
+         }
+      }
+      p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 64, 32, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+      for (unsigned i = 0; i < 32 * 16; ++i) {
+         pixels[4*i] = 0; pixels[4*i+1] = 255;
+         pixels[4*i+2] = 0; pixels[4*i+3] = 255;
+      }
+      p_glTexImage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 32, 16, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+      unsigned width = axis ? 64 : 4, height = axis ? 2 : 32;
+      char fs[512];
+      snprintf(fs, sizeof(fs), "#version 300 es\nprecision highp float;"
+         "uniform sampler2D tex; out vec4 color; void main(){"
+         "color=texture(tex,gl_FragCoord.xy/vec2(%u,%u)+vec2(%s));}",
+         width, height, axis ? "0.0,0.5/32.0" : "0.5/64.0,0.0");
+      GLuint prog = link_program(vs, fs, "base level anisotropy");
+      p_glUseProgram(prog);
+      p_glUniform1i(p_glGetUniformLocation(prog, "tex"), 0);
+      p_glViewport(0, 0, width, height);
+      const unsigned anisotropy[] = {1, 16, 1};
+      for (unsigned i = 0; i < 3; ++i) {
+         p_glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, anisotropy[i]);
+         p_glDrawArrays(GL_TRIANGLES, 0, 3);
+         uint8_t pixel[4]; read_center(pixel, width, height);
+         CHECK(abs((int)pixel[0] - (anisotropy[i] > 1 ? 128 : 0)) <= 8 &&
+               abs((int)pixel[1] - 20) <= 1 && abs((int)pixel[2] - 80) <= 1 &&
+               pixel[3] == 255,
+               "base level anisotropy axis=%u aniso=%u: %u,%u,%u,%u",
+               axis, anisotropy[i], pixel[0], pixel[1], pixel[2], pixel[3]);
+      }
+      p_glUseProgram(0);
+      p_glDeleteProgram(prog);
+   }
+   p_glViewport(0, 0, W, H);
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glDeleteTextures(1, &texture);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(),
+         "base level anisotropy context failed");
+}
+
 static void
 integer_cube_lod(void)
 {
@@ -2137,6 +2209,7 @@ exercise(const char *label, int api, wink_surface *surface)
       helper_invocation();
       independent_samplers();
       mipmap_full_image();
+      base_level_anisotropy();
       integer_cube_lod();
       integer_texture_offsets();
       integer_mip_view_changes();
