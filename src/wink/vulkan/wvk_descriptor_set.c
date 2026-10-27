@@ -281,20 +281,27 @@ write_image(struct wvk_descriptor *d, const struct wvk_descriptor_set_binding_la
          wgpu = view->storage_view;
          desc = &view->storage_desc;
       }
+      const bool sampled_copy = view && view->sampled_view &&
+         (type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+      if (sampled_copy) {
+         wgpu = view->sampled_view;
+         desc = &view->sampled_desc;
+      }
       if (wgpu) {
          d->view_image = wvk_image_view_image(view);
          wvk_image_ref(d->view_image);
-         d->view_texture = view->texture;
+         d->view_texture = sampled_copy ? view->sampled_texture : view->texture;
          d->view_level = view->vk.base_mip_level;
          d->view_levels = desc->mipLevelCount;
          d->view_desc = *desc;
          d->view_desc.label = (WGPUStringView)WGPU_STRING_VIEW_INIT;
          d->view = wgpu;
          wgpuTextureViewAddRef(d->view);
-         if (wgpu != view->array_view && view->array_view &&
+         WGPUTextureView faces = sampled_copy ? view->sampled_array_view : view->array_view;
+         if (wgpu != faces && faces &&
              (view->view_desc.dimension == WGPUTextureViewDimension_Cube ||
               view->view_desc.dimension == WGPUTextureViewDimension_CubeArray)) {
-            d->cube_faces = view->array_view;
+            d->cube_faces = faces;
             wgpuTextureViewAddRef(d->cube_faces);
          }
          d->view_format = view->vk.view_format;

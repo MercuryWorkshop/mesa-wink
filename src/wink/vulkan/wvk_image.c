@@ -439,6 +439,13 @@ wvk_image_make_current(struct wvk_device *dev, struct wvk_replay *replay, struct
    for (uint32_t l = first; l < first + count && l < ARRAY_SIZE(image->valid); ++l) {
       if (image->valid[l] & BITFIELD_BIT(t))
          continue;
+      if (t != WVK_IMAGE_TEXTURE && t != WVK_IMAGE_SHADOW && image->aliases[t - 1].sampling_copy) {
+         const uint32_t source = image->aliases[t - 1].sampling_source;
+         wvk_image_make_current(dev, replay, image, source, l, 1);
+         wvk_image_update_decoded(dev, replay, image, source, t, l);
+         image->valid[l] |= BITFIELD_BIT(t);
+         continue;
+      }
       /* The shadow is what the image's own texture decodes to. */
       if (t == WVK_IMAGE_SHADOW) {
          wvk_image_make_current(dev, replay, image, WVK_IMAGE_TEXTURE, l, 1);
@@ -927,7 +934,7 @@ view_dimension(VkImageViewType type)
  * none to be had. */
 static uint32_t
 image_alias(struct wvk_device *dev, struct wvk_image *image, const struct wvk_image_view *view,
-            WGPUTextureFormat format)
+            WGPUTextureFormat format, bool sampling_copy)
 {
    const struct wvk_physical_device *pdev = wvk_device_physical(dev);
    const VkFormat vf = view->vk.view_format;
@@ -942,6 +949,9 @@ image_alias(struct wvk_device *dev, struct wvk_image *image, const struct wvk_im
       /* Packed formats all share RGBA8: of the same one, then. */
       const struct wvk_format *pf = wvk_format_get(vf);
       if ((image->aliases[i].format == format || (twin && image->aliases[i].format == twin)) &&
+          image->aliases[i].sampling_copy == sampling_copy &&
+          (!sampling_copy || (image->aliases[i].vk_format == vf &&
+                             image->aliases[i].sampling_source == view->texture)) &&
           image->aliases[i].first_level == first &&
           (!pf || !(pf->caps & WVK_CAP_PACKED16) || image->aliases[i].vk_format == vf)) {
          t = i + 1;
@@ -966,6 +976,8 @@ image_alias(struct wvk_device *dev, struct wvk_image *image, const struct wvk_im
       usage |= WGPUTextureUsage_RenderAttachment;
    if ((image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) && (caps & WVK_CAP_STORAGE))
       usage |= WGPUTextureUsage_StorageBinding;
+   if (sampling_copy)
+      usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_RenderAttachment;
    WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
    desc.label = wvk_sv("VkImage alias");
    desc.usage = usage;
@@ -1015,10 +1027,16 @@ image_alias(struct wvk_device *dev, struct wvk_image *image, const struct wvk_im
    alias->layer_textures = layers;
    alias->first_level = first;
    alias->level_count = desc.mipLevelCount;
+   alias->sampling_copy = sampling_copy;
+   alias->sampling_source = view->texture;
    if (!image->tracked)
       p_atomic_inc(&dev->tracked_images);
    image->tracked = true;
    t = ++image->alias_count;
+   /* A view may be created after a host upload, before the image was
+    * tracked. Its new texture still needs the original's contents. */
+   for (uint32_t l = 0; l < ARRAY_SIZE(image->valid); ++l)
+      image->valid[l] &= ~BITFIELD_BIT(t);
 out:
    simple_mtx_unlock(&dev->cache_lock);
    return t;
@@ -1156,7 +1174,7 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
     * it decodes to; a view of a format WebGPU cannot view the texture as
     * is of a texture of that format. */
    if (needs_alias(wvk_device_physical(dev), image, view, view->format))
-      view->texture = image_alias(dev, image, view, view->format);
+      view->texture = image_alias(dev, image, view, view->format, false);
    else if (image->shadow && vk_format_is_compressed(view->vk.view_format))
       view->texture = WVK_IMAGE_SHADOW;
 
@@ -1216,6 +1234,36 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
       }
    }
 
+   if (view->view && image->vk.samples == 1 &&
+       (view->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+       wvk_format_needs_sampling_copy(wvk_device_physical(dev), view->vk.view_format)) {
+      view->sampled_texture = image_alias(dev, image, view, WGPUTextureFormat_RGBA32Float, true);
+      if (view->sampled_texture == WVK_IMAGE_TEXTURE) {
+         wvk_DestroyImageView(_device, wvk_image_view_to_handle(view), pAllocator);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      uint32_t first;
+      WGPUTexture texture = wvk_image_texture(image, view->sampled_texture, &first);
+      view->sampled_desc = view->view_desc;
+      view->sampled_desc.format = WGPUTextureFormat_RGBA32Float;
+      view->sampled_desc.baseMipLevel = view->vk.base_mip_level - first;
+      view->sampled_view = wgpuTextureCreateView(texture, &view->sampled_desc);
+      if (!view->sampled_view) {
+         wvk_DestroyImageView(_device, wvk_image_view_to_handle(view), pAllocator);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      if (view->sampled_desc.dimension == WGPUTextureViewDimension_Cube ||
+          view->sampled_desc.dimension == WGPUTextureViewDimension_CubeArray) {
+         WGPUTextureViewDescriptor ad = view->sampled_desc;
+         ad.dimension = WGPUTextureViewDimension_2DArray;
+         view->sampled_array_view = wgpuTextureCreateView(texture, &ad);
+         if (!view->sampled_array_view) {
+            wvk_DestroyImageView(_device, wvk_image_view_to_handle(view), pAllocator);
+            return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         }
+      }
+   }
+
    *pView = wvk_image_view_to_handle(view);
    return VK_SUCCESS;
 }
@@ -1239,6 +1287,10 @@ wvk_DestroyImageView(VkDevice _device, VkImageView _view, const VkAllocationCall
       wgpuTextureViewRelease(view->array_view);
    if (view->storage_view)
       wgpuTextureViewRelease(view->storage_view);
+   if (view->sampled_view)
+      wgpuTextureViewRelease(view->sampled_view);
+   if (view->sampled_array_view)
+      wgpuTextureViewRelease(view->sampled_array_view);
    if (view->msrtss) {
       wvk_DestroyImageView(_device, wvk_image_view_to_handle(view->msrtss), NULL);
       wvk_DestroyImage(_device, wvk_image_to_handle(view->msrtss_image), NULL);

@@ -394,6 +394,11 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   formats regardless), rendering to 8-bit snorm, storage for most 8- and
   16-bit and 10-bit packed formats (so `shaderStorageImageExtendedFormats`),
   and read-write storage for R8, R16, RGBA8, RGBA16 and RGBA32 formats.
+  Browsers can expose normalized 16-bit textures without filtering them.
+  With `float32-filterable`, sampled views use an RGBA32Float copy decoded
+  after writes, preserving normalized 16-bit precision. Attachments, storage
+  and transfers keep the original encoded texture. Without that feature,
+  these formats do not advertise linear filtering.
 - **16-bit packed formats** (565, 4444, 5551, 1555, and the extension ones:
   `VK_EXT_4444_formats`, maintenance5's A1B5G5R5), which WebGPU does not
   have, are RGBA8 textures. Copies to and from buffers are a shader's,

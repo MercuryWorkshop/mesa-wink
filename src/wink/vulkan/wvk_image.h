@@ -29,6 +29,8 @@ struct wvk_image_alias {
    /* The image's levels it has, from its level 0. */
    uint32_t first_level;
    uint32_t level_count;
+   bool sampling_copy;
+   uint32_t sampling_source;
 };
 
 #define WVK_IMAGE_MAX_ALIASES 8
@@ -154,6 +156,8 @@ wvk_image_for_aspect(struct wvk_image *image, VkImageAspectFlags *aspect)
  * slice, into its shadow (wvk_cmd_copy.c). */
 void wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
                              uint32_t level);
+void wvk_image_update_decoded(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+                              uint32_t source, uint32_t destination, uint32_t level);
 
 /* The image's texture `t`, and the image's level its level 0 is. */
 static inline WGPUTexture
@@ -325,6 +329,11 @@ struct wvk_image_view {
     * that is all a storage image reads and writes, and WebGPU binds no
     * more than one level as storage. */
    WGPUTextureView storage_view;
+   /* Filterable float32 copy of a norm16 view; storage and attachments
+    * continue to access the original encoded texture. */
+   WGPUTextureView sampled_view, sampled_array_view;
+   WGPUTextureViewDescriptor sampled_desc;
+   uint32_t sampled_texture;
    /* How they were made, for a view alike of a copy of the image: a pass
     * that reads what it renders to reads a copy (wvk_cmd_draw.c). */
    WGPUTextureViewDescriptor view_desc, array_desc, storage_desc;

@@ -865,7 +865,8 @@ static WGPURenderPipeline
 shadow_pipeline(struct wvk_device *dev, WGPUTextureFormat format, bool is_3d)
 {
    const uint32_t which = format == WGPUTextureFormat_RGBA8Unorm ? 0
-                          : format == WGPUTextureFormat_RGBA8UnormSrgb ? 1 : 2;
+                          : format == WGPUTextureFormat_RGBA8UnormSrgb ? 1
+                          : format == WGPUTextureFormat_RGBA16Float ? 2 : 3;
    simple_mtx_lock(&dev->cache_lock);
    WGPURenderPipeline *slot = &dev->shadow_pipelines[which][is_3d];
    if (!*slot) {
@@ -897,7 +898,23 @@ shadow_pipeline(struct wvk_device *dev, WGPUTextureFormat format, bool is_3d)
       desc.vertex.module = module;
       desc.vertex.entryPoint = wvk_sv("vs");
       desc.fragment = &fragment;
+      WGPUBindGroupLayoutEntry entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry.binding = 0;
+      entry.visibility = WGPUShaderStage_Fragment;
+      entry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+      entry.texture.viewDimension = is_3d ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2DArray;
+      WGPUBindGroupLayoutDescriptor bd = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+      bd.entryCount = 1;
+      bd.entries = &entry;
+      WGPUBindGroupLayout bgl = wgpuDeviceCreateBindGroupLayout(dev->wgpu, &bd);
+      WGPUPipelineLayoutDescriptor ld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+      ld.bindGroupLayoutCount = 1;
+      ld.bindGroupLayouts = &bgl;
+      WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(dev->wgpu, &ld);
+      desc.layout = layout;
       *slot = wgpuDeviceCreateRenderPipeline(dev->wgpu, &desc);
+      wgpuPipelineLayoutRelease(layout);
+      wgpuBindGroupLayoutRelease(bgl);
       wgpuShaderModuleRelease(module);
    }
    WGPURenderPipeline pipeline = *slot;
@@ -908,8 +925,17 @@ shadow_pipeline(struct wvk_device *dev, WGPUTextureFormat format, bool is_3d)
 void
 wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image, uint32_t level)
 {
+   wvk_image_update_decoded(dev, replay, image, WVK_IMAGE_TEXTURE, WVK_IMAGE_SHADOW, level);
+}
+
+void
+wvk_image_update_decoded(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+                          uint32_t source, uint32_t destination, uint32_t level)
+{
    const bool is_3d = image->dimension == WGPUTextureDimension_3D;
-   WGPURenderPipeline pipeline = shadow_pipeline(dev, image->shadow_format, is_3d);
+   const WGPUTextureFormat format = destination == WVK_IMAGE_SHADOW ? image->shadow_format
+                                                                   : image->aliases[destination - 1].format;
+   WGPURenderPipeline pipeline = shadow_pipeline(dev, format, is_3d);
    if (!pipeline)
       return;
    const uint32_t base_layer = 0;
@@ -917,11 +943,14 @@ wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struc
 
    WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
    vd.dimension = is_3d ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2DArray;
-   vd.baseMipLevel = level;
+   uint32_t source_first, destination_first;
+   WGPUTexture source_texture = wvk_image_texture(image, source, &source_first);
+   WGPUTexture destination_texture = wvk_image_texture(image, destination, &destination_first);
+   vd.baseMipLevel = level - source_first;
    vd.mipLevelCount = 1;
    vd.baseArrayLayer = 0;
    vd.arrayLayerCount = is_3d ? 1 : image->vk.array_layers;
-   WGPUTextureView src = wgpuTextureCreateView(image->texture, &vd);
+   WGPUTextureView src = wgpuTextureCreateView(source_texture, &vd);
    util_dynarray_append(&replay->views, src);
    WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
    const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src };
@@ -936,11 +965,11 @@ wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struc
    for (uint32_t z = base_layer; z < base_layer + layer_count; ++z) {
       WGPUTextureViewDescriptor ad = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
       ad.dimension = is_3d ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2D;
-      ad.baseMipLevel = level;
+      ad.baseMipLevel = level - destination_first;
       ad.mipLevelCount = 1;
       ad.baseArrayLayer = is_3d ? 0 : z;
       ad.arrayLayerCount = 1;
-      WGPUTextureView view = wgpuTextureCreateView(image->shadow, &ad);
+      WGPUTextureView view = wgpuTextureCreateView(destination_texture, &ad);
       util_dynarray_append(&replay->views, view);
       WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
       color.view = view;

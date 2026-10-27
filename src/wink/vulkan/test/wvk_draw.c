@@ -25,6 +25,8 @@
 #include "discard_frag.h"
 #include "texture_frag.h"
 #include "instanced_vert.h"
+#include "norm16_sample_comp.h"
+#include <math.h>
 
 enum { W = 64, H = 64 };
 
@@ -592,15 +594,16 @@ make_linear_texture(void **map, VkSubresourceLayout *layout)
 }
 
 static void
-test_texture(VkBuffer vertices, bool linear)
+test_texture(VkBuffer vertices, bool linear, VkFormat format)
 {
    /* A 2x2 texture, a texel per corner, sampled nearest. */
+   const bool norm16 = format != VK_FORMAT_R8G8B8A8_UNORM;
    void *linear_map = NULL;
    VkSubresourceLayout linear_layout;
    struct image tex = linear ? make_linear_texture(&linear_map, &linear_layout)
-                            : make_image(2, 2, VK_FORMAT_R8G8B8A8_UNORM,
+                            : make_image(2, 2, format,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-   struct buffer staging = make_buffer(16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST);
+   struct buffer staging = make_buffer(norm16 ? 32 : 16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST);
    const uint8_t texels[16] = { 255, 0, 0, 255,   0, 255, 0, 255,
                                 0, 0, 255, 255,   255, 255, 255, 255 };
    memcpy(staging.map, texels, sizeof(texels));
@@ -611,8 +614,8 @@ test_texture(VkBuffer vertices, bool linear)
 
    VkSampler sampler;
    VK(vkCreateSampler(dev, &(VkSamplerCreateInfo){
-      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST,
-      .minFilter = VK_FILTER_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = norm16 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+      .minFilter = norm16 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
       .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
       .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0.25f,
    }, NULL, &sampler));
@@ -665,7 +668,15 @@ test_texture(VkBuffer vertices, bool linear)
    struct buffer out = make_buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST);
    const VkDeviceSize zero = 0;
 
-   for (unsigned round = 0; round < (linear ? 3u : 1u); ++round) {
+   for (unsigned round = 0; round < ((linear || norm16) ? 3u : 1u); ++round) {
+      if (norm16) {
+         const unsigned max = format == VK_FORMAT_R16G16B16A16_SNORM ? 32767 : 65535;
+         for (unsigned n = 0; n < 16; ++n) {
+            const unsigned c = n % 4;
+            const unsigned from = round == 1 && (c == 0 || c == 2) ? n ^ 2u : n;
+            ((uint16_t *)staging.map)[n] = texels[from] ? max : 0;
+         }
+      }
       /* Refresh after a host rewrite, then after a GPU buffer-to-image copy.
        * The sampled shadow must never overwrite authoritative linear memory. */
       if (linear && round < 2) {
@@ -708,6 +719,12 @@ test_texture(VkBuffer vertices, bool linear)
       CHECK(is(bl, round == 1 ? 255 : 0, 0, round == 1 ? 0 : 255),
             "texture bottom left round %u: %u %u %u %u", round, bl[0], bl[1], bl[2], bl[3]);
       CHECK(is(br, 255, 128, 255), "texture bottom right: %u %u %u %u", br[0], br[1], br[2], br[3]);
+      if (norm16) {
+         const uint8_t *middle = pixel(&out, W / 2, H / 2);
+         CHECK(is(middle, round == 1 ? 131 : 128, 66, round == 1 ? 128 : 131),
+               "norm16 bilinear center format %u round %u: %u %u %u %u",
+               format, round, middle[0], middle[1], middle[2], middle[3]);
+      }
    }
 
    free_buffer(&out);
@@ -724,7 +741,109 @@ test_texture(VkBuffer vertices, bool linear)
    if (linear_map)
       vkUnmapMemory(dev, tex.memory);
    free_image(&tex);
-   printf("%stexture: done\n", linear ? "linear sampled " : "");
+   printf("%stexture format %u: done\n", linear ? "linear sampled " : "", format);
+}
+
+static void
+test_norm16_precision(void)
+{
+   const VkDescriptorSetLayoutBinding bindings[] = {
+      { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+      { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+   };
+   VkDescriptorSetLayout sl;
+   VK(vkCreateDescriptorSetLayout(dev, &(VkDescriptorSetLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = bindings,
+   }, NULL, &sl));
+   VkPipelineLayout layout;
+   VK(vkCreatePipelineLayout(dev, &(VkPipelineLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl,
+   }, NULL, &layout));
+   VkShaderModule shader = make_module(spv_norm16_sample_comp, sizeof(spv_norm16_sample_comp));
+   VkPipeline pipeline;
+   VK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &(VkComputePipelineCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = layout,
+      .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main" },
+   }, NULL, &pipeline));
+   VkSampler sampler;
+   VK(vkCreateSampler(dev, &(VkSamplerCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .minFilter = VK_FILTER_LINEAR,
+      .magFilter = VK_FILTER_LINEAR, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+   }, NULL, &sampler));
+   const VkDescriptorPoolSize sizes[] = {
+      { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 },
+   };
+   VkDescriptorPool pool;
+   VK(vkCreateDescriptorPool(dev, &(VkDescriptorPoolCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
+      .poolSizeCount = 2, .pPoolSizes = sizes,
+   }, NULL, &pool));
+   VkDescriptorSet set;
+   VK(vkAllocateDescriptorSets(dev, &(VkDescriptorSetAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool,
+      .descriptorSetCount = 1, .pSetLayouts = &sl,
+   }, &set));
+   struct buffer source = make_buffer(32, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST);
+   struct buffer result = make_buffer(32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, HOST);
+   const VkFormat formats[] = { VK_FORMAT_R16_UNORM, VK_FORMAT_R16_SNORM,
+      VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16_SNORM,
+      VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_SNORM };
+   for (unsigned f = 0; f < 6; ++f) {
+      const unsigned channels = 1u << (f / 2);
+      const bool sign = f & 1;
+      struct image image = make_image(2, 2, formats[f], VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+      const VkWriteDescriptorSet writes[] = {
+         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
+           .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+           .pImageInfo = &(VkDescriptorImageInfo){ sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL } },
+         { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1,
+           .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+           .pBufferInfo = &(VkDescriptorBufferInfo){ result.buffer, 0, 32 } },
+      };
+      vkUpdateDescriptorSets(dev, 2, writes, 0, NULL);
+      for (unsigned round = 0; round < 2; ++round) {
+         float expected[8] = {0, 0, 0, 1, 0, 0, 0, 1};
+         for (unsigned n = 0; n < 4 * channels; ++n) {
+            const int value = 12345 + n * 719 + round * 1337;
+            const int encoded = sign && (n & 1) ? -value : value;
+            ((uint16_t *)source.map)[n] = encoded;
+            const float decoded = (float)encoded / (sign ? 32767.0f : 65535.0f);
+            const unsigned c = n % channels;
+            if (n < channels) expected[c] = decoded;
+            if (n < channels) expected[4 + c] = 0;
+            expected[4 + c] += decoded * 0.25f;
+         }
+         memset(result.map, 0, 32);
+         VkCommandBuffer cmd = begin();
+         vkCmdCopyBufferToImage(cmd, source.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                               &(VkBufferImageCopy){ .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                                    .imageExtent = {2, 2, 1} });
+         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+         vkCmdDispatch(cmd, 1, 1, 1);
+         submit_and_wait(cmd);
+         /* Native normalized filtering may round to the source format's
+          * precision. The texel-center check still requires full float32
+          * conversion, catching an intermediate float16 sampling copy. */
+         for (unsigned n = 0; n < 8; ++n)
+            CHECK(fabsf(((float *)result.map)[n] - expected[n]) <
+                     (n < 4 ? 0.0000002f : 1.0f / (sign ? 32767.0f : 65535.0f)),
+                  "norm16 precision format %u round %u channel %u: %.9f expected %.9f",
+                  formats[f], round, n, ((float *)result.map)[n], expected[n]);
+      }
+      free_image(&image);
+   }
+   free_buffer(&source);
+   free_buffer(&result);
+   vkDestroyDescriptorPool(dev, pool, NULL);
+   vkDestroySampler(dev, sampler, NULL);
+   vkDestroyPipeline(dev, pipeline, NULL);
+   vkDestroyShaderModule(dev, shader, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   vkDestroyDescriptorSetLayout(dev, sl, NULL);
+   printf("norm16 full precision and rewrites: done\n");
 }
 
 static void
@@ -932,8 +1051,11 @@ main(void)
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_1_BIT, ~0u, 1);
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_4_BIT, ~0u, 4);
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_4_BIT, 5u, 2);
-   test_texture(vertices.buffer, false);
-   test_texture(vertices.buffer, true);
+   test_texture(vertices.buffer, false, VK_FORMAT_R8G8B8A8_UNORM);
+   test_texture(vertices.buffer, true, VK_FORMAT_R8G8B8A8_UNORM);
+   test_texture(vertices.buffer, false, VK_FORMAT_R16G16B16A16_UNORM);
+   test_texture(vertices.buffer, false, VK_FORMAT_R16G16B16A16_SNORM);
+   test_norm16_precision();
    test_clear_attachments();
    test_blit();
    test_instances();
