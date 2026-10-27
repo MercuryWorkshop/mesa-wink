@@ -1332,19 +1332,42 @@ PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *na
 VkResult wvk_create_canvas_surface(VkInstance instance, const char *selector,
                                    const VkAllocationCallbacks *allocator, VkSurfaceKHR *surface);
 
+#ifdef __EMSCRIPTEN_PTHREADS__
+#include "wink_vk_rpc.h"
+#endif
+
 WINK_EXPORT wink_vk_void_function
 wink_vk_get_instance_proc_addr(void *instance, const char *name)
 {
-   return (wink_vk_void_function)vk_icdGetInstanceProcAddr((VkInstance)instance, name);
+   PFN_vkVoidFunction actual = vk_icdGetInstanceProcAddr((VkInstance)instance, name);
+#ifdef __EMSCRIPTEN_PTHREADS__
+   if (wink.remote)
+      actual = wink_vk_rpc_wrap(name, actual);
+#endif
+   return (wink_vk_void_function)actual;
+}
+
+struct wink_vk_surface_rpc {
+   VkInstance instance;
+   const char *selector;
+   VkSurfaceKHR surface;
+   VkResult result;
+};
+
+static void
+wink_vk_surface_create_rpc(void *data)
+{
+   struct wink_vk_surface_rpc *a = data;
+   a->result = wvk_create_canvas_surface(a->instance, a->selector, NULL, &a->surface);
 }
 
 WINK_EXPORT int
 wink_vk_create_surface(void *instance, const char *selector, uint64_t *surface)
 {
-   VkSurfaceKHR s = VK_NULL_HANDLE;
-   const VkResult result = wvk_create_canvas_surface((VkInstance)instance, selector, NULL, &s);
-   *surface = (uint64_t)s;
-   return result;
+   struct wink_vk_surface_rpc a = { .instance = (VkInstance)instance, .selector = selector };
+   wink_rpc(wink_vk_surface_create_rpc, &a);
+   *surface = (uint64_t)a.surface;
+   return a.result;
 }
 #else
 /* Built without the Vulkan driver: there is none to find, so windowing

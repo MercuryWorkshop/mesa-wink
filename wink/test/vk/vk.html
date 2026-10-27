@@ -9,14 +9,24 @@
   const test = new URLSearchParams(location.search).get('test') || 'wvk_smoke';
   try {
     const { default: create } = await import('./' + test + '.js');
+    let done;
+    const finished = new Promise(resolve => { done = resolve; });
     const Module = await create({
+      wvkTestDone: done,
       print: (s) => { log.push(s); console.log(s); },
       printErr: (s) => { log.push(s); console.warn(s); },
       canvas: document.getElementById('canvas'),
     });
-    const main = WebAssembly.promising(Module.wvkTestRaw);
-    const rc = await main();
-    globalThis.__winkResult = { pass: rc === 0, rc, log };
+    const worker = new URLSearchParams(location.search).has('worker');
+    let rc;
+    if (worker) {
+      if (Module._wvk_browser_start()) throw new Error('worker creation failed');
+      rc = await finished;
+    } else {
+      rc = await WebAssembly.promising(Module.wvkTestRaw)();
+    }
+    const observedWorker = log.includes('WINK_VK_WORKER\t1');
+    globalThis.__winkResult = { pass: rc === 0 && (!worker || observedWorker), rc, log };
   } catch (e) {
     log.push('exception: ' + (e && e.stack || e));
     console.error('exception: ' + (e && e.stack || e));

@@ -21,7 +21,7 @@ done
 flags=()
 while IFS= read -r line; do flags+=("$line"); done < "$pkg/wink.rsp"
 extra=()
-[ "$variant" = mt ] && extra+=(-sPTHREAD_POOL_SIZE=2)
+[ "$variant" = mt ] && extra+=(-sPTHREAD_POOL_SIZE=4)
 
 for t in wvk_smoke wvk_draw; do
   "$emcc" -O2 -I"$pkg/include" -I"$MESA/include" -I"$out/shaders" -Dmain=wvk_test_main \

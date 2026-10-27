@@ -81,7 +81,9 @@ enum wink_api {
  * the canvas already is -- no OffscreenCanvas transfer, no JSPI on the worker.
  * GL calls are recorded on the worker and run on main (Mesa's glthread with
  * the main thread as its driver thread); a call that needs an answer waits
- * for it. The main thread must keep returning to its event loop. Ignored when
+ * for it. Vulkan entrypoints obtained through wink_vk_get_instance_proc_addr
+ * also run there, so Vulkan calls from multiple workers share WebGPU's owning
+ * JavaScript realm. The main thread must keep returning to its event loop. Ignored when
  * wink_init is called on the main thread itself. */
 #define WINK_INIT_GL_ON_MAIN_THREAD      (1u << 0)
 

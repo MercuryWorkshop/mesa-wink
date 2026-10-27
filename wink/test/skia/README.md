@@ -48,8 +48,9 @@ python3 wink/test/skia/run.py run --target mt --route gles --sources gm --match 
 
 Both variants also build the `vk` and `grvk` routes. Vulkan resolves through
 Wink directly, without a loader. The ST body enters through JSPI on main; the
-MT body enters through JSPI on a real pthread and routes GLES through Wink's
-main-thread runner. The audit rejects an MT result with no worker marker.
+MT body enters through JSPI on a real pthread and routes GLES and Vulkan
+through Wink's main-thread runner. Graphite's pipeline workers therefore use
+the same WebGPU realm. The audit rejects an MT result with no worker marker.
 ST disables DM's background GPU thread pool; MT uses two background threads.
 Tests which explicitly create threads still require separate applicability
 classification for ST.

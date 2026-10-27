@@ -83,7 +83,9 @@ def main():
              '-sEXPORTED_RUNTIME_METHODS=FS,HEAPU8,HEAPU32,ENV',
              '-sENVIRONMENT=web,worker', '-sINITIAL_MEMORY=256MB', '-sASSERTIONS=1']
     if a.target == 'mt':
-        link += ['-sPTHREAD_POOL_SIZE=4']
+        # Graphite creates two executor work lists, in addition to the
+        # owning graphics worker and Wink/Tint's helper threads.
+        link += ['-sPTHREAD_POOL_SIZE=16']
     args = dict(target_cpu='wasm', skia_emsdk_dir=str(a.emsdk.resolve()),
                 wink_skia_variant=a.target, is_debug=False, skia_use_gl=True,
                 skia_gl_standard='gles', skia_enable_ganesh=True, skia_enable_graphite=True,

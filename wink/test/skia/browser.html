@@ -18,7 +18,7 @@ try {
     canvas: document.querySelector('canvas'),
     print: record, printErr: record,
     winkSkiaDone: done,
-    onAbort: reason => { record('abort: ' + reason); done(-1); },
+    onAbort: reason => { record(new Error('abort: ' + reason).stack); done(-1); },
   });
   module.FS.mkdir('/out');
   const route = options.get('route');

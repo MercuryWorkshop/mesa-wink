@@ -26,6 +26,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef __EMSCRIPTEN_PTHREADS__
+#include <pthread.h>
+#include <emscripten/threading.h>
+#endif
 
 static int failures;
 
@@ -45,6 +49,24 @@ static VkCommandPool pool;
 static VkPhysicalDeviceMemoryProperties mem_props;
 static PFN_vkCmdBeginRenderingKHR begin_rendering;
 static PFN_vkCmdEndRenderingKHR end_rendering;
+
+#ifdef __EMSCRIPTEN_PTHREADS__
+struct host_signal {
+   VkSemaphore semaphore;
+   VkResult result;
+};
+
+static void *signal_from_worker(void *data)
+{
+   struct host_signal *a = data;
+   emscripten_thread_sleep(25);
+   a->result = vkSignalSemaphore(dev, &(VkSemaphoreSignalInfo){
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+      .semaphore = a->semaphore, .value = 4,
+   });
+   return NULL;
+}
+#endif
 
 static uint32_t
 memory_type(uint32_t bits, VkMemoryPropertyFlags want)
@@ -416,6 +438,27 @@ test_sync(void)
       .pSemaphores = &timeline, .pValues = &three,
    }, UINT64_MAX));
    CHECK(((uint32_t *)c.map)[3] == 0x12345678, "wait-before-signal: %08x", ((uint32_t *)c.map)[3]);
+
+#ifdef __EMSCRIPTEN_PTHREADS__
+   if (getenv("WINK_VK_WORKER_TEST")) {
+      /* A main-thread RPC wait must release the runner for another worker's
+       * signal, including when the wait resolves through GetDeviceProcAddr. */
+      struct host_signal a = { .semaphore = timeline };
+      pthread_t thread;
+      if (pthread_create(&thread, NULL, signal_from_worker, &a)) {
+         printf("FAIL signal worker creation\n");
+         exit(1);
+      }
+      PFN_vkWaitSemaphores wait = (PFN_vkWaitSemaphores)vkGetDeviceProcAddr(dev, "vkWaitSemaphores");
+      const uint64_t four = 4;
+      VK(wait(dev, &(VkSemaphoreWaitInfo){
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+         .pSemaphores = &timeline, .pValues = &four,
+      }, 2000000000ull));
+      pthread_join(thread, NULL);
+      VK(a.result);
+   }
+#endif
 
    VK(vkQueueWaitIdle(queue));
    VK(vkDeviceWaitIdle(dev));

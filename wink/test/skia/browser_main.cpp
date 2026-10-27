@@ -23,7 +23,8 @@ PFN_vkVoidFunction wink_skia_vk_proc(VkInstance instance, const char* name) {
 extern "C" EMSCRIPTEN_KEEPALIVE int wink_skia_main(int argc, char** argv) {
 #ifdef __EMSCRIPTEN_PTHREADS__
     // DM and its explicit test threads may call GLES; the Wink runner keeps
-    // the GPU and its JSPI waits on main. Vulkan stays on this owning worker.
+    // the GPU and its JSPI waits on main, including Vulkan calls issued by
+    // Graphite's background pipeline workers.
     if (!emscripten_is_main_browser_thread()) {
         wink_init_attribs a;
         wink_init_attribs_default(&a);
