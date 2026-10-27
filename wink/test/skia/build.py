@@ -79,6 +79,24 @@ def adapt(source):
           '''    auto result = this->getContextInfoInternal(type, overrides, nullptr, 0);
     if (result.directContext()) SkDebugf("WINK_SKIA_CONTEXT\\tganesh\\n");
     return result;''')
+    # Upstream DM deliberately skips GLES on desktop hosts. These are GLES
+    # tests even on a Mac; selecting only a GLES sink does not change units.
+    patch(source, 'dm/DMGpuTestProcs.cpp',
+          '    static constexpr auto kNativeGLType = skgpu::ContextType::kGL;',
+          '''    const auto kNativeGLType = getenv("WINK_SKIA_ROUTE") &&
+            !strcmp(getenv("WINK_SKIA_ROUTE"), "gles")
+            ? skgpu::ContextType::kGLES : skgpu::ContextType::kGL;''')
+    patch(source, 'dm/DMGpuTestProcs.cpp',
+          '''        GrContextFactory factory(options);
+        ContextInfo ctxInfo = factory.getContextInfo(contextType);
+        if (filter && !(*filter)(contextType)) {
+            continue;
+        }''',
+          '''        if (filter && !(*filter)(contextType)) {
+            continue;
+        }
+        GrContextFactory factory(options);
+        ContextInfo ctxInfo = factory.getContextInfo(contextType);''')
     patch(source, 'tools/graphite/ContextFactory.cpp',
           'ContextInfo ContextFactory::getContextInfo(skgpu::ContextType type) {',
           '''ContextInfo ContextFactory::getContextInfo(skgpu::ContextType type) {
