@@ -41407,7 +41407,6 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
       if ((gex->persistent_usage & PIPE_MAP_FLUSH_EXPLICIT) &&
           !(gex->persistent_usage & PIPE_MAP_COHERENT))
          continue;
-      }
       if (gex->persistent_sent && gex->persistent_sent_size != size) {
          FREE(gex->persistent_sent);
          gex->persistent_sent = NULL;
@@ -41466,6 +41465,7 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
                break;
          }
          continue;
+      }
       if (gex->persistent_sent && gex->persistent_sent_size != size) {
          FREE(gex->persistent_sent);
          gex->persistent_sent = NULL;
