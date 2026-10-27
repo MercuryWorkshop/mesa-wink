@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: MIT
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+spec = importlib.util.spec_from_file_location('skia_run', Path(__file__).with_name('run.py'))
+suite = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(suite)
+
+
+class ExecutionIntegrity(unittest.TestCase):
+    task = ('gles', 'gm', '', 'clip')
+    log = ('WINK_SKIA_BACKEND\tgles\tgex WebGPU\n'
+           'WINK_SKIA_START\tgles\tgm\t\tclip\n'
+           'WINK_SKIA_DONE\tgles\tgm\t\tclip\n')
+
+    def check_log(self, log, expected=None, code=0):
+        return suite.inspect_run(expected if expected is not None else [self.task], log, code, 'gles')
+
+    def test_complete_execution(self):
+        self.assertTrue(self.check_log(self.log)['pass'])
+
+    def test_missing_duplicate_and_unstarted_tasks_fail(self):
+        for log in (self.log.replace('WINK_SKIA_DONE', 'unused'),
+                    self.log + 'WINK_SKIA_DONE\tgles\tgm\t\tclip\n',
+                    self.log.replace('WINK_SKIA_START', 'unused')):
+            self.assertFalse(self.check_log(log)['pass'])
+
+    def test_empty_inventory_and_exit_errors_fail(self):
+        self.assertFalse(self.check_log(self.log, expected=[])['pass'])
+        for code in (1, -11, 124):
+            self.assertFalse(self.check_log(self.log, code=code)['pass'])
+
+    def test_skips_and_validation_errors_fail_even_with_exit_zero(self):
+        for extra in ('WINK_SKIA_SKIP\tgles\tgm\t\tclip\tunsupported\n',
+                      'WebGPU validation error\n', 'Device lost\n'):
+            self.assertFalse(self.check_log(self.log + extra)['pass'])
+
+    def test_wrong_backend_and_wink_reference_fail(self):
+        self.assertFalse(self.check_log(self.log.replace('gex WebGPU', 'Apple GL'))['pass'])
+        self.assertFalse(suite.inspect_run([self.task], self.log, 0, 'gles', reference=True)['pass'])
+
+    def test_gpu_unit_with_no_context_is_not_a_pass(self):
+        log = self.log + 'WINK_SKIA_START\tunit\ttest\t\tGPUOnly\nWINK_SKIA_DONE\tunit\ttest\t\tGPUOnly\n'
+        expected = [self.task, ('unit', 'test', '', 'GPUOnly')]
+        result = self.check_log(log, expected)
+        self.assertFalse(result['pass'])
+        self.assertEqual(result['units_without_context'], ['GPUOnly'])
+        log = log.replace('WINK_SKIA_DONE\tunit', 'WINK_SKIA_CONTEXT\tganesh\nWINK_SKIA_DONE\tunit')
+        self.assertTrue(self.check_log(log, expected)['pass'])
+
+
+class ReferenceIntegrity(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.ref = Path(self.tmp.name) / 'ref'
+        self.candidate = Path(self.tmp.name) / 'candidate'
+        for root, role in ((self.ref, 'reference'), (self.candidate, 'candidate')):
+            root.mkdir()
+            suite.write_json(root / 'run.json', dict(role=role, route='gles', skia='abc',
+                             sources=['gm'], match=[], fixtures='same', **{'pass': True}))
+            suite.write_json(root / 'dm.json', {'results': [self.row('clip', 'abc')]})
+
+    @staticmethod
+    def row(name, md5):
+        return dict(key=dict(source_type='gm', name=name, config='gles'),
+                    options=dict(color_depth='8', alpha_type='premul'), md5=md5)
+
+    def test_exact_pixels_pass(self):
+        self.assertTrue(suite.compare(self.ref, self.candidate)['pass_'])
+
+    def test_alpha_or_pixel_change_fails(self):
+        suite.write_json(self.candidate / 'dm.json', {'results': [self.row('clip', 'changed-alpha')]})
+        self.assertFalse(suite.compare(self.ref, self.candidate)['pass_'])
+
+    def test_missing_and_empty_results_fail(self):
+        suite.write_json(self.candidate / 'dm.json', {'results': []})
+        self.assertFalse(suite.compare(self.ref, self.candidate)['pass_'])
+
+    def test_duplicate_results_rejected(self):
+        row = self.row('clip', 'abc')
+        suite.write_json(self.candidate / 'dm.json', {'results': [row, row]})
+        with self.assertRaises(ValueError):
+            suite.compare(self.ref, self.candidate)
+
+    def test_failed_reference_and_different_fixtures_fail(self):
+        metadata = json.loads((self.ref / 'run.json').read_text())
+        metadata.update({'pass': False, 'fixtures': 'different'})
+        suite.write_json(self.ref / 'run.json', metadata)
+        self.assertFalse(suite.compare(self.ref, self.candidate)['pass_'])
+
+
+if __name__ == '__main__':
+    unittest.main()

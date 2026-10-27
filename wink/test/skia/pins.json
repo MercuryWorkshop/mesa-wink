@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "skia": {
+    "url": "https://github.com/google/skia.git",
+    "commit": "f22d4495ea6b7f40201599e40defd35f52af9a86"
+  },
+  "wink_base": "51eb6bdb32520dc3c50fee1d94242ae099bd6bac",
+  "fix_stack": "0c859229e6445934abfb9ddcf0682b6457f1c3e2"
+}
