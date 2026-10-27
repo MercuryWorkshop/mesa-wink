@@ -656,6 +656,15 @@ main(void)
       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
    }, NULL, &pool));
 
+   /* Direct browser linking has no loader to supply layer enumeration. */
+   PFN_vkEnumerateInstanceLayerProperties instance_layers =
+      (PFN_vkEnumerateInstanceLayerProperties)vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceLayerProperties");
+   PFN_vkEnumerateDeviceLayerProperties device_layers =
+      (PFN_vkEnumerateDeviceLayerProperties)vkGetInstanceProcAddr(instance, "vkEnumerateDeviceLayerProperties");
+   CHECK(instance_layers && device_layers, "missing core layer enumeration entrypoints");
+   uint32_t layer_count = 0;
+   if (instance_layers) VK(instance_layers(&layer_count, NULL));
+   if (device_layers) VK(device_layers(pdev, &layer_count, NULL));
    test_fence_poll();
    test_buffers();
    test_clears();
