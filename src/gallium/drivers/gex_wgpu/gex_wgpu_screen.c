@@ -3050,6 +3050,9 @@ struct gex_wgpu_interp_variant {
    uint8_t aux[GEX_WGPU_MAX_VARYING_LOCATIONS];
    /* The fragment stage's varying widths this module was reshaped to. */
    uint8_t components[GEX_WGPU_MAX_VARYING_LOCATIONS];
+   /* Query answers are compiled into the module and change with the view. */
+   uint32_t query_only_slots;
+   uint32_t query_only_geom[GEX_WGPU_MAX_SAMPLERS][5];
    /* Sampler state this variant's texture lowering was built against, for a
     * vertex shader that samples an integer texture. The lowering reads
     * filters, wrap modes and view swizzles, so two draws with different
@@ -16432,6 +16435,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       gex_wgpu_ignore_sample_mask(variant);
    if (want_drop_color)
       gex_wgpu_drop_color_outputs(variant);
+   /* Queries are independent of the sampled component type. Preserve their
+    * real answers before unusable-binding lowering zeros texture operations
+    * whose default sample-type classification disagrees with an integer view. */
+   if (want_query_only)
+      gex_wgpu_lower_query_only(variant, want_query_only, want_query_geom);
    if (want_omit_slots)
       gex_wgpu_omit_textures(variant, want_omit_slots);
    /* Before the texture lowering below, which reads each sampler's dimension
@@ -16443,9 +16451,6 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    if (fs->ms_array_slots)
       gex_wgpu_flatten_ms_array(variant, fs->ms_array_slots, want_tiled_geom);
    gex_wgpu_lower_frag_coord_tile(variant, want_frag_tile_x);
-   if (want_query_only)
-      gex_wgpu_lower_query_only(variant, want_query_only,
-                                want_query_geom);
    /* Before the texture lowering, which reads gl_FragCoord for nothing and
     * would otherwise see the load this adds. */
    if (want_stipple)
@@ -39293,6 +39298,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    const uint8_t *want_interp = fs ? fs->varying_interp : NULL;
    const uint8_t *want_aux = fs ? fs->varying_aux : NULL;
    const uint8_t *want_components = fs ? fs->varying_components : NULL;
+   uint32_t want_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
+   const uint32_t want_query_only = gex_wgpu_query_only_geom(
+      vs, ctx->vertex_sampler_views, want_query_geom);
    uint8_t want_buftex[GEX_WGPU_MAX_BUFFER_TEXTURES];
    gex_wgpu_buftex_words(vs->buftex_count, vs->buftex_slots,
                          ctx->vertex_sampler_views, want_buftex);
@@ -39300,6 +39308,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    for (struct gex_wgpu_interp_variant *v = vs->interp_variants; v;
         v = v->next) {
       bool match = v->mask == fs_mask && v->sampler_mask == sampler_mask &&
+                   v->query_only_slots == want_query_only &&
+                   memcmp(v->query_only_geom, want_query_geom,
+                          sizeof(v->query_only_geom)) == 0 &&
                    v->clip_halfz == want_halfz &&
                    v->clip_dist_for == want_clip_dist &&
                    v->inv_w_location == want_inv_w &&
@@ -39368,6 +39379,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       memcpy(variant->attrib_unpack, want_unpack,
              sizeof(variant->attrib_unpack));
       variant->sampler_mask = sampler_mask;
+      variant->query_only_slots = want_query_only;
+      memcpy(variant->query_only_geom, want_query_geom,
+             sizeof(variant->query_only_geom));
       for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
          if (!(sampler_mask & (UINT64_C(1) << slot)))
             continue;
@@ -39496,13 +39510,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       /* And the vertex stage's query-only slots, for the same reason: three
        * of texture_query_levels' six shadow cases read the level count from
        * the vertex stage. */
-      if (vs->query_only_slots) {
-         uint32_t vs_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
-         const uint32_t vs_query = gex_wgpu_query_only_geom(
-            vs, ctx->vertex_sampler_views, vs_query_geom);
-         if (vs_query)
-            gex_wgpu_lower_query_only(clone, vs_query, vs_query_geom);
-      }
+      if (want_query_only)
+         gex_wgpu_lower_query_only(clone, want_query_only, want_query_geom);
       if (lower_textures &&
           !gex_wgpu_lower_texture_variant(clone, vs->texture_count,
                                           vs->texture_slots,
@@ -48458,22 +48467,30 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* The vertex stage's textures, in group 3. */
    WGPUBindGroupLayoutEntry
       vertex_texture_entries[2 * GEX_WGPU_MAX_SAMPLERS];
-   const bool needs_vertex_texture = ctx->vs->texture_count != 0;
-   if (needs_vertex_texture) {
+   uint32_t vertex_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
+   const uint32_t vertex_query_only = gex_wgpu_query_only_geom(
+      ctx->vs, ctx->vertex_sampler_views, vertex_query_geom);
+   unsigned vertex_texture_entry_count = 0;
+   if (ctx->vs->texture_count) {
       for (unsigned i = 0; i < ctx->vs->texture_count; ++i) {
-         vertex_texture_entries[i] =
+         if (vertex_query_only & BITFIELD_BIT(ctx->vs->texture_slots[i]))
+            continue;
+         const unsigned entry = vertex_texture_entry_count++;
+         vertex_texture_entries[entry] =
             (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
-         vertex_texture_entries[i].binding = ctx->vs->texture_bindings[i];
-         vertex_texture_entries[i].visibility = WGPUShaderStage_Vertex;
-         vertex_texture_entries[i].texture.sampleType =
+         vertex_texture_entries[entry].binding = ctx->vs->texture_bindings[i];
+         vertex_texture_entries[entry].visibility = WGPUShaderStage_Vertex;
+         vertex_texture_entries[entry].texture.sampleType =
             ctx->vs->texture_sample_types[i];
-         vertex_texture_entries[i].texture.viewDimension =
+         vertex_texture_entries[entry].texture.viewDimension =
             ctx->vs->texture_dimensions[i];
-         vertex_texture_entries[i].texture.multisampled =
+         vertex_texture_entries[entry].texture.multisampled =
             (ctx->vs->multisampled_slots >> ctx->vs->texture_slots[i]) & 1;
       }
       for (unsigned i = 0; i < ctx->vs->sampler_count; ++i) {
-         const unsigned entry = ctx->vs->texture_count + i;
+         if (vertex_query_only & BITFIELD_BIT(ctx->vs->sampler_slots[i]))
+            continue;
+         const unsigned entry = vertex_texture_entry_count++;
          vertex_texture_entries[entry] =
             (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
          vertex_texture_entries[entry].binding = ctx->vs->sampler_bindings[i];
@@ -48494,6 +48511,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          vertex_texture_entries[entry].sampler.type = ctx->vs->sampler_types[i];
       }
    }
+   const bool needs_vertex_texture = vertex_texture_entry_count != 0;
    /* The fragment stage's, which may be written. */
    for (unsigned i = 0; i < ctx->fs->ssbo_count; ++i) {
       const unsigned at = ctx->fs->ubo_count + i;
@@ -48631,7 +48649,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          desc.entryCount = fragment_group_count;
          desc.entries = fragment_layout_entries;
       } else if (group == 3 && needs_vertex_texture) {
-         desc.entryCount = ctx->vs->texture_count + ctx->vs->sampler_count;
+         desc.entryCount = vertex_texture_entry_count;
          desc.entries = vertex_texture_entries;
       }
       {
@@ -49489,13 +49507,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    if (pipeline && needs_vertex_texture) {
       WGPUBindGroupEntry entries[2 * GEX_WGPU_MAX_SAMPLERS];
+      unsigned entry_count = 0;
       for (unsigned i = 0; i < ctx->vs->texture_count; ++i) {
          const unsigned slot = ctx->vs->texture_slots[i];
+         if (vertex_query_only & BITFIELD_BIT(slot))
+            continue;
+         const unsigned entry = entry_count++;
          struct gex_wgpu_sampler_view *view =
             (struct gex_wgpu_sampler_view *)ctx->vertex_sampler_views[slot];
-         entries[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
-         entries[i].binding = ctx->vs->texture_bindings[i];
-         entries[i].textureView = view
+         entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[entry].binding = ctx->vs->texture_bindings[i];
+         entries[entry].textureView = view
             ? gex_wgpu_stage_texture_view(&view->base,
                                           ctx->vs->texture_dimensions[i])
             /* GL leaves units enabled with nothing bound, as in the fragment
@@ -49506,7 +49528,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
       for (unsigned i = 0; i < ctx->vs->sampler_count; ++i) {
          const unsigned slot = ctx->vs->sampler_slots[i];
-         const unsigned entry = ctx->vs->texture_count + i;
+         if (vertex_query_only & BITFIELD_BIT(slot))
+            continue;
+         const unsigned entry = entry_count++;
          entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[entry].binding = ctx->vs->sampler_bindings[i];
          /* The sampler the layout above names: the application's, or its
@@ -49522,7 +49546,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[3];
-      bind_desc.entryCount = ctx->vs->texture_count + ctx->vs->sampler_count;
+      bind_desc.entryCount = entry_count;
       bind_desc.entries = entries;
       bind_groups[3] = gex_wgpu_cached_bind_group(
          screen, group_label[3], bind_desc.layout, bind_desc.entries,

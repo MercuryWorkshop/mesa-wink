@@ -1029,6 +1029,63 @@ integer_texture_offsets(void)
 }
 
 static void
+texture_query_variants(void)
+{
+   const char *vs = "#version 320 es\nprecision highp float; precision highp int;"
+      "uniform highp isampler2D integerTex; uniform highp sampler2DShadow depthTex;"
+      "uniform highp sampler2D colorTex; flat out vec3 result;"
+      "void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+      "gl_Position=vec4(p*2.0-1.0,0,1); ivec2 a=textureSize(integerTex,1);"
+      "result=vec3(vec2(a),float(textureSize(depthTex,0).x)+"
+      "textureLod(colorTex,vec2(0.5),0.0).r*4.0);}";
+   const char *fs = "#version 320 es\nprecision highp float; precision highp int;"
+      "uniform highp isampler2D integerTex; uniform highp sampler2DShadow depthTex;"
+      "flat in vec3 result; out vec4 color;"
+      "void main(){ivec2 a=textureSize(integerTex,1); ivec2 b=textureSize(depthTex,0);"
+      "color=vec4(result/255.0,1); if(any(notEqual(ivec2(result.xy),a))||"
+      "abs(result.z-float(b.x)-1.0)>0.01)color=vec4(1,0,1,1);}";
+   GLuint prog = link_program(vs, fs, "texture query variants"), vao, textures[3];
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glUseProgram(prog);
+   p_glUniform1i(p_glGetUniformLocation(prog, "integerTex"), 0);
+   p_glUniform1i(p_glGetUniformLocation(prog, "depthTex"), 1);
+   p_glUniform1i(p_glGetUniformLocation(prog, "colorTex"), 2);
+   p_glGenTextures(3, textures);
+   for (unsigned i = 0; i < 3; ++i) {
+      p_glActiveTexture(GL_TEXTURE0+i);
+      p_glBindTexture(GL_TEXTURE_2D, textures[i]);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+   }
+   const uint8_t color[] = {64,0,0,255};
+   p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, color);
+   const unsigned widths[] = {8,16,8};
+   for (unsigned draw = 0; draw < 3; ++draw) {
+      const unsigned w = widths[draw];
+      p_glActiveTexture(GL_TEXTURE0);
+      p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8I, w, w/2, 0, GL_RGBA_INTEGER, GL_BYTE, NULL);
+      p_glTexImage2D(GL_TEXTURE_2D, 1, GL_RGBA8I, w/2, w/4, 0, GL_RGBA_INTEGER, GL_BYTE, NULL);
+      p_glActiveTexture(GL_TEXTURE1);
+      p_glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, w+2, 3, 0,
+                    GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, NULL);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+      p_glDrawArrays(GL_TRIANGLES, 0, 3);
+      uint8_t pixel[4]; read_center(pixel, W, H);
+      CHECK(near(pixel, w/2, w/4, w+3),
+            "texture query variants draw=%u: %u,%u,%u,%u", draw,
+            pixel[0], pixel[1], pixel[2], pixel[3]);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "texture query variants context failed");
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+   p_glDeleteTextures(3, textures);
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glActiveTexture(GL_TEXTURE0);
+}
+
+static void
 independent_samplers(void)
 {
    GLint units = 0;
@@ -1820,6 +1877,7 @@ exercise(const char *label, int api, wink_surface *surface)
       independent_samplers();
       integer_cube_lod();
       integer_texture_offsets();
+      texture_query_variants();
       framebuffer_fetch();
       external_image(ctx, surface);
    }
