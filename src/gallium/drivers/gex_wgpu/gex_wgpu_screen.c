@@ -7406,7 +7406,6 @@ struct gex_wgpu_border_lowering {
    uint8_t integer_wrap_s;
    uint8_t integer_wrap_t;
    uint8_t integer_wrap_r;
-   uint8_t integer_levels;
    uint8_t integer_mip_filter;
    float lod_bias;
    float integer_min_lod;
@@ -7894,10 +7893,9 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
    b->cursor = nir_after_instr(instr);
    const struct gex_wgpu_border_lowering *lower = &table->slots[slot];
    /* A cube's LOD must be resolved while its coordinates are still a
-    * direction. The gradient prepass does that before face projection.
-    * If an implicit cube reaches here, only a single-level view is safe. */
-   if (lower->integer_cube && tex->op != nir_texop_txl &&
-       lower->integer_levels > 1) {
+    * direction. The gradient prepass does that before face projection,
+    * including when the currently bound view exposes only one level. */
+   if (lower->integer_cube && tex->op != nir_texop_txl) {
       gex_tex_lower_fail(table,
                          "an implicit-LOD integer cube sample on a mipmapped "
                          "texture");
@@ -7929,12 +7927,18 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
    nir_builder_instr_insert(b, &base_txs->instr);
 
    nir_def *selected_lod = zero_lod;
-   /* `integer_levels > 1` is not an optimisation: with one level the clamp at
-      the end of this block takes every LOD to zero, so skipping it is the
-      same answer -- and it is what lets an implicit-LOD cube sample through
-      above, where the derivative formula would not apply. */
-   if (lower->integer_mip_filter == PIPE_TEX_MIPFILTER_NEAREST &&
-       lower->integer_levels > 1) {
+   if (lower->integer_mip_filter == PIPE_TEX_MIPFILTER_NEAREST) {
+      /* Sampler state and swizzles can stay unchanged when GL changes a
+       * texture's base/max level. Query the bound view rather than baking
+       * its original mip count into a cached module, even for one level. */
+      nir_tex_instr *levels = nir_tex_instr_create(b->shader, 1);
+      levels->op = nir_texop_query_levels;
+      levels->sampler_dim = tex->sampler_dim;
+      levels->is_array = tex->is_array;
+      levels->dest_type = nir_type_int32;
+      levels->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture_deref);
+      nir_def_init(&levels->instr, &levels->def, 1, 32);
+      nir_builder_instr_insert(b, &levels->instr);
       nir_def *lod;
       if (tex->op == nir_texop_txl) {
          lod = tex->src[lod_src].src.ssa;
@@ -7958,8 +7962,7 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       lod = nir_fmax(b, lod, nir_imm_float(b, lower->integer_min_lod));
       lod = nir_fmin(b, lod, nir_imm_float(b, lower->integer_max_lod));
       lod = nir_fmax(b, lod, nir_imm_float(b, 0.0f));
-      lod = nir_fmin(
-         b, lod, nir_imm_float(b, (float)(lower->integer_levels - 1)));
+      lod = nir_fmin(b, lod, nir_i2f32(b, nir_iadd_imm(b, &levels->def, -1)));
       selected_lod = nir_f2i32(
          b, nir_ffloor(b, nir_fadd_imm(b, lod, 0.5f)));
    }
@@ -10262,8 +10265,6 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
          .integer_wrap_s = state->wrap_s,
          .integer_wrap_t = state->wrap_t,
          .integer_wrap_r = state->wrap_r,
-         .integer_levels =
-            view->u.tex.last_level - view->u.tex.first_level + 1,
          .integer_mip_filter = state->min_mip_filter,
          .lod_bias = state->lod_bias,
          .integer_min_lod = state->min_lod,

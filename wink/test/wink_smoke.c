@@ -1030,6 +1030,67 @@ integer_texture_offsets(void)
 }
 
 static void
+integer_mip_view_changes(void)
+{
+   GLuint vao;
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glActiveTexture(GL_TEXTURE0);
+   for (unsigned sign = 0; sign < 2; ++sign) {
+      GLuint texture;
+      p_glGenTextures(1, &texture);
+      p_glBindTexture(GL_TEXTURE_2D, texture);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      for (unsigned level = 0; level < 3; ++level) {
+         const unsigned size = 4 >> level;
+         uint8_t pixels[4 * 4 * 4];
+         for (unsigned p = 0; p < size * size; ++p) {
+            pixels[4*p] = (level + 1) * 50 - (sign ? 128 : 0);
+            pixels[4*p+1] = pixels[4*p+2] = 0;
+            pixels[4*p+3] = sign ? 127 : 255;
+         }
+         p_glTexImage2D(GL_TEXTURE_2D, level, sign ? GL_RGBA8I : GL_RGBA8UI,
+                       size, size, 0, GL_RGBA_INTEGER, sign ? GL_BYTE : GL_UNSIGNED_BYTE, pixels);
+      }
+      for (unsigned vertex = 0; vertex < 2; ++vertex) {
+         char vs[800], fs[800], expression[150];
+         snprintf(expression, sizeof(expression), "float(textureLod(tex,vec2(0.5),9.0).r+%s)/255.0",
+                  sign ? "128" : "0u");
+         const char *header = "#version 320 es\nprecision highp float; precision highp int;";
+         snprintf(vs, sizeof(vs), "%s uniform highp %ssampler2D tex; out vec4 sampled;"
+            "void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+            "gl_Position=vec4(p*2.0-1.0,0,1);sampled=vec4(%s,0,0,1);}",
+            header, sign ? "i" : "u", vertex ? expression : "0.0");
+         snprintf(fs, sizeof(fs), "%s uniform highp %ssampler2D tex; in vec4 sampled; out vec4 color;"
+            "void main(){color=vec4(%s,0,0,1);}", header, sign ? "i" : "u",
+            vertex ? "sampled.r" : expression);
+         GLuint prog = link_program(vs, fs, "integer mip view changes");
+         p_glUseProgram(prog);
+         p_glUniform1i(p_glGetUniformLocation(prog, "tex"), 0);
+         /* Reuse the program and sampler while both narrowing and expanding
+          * the exposed mip range. The first draw exposes only one level. */
+         const unsigned ranges[][2] = {{0,0}, {0,2}, {0,1}, {0,2}, {1,2}, {1,1}, {0,2}};
+         for (unsigned i = 0; i < sizeof(ranges)/sizeof(ranges[0]); ++i) {
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, ranges[i][0]);
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, ranges[i][1]);
+            p_glDrawArrays(GL_TRIANGLES, 0, 3);
+            uint8_t pixel[4]; read_center(pixel, W, H);
+            CHECK(near(pixel, (ranges[i][1] + 1) * 50, 0, 0),
+                  "integer mip view sign=%u vertex=%u base=%u max=%u: %u,%u,%u,%u",
+                  sign, vertex, ranges[i][0], ranges[i][1], pixel[0], pixel[1], pixel[2], pixel[3]);
+         }
+         p_glUseProgram(0);
+         p_glDeleteProgram(prog);
+      }
+      p_glDeleteTextures(1, &texture);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "integer mip view context failed");
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+}
+
+static void
 mip_border_filtering_target(unsigned shape)
 {
    const GLenum target = shape == 0 ? GL_TEXTURE_2D : shape == 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_3D;
@@ -2016,6 +2077,7 @@ exercise(const char *label, int api, wink_surface *surface)
       independent_samplers();
       integer_cube_lod();
       integer_texture_offsets();
+      integer_mip_view_changes();
       texture_query_variants();
       mip_border_filtering();
       framebuffer_fetch();
