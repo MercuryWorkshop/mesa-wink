@@ -11,7 +11,9 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 MESA = HERE.parents[2]
-CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1']
+CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
+                     'freetype-wasm-svg-module-registration-v1',
+                     'dm-image-extension-boundary-v1']
 
 
 def run(args, **kwargs):
@@ -49,6 +51,20 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # SkOSFile::Iter matches suffixes literally: "bmp" also found ".wbmp",
+    # causing duplicate task identities and overwriting image artifacts.
+    patch(source, 'tools/flags/CommonFlagsImages.cpp',
+          '                SkOSFile::Iter it(flag, ext);',
+          '''                SkString suffix(".");
+                suffix.append(ext);
+                SkOSFile::Iter it(flag, suffix.c_str());''')
+    # This Wasm module list omitted the SVG renderer despite compiling SVG
+    # support. FreeType's SVG glyph metrics then dereferenced a missing module.
+    patch(source, 'third_party/freetype2/include/freetype-no-type1/freetype/config/ftmodule.h',
+          '//FT_USE_MODULE( FT_Renderer_Class, ft_svg_renderer_class )',
+          '''#if defined(FT_CONFIG_OPTION_SVG)
+FT_USE_MODULE( FT_Renderer_Class, ft_svg_renderer_class )
+#endif''')
     # Unlike buffer uploads, this pinned host-copy path counts blocks rather
     # than texels. VK_EXT_host_image_copy uses the same texel row-length rule.
     patch(source, 'src/gpu/graphite/vk/VulkanTexture.cpp',
@@ -107,6 +123,23 @@ def adapt(source):
                 fprintf(stderr, "WINK_SKIA_SKIP\\t%s\\t%s\\t%s\\t%s\\t%s\\n",
                         task.sink.tag.c_str(), task.src.tag.c_str(),
                         task.src.options.c_str(), name.c_str(), result.c_str());''')
+    # DM counts every source/sink pair in its progress total, then silently
+    # vetoes incompatible pairs (most codec variants, for GPU sinks). Record
+    # these separately so they cannot be mistaken for exercised GPU work.
+    patch(source, 'dm/DM.cpp',
+          '            if (src->veto(sink->flags()) ||',
+          '''            const bool sourceVeto = src->veto(sink->flags());
+            if (sourceVeto ||''')
+    patch(source, 'dm/DM.cpp',
+          '''                SkAutoSpinlock lock(gMutex);
+                gPending--;
+                continue;''',
+          '''                fprintf(stderr, "WINK_SKIA_%s\\t%s\\t%s\\t%s\\t%s\\n",
+                        sourceVeto ? "VETO" : "FILTER", sink.tag.c_str(), src.tag.c_str(),
+                        src.options.c_str(), src->name().c_str());
+                SkAutoSpinlock lock(gMutex);
+                gPending--;
+                continue;''')
     # Some GPU-labelled units explicitly use a mock to test CPU bookkeeping.
     # Permit it without attributing that work to the selected hardware route.
     # Upgrade earlier harness patches in the disposable dependency checkout.

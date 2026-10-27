@@ -51,6 +51,9 @@ def inspect_run(expected, log, returncode, route, reference=False):
     skipped = events(log, 'SKIP')
     if skipped:
         problems.append(f'{len(skipped)} tasks skipped')
+    filtered = events(log, 'FILTER')
+    if filtered:
+        problems.append(f'{len(filtered)} tasks excluded by DM skip filters')
     active_unit = None
     unit_context = False
     no_context = []
@@ -90,6 +93,7 @@ def inspect_run(expected, log, returncode, route, reference=False):
     return {'pass': not problems, 'problems': problems,
             'discovered': len(expected), 'started': len(started),
             'completed': len(completed), 'skipped': skipped, 'backends': identities,
+            'source_vetoes': events(log, 'VETO'), 'filtered': filtered,
             'units_without_context': no_context,
             'missing': list((Counter(expected) - Counter(completed)).elements()),
             'unexpected': list((Counter(completed) - Counter(expected)).elements())}

@@ -28,6 +28,13 @@ this correction, and comparisons reject different fix sets. Keep unpatched
 failure artifacts when investigating upstream behavior. No image tolerance is
 added by this correction.
 
+The integration registers FreeType's compiled SVG renderer in its Wasm module
+list, fixing an SVG emoji metrics crash, and matches image extensions with a
+leading dot so `.wbmp` is not also collected as `bmp`. These corrections are
+included in `skia_fixes`. Source/sink vetoes are recorded separately as
+`source_vetoes`; they are excluded by upstream compatibility checks and never
+count toward completed GPU tasks. Explicit DM skip filters fail the run.
+
 The default native build enables `gles`, `vk`, and `grvk`. To additionally
 build Graphite through an outer Dawn GLES backend:
 

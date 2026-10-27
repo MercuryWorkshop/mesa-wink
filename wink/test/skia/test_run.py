@@ -57,6 +57,14 @@ class ExecutionIntegrity(unittest.TestCase):
         for code in (1, -11, 124):
             self.assertFalse(self.check_log(self.log, code=code)['pass'])
 
+    def test_source_veto_is_reported_without_counting_as_gpu_work(self):
+        veto = 'WINK_SKIA_VETO\tgles\timage\tcodec\tCPUOnly.png\n'
+        result = self.check_log(self.log + veto)
+        self.assertTrue(result['pass'])
+        self.assertEqual(result['completed'], 1)
+        self.assertEqual(result['source_vetoes'], [('gles', 'image', 'codec', 'CPUOnly.png')])
+        self.assertFalse(self.check_log(self.log + veto.replace('VETO', 'FILTER'))['pass'])
+
     def test_skips_and_validation_errors_fail_even_with_exit_zero(self):
         for extra in ('WINK_SKIA_SKIP\tgles\tgm\t\tclip\tunsupported\n',
                       'WebGPU validation error\n', 'Device lost\n',
