@@ -279,12 +279,6 @@ KHR-GLES3.packed_pixels.varied_rectangle.rgba_format_rgba,Crash
 KHR-GLES3.texture_lod_bias.texture_lod_bias_all,Fail
 KHR-GLES31.core.draw_buffers_indexed.color_masks,Fail
 KHR-GLES31.core.gpu_shader5.precise_qualifier,Fail
-KHR-GLES31.core.pixelstoragemodes.teximage2d.r32f.0_0,Fail
-KHR-GLES31.core.pixelstoragemodes.teximage2d.r8snorm.16_1,Fail
-KHR-GLES31.core.pixelstoragemodes.teximage2d.rg16ui.16_0,Fail
-KHR-GLES31.core.pixelstoragemodes.teximage2d.rg32i.16_0,Fail
-KHR-GLES31.core.pixelstoragemodes.teximage2d.rg32ui.16_0,Fail
-KHR-GLES31.core.pixelstoragemodes.teximage2d.rgb8.1_1,Fail
 KHR-GLES31.core.shader_atomic_counters.advanced-usage-multi-stage,Fail
 KHR-GLES31.core.shader_atomic_counters.advanced-usage-switch-programs,Fail
 KHR-GLES31.core.shader_image_load_store.advanced-allMips-cs,Fail
