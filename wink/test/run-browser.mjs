@@ -15,7 +15,7 @@ import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir, platform } from 'node:os';
-import { basename, dirname, extname, join, normalize } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, normalize, relative, resolve } from 'node:path';
 
 const dir = process.argv[2];
 const timeout = Number((process.argv.find((a) => a.startsWith('--timeout=')) || '=120').split('=')[1]) * 1000;
@@ -23,6 +23,8 @@ const pageArg = process.argv.find((a) => a.startsWith('--page=')) || '--page=ind
 const pageName = pageArg.slice(pageArg.indexOf('=') + 1);
 const resultArg = process.argv.find(a => a.startsWith('--result='));
 const resultPath = resultArg?.slice('--result='.length);
+const artifactArg = process.argv.find(a => a.startsWith('--artifact-dir='));
+const artifactDir = artifactArg ? resolve(artifactArg.slice('--artifact-dir='.length)) : null;
 // A page may take a query (vk.html?test=...): the file is what precedes it.
 if (!dir || !existsSync(join(dir, pageName.split('?')[0]))) {
   console.error('usage: run-browser.mjs <dir> [--page=index.html] [--timeout=SECONDS]');
@@ -31,7 +33,32 @@ if (!dir || !existsSync(join(dir, pageName.split('?')[0]))) {
 
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
                 '.wasm': 'application/wasm', '.json': 'application/json' };
-const server = createServer((req, res) => {
+const server = createServer(async (req, res) => {
+  // Opt-in persistence for large test outputs, uploaded one file at a time.
+  // Keep upload paths inside the caller's designated artifact directory.
+  if (req.method === 'PUT' && artifactDir && req.url.startsWith('/__wink_artifacts/')) {
+    try {
+      const name = decodeURIComponent(req.url.slice('/__wink_artifacts/'.length));
+      const file = resolve(artifactDir, name);
+      const path = relative(artifactDir, file);
+      if (!path || path.startsWith('..') || isAbsolute(path) || name.includes('\0')) {
+        res.writeHead(400); res.end('invalid artifact path'); return;
+      }
+      const chunks = [];
+      let bytes = 0;
+      for await (const chunk of req) {
+        bytes += chunk.length;
+        if (bytes > 512 * 1024 * 1024) throw new Error('artifact exceeds 512 MiB');
+        chunks.push(chunk);
+      }
+      mkdirSync(dirname(file), { recursive: true });
+      writeFileSync(file, Buffer.concat(chunks));
+      res.writeHead(201); res.end();
+    } catch (e) {
+      res.writeHead(400); res.end(String(e));
+    }
+    return;
+  }
   const path = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname)).replace(/^(\.\.[/\\])+/, '');
   const file = join(dir, path === '/' ? 'index.html' : path);
   if (!existsSync(file) || !statSync(file).isFile()) {

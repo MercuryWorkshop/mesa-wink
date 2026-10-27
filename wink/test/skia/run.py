@@ -145,6 +145,24 @@ def fixtures(source):
     return h.hexdigest()
 
 
+def driver_provenance(dm, environment):
+    paths = []
+    manifest = dm.parent / 'wink-build.json'
+    if manifest.is_file():
+        build = json.loads(manifest.read_text())
+        paths.append(Path(build['gn_args']['extra_ldflags'][0]))
+    for name in environment.get('VK_DRIVER_FILES', '').split(os.pathsep):
+        if not name:
+            continue
+        path = Path(name)
+        paths.append(path)
+        if path.is_file():
+            library = json.loads(path.read_text())['ICD']['library_path']
+            library = Path(library)
+            paths.append(library if library.is_absolute() else path.parent / library)
+    return {str(path.resolve()): digest(path) for path in paths if path.is_file()}
+
+
 def execute(a):
     if a.out.exists():
         raise ValueError(f'output already exists: {a.out}; use a fresh directory')
@@ -176,13 +194,19 @@ def execute(a):
                     wink=subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
                     dm_sha256=digest(a.dm), host=platform.platform(), sources=a.sources,
                     match=a.match, fixtures=fixtures(source), command=args,
+                    drivers=driver_provenance(a.dm, env),
                     environment={k: env[k] for k in ('VK_DRIVER_FILES', 'WINK_SKIA_EXPECT_VULKAN',
                                  'WINK_SKIA_ROUTE', 'WINK_VK_ABORT_ON_ERROR') if k in env})
     write_json(a.out / 'reproduce.json', metadata)
+    write_json(a.out / 'run.json', dict(metadata, **{'pass': False, 'problems': ['inventory has not completed']}))
     inventory_command = [*args, '--dryRun']
-    with (a.out / 'inventory.log').open('w') as log:
-        inventory = subprocess.run(inventory_command, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                   timeout=a.timeout)
+    try:
+        with (a.out / 'inventory.log').open('w') as log:
+            inventory = subprocess.run(inventory_command, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                       timeout=a.timeout)
+    except subprocess.TimeoutExpired:
+        write_json(a.out / 'run.json', dict(metadata, **{'pass': False, 'problems': ['inventory timed out']}))
+        return 1
     text = (a.out / 'inventory.log').read_text(errors='replace')
     expected = events(text, 'DONE')
     write_json(a.out / 'inventory.json', [list(task) for task in expected])
@@ -222,6 +246,8 @@ def main():
     for name in ('list', 'run', 'reference'):
         s = sub.add_parser(name)
         s.add_argument('--dm', type=Path, default=MESA / 'build/skia/native/dm')
+        s.add_argument('--target', choices=['native', 'st', 'mt'], default='native')
+        s.add_argument('--browser-dir', type=Path, help='Directory containing a browser DM build')
         s.add_argument('--source', type=Path, default=MESA / 'build/skia/deps/skia')
         s.add_argument('--route', choices=ROUTES, required=True)
         s.add_argument('--out', type=Path, required=True)
@@ -242,6 +268,9 @@ def main():
             a.out.parent.mkdir(parents=True, exist_ok=True)
             write_json(a.out, report)
             return 0 if report['pass'] else 1
+        if a.target != 'native':
+            from run_browser import execute as execute_browser
+            return execute_browser(a)
         return execute(a)
     except (ValueError, OSError, subprocess.SubprocessError) as e:
         p.exit(1, f'{e}\n')

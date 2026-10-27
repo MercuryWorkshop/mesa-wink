@@ -1,0 +1,77 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<meta charset="utf-8">
+<title>Skia DM on Wink</title>
+<canvas id="canvas" width="256" height="256"></canvas>
+<script type="module">
+const log = [];
+globalThis.__winkResult = null;
+try {
+  const options = new URLSearchParams(location.search);
+  const args = JSON.parse(options.get('args'));
+  const {default: create} = await import('./dm.js');
+  let done;
+  const finished = new Promise(resolve => { done = resolve; });
+  const record = s => { log.push(s); console.log(s); };
+  const module = await create({
+    noInitialRun: true,
+    canvas: document.querySelector('canvas'),
+    print: record, printErr: record,
+    winkSkiaDone: done,
+    onAbort: reason => { record('abort: ' + reason); done(-1); },
+  });
+  module.FS.mkdir('/out');
+  const route = options.get('route');
+  module.ENV.WINK_SKIA_ROUTE = route;
+  module.ENV.WINK_VK_ABORT_ON_ERROR = '1';
+  // The C runtime has already initialized environ. setenv updates it too.
+  const strings = ['dm', ...args];
+  const pointers = strings.map(s => {
+    const bytes = new TextEncoder().encode(s + '\0');
+    const p = module._malloc(bytes.length);
+    module.HEAPU8.set(bytes, p);
+    return p;
+  });
+  const argv = module._malloc((pointers.length + 1) * 4);
+  module.HEAPU32.set([...pointers, 0], argv >>> 2);
+  const envStrings = [['WINK_SKIA_ROUTE', route], ['WINK_VK_ABORT_ON_ERROR', '1']];
+  for (const [key, value] of envStrings) {
+    const alloc = s => {
+      const b = new TextEncoder().encode(s + '\0');
+      const p = module._malloc(b.length); module.HEAPU8.set(b, p); return p;
+    };
+    const k = alloc(key), v = alloc(value);
+    module._wink_setenv(k, v);
+    module._free(k); module._free(v);
+  }
+  let rc;
+  if (options.get('target') === 'mt') {
+    if (module._wink_skia_start(pointers.length, argv)) throw new Error('worker creation failed');
+    rc = await finished;
+  } else {
+    rc = await WebAssembly.promising(module.winkSkiaRaw)(pointers.length, argv);
+  }
+  // Persist one file at a time. Full GM output is hundreds of MB and must
+  // not be serialized into one CDP result or held as base64 copies.
+  async function save(directory, prefix = '') {
+    for (const name of module.FS.readdir(directory)) {
+      if (name === '.' || name === '..') continue;
+      const path = directory + '/' + name;
+      if (module.FS.isDir(module.FS.stat(path).mode)) {
+        await save(path, prefix + name + '/');
+      } else {
+        const response = await fetch('/__wink_artifacts/' + prefix + name, {
+          method: 'PUT', body: module.FS.readFile(path),
+        });
+        if (!response.ok) throw new Error('artifact upload failed: ' + path);
+      }
+    }
+  }
+  await save('/out');
+  globalThis.__winkResult = {pass: rc === 0, rc, log, browser: navigator.userAgent};
+} catch (e) {
+  log.push('exception: ' + (e.stack || e));
+  console.error(log.at(-1));
+  globalThis.__winkResult = {pass: false, rc: -1, log};
+}
+</script>

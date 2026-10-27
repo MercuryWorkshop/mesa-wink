@@ -8,6 +8,30 @@ import unittest
 spec = importlib.util.spec_from_file_location('skia_run', Path(__file__).with_name('run.py'))
 suite = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(suite)
+build_spec = importlib.util.spec_from_file_location('skia_build', Path(__file__).with_name('build.py'))
+builder = importlib.util.module_from_spec(build_spec)
+build_spec.loader.exec_module(builder)
+
+
+class DependencyAdaptation(unittest.TestCase):
+    def test_platform_anchor_is_not_skipped_when_replacement_exists_elsewhere(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'BUILD.gn'
+            path.write_text('mac: wink_factory\nwasm: null_factory\n')
+            builder.patch(root, 'BUILD.gn', 'null_factory', 'wink_factory')
+            self.assertEqual(path.read_text(), 'mac: wink_factory\nwasm: wink_factory\n')
+            builder.patch(root, 'BUILD.gn', 'null_factory', 'wink_factory')
+            self.assertEqual(path.read_text().count('wink_factory'), 2)
+
+    def test_instrumentation_anchor_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'DM.cpp'
+            path.write_text('void done() {}')
+            for _ in range(2):
+                builder.patch(root, 'DM.cpp', 'void done() {', 'void done() { record();')
+            self.assertEqual(path.read_text(), 'void done() { record();}')
 
 
 class ExecutionIntegrity(unittest.TestCase):

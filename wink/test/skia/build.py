@@ -21,7 +21,9 @@ def run(args, **kwargs):
 def patch(source, name, before, after):
     path = source / name
     content = path.read_text()
-    if after in content:
+    # Another platform may already contain the same replacement. Its
+    # presence does not mean this platform's old anchor was replaced too.
+    if after in content and (before in after or before not in content):
         return
     if content.count(before) != 1:
         raise RuntimeError(f'{name}: patch anchor changed')
@@ -52,8 +54,14 @@ def adapt(source):
     patch(source, 'BUILD.gn',
           '"tools/ganesh/gl/mac/CreatePlatformGLTestContext_mac.cpp"',
           '"tools/ganesh/gl/wink/GLTestContext_wink.cpp"')
-    patch(source, 'BUILD.gn', '"tools/ganesh/gl/none/CreatePlatformGLTestContext_none.cpp"',
-          '"tools/ganesh/gl/wink/GLTestContext_wink.cpp"')
+    patch(source, 'BUILD.gn',
+          '''        } else if (is_wasm) {
+          # TODO: replace with webgl test context
+          sources +=
+              [ "tools/ganesh/gl/none/CreatePlatformGLTestContext_none.cpp" ]''',
+          '''        } else if (is_wasm) {
+          sources +=
+              [ "tools/ganesh/gl/wink/GLTestContext_wink.cpp" ]''')
     # DM does not serialize unit-test successes in dm.json. Emit task lifecycle
     # records in dry runs too, so the runner can check inventory completeness.
     for event, signature in (

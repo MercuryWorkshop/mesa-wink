@@ -25,6 +25,31 @@ build Graphite's outer Dawn GLES adapter. The runner recognizes
 `grdawn_gles`, but an unavailable configuration fails inventory and is not
 counted as tested.
 
+## Browser builds
+
+Package both Wink variants first, then build DM with the same SDK:
+
+```sh
+wink/build.sh --variant=both
+python3 wink/test/skia/build-browser.py st
+python3 wink/test/skia/build-browser.py mt
+python3 wink/test/skia/run.py run --target st --route gles --sources gm --match '^aaclip$' --out build/skia/browser-clip-st
+python3 wink/test/skia/run.py run --target mt --route gles --sources gm --match '^aaclip$' --out build/skia/browser-clip-mt
+```
+
+Both variants also build the `vk` and `grvk` routes. Vulkan resolves through
+Wink directly, without a loader. The ST body enters through JSPI on main; the
+MT body enters through JSPI on a real pthread and routes GLES through Wink's
+main-thread runner. The audit rejects an MT result with no worker marker.
+ST disables DM's background GPU thread pool; MT uses two background threads.
+Tests which explicitly create threads still require separate applicability
+classification for ST.
+
+Browser files stream individually into the run's `run-artifacts/` directory,
+avoiding a single base64/CDP payload for a full GM corpus. The local browser
+server only accepts uploads when `--artifact-dir` is provided, and rejects
+paths outside it. The runner copies `dm.json` to the run root for comparison.
+
 ## Inventory and run
 
 Use a fresh output directory for each invocation. Each run inventories tasks
@@ -37,6 +62,7 @@ python3 wink/test/skia/run.py list --route gles --out build/skia/list-gles
 python3 wink/test/skia/run.py run --route gles --sources gm --match '^aaclip$' --out build/skia/clip-gles
 python3 wink/test/skia/run.py run --route vk --out build/skia/all-vk
 python3 wink/test/skia/run.py run --route grvk --out build/skia/all-grvk
+python3 wink/test/skia/run.py run --route gles --sources tests --match SkSL --out build/skia/sksl-gles
 ```
 
 The default sources are all compiled GPU unit tests for the selected
@@ -82,7 +108,9 @@ unstarted/unfinished task, skipped draw, absent or incorrect backend identity,
 GPU validation/device error, or missing `dm.json`. A unit run alone checks
 execution/assertions; rendered correctness additionally requires reference
 comparison. Backend-inapplicable tests and upstream bugs remain visible until
-their exclusions have independent evidence.
+their exclusions have independent evidence. Native runs also hash the loaded
+Wink library and the selected ICD/library when present, so an uncommitted
+driver build is distinguishable from another build at the same Git revision.
 
 Run harness integrity checks with:
 
@@ -90,6 +118,7 @@ Run harness integrity checks with:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s wink/test/skia -p 'test_*.py' -v
 ```
 
-Full acceptance additionally requires the browser ST/MT matrix, outer Dawn
-GLES integration, independent GLES references, full CTS regression comparisons,
-and repeated cold/warm-cache runs. These are not implied by the native runner.
+Full acceptance additionally requires complete browser ST/MT corpus runs,
+outer Dawn GLES integration, independent GLES references, full CTS regression
+comparisons, and repeated cold/warm-cache runs. Successful isolated browser
+GMs or the native SkSL suites do not establish that acceptance.
