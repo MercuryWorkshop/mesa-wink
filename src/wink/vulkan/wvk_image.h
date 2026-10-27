@@ -253,6 +253,8 @@ WGPUTexture wvk_image_snapshot(WGPUDevice device, const struct wvk_image *image,
 
 /* The same of a multisampled colour image's first layer, which is what
  * shaders see of it: a pass copying each sample (wvk_cmd_copy.c). */
+bool wvk_image_copy_ms_views(struct wvk_device *dev, struct wvk_replay *replay, WGPUTextureView src,
+                              WGPUTextureView dst, WGPUTextureFormat format, VkFormat vk_format, unsigned samples);
 WGPUTexture wvk_image_snapshot_ms(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image);
 
 /* Whether a multisampled texture of `from` can be copied into one of

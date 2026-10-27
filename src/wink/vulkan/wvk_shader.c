@@ -1126,12 +1126,15 @@ lower_blend(nir_shader *nir, const struct wvk_shader_key *key, uint8_t *reads)
                               .align_mul = 16, .access = ACCESS_NON_WRITEABLE);
    u_foreach_bit(rt, key->blend_mask) {
       nir_variable *tex = nir_variable_create(nir, nir_var_uniform,
-                                              glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_FLOAT),
+                                              glsl_texture_type(key->samples > 1 ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D,
+                                                                false, GLSL_TYPE_FLOAT),
                                               "wvk_blend_dst");
       tex->data.descriptor_set = WVK_DRIVER_GROUP;
       tex->data.binding = WVK_DRIVER_SLOT_LOGIC_OP + rt;
-      nir_def *d = nir_txf(&b, coord, .texture_deref = nir_build_deref_var(&b, tex), .lod = nir_imm_int(&b, 0),
-                           .dest_type = nir_type_float32);
+      nir_deref_instr *deref = nir_build_deref_var(&b, tex);
+      nir_def *d = key->samples > 1
+         ? nir_txf_ms(&b, coord, nir_load_sample_id(&b), .texture_deref = deref, .dest_type = nir_type_float32)
+         : nir_txf(&b, coord, .texture_deref = deref, .lod = nir_imm_int(&b, 0), .dest_type = nir_type_float32);
       nir_def *s1 = rt == 0 && src1 ? nir_load_var(&b, src1) : nir_imm_vec4(&b, 0, 0, 0, 0);
       nir_def *r = blend_apply(&b, key->blend_equation[rt], (VkFormat)key->logic_format[rt],
                                nir_load_var(&b, src[rt]), s1, d, k);
@@ -9109,23 +9112,20 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
                                   ? wvk_shader_blend_mask(dyn, outputs & dyn->cb.color_write_enables)
                                   : 0) |
                               advanced;
-      if (blends && samples > 1) {
-         mesa_logw_once("wvk: colour blend factors with both CONSTANT_COLOR and CONSTANT_ALPHA, or advanced "
-                        "blending, on a multisampled pass, which is not done");
-      } else {
-         u_foreach_bit(i, blends) {
-            const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
-            if (!color_formats[i])
-               continue;
-            key.blend_mask |= BITFIELD_BIT(i);
-            key.blend_equation[i] =
-               (advanced & BITFIELD_BIT(i))
-                  ? wvk_blend_advanced(vk_advanced_blend_op_to_pipe(a->color_blend_op), a->src_premultiplied,
-                                       a->dst_premultiplied, vk_blend_overlap_to_pipe(a->blend_overlap))
-                  : wvk_blend_equation(a->src_color_blend_factor, a->dst_color_blend_factor, a->color_blend_op,
-                                       a->src_alpha_blend_factor, a->dst_alpha_blend_factor, a->alpha_blend_op);
-            key.logic_format[i] = color_formats[i];
-         }
+      if (blends && samples > 1)
+         key.samples = samples;
+      u_foreach_bit(i, blends) {
+         const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
+         if (!color_formats[i])
+            continue;
+         key.blend_mask |= BITFIELD_BIT(i);
+         key.blend_equation[i] =
+            (advanced & BITFIELD_BIT(i))
+               ? wvk_blend_advanced(vk_advanced_blend_op_to_pipe(a->color_blend_op), a->src_premultiplied,
+                                    a->dst_premultiplied, vk_blend_overlap_to_pipe(a->blend_overlap))
+               : wvk_blend_equation(a->src_color_blend_factor, a->dst_color_blend_factor, a->color_blend_op,
+                                    a->src_alpha_blend_factor, a->dst_alpha_blend_factor, a->alpha_blend_op);
+         key.logic_format[i] = color_formats[i];
       }
       /* The discard rectangle test, of the rectangles the draw's data has. */
       key.discard_rects = dyn->dr.enable;

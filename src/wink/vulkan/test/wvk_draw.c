@@ -21,6 +21,7 @@
 #include "quad_vert.h"
 #include "dead_input_vert.h"
 #include "color_frag.h"
+#include "solid_frag.h"
 #include "discard_frag.h"
 #include "texture_frag.h"
 #include "instanced_vert.h"
@@ -44,8 +45,9 @@ static const float quad[] = {
 /* The pipeline for the quad, or with `divisor` for instanced.vert: one
  * instance-rate attribute of that divisor, and strips of four indices. */
 static VkPipeline
-make_pipeline_samples_stencil(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, uint32_t divisor,
-                              VkSampleCountFlagBits samples, VkSampleMask mask, VkFormat stencil_format)
+make_pipeline_samples_state(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, uint32_t divisor,
+                            VkSampleCountFlagBits samples, VkSampleMask mask, VkFormat stencil_format,
+                            const VkPipelineColorBlendAttachmentState *blend)
 {
    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
    const VkPipelineShaderStageCreateInfo stages[] = {
@@ -62,7 +64,8 @@ make_pipeline_samples_stencil(VkPipelineLayout layout, VkShaderModule vs, VkShad
       .location = 0, .binding = 0, .format = VK_FORMAT_R8G8B8A8_UNORM, .offset = 0,
    };
    const VkVertexInputBindingDivisorDescriptionKHR binding_divisor = { .binding = 0, .divisor = divisor };
-   const VkDynamicState dynamic[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+   const VkDynamicState dynamic[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS };
    VkPipeline pipeline;
    VK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &(VkGraphicsPipelineCreateInfo){
       .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -116,14 +119,19 @@ make_pipeline_samples_stencil(VkPipelineLayout layout, VkShaderModule vs, VkShad
       } : NULL,
       .pColorBlendState = &(VkPipelineColorBlendStateCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+         .pNext = &(VkPipelineColorBlendAdvancedStateCreateInfoEXT){
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_ADVANCED_STATE_CREATE_INFO_EXT,
+            .srcPremultiplied = VK_TRUE, .dstPremultiplied = VK_TRUE,
+            .blendOverlap = VK_BLEND_OVERLAP_UNCORRELATED_EXT,
+         },
          .attachmentCount = 1,
-         .pAttachments = &(VkPipelineColorBlendAttachmentState){
+         .pAttachments = blend ? blend : &(VkPipelineColorBlendAttachmentState){
             .colorWriteMask = 0xf,
          },
       },
       .pDynamicState = &(VkPipelineDynamicStateCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-         .dynamicStateCount = 2, .pDynamicStates = dynamic,
+         .dynamicStateCount = 3, .pDynamicStates = dynamic,
       },
       .layout = layout,
    }, NULL, &pipeline));
@@ -134,7 +142,7 @@ static VkPipeline
 make_pipeline_samples(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, uint32_t divisor,
                       VkSampleCountFlagBits samples, VkSampleMask mask)
 {
-   return make_pipeline_samples_stencil(layout, vs, fs, divisor, samples, mask, VK_FORMAT_UNDEFINED);
+   return make_pipeline_samples_state(layout, vs, fs, divisor, samples, mask, VK_FORMAT_UNDEFINED, NULL);
 }
 
 static VkPipeline
@@ -282,6 +290,97 @@ test_colors(VkBuffer vertices, const uint32_t *vertex_code, size_t vertex_bytes)
    printf("colors: done\n");
 }
 
+/* Shader-emulated blend equations must preserve each destination sample,
+ * including a second draw reusing the copy and a partial sample mask. */
+static void
+test_shader_blend(VkBuffer vertices, unsigned samples, VkSampleMask mask, bool advanced)
+{
+   VkPipelineLayout layout;
+   VK(vkCreatePipelineLayout(dev, &(VkPipelineLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &(VkPushConstantRange){
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(struct push),
+      },
+   }, NULL, &layout));
+   VkShaderModule vs = make_module(spv_quad_vert, sizeof(spv_quad_vert));
+   VkShaderModule fs = make_module(spv_solid_frag, sizeof(spv_solid_frag));
+   const VkPipelineColorBlendAttachmentState blend = {
+      .blendEnable = VK_TRUE, .colorWriteMask = 0xf,
+      .srcColorBlendFactor = advanced ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_CONSTANT_COLOR,
+      .dstColorBlendFactor = advanced ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_CONSTANT_ALPHA,
+      .colorBlendOp = advanced ? VK_BLEND_OP_MULTIPLY_EXT : VK_BLEND_OP_ADD,
+      .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+      .alphaBlendOp = advanced ? VK_BLEND_OP_MULTIPLY_EXT : VK_BLEND_OP_ADD,
+   };
+   VkPipeline pipeline = make_pipeline_samples_state(layout, vs, fs, 0, samples, mask,
+                                                     VK_FORMAT_UNDEFINED, &blend);
+   struct image target = make_image_samples(W, H, VK_FORMAT_R8G8B8A8_UNORM,
+                                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                            samples);
+   struct image resolved = make_image(W, H, VK_FORMAT_R8G8B8A8_UNORM,
+                                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+   struct buffer out = make_buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST);
+   const float initial[] = { .2f, .4f, .6f, advanced ? .75f : 1.f };
+   const float constants[] = { .25f, .5f, .75f, .125f };
+   const struct push push = { { .4f, .2f, .1f, .5f }, { 0, 0 } };
+   VkCommandBuffer cmd = begin();
+   const VkRenderingAttachmentInfo color = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .imageView = target.view, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      .clearValue.color.float32 = { initial[0], initial[1], initial[2], initial[3] },
+      .resolveMode = samples > 1 ? VK_RESOLVE_MODE_AVERAGE_BIT : VK_RESOLVE_MODE_NONE,
+      .resolveImageView = samples > 1 ? resolved.view : VK_NULL_HANDLE,
+      .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+   };
+   begin_rendering(cmd, &(VkRenderingInfo){
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = { { 0, 0 }, { W, H } }, .layerCount = 1,
+      .colorAttachmentCount = 1, .pColorAttachments = &color,
+   });
+   vkCmdSetViewport(cmd, 0, 1, &(VkViewport){ 0, 0, W, H, 0, 1 });
+   vkCmdSetScissor(cmd, 0, 1, &(VkRect2D){ { 0, 0 }, { W, H } });
+   vkCmdSetBlendConstants(cmd, constants);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+   const VkDeviceSize zero = 0;
+   vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &zero);
+   vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                      0, sizeof(push), &push);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   end_rendering(cmd);
+   vkCmdCopyImageToBuffer(cmd, samples > 1 ? resolved.image : target.image,
+                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.buffer, 1, &(VkBufferImageCopy){
+      .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { W, H, 1 },
+   });
+   submit_and_wait(cmd);
+   float expected[4];
+   memcpy(expected, initial, sizeof(expected));
+   for (unsigned draw = 0; draw < 2; ++draw) {
+      const float dst_alpha = expected[3];
+      for (unsigned c = 0; c < 4; ++c) {
+         const float src = push.tint[c], dst = expected[c];
+         expected[c] = advanced ? (c == 3 ? src + dst - src * dst
+                                             : src * (1 - dst_alpha) + dst * (1 - push.tint[3]) + src * dst)
+                                : (c == 3 ? src : src * constants[c] + dst * constants[3]);
+      }
+   }
+   const uint8_t *p = pixel(&out, W / 4, H / 4);
+   for (unsigned c = 0; c < 4; ++c) {
+      const float value = mask == 5 ? (expected[c] + initial[c]) * .5f : expected[c];
+      const unsigned want = (unsigned)(value * 255 + .5f);
+      CHECK(near(p[c], want), "shader blend advanced=%u samples=%u mask=%x channel=%u: %u want %u",
+            advanced, samples, mask, c, p[c], want);
+   }
+   free_buffer(&out);
+   free_image(&target);
+   free_image(&resolved);
+   vkDestroyPipeline(dev, pipeline, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   vkDestroyShaderModule(dev, vs, NULL);
+   vkDestroyShaderModule(dev, fs, NULL);
+   printf("shader blend advanced=%u samples=%u mask=%x: done\n", advanced, samples, mask);
+}
+
 /* A pooled stencil image is larger than two differently-sized colour targets.
  * The clear determines whether the quad passes stencil; reusing it at another
  * extent checks auxiliary-view replacement as well as the first allocation. */
@@ -297,8 +396,8 @@ test_transient_stencil(VkBuffer vertices)
    }, NULL, &layout));
    VkShaderModule vs = make_module(spv_quad_vert, sizeof(spv_quad_vert));
    VkShaderModule fs = make_module(spv_color_frag, sizeof(spv_color_frag));
-   VkPipeline pipeline = make_pipeline_samples_stencil(layout, vs, fs, 0, VK_SAMPLE_COUNT_1_BIT,
-                                                       ~0u, VK_FORMAT_S8_UINT);
+   VkPipeline pipeline = make_pipeline_samples_state(layout, vs, fs, 0, VK_SAMPLE_COUNT_1_BIT,
+                                                     ~0u, VK_FORMAT_S8_UINT, NULL);
    struct image stencil = make_image(W * 2, H * 2, VK_FORMAT_S8_UINT,
                                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
    struct buffer out = make_buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST);
@@ -720,7 +819,7 @@ int
 main(void)
 {
    const char *extensions[] = { "VK_KHR_portability_subset", "VK_KHR_dynamic_rendering",
-                                "VK_KHR_vertex_attribute_divisor" };
+                                "VK_KHR_vertex_attribute_divisor", "VK_EXT_blend_operation_advanced" };
    VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR,
       .vertexAttributeInstanceRateDivisor = VK_TRUE,
@@ -733,7 +832,7 @@ main(void)
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &rendering,
       .shaderDrawParameters = VK_TRUE,
    };
-   test_init(3, extensions, &(VkPhysicalDeviceFeatures2){
+   test_init(4, extensions, &(VkPhysicalDeviceFeatures2){
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &vk11,
       .features = { .multiDrawIndirect = VK_TRUE, .occlusionQueryPrecise = VK_TRUE },
    });
@@ -745,6 +844,11 @@ main(void)
 
    test_colors(vertices.buffer, spv_quad_vert, sizeof(spv_quad_vert));
    test_colors(vertices.buffer, spv_dead_input_vert, sizeof(spv_dead_input_vert));
+   for (unsigned advanced = 0; advanced < 2; ++advanced) {
+      test_shader_blend(vertices.buffer, 1, ~0u, advanced);
+      test_shader_blend(vertices.buffer, 4, ~0u, advanced);
+      test_shader_blend(vertices.buffer, 4, 5, advanced);
+   }
    test_transient_stencil(vertices.buffer);
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_1_BIT, ~0u, 1);
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_4_BIT, ~0u, 4);

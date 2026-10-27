@@ -1008,6 +1008,41 @@ ms_copy_pipeline(struct wvk_device *dev, WGPUTextureFormat format, VkFormat vk_f
    return pipeline;
 }
 
+bool
+wvk_image_copy_ms_views(struct wvk_device *dev, struct wvk_replay *replay, WGPUTextureView src,
+                         WGPUTextureView dst, WGPUTextureFormat format, VkFormat vk_format, unsigned samples)
+{
+   WGPURenderPipeline pipeline = ms_copy_pipeline(dev, format, vk_format, samples);
+   if (!pipeline)
+      return false;
+   WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+   const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = bgl;
+   bg.entryCount = 1;
+   bg.entries = &entry;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bgl);
+
+   wvk_replay_end_passes(replay);
+   WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+   color.view = dst;
+   color.loadOp = WGPULoadOp_Clear;
+   color.storeOp = WGPUStoreOp_Store;
+   WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+   pd.label = wvk_sv("wvk ms copy");
+   pd.colorAttachmentCount = 1;
+   pd.colorAttachments = &color;
+   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &pd);
+   wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+   wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+   wgpuRenderPassEncoderEnd(pass);
+   wgpuRenderPassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+   return true;
+}
+
 WGPUTexture
 wvk_image_snapshot_ms(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image)
 {
@@ -1034,31 +1069,10 @@ wvk_image_snapshot_ms(struct wvk_device *dev, struct wvk_replay *replay, const s
    util_dynarray_append(&replay->views, src);
    WGPUTextureView dst = wgpuTextureCreateView(copy, &vd);
    util_dynarray_append(&replay->views, dst);
-   WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
-   const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src };
-   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-   bg.layout = bgl;
-   bg.entryCount = 1;
-   bg.entries = &entry;
-   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
-   wgpuBindGroupLayoutRelease(bgl);
-
-   wvk_replay_end_passes(replay);
-   WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
-   color.view = dst;
-   color.loadOp = WGPULoadOp_Clear;
-   color.storeOp = WGPUStoreOp_Store;
-   WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-   pd.label = wvk_sv("wvk ms copy");
-   pd.colorAttachmentCount = 1;
-   pd.colorAttachments = &color;
-   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &pd);
-   wgpuRenderPassEncoderSetPipeline(pass, pipeline);
-   wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
-   wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
-   wgpuRenderPassEncoderEnd(pass);
-   wgpuRenderPassEncoderRelease(pass);
-   wgpuBindGroupRelease(group);
+   if (!wvk_image_copy_ms_views(dev, replay, src, dst, image->format, image->vk.format, image->vk.samples)) {
+      wgpuTextureRelease(copy);
+      return NULL;
+   }
    return copy;
 }
 

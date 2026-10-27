@@ -765,9 +765,6 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   has no copy of, which are not counted.
 - Subgroups are one invocation each: Tint reads no subgroup operations from
   SPIR-V. Every operation but the quad ones is there, trivially.
-- Blend states whose colour factors use both CONSTANT_COLOR and
-  CONSTANT_ALPHA, on a multisampled pass: WebGPU has one constant, and
-  the fragment shader's blending reads single-sampled copies.
 - Views of multisampled images in formats WebGPU does not multisample
   (R32 integers, RG32): other formats' views are of a multisampled
   texture of the view's format, which a pass moving each sample's bits

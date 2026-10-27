@@ -2964,7 +2964,9 @@ snapshot_logic_op(struct wvk_cmd_buffer *cmd)
       const VkExtent3D e = vk_image_mip_level_extent(&image->vk, level);
       WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
       td.label = wvk_sv("wvk logic op destination");
-      td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+      td.sampleCount = image->vk.samples;
+      td.usage = WGPUTextureUsage_TextureBinding |
+                 (td.sampleCount > 1 ? WGPUTextureUsage_RenderAttachment : WGPUTextureUsage_CopyDst);
       td.dimension = WGPUTextureDimension_2D;
       td.size = (WGPUExtent3D){ e.width, e.height, 1 };
       td.format = wgpuTextureGetFormat(texture);
@@ -2980,7 +2982,7 @@ snapshot_logic_op(struct wvk_cmd_buffer *cmd)
        * its own for each, all of them the submit's until it is done. */
       struct wvk_attachment_copy *c = &replay->logic_op_copies[i];
       if (!c->texture || c->width != e.width || c->height != e.height || c->format != td.format ||
-          c->view_format != view->format) {
+          c->view_format != view->format || c->samples != td.sampleCount) {
          WGPUTexture copy = wgpuDeviceCreateTexture(dev->wgpu, &td);
          if (!copy)
             continue;
@@ -2991,14 +2993,30 @@ snapshot_logic_op(struct wvk_cmd_buffer *cmd)
          if (!v)
             continue;
          util_dynarray_append(&replay->views, v);
-         *c = (struct wvk_attachment_copy){ copy, v, td.format, view->format, e.width, e.height };
+         *c = (struct wvk_attachment_copy){ copy, v, td.format, view->format, e.width, e.height, td.sampleCount };
       }
       WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
       src.texture = texture;
       src.mipLevel = level - first_level;
       src.origin.z = texture_layer;
       dst.texture = c->texture;
-      wgpuCommandEncoderCopyTextureToTexture(replay->encoder, &src, &dst, &td.size);
+      if (td.sampleCount > 1) {
+         WGPUTextureView src_view;
+         WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+         vd.format = view->format;
+         vd.dimension = WGPUTextureViewDimension_2D;
+         vd.baseMipLevel = level - first_level;
+         vd.mipLevelCount = 1;
+         vd.baseArrayLayer = texture_layer;
+         vd.arrayLayerCount = 1;
+         src_view = wgpuTextureCreateView(texture, &vd);
+         util_dynarray_append(&replay->views, src_view);
+         if (!wvk_image_copy_ms_views(dev, replay, src_view, c->view, view->format, view->vk.view_format,
+                                      td.sampleCount))
+            continue;
+      } else {
+         wgpuCommandEncoderCopyTextureToTexture(replay->encoder, &src, &dst, &td.size);
+      }
       replay->logic_op_views[i] = c->view;
    }
    wvk_replay_restart_pass(cmd, replay->pass_layer);

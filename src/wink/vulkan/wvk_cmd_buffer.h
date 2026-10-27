@@ -53,6 +53,7 @@ struct wvk_attachment_copy {
    WGPUTextureView view;
    WGPUTextureFormat format, view_format;
    uint32_t width, height;
+   unsigned samples;
 };
 
 struct wvk_replay {
