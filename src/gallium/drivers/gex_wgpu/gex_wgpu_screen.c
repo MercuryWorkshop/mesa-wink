@@ -196,6 +196,11 @@ gex_wgpu_queue_write(WGPUQueue queue, WGPUBuffer buffer, uint64_t offset,
             memmove(s->bytes + (s->lo - lo), s->bytes, s->hi - s->lo);
          }
          memcpy(s->bytes + (offset - lo), data, size);
+      } else {
+         /* Counting only: sent now. */
+         ++gex_wgpu_made.write_buffers;
+         gex_wgpu_made.write_buffer_bytes += size;
+         wgpuQueueWriteBuffer(queue, buffer, offset, data, size);
       }
       s->lo = lo;
       s->hi = hi;
