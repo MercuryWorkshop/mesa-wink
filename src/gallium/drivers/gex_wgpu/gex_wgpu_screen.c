@@ -23491,18 +23491,10 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
    return transfer->data;
 }
 
-/* Buffer mapping.
- *
- * Every buffer this driver creates carries a CPU shadow, which buffer_subdata
- * already treats as authoritative: nothing on the GPU writes a buffer yet (no
- * transform feedback, no shader storage, no compute), so the shadow and the
- * WGPUBuffer cannot disagree.  Mapping is therefore a pointer into the shadow
- * plus, on unmap, the same aligned upload buffer_subdata performs.
- *
- * When the GPU does gain the ability to write a buffer, a read map will have
- * to fall back to a readback the way texture_map does; until then that case
- * cannot arise and is asserted rather than silently mis-served.
- */
+/* CPU-authored buffers can read their shadow. Shader storage, feedback,
+ * copies and compute-emulated stages mark gpu_written, so their read maps
+ * fetch the device's current contents instead. Aligned write-only maps can
+ * use temporary staging without allocating a permanent shadow. */
 static void *
 gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
                     unsigned level, unsigned usage,
@@ -34769,6 +34761,11 @@ gex_wgpu_bind_storage_access(struct gex_wgpu_bindings *group, uint32_t binding,
    const unsigned i = group->count++;
    group->binding[i] = binding;
    group->buffer[i] = gex_resource(resource)->buffer;
+   /* The emulated stages write these buffers directly, bypassing
+    * set_shader_buffers. Layer/viewport routing and feedback read them on
+    * the CPU afterwards and must not mistake their old shadow for output. */
+   if (!read_only)
+      gex_resource(resource)->gpu_written = true;
    group->offset[i] = 0;
    group->size[i] = gex_resource(resource)->allocation_size;
    group->storage_mask |= UINT64_C(1) << i;

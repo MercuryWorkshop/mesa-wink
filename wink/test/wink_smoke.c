@@ -103,9 +103,12 @@ note(const char *fmt, ...)
    X(void, BindTexture, (GLenum, GLuint))                                        \
    X(void, TexParameteri, (GLenum, GLenum, GLint))                               \
    X(void, TexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
+   X(void, TexImage3D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
+   X(void, TexSubImage3D, (GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, const void *)) \
    X(void, GenFramebuffers, (GLsizei, GLuint *))                                \
    X(void, BindFramebuffer, (GLenum, GLuint))                                   \
    X(void, FramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint))       \
+   X(void, FramebufferTextureLayer, (GLenum, GLenum, GLuint, GLint, GLint))    \
    X(GLenum, CheckFramebufferStatus, (GLenum))                                 \
    X(void, DeleteFramebuffers, (GLsizei, const GLuint *))                       \
    X(void, DrawBuffers, (GLsizei, const GLenum *))                              \
@@ -783,6 +786,58 @@ norm16_readback(void)
 }
 
 static void
+layered_pbo_upload(void)
+{
+   enum { width = 11, height = 11, layers = 12, slice = width * height * 4 };
+   uint8_t source[slice * layers], result[slice];
+   const GLenum targets[] = { GL_TEXTURE_3D, GL_TEXTURE_2D_ARRAY, GL_TEXTURE_CUBE_MAP_ARRAY };
+   GLuint pbo, fbo, textures[3];
+   p_glGenBuffers(1, &pbo);
+   p_glGenFramebuffers(1, &fbo);
+   p_glGenTextures(3, textures);
+   p_glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+   for (unsigned t = 0; t < 3; ++t) {
+      p_glBindTexture(targets[t], textures[t]);
+      for (unsigned round = 0; round < 2; ++round) {
+         for (unsigned z = 0; z < layers; ++z)
+            for (unsigned y = 0; y < height; ++y)
+               for (unsigned x = 0; x < width; ++x) {
+                  uint8_t *p = source + z * slice + (y * width + x) * 4;
+                  p[0] = 13 + z * 17;
+                  p[1] = 211 - z * 7;
+                  p[2] = (x * 19 + y * 11) & 255;
+                  p[3] = 255;
+                  if (round) { uint8_t tmp = p[0]; p[0] = p[2]; p[2] = tmp; }
+               }
+         p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+         p_glBufferData(GL_PIXEL_UNPACK_BUFFER, sizeof(source), source, GL_STATIC_DRAW);
+         if (!round)
+            p_glTexImage3D(targets[t], 0, GL_RGBA8, width, height, layers, 0,
+                           GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+         else
+            p_glTexSubImage3D(targets[t], 0, 0, 0, 0, width, height, layers,
+                              GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+         p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+         p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+         for (unsigned z = 0; z < layers; ++z) {
+            p_glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, textures[t], 0, z);
+            CHECK(p_glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE,
+                  "PBO layer framebuffer target=%x layer=%u", targets[t], z);
+            memset(result, 0, sizeof(result));
+            p_glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, result);
+            CHECK(memcmp(result, source + z * slice, slice) == 0,
+                  "PBO layer data target=%x layer=%u round=%u", targets[t], z, round);
+         }
+         p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+         CHECK(p_glGetError() == GL_NO_ERROR, "PBO upload GL error target=%x round=%u", targets[t], round);
+      }
+   }
+   p_glDeleteTextures(3, textures);
+   p_glDeleteFramebuffers(1, &fbo);
+   p_glDeleteBuffers(1, &pbo);
+}
+
+static void
 helper_invocation(void)
 {
    const char *vs = "#version 320 es\n"
@@ -1426,6 +1481,7 @@ exercise(const char *label, int api, wink_surface *surface)
 
    if (api == WINK_API_OPENGL_ES) {
       norm16_readback();
+      layered_pbo_upload();
       helper_invocation();
       framebuffer_fetch();
    }
