@@ -789,6 +789,76 @@ norm16_readback(void)
 }
 
 static void
+integer_cube_lod(void)
+{
+   static const float axes[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+   const char *vs = "#version 320 es\nvoid main(){int i=gl_VertexID%3;"
+      "gl_Position=vec4(i==1?3.0:-1.0,i==2?3.0:-1.0,0,1);}";
+   const char *samples[] = {
+      "texture(tex,dir)", "texture(tex,dir,params.w)",
+      "textureGrad(tex,dir,0.5*u,0.5*v)", "textureLod(tex,params.xyz,2.0)"
+   };
+   for (unsigned sign = 0; sign < 2; ++sign) {
+      GLuint texture;
+      p_glGenTextures(1, &texture);
+      p_glActiveTexture(GL_TEXTURE0);
+      p_glBindTexture(GL_TEXTURE_CUBE_MAP, texture);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, 3);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+      for (unsigned level = 0; level < 4; ++level) {
+         const unsigned size = 8 >> level;
+         for (unsigned face = 0; face < 6; ++face) {
+            uint8_t pixels[8 * 8 * 4];
+            for (unsigned p = 0; p < size * size; ++p) {
+               pixels[p * 4] = sign ? -80 + level * 20 + face * 3 : 20 + level * 40 + face * 3;
+               pixels[p * 4 + 1] = 7 + face * 19;
+               pixels[p * 4 + 2] = 5 + level * 31;
+               pixels[p * 4 + 3] = sign ? 127 : 255;
+            }
+            p_glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, level,
+               sign ? GL_RGBA8I : GL_RGBA8UI, size, size, 0, GL_RGBA_INTEGER,
+               sign ? GL_BYTE : GL_UNSIGNED_BYTE, pixels);
+         }
+      }
+      for (unsigned mode = 0; mode < 4; ++mode) {
+         char fs[1400];
+         snprintf(fs, sizeof(fs), "#version 320 es\nprecision highp float; precision highp int;"
+            "uniform highp %ssamplerCube tex; uniform vec4 params; layout(location=0) out vec4 color;"
+            "void main(){vec3 u=abs(params.x)>0.5?vec3(0,1,0):vec3(1,0,0);"
+            "vec3 v=abs(params.z)>0.5?vec3(0,1,0):vec3(0,0,1);"
+            "vec2 p=(gl_FragCoord.xy-vec2(32.5,24.5))*0.5;"
+            "vec3 dir=params.xyz+p.x*u+p.y*v; %svec4 c=%s;"
+            "color=vec4((vec3(c.rgb)+vec3(%u,0,0))/255.0,1);"
+            "if(any(notEqual(textureSize(tex,0),ivec2(8)))||"
+            "any(notEqual(textureSize(tex,2),ivec2(2)))) color=vec4(1,0,1,1);}",
+            sign ? "i" : "u", sign ? "i" : "u", samples[mode], sign ? 128 : 0);
+         GLuint prog = link_program(vs, fs, "integer cube LOD");
+         p_glUseProgram(prog);
+         p_glUniform1i(p_glGetUniformLocation(prog, "tex"), 0);
+         GLint params = p_glGetUniformLocation(prog, "params");
+         for (unsigned face = 0; face < 6; ++face) {
+            p_glUniform4f(params, axes[face][0], axes[face][1], axes[face][2], 1.0f);
+            p_glDrawArrays(GL_TRIANGLES, 0, 3);
+            uint8_t pixel[4]; read_center(pixel, W, H);
+            const unsigned level = mode == 1 || mode == 3 ? 2 : 1;
+            const unsigned red = sign ? 48 + level * 20 + face * 3 : 20 + level * 40 + face * 3;
+            CHECK(near(pixel, red, 7 + face * 19, 5 + level * 31),
+                  "integer cube LOD sign=%u mode=%u face=%u: %u,%u,%u,%u",
+                  sign, mode, face, pixel[0], pixel[1], pixel[2], pixel[3]);
+         }
+         CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "integer cube LOD context failed");
+         p_glUseProgram(0);
+         p_glDeleteProgram(prog);
+      }
+      p_glDeleteTextures(1, &texture);
+   }
+}
+
+static void
 independent_samplers(void)
 {
    GLint units = 0;
@@ -1578,6 +1648,7 @@ exercise(const char *label, int api, wink_surface *surface)
       layered_pbo_upload();
       helper_invocation();
       independent_samplers();
+      integer_cube_lod();
       framebuffer_fetch();
    }
 

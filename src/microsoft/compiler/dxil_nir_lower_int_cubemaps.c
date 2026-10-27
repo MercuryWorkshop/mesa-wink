@@ -456,8 +456,14 @@ lower_cube_image_load_store_atomic(nir_builder *b, nir_intrinsic_instr *intr)
 static nir_def *
 lower_cube_txs(nir_builder *b, nir_tex_instr *tex)
 {
+   const bool cube_array = tex->is_array;
+   /* Query the 2D array the texture declaration has become. Its result
+    * includes a layer count, even when the original cube query did not. */
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   tex->is_array = true;
+   tex->def.num_components = 3;
    b->cursor = nir_after_instr(&tex->instr);
-   if (!tex->is_array)
+   if (!cube_array)
       return nir_trim_vector(b, &tex->def, 2);
 
    nir_def *array_dim = nir_channel(b, &tex->def, 2);

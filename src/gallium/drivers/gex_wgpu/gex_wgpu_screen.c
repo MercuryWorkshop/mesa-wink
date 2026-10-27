@@ -7889,16 +7889,9 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
    nir_def *coord = tex->src[coord_src].src.ssa;
    b->cursor = nir_after_instr(instr);
    const struct gex_wgpu_border_lowering *lower = &table->slots[slot];
-   /* An implicit LOD needs the derivative-based computation below, and that
-    * works on the *spatial* coordinate -- which for a cube is a three-component
-    * direction, not the face UV it is converted to further down, so the
-    * formula does not apply to it.
-    *
-    * With a single level there is nothing to compute: the clamp to
-    * `integer_levels - 1` takes any LOD to zero, so level zero is the answer
-    * whatever the derivatives say. That makes this exact rather than an
-    * approximation, which is the only reason it is allowed -- a mipmapped
-    * integer cube sampled with an implicit LOD is still refused, by name. */
+   /* A cube's LOD must be resolved while its coordinates are still a
+    * direction. The gradient prepass does that before face projection.
+    * If an implicit cube reaches here, only a single-level view is safe. */
    if (lower->integer_cube && tex->op != nir_texop_txl &&
        lower->integer_levels > 1) {
       gex_tex_lower_fail(table,
@@ -9454,6 +9447,41 @@ gex_wgpu_lower_integer_txd(const nir_tex_instr *tex, const void *data)
    return base == nir_type_uint || base == nir_type_int;
 }
 
+/* Resolve implicit derivatives before cube directions become face UVs.
+ * Mesa's lower_txd computes LOD in the original sampler's coordinate space,
+ * including the cube projection. A bias scales the gradients by exp2(bias). */
+static bool
+gex_wgpu_integer_sample_gradients(nir_builder *b, nir_instr *instr, void *data)
+{
+   (void)data;
+   if (instr->type != nir_instr_type_tex || b->shader->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   const nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
+   if ((base != nir_type_uint && base != nir_type_int) ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txb))
+      return false;
+   const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_src < 0)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *coord = tex->src[coord_src].src.ssa;
+   if (tex->is_array)
+      coord = nir_trim_vector(b, coord, coord->num_components - 1);
+   nir_def *dx = nir_ddx(b, coord), *dy = nir_ddy(b, coord);
+   const int bias_src = nir_tex_instr_src_index(tex, nir_tex_src_bias);
+   if (bias_src >= 0) {
+      nir_def *scale = nir_fexp2(b, tex->src[bias_src].src.ssa);
+      dx = nir_fmul(b, dx, scale);
+      dy = nir_fmul(b, dy, scale);
+      nir_tex_instr_remove_src(tex, bias_src);
+   }
+   tex->op = nir_texop_txd;
+   nir_tex_instr_add_src(tex, nir_tex_src_ddx, dx);
+   nir_tex_instr_add_src(tex, nir_tex_src_ddy, dy);
+   return true;
+}
+
 /* A texture slot the bound state cannot satisfy reads zero, and its binding
  * goes away entirely.
  *
@@ -9951,6 +9979,7 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
    const nir_lower_tex_options rect_options = {
       .lower_rect = true,
       .lower_txd_cb = gex_wgpu_lower_integer_txd,
+      .lower_invalid_implicit_lod = true,
       /* textureGatherOffsets, split into four single-offset gathers taking
        * one texel each -- Mesa's own lowering, so the rule about *which*
        * texel of each footprint is authoritative rather than remembered. The
@@ -9958,6 +9987,8 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
       .lower_tg4_offsets = true,
    };
    bool progress = false;
+   NIR_PASS(progress, nir, nir_shader_instructions_pass,
+            gex_wgpu_integer_sample_gradients, nir_metadata_control_flow, NULL);
    NIR_PASS(progress, nir, nir_lower_tex, &rect_options);
    bool has_integer_cube = false;
    for (unsigned i = 0; i < texture_count; ++i) {
