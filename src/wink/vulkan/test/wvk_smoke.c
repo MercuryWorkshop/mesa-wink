@@ -50,6 +50,43 @@ static VkPhysicalDeviceMemoryProperties mem_props;
 static PFN_vkCmdBeginRenderingKHR begin_rendering;
 static PFN_vkCmdEndRenderingKHR end_rendering;
 
+static void
+test_multiple_devices(void)
+{
+   VkDevice others[2];
+   const VkDeviceCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = 1,
+      .pQueueCreateInfos = &(VkDeviceQueueCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+         .queueFamilyIndex = 0, .queueCount = 1,
+         .pQueuePriorities = &(float){ 1.0f },
+      },
+   };
+   /* Keep the primary and both secondary devices alive together, then
+    * create another after destroying one. A browser GPUAdapter itself
+    * permits only one requestDevice, unlike a Vulkan physical device. */
+   for (unsigned i = 0; i < 2; ++i)
+      VK(vkCreateDevice(pdev, &info, NULL, &others[i]));
+   for (unsigned i = 0; i < 2; ++i) {
+      VkQueue other_queue;
+      VkFence fence;
+      vkGetDeviceQueue(others[i], 0, 0, &other_queue);
+      VK(vkCreateFence(others[i], &(VkFenceCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+      }, NULL, &fence));
+      VK(vkQueueSubmit(other_queue, 0, NULL, fence));
+      VK(vkWaitForFences(others[i], 1, &fence, VK_TRUE, UINT64_MAX));
+      vkDestroyFence(others[i], fence, NULL);
+   }
+   vkDestroyDevice(others[0], NULL);
+   VK(vkCreateDevice(pdev, &info, NULL, &others[0]));
+   VK(vkDeviceWaitIdle(others[0]));
+   vkDestroyDevice(others[0], NULL);
+   vkDestroyDevice(others[1], NULL);
+   printf("multiple logical devices: done\n");
+}
+
 #ifdef __EMSCRIPTEN_PTHREADS__
 struct host_signal {
    VkSemaphore semaphore;
@@ -708,6 +745,7 @@ main(void)
    uint32_t layer_count = 0;
    if (instance_layers) VK(instance_layers(&layer_count, NULL));
    if (device_layers) VK(device_layers(pdev, &layer_count, NULL));
+   test_multiple_devices();
    test_fence_poll();
    test_buffers();
    test_clears();
