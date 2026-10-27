@@ -51,13 +51,21 @@ texture limit keep their error path. This correction is recorded in
 Graphite mask-filter precompilation includes alpha-only blur inputs, the
 inner/solid/outer mask combinations, and the coverage geometry and render
 passes used by rectangles and blurred text paths, including single-sample
-restores after MSAA coverage and grayscale atlas fallbacks for LCD text and paths.
+restores after MSAA coverage and grayscale atlas fallbacks for text and paths,
+retaining analytic clip modifiers on the restore draw.
+Mask-filtered color text also precompiles its grayscale fallback using the
+original paint shader, before the ARGB path removes that shader.
 Gradient and YUVA precompilation also use the same intermediate alpha types
 and destination alpha types as real draws, including specialized transforms
 inside working-color-space shaders. The randomized precompile
 test also composes its perspective transform instead of generating a singular
 matrix. These corrections are recorded in `skia_fixes`; the original key and
 pipeline coverage assertions remain enabled.
+
+Runtime blend precompilation applies runtime-effect flags to each child, as
+real runtime shaders do. In particular, alpha-only image children keep their
+alpha data instead of being colorized with the paint color. This correction
+is also recorded in `skia_fixes`.
 
 The integration registers FreeType's compiled SVG renderer in its Wasm module
 list, fixing an SVG emoji metrics crash, and matches image extensions with a
@@ -135,7 +143,8 @@ an unsigned 32-bit seed, on native or browser routes. The equivalent environment
 variable is `WINK_SKIA_PAINT_KEY_SEED`; the command-line option takes precedence.
 The selected seed is recorded in run metadata and must match for comparisons.
 Without an override, Skia keeps its time-derived seed. Set
-`WINK_SKIA_TRACE_PRECOMPILE=1` on native or browser runs to print missing pipeline descriptions alongside
+`WINK_SKIA_TRACE_PRECOMPILE=1` on native or browser runs to print missing
+pipeline descriptions alongside
 precompiled candidates when diagnosing a coverage assertion.
 
 GLES always uses Wink's context factory and proc-address API. Vulkan uses an

@@ -18,9 +18,11 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'graphite-automatic-image-tiling-v1',
                      'graphite-oversized-image-shader-paint-fallback-v1',
                      'graphite-precompile-random-local-matrix-v1',
-                     'graphite-blur-precompile-coverage-v2',
+                     'graphite-blur-precompile-coverage-v3',
                      'graphite-gradient-precompile-alpha-v1',
-                     'graphite-yuv-precompile-alpha-v1']
+                     'graphite-yuv-precompile-alpha-v1',
+                     'graphite-blend-precompile-child-context-v1',
+                     'graphite-color-text-mask-precompile-v1']
 
 
 def run(args, **kwargs):
@@ -58,6 +60,38 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # Mask-filtered color glyphs can fall back to grayscale coverage. Preserve
+    # the original shader before the ARGB-only branch strips it from options.
+    patch(source, 'src/gpu/graphite/PublicPrecompile.cpp',
+          '''                // For color emoji text, shaders don't affect the final color
+                PaintOptions tmp = options;''',
+          '''                if (!options.getMaskFilters().empty()) {
+                    PaintOptions maskOptions = options;
+                    maskOptions.setMaskFilters({});
+                    PrecompileCombinations(sharedContext, maskOptions, keyContext,
+                            static_cast<DrawTypeFlags>(DrawTypeFlags::kBitmapText_Mask |
+                                                       (drawTypes & DrawTypeFlags::kAnalyticClip)),
+                            false, Coverage::kSingleChannel, renderPassDesc);
+                }
+                // For color emoji text, shaders don't affect the final color
+                PaintOptions tmp = options;''')
+    # Runtime blend shaders give their children runtime-effect semantics,
+    # including disabling paint-color colorization of alpha-only images.
+    patch(source, 'src/gpu/graphite/precompile/PrecompileShader.cpp',
+          '''        AddToKey<PrecompileShader>(keyContext, fSrcOptions, desiredSrcCombination);
+        AddToKey<PrecompileShader>(keyContext, fDstOptions, desiredDstCombination);''',
+          '''        const SkRuntimeEffect* runtimeBlend = blender->priv().asBlendMode() ? nullptr
+                : GetKnownRuntimeEffect(SkKnownRuntimeEffects::StableKey::kBlend);
+        KeyContext srcContext = runtimeBlend ? keyContext.forRuntimeEffect(runtimeBlend, 0)
+                                             : keyContext;
+        KeyContext dstContext = runtimeBlend ? keyContext.forRuntimeEffect(runtimeBlend, 1)
+                                             : keyContext;
+        AddToKey<PrecompileShader>(srcContext, fSrcOptions, desiredSrcCombination);
+        AddToKey<PrecompileShader>(dstContext, fDstOptions, desiredDstCombination);''')
+    patch(source, 'src/gpu/graphite/precompile/PrecompileShader.cpp',
+          '            blender->priv().addToKey(keyContext, blenderCombination);',
+          '''            blender->priv().addToKey(keyContext.forRuntimeEffect(runtimeBlend, 2),
+                                       blenderCombination);''')
     # The real gradient path uses unpremultiplied interpolation for perceptual
     # color spaces and for explicit unpremultiplied interpolation. This is
     # visible in specialized keys inside working-color-space shaders.
@@ -138,11 +172,15 @@ def adapt(source):
     patch(source, 'src/gpu/graphite/precompile/PrecompileMaskFilter.cpp',
           '''            restoreOptions.setMaskFilters({});''',
           '''            restoreOptions.setMaskFilters({});
-            // LCD text and complex paths with a mask filter can use a
+            // Text and complex paths with a mask filter can use a
             // grayscale atlas fallback instead of a filtered coverage layer.
-            if (drawTypes & (DrawTypeFlags::kBitmapText_LCD | DrawTypeFlags::kNonSimpleShape)) {
+            if (drawTypes & (DrawTypeFlags::kBitmapText_LCD | DrawTypeFlags::kBitmapText_Color |
+                             DrawTypeFlags::kSDFText | DrawTypeFlags::kSDFText_LCD |
+                             DrawTypeFlags::kNonSimpleShape)) {
                 restoreOptions.priv().buildCombinations(keyContext,
-                        DrawTypeFlags::kBitmapText_Mask, false, Coverage::kSingleChannel,
+                        static_cast<DrawTypeFlags>(DrawTypeFlags::kBitmapText_Mask |
+                                                   (drawTypes & DrawTypeFlags::kAnalyticClip)),
+                        false, Coverage::kSingleChannel,
                         renderPassDescIn, processCombination);
             }''')
     patch(source, 'src/gpu/graphite/precompile/PrecompileMaskFilter.cpp',
@@ -162,12 +200,21 @@ def adapt(source):
                         caps->avoidDepthMode() ? DepthStencilFlags::kNone
                                                : DepthStencilFlags::kDepth);
                 restoreOptions.priv().buildCombinations(keyContext,
-                        static_cast<DrawTypeFlags>(InternalDrawTypeFlags::kCoverageMask),
+                        static_cast<DrawTypeFlags>(static_cast<int>(InternalDrawTypeFlags::kCoverageMask) |
+                                                   (drawTypes & DrawTypeFlags::kAnalyticClip)),
                         false, Coverage::kSingleChannel, restorePass, processCombination);
                 restoreOptions.priv().buildCombinations(keyContext,
-                        DrawTypeFlags::kBitmapText_Mask, false, Coverage::kSingleChannel,
+                        static_cast<DrawTypeFlags>(DrawTypeFlags::kBitmapText_Mask |
+                                                   (drawTypes & DrawTypeFlags::kAnalyticClip)),
+                        false, Coverage::kSingleChannel,
                         restorePass, processCombination);
             }''')
+    patch(source, 'src/gpu/graphite/precompile/PrecompileMaskFilter.cpp',
+          '''                    static_cast<DrawTypeFlags>(InternalDrawTypeFlags::kCoverageMask),
+                    /* withPrimitiveBlender= */ false,''',
+          '''                    static_cast<DrawTypeFlags>(static_cast<int>(InternalDrawTypeFlags::kCoverageMask) |
+                                               (drawTypes & DrawTypeFlags::kAnalyticClip)),
+                    /* withPrimitiveBlender= */ false,''')
     patch(source, 'src/gpu/graphite/precompile/PrecompileMaskFilter.cpp',
           '''            coverageOptions.priv().buildCombinations(
                     keyContext,
