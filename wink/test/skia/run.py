@@ -17,6 +17,15 @@ HERE = Path(__file__).resolve().parent
 MESA = HERE.parents[2]
 ROUTES = {'gles': ('gles', False), 'vk': ('vulkan', False), 'grvk': ('vulkan', True),
           'grdawn_gles': ('gles', True)}
+CONFIG_ROUTES = {**{route: route for route in ROUTES},
+                 'glesmsaa4': 'gles', 'vkmsaa4': 'vk'}
+
+
+def selected_config(a):
+    config = a.config or a.route
+    if CONFIG_ROUTES.get(config) != a.route:
+        raise ValueError(f'config {config} does not use route {a.route}')
+    return config
 
 
 def parse_seed(value):
@@ -136,6 +145,8 @@ def compare(reference, candidate):
     for key in ('skia', 'skia_fixes', 'route', 'sources', 'match', 'fixtures', 'paint_key_seed'):
         if ref_run.get(key) != cand_run.get(key):
             problems.append(f'{key} differs')
+    if ref_run.get('config', ref_run.get('route')) != cand_run.get('config', cand_run.get('route')):
+        problems.append('config differs')
     if ref_run.get('role') != 'reference' or cand_run.get('role') != 'candidate':
         problems.append('expected independent reference and candidate roles')
     if not ref_run.get('pass') or not cand_run.get('pass'):
@@ -214,7 +225,7 @@ def execute(a):
     env.pop('WINK_SKIA_REFERENCE_GLES', None)
     if a.role == 'reference' and a.reference_angle:
         env['WINK_SKIA_REFERENCE_GLES'] = '1'
-    config, graphite = a.route, ROUTES[a.route][1]
+    config, graphite = selected_config(a), ROUTES[a.route][1]
     args = [str(a.dm.resolve()), '--config', config, '--src', *a.sources,
             '--resourcePath', str(source / 'resources'), '--images', str(source / 'resources/images'),
             '--threads', '0', '--verbose', '--nocpu']
@@ -223,7 +234,7 @@ def execute(a):
         args += ['--match', *a.match]
     manifest = a.dm.parent / 'wink-build.json'
     skia_fixes = json.loads(manifest.read_text()).get('skia_fixes', []) if manifest.is_file() else []
-    metadata = dict(schema=1, role=a.role, route=a.route, target='native', skia=revision,
+    metadata = dict(schema=1, role=a.role, route=a.route, config=config, target='native', skia=revision,
                     skia_fixes=skia_fixes,
                     wink=subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
                     dm_sha256=digest(a.dm), host=platform.platform(), sources=a.sources,
@@ -286,6 +297,8 @@ def main():
         s.add_argument('--browser-dir', type=Path, help='Directory containing a browser DM build')
         s.add_argument('--source', type=Path, default=MESA / 'build/skia/deps/skia')
         s.add_argument('--route', choices=ROUTES, required=True)
+        s.add_argument('--config', choices=CONFIG_ROUTES,
+                       help='Skia rendering configuration; defaults to the selected route')
         s.add_argument('--out', type=Path, required=True)
         s.add_argument('--sources', nargs='+', default=['tests', 'gm', 'image'])
         s.add_argument('--match', nargs='+', default=[])
@@ -307,6 +320,7 @@ def main():
             a.out.parent.mkdir(parents=True, exist_ok=True)
             write_json(a.out, report)
             return 0 if report['pass'] else 1
+        selected_config(a)
         if a.target != 'native':
             from run_browser import execute as execute_browser
             return execute_browser(a)

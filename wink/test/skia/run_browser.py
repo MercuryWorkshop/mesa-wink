@@ -7,7 +7,7 @@ import shutil
 import subprocess
 from urllib.parse import urlencode
 
-from run import HERE, MESA, ROUTES, digest, events, fixtures, inspect_run, selected_seed, write_json
+from run import HERE, MESA, ROUTES, digest, events, fixtures, inspect_run, selected_config, selected_seed, write_json
 
 
 def execute(a):
@@ -25,9 +25,10 @@ def execute(a):
         raise ValueError('Skia revision differs from pins.json')
     a.out.mkdir(parents=True)
     graphite = ROUTES[a.route][1]
+    config = selected_config(a)
     seed = selected_seed(a)
     trace = os.environ.get('WINK_SKIA_TRACE_PRECOMPILE')
-    args = ['--config', a.route, '--src', *a.sources, '--resourcePath', '/resources',
+    args = ['--config', config, '--src', *a.sources, '--resourcePath', '/resources',
             '--images', '/resources/images', '--threads', '0',
             '--gpuThreads', '0' if a.target == 'st' else '2', '--verbose', '--nocpu']
     args += ['--nogpu', '--graphite'] if graphite else ['--nographite']
@@ -35,7 +36,7 @@ def execute(a):
         args += ['--match', *a.match]
     manifest = build / 'wink-build.json'
     skia_fixes = json.loads(manifest.read_text()).get('skia_fixes', []) if manifest.is_file() else []
-    metadata = dict(schema=1, role='candidate', route=a.route, target=a.target,
+    metadata = dict(schema=1, role='candidate', route=a.route, config=config, target=a.target,
                     skia_fixes=skia_fixes,
                     skia=pin, sources=a.sources, match=a.match, fixtures=fixtures(a.source),
                     paint_key_seed=seed,

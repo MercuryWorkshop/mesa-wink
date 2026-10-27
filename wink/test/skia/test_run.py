@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 spec = importlib.util.spec_from_file_location('skia_run', Path(__file__).with_name('run.py'))
@@ -97,6 +98,16 @@ class ExecutionIntegrity(unittest.TestCase):
         self.assertEqual(result['units_without_context'], ['VKOnly'])
 
 
+class ConfigurationIntegrity(unittest.TestCase):
+    def test_configs_keep_the_selected_backend(self):
+        for config, route in suite.CONFIG_ROUTES.items():
+            self.assertEqual(suite.selected_config(SimpleNamespace(route=route, config=config)), config)
+            self.assertEqual(suite.selected_config(SimpleNamespace(route=route, config=None)), route)
+        for route, config in [('gles', 'vkmsaa4'), ('vk', 'glesmsaa4'), ('grvk', 'vkmsaa4')]:
+            with self.assertRaises(ValueError):
+                suite.selected_config(SimpleNamespace(route=route, config=config))
+
+
 class ReferenceIntegrity(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -116,6 +127,13 @@ class ReferenceIntegrity(unittest.TestCase):
 
     def test_exact_pixels_pass(self):
         self.assertTrue(suite.compare(self.ref, self.candidate)['pass_'])
+
+    def test_different_sample_configuration_fails_with_identical_pixels(self):
+        path = self.candidate / 'run.json'
+        run = json.loads(path.read_text())
+        run['config'] = 'glesmsaa4'
+        suite.write_json(path, run)
+        self.assertIn('config differs', suite.compare(self.ref, self.candidate)['problems'])
 
     def test_different_random_seed_fails_even_with_identical_pixels(self):
         path = self.candidate / 'run.json'

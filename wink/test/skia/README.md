@@ -157,6 +157,11 @@ allow a reduced reproducer. A reduced run does not establish full coverage.
 Additional resource corpora such as SKPs must be separately pinned before
 being included in the acceptance suite.
 
+Use `--route gles --config glesmsaa4` or `--route vk --config vkmsaa4` to run
+Skia's four-sample rendering configurations on native or browser targets.
+The route still controls the context factory and backend identity checks.
+Comparisons require the same rendering configuration, including sample count.
+
 Use `--paint-key-seed 1793113975` to replay `PaintParamsKeyTestReduced` with
 an unsigned 32-bit seed, on native or browser routes. The equivalent environment
 variable is `WINK_SKIA_PAINT_KEY_SEED`; the command-line option takes precedence.
