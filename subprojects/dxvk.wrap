@@ -1,0 +1,6 @@
+[wrap-git]
+directory = dxvk
+
+url = https://github.com/MercuryWorkshop/dirk.git
+revision = e8312540f937757b2524e29b6f86b124727f626a
+clone-recursive = true
