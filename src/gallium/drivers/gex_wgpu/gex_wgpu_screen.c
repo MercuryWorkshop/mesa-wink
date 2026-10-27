@@ -7030,6 +7030,27 @@ enum { GEX_WGPU_PASS_END_STAGED, GEX_WGPU_PASS_END_CLEAR,
 static uint64_t gex_wgpu_pass_ends[GEX_WGPU_PASS_END_COUNT + 1];
 /* Bind group cache misses by what the slot held (gex_wgpu_cached_bind_group). */
 static uint64_t gex_wgpu_bg_miss_why[6];
+/* Bind group cache invalidations by what made them: a sampler view or a
+ * sampler state deleted, for the timing report. */
+static uint64_t gex_wgpu_bg_epoch_view, gex_wgpu_bg_epoch_sampler;
+
+/* GEX_WGPU_BG_KEEP=1: a sampler view or sampler state deleted no longer
+ * invalidates the whole bind group cache. Every slot holds a reference to
+ * each buffer, view and sampler its key names (gex_wgpu_bg_entries_ref), so
+ * a deleted one's handle stays alive, and its address cannot come back for
+ * another object, until the slot naming it is evicted. A view that owned a
+ * texture of its own (a reinterpreted or decoded copy) still invalidates,
+ * since that texture is destroyed with it. */
+static bool
+gex_wgpu_bg_keep_on(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("GEX_WGPU_BG_KEEP");
+      on = v && *v && *v != '0';
+   }
+   return on != 0;
+}
 static uint64_t gex_wgpu_staged_by_size[4], gex_wgpu_staged_by_bind[4],
    gex_wgpu_staged_bytes, gex_wgpu_norename_big_rename, gex_wgpu_norename_big_carry;
 #define GEX_WGPU_PASS_END(ctx, why) \
@@ -22415,12 +22436,16 @@ gex_wgpu_sampler_view_destroy(struct pipe_context *pipe,
    /* The bind group cache keys on the entry bytes, and those name
     * this object by address -- which Dawn hands straight back for the
     * next one. Retire every cached binding rather than let a key match
-    * a view that no longer exists. */
-   ++gex_screen(pipe->screen)->cache_epoch;
+    * a view that no longer exists (see gex_wgpu_bg_keep_on). */
+   struct gex_wgpu_sampler_view *view = (struct gex_wgpu_sampler_view *)base;
+   if (!gex_wgpu_bg_keep_on() || view->reinterpret || view->decoded ||
+       view->reinterpret_staging) {
+      ++gex_screen(pipe->screen)->cache_epoch;
+      ++gex_wgpu_bg_epoch_view;
+   }
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
    (void)pipe;
-   struct gex_wgpu_sampler_view *view = (struct gex_wgpu_sampler_view *)base;
    pipe_resource_reference(&view->base.texture, NULL);
    if (view->view)
       wgpuTextureViewRelease(view->view);
@@ -22772,8 +22797,11 @@ gex_wgpu_delete_sampler_state(struct pipe_context *pipe, void *state)
    /* The bind group cache keys on the entry bytes, and those name
     * this object by address -- which Dawn hands straight back for the
     * next one. Retire every cached binding rather than let a key match
-    * a sampler that no longer exists. */
-   ++gex_screen(pipe->screen)->cache_epoch;
+    * a sampler that no longer exists (see gex_wgpu_bg_keep_on). */
+   if (!gex_wgpu_bg_keep_on()) {
+      ++gex_screen(pipe->screen)->cache_epoch;
+      ++gex_wgpu_bg_epoch_sampler;
+   }
    GEX_ENTRY_TIMER();
    (void)pipe;
    struct gex_wgpu_sampler *sampler = state;
@@ -40825,15 +40853,19 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
             was_bg[0] = sc->bg_cache_hits;
             was_bg[1] = sc->bg_cache_misses;
             {
-               static uint64_t wmw[6];
+               static uint64_t wmw[6], wep[2];
                fprintf(stderr,
                        "gex-wgpu: bind group misses per frame by what the cache slot held -- "
                        "nothing %.1f, another layout %.1f; this layout with another buffer "
-                       "%.1f, offset or size %.1f, view %.1f, sampler %.1f\n",
+                       "%.1f, offset or size %.1f, view %.1f, sampler %.1f; "
+                       "whole cache dropped by a sampler view deleted %.1f, a sampler %.1f\n",
                        (gex_wgpu_bg_miss_why[0] - wmw[0]) / f, (gex_wgpu_bg_miss_why[1] - wmw[1]) / f,
                        (gex_wgpu_bg_miss_why[2] - wmw[2]) / f, (gex_wgpu_bg_miss_why[3] - wmw[3]) / f,
-                       (gex_wgpu_bg_miss_why[4] - wmw[4]) / f, (gex_wgpu_bg_miss_why[5] - wmw[5]) / f);
+                       (gex_wgpu_bg_miss_why[4] - wmw[4]) / f, (gex_wgpu_bg_miss_why[5] - wmw[5]) / f,
+                       (gex_wgpu_bg_epoch_view - wep[0]) / f, (gex_wgpu_bg_epoch_sampler - wep[1]) / f);
                memcpy(wmw, gex_wgpu_bg_miss_why, sizeof(wmw));
+               wep[0] = gex_wgpu_bg_epoch_view;
+               wep[1] = gex_wgpu_bg_epoch_sampler;
             }
 #undef GEX_PER
             was = *m;
