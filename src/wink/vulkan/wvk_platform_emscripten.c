@@ -41,8 +41,13 @@ wvk_platform_wait_any(WGPUInstance instance, WGPUFutureWaitInfo *waits, size_t c
    (void)instance;
    (void)waits;
    (void)count;
-   if (timeout_ns == 0)
+   if (timeout_ns == 0) {
+      /* A tight Vulkan status-poll loop otherwise never returns to JS,
+       * so even a completed GPU promise cannot deliver its callback.
+       * Yield one event-loop turn, without waiting for GPU completion. */
+      wvk_js_wait(0);
       return WGPUWaitStatus_TimedOut;
+   }
    wvk_js_wait(timeout_ns == UINT64_MAX ? -1.0 : ceil(timeout_ns / 1e6));
    return WGPUWaitStatus_Success;
 }

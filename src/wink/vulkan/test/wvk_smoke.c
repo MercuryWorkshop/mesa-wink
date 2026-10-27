@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int failures;
 
@@ -139,6 +140,45 @@ begin(VkCommandBufferUsageFlags flags)
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = flags,
    }));
    return cmd;
+}
+
+/* Status polling alone must finish the submit and publish mapped readback
+ * data. No blocking Vulkan wait is allowed to make this test pass. */
+static void
+test_fence_poll(void)
+{
+   const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   struct buffer out = make_buffer(16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host);
+   VkCommandBuffer cmd = begin(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+   vkCmdFillBuffer(cmd, out.buffer, 0, 16, 0x12345678);
+   VK(vkEndCommandBuffer(cmd));
+   VkFence fence;
+   VK(vkCreateFence(dev, &(VkFenceCreateInfo){ .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }, NULL, &fence));
+   CHECK(vkGetFenceStatus(dev, fence) == VK_NOT_READY, "unsubmitted fence signaled");
+   VK(vkQueueSubmit(queue, 1, &(VkSubmitInfo){
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd,
+   }, fence));
+   struct timespec start, now;
+   timespec_get(&start, TIME_UTC);
+   VkResult status;
+   unsigned polls = 0;
+   do {
+      status = (++polls & 1) ? vkGetFenceStatus(dev, fence) : vkWaitForFences(dev, 1, &fence, VK_TRUE, 0);
+      if (status == VK_SUCCESS)
+         break;
+      CHECK(status == VK_NOT_READY || status == VK_TIMEOUT, "fence poll returned %d", status);
+      timespec_get(&now, TIME_UTC);
+   } while (now.tv_sec - start.tv_sec < 10);
+   CHECK(status == VK_SUCCESS, "fence status polling made no progress");
+   if (status == VK_SUCCESS) {
+      for (unsigned i = 0; i < 4; ++i)
+         CHECK(((uint32_t *)out.map)[i] == 0x12345678, "poll readback word %u not published", i);
+   } else {
+      VK(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
+   }
+   vkDestroyFence(dev, fence, NULL);
+   free_buffer(&out);
+   printf("fence status polling: done\n");
 }
 
 static void
@@ -616,6 +656,7 @@ main(void)
       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
    }, NULL, &pool));
 
+   test_fence_poll();
    test_buffers();
    test_clears();
    test_sync();
