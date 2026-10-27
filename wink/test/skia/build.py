@@ -11,6 +11,7 @@ import sys
 
 HERE = Path(__file__).resolve().parent
 MESA = HERE.parents[2]
+CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1']
 
 
 def run(args, **kwargs):
@@ -48,6 +49,12 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # Unlike buffer uploads, this pinned host-copy path counts blocks rather
+    # than texels. VK_EXT_host_image_copy uses the same texel row-length rule.
+    patch(source, 'src/gpu/graphite/vk/VulkanTexture.cpp',
+          '        copyRegion.memoryRowLength = levels[currentMipLevel].fRowBytes / bpp;',
+          '''        copyRegion.memoryRowLength = (levels[currentMipLevel].fRowBytes / bpp) *
+                CompressedDimensions(TextureFormatCompressionType(format), {1, 1}).width();''')
     target = source / 'tools/ganesh/gl/wink'
     target.mkdir(parents=True, exist_ok=True)
     shutil.copy2(HERE / 'GLTestContext_wink.cpp', target)
@@ -283,7 +290,7 @@ def main():
     run([source / 'bin/gn', 'gen', build], cwd=source)
     run(['ninja', '-C', build, '-j', a.jobs, 'dm', 'skdiff'], cwd=source)
     (build / 'wink-build.json').write_text(json.dumps({
-        'schema': 1, 'skia': pin, 'gn_args': args,
+        'schema': 1, 'skia': pin, 'gn_args': args, 'skia_fixes': CORRECTNESS_FIXES,
         'wink': subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
         'routes': ['gles', 'vk', 'grvk'] + (['grdawn_gles'] if a.dawn_gles else []),
     }, indent=2) + '\n')

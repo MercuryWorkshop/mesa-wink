@@ -102,6 +102,8 @@ def main():
     (build / 'args.gn').write_text('\n'.join(f'{k} = {json.dumps(v)}' for k, v in args.items()) + '\n')
     base.run([source / 'bin/gn', 'gen', build], cwd=source)
     base.run(['ninja', '-C', build, '-j', a.jobs, 'dm'], cwd=source)
+    (build / 'wink-build.json').write_text(json.dumps(dict(
+        schema=1, skia=pin, skia_fixes=base.CORRECTNESS_FIXES, gn_args=args), indent=2) + '\n')
     shutil.copy2(HERE / 'browser.html', build / 'index.html')
 
 

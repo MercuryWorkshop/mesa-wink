@@ -115,7 +115,7 @@ def compare(reference, candidate):
     ref_run = json.loads((reference / 'run.json').read_text())
     cand_run = json.loads((candidate / 'run.json').read_text())
     problems = []
-    for key in ('skia', 'route', 'sources', 'match', 'fixtures'):
+    for key in ('skia', 'skia_fixes', 'route', 'sources', 'match', 'fixtures'):
         if ref_run.get(key) != cand_run.get(key):
             problems.append(f'{key} differs')
     if ref_run.get('role') != 'reference' or cand_run.get('role') != 'candidate':
@@ -200,7 +200,10 @@ def execute(a):
     args += ['--nogpu', '--graphite'] if graphite else ['--nographite']
     if a.match:
         args += ['--match', *a.match]
+    manifest = a.dm.parent / 'wink-build.json'
+    skia_fixes = json.loads(manifest.read_text()).get('skia_fixes', []) if manifest.is_file() else []
     metadata = dict(schema=1, role=a.role, route=a.route, target='native', skia=revision,
+                    skia_fixes=skia_fixes,
                     wink=subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
                     dm_sha256=digest(a.dm), host=platform.platform(), sources=a.sources,
                     match=a.match, fixtures=fixtures(source), command=args,

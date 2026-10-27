@@ -20,6 +20,14 @@ its dependencies and `bin/fetch-gn` pins GN. `pins.json` pins Skia itself.
 The adapter modifies only that disposable dependency checkout. Patch anchors
 and revision checks fail if the upstream source no longer matches.
 
+The pinned Skia integration also fixes its compressed Vulkan host-copy row
+length: `memoryRowLength` counts texels, while the original code passed the
+number of compression blocks. This fixes corrupted Graphite uploads on
+drivers exposing host image copy. The `skia_fixes` build/run metadata records
+this correction, and comparisons reject different fix sets. Keep unpatched
+failure artifacts when investigating upstream behavior. No image tolerance is
+added by this correction.
+
 The default native build enables `gles`, `vk`, and `grvk`. To additionally
 build Graphite through an outer Dawn GLES backend:
 

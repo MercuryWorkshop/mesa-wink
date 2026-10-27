@@ -30,7 +30,10 @@ def execute(a):
     args += ['--nogpu', '--graphite'] if graphite else ['--nographite']
     if a.match:
         args += ['--match', *a.match]
+    manifest = build / 'wink-build.json'
+    skia_fixes = json.loads(manifest.read_text()).get('skia_fixes', []) if manifest.is_file() else []
     metadata = dict(schema=1, role='candidate', route=a.route, target=a.target,
+                    skia_fixes=skia_fixes,
                     skia=pin, sources=a.sources, match=a.match, fixtures=fixtures(a.source),
                     wasm_sha256=digest(build / 'dm.wasm'), js_sha256=digest(build / 'dm.js'),
                     wink=subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),

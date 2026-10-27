@@ -109,6 +109,13 @@ class ReferenceIntegrity(unittest.TestCase):
     def test_exact_pixels_pass(self):
         self.assertTrue(suite.compare(self.ref, self.candidate)['pass_'])
 
+    def test_different_skia_correctness_fixes_fail(self):
+        path = self.candidate / 'run.json'
+        run = json.loads(path.read_text())
+        run['skia_fixes'] = ['compressed-host-copy-fix']
+        suite.write_json(path, run)
+        self.assertFalse(suite.compare(self.ref, self.candidate)['pass_'])
+
     def test_alpha_or_pixel_change_fails(self):
         suite.write_json(self.candidate / 'dm.json', {'results': [self.row('clip', 'changed-alpha')]})
         self.assertFalse(suite.compare(self.ref, self.candidate)['pass_'])
