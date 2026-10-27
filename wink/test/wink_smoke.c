@@ -103,6 +103,8 @@ note(const char *fmt, ...)
    X(void, BindTexture, (GLenum, GLuint))                                        \
    X(void, ActiveTexture, (GLenum))                                             \
    X(void, TexParameteri, (GLenum, GLenum, GLint))                               \
+   X(void, TexParameterIiv, (GLenum, GLenum, const GLint *))                    \
+   X(void, TexParameterIuiv, (GLenum, GLenum, const GLuint *))                  \
    X(void, TexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
    X(void, TexImage3D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
    X(void, TexSubImage3D, (GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, const void *)) \
@@ -950,6 +952,83 @@ integer_cube_lod(void)
 }
 
 static void
+integer_texture_offsets(void)
+{
+   const char *vs = "#version 320 es\n"
+      "void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+      "gl_Position=vec4(p*2.0-1.0,0,1);}";
+   const char *samples[] = {
+      "textureOffset(tex,p,ivec2(2,-1))",
+      "textureLodOffset(tex,p,1.0,ivec2(2,-1))",
+      "textureGradOffset(tex,p,vec2(0.25,0),vec2(0,0.25),ivec2(2,-1))",
+      "textureProjOffset(tex,vec3(p*2.0,2.0),ivec2(2,-1))",
+      "textureProjLodOffset(tex,vec3(p*2.0,2.0),1.0,ivec2(2,-1))",
+      "textureProjGradOffset(tex,vec3(p*2.0,2.0),vec2(0.25,0),vec2(0,0.25),ivec2(2,-1))",
+   };
+   const GLenum wraps[] = {GL_REPEAT, GL_MIRRORED_REPEAT, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_BORDER};
+   const float coords[][2] = {{0.875f,0.125f}, {1.125f,1.125f}, {-0.125f,0.875f}};
+   const unsigned expected[][4] = {{14,3,4,17}, {15,14,16,17}, {10,10,10,10}};
+   GLuint vao;
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glActiveTexture(GL_TEXTURE0);
+   for (unsigned sign = 0; sign < 2; ++sign) {
+      GLuint texture;
+      p_glGenTextures(1, &texture);
+      p_glBindTexture(GL_TEXTURE_2D, texture);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      const GLint signed_border[] = {-15,0,0,127};
+      const GLuint unsigned_border[] = {17,0,0,255};
+      if (sign)
+         p_glTexParameterIiv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, signed_border);
+      else
+         p_glTexParameterIuiv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, unsigned_border);
+      for (unsigned level = 0; level < 4; ++level) {
+         const unsigned size = 8 >> level;
+         uint8_t pixels[8 * 8 * 4];
+         for (unsigned p = 0; p < size * size; ++p) {
+            pixels[4*p] = (level == 1 ? p + 1 : 0) - (sign ? 32 : 0);
+            pixels[4*p+1] = pixels[4*p+2] = 0;
+            pixels[4*p+3] = sign ? 127 : 255;
+         }
+         p_glTexImage2D(GL_TEXTURE_2D, level, sign ? GL_RGBA8I : GL_RGBA8UI,
+                       size, size, 0, GL_RGBA_INTEGER, sign ? GL_BYTE : GL_UNSIGNED_BYTE, pixels);
+      }
+      for (unsigned mode = 0; mode < sizeof(samples)/sizeof(samples[0]); ++mode) {
+         char fs[900];
+         snprintf(fs, sizeof(fs), "#version 320 es\nprecision highp float; precision highp int;"
+            "uniform highp %ssampler2D tex; uniform vec4 coords; out vec4 color;"
+            "void main(){vec2 p=coords.xy+(gl_FragCoord.xy-vec2(32.5,24.5))*0.25;"
+            "color=vec4(float(%s.r+%s)*10.0/255.0,0,0,1);}",
+            sign ? "i" : "u", samples[mode], sign ? "32" : "0u");
+         GLuint prog = link_program(vs, fs, "integer texture offset");
+         p_glUseProgram(prog);
+         p_glUniform1i(p_glGetUniformLocation(prog, "tex"), 0);
+         GLint location = p_glGetUniformLocation(prog, "coords");
+         for (unsigned wrap = 0; wrap < 4; ++wrap) {
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wraps[wrap]);
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wraps[wrap]);
+            for (unsigned pos = 0; pos < 3; ++pos) {
+               p_glUniform4f(location, coords[pos][0], coords[pos][1], 0, 0);
+               p_glDrawArrays(GL_TRIANGLES, 0, 3);
+               uint8_t pixel[4]; read_center(pixel, W, H);
+               CHECK(near(pixel, expected[pos][wrap]*10, 0, 0),
+                     "integer offset sign=%u mode=%u wrap=%u pos=%u: %u,%u,%u,%u",
+                     sign, mode, wrap, pos, pixel[0], pixel[1], pixel[2], pixel[3]);
+            }
+         }
+         p_glUseProgram(0);
+         p_glDeleteProgram(prog);
+      }
+      p_glDeleteTextures(1, &texture);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "integer texture offset context failed");
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+}
+
+static void
 independent_samplers(void)
 {
    GLint units = 0;
@@ -1740,6 +1819,7 @@ exercise(const char *label, int api, wink_surface *surface)
       helper_invocation();
       independent_samplers();
       integer_cube_lod();
+      integer_texture_offsets();
       framebuffer_fetch();
       external_image(ctx, surface);
    }

@@ -7860,6 +7860,7 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
    const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    const int lod_src = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   const int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_offset);
    struct gex_wgpu_texture_lowering *table = data;
    const bool is_1d = tex->sampler_dim == GLSL_SAMPLER_DIM_1D;
    const bool is_3d = tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
@@ -7983,11 +7984,11 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       if (wrap == PIPE_TEX_WRAP_REPEAT) {
          wrapped[axis] = nir_ffract(b, component);
       } else if (wrap == PIPE_TEX_WRAP_MIRROR_REPEAT) {
-         nir_def *period = nir_fmul_imm(b, nir_ffract(
+         /* Keep the direction within the two-image period until after the
+          * integer texel offset is applied. Folding first would reverse an
+          * offset on every other mirrored image. */
+         wrapped[axis] = nir_fmul_imm(b, nir_ffract(
             b, nir_fmul_imm(b, component, 0.5f)), 2.0f);
-         wrapped[axis] = nir_fsub(
-            b, nir_imm_float(b, 1.0f),
-            nir_fabs(b, nir_fadd_imm(b, period, -1.0f)));
       } else {
          wrapped[axis] = component;
       }
@@ -8000,14 +8001,29 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       nir_i2f32(
          b, nir_channels(b, &txs->def, spatial_mask)));
    nir_def *texel = nir_f2i32(b, nir_ffloor(b, scaled));
-   nir_def *zero_coord = is_1d ? nir_imm_int(b, 0)
-      : is_3d ? nir_imm_ivec3(b, 0, 0, 0)
-              : nir_imm_ivec2(b, 0, 0);
-   texel = nir_imin(
-      b, nir_imax(b, texel, zero_coord),
-      nir_iadd_imm(
-         b, nir_channels(
-            b, &txs->def, spatial_mask), -1));
+   if (offset_src >= 0)
+      texel = nir_iadd(b, texel, tex->src[offset_src].src.ssa);
+   nir_def *unwrapped_texel = texel;
+   nir_def *indices[3];
+   for (unsigned axis = 0; axis < spatial_components; ++axis) {
+      nir_def *index = nir_channel(b, texel, axis);
+      nir_def *size = nir_channel(b, &txs->def, axis);
+      const unsigned wrap = axis == 0 ? lower->integer_wrap_s
+                            : axis == 1 ? lower->integer_wrap_t
+                                        : lower->integer_wrap_r;
+      if (wrap == PIPE_TEX_WRAP_REPEAT) {
+         index = nir_imod(b, index, size);
+      } else if (wrap == PIPE_TEX_WRAP_MIRROR_REPEAT) {
+         nir_def *period = nir_imul_imm(b, size, 2);
+         index = nir_imod(b, index, period);
+         index = nir_imin(b, index, nir_isub(b, nir_iadd_imm(b, period, -1), index));
+      } else {
+         index = nir_imin(b, nir_imax(b, index, nir_imm_int(b, 0)),
+                           nir_iadd_imm(b, size, -1));
+      }
+      indices[axis] = index;
+   }
+   texel = nir_vec(b, indices, spatial_components);
    nir_def *fetch_coord = texel;
    if (tex->is_array) {
       const unsigned layer_component = spatial_components;
@@ -8052,13 +8068,11 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
                                            : lower->integer_wrap_r;
          if (wrap != PIPE_TEX_WRAP_CLAMP_TO_BORDER)
             continue;
-         nir_def *component = nir_channel(b, coord, axis);
-         /* `>= 1` for the same reason as in the float path above: at c == 1.0
-          * the nearest texel index is `size`, one past the end. */
+         nir_def *component = nir_channel(b, unwrapped_texel, axis);
          outside = nir_ior(
             b, outside,
-            nir_ior(b, nir_flt_imm(b, component, 0.0f),
-                    nir_fge_imm(b, component, 1.0f)));
+            nir_ior(b, nir_ilt_imm(b, component, 0),
+                    nir_ige(b, component, nir_channel(b, &txs->def, axis))));
       }
       nir_def *border = nir_imm_ivec4(
          b, (int32_t)lower->integer_border[0],
@@ -9976,6 +9990,9 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
                                struct pipe_sampler_view *const *views)
 {
    struct gex_wgpu_texture_lowering table = {0};
+   const nir_lower_tex_options projector_options = {
+      .lower_txp = ~0u,
+   };
    const nir_lower_tex_options rect_options = {
       .lower_rect = true,
       .lower_txd_cb = gex_wgpu_lower_integer_txd,
@@ -9987,6 +10004,10 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
       .lower_tg4_offsets = true,
    };
    bool progress = false;
+   /* Integer sampling becomes texelFetch, which has no projector operand.
+    * Divide first so implicit gradients describe the projected coordinates;
+    * explicit gradients already describe that space in GLSL. */
+   NIR_PASS(progress, nir, nir_lower_tex, &projector_options);
    NIR_PASS(progress, nir, nir_shader_instructions_pass,
             gex_wgpu_integer_sample_gradients, nir_metadata_control_flow, NULL);
    NIR_PASS(progress, nir, nir_lower_tex, &rect_options);
