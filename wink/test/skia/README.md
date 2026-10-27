@@ -48,6 +48,13 @@ cannot be uploaded. Raw shaders and conversion failures for images within the
 texture limit keep their error path. This correction is recorded in
 `skia_fixes`.
 
+Graphite mask-filter precompilation includes alpha-only blur inputs, the
+inner/solid/outer mask combinations, and the coverage geometry and render
+passes used by rectangles and blurred text paths. The randomized precompile
+test also composes its perspective transform instead of generating a singular
+matrix. Both corrections are recorded in `skia_fixes`; the original key and
+pipeline coverage assertions remain enabled.
+
 The integration registers FreeType's compiled SVG renderer in its Wasm module
 list, fixing an SVG emoji metrics crash, and matches image extensions with a
 leading dot so `.wbmp` is not also collected as `bmp`. These corrections are
@@ -118,6 +125,14 @@ architecture, GMs, and the pinned image resources. `--sources` and `--match`
 allow a reduced reproducer. A reduced run does not establish full coverage.
 Additional resource corpora such as SKPs must be separately pinned before
 being included in the acceptance suite.
+
+Use `--paint-key-seed 1793113975` to replay `PaintParamsKeyTestReduced` with
+an unsigned 32-bit seed, on native or browser routes. The equivalent environment
+variable is `WINK_SKIA_PAINT_KEY_SEED`; the command-line option takes precedence.
+The selected seed is recorded in run metadata and must match for comparisons.
+Without an override, Skia keeps its time-derived seed. Native runs can set
+`WINK_SKIA_TRACE_PRECOMPILE=1` to print missing pipeline descriptions alongside
+precompiled candidates when diagnosing a coverage assertion.
 
 GLES always uses Wink's context factory and proc-address API. Vulkan uses an
 explicit ICD manifest (`--icd` overrides the default native build). GPU unit

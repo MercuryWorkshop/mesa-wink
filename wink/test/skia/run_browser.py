@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from urllib.parse import urlencode
 
-from run import HERE, MESA, ROUTES, digest, events, fixtures, inspect_run, write_json
+from run import HERE, MESA, ROUTES, digest, events, fixtures, inspect_run, selected_seed, write_json
 
 
 def execute(a):
@@ -24,6 +24,7 @@ def execute(a):
         raise ValueError('Skia revision differs from pins.json')
     a.out.mkdir(parents=True)
     graphite = ROUTES[a.route][1]
+    seed = selected_seed(a)
     args = ['--config', a.route, '--src', *a.sources, '--resourcePath', '/resources',
             '--images', '/resources/images', '--threads', '0',
             '--gpuThreads', '0' if a.target == 'st' else '2', '--verbose', '--nocpu']
@@ -35,6 +36,7 @@ def execute(a):
     metadata = dict(schema=1, role='candidate', route=a.route, target=a.target,
                     skia_fixes=skia_fixes,
                     skia=pin, sources=a.sources, match=a.match, fixtures=fixtures(a.source),
+                    paint_key_seed=seed,
                     wasm_sha256=digest(build / 'dm.wasm'), js_sha256=digest(build / 'dm.js'),
                     wink=subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
                     **{'pass': False, 'problems': ['execution has not completed']})
@@ -44,7 +46,10 @@ def execute(a):
         result_path = (a.out / f'{phase}-browser.json').resolve()
         artifact_dir = (a.out / f'{phase}-artifacts').resolve()
         phase_args = args + (['--dryRun'] if phase == 'inventory' else ['--writePath', '/out'])
-        query = urlencode({'args': json.dumps(phase_args), 'route': a.route, 'target': a.target})
+        options = {'args': json.dumps(phase_args), 'route': a.route, 'target': a.target}
+        if seed is not None:
+            options['paint-key-seed'] = seed
+        query = urlencode(options)
         command = ['node', str(HERE.parent / 'run-browser.mjs'), str(build),
                    '--page=index.html?' + query, '--timeout=' + str(a.timeout),
                    '--result=' + str(result_path), '--artifact-dir=' + str(artifact_dir)]

@@ -117,6 +117,15 @@ class ReferenceIntegrity(unittest.TestCase):
     def test_exact_pixels_pass(self):
         self.assertTrue(suite.compare(self.ref, self.candidate)['pass_'])
 
+    def test_different_random_seed_fails_even_with_identical_pixels(self):
+        path = self.candidate / 'run.json'
+        run = json.loads(path.read_text())
+        run['paint_key_seed'] = 1793113975
+        suite.write_json(path, run)
+        result = suite.compare(self.ref, self.candidate)
+        self.assertFalse(result['pass_'])
+        self.assertIn('paint_key_seed differs', result['problems'])
+
     def test_different_skia_correctness_fixes_fail(self):
         path = self.candidate / 'run.json'
         run = json.loads(path.read_text())

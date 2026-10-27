@@ -19,6 +19,20 @@ ROUTES = {'gles': ('gles', False), 'vk': ('vulkan', False), 'grvk': ('vulkan', T
           'grdawn_gles': ('gles', True)}
 
 
+def parse_seed(value):
+    seed = int(value, 10)
+    if not 0 <= seed <= 0xffffffff:
+        raise ValueError('seed must be an unsigned 32-bit integer')
+    return seed
+
+
+def selected_seed(a):
+    if a.paint_key_seed is not None:
+        return a.paint_key_seed
+    value = os.environ.get('WINK_SKIA_PAINT_KEY_SEED')
+    return parse_seed(value) if value is not None else None
+
+
 def digest(path):
     h = hashlib.sha256()
     with Path(path).open('rb') as stream:
@@ -119,7 +133,7 @@ def compare(reference, candidate):
     ref_run = json.loads((reference / 'run.json').read_text())
     cand_run = json.loads((candidate / 'run.json').read_text())
     problems = []
-    for key in ('skia', 'skia_fixes', 'route', 'sources', 'match', 'fixtures'):
+    for key in ('skia', 'skia_fixes', 'route', 'sources', 'match', 'fixtures', 'paint_key_seed'):
         if ref_run.get(key) != cand_run.get(key):
             problems.append(f'{key} differs')
     if ref_run.get('role') != 'reference' or cand_run.get('role') != 'candidate':
@@ -184,6 +198,9 @@ def execute(a):
     if revision != expected_pin:
         raise ValueError('Skia revision differs from pins.json')
     env = os.environ.copy()
+    seed = selected_seed(a)
+    if seed is not None:
+        env['WINK_SKIA_PAINT_KEY_SEED'] = str(seed)
     env['WINK_SKIA_ROUTE'] = a.route
     env['WINK_VK_ABORT_ON_ERROR'] = '1'
     if a.icd:
@@ -211,9 +228,11 @@ def execute(a):
                     wink=subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
                     dm_sha256=digest(a.dm), host=platform.platform(), sources=a.sources,
                     match=a.match, fixtures=fixtures(source), command=args,
-                    drivers=driver_provenance(a.dm, env),
+                    drivers=driver_provenance(a.dm, env), paint_key_seed=seed,
                     environment={k: env[k] for k in ('VK_DRIVER_FILES', 'WINK_SKIA_EXPECT_VULKAN',
-                                 'WINK_SKIA_ROUTE', 'WINK_VK_ABORT_ON_ERROR') if k in env})
+                                 'WINK_SKIA_ROUTE', 'WINK_VK_ABORT_ON_ERROR',
+                                 'WINK_SKIA_PAINT_KEY_SEED',
+                                 'WINK_SKIA_TRACE_PRECOMPILE') if k in env})
     write_json(a.out / 'reproduce.json', metadata)
     write_json(a.out / 'run.json', dict(metadata, **{'pass': False, 'problems': ['inventory has not completed']}))
     inventory_command = [*args, '--dryRun']
@@ -271,6 +290,8 @@ def main():
         s.add_argument('--sources', nargs='+', default=['tests', 'gm', 'image'])
         s.add_argument('--match', nargs='+', default=[])
         s.add_argument('--timeout', type=int, default=7200)
+        s.add_argument('--paint-key-seed', type=parse_seed,
+                       help='Reproduce PaintParamsKeyTestReduced with an unsigned 32-bit seed')
         s.add_argument('--icd', type=Path, help='Explicit ICD manifest; required for Vulkan references')
         s.add_argument('--reference-angle', action='store_true', help='Select the independent ANGLE factory in a reference build')
         s.set_defaults(role='reference' if name == 'reference' else 'candidate')

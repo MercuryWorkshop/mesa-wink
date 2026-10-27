@@ -16,7 +16,9 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'dm-image-extension-boundary-v1',
                      'ganesh-framebuffer-fetch-destination-swizzle-v1',
                      'graphite-automatic-image-tiling-v1',
-                     'graphite-oversized-image-shader-paint-fallback-v1']
+                     'graphite-oversized-image-shader-paint-fallback-v1',
+                     'graphite-precompile-random-local-matrix-v1',
+                     'graphite-blur-precompile-coverage-v1']
 
 
 def run(args, **kwargs):
@@ -54,6 +56,142 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # Coverage-layer blur consumes Alpha_8 images, and non-normal blur styles
+    # combine the original and blurred masks. Precompile all those real paths,
+    # including the actual coverage geometry and text's bitmap-mask fallback.
+    patch(source, 'src/gpu/graphite/precompile/PrecompileImageFilter.cpp',
+          '''    // For blur imagefilters we know we don't have alpha-only textures and don't need cubic
+    // filtering.
+    sk_sp<PrecompileShader> imageShader = PrecompileShaders::Image(
+            ImageShaderFlags::kNoAlphaNoCubic);''',
+          '''    // Blur inputs include alpha-only coverage masks. Cubic filtering is not used.
+    sk_sp<PrecompileShader> imageShader = PrecompileShaders::Image(
+            ImageShaderFlags::kExcludeCubic);''')
+    patch(source, 'include/gpu/graphite/precompile/PrecompileMaskFilter.h',
+          '''    virtual void createPipelines(const KeyContext&,
+                                 const PaintOptions&,
+                                 const RenderPassDesc&,''',
+          '''    virtual void createPipelines(const KeyContext&,
+                                 const PaintOptions&,
+                                 DrawTypeFlags,
+                                 const RenderPassDesc&,''')
+    patch(source, 'src/gpu/graphite/precompile/PaintOptions.cpp',
+          '            o->createPipelines(keyContext, *this, renderPassDesc, processCombination);',
+          '            o->createPipelines(keyContext, *this, drawTypes, renderPassDesc, processCombination);')
+    patch(source, 'src/gpu/graphite/precompile/PrecompileMaskFilter.cpp',
+          '''            const PaintOptions& paintOptions,
+            const RenderPassDesc& renderPassDescIn,''',
+          '''            const PaintOptions& paintOptions,
+            DrawTypeFlags drawTypes,
+            const RenderPassDesc& renderPassDescIn,''')
+    patch(source, 'src/gpu/graphite/precompile/PrecompileMaskFilter.cpp',
+          '''                                                                   processCombination);
+
+        // c.f. AutoLayerForImageFilter::addMaskFilterLayer.''',
+          '''                                                                   processCombination);
+
+        // Inner, solid and outer blur styles blend the original and blurred masks.
+        const SkColorInfo maskInfo(kAlpha_8_SkColorType, kPremul_SkAlphaType, nullptr);
+        auto maskShader = PrecompileShaders::Image(PrecompileShaders::ImageShaderFlags::kExcludeCubic,
+                                                   SkSpan(&maskInfo, 1));
+        for (SkBlendMode style : {SkBlendMode::kDstIn, SkBlendMode::kSrcOver,
+                                 SkBlendMode::kDstOut}) {
+            PaintOptions combineMasks;
+            combineMasks.setShaders({{PrecompileShaders::Blend(SkSpan<const SkBlendMode>(&style, 1),
+                                                   SkSpan(&maskShader, 1), SkSpan(&maskShader, 1))}});
+            combineMasks.setBlendModes(SKSPAN_INIT_ONE(SkBlendMode::kSrc));
+            for (Coverage coverage : {Coverage::kNone, Coverage::kSingleChannel}) {
+                combineMasks.priv().buildCombinations(keyContext, DrawTypeFlags::kSimpleShape,
+                        false, coverage, coverageRenderPassDesc, processCombination);
+            }
+        }
+
+        // c.f. AutoLayerForImageFilter::addMaskFilterLayer.''')
+    patch(source, 'src/gpu/graphite/precompile/PrecompileMaskFilter.cpp',
+          '''            coverageOptions.priv().buildCombinations(
+                    keyContext,
+                    DrawTypeFlags::kAnalyticRRect,
+                    /* withPrimitiveBlender= */ false,
+                    Coverage::kSingleChannel,
+                    coverageRenderPassDesc,
+                    processCombination);''',
+          '''            for (Coverage coverage : {Coverage::kNone, Coverage::kSingleChannel}) {
+                coverageOptions.priv().buildCombinations(
+                        keyContext,
+                        static_cast<DrawTypeFlags>(drawTypes | DrawTypeFlags::kSimpleShape |
+                                                   DrawTypeFlags::kBitmapText_Mask),
+                        /* withPrimitiveBlender= */ false,
+                        coverage,
+                        coverageRenderPassDesc,
+                        processCombination);
+                // Blurred text can fall back to paths requiring stencil and MSAA.
+                RenderPassDesc pathPass = RenderPassDesc::Make(caps, info,
+                        LoadOp::kClear, StoreOp::kStore, DepthStencilFlags::kDepthStencil,
+                        {0.f, 0.f, 0.f, 0.f}, true, skgpu::Swizzle("a000"),
+                        caps->getDstReadStrategy());
+                coverageOptions.priv().buildCombinations(keyContext,
+                        DrawTypeFlags::kNonSimpleShape, false, coverage, pathPass,
+                        processCombination);
+            }''')
+    patch(source, 'src/gpu/graphite/precompile/PrecompileImageFilter.cpp',
+          '''    blurPaintOptions.priv().buildCombinations(keyContext,
+                                              DrawTypeFlags::kSimpleShape,
+                                              /* withPrimitiveBlender= */ false,
+                                              Coverage::kSingleChannel,
+                                              renderPassDesc,
+                                              processCombination);''',
+          '''    for (Coverage coverage : {Coverage::kNone, Coverage::kSingleChannel}) {
+        blurPaintOptions.priv().buildCombinations(keyContext,
+                                                DrawTypeFlags::kSimpleShape,
+                                                /* withPrimitiveBlender= */ false,
+                                                coverage,
+                                                renderPassDesc,
+                                                processCombination);
+    }''')
+    # Replacing the perspective row of a translate(2,2) matrix with (0.5,0,1)
+    # makes it singular. Compose an invertible perspective transform instead
+    # so generated shader inputs remain valid for precompile comparisons.
+    patch(source, 'tests/graphite/precompile/PaintParamsTestUtils.cpp',
+          '        storage->setPerspX(0.5f);',
+          '''        SkMatrix perspective = SkMatrix::I();
+        perspective.setPerspX(0.5f);
+        storage->postConcat(perspective);''')
+    patch(source, 'tests/graphite/precompile/PaintParamsKeyTest.cpp',
+          '#include "tests/Test.h"', '#include "tests/Test.h"\n#include <cstdlib>')
+    patch(source, 'tests/graphite/precompile/PaintParamsKeyTest.cpp',
+          '            ++missingPipelines;',
+          '''            ++missingPipelines;
+            if (std::getenv("WINK_SKIA_TRACE_PRECOMPILE")) {
+                GraphicsPipelineDesc actual;
+                RenderPassDesc actualPass;
+                UniqueKeyUtils::ExtractKeyDescs(precompileContext, k, &actual, &actualPass);
+                auto* caps = precompileContext->priv().caps();
+                auto* dict = precompileContext->priv().shaderCodeDictionary();
+                SkDebugf("WINK_SKIA_MISSING_PIPELINE\\n%s\\n%s\\n",
+                         actual.toString(caps, dict).c_str(), actualPass.toString().c_str());
+                for (const auto& compiled : precompileKeys) {
+                    GraphicsPipelineDesc candidate;
+                    RenderPassDesc candidatePass;
+                    UniqueKeyUtils::ExtractKeyDescs(precompileContext, compiled,
+                                                   &candidate, &candidatePass);
+                    if (candidate.renderStepID() == actual.renderStepID()) {
+                        SkDebugf("WINK_SKIA_PRECOMPILED_PIPELINE\\n%s\\n%s\\n",
+                                 candidate.toString(caps, dict).c_str(),
+                                 candidatePass.toString().c_str());
+                    }
+                }
+            }''')
+    patch(source, 'tests/graphite/precompile/PaintParamsKeyTest.cpp',
+          '    uint32_t seed = std::time(nullptr) % std::numeric_limits<uint32_t>::max();',
+          '''    uint32_t seed = std::time(nullptr) % std::numeric_limits<uint32_t>::max();
+    if (const char* overrideSeed = std::getenv("WINK_SKIA_PAINT_KEY_SEED")) {
+        char* end = nullptr;
+        unsigned long long parsed = std::strtoull(overrideSeed, &end, 10);
+        if (end == overrideSeed || *end || parsed > std::numeric_limits<uint32_t>::max()) {
+            SK_ABORT("Invalid WINK_SKIA_PAINT_KEY_SEED");
+        }
+        seed = static_cast<uint32_t>(parsed);
+    }''')
     # Match Ganesh's existing hugebitmapshader contract: an image shader
     # beyond the texture limit draws using the paint color instead of dropping
     # the geometry. Ordinary image draws use tiling; raw shaders and failures

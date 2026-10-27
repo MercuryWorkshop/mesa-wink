@@ -35,6 +35,11 @@ try {
   const argv = module._malloc((pointers.length + 1) * 4);
   module.HEAPU32.set([...pointers, 0], argv >>> 2);
   const envStrings = [['WINK_SKIA_ROUTE', route], ['WINK_VK_ABORT_ON_ERROR', '1']];
+  if (options.has('paint-key-seed')) {
+    const seed = options.get('paint-key-seed');
+    module.ENV.WINK_SKIA_PAINT_KEY_SEED = seed;
+    envStrings.push(['WINK_SKIA_PAINT_KEY_SEED', seed]);
+  }
   for (const [key, value] of envStrings) {
     const alloc = s => {
       const b = new TextEncoder().encode(s + '\0');
