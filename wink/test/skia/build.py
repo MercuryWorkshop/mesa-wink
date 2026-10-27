@@ -23,7 +23,8 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'graphite-yuv-precompile-alpha-v1',
                      'graphite-blend-precompile-child-context-v1',
                      'graphite-color-text-mask-precompile-v1',
-                     'resource-cache-purge-clock-progress-v1']
+                     'resource-cache-purge-clock-progress-v1',
+                     'test-typeface-empty-native-fallback-v1']
 
 
 def run(args, **kwargs):
@@ -61,6 +62,18 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # A host without installed fonts may return a non-null empty typeface.
+    # Use the existing portable fallback for it as well as for null results,
+    # while keeping the native manager's resource-font loading available.
+    patch(source, 'tools/fonts/FontToolUtils.cpp',
+          '''    if (face) {
+        return face;
+    }
+    return CreatePortableTypeface(name, style);''',
+          '''    if (face && face->countGlyphs() > 0) {
+        return face;
+    }
+    return CreatePortableTypeface(name, style);''')
     # Browser steady clocks are quantized. A five-nanosecond sleep need not
     # advance their observable value; wait for actual ticks on both sides of
     # the purge threshold instead, preserving all cache-content assertions.

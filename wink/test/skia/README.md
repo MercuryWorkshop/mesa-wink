@@ -72,6 +72,11 @@ of assuming a five-nanosecond sleep advances the quantized browser clock. Its
 purge and cache-content assertions remain enabled. This test correction is
 recorded in `skia_fixes`.
 
+The test typeface helper uses its portable fallback when a native font manager
+returns an empty typeface, as can happen without installed system fonts in
+Wasm. Resource fonts still load through FreeType. This correction is recorded
+in `skia_fixes` and preserves the remote-glyph cache assertions.
+
 The integration registers FreeType's compiled SVG renderer in its Wasm module
 list, fixing an SVG emoji metrics crash, and matches image extensions with a
 leading dot so `.wbmp` is not also collected as `bmp`. These corrections are
