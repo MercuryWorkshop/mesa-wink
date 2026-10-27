@@ -37,6 +37,7 @@ def execute(a):
     manifest = build / 'wink-build.json'
     skia_fixes = json.loads(manifest.read_text()).get('skia_fixes', []) if manifest.is_file() else []
     metadata = dict(schema=1, role='candidate', route=a.route, config=config, target=a.target,
+                    font_engine='freetype',
                     skia_fixes=skia_fixes,
                     skia=pin, sources=a.sources, match=a.match, fixtures=fixtures(a.source),
                     paint_key_seed=seed,

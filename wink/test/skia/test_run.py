@@ -135,6 +135,13 @@ class ReferenceIntegrity(unittest.TestCase):
         suite.write_json(path, run)
         self.assertIn('config differs', suite.compare(self.ref, self.candidate)['problems'])
 
+    def test_different_font_engine_fails_with_identical_pixels(self):
+        path = self.candidate / 'run.json'
+        run = json.loads(path.read_text())
+        run['font_engine'] = 'freetype'
+        suite.write_json(path, run)
+        self.assertIn('font_engine differs', suite.compare(self.ref, self.candidate)['problems'])
+
     def test_different_random_seed_fails_even_with_identical_pixels(self):
         path = self.candidate / 'run.json'
         run = json.loads(path.read_text())

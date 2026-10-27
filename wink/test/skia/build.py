@@ -666,6 +666,8 @@ def main():
     p.add_argument('--no-sync', action='store_true', help='Use an already synchronized pinned checkout')
     p.add_argument('--angle', type=Path, help='Optional ANGLE output directory for independent GLES references')
     p.add_argument('--dawn-gles', action='store_true', help='Build Graphite through an outer Dawn GLES backend into native-dawn/')
+    p.add_argument('--font-engine', choices=['platform', 'freetype'], default='platform',
+                   help='Use FreeType for resource-font references to browser builds')
     a = p.parse_args()
     a.out = a.out.resolve()
     source = a.out / 'deps/skia' if a.no_sync else checkout(a.out)
@@ -699,7 +701,15 @@ def main():
     if a.dawn_gles:
         args.update(skia_use_dawn=True, dawn_enable_opengles=True, dawn_enable_metal=False,
                     dawn_enable_vulkan=False, dawn_enable_d3d11=False, dawn_enable_d3d12=False)
+    if a.font_engine == 'freetype':
+        args.update(skia_use_freetype=True, skia_use_system_freetype2=False,
+                    skia_use_fonthost_mac=False, skia_use_fontconfig=False,
+                    skia_enable_fontmgr_custom_directory=False,
+                    skia_enable_fontmgr_custom_empty=True,
+                    skia_enable_fontmgr_custom_embedded=True)
     build = a.out / ('native-dawn' if a.dawn_gles else 'native')
+    if a.font_engine == 'freetype':
+        build = build.with_name(build.name + '-freetype')
     build.mkdir(parents=True, exist_ok=True)
     gn_args = '\n'.join(f'{k} = {json.dumps(v)}' for k, v in args.items()) + '\n'
     (build / 'args.gn').write_text(gn_args)
@@ -707,6 +717,7 @@ def main():
     run(['ninja', '-C', build, '-j', a.jobs, 'dm', 'skdiff'], cwd=source)
     (build / 'wink-build.json').write_text(json.dumps({
         'schema': 1, 'skia': pin, 'gn_args': args, 'skia_fixes': CORRECTNESS_FIXES,
+        'font_engine': a.font_engine,
         'wink': subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
         'routes': ['gles', 'vk', 'grvk'] + (['grdawn_gles'] if a.dawn_gles else []),
     }, indent=2) + '\n')

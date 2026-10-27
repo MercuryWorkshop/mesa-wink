@@ -179,6 +179,14 @@ observed GPU context are reported as unresolved, rather than passing silently.
 
 ## Independent reference and comparison
 
+Browser builds use FreeType, while the default native Mac build uses CoreText.
+Build native references with `build.py --no-sync --font-engine freetype`
+(and `--angle build/skia/angle` for GLES), then select
+`--dm build/skia/native-freetype/dm` when running those references. This keeps
+resource-font loading and rasterization comparable. Comparisons reject
+different font engines. Platform-specific GMs and default emoji selection
+still require separate applicability checks.
+
 For Vulkan, the same test binary can select an independent ICD. For example,
 on a Mac with Homebrew MoltenVK:
 

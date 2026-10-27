@@ -145,6 +145,8 @@ def compare(reference, candidate):
     for key in ('skia', 'skia_fixes', 'route', 'sources', 'match', 'fixtures', 'paint_key_seed'):
         if ref_run.get(key) != cand_run.get(key):
             problems.append(f'{key} differs')
+    if ref_run.get('font_engine', 'platform') != cand_run.get('font_engine', 'platform'):
+        problems.append('font_engine differs')
     if ref_run.get('config', ref_run.get('route')) != cand_run.get('config', cand_run.get('route')):
         problems.append('config differs')
     if ref_run.get('role') != 'reference' or cand_run.get('role') != 'candidate':
@@ -233,9 +235,11 @@ def execute(a):
     if a.match:
         args += ['--match', *a.match]
     manifest = a.dm.parent / 'wink-build.json'
-    skia_fixes = json.loads(manifest.read_text()).get('skia_fixes', []) if manifest.is_file() else []
+    build = json.loads(manifest.read_text()) if manifest.is_file() else {}
+    skia_fixes = build.get('skia_fixes', [])
     metadata = dict(schema=1, role=a.role, route=a.route, config=config, target='native', skia=revision,
                     skia_fixes=skia_fixes,
+                    font_engine=build.get('font_engine', 'platform'),
                     wink=subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
                     dm_sha256=digest(a.dm), host=platform.platform(), sources=a.sources,
                     match=a.match, fixtures=fixtures(source), command=args,
