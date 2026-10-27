@@ -72,7 +72,9 @@ def inspect_run(expected, log, returncode, route, reference=False):
     if not matching:
         problems.append('no backend identity recorded')
     if reference:
-        if any('gex' in ' '.join(r).lower() or 'wink on' in ' '.join(r).lower() for r in identities):
+        # Ganesh keeps a sentinel GL context alive for Vulkan/TSAN. It does
+        # not render this configuration; check the selected API's identity.
+        if any('gex' in ' '.join(r).lower() or 'wink on' in ' '.join(r).lower() for r in matching):
             problems.append('reference unexpectedly uses Wink')
     elif api == 'gles':
         if not matching or any('gex' not in ' '.join(r).lower() for r in matching):
