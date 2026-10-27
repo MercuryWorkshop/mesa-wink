@@ -7049,7 +7049,7 @@ static uint64_t gex_wgpu_bg_miss_why[6];
  * sampler state deleted, for the timing report. */
 static uint64_t gex_wgpu_bg_epoch_view, gex_wgpu_bg_epoch_sampler;
 
-/* GEX_WGPU_BG_KEEP=1: a sampler view or sampler state deleted no longer
+/* GEX_WGPU_BG_KEEP (on unless =0): a sampler view or sampler state deleted no longer
  * invalidates the whole bind group cache. Every slot holds a reference to
  * each buffer, view and sampler its key names (gex_wgpu_bg_entries_ref), so
  * a deleted one's handle stays alive, and its address cannot come back for
@@ -7062,7 +7062,7 @@ gex_wgpu_bg_keep_on(void)
    static int on = -1;
    if (on < 0) {
       const char *v = getenv("GEX_WGPU_BG_KEEP");
-      on = v && *v && *v != '0';
+      on = !v || *v != '0';
    }
    return on != 0;
 }
@@ -18567,7 +18567,7 @@ static void gex_wgpu_versions_note_read(struct gex_wgpu_resource *gex,
                                         uint32_t bit);
 static void gex_wgpu_batch_let_go(struct gex_wgpu_resource *gex, uint32_t bit);
 
-/* GEX_WGPU_RANGES=1 (off by default): a write into a buffer the pending
+/* GEX_WGPU_RANGES (on unless =0): a write into a buffer the pending
  * batch reads goes straight to the queue when no draw of any pending batch
  * reads (and no staged copy writes) the bytes it writes. A queue write lands
  * ahead of the whole batch, so the draws recorded before it, which read
@@ -18578,7 +18578,7 @@ gex_wgpu_ranges_on(void)
    static int on = -1;
    if (on < 0) {
       const char *v = getenv("GEX_WGPU_RANGES");
-      on = v && *v && *v != '0';
+      on = !v || *v != '0';
    }
    return on != 0;
 }
@@ -20846,7 +20846,7 @@ gex_wgpu_subdata_note(struct gex_wgpu_resource *gex, unsigned offset,
 
 static unsigned long gex_wgpu_subdata_skipped, gex_wgpu_subdata_skipped_bytes;
 
-/* GEX_WGPU_INDEX_PATCH=1 (off by default): a small write into an index
+/* GEX_WGPU_INDEX_PATCH (2 unless set; 0 turns it off): a small write into an index
  * buffer that a draw of the pending batch has read, where the write
  * overlaps what was read (GEX_WGPU_RANGES), goes to a slab rather than
  * being staged into the batch. Staging ends the render pass; under dirk
@@ -20874,7 +20874,7 @@ gex_wgpu_index_patch_mode(void)
    static int on = -1;
    if (on < 0) {
       const char *v = getenv("GEX_WGPU_INDEX_PATCH");
-      on = v && *v && *v != '0' ? (*v == '2' ? 2 : 1) : 0;
+      on = !v ? 2 : *v == '0' ? 0 : *v == '1' ? 1 : 2;
    }
    return on;
 }
@@ -21157,7 +21157,7 @@ gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
  * are not here), a persistently mapped one, one bound as anything but vertex,
  * index or constant data (a view or a binding made from the handle could
  * outlive the switch), or with a second context recording batches of its
- * own. GEX_WGPU_RENAME=1 turns it on. */
+ * own. On unless GEX_WGPU_RENAME=0. */
 #define GEX_WGPU_RENAME_VERSIONS 16
 #define GEX_WGPU_RENAME_MAX_BYTES (4u << 20)
 
@@ -21222,7 +21222,7 @@ gex_wgpu_rename_on(void)
    static int on = -1;
    if (on < 0) {
       const char *v = getenv("GEX_WGPU_RENAME");
-      on = v && *v && *v != '0';
+      on = !v || *v != '0';
    }
    return on != 0;
 }
