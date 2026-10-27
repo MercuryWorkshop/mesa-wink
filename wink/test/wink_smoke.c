@@ -747,6 +747,42 @@ buffer_read_sources(void)
 /* Repeated triangles in a single draw must read earlier primitives' writes.
  * Three increments distinguish coherent fetch from a once-per-draw snapshot. */
 static void
+norm16_readback(void)
+{
+   GLuint fbo, textures[2];
+   p_glGenFramebuffers(1, &fbo);
+   p_glGenTextures(2, textures);
+   p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+   p_glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+   for (unsigned i = 0; i < 2; ++i) {
+      const GLenum type = i ? GL_SHORT : GL_UNSIGNED_SHORT;
+      p_glBindTexture(GL_TEXTURE_2D, textures[i]);
+      p_glTexImage2D(GL_TEXTURE_2D, 0, i ? GL_RG16_SNORM : GL_RG16,
+                    1, 1, 0, GL_RG, type, NULL);
+      p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textures[i], 0);
+      CHECK(p_glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE,
+            "RG16 read framebuffer, signed=%u", i);
+      GLint format = 0, read_type = 0;
+      p_glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &format);
+      p_glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &read_type);
+      CHECK(format == GL_RG && (GLenum)read_type == type,
+            "RG16 preferred read pair, signed=%u: %x/%x", i, format, read_type);
+      p_glClearColor(0.25f, 0.75f, 0.0f, 1.0f);
+      p_glClear(GL_COLOR_BUFFER_BIT);
+      uint16_t pixel[2] = { 0, 0 };
+      p_glReadPixels(0, 0, 1, 1, GL_RG, type, pixel);
+      const int max = i ? 32767 : 65535;
+      CHECK(abs((int)pixel[0] - (int)lroundf(0.25f * max)) <= 1 &&
+            abs((int)pixel[1] - (int)lroundf(0.75f * max)) <= 1,
+            "RG16 read values, signed=%u: %u/%u", i, pixel[0], pixel[1]);
+      CHECK(p_glGetError() == GL_NO_ERROR, "RG16 read GL error, signed=%u", i);
+   }
+   p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   p_glDeleteFramebuffers(1, &fbo);
+   p_glDeleteTextures(2, textures);
+}
+
+static void
 framebuffer_fetch(void)
 {
    GLint n = 0;
@@ -1364,8 +1400,10 @@ exercise(const char *label, int api, wink_surface *surface)
    GLenum err = p_glGetError();
    CHECK(err == GL_NO_ERROR, "%s: GL error 0x%x", label, err);
 
-   if (api == WINK_API_OPENGL_ES)
+   if (api == WINK_API_OPENGL_ES) {
+      norm16_readback();
       framebuffer_fetch();
+   }
 
    if (api == WINK_API_OPENGL_CORE) {
       vertex_input_types();
