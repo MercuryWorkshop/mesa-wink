@@ -22,7 +22,8 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'graphite-gradient-precompile-alpha-v1',
                      'graphite-yuv-precompile-alpha-v1',
                      'graphite-blend-precompile-child-context-v1',
-                     'graphite-color-text-mask-precompile-v1']
+                     'graphite-color-text-mask-precompile-v1',
+                     'resource-cache-purge-clock-progress-v1']
 
 
 def run(args, **kwargs):
@@ -60,6 +61,33 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # Browser steady clocks are quantized. A five-nanosecond sleep need not
+    # advance their observable value; wait for actual ticks on both sides of
+    # the purge threshold instead, preserving all cache-content assertions.
+    patch(source, 'tests/ResourceCacheTest.cpp',
+          '''    auto nowish = []() {
+        // We sleep so that we ensure we get a value that is greater than the last call to
+        // GrStdSteadyClock::now().
+        std::this_thread::sleep_for(skgpu::StdSteadyClock::duration(5));
+        auto result = skgpu::StdSteadyClock::now();
+        // Also sleep afterwards so we don't get this value again.
+        std::this_thread::sleep_for(skgpu::StdSteadyClock::duration(5));
+        return result;
+    };''',
+          '''    auto nextTick = [](skgpu::StdSteadyClock::time_point previous) {
+        auto now = skgpu::StdSteadyClock::now();
+        while (now <= previous) {
+            std::this_thread::yield();
+            now = skgpu::StdSteadyClock::now();
+        }
+        return now;
+    };
+    auto nowish = [&]() {
+        const auto result = nextTick(skgpu::StdSteadyClock::now());
+        // The next resource insertion must also be strictly after result.
+        nextTick(result);
+        return result;
+    };''')
     # Mask-filtered color glyphs can fall back to grayscale coverage. Preserve
     # the original shader before the ARGB-only branch strips it from options.
     patch(source, 'src/gpu/graphite/PublicPrecompile.cpp',

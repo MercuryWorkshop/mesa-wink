@@ -67,6 +67,11 @@ real runtime shaders do. In particular, alpha-only image children keep their
 alpha data instead of being colorized with the paint color. This correction
 is also recorded in `skia_fixes`.
 
+The resource-cache purge test waits for observable steady-clock ticks instead
+of assuming a five-nanosecond sleep advances the quantized browser clock. Its
+purge and cache-content assertions remain enabled. This test correction is
+recorded in `skia_fixes`.
+
 The integration registers FreeType's compiled SVG renderer in its Wasm module
 list, fixing an SVG emoji metrics crash, and matches image extensions with a
 leading dot so `.wbmp` is not also collected as `bmp`. These corrections are
