@@ -2586,6 +2586,8 @@ struct gex_wgpu_context {
       uint32_t lo, hi, at;
    } *index_patches;
    unsigned index_patch_count, index_patch_cap;
+   /* The slab's bytes on the host, for joining patches (GEX_WGPU_INDEX_PATCH=2). */
+   uint8_t *index_patch_cpu;
    /* A zero-filled buffer bound in place of a storage block a shader
     * declares and the application never bound. See
     * gex_wgpu_placeholder_storage. */
@@ -20850,15 +20852,24 @@ static uint64_t gex_wgpu_index_patched, gex_wgpu_index_patched_bytes,
    gex_wgpu_index_redirected, gex_wgpu_index_patch_applied_early,
    gex_wgpu_index_patch_grown;
 
-static bool
-gex_wgpu_index_patch_on(void)
+static uint64_t gex_wgpu_index_patch_joined, gex_wgpu_index_patch_joined_shadow,
+   gex_wgpu_index_patch_early_inexact;
+
+static int
+gex_wgpu_index_patch_mode(void)
 {
    static int on = -1;
    if (on < 0) {
       const char *v = getenv("GEX_WGPU_INDEX_PATCH");
-      on = v && *v && *v != '0';
+      on = v && *v && *v != '0' ? (*v == '2' ? 2 : 1) : 0;
    }
-   return on != 0;
+   return on;
+}
+
+static bool
+gex_wgpu_index_patch_on(void)
+{
+   return gex_wgpu_index_patch_mode() != 0;
 }
 
 static bool gex_wgpu_ranges_on(void);
@@ -20892,6 +20903,11 @@ gex_wgpu_index_patch(struct gex_wgpu_context *ctx,
       if (!ctx->index_patch_slab)
          return false;
    }
+   if (gex_wgpu_index_patch_mode() == 2 && !ctx->index_patch_cpu) {
+      ctx->index_patch_cpu = MALLOC(GEX_WGPU_INDEX_PATCH_SLAB_BYTES);
+      if (!ctx->index_patch_cpu)
+         return false;
+   }
    if (ctx->index_patch_count == ctx->index_patch_cap) {
       const unsigned cap = ctx->index_patch_cap ? ctx->index_patch_cap * 2 : 64;
       struct gex_wgpu_index_patch *grown =
@@ -20905,6 +20921,8 @@ gex_wgpu_index_patch(struct gex_wgpu_context *ctx,
    const uint32_t at = ctx->index_patch_used;
    ctx->index_patch_used = at + size;
    wgpuQueueWriteBuffer(screen->queue, ctx->index_patch_slab, at, data, size);
+   if (ctx->index_patch_cpu)
+      memcpy(ctx->index_patch_cpu + at, data, size);
    /* A write that carries on where the last patch ended, in the buffer and
     * in the slab, grows it: an application filling its indices a few draws'
     * worth at a time then draws across those writes, and one patch still
@@ -20983,6 +21001,68 @@ gex_wgpu_index_patch_lookup(struct gex_wgpu_context *ctx,
       return -1;
    }
    return 0;
+}
+
+/* GEX_WGPU_INDEX_PATCH=2: a draw whose indices cross a patch's edge gets
+ * them gathered into a fresh stretch of the slab, which it binds, rather than
+ * the patches going into the buffer (which ends the pass). From the buffer's
+ * shadow where it has one -- that holds every write, patches included -- and
+ * otherwise from the patches themselves, when together they cover the whole
+ * range. The stretch is this draw's alone: it is not a patch, so nothing of
+ * it is copied into the buffer at the end. Returns where the draw's first
+ * index lies in the slab, or -1. */
+static int64_t
+gex_wgpu_index_patch_join(struct gex_wgpu_context *ctx,
+                          struct pipe_resource *resource, uint64_t lo,
+                          uint64_t hi)
+{
+   struct gex_wgpu_resource *gex = gex_resource(resource);
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   if (gex_wgpu_index_patch_mode() != 2 || !ctx->index_patch_cpu ||
+       !ctx->index_patch_slab || hi <= lo || hi > resource->width0)
+      return -1;
+   const uint64_t lo4 = lo & ~(uint64_t)3, hi4 = (hi + 3) & ~(uint64_t)3;
+   const uint32_t len = (uint32_t)(hi4 - lo4);
+   if (len > GEX_WGPU_INDEX_PATCH_MAX_BYTES ||
+       len > GEX_WGPU_INDEX_PATCH_SLAB_BYTES - ctx->index_patch_used)
+      return -1;
+   uint8_t *dst = ctx->index_patch_cpu + ctx->index_patch_used;
+   bool shadow = false;
+   if (gex->shadow && !gex->gpu_written && hi4 <= resource->width0) {
+      memcpy(dst, gex->shadow + lo4, len);
+      shadow = true;
+   } else {
+      /* Covered end to end? The patches of this buffer that reach into the
+       * range, clipped to it and walked in order of where they start. */
+      uint64_t reach = lo;
+      for (bool moved = true; moved && reach < hi;) {
+         moved = false;
+         for (unsigned i = 0; i < ctx->index_patch_count; ++i) {
+            const struct gex_wgpu_index_patch *p = &ctx->index_patches[i];
+            if (p->resource == resource && p->lo <= reach && p->hi > reach) {
+               reach = p->hi;
+               moved = true;
+            }
+         }
+      }
+      if (reach < hi)
+         return -1;
+      memset(dst, 0, len);
+      /* Oldest first, so a later write over the same bytes wins. */
+      for (unsigned i = 0; i < ctx->index_patch_count; ++i) {
+         const struct gex_wgpu_index_patch *p = &ctx->index_patches[i];
+         if (p->resource != resource || p->hi <= lo4 || p->lo >= hi4)
+            continue;
+         const uint64_t a = MAX2(p->lo, lo4), b = MIN2(p->hi, hi4);
+         memcpy(dst + (a - lo4), ctx->index_patch_cpu + p->at + (a - p->lo), b - a);
+      }
+   }
+   const uint32_t at = ctx->index_patch_used;
+   ctx->index_patch_used = at + len;
+   wgpuQueueWriteBuffer(screen->queue, ctx->index_patch_slab, at, dst, len);
+   ++gex_wgpu_index_patch_joined;
+   gex_wgpu_index_patch_joined_shadow += shadow;
+   return at + (int64_t)(lo - lo4);
 }
 
 static bool
@@ -40789,7 +40869,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                   wib[2] = (uint64_t)dirk_index_bounds_ns;
                }
                {
-                  static uint64_t wpe[GEX_WGPU_PASS_END_COUNT + 1], wsz[4], wbd[4], wsb, wbig[2], wip[5];
+                  static uint64_t wpe[GEX_WGPU_PASS_END_COUNT + 1], wsz[4], wbd[4], wsb, wbig[2], wip[8];
                   uint64_t named = 0;
                   for (unsigned i = 0; i < GEX_WGPU_PASS_END_COUNT; ++i)
                      named += gex_wgpu_pass_ends[i] - wpe[i];
@@ -40803,7 +40883,8 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                           "%.1f, index %.1f, constant %.1f, other %.1f; %.1f KiB staged; "
                           "not renamed as big: past 4 MiB %.1f, carry past 1 MiB %.1f; "
                           "index patches %.1f (%.1f KiB, %.1f grew the last), draws on them %.1f, applied "
-                          "early %.1f, passes closed applying them %.1f\n",
+                          "early %.1f (%.1f not one plain draw), passes closed applying them %.1f; "
+                          "joined %.1f (%.1f from the shadow)\n",
                           (gex_wgpu_pass_ends[0] - wpe[0]) / f, (gex_wgpu_pass_ends[1] - wpe[1]) / f,
                           (gex_wgpu_pass_ends[2] - wpe[2]) / f, (gex_wgpu_pass_ends[3] - wpe[3]) / f,
                           (gex_wgpu_pass_ends[4] - wpe[4]) / f, (all - named) / f,
@@ -40819,12 +40900,18 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                           (gex_wgpu_index_patch_grown - wip[4]) / f,
                           (gex_wgpu_index_redirected - wip[2]) / f,
                           (gex_wgpu_index_patch_applied_early - wip[3]) / f,
-                          (gex_wgpu_pass_ends[GEX_WGPU_PASS_END_PATCH] - wpe[GEX_WGPU_PASS_END_PATCH]) / f);
+                          (gex_wgpu_index_patch_early_inexact - wip[5]) / f,
+                          (gex_wgpu_pass_ends[GEX_WGPU_PASS_END_PATCH] - wpe[GEX_WGPU_PASS_END_PATCH]) / f,
+                          (gex_wgpu_index_patch_joined - wip[6]) / f,
+                          (gex_wgpu_index_patch_joined_shadow - wip[7]) / f);
                   wip[0] = gex_wgpu_index_patched;
                   wip[1] = gex_wgpu_index_patched_bytes;
                   wip[2] = gex_wgpu_index_redirected;
                   wip[3] = gex_wgpu_index_patch_applied_early;
                   wip[4] = gex_wgpu_index_patch_grown;
+                  wip[5] = gex_wgpu_index_patch_early_inexact;
+                  wip[6] = gex_wgpu_index_patch_joined;
+                  wip[7] = gex_wgpu_index_patch_joined_shadow;
                   memcpy(wpe, gex_wgpu_pass_ends, sizeof(wpe));
                   memcpy(wsz, gex_wgpu_staged_by_size, sizeof(wsz));
                   memcpy(wbd, gex_wgpu_staged_by_bind, sizeof(wbd));
@@ -50062,11 +50149,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       const uint64_t hi = lo + (uint64_t)draws[0].count * info->index_size;
       uint32_t at = 0;
       const int where = exact ? gex_wgpu_index_patch_lookup(ctx, index_resource, lo, hi, &at) : -1;
+      const int64_t joined = where < 0 && exact
+         ? gex_wgpu_index_patch_join(ctx, index_resource, lo, hi) : -1;
       if (where > 0) {
          index_patch_at = at;
          ++gex_wgpu_index_redirected;
+      } else if (joined >= 0) {
+         index_patch_at = joined;
+         ++gex_wgpu_index_redirected;
       } else if (where < 0) {
          ++gex_wgpu_index_patch_applied_early;
+         gex_wgpu_index_patch_early_inexact += !exact;
          gex_wgpu_index_patch_apply(ctx);
       }
    }
@@ -50921,6 +51014,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    gex_wgpu_free_buffer(ctx->subdata_stage);
    gex_wgpu_index_patch_apply(ctx);
    FREE(ctx->index_patches);
+   FREE(ctx->index_patch_cpu);
    gex_wgpu_free_buffer(ctx->index_patch_slab);
    gex_wgpu_free_buffer(ctx->occlusion_readback);
    /* const_uploader aliases stream_uploader, so destroy it once. */
