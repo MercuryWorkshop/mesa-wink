@@ -15138,6 +15138,17 @@ gex_wgpu_lower_framebuffer_fetch(nir_shader *nir, const enum pipe_format *format
    nir_foreach_shader_out_variable_safe(var, nir) {
       if (!var->data.fb_fetch_output)
          continue;
+      /* gl_LastFragData is a read-only query, despite using shader_out
+       * storage in Mesa. Its loads were replaced above; initializing a new
+       * output here would collide with gl_FragColor's location zero.
+       * Scalarization can lose read_only, so retain the builtin's semantics
+       * by its reserved name too. */
+      if (var->data.read_only ||
+          (var->name && !strncmp(var->name, "gl_LastFragData", strlen("gl_LastFragData")))) {
+         nir_remove_dead_derefs(nir);
+         exec_node_remove(&var->node);
+         continue;
+      }
       const unsigned first = var->data.location == FRAG_RESULT_COLOR ? 0 :
                              var->data.location - FRAG_RESULT_DATA0;
       const unsigned slots = glsl_count_attribute_slots(var->type, false);

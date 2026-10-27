@@ -139,6 +139,7 @@ note(const char *fmt, ...)
    X(void, ColorPointer, (GLint, GLenum, GLsizei, const void *))                 \
    X(void, BlendFunc, (GLenum, GLenum))                                          \
    X(GLint, GetUniformLocation, (GLuint, const GLchar *))                        \
+   X(GLint, GetAttribLocation, (GLuint, const GLchar *))                         \
    X(void, Uniform1i, (GLint, GLint))                                           \
    X(void, Uniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat))               \
    X(void, ClearTexImage, (GLuint, GLint, GLenum, GLenum, const void *))
@@ -913,6 +914,47 @@ helper_invocation(void)
 }
 
 static void
+legacy_framebuffer_fetch(void)
+{
+   const char *vs = "#version 100\nattribute vec2 pos;"
+      "void main(){gl_Position=vec4(pos,0,1);}";
+   const char *fs = "#version 100\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; void main(){"
+      "gl_FragColor=gl_LastFragData[0]+vec4(0.125,0,0,0);}";
+   GLuint prog = link_program(vs, fs, "legacy framebuffer fetch"), vao, vbo;
+   GLint old_vao = 0, old_vbo = 0;
+   p_glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+   p_glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_vbo);
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glGenBuffers(1, &vbo);
+   p_glBindBuffer(GL_ARRAY_BUFFER, vbo);
+   const float vertices[] = {-1, -1, 3, -1, -1, 3};
+   p_glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+   GLint pos = p_glGetAttribLocation(prog, "pos");
+   CHECK(pos >= 0, "legacy framebuffer fetch position attribute");
+   if (pos >= 0) {
+      p_glEnableVertexAttribArray(pos);
+      p_glVertexAttribPointer(pos, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+      p_glUseProgram(prog);
+      p_glClearColor(0, 0, 0, 1);
+      p_glClear(GL_COLOR_BUFFER_BIT);
+      for (unsigned draw = 0; draw < 3; ++draw)
+         p_glDrawArrays(GL_TRIANGLES, 0, 3);
+      uint8_t px[4]; read_center(px, W, H);
+      CHECK(near(px, 96, 0, 0), "legacy framebuffer fetch: %u,%u,%u,%u", px[0],px[1],px[2],px[3]);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "legacy framebuffer fetch: context failed");
+   p_glUseProgram(0);
+   p_glBindVertexArray(old_vao);
+   p_glBindBuffer(GL_ARRAY_BUFFER, old_vbo);
+   p_glDeleteBuffers(1, &vbo);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glDeleteProgram(prog);
+}
+
+static void
 framebuffer_fetch(void)
 {
    GLint n = 0;
@@ -925,6 +967,7 @@ framebuffer_fetch(void)
       note("coherent framebuffer fetch: unavailable");
       return;
    }
+   legacy_framebuffer_fetch();
    const char *vs = "#version 300 es\n"
       "void main(){ int i=gl_VertexID%3; vec2 p=vec2(i==1?3.0:-1.0,i==2?3.0:-1.0);"
       "gl_Position=vec4(p,0,1); }\n";
