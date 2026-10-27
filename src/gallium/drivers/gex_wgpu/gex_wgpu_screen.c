@@ -2112,6 +2112,9 @@ struct gex_wgpu_resource {
    /* Took a direct write while a pending batch read other bytes of it
     * (GEX_WGPU_RANGES); verify then checks the bytes each draw read. */
    bool range_written;
+   /* GEX_WGPU_INDEX_PATCH: the contexts (their batch_bit) whose pending
+    * batch holds writes to this index buffer in its patch slab. */
+   uint32_t index_patched_by;
    /* The contexts (their batch_bit) with a draw that touched this resource
     * recorded and not yet submitted. */
    uint32_t in_batch;
@@ -2572,6 +2575,17 @@ struct gex_wgpu_context {
     * the queue runs a later write to it after the copies before it. */
    WGPUBuffer subdata_stage;
    uint32_t subdata_stage_offset;
+   /* GEX_WGPU_INDEX_PATCH: small writes into an index buffer the pending
+    * batch reads, held in a slab the later draws bind instead, and copied
+    * into the buffer itself at the end of the batch (gex_wgpu_index_patch).
+    * Bump-allocated and reset at each submit, like the stage above. */
+   WGPUBuffer index_patch_slab;
+   uint32_t index_patch_used;
+   struct gex_wgpu_index_patch {
+      struct pipe_resource *resource;
+      uint32_t lo, hi, at;
+   } *index_patches;
+   unsigned index_patch_count, index_patch_cap;
    /* A zero-filled buffer bound in place of a storage block a shader
     * declares and the application never bound. See
     * gex_wgpu_placeholder_storage. */
@@ -7011,7 +7025,8 @@ static void gex_wgpu_end_pass(struct gex_wgpu_context *ctx);
  * draw), and the writes staged by buffer size and binding. */
 enum { GEX_WGPU_PASS_END_STAGED, GEX_WGPU_PASS_END_CLEAR,
        GEX_WGPU_PASS_END_SUBMIT, GEX_WGPU_PASS_END_TARGETS,
-       GEX_WGPU_PASS_END_ORDERED, GEX_WGPU_PASS_END_COUNT };
+       GEX_WGPU_PASS_END_ORDERED, GEX_WGPU_PASS_END_PATCH,
+       GEX_WGPU_PASS_END_COUNT };
 static uint64_t gex_wgpu_pass_ends[GEX_WGPU_PASS_END_COUNT + 1];
 static uint64_t gex_wgpu_staged_by_size[4], gex_wgpu_staged_by_bind[4],
    gex_wgpu_staged_bytes, gex_wgpu_norename_big_rename, gex_wgpu_norename_big_carry;
@@ -7188,9 +7203,24 @@ gex_wgpu_verify_note_write(struct gex_wgpu_resource *gex, unsigned offset,
  * writes after the draw land before the batch runs, so only the bytes the
  * batch reads must still hold what they held at the draw. */
 static void
+gex_wgpu_verify_capture_from(struct gex_wgpu_context *ctx,
+                             struct pipe_resource *resource, uint64_t lo,
+                             uint64_t hi, WGPUBuffer src, int64_t delta);
+
+static void
 gex_wgpu_verify_capture(struct gex_wgpu_context *ctx,
                         struct pipe_resource *resource, uint64_t lo,
                         uint64_t hi)
+{
+   gex_wgpu_verify_capture_from(ctx, resource, lo, hi, NULL, 0);
+}
+
+/* The same, for a draw that read the bytes from `src` instead, at their
+ * offset in the buffer plus `delta` (an index patch: the slab). */
+static void
+gex_wgpu_verify_capture_from(struct gex_wgpu_context *ctx,
+                             struct pipe_resource *resource, uint64_t lo,
+                             uint64_t hi, WGPUBuffer src, int64_t delta)
 {
    if (!resource || resource->target != PIPE_BUFFER || !ctx->pending_encoder)
       return;
@@ -7250,7 +7280,9 @@ gex_wgpu_verify_capture(struct gex_wgpu_context *ctx,
    ++ctx->verify_count;
    ctx->verify_used += ALIGN_POT(size, 256);
    gex_wgpu_end_pass(ctx);
-   wgpuCommandEncoderCopyBufferToBuffer(ctx->pending_encoder, gex->buffer, from,
+   wgpuCommandEncoderCopyBufferToBuffer(ctx->pending_encoder,
+                                        src ? src : gex->buffer,
+                                        (uint64_t)((int64_t)from + delta),
                                         ctx->verify_readback, r->at, size);
 }
 
@@ -20776,6 +20808,147 @@ gex_wgpu_subdata_note(struct gex_wgpu_resource *gex, unsigned offset,
 
 static unsigned long gex_wgpu_subdata_skipped, gex_wgpu_subdata_skipped_bytes;
 
+/* GEX_WGPU_INDEX_PATCH=1 (off by default): a small write into an index
+ * buffer that a draw of the pending batch has read, where the write
+ * overlaps what was read (GEX_WGPU_RANGES), goes to a slab rather than
+ * being staged into the batch. Staging ends the render pass; under dirk
+ * Hades staged about 70 such writes a frame, of about 90 bytes each into a
+ * 1-4 MiB index buffer, and they closed 68 of its 83 passes. A later draw
+ * whose indices lie inside one patch binds the slab at the matching offset;
+ * the batch's draws before the write read the buffer, which the queue
+ * write never touched. At the end of the batch the patches are copied into
+ * the buffer in the order they were written, so what comes after sees
+ * them. A draw that reads across a patch's edge, and a write staged into
+ * the batch, first copy the patches over (gex_wgpu_index_patch_apply),
+ * which costs the pass the patch saved. */
+#define GEX_WGPU_INDEX_PATCH_SLAB_BYTES (1u << 20)
+#define GEX_WGPU_INDEX_PATCH_MAX_BYTES (64u << 10)
+static uint64_t gex_wgpu_index_patched, gex_wgpu_index_patched_bytes,
+   gex_wgpu_index_redirected, gex_wgpu_index_patch_applied_early;
+
+static bool
+gex_wgpu_index_patch_on(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *v = getenv("GEX_WGPU_INDEX_PATCH");
+      on = v && *v && *v != '0';
+   }
+   return on != 0;
+}
+
+static bool gex_wgpu_ranges_on(void);
+static void gex_wgpu_note_range(struct gex_wgpu_resource *gex, uint32_t bit,
+                                uint64_t lo, uint64_t hi);
+
+static bool
+gex_wgpu_index_patch(struct gex_wgpu_context *ctx,
+                     struct pipe_resource *resource, unsigned usage,
+                     unsigned offset, unsigned size, const void *data)
+{
+   struct gex_wgpu_resource *gex = gex_resource(resource);
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   if (!gex_wgpu_index_patch_on() || !gex_wgpu_ranges_on() ||
+       !ctx->pending_encoder || !size || !data || (usage & PIPE_MAP_READ) ||
+       resource->target != PIPE_BUFFER || !gex->buffer ||
+       !(resource->bind & PIPE_BIND_INDEX_BUFFER) ||
+       (resource->bind & ~PIPE_BIND_INDEX_BUFFER) ||
+       gex->gpu_written || gex->persistent_usage || !screen->one_thread ||
+       ctx->batch_touched_overflowed || ((offset | size) & 3u) ||
+       size > GEX_WGPU_INDEX_PATCH_MAX_BYTES ||
+       (uint64_t)offset + size > resource->width0 ||
+       size > GEX_WGPU_INDEX_PATCH_SLAB_BYTES - ctx->index_patch_used)
+      return false;
+   if (!ctx->index_patch_slab) {
+      WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+      desc.usage = WGPUBufferUsage_Index | WGPUBufferUsage_CopySrc |
+                   WGPUBufferUsage_CopyDst;
+      desc.size = GEX_WGPU_INDEX_PATCH_SLAB_BYTES;
+      ctx->index_patch_slab = wgpuDeviceCreateBuffer(screen->device, &desc);
+      if (!ctx->index_patch_slab)
+         return false;
+   }
+   if (ctx->index_patch_count == ctx->index_patch_cap) {
+      const unsigned cap = ctx->index_patch_cap ? ctx->index_patch_cap * 2 : 64;
+      struct gex_wgpu_index_patch *grown =
+         REALLOC(ctx->index_patches, ctx->index_patch_cap * sizeof(*grown),
+                 cap * sizeof(*grown));
+      if (!grown)
+         return false;
+      ctx->index_patches = grown;
+      ctx->index_patch_cap = cap;
+   }
+   const uint32_t at = ctx->index_patch_used;
+   ctx->index_patch_used = at + size;
+   wgpuQueueWriteBuffer(screen->queue, ctx->index_patch_slab, at, data, size);
+   struct gex_wgpu_index_patch *p = &ctx->index_patches[ctx->index_patch_count++];
+   p->resource = NULL;
+   pipe_resource_reference(&p->resource, resource);
+   p->lo = offset;
+   p->hi = offset + size;
+   p->at = at;
+   gex->index_patched_by |= ctx->batch_bit;
+   /* Read, as far as later writes go: one that overlaps it must not reach
+    * the buffer ahead of the copy at the end of the batch. */
+   gex_wgpu_note_range(gex, ctx->batch_bit, offset, (uint64_t)offset + size);
+   gex->range_written = true;
+   if (gex->shadow)
+      memcpy(gex->shadow + offset, data, size);
+   gex->bytes_written += size;
+   ++gex_wgpu_index_patched;
+   gex_wgpu_index_patched_bytes += size;
+   gex_wgpu_log_upload("sub-patch", resource->width0, offset, data, size);
+   return true;
+}
+
+/* Copy the pending batch's patches into their buffers, in order, at this
+ * point of the batch. */
+static void
+gex_wgpu_index_patch_apply(struct gex_wgpu_context *ctx)
+{
+   if (!ctx->index_patch_count)
+      return;
+   if (ctx->pending_encoder) {
+      GEX_WGPU_PASS_END(ctx, GEX_WGPU_PASS_END_PATCH);
+      gex_wgpu_end_pass(ctx);
+   }
+   for (unsigned i = 0; i < ctx->index_patch_count; ++i) {
+      struct gex_wgpu_index_patch *p = &ctx->index_patches[i];
+      struct gex_wgpu_resource *gex = gex_resource(p->resource);
+      if (ctx->pending_encoder && gex->buffer)
+         wgpuCommandEncoderCopyBufferToBuffer(ctx->pending_encoder,
+                                              ctx->index_patch_slab, p->at,
+                                              gex->buffer, p->lo,
+                                              p->hi - p->lo);
+      gex->index_patched_by &= ~ctx->batch_bit;
+      pipe_resource_reference(&p->resource, NULL);
+   }
+   ctx->index_patch_count = 0;
+}
+
+/* Where a draw reading [lo, hi) of `resource` finds its indices: 0 the
+ * buffer, 1 the slab at *at (inside the newest patch it overlaps), -1 across
+ * a patch's edge. */
+static int
+gex_wgpu_index_patch_lookup(struct gex_wgpu_context *ctx,
+                            struct pipe_resource *resource, uint64_t lo,
+                            uint64_t hi, uint32_t *at)
+{
+   if (!(gex_resource(resource)->index_patched_by & ctx->batch_bit))
+      return 0;
+   for (unsigned i = ctx->index_patch_count; i-- > 0;) {
+      const struct gex_wgpu_index_patch *p = &ctx->index_patches[i];
+      if (p->resource != resource || lo >= p->hi || hi <= p->lo)
+         continue;
+      if (lo >= p->lo && hi <= p->hi && hi > lo) {
+         *at = p->at + (uint32_t)(lo - p->lo);
+         return 1;
+      }
+      return -1;
+   }
+   return 0;
+}
+
 static bool
 gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
                           struct pipe_resource *resource, unsigned usage,
@@ -20796,6 +20969,11 @@ gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
       ctx->subdata_stage = wgpuDeviceCreateBuffer(screen->device, &desc);
       if (!ctx->subdata_stage)
          return false;
+   }
+   /* Patches are older than this write: they go into the buffer first. */
+   if (gex->index_patched_by & ctx->batch_bit) {
+      ++gex_wgpu_index_patch_applied_early;
+      gex_wgpu_index_patch_apply(ctx);
    }
    const uint32_t at = ctx->subdata_stage_offset;
    ctx->subdata_stage_offset = at + size;
@@ -20983,6 +21161,10 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIND);
    if (gex->gpu_written || gex->persistent_usage)
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_GPU);
+   /* Its patches are copied into the buffer the batch holds, not into a
+    * new version. */
+   if (gex->index_patched_by & ctx->batch_bit)
+      return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_OTHER);
    if (gex->gpu_size > GEX_WGPU_RENAME_MAX_BYTES) {
       ++gex_wgpu_norename_big_rename;
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIG);
@@ -21167,6 +21349,11 @@ gex_wgpu_buffer_subdata_inner(struct pipe_context *pipe,
       }
    }
    if (conflicts) {
+      if (gex_wgpu_index_patch(ctx, resource, usage, offset, size, data)) {
+         gex_wgpu_subdata_note(gex_resource(resource), offset, size, sub_hash,
+                               sub_hashed);
+         return;
+      }
       if (gex_wgpu_subdata_rename(ctx, resource, usage, offset, size, data)) {
          gex_wgpu_subdata_note(gex_resource(resource), offset, size, sub_hash,
                                sub_hashed);
@@ -40559,7 +40746,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                   wib[2] = (uint64_t)dirk_index_bounds_ns;
                }
                {
-                  static uint64_t wpe[GEX_WGPU_PASS_END_COUNT + 1], wsz[4], wbd[4], wsb, wbig[2];
+                  static uint64_t wpe[GEX_WGPU_PASS_END_COUNT + 1], wsz[4], wbd[4], wsb, wbig[2], wip[4];
                   uint64_t named = 0;
                   for (unsigned i = 0; i < GEX_WGPU_PASS_END_COUNT; ++i)
                      named += gex_wgpu_pass_ends[i] - wpe[i];
@@ -40571,7 +40758,9 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                           "serial %.1f, else %.1f; staged writes by buffer size: to 64 KiB "
                           "%.1f, to 1 MiB %.1f, to 4 MiB %.1f, past %.1f; by binding: vertex "
                           "%.1f, index %.1f, constant %.1f, other %.1f; %.1f KiB staged; "
-                          "not renamed as big: past 4 MiB %.1f, carry past 1 MiB %.1f\n",
+                          "not renamed as big: past 4 MiB %.1f, carry past 1 MiB %.1f; "
+                          "index patches %.1f (%.1f KiB), draws on them %.1f, applied "
+                          "early %.1f, passes closed applying them %.1f\n",
                           (gex_wgpu_pass_ends[0] - wpe[0]) / f, (gex_wgpu_pass_ends[1] - wpe[1]) / f,
                           (gex_wgpu_pass_ends[2] - wpe[2]) / f, (gex_wgpu_pass_ends[3] - wpe[3]) / f,
                           (gex_wgpu_pass_ends[4] - wpe[4]) / f, (all - named) / f,
@@ -40581,7 +40770,16 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                           (gex_wgpu_staged_by_bind[2] - wbd[2]) / f, (gex_wgpu_staged_by_bind[3] - wbd[3]) / f,
                           (gex_wgpu_staged_bytes - wsb) / f / 1024,
                           (gex_wgpu_norename_big_rename - wbig[0]) / f,
-                          (gex_wgpu_norename_big_carry - wbig[1]) / f);
+                          (gex_wgpu_norename_big_carry - wbig[1]) / f,
+                          (gex_wgpu_index_patched - wip[0]) / f,
+                          (gex_wgpu_index_patched_bytes - wip[1]) / f / 1024,
+                          (gex_wgpu_index_redirected - wip[2]) / f,
+                          (gex_wgpu_index_patch_applied_early - wip[3]) / f,
+                          (gex_wgpu_pass_ends[GEX_WGPU_PASS_END_PATCH] - wpe[GEX_WGPU_PASS_END_PATCH]) / f);
+                  wip[0] = gex_wgpu_index_patched;
+                  wip[1] = gex_wgpu_index_patched_bytes;
+                  wip[2] = gex_wgpu_index_redirected;
+                  wip[3] = gex_wgpu_index_patch_applied_early;
                   memcpy(wpe, gex_wgpu_pass_ends, sizeof(wpe));
                   memcpy(wsz, gex_wgpu_staged_by_size, sizeof(wsz));
                   memcpy(wbd, gex_wgpu_staged_by_bind, sizeof(wbd));
@@ -41965,6 +42163,7 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
 {
    GEX_WGPU_PASS_END(ctx, GEX_WGPU_PASS_END_SUBMIT);
    gex_wgpu_end_pass(ctx);
+   gex_wgpu_index_patch_apply(ctx);
    /* Before the early return, not after it. Uniforms are staged into a ring
     * and written to the GPU in one go here, and a compute pass -- a transform
     * feedback capture, a geometry stage, a wide line's vertex capture --
@@ -42033,6 +42232,7 @@ gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
    /* The staged subdata goes with this batch; a later queue write to the
     * staging buffer runs after it. */
    ctx->subdata_stage_offset = 0;
+   ctx->index_patch_used = 0;
    WGPUCommandBuffer prologue = NULL;
    if (ctx->prologue_encoder) {
       prologue = wgpuCommandEncoderFinish(ctx->prologue_encoder, NULL);
@@ -49769,6 +49969,27 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       if (odd_pipeline && odd_cached)
          wgpuRenderPipelineAddRef(odd_pipeline);
    }
+   /* An index patch this draw reads (GEX_WGPU_INDEX_PATCH): bind the slab
+    * where the draw's indices lie inside one, and otherwise put the patches
+    * in the buffer first. Before the pass, which applying them ends. */
+   int64_t index_patch_at = -1;
+   if (index_resource && !uploaded_index_resource &&
+       (gex_resource(index_resource)->index_patched_by & ctx->batch_bit)) {
+      const bool exact = !indirect && num_draws == 1 && !serial_fetch &&
+                         !ctx->point_expand.active && !vs_records &&
+                         !(ctx->point_gather_mask | ctx->deindex_gather_mask);
+      const uint64_t lo = (uint64_t)first_index * info->index_size;
+      const uint64_t hi = lo + (uint64_t)draws[0].count * info->index_size;
+      uint32_t at = 0;
+      const int where = exact ? gex_wgpu_index_patch_lookup(ctx, index_resource, lo, hi, &at) : -1;
+      if (where > 0) {
+         index_patch_at = at;
+         ++gex_wgpu_index_redirected;
+      } else if (where < 0) {
+         ++gex_wgpu_index_patch_applied_early;
+         gex_wgpu_index_patch_apply(ctx);
+      }
+   }
    WGPURenderPassEncoder pass = NULL;
    for (uint64_t ordered = 0; ordered < ordered_draws; ++ordered) {
       const uint32_t ordered_primitive = serial_fetch ? ordered % ordered_primitives : 0;
@@ -50094,20 +50315,26 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          }
          GEX_SET_MARK(GEX_SET_VERTEX);
          if (index_resource) {
-            WGPUBuffer index_handle = gex_resource(index_resource)->buffer;
+            const bool patched = index_patch_at >= 0;
+            WGPUBuffer index_handle = patched ? ctx->index_patch_slab
+                                              : gex_resource(index_resource)->buffer;
+            const uint32_t index_at = patched ? (uint32_t)index_patch_at : index_byte_offset;
+            const uint64_t index_bytes = patched
+               ? GEX_WGPU_INDEX_PATCH_SLAB_BYTES - index_at
+               : index_resource->width0 - index_byte_offset;
             const WGPUIndexFormat index_format = info->index_size == 2
                ? WGPUIndexFormat_Uint16 : WGPUIndexFormat_Uint32;
-            gex_wgpu_cmd_note("ib w0=%u+%u fmt=%u", index_resource->width0,
-                              index_byte_offset, (unsigned)index_format);
+            gex_wgpu_cmd_note("ib w0=%u+%u fmt=%u%s", index_resource->width0,
+                              index_at, (unsigned)index_format,
+                              patched ? " patch" : "");
             if (ctx->emitted.index != index_handle ||
                 ctx->emitted.index_format != index_format ||
-                ctx->emitted.index_offset != index_byte_offset) {
+                ctx->emitted.index_offset != index_at) {
                wgpuRenderPassEncoderSetIndexBuffer(
-                  pass, index_handle, index_format, index_byte_offset,
-                  index_resource->width0 - index_byte_offset);
+                  pass, index_handle, index_format, index_at, index_bytes);
                ctx->emitted.index = index_handle;
                ctx->emitted.index_format = index_format;
-               ctx->emitted.index_offset = index_byte_offset;
+               ctx->emitted.index_offset = index_at;
                GEX_SET_CALL(GEX_SET_INDEX);
             }
             GEX_SET_MARK(GEX_SET_INDEX);
@@ -50134,11 +50361,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             wgpuRenderPassEncoderDrawIndexed(
                pass, serial_fetch ? primitive_size : draws[0].count,
                serial_fetch ? 1 : info->instance_count,
-               first_index + (serial_fetch ? ordered_primitive * primitive_step : 0),
+               (index_patch_at >= 0 ? 0u : first_index) +
+                  (serial_fetch ? ordered_primitive * primitive_step : 0),
                draws[0].index_bias, serial_fetch ? ordered_instance : 0u);
             /* Not per primitive: ordered framebuffer fetch draws one at a
              * time and has nothing to repeat. */
-            if (!serial_fetch &&
+            if (!serial_fetch && index_patch_at < 0 &&
                 gex_wgpu_repeat_ok(ctx, info, &draws[0], index_resource,
                                    uploaded_index_resource != NULL, first_index,
                                    draw_params_offset != ~0u, counting,
@@ -50298,7 +50526,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          ilo = (uint64_t)first_index * info->index_size;
          ihi = ilo + (uint64_t)draws[0].count * info->index_size;
       }
-      gex_wgpu_batch_touch_range(ctx, index_resource, ilo, ihi);
+      /* A draw reading a patch reads the slab, not the buffer. */
+      if (index_patch_at < 0)
+         gex_wgpu_batch_touch_range(ctx, index_resource, ilo, ihi);
       /* The vertices: from the draw, or for an indexed one from the bounds
        * the frontend gave. */
       int64_t first_vertex = -1, last_vertex = -1;
@@ -50421,7 +50651,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          ctx,
          ctx->shader_images[MESA_SHADER_FRAGMENT][ctx->fs->image_slots[i]].resource);
    if (gex_wgpu_rename_verify_on()) {
-      gex_wgpu_verify_capture(ctx, index_resource, ilo, ihi);
+      if (index_patch_at >= 0)
+         gex_wgpu_verify_capture_from(ctx, index_resource, ilo, ihi,
+                                      ctx->index_patch_slab,
+                                      index_patch_at - (int64_t)ilo);
+      else
+         gex_wgpu_verify_capture(ctx, index_resource, ilo, ihi);
       for (unsigned slot = 0; slot < vb_slot_count; ++slot)
          gex_wgpu_verify_capture(ctx, ctx->vertex_buffers[vb_buffer[slot]],
                                  vb_lo[slot], vb_hi[slot]);
@@ -50604,6 +50839,9 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
    }
    gex_wgpu_free_buffer(ctx->occlusion_resolve);
    gex_wgpu_free_buffer(ctx->subdata_stage);
+   gex_wgpu_index_patch_apply(ctx);
+   FREE(ctx->index_patches);
+   gex_wgpu_free_buffer(ctx->index_patch_slab);
    gex_wgpu_free_buffer(ctx->occlusion_readback);
    /* const_uploader aliases stream_uploader, so destroy it once. */
    if (ctx->base.stream_uploader) {
