@@ -7028,6 +7028,8 @@ enum { GEX_WGPU_PASS_END_STAGED, GEX_WGPU_PASS_END_CLEAR,
        GEX_WGPU_PASS_END_ORDERED, GEX_WGPU_PASS_END_PATCH,
        GEX_WGPU_PASS_END_COUNT };
 static uint64_t gex_wgpu_pass_ends[GEX_WGPU_PASS_END_COUNT + 1];
+/* Bind group cache misses by what the slot held (gex_wgpu_cached_bind_group). */
+static uint64_t gex_wgpu_bg_miss_why[6];
 static uint64_t gex_wgpu_staged_by_size[4], gex_wgpu_staged_by_bind[4],
    gex_wgpu_staged_bytes, gex_wgpu_norename_big_rename, gex_wgpu_norename_big_carry;
 #define GEX_WGPU_PASS_END(ctx, why) \
@@ -40807,6 +40809,17 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
             was_pl[1] = sc->pipeline_cache_misses;
             was_bg[0] = sc->bg_cache_hits;
             was_bg[1] = sc->bg_cache_misses;
+            {
+               static uint64_t wmw[6];
+               fprintf(stderr,
+                       "gex-wgpu: bind group misses per frame by what the cache slot held -- "
+                       "nothing %.1f, another layout %.1f; this layout with another buffer "
+                       "%.1f, offset or size %.1f, view %.1f, sampler %.1f\n",
+                       (gex_wgpu_bg_miss_why[0] - wmw[0]) / f, (gex_wgpu_bg_miss_why[1] - wmw[1]) / f,
+                       (gex_wgpu_bg_miss_why[2] - wmw[2]) / f, (gex_wgpu_bg_miss_why[3] - wmw[3]) / f,
+                       (gex_wgpu_bg_miss_why[4] - wmw[4]) / f, (gex_wgpu_bg_miss_why[5] - wmw[5]) / f);
+               memcpy(wmw, gex_wgpu_bg_miss_why, sizeof(wmw));
+            }
 #undef GEX_PER
             was = *m;
             was_presents = gex_wgpu_presents;
@@ -42636,6 +42649,26 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
         return gex_ret; }
    }
    ++screen->bg_cache_misses;
+   /* For the timing report: what the slot held. Empty or another epoch, a
+    * group of another layout (a collision), or one of this layout whose
+    * entries differ -- in a buffer, an offset or size, a view or a sampler,
+    * counted once each per miss. */
+   if (!slot->used || slot->epoch != screen->cache_epoch) {
+      ++gex_wgpu_bg_miss_why[0];
+   } else if (slot->layout != layout || slot->count != count) {
+      ++gex_wgpu_bg_miss_why[1];
+   } else {
+      bool d[4] = {false, false, false, false};
+      for (unsigned i = 0; i < count; ++i) {
+         d[0] |= slot->entries[i].buffer != entries[i].buffer;
+         d[1] |= slot->entries[i].offset != entries[i].offset ||
+                 slot->entries[i].size != entries[i].size;
+         d[2] |= slot->entries[i].textureView != entries[i].textureView;
+         d[3] |= slot->entries[i].sampler != entries[i].sampler;
+      }
+      for (unsigned i = 0; i < 4; ++i)
+         gex_wgpu_bg_miss_why[2 + i] += d[i];
+   }
 
    WGPUBindGroupDescriptor desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
    desc.layout = layout;
