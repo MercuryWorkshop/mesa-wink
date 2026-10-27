@@ -15,6 +15,28 @@ GLTestContext* CreateWinkReferenceGLTestContext(GrGLStandard, GLTestContext*);
 #endif
 
 namespace {
+#if defined(__EMSCRIPTEN__) && __EMSCRIPTEN_major__ < 5
+// Older Skia WebGL interfaces split sync timeouts for the JS FFI. Wink's
+// function pointers call native Wasm C functions, which still take one i64.
+GrGLenum client_wait_sync(GrGLsync sync, GrGLbitfield flags, GrGLint lo, GrGLint hi) {
+    using Native = GrGLenum (*)(GrGLsync, GrGLbitfield, GrGLuint64);
+    auto proc = reinterpret_cast<Native>(wink_get_proc_address("glClientWaitSync"));
+    const GrGLuint64 timeout = (GrGLuint64(GrGLuint(hi)) << 32) | GrGLuint(lo);
+    return proc(sync, flags, timeout);
+}
+void wait_sync(GrGLsync sync, GrGLbitfield flags, GrGLuint lo, GrGLuint hi) {
+    using Native = void (*)(GrGLsync, GrGLbitfield, GrGLuint64);
+    auto proc = reinterpret_cast<Native>(wink_get_proc_address("glWaitSync"));
+    proc(sync, flags, (GrGLuint64(hi) << 32) | lo);
+}
+#endif
+GrGLFuncPtr skia_proc(const char* name) {
+#if defined(__EMSCRIPTEN__) && __EMSCRIPTEN_major__ < 5
+    if (!strcmp(name, "glClientWaitSync")) return reinterpret_cast<GrGLFuncPtr>(client_wait_sync);
+    if (!strcmp(name, "glWaitSync")) return reinterpret_cast<GrGLFuncPtr>(wait_sync);
+#endif
+    return reinterpret_cast<GrGLFuncPtr>(wink_get_proc_address(name));
+}
 void check(int status) {
     if (status != WINK_OK) SK_ABORT("Wink: %s", wink_status_string(status));
 }
@@ -44,7 +66,7 @@ public:
         check(status);
         this->onPlatformMakeCurrent();
         auto assembled = GrGLMakeAssembledGLESInterface(nullptr, [](void*, const char* name) {
-            return reinterpret_cast<GrGLFuncPtr>(wink_get_proc_address(name));
+            return skia_proc(name);
         });
         if (!assembled || !assembled->validate()) SK_ABORT("Wink GLES interface validation failed");
         auto gl = sk_make_sp<GrGLInterface>(*assembled);
@@ -132,7 +154,7 @@ private:
         return restorer();
     }
     GrGLFuncPtr onPlatformGetProcAddress(const char* name) const override {
-        return reinterpret_cast<GrGLFuncPtr>(wink_get_proc_address(name));
+        return skia_proc(name);
     }
     wink_context* fContext = nullptr;
     wink_surface* fSurface = nullptr;

@@ -117,6 +117,10 @@ ST disables DM's background GPU thread pool; MT uses two background threads.
 Tests which explicitly create threads still require separate applicability
 classification for ST.
 
+The GL adapter bridges older Skia WebGL sync callbacks, which split a 64-bit
+timeout into two words, to Wink's native Wasm C ABI. Both fence polling and
+server waits retain the full timeout value.
+
 Browser files stream individually into the run's `run-artifacts/` directory,
 avoiding a single base64/CDP payload for a full GM corpus. The local browser
 server only accepts uploads when `--artifact-dir` is provided, and rejects
