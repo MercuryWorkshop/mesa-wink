@@ -166,7 +166,9 @@ make_image_samples(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags us
    VK(vkCreateImageView(dev, &(VkImageViewCreateInfo){
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im.image,
       .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = format,
-      .subresourceRange = { depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+      .subresourceRange = { depth ? VK_IMAGE_ASPECT_DEPTH_BIT :
+                           format == VK_FORMAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
+                           0, 1, 0, 1 },
    }, NULL, &im.view));
    return im;
 }

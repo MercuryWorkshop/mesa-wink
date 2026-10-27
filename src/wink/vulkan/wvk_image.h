@@ -335,9 +335,16 @@ struct wvk_image_view {
     * (wvk_image_view_msrtss). */
    struct wvk_image_view *msrtss;
    struct wvk_image *msrtss_image;
+   /* Discarded depth/stencil attachment fitted to a colour target's size.
+    * WebGPU requires equal attachment extents, unlike Vulkan. */
+   struct wvk_image_view *transient_ds;
+   struct wvk_image *transient_ds_image;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_image_view, vk.base, VkImageView, VK_OBJECT_TYPE_IMAGE_VIEW)
+
+struct wvk_image_view *wvk_image_view_transient_ds(struct wvk_device *dev, struct wvk_image_view *view,
+                                                  VkExtent2D extent);
 
 /* The multisampled view of `samples` a single-sampled view is rendered to
  * (VK_EXT_multisampled_render_to_single_sampled), or NULL. */

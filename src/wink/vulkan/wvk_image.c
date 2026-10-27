@@ -1234,6 +1234,10 @@ wvk_DestroyImageView(VkDevice _device, VkImageView _view, const VkAllocationCall
       wvk_DestroyImageView(_device, wvk_image_view_to_handle(view->msrtss), NULL);
       wvk_DestroyImage(_device, wvk_image_to_handle(view->msrtss_image), NULL);
    }
+   if (view->transient_ds) {
+      wvk_DestroyImageView(_device, wvk_image_view_to_handle(view->transient_ds), NULL);
+      wvk_DestroyImage(_device, wvk_image_to_handle(view->transient_ds_image), NULL);
+   }
    vk_image_view_destroy(&dev->vk, pAllocator, &view->vk);
 }
 
@@ -1241,12 +1245,14 @@ wvk_DestroyImageView(VkDevice _device, VkImageView _view, const VkAllocationCall
  * family may make one at once. */
 static simple_mtx_t msrtss_lock = SIMPLE_MTX_INITIALIZER;
 
-struct wvk_image_view *
-wvk_image_view_msrtss(struct wvk_device *dev, struct wvk_image_view *view, VkSampleCountFlagBits samples)
+static struct wvk_image_view *
+aux_attachment_view(struct wvk_device *dev, struct wvk_image_view *view, VkSampleCountFlagBits samples,
+                    VkExtent2D extent, struct wvk_image_view **cached, struct wvk_image **cached_image)
 {
    simple_mtx_lock(&msrtss_lock);
-   struct wvk_image_view *ms = view->msrtss;
-   if (ms && ms->vk.image->samples == samples) {
+   struct wvk_image_view *ms = *cached;
+   if (ms && ms->vk.image->samples == samples &&
+       ms->vk.extent.width == extent.width && ms->vk.extent.height == extent.height) {
       simple_mtx_unlock(&msrtss_lock);
       return ms;
    }
@@ -1255,9 +1261,9 @@ wvk_image_view_msrtss(struct wvk_device *dev, struct wvk_image_view *view, VkSam
    const VkDevice device = wvk_device_to_handle(dev);
    if (ms) {
       wvk_DestroyImageView(device, wvk_image_view_to_handle(ms), NULL);
-      wvk_DestroyImage(device, wvk_image_to_handle(view->msrtss_image), NULL);
-      view->msrtss = NULL;
-      view->msrtss_image = NULL;
+      wvk_DestroyImage(device, wvk_image_to_handle(*cached_image), NULL);
+      *cached = NULL;
+      *cached_image = NULL;
       ms = NULL;
    }
    const bool color = view->vk.aspects & VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1265,7 +1271,7 @@ wvk_image_view_msrtss(struct wvk_device *dev, struct wvk_image_view *view, VkSam
       .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
       .imageType = VK_IMAGE_TYPE_2D,
       .format = view->vk.view_format,
-      .extent = { view->vk.extent.width, view->vk.extent.height, 1 },
+      .extent = { extent.width, extent.height, 1 },
       .mipLevels = 1,
       .arrayLayers = view->vk.layer_count,
       .samples = samples,
@@ -1286,14 +1292,28 @@ wvk_image_view_msrtss(struct wvk_device *dev, struct wvk_image_view *view, VkSam
       VkImageView handle;
       if (wvk_CreateImageView(device, &vci, NULL, &handle) == VK_SUCCESS) {
          ms = wvk_image_view_from_handle(handle);
-         view->msrtss = ms;
-         view->msrtss_image = wvk_image_from_handle(image);
+         *cached = ms;
+         *cached_image = wvk_image_from_handle(image);
       } else {
          wvk_DestroyImage(device, image, NULL);
       }
    }
    simple_mtx_unlock(&msrtss_lock);
    return ms;
+}
+
+struct wvk_image_view *
+wvk_image_view_msrtss(struct wvk_device *dev, struct wvk_image_view *view, VkSampleCountFlagBits samples)
+{
+   const VkExtent2D extent = { view->vk.extent.width, view->vk.extent.height };
+   return aux_attachment_view(dev, view, samples, extent, &view->msrtss, &view->msrtss_image);
+}
+
+struct wvk_image_view *
+wvk_image_view_transient_ds(struct wvk_device *dev, struct wvk_image_view *view, VkExtent2D extent)
+{
+   return aux_attachment_view(dev, view, view->vk.image->samples, extent,
+                              &view->transient_ds, &view->transient_ds_image);
 }
 
 WGPUTextureView

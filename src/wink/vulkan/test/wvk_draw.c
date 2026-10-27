@@ -43,8 +43,8 @@ static const float quad[] = {
 /* The pipeline for the quad, or with `divisor` for instanced.vert: one
  * instance-rate attribute of that divisor, and strips of four indices. */
 static VkPipeline
-make_pipeline_samples(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, uint32_t divisor,
-                      VkSampleCountFlagBits samples, VkSampleMask mask)
+make_pipeline_samples_stencil(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, uint32_t divisor,
+                              VkSampleCountFlagBits samples, VkSampleMask mask, VkFormat stencil_format)
 {
    const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
    const VkPipelineShaderStageCreateInfo stages[] = {
@@ -68,6 +68,7 @@ make_pipeline_samples(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule
       .pNext = &(VkPipelineRenderingCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
          .colorAttachmentCount = 1, .pColorAttachmentFormats = &format,
+         .stencilAttachmentFormat = stencil_format,
       },
       .stageCount = 2, .pStages = stages,
       .pVertexInputState = divisor ? &(VkPipelineVertexInputStateCreateInfo){
@@ -106,6 +107,12 @@ make_pipeline_samples(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule
          .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
          .rasterizationSamples = samples, .pSampleMask = &mask,
       },
+      .pDepthStencilState = stencil_format != VK_FORMAT_UNDEFINED ? &(VkPipelineDepthStencilStateCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+         .stencilTestEnable = VK_TRUE,
+         .front = { .compareOp = VK_COMPARE_OP_EQUAL, .compareMask = 0xff, .reference = 7 },
+         .back = { .compareOp = VK_COMPARE_OP_EQUAL, .compareMask = 0xff, .reference = 7 },
+      } : NULL,
       .pColorBlendState = &(VkPipelineColorBlendStateCreateInfo){
          .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
          .attachmentCount = 1,
@@ -120,6 +127,13 @@ make_pipeline_samples(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule
       .layout = layout,
    }, NULL, &pipeline));
    return pipeline;
+}
+
+static VkPipeline
+make_pipeline_samples(VkPipelineLayout layout, VkShaderModule vs, VkShaderModule fs, uint32_t divisor,
+                      VkSampleCountFlagBits samples, VkSampleMask mask)
+{
+   return make_pipeline_samples_stencil(layout, vs, fs, divisor, samples, mask, VK_FORMAT_UNDEFINED);
 }
 
 static VkPipeline
@@ -265,6 +279,80 @@ test_colors(VkBuffer vertices)
    vkDestroyShaderModule(dev, fs, NULL);
    vkDestroyPipelineLayout(dev, layout, NULL);
    printf("colors: done\n");
+}
+
+/* A pooled stencil image is larger than two differently-sized colour targets.
+ * The clear determines whether the quad passes stencil; reusing it at another
+ * extent checks auxiliary-view replacement as well as the first allocation. */
+static void
+test_transient_stencil(VkBuffer vertices)
+{
+   VkPipelineLayout layout;
+   VK(vkCreatePipelineLayout(dev, &(VkPipelineLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &(VkPushConstantRange){
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(struct push),
+      },
+   }, NULL, &layout));
+   VkShaderModule vs = make_module(spv_quad_vert, sizeof(spv_quad_vert));
+   VkShaderModule fs = make_module(spv_color_frag, sizeof(spv_color_frag));
+   VkPipeline pipeline = make_pipeline_samples_stencil(layout, vs, fs, 0, VK_SAMPLE_COUNT_1_BIT,
+                                                       ~0u, VK_FORMAT_S8_UINT);
+   struct image stencil = make_image(W * 2, H * 2, VK_FORMAT_S8_UINT,
+                                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+   struct buffer out = make_buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST);
+   const VkDeviceSize zero = 0;
+   const struct push push = { { 1, 1, 1, 1 }, { 0, 0 } };
+   for (unsigned size = 0; size < 2; ++size) {
+      const uint32_t width = W - size * 8, height = H - size * 16;
+      struct image target = make_image(width, height, VK_FORMAT_R8G8B8A8_UNORM,
+                                       VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+      for (unsigned clear = 0; clear < 2; ++clear) {
+         VkCommandBuffer cmd = begin();
+         const VkRenderingAttachmentInfo color = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = target.view, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue.color.float32 = { 0, 0, 0, 1 },
+         };
+         const VkRenderingAttachmentInfo ds = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = stencil.view, .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            .clearValue.depthStencil.stencil = clear ? 7 : 3,
+         };
+         begin_rendering(cmd, &(VkRenderingInfo){
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = { { 0, 0 }, { width, height } }, .layerCount = 1,
+            .colorAttachmentCount = 1, .pColorAttachments = &color, .pStencilAttachment = &ds,
+         });
+         vkCmdSetViewport(cmd, 0, 1, &(VkViewport){ 0, 0, width, height, 0, 1 });
+         vkCmdSetScissor(cmd, 0, 1, &(VkRect2D){ { 0, 0 }, { width, height } });
+         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+         vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &zero);
+         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                            0, sizeof(push), &push);
+         vkCmdDraw(cmd, 4, 1, 0, 0);
+         end_rendering(cmd);
+         vkCmdCopyImageToBuffer(cmd, target.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, out.buffer, 1,
+                                &(VkBufferImageCopy){
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { width, height, 1 },
+         });
+         submit_and_wait(cmd);
+         const uint8_t *p = (const uint8_t *)out.map + (width + 1) * 4;
+         CHECK(clear ? mostly(p, true, false, false) : is(p, 0, 0, 0),
+               "transient stencil %ux%u clear %u: %u,%u,%u,%u", width, height, clear,
+               p[0], p[1], p[2], p[3]);
+      }
+      free_image(&target);
+   }
+   free_buffer(&out);
+   free_image(&stencil);
+   vkDestroyPipeline(dev, pipeline, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   vkDestroyShaderModule(dev, vs, NULL);
+   vkDestroyShaderModule(dev, fs, NULL);
+   printf("transient stencil extents: done\n");
 }
 
 static void
@@ -655,6 +743,7 @@ main(void)
    memcpy(vertices.map, quad, sizeof(quad));
 
    test_colors(vertices.buffer);
+   test_transient_stencil(vertices.buffer);
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_1_BIT, ~0u, 1);
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_4_BIT, ~0u, 4);
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_4_BIT, 5u, 2);
