@@ -35,6 +35,12 @@ absent alpha instead produced black boxes around LCD text. The existing
 `skbug_12212` GM now matches the independent ANGLE reference exactly. This
 correction is recorded in `skia_fixes` for native and browser builds.
 
+Graphite's existing image tiling implementation is enabled for ordinary canvas
+image draws. The pinned version otherwise inherits a disabled tiling hook and
+drops images larger than the texture limit. The large bitmap and picture GMs
+now match their explicitly tiled variants exactly; this correction is also
+recorded in `skia_fixes`.
+
 The integration registers FreeType's compiled SVG renderer in its Wasm module
 list, fixing an SVG emoji metrics crash, and matches image extensions with a
 leading dot so `.wbmp` is not also collected as `bmp`. These corrections are

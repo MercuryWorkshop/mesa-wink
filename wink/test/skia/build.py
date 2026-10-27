@@ -14,7 +14,8 @@ MESA = HERE.parents[2]
 CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'freetype-wasm-svg-module-registration-v1',
                      'dm-image-extension-boundary-v1',
-                     'ganesh-framebuffer-fetch-destination-swizzle-v1']
+                     'ganesh-framebuffer-fetch-destination-swizzle-v1',
+                     'graphite-automatic-image-tiling-v1']
 
 
 def run(args, **kwargs):
@@ -52,6 +53,14 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # Graphite implements drawAsTiledImageRect but inherits the false opt-in
+    # from SkDevice, so ordinary canvas draws bypass it and try to upload
+    # images larger than maxTextureSize. Use the existing tiling path as
+    # Ganesh does; manual SkTiledImageUtils draws already exercise this code.
+    patch(source, 'src/gpu/graphite/Device.h',
+          '    bool drawAsTiledImageRect(SkCanvas*,',
+          '''    bool shouldDrawAsTiledImageRect() const override { return true; }
+    bool drawAsTiledImageRect(SkCanvas*,''')
     # Framebuffer fetch returns physical attachment channels. Convert back to
     # the logical surface color before shader blending, just as a destination
     # texture's sampler swizzle does. Alpha_8 backed by R8 writes a000 and must
