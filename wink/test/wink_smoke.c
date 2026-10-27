@@ -111,6 +111,7 @@ note(const char *fmt, ...)
    X(void, DrawBuffers, (GLsizei, const GLenum *))                              \
    X(void, ReadBuffer, (GLenum))                                                \
    X(void, TexStorage2DMultisample, (GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean)) \
+   X(void, TexStorage2D, (GLenum, GLsizei, GLenum, GLsizei, GLsizei))          \
    X(void, BlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum)) \
    X(void, CompressedTexImage2D, (GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *)) \
    X(void, DeleteTextures, (GLsizei, const GLuint *))                             \
@@ -807,7 +808,11 @@ framebuffer_fetch(void)
    GLuint fb[2], tex[3]; p_glGenFramebuffers(2,fb); p_glGenTextures(3,tex);
    p_glBindFramebuffer(GL_FRAMEBUFFER,fb[1]);
    p_glBindTexture(GL_TEXTURE_2D,tex[2]);
-   p_glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,W,H,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+   /* Resolve into level zero of a mipmapped texture, not a default view of
+    * all its levels. Pixel checks below also catch a discarded invalid pass. */
+   unsigned levels = 1;
+   for (unsigned size = W > H ? W : H; size > 1; size >>= 1) ++levels;
+   p_glTexStorage2D(GL_TEXTURE_2D,levels,GL_RGBA8,W,H);
    p_glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,tex[2],0);
    for (unsigned samples = 1; samples <= 4; samples += 3) {
       const GLenum target = samples == 1 ? GL_TEXTURE_2D : GL_TEXTURE_2D_MULTISAMPLE;

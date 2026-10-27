@@ -28498,8 +28498,14 @@ gex_wgpu_resolve(struct pipe_context *pipe, struct pipe_resource *dst,
    if (util_format_is_depth_or_stencil(src->format))
       return gex_wgpu_resolve_depth(pipe, dst, src);
 
-   WGPUTextureView msaa = wgpuTextureCreateView(gex_resource(src)->texture, NULL);
-   WGPUTextureView single = wgpuTextureCreateView(gex_resource(dst)->texture, NULL);
+   /* The destination may have a complete mip chain. A resolve attachment
+    * names one subresource, whereas the default view includes every mip. */
+   WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   vd.dimension = WGPUTextureViewDimension_2D;
+   vd.mipLevelCount = 1;
+   vd.arrayLayerCount = 1;
+   WGPUTextureView msaa = wgpuTextureCreateView(gex_resource(src)->texture, &vd);
+   WGPUTextureView single = wgpuTextureCreateView(gex_resource(dst)->texture, &vd);
    WGPUCommandEncoder encoder =
       gex_wgpu_local_encoder(screen);
    if (!msaa || !single || !encoder) {
