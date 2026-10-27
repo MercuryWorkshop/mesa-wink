@@ -101,6 +101,7 @@ note(const char *fmt, ...)
    X(void, Disable, (GLenum))                                                  \
    X(void, GenTextures, (GLsizei, GLuint *))                                     \
    X(void, BindTexture, (GLenum, GLuint))                                        \
+   X(void, ActiveTexture, (GLenum))                                             \
    X(void, TexParameteri, (GLenum, GLenum, GLint))                               \
    X(void, TexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
    X(void, TexImage3D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
@@ -138,6 +139,7 @@ note(const char *fmt, ...)
    X(void, ColorPointer, (GLint, GLenum, GLsizei, const void *))                 \
    X(void, BlendFunc, (GLenum, GLenum))                                          \
    X(GLint, GetUniformLocation, (GLuint, const GLchar *))                        \
+   X(void, Uniform1i, (GLint, GLint))                                           \
    X(void, Uniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat))               \
    X(void, ClearTexImage, (GLuint, GLint, GLenum, GLenum, const void *))
 
@@ -783,6 +785,55 @@ norm16_readback(void)
    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
    p_glDeleteFramebuffers(1, &fbo);
    p_glDeleteTextures(2, textures);
+}
+
+static void
+independent_samplers(void)
+{
+   GLint units = 0;
+   p_glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
+   CHECK(units >= 16 && units <= 32, "fragment sampler unit count: %d", units);
+   if (units < 16 || units > 32)
+      return;
+   char fs[4096];
+   int at = snprintf(fs, sizeof(fs), "#version 320 es\nprecision highp float;"
+      "uniform sampler2D tex[%d]; layout(location=0) out vec4 color;"
+      "void main(){color=vec4(0);", units);
+   for (int i = 0; i < units; ++i)
+      at += snprintf(fs + at, sizeof(fs) - at,
+         "color+=texture(tex[%d],vec2(0.5))/%d.0;", i, units);
+   snprintf(fs + at, sizeof(fs) - at, "}");
+   const char *vs = "#version 320 es\nvoid main(){int i=gl_VertexID%3;"
+      "gl_Position=vec4(i==1?3.0:-1.0,i==2?3.0:-1.0,0,1);}";
+   GLuint prog = link_program(vs, fs, "independent samplers"), textures[32];
+   p_glUseProgram(prog);
+   p_glGenTextures(units, textures);
+   const GLenum wraps[] = { GL_REPEAT, GL_CLAMP_TO_EDGE, GL_MIRRORED_REPEAT };
+   int sum[3] = {0};
+   for (int i = 0; i < units; ++i) {
+      p_glActiveTexture(GL_TEXTURE0 + i);
+      p_glBindTexture(GL_TEXTURE_2D, textures[i]);
+      const uint8_t color[] = { 8 + i * 7, 247 - i * 7, i * 5, 255 };
+      for (unsigned c = 0; c < 3; ++c) sum[c] += color[c];
+      p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, color);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, (i / 9) & 1 ? GL_LINEAR : GL_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (i / 18) & 1 ? GL_LINEAR : GL_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wraps[i % 3]);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wraps[(i / 3) % 3]);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_R, wraps[(i / 9) % 3]);
+      char name[24]; snprintf(name, sizeof(name), "tex[%d]", i);
+      p_glUniform1i(p_glGetUniformLocation(prog, name), i);
+   }
+   p_glDrawArrays(GL_TRIANGLES, 0, 3);
+   uint8_t px[4]; read_center(px, W, H);
+   CHECK(near(px, (sum[0] + units / 2) / units, (sum[1] + units / 2) / units,
+              (sum[2] + units / 2) / units),
+         "independent samplers (%d): %u,%u,%u,%u", units, px[0], px[1], px[2], px[3]);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "independent samplers: context failed");
+   p_glDeleteTextures(units, textures);
+   p_glActiveTexture(GL_TEXTURE0);
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
 }
 
 static void
@@ -1483,6 +1534,7 @@ exercise(const char *label, int api, wink_surface *surface)
       norm16_readback();
       layered_pbo_upload();
       helper_invocation();
+      independent_samplers();
       framebuffer_fetch();
    }
 

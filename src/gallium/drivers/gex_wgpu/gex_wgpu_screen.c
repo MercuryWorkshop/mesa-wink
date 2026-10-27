@@ -1858,10 +1858,8 @@ struct gex_wgpu_screen {
     * using more units than this shares sampler bindings between units that
     * bind the same sampler; see gex_wgpu_fs_share_samplers. */
    uint32_t max_samplers;
-   /* Texture units the fragment stage offers: what the device's
-    * sampled-texture limit leaves after the read-only images and the
-    * framebuffer copies, between GEX_WGPU_MAX_STAGE_SAMPLERS and
-    * GEX_WGPU_MAX_SAMPLERS. See where it is set. */
+   /* Fragment texture units must fit both sampled textures and independent
+    * sampler bindings, after reserving textures for images and copies. */
    uint32_t max_fs_samplers;
    uint32_t max_storage_buffer_size;
    /* Buffers and textures let go of, destroyed once nothing recorded may
@@ -51873,20 +51871,11 @@ gex_wgpu_screen_create(WGPUDevice device)
    const bool force_ordered_fetch = getenv("GEX_WGPU_FORCE_ORDERED_FETCH") != NULL;
    if (force_ordered_fetch)
       screen->framebuffer_fetch = false;
-   /* The fragment stage's texture units, from what the device grants.
-    *
-    * Every unit is a sampled texture, and so is every read-only image
-    * (GEX_WGPU_MAX_SHADER_IMAGES of them) and each of the eight colour
-    * attachment copies framebuffer fetch and logic ops bind
-    * (GEX_WGPU_LOGICOP_BINDING + rt); a shader may use all three at once, so
-    * the units are what is left after the other two. WebGPU's default of
-    * sixteen leaves the sixteen GL 3.x requires; Chrome's 48 leaves 24, and a
-    * device granting 56 or more gets all 32. Iris sizes its sampler pool
-    * from GL_MAX_TEXTURE_IMAGE_UNITS -- the fragment stage's figure -- and
-    * Complementary's HIGH profile and Photon both ask for more than sixteen.
-    * Samplers are a separate limit, sixteen in all of Chrome's tiers;
-    * gex_wgpu_fs_share_samplers lets units bind more textures than that.
-    * GEX_WGPU_FS_UNITS lowers it, for comparisons. */
+   /* Every advertised GL unit may use an independent sampler state. Sharing
+    * compatible samplers is an optimization, not a way to promise more units
+    * than the device's sampler limit: a legal draw with distinct states must
+    * still execute. Reserve sampled textures for read-only images and color
+    * copies as well. GEX_WGPU_FS_UNITS can further lower this limit. */
    {
       const uint32_t reserved = GEX_WGPU_MAX_SHADER_IMAGES + 8;
       const uint32_t granted =
@@ -51894,6 +51883,10 @@ gex_wgpu_screen_create(WGPUDevice device)
          limits.maxSampledTexturesPerShaderStage != WGPU_LIMIT_U32_UNDEFINED
             ? limits.maxSampledTexturesPerShaderStage : 0;
       uint32_t units = granted > reserved ? granted - reserved : 0;
+      const uint32_t sampler_limit = got_limits &&
+         limits.maxSamplersPerShaderStage != WGPU_LIMIT_U32_UNDEFINED
+            ? limits.maxSamplersPerShaderStage : GEX_WGPU_MAX_STAGE_SAMPLERS;
+      units = MIN2(units, sampler_limit);
       const char *cap = getenv("GEX_WGPU_FS_UNITS");
       if (cap && *cap)
          units = MIN2(units, (uint32_t)atoi(cap));
