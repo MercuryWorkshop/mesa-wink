@@ -44,6 +44,8 @@
 
 #include "util/u_screen.h"
 #include "util/u_upload_mgr.h"
+#define XXH_INLINE_ALL
+#include "util/xxhash.h"
 
 #include <stdbool.h>
 #include <math.h>
@@ -320,10 +322,11 @@ extern void gex_wgpu_jspi_signal(void);
  * 0..3", and a shader with several ordinary textures and one samplerBuffer
  * puts it well past unit 3. KHR-GL44's compute_shader.resource-texture uses
  * unit 6, and it failed with "slot=6 count=0 max=4" -- a message that reads
- * like a capacity problem and is not one. Sixteen is the sampler-unit count,
- * so any declaration fits; the bindings after this are all derived from it
- * and move with it. */
-#define GEX_WGPU_MAX_BUFFER_TEXTURES 16
+ * like a capacity problem and is not one. This is the sampler-unit count
+ * (GEX_WGPU_MAX_SAMPLERS, spelled out because it is used here before that is
+ * defined), so any declaration fits; the bindings after this are all derived
+ * from it and move with it. */
+#define GEX_WGPU_MAX_BUFFER_TEXTURES 32
 /* ARB_shader_draw_parameters: gl_BaseVertexARB, gl_BaseInstanceARB and
  * gl_DrawIDARB, which WGSL has no builtin for.
  *
@@ -1421,11 +1424,22 @@ gex_wgpu_topology(enum mesa_prim mode)
    default: return WGPUPrimitiveTopology_TriangleList;
    }
 }
-/* Sixteen, not eight: GL 3.1 requires MAX_VERTEX_TEXTURE_IMAGE_UNITS >= 16,
- * and WebGPU's default maxSampledTexturesPerShaderStage and
- * maxSamplersPerShaderStage are both exactly that. The slot masks below are
- * sized to match; an eight-bit mask silently dropped slots 8 and up. */
-#define GEX_WGPU_MAX_SAMPLERS 16
+/* Room for Mesa's 32 units (MAX_TEXTURE_IMAGE_UNITS), which is what every
+ * per-slot array and mask is sized by. How many a stage *offers* is a cap:
+ * GEX_WGPU_MAX_STAGE_SAMPLERS for all but the fragment stage, and for the
+ * fragment stage whatever the device's sampled-texture limit leaves room for.
+ * Sixteen was the ceiling while it was also WebGPU's default
+ * maxSampledTexturesPerShaderStage -- and that is the shaderpack wall: Iris
+ * sizes its pool from GL_MAX_TEXTURE_IMAGE_UNITS, and Complementary's HIGH
+ * profile asks for a seventeenth. The masks are 32-bit; an eight-bit one
+ * once silently dropped slots 8 and up, and a sixteen-bit one would have
+ * dropped 16 and up out of the variant keys. */
+#define GEX_WGPU_MAX_SAMPLERS 32
+/* The units every stage but the fragment stage offers. GL 3.1 requires
+ * MAX_VERTEX_TEXTURE_IMAGE_UNITS >= 16 and wants no more; the compute-run
+ * stages bind a texture *and* a sampler for every unit into a group whose
+ * masks are 64-bit (GEX_WGPU_MAX_GROUP_BINDINGS), so they stay here. */
+#define GEX_WGPU_MAX_STAGE_SAMPLERS 16
 
 /* The three stages this driver runs as compute passes and which therefore
  * keep their sampler state in gex_wgpu_context::stage_sampler_views. */
@@ -1683,12 +1697,17 @@ gex_wgpu_collect_stage_images(nir_shader *nir,
 static_assert(GEX_WGPU_MAX_BUFFER_TEXTURES == GEX_WGPU_MAX_SAMPLERS,
               "a buffer texture is indexed by its sampler unit");
 /* The widest bind group any of the four can have: the fragment texture group
- * carries a texture and a sampler per slot. */
-#define GEX_WGPU_CACHE_MAX_ENTRIES (2 * GEX_WGPU_MAX_SAMPLERS)
+ * carries a texture and a sampler per slot, and a colour-attachment copy per
+ * render target for framebuffer fetch and logic ops (GEX_WGPU_LOGICOP_BINDING
+ * + rt). Without those eight a draw that used every unit and read the
+ * framebuffer would have found no cache slot wide enough. */
+#define GEX_WGPU_CACHE_MAX_ENTRIES (2 * GEX_WGPU_MAX_SAMPLERS + 8)
 #define GEX_WGPU_BGL_CACHE_SLOTS 64
 #define GEX_WGPU_PL_CACHE_SLOTS 64
-#define GEX_WGPU_BG_CACHE_SLOTS 512
-#define GEX_WGPU_PIPELINE_CACHE_SLOTS 256
+#define GEX_WGPU_BG_CACHE_SLOTS 1024
+#define GEX_WGPU_BG_CACHE_WAYS 4
+#define GEX_WGPU_PIPELINE_CACHE_SLOTS 1024
+#define GEX_WGPU_PIPELINE_CACHE_WAYS 4
 #define GEX_WGPU_PIPELINE_KEY_MAX 4096
 /* Big enough that Minecraft, which uploads about two constant buffers per
  * draw, wraps every few dozen frames rather than every few draws. */
@@ -1705,6 +1724,11 @@ enum gex_wgpu_decode_format {
    GEX_WGPU_DECODE_R16F,
    GEX_WGPU_DECODE_RG16F,
    GEX_WGPU_DECODE_RGBA16F,
+   /* Not decompression: two 16-bit normalized channels unpacked from the
+    * four bytes of a 32-bit texture's texel into the float32 pair this
+    * driver stores the format as (gex_wgpu_norm16_wgsl's sampled half). */
+   GEX_WGPU_DECODE_RG16_UNORM_OF_32,
+   GEX_WGPU_DECODE_RG16_SNORM_OF_32,
    GEX_WGPU_DECODE_FORMATS,
 };
 
@@ -1743,6 +1767,16 @@ struct gex_wgpu_screen {
    /* The passes decoding a compressed texture into a sampler view's scratch
     * (gex_wgpu_sampler_view_refresh), one per scratch format. */
    WGPURenderPipeline decode_pipelines[GEX_WGPU_DECODE_FORMATS];
+   /* glGenerateMipmap's box filter (gex_wgpu_generate_mipmap): one pipeline
+    * per destination format, sharing a layout and a module. */
+   struct {
+      WGPUTextureFormat format;
+      WGPURenderPipeline pipeline;
+   } mip_pipelines[16];
+   unsigned mip_pipeline_count;
+   WGPUShaderModule mip_module;
+   WGPUBindGroupLayout mip_bgl;
+   WGPUPipelineLayout mip_layout;
    /* The multisampled-depth resolve, one pipeline per depth format. Distinct
     * from `depth_resolve` above, which turns a packed depth texture into
     * something readable: this one turns 4x samples into one. WebGPU resolves
@@ -1780,6 +1814,9 @@ struct gex_wgpu_screen {
     * blend a float32 attachment, both of which are optional features. */
    bool float32_filterable;
    bool texture_formats_tier1;
+   /* gex_wgpu_norm16_convert's two pipelines and their layout, made once. */
+   WGPUBindGroupLayout norm16_layout;
+   WGPUComputePipeline norm16_pack, norm16_unpack;
    bool float32_blendable;
    /* WebGPU bounds the total bytes per sample across colour attachments.
     *
@@ -1873,8 +1910,10 @@ struct gex_wgpu_screen {
       unsigned count;
       WGPUBindGroupEntry entries[GEX_WGPU_CACHE_MAX_ENTRIES];
       WGPUBindGroup group;
+      uint64_t last_used;
    } bg_cache[GEX_WGPU_BG_CACHE_SLOTS];
    uint64_t bg_cache_hits, bg_cache_misses;
+   uint64_t bg_cache_clock;
    /* One readback staging buffer, reused. Every texture_map(PIPE_MAP_READ)
     * created one and released it again, and presentation goes through that
     * path once a frame -- so an ordinary windowed application allocated and
@@ -1974,9 +2013,11 @@ struct gex_wgpu_screen {
        * were a megabyte of the screen's, used or not. */
       uint8_t *key;
       unsigned key_capacity;
+      uint64_t last_used;
       WGPURenderPipeline pipeline;
    } pipeline_cache[GEX_WGPU_PIPELINE_CACHE_SLOTS];
    uint64_t pipeline_cache_hits, pipeline_cache_misses;
+   uint64_t pipeline_cache_clock;
    /* Device limits, so caps report what this device can honour rather than
     * what the driver was compiled to hold. Advertising more than the device
     * allows does not fail here -- it fails later, at pipeline creation, on
@@ -2029,6 +2070,16 @@ struct gex_wgpu_screen {
     * texture -- so this bounds the writable count rather than the declared
     * one; see GEX_WGPU_MAX_SHADER_IMAGES. */
    uint32_t max_storage_textures;
+   /* Samplers the device grants per stage. Chrome grants sixteen in every
+    * limit tier, against up to 48 sampled textures, so a fragment shader
+    * using more units than this shares sampler bindings between units that
+    * bind the same sampler; see gex_wgpu_fs_share_samplers. */
+   uint32_t max_samplers;
+   /* Texture units the fragment stage offers: what the device's
+    * sampled-texture limit leaves after the read-only images and the
+    * framebuffer copies, between GEX_WGPU_MAX_STAGE_SAMPLERS and
+    * GEX_WGPU_MAX_SAMPLERS. See where it is set. */
+   uint32_t max_fs_samplers;
    uint32_t max_storage_buffer_size;
    /* Buffers and textures let go of, destroyed once nothing recorded may
     * still use them: see gex_wgpu_doom. `doom_serial` counts them, and
@@ -2176,6 +2227,10 @@ struct gex_wgpu_resource {
    WGPUBuffer rt_scratch_staging;
    enum pipe_format rt_scratch_format;
    unsigned rt_scratch_level;
+   /* A layer of the scratch for each layer (or 3D slice) of the level, so
+    * that two layers attached together -- Blender's G-buffer closures, two
+    * layers of one array -- are two attachments rather than one twice. */
+   uint32_t rt_scratch_layers;
    uint32_t rt_scratch_width, rt_scratch_height, rt_scratch_row_bytes;
    uint64_t rt_scratch_bytes;
    /* Where a packed shader image's texels land before they are copied into
@@ -2202,6 +2257,13 @@ struct gex_wgpu_resource {
    uint32_t image_alias_width;
    uint32_t image_alias_height;
    uint32_t image_alias_layers;
+   /* An alias whose texels are not the texture's bytes (gex_wgpu_norm16_*):
+    * 1 for 2x16 unorm, 2 for 2x16 snorm, packed through image_alias_narrow
+    * (the texture's four bytes a texel) with image_alias_params' layout. */
+   uint8_t image_alias_convert;
+   WGPUBuffer image_alias_narrow;
+   WGPUBuffer image_alias_params;
+   uint32_t image_alias_narrow_row_bytes;
 };
 
 struct gex_wgpu_query;
@@ -2777,8 +2839,10 @@ struct gex_wgpu_context {
    struct primconvert_context *primconvert;
    /* GEX_WGPU_QUAD_IB: the cached quads-as-triangles index buffers, [0] for the
     * last-vertex convention and [1] for the first, and how many quads each covers. */
-   struct pipe_resource *quad_ib[2];
-   unsigned quad_ib_quads[2];
+   /* By triangulation: GL's last-vertex convention, the first-vertex one,
+    * and the last with each triangle turned so that vertex comes first. */
+   struct pipe_resource *quad_ib[3];
+   unsigned quad_ib_quads[3];
    /* GEX_WGPU_REPEAT: the commands of one multi-draw after its first, handed to
     * the emit of that first command, which -- when nothing it built depends on
     * the command -- records them as further drawIndexed calls on the pipeline,
@@ -3052,9 +3116,9 @@ struct gex_wgpu_shader {
     * found no input variables, and the caller falls back to the element
     * index. */
    uint8_t vertex_element_location[GEX_WGPU_MAX_VERTEX_ELEMENTS];
-   uint16_t integer_sampled_slots;
+   uint32_t integer_sampled_slots;
    /* Texture slots whose shader declaration is multisampled. */
-   uint16_t multisampled_slots;
+   uint32_t multisampled_slots;
    /* Slots whose *every* use is a query -- textureSize, textureQueryLevels or
     * textureSamples -- and never a sample.
     *
@@ -3068,7 +3132,7 @@ struct gex_wgpu_shader {
     * A query-only slot needs no binding at all, though: every answer is a
     * property of the bound view, so the variant replaces the queries with
     * immediates and the declaration falls out as dead code. */
-   uint16_t query_only_slots;
+   uint32_t query_only_slots;
    /* And which of those are *arrays*. WGSL has no multisampled array texture
     * and Dawn will not create one either, so the driver holds a GL
     * 2D_MULTISAMPLE_ARRAY as one wide multisampled 2D texture with the layers
@@ -3076,7 +3140,7 @@ struct gex_wgpu_shader {
     * cannot be rewritten here, because the tile width comes from the bound
     * texture, so it is deferred to the variant exactly as integer sampling
     * is: no base module is built for such a shader. */
-   uint16_t ms_array_slots;
+   uint32_t ms_array_slots;
    /* Whether the shader reads gl_DrawID. Only then does a non-zero
     * drawid_offset change what it computes. */
    bool reads_draw_id;
@@ -3269,7 +3333,7 @@ struct gex_wgpu_interp_variant {
     * filters, wrap modes and view swizzles, so two draws with different
     * sampler state need different modules -- exactly as the fragment stage
     * keys its own variants. */
-   uint16_t sampler_mask;
+   uint32_t sampler_mask;
    struct pipe_sampler_state sampler_keys[GEX_WGPU_MAX_SAMPLERS];
    uint8_t swizzles[GEX_WGPU_MAX_SAMPLERS][4];
    /* The vertex-element unpack signature this module was built for. A vertex
@@ -3303,7 +3367,7 @@ struct gex_wgpu_shader_variant {
    /* The colour output base type this variant declares, which has to match
     * the bound target's. */
    nir_alu_type color_output_type;
-   uint16_t sampler_mask;
+   uint32_t sampler_mask;
    /* The GL_COORD_REPLACE mask this variant substituted, which is zero for
     * every draw that is not points -- so a points variant and a triangles
     * variant of the same shader are distinct and neither is reused for the
@@ -3362,26 +3426,30 @@ struct gex_wgpu_shader_variant {
    bool drop_color;
    /* Texture slots removed from this variant because the bound state could
     * not satisfy their declaration; see gex_wgpu_unusable_texture_slots. */
-   uint16_t omitted_slots;
+   uint32_t omitted_slots;
    /* Slots this variant rewrote from a multisampled declaration to an
     * ordinary one, because the bound texture has a single sample. Part of the
     * key: the same shader against a real multisample texture is a different
     * module. */
-   uint16_t demoted_ms_slots;
+   uint32_t demoted_ms_slots;
    /* Slots this variant read as a tiled multisampled array, and the geometry
     * it baked in as immediates. Both are part of the key: the width decides
     * every rewritten coordinate and the layer count decides what textureSize
     * answers, so the same shader against a differently shaped array is a
     * different module. */
-   uint16_t tiled_ms_slots;
+   uint32_t tiled_ms_slots;
    uint32_t tiled_ms_geom[GEX_WGPU_MAX_SAMPLERS][3];
    /* The tile offset this variant subtracted from gl_FragCoord, baked in as
     * an immediate and so part of the key. */
    uint32_t frag_tile_x;
    /* Slots whose queries this variant answered with immediates, and the
     * answers. Both are part of the key for the obvious reason. */
-   uint16_t query_only_slots;
+   uint32_t query_only_slots;
    uint32_t query_only_geom[GEX_WGPU_MAX_SAMPLERS][5];
+   /* Sampler slots whose derefs this variant points at another slot's
+    * sampler, and which slot that is (gex_wgpu_fs_share_samplers). */
+   uint32_t shared_samplers;
+   uint8_t sampler_share[GEX_WGPU_MAX_SAMPLERS];
    /* The polygon offset this variant computes itself, and the state it baked
     * in as immediates; see gex_wgpu_lower_polygon_offset_clamp. All four are
     * part of the key because all four are constants in the shader. */
@@ -3592,7 +3660,7 @@ struct gex_wgpu_gs {
    /* Which of those are sampled as integers, and the modules built for them.
     * Empty for almost every shader, in which case the base module is used
     * directly and none of this costs anything. */
-   uint16_t integer_sampled_slots;
+   uint32_t integer_sampled_slots;
    struct gex_wgpu_gs_variant *variants;
    /* And the images. GL 4.2 puts image uniforms in every stage, and this one
     * runs as a compute pass, where WebGPU allows a writable storage texture
@@ -3720,7 +3788,7 @@ struct gex_wgpu_tcs {
    /* Which of those are sampled as integers, and the modules built for them.
     * Empty for almost every shader, and then `module` below is the only one
     * and none of this costs anything. */
-   uint16_t integer_sampled_slots;
+   uint32_t integer_sampled_slots;
    struct gex_wgpu_tcs_variant *variants;
    /* Kept only when there are integer-sampled slots, because then the
     * variants are the only modules this shader ever has and each is built
@@ -3793,7 +3861,7 @@ struct gex_wgpu_tes {
    struct gex_wgpu_stage_textures textures;
    /* Which of those are sampled as integers. Empty for almost every shader,
     * and then none of the variant's texture key is looked at. */
-   uint16_t integer_sampled_slots;
+   uint32_t integer_sampled_slots;
    /* And its images; see gex_wgpu_collect_stage_images. This stage
     * runs as a compute pass too, so a writable storage texture is
     * legal in it for the same reason it is in the geometry one. */
@@ -4041,6 +4109,23 @@ gex_wgpu_sampler_matching(const struct gex_wgpu_sampler *sampler,
    if (state_compares != want_compare && sampler->flipped_comparison)
       return sampler->flipped_comparison;
    return sampler->sampler;
+}
+
+/* The nearest twin for a NonFiltering binding. That binding is never a
+ * comparison one, and `nonfiltering` keeps the state's comparison, so a state
+ * that compares has to give its flipped twin instead -- nearest, and
+ * comparing nothing. Binding `nonfiltering` there was a validation error
+ * ("Comparison sampler is incompatible with non-comparison sampler binding")
+ * that invalidated every command buffer it reached: Iris turns comparison on
+ * for the shadow maps, and Sildur's Vibrant also reads shadowtex as plain
+ * depth, so most of each frame was lost. */
+static WGPUSampler
+gex_wgpu_sampler_nonfiltering(const struct gex_wgpu_sampler *sampler)
+{
+   if (sampler->state.compare_mode == PIPE_TEX_COMPARE_R_TO_TEXTURE &&
+       sampler->flipped_comparison)
+      return sampler->flipped_comparison;
+   return sampler->nonfiltering;
 }
 
 struct gex_wgpu_sampler_view {
@@ -9931,7 +10016,7 @@ gex_wgpu_lower_integer_txd(const nir_tex_instr *tex, const void *data)
  * float cases.
  */
 struct gex_wgpu_omit_textures {
-   uint16_t slots;
+   uint32_t slots;
    bool progress;
 };
 
@@ -9972,7 +10057,7 @@ gex_wgpu_omit_texture_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 static bool
-gex_wgpu_omit_textures(nir_shader *nir, uint16_t slots)
+gex_wgpu_omit_textures(nir_shader *nir, uint32_t slots)
 {
    struct gex_wgpu_omit_textures state = {.slots = slots};
    nir_shader_instructions_pass(nir, gex_wgpu_omit_texture_instr,
@@ -10003,7 +10088,7 @@ gex_wgpu_omit_textures(nir_shader *nir, uint16_t slots)
  * KHR-GL44.sample_variables' nine remaining failures are that, all of them
  * rgba32f, which is exactly the format WebGPU will not multisample. */
 struct gex_wgpu_demote_ms {
-   uint16_t slots;
+   uint32_t slots;
    bool progress;
 };
 
@@ -10016,8 +10101,8 @@ gex_wgpu_demote_ms_instr(nir_builder *b, nir_instr *instr, void *data)
    nir_tex_instr *tex = nir_instr_as_tex(instr);
    if (tex->sampler_dim != GLSL_SAMPLER_DIM_MS)
       return false;
-   if (tex->texture_index >= 16 ||
-       !(state->slots & (uint16_t)(1u << tex->texture_index)))
+   if (tex->texture_index >= GEX_WGPU_MAX_SAMPLERS ||
+       !(state->slots & (uint32_t)(1u << tex->texture_index)))
       return false;
    tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
    /* The sample index has no meaning once the texture has one sample, and
@@ -10050,7 +10135,7 @@ gex_wgpu_demote_ms_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 static bool
-gex_wgpu_demote_ms_textures(nir_shader *nir, uint16_t slots)
+gex_wgpu_demote_ms_textures(nir_shader *nir, uint32_t slots)
 {
    struct gex_wgpu_demote_ms state = {.slots = slots};
    nir_shader_instructions_pass(nir, gex_wgpu_demote_ms_instr,
@@ -10079,7 +10164,7 @@ gex_wgpu_demote_ms_textures(nir_shader *nir, uint16_t slots)
        * dropped the sample index. Tint says so exactly: "Image Operand Sample
        * is required for operation on multi-sampled image". */
       const unsigned at = var->data.driver_location;
-      if (at >= 16 || !(slots & (uint16_t)(1u << at)))
+      if (at >= GEX_WGPU_MAX_SAMPLERS || !(slots & (uint32_t)(1u << at)))
          continue;
       const bool is_array = glsl_sampler_type_is_array(type);
       const struct glsl_type *flat = sampler
@@ -10126,7 +10211,7 @@ gex_wgpu_demote_ms_textures(nir_shader *nir, uint16_t slots)
  * disagree about. The same move as the multisampled-array textureSize, which
  * cannot be read off the flattened texture either. */
 struct gex_wgpu_query_const {
-   uint16_t slots;
+   uint32_t slots;
    /* width, height, layers-or-depth, levels, samples -- per slot */
    const uint32_t (*geom)[5];
    bool progress;
@@ -10143,7 +10228,7 @@ gex_wgpu_lower_query_only_instr(nir_builder *b, nir_instr *instr, void *data)
        tex->op != nir_texop_texture_samples)
       return false;
    if (tex->texture_index >= GEX_WGPU_MAX_SAMPLERS ||
-       !(state->slots & (uint16_t)(1u << tex->texture_index)))
+       !(state->slots & (uint32_t)(1u << tex->texture_index)))
       return false;
    const uint32_t *g = state->geom[tex->texture_index];
    b->cursor = nir_before_instr(instr);
@@ -10191,7 +10276,7 @@ gex_wgpu_lower_query_only_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 static bool
-gex_wgpu_lower_query_only(nir_shader *nir, uint16_t slots,
+gex_wgpu_lower_query_only(nir_shader *nir, uint32_t slots,
                           const uint32_t (*geom)[5])
 {
    struct gex_wgpu_query_const state = {.slots = slots, .geom = geom};
@@ -10288,7 +10373,7 @@ gex_wgpu_lower_frag_coord_tile(nir_shader *nir, uint32_t tile_x)
  * and a single layer, so textureSize would answer for the wrong thing. That
  * makes it part of the variant key. */
 struct gex_wgpu_tiled_ms {
-   uint16_t slots;
+   uint32_t slots;
    const uint32_t (*geom)[3];   /* width, height, layers -- per slot */
    bool progress;
 };
@@ -10303,7 +10388,7 @@ gex_wgpu_flatten_ms_array_instr(nir_builder *b, nir_instr *instr, void *data)
    if (tex->sampler_dim != GLSL_SAMPLER_DIM_MS || !tex->is_array)
       return false;
    if (tex->texture_index >= GEX_WGPU_MAX_SAMPLERS ||
-       !(state->slots & (uint16_t)(1u << tex->texture_index)))
+       !(state->slots & (uint32_t)(1u << tex->texture_index)))
       return false;
    const uint32_t width = state->geom[tex->texture_index][0];
    const uint32_t height = state->geom[tex->texture_index][1];
@@ -10341,7 +10426,7 @@ gex_wgpu_flatten_ms_array_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 static bool
-gex_wgpu_flatten_ms_array(nir_shader *nir, uint16_t slots,
+gex_wgpu_flatten_ms_array(nir_shader *nir, uint32_t slots,
                           const uint32_t (*geom)[3])
 {
    struct gex_wgpu_tiled_ms state = {.slots = slots, .geom = geom};
@@ -10364,7 +10449,7 @@ gex_wgpu_flatten_ms_array(nir_shader *nir, uint16_t slots,
           !glsl_sampler_type_is_array(type))
          continue;
       const unsigned at = var->data.driver_location;
-      if (at >= GEX_WGPU_MAX_SAMPLERS || !(slots & (uint16_t)(1u << at)))
+      if (at >= GEX_WGPU_MAX_SAMPLERS || !(slots & (uint32_t)(1u << at)))
          continue;
       const struct glsl_type *flat = sampler
          ? glsl_sampler_type(GLSL_SAMPLER_DIM_MS, false, false,
@@ -10390,7 +10475,7 @@ static bool
 gex_wgpu_lower_texture_variant(nir_shader *nir,
                                unsigned texture_count,
                                const uint8_t *texture_slots,
-                               uint16_t integer_sampled_slots,
+                               uint32_t integer_sampled_slots,
                                struct gex_wgpu_sampler *const *samplers,
                                struct pipe_sampler_view *const *views)
 {
@@ -11945,6 +12030,9 @@ struct gex_wgpu_capture_pack {
    { 1, 4, {0,0,0,0}, {0,8,16,24}, {8,8,8,8}, (c) }
 #define GEX_CAPTURE_8888_BGRA(c) \
    { 1, 4, {0,0,0,0}, {16,8,0,24}, {8,8,8,8}, (c) }
+/* Three 8-bit components in one word; fetched four wide by the render path. */
+#define GEX_CAPTURE_888(c) \
+   { 1, 3, {0,0,0,0}, {0,8,16,0}, {8,8,8,0}, (c) }
 /* Four 16-bit components across two words. */
 #define GEX_CAPTURE_16161616(c) \
    { 2, 4, {0,0,1,1}, {0,16,0,16}, {16,16,16,16}, (c) }
@@ -12051,6 +12139,10 @@ gex_wgpu_capture_pack_for(enum pipe_format format,
       { PIPE_FORMAT_R16G16B16_UNORM,      GEX_CAPTURE_161616(GEX_CAPTURE_UNORM) },
       { PIPE_FORMAT_R16G16B16_SNORM,      GEX_CAPTURE_161616(GEX_CAPTURE_SNORM) },
       { PIPE_FORMAT_R16G16B16_FLOAT,      GEX_CAPTURE_161616(GEX_CAPTURE_FLOAT16) },
+      { PIPE_FORMAT_R8G8B8_UNORM,         GEX_CAPTURE_888(GEX_CAPTURE_UNORM) },
+      { PIPE_FORMAT_R8G8B8_SNORM,         GEX_CAPTURE_888(GEX_CAPTURE_SNORM) },
+      { PIPE_FORMAT_R8G8B8_USCALED,       GEX_CAPTURE_888(GEX_CAPTURE_USCALED) },
+      { PIPE_FORMAT_R8G8B8_SSCALED,       GEX_CAPTURE_888(GEX_CAPTURE_SSCALED) },
       { PIPE_FORMAT_R11G11B10_FLOAT,     GEX_CAPTURE_PACKED3 },
    };
    for (unsigned i = 0; i < ARRAY_SIZE(table); ++i)
@@ -14583,7 +14675,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
           * gex_wgpu_flatten_ms_array rewrites the fetches to match once the
           * tile width is known. */
          if (multisampled && is_array)
-            shader->ms_array_slots |= (uint16_t)(1u << slot);
+            shader->ms_array_slots |= (uint32_t)(1u << slot);
          shader->texture_dimensions[shader->texture_count] =
             (multisampled && is_array) ? WGPUTextureViewDimension_2D
                                        : view_dimension;
@@ -14633,7 +14725,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          "gex_wgpu requires collision-free texture and sampler declarations");
       return NULL;
    }
-   uint16_t texture_slots_used = 0, sampler_slots_used = 0;
+   uint32_t texture_slots_used = 0, sampler_slots_used = 0;
    /* One bit per sampler slot, so these must be as wide as the slot space.
     * They were uint8_t, and `1u << slot` for slots 8..15 was truncated away
     * silently: every unit from eight up kept the default Float sample type,
@@ -14642,10 +14734,10 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
     * rewrote its fetches to zero. A `usampler2D s[16]` read units 0..7 and
     * zero above -- and so did
     * KHR-GL45.geometry_shader.limits.max_combined_texture_units. */
-   uint16_t shadow_slots = 0, float_slots = 0, uint_slots = 0, sint_slots = 0;
+   uint32_t shadow_slots = 0, float_slots = 0, uint_slots = 0, sint_slots = 0;
    /* Queries and samples tracked apart, so a slot that only ever asks about
     * the texture can be told from one that reads it. */
-   uint16_t query_slots = 0, sampled_slots = 0;
+   uint32_t query_slots = 0, sampled_slots = 0;
    /* Which texture op made the metadata invalid, if one did. The masks alone
     * cannot say: the refusals below happen before a slot is recorded, so a
     * rejected shader printed three perfectly consistent masks. Numeric
@@ -14762,9 +14854,9 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
    descriptors_valid &= !(shadow_slots & (float_slots | uint_slots | sint_slots));
    descriptors_valid &= !(float_slots & (uint_slots | sint_slots));
    descriptors_valid &= !(uint_slots & sint_slots);
-   shader->query_only_slots = (uint16_t)(query_slots & ~sampled_slots);
+   shader->query_only_slots = (uint32_t)(query_slots & ~sampled_slots);
    for (unsigned i = 0; i < shader->texture_count; ++i) {
-      const uint16_t slot_bit = 1u << shader->texture_slots[i];
+      const uint32_t slot_bit = 1u << shader->texture_slots[i];
       if (shadow_slots & slot_bit)
          shader->texture_sample_types[i] = WGPUTextureSampleType_Depth;
       else if (uint_slots & slot_bit)
@@ -14781,7 +14873,7 @@ gex_wgpu_create_shader_state(struct pipe_context *pipe,
          shader->texture_dimensions[i] = WGPUTextureViewDimension_2DArray;
    }
    for (unsigned i = 0; i < shader->sampler_count; ++i) {
-      const uint16_t slot_bit = 1u << shader->sampler_slots[i];
+      const uint32_t slot_bit = 1u << shader->sampler_slots[i];
       if (shadow_slots & slot_bit)
          shader->sampler_types[i] = WGPUSamplerBindingType_Comparison;
       else if ((uint_slots | sint_slots) & slot_bit)
@@ -15746,11 +15838,11 @@ static WGPUTextureSampleType gex_wgpu_format_sample_type(enum pipe_format fmt);
  * that, and serving it is better than removing the sampler, because the
  * shader may go on to use the result.
  */
-static uint16_t
+static uint32_t
 gex_wgpu_unusable_texture_slots(struct gex_wgpu_context *ctx)
 {
    const struct gex_wgpu_shader *fs = ctx->fs;
-   uint16_t mask = 0;
+   uint32_t mask = 0;
    if (!fs)
       return 0;
    for (unsigned i = 0; i < fs->texture_count; ++i) {
@@ -15791,13 +15883,13 @@ gex_wgpu_unusable_texture_slots(struct gex_wgpu_context *ctx)
 /* Slots whose bound texture is a multisampled array held as one wide
  * multisampled 2D texture, with the geometry the shader has to bake in.
  * See gex_wgpu_flatten_ms_array. */
-static uint16_t
+static uint32_t
 gex_wgpu_tiled_ms_slots_for(const struct gex_wgpu_shader *fs,
                             struct pipe_sampler_view *const *views,
                             uint32_t geom[GEX_WGPU_MAX_SAMPLERS][3])
 {
    memset(geom, 0, sizeof(uint32_t) * GEX_WGPU_MAX_SAMPLERS * 3);
-   uint16_t mask = 0;
+   uint32_t mask = 0;
    if (!fs)
       return 0;
    for (unsigned i = 0; i < fs->texture_count; ++i) {
@@ -15814,7 +15906,7 @@ gex_wgpu_tiled_ms_slots_for(const struct gex_wgpu_shader *fs,
       geom[slot][0] = res->ms_tile_width;
       geom[slot][1] = view->texture->height0;
       geom[slot][2] = res->ms_tile_layers;
-      mask |= (uint16_t)(1u << slot);
+      mask |= (uint32_t)(1u << slot);
    }
    return mask;
 }
@@ -15822,13 +15914,13 @@ gex_wgpu_tiled_ms_slots_for(const struct gex_wgpu_shader *fs,
 /* The answers a query-only slot needs, read off the bound view. Only slots
  * that actually have one: with nothing bound there is no answer to bake in,
  * and the unusable-slot machinery already covers that case. */
-static uint16_t
+static uint32_t
 gex_wgpu_query_only_geom(const struct gex_wgpu_shader *sh,
                          struct pipe_sampler_view *const *views,
                          uint32_t geom[GEX_WGPU_MAX_SAMPLERS][5])
 {
    memset(geom, 0, sizeof(uint32_t) * GEX_WGPU_MAX_SAMPLERS * 5);
-   uint16_t mask = 0;
+   uint32_t mask = 0;
    if (!sh || !sh->query_only_slots)
       return 0;
    for (unsigned i = 0; i < sh->texture_count; ++i) {
@@ -15853,12 +15945,12 @@ gex_wgpu_query_only_geom(const struct gex_wgpu_shader *sh,
          : (view->target == PIPE_TEXTURE_CUBE_ARRAY ? layers / 6u : layers);
       geom[slot][3] = view->u.tex.last_level - first + 1;
       geom[slot][4] = MAX2(1u, (unsigned)t->nr_samples);
-      mask |= (uint16_t)(1u << slot);
+      mask |= (uint32_t)(1u << slot);
    }
    return mask;
 }
 
-static uint16_t
+static uint32_t
 gex_wgpu_tiled_ms_slots(struct gex_wgpu_context *ctx,
                         uint32_t geom[GEX_WGPU_MAX_SAMPLERS][3])
 {
@@ -15868,11 +15960,11 @@ gex_wgpu_tiled_ms_slots(struct gex_wgpu_context *ctx,
 /* Slots the shader declared multisampled where the bound texture has exactly
  * one sample. Legal GL, unrepresentable as a WebGPU multisampled binding, and
  * served by gex_wgpu_demote_ms_textures rewriting the declaration. */
-static uint16_t
+static uint32_t
 gex_wgpu_demotable_ms_slots(struct gex_wgpu_context *ctx)
 {
    const struct gex_wgpu_shader *fs = ctx->fs;
-   uint16_t mask = 0;
+   uint32_t mask = 0;
    if (!fs)
       return 0;
    for (unsigned i = 0; i < fs->texture_count; ++i) {
@@ -15948,10 +16040,198 @@ gex_wgpu_say_no_base_module(const struct gex_wgpu_shader *shader,
    }
 }
 
+static WGPUSampler
+gex_wgpu_default_sampler(struct gex_wgpu_screen *screen,
+                         WGPUSamplerBindingType type);
+static WGPUTextureSampleType
+gex_wgpu_format_sample_type(enum pipe_format format);
+
+/* The fragment slots whose depth view the draw will read as float -- the
+ * same test gex_wgpu_draw_vbo_inner makes when it builds `depth_as_float`,
+ * for the decisions that have to be taken before it runs. */
+static uint32_t
+gex_wgpu_fs_depth_as_float(const struct gex_wgpu_context *ctx,
+                           uint32_t omitted)
+{
+   uint32_t mask = 0;
+   for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
+      const unsigned slot = ctx->fs->texture_slots[i];
+      const struct pipe_sampler_view *view = ctx->sampler_views[slot];
+      if (view && !((omitted >> slot) & 1) &&
+          gex_wgpu_format_sample_type(view->format) ==
+             WGPUTextureSampleType_Depth &&
+          ctx->fs->texture_sample_types[i] == WGPUTextureSampleType_Float)
+         mask |= 1u << slot;
+   }
+   return mask;
+}
+
+/* What fragment sampler `i` (an index into fs->sampler_slots) binds: the
+ * sampler object group 0's entry carries, and the binding type its layout
+ * entry declares. One function for both, so that the sharing decision and
+ * the bind group cannot come to different answers. */
+static WGPUSampler
+gex_wgpu_fs_sampler_binding(struct gex_wgpu_context *ctx, unsigned i,
+                            uint32_t depth_as_float,
+                            WGPUSamplerBindingType *type)
+{
+   const unsigned slot = ctx->fs->sampler_slots[i];
+   const bool as_float = (depth_as_float >> slot) & 1;
+   /* A slot whose depth view is read as float declares a non-filtering
+    * sampler, so the nearest twin is what may be bound to it. */
+   *type = as_float ? WGPUSamplerBindingType_NonFiltering
+                    : ctx->fs->sampler_types[i];
+   const struct gex_wgpu_sampler *sampler = ctx->samplers[slot];
+   if (!sampler)
+      return gex_wgpu_default_sampler(gex_screen(ctx->base.screen), *type);
+   return as_float && sampler->nonfiltering
+      ? gex_wgpu_sampler_nonfiltering(sampler)
+      : gex_wgpu_sampler_matching(sampler, ctx->fs->sampler_types[i]);
+}
+
+/* Sampler bindings for a fragment shader with more sampler slots than the
+ * device has samplers.
+ *
+ * GL gives every texture unit its own sampler state; WebGPU counts sampler
+ * *bindings* against maxSamplersPerShaderStage, which Chrome holds at sixteen
+ * in every limit tier while granting up to 48 sampled textures. The states
+ * themselves are few -- an Iris composite pass reads a dozen colour buffers
+ * through two or three -- so a slot that would bind the same sampler object
+ * as the same binding type as an earlier slot borrows that slot's binding
+ * instead of declaring its own. `share[slot]` names the slot whose binding
+ * it uses (itself when it keeps its own) and `shared` has a bit for each
+ * slot that borrows. False when even that leaves more bindings than the
+ * device has.
+ *
+ * An omitted slot keeps its own binding and lends it to nobody: the variant
+ * removes what read it, so its sampler variable may be gone. */
+static bool
+gex_wgpu_fs_share_samplers(struct gex_wgpu_context *ctx, uint32_t omitted,
+                           uint8_t share[GEX_WGPU_MAX_SAMPLERS],
+                           uint32_t *shared)
+{
+   const struct gex_wgpu_shader *fs = ctx->fs;
+   const unsigned limit = gex_screen(ctx->base.screen)->max_samplers;
+   for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot)
+      share[slot] = slot;
+   *shared = 0;
+   if (fs->sampler_count <= limit)
+      return true;
+   const uint32_t depth_as_float = gex_wgpu_fs_depth_as_float(ctx, omitted);
+   WGPUSampler handle[GEX_WGPU_MAX_SAMPLERS];
+   WGPUSamplerBindingType type[GEX_WGPU_MAX_SAMPLERS];
+   unsigned bindings = 0;
+   for (unsigned i = 0; i < fs->sampler_count; ++i) {
+      const unsigned slot = fs->sampler_slots[i];
+      handle[i] = gex_wgpu_fs_sampler_binding(ctx, i, depth_as_float,
+                                              &type[i]);
+      unsigned lender = i;
+      if (!((omitted >> slot) & 1) && handle[i]) {
+         for (unsigned j = 0; j < i; ++j) {
+            const unsigned other = fs->sampler_slots[j];
+            if (!((omitted >> other) & 1) && share[other] == other &&
+                handle[j] == handle[i] && type[j] == type[i]) {
+               lender = j;
+               break;
+            }
+         }
+      }
+      if (lender != i) {
+         share[slot] = fs->sampler_slots[lender];
+         *shared |= 1u << slot;
+      } else {
+         ++bindings;
+      }
+   }
+   static bool said;
+   if (!said && *shared) {
+      said = true;
+      fprintf(stderr, "gex-wgpu: %u fragment sampler slots share %u sampler "
+              "bindings (the device has %u)\n", fs->sampler_count, bindings,
+              limit);
+   }
+   return bindings <= limit;
+}
+
+static bool
+gex_wgpu_is_shared_sampler_var(nir_variable *var, void *data)
+{
+   const uint32_t shared = *(const uint32_t *)data;
+   return glsl_type_is_bare_sampler(var->type) &&
+          var->data.driver_location < GEX_WGPU_MAX_SAMPLERS &&
+          ((shared >> var->data.driver_location) & 1);
+}
+
+/* Points the sampler derefs of each slot that borrows (see
+ * gex_wgpu_fs_share_samplers) at the sampler of the slot it borrows from.
+ *
+ * Run last, just before the variant is compiled: the lowerings before it find
+ * a slot's sampler state and view through the sampler deref's
+ * driver_location, and must still find the slot's own. The lender's variable
+ * is made again if a lowering left it unused and it was removed, so the
+ * borrowed binding is always declared. */
+static void
+gex_wgpu_apply_sampler_sharing(nir_shader *nir, const uint8_t *share,
+                               uint32_t shared)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   if (!impl || !shared)
+      return;
+   nir_variable *by_slot[GEX_WGPU_MAX_SAMPLERS] = {0};
+   unsigned set = 0;
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      if (glsl_type_is_bare_sampler(var->type) &&
+          var->data.driver_location < GEX_WGPU_MAX_SAMPLERS) {
+         by_slot[var->data.driver_location] = var;
+         set = var->data.descriptor_set;
+      }
+   }
+   nir_builder b = nir_builder_create(impl);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_tex)
+            continue;
+         nir_tex_instr *tex = nir_instr_as_tex(instr);
+         const int at = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+         if (at < 0)
+            continue;
+         nir_variable *var =
+            nir_deref_instr_get_variable(nir_src_as_deref(tex->src[at].src));
+         if (!var || !glsl_type_is_bare_sampler(var->type))
+            continue;
+         const unsigned slot = var->data.driver_location;
+         if (slot >= GEX_WGPU_MAX_SAMPLERS || !((shared >> slot) & 1))
+            continue;
+         const unsigned lender = share[slot];
+         if (!by_slot[lender]) {
+            char name[32];
+            snprintf(name, sizeof(name), "gex_sampler%u", lender);
+            nir_variable *made = nir_variable_create(
+               nir, nir_var_uniform, glsl_bare_sampler_type(), name);
+            made->data.descriptor_set = set;
+            made->data.driver_location = lender;
+            made->data.binding = 2 * lender + 1;
+            by_slot[lender] = made;
+         }
+         b.cursor = nir_before_instr(instr);
+         nir_src_rewrite(&tex->src[at].src,
+                         &nir_build_deref_var(&b, by_slot[lender])->def);
+      }
+   }
+   nir_progress(true, impl, nir_metadata_control_flow);
+   nir_opt_dce(nir);
+   nir_remove_dead_variables_options options = {
+      .can_remove_var = gex_wgpu_is_shared_sampler_var,
+      .can_remove_var_data = &shared,
+   };
+   nir_remove_dead_variables(nir, nir_var_uniform, &options);
+}
+
 static WGPUShaderModule
 gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                          bool drawing_triangles,
-                         uint16_t *omitted_out, uint16_t *demoted_out)
+                         uint32_t *omitted_out, uint32_t *demoted_out,
+                         uint32_t *shared_out, uint8_t *share_out)
 {
    /* Declining, not latching. This returns NULL and draw_vbo checks it, so
     * the caller already learns of the failure -- latching on top ended the
@@ -16002,7 +16282,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    /* Slots the bound state cannot satisfy; their samplers are removed from
     * this variant and their bindings left out of the group. Decided here for
     * the same reason as the line above: there are two early returns below. */
-   const uint16_t want_omit_slots = gex_wgpu_unusable_texture_slots(ctx);
+   const uint32_t want_omit_slots = gex_wgpu_unusable_texture_slots(ctx);
    /* Query-only slots are omitted in exactly the same sense, and have to be
     * reported through the same mask: the binding validation and the bind
     * group both read the *base* shader's recorded slots, which a variant
@@ -16010,17 +16290,33 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
     * texture and the draw was still declined for the one it used to have --
     * "sample type differs from the shader's", naming a slot nothing sampled. */
    uint32_t want_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
-   const uint16_t want_query_only =
+   const uint32_t want_query_only =
       gex_wgpu_query_only_geom(fs, ctx->sampler_views, want_query_geom);
    if (omitted_out)
-      *omitted_out = (uint16_t)(want_omit_slots | want_query_only);
+      *omitted_out = (uint32_t)(want_omit_slots | want_query_only);
    /* Decided here for the same reason the omit mask is: this function has two
     * early returns below and a variant reason must sit above both. */
-   const uint16_t want_demote_ms = gex_wgpu_demotable_ms_slots(ctx);
+   const uint32_t want_demote_ms = gex_wgpu_demotable_ms_slots(ctx);
    if (demoted_out)
       *demoted_out = want_demote_ms;
+   /* Sampler slots past the device's sampler count, folded onto the bindings
+    * of slots that bind the same sampler; see gex_wgpu_fs_share_samplers.
+    * Above both early returns like the masks before it, though only a shader
+    * with textures can need it and the first return is for one without. */
+   uint8_t want_share[GEX_WGPU_MAX_SAMPLERS];
+   uint32_t want_shared = 0;
+   if (!gex_wgpu_fs_share_samplers(ctx, want_omit_slots | want_query_only,
+                                   want_share, &want_shared)) {
+      GEX_FS_DECLINE("more distinct samplers than the device has sampler "
+                     "bindings");
+      return NULL;
+   }
+   if (shared_out)
+      *shared_out = want_shared;
+   if (share_out)
+      memcpy(share_out, want_share, sizeof(want_share));
    uint32_t want_tiled_geom[GEX_WGPU_MAX_SAMPLERS][3];
-   const uint16_t want_tiled_ms =
+   const uint32_t want_tiled_ms =
       gex_wgpu_tiled_ms_slots(ctx, want_tiled_geom);
    /* Only when something is actually rendering into a tile. A pass whose
     * attachments are ordinary leaves gl_FragCoord alone, which is every pass
@@ -16273,7 +16569,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
             gex_wgpu_say_no_base_module(fs, "fragment", __LINE__);
          return fs->module;
       }
-   uint16_t sampler_mask = 0;
+   uint32_t sampler_mask = 0;
    /* Kept apart on purpose: a retype needs a *variant*, but it does not need
     * the texture specialization. Folding the two together made every retyped
     * shader run sampler lowering it never asked for, which then refused. */
@@ -16398,7 +16694,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       want_omit_slots != 0 ||
       want_demote_ms != 0 || want_tiled_ms != 0 || fs->ms_array_slots != 0 ||
       want_frag_tile_x != 0 || want_query_only != 0 || want_offset_clamp ||
-      fs->unformatted_images != 0;
+      fs->unformatted_images != 0 || want_shared != 0;
    if (!needs_variant && !fs->buftex_count)
       {
          if (!fs->module)
@@ -16436,6 +16732,10 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
                    cached->tiled_ms_slots == want_tiled_ms &&
                    cached->frag_tile_x == want_frag_tile_x &&
                    cached->query_only_slots == want_query_only &&
+                   cached->shared_samplers == want_shared &&
+                   (!want_shared ||
+                    memcmp(cached->sampler_share, want_share,
+                           sizeof(want_share)) == 0) &&
                    memcmp(cached->query_only_geom, want_query_geom,
                           sizeof(cached->query_only_geom)) == 0 &&
                    memcmp(cached->tiled_ms_geom, want_tiled_geom,
@@ -16631,6 +16931,7 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
          return NULL;
       }
    }
+   gex_wgpu_apply_sampler_sharing(variant, want_share, want_shared);
    char *error = NULL;
    WGPUShaderModule module = gex_wgpu_compile_nir(
       &ctx->base, variant, MESA_SHADER_FRAGMENT, false, false, &error);
@@ -16684,6 +16985,8 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    cached->tiled_ms_slots = want_tiled_ms;
    cached->frag_tile_x = want_frag_tile_x;
    cached->query_only_slots = want_query_only;
+   cached->shared_samplers = want_shared;
+   memcpy(cached->sampler_share, want_share, sizeof(want_share));
    memcpy(cached->query_only_geom, want_query_geom,
           sizeof(cached->query_only_geom));
    memcpy(cached->tiled_ms_geom, want_tiled_geom,
@@ -17511,7 +17814,38 @@ gex_wgpu_set_scissor_states(struct pipe_context *pipe, unsigned start_slot,
    }
 }
 
-/* The same vertex format with the signedness the shader asked for.
+/* The integer format of the same width as a float, normalized or packed
+ * one, for gex_wgpu_vertex_format_signed_as; anything else is unchanged. */
+static WGPUVertexFormat
+gex_wgpu_vertex_format_as_uint(WGPUVertexFormat format)
+{
+   switch (format) {
+   case WGPUVertexFormat_Float32:   return WGPUVertexFormat_Uint32;
+   case WGPUVertexFormat_Float32x2: return WGPUVertexFormat_Uint32x2;
+   case WGPUVertexFormat_Float32x3: return WGPUVertexFormat_Uint32x3;
+   case WGPUVertexFormat_Float32x4: return WGPUVertexFormat_Uint32x4;
+   case WGPUVertexFormat_Float16:
+   case WGPUVertexFormat_Unorm16:
+   case WGPUVertexFormat_Snorm16:   return WGPUVertexFormat_Uint16;
+   case WGPUVertexFormat_Float16x2:
+   case WGPUVertexFormat_Unorm16x2:
+   case WGPUVertexFormat_Snorm16x2: return WGPUVertexFormat_Uint16x2;
+   case WGPUVertexFormat_Float16x4:
+   case WGPUVertexFormat_Unorm16x4:
+   case WGPUVertexFormat_Snorm16x4: return WGPUVertexFormat_Uint16x4;
+   case WGPUVertexFormat_Unorm8:
+   case WGPUVertexFormat_Snorm8:    return WGPUVertexFormat_Uint8;
+   case WGPUVertexFormat_Unorm8x2:
+   case WGPUVertexFormat_Snorm8x2:  return WGPUVertexFormat_Uint8x2;
+   case WGPUVertexFormat_Unorm8x4:
+   case WGPUVertexFormat_Snorm8x4:
+   case WGPUVertexFormat_Unorm8x4BGRA: return WGPUVertexFormat_Uint8x4;
+   case WGPUVertexFormat_Unorm10_10_10_2: return WGPUVertexFormat_Uint32;
+   default: return format;
+   }
+}
+
+/* The same vertex format with the base type the shader asked for.
  *
  * GL lets an integer attribute's buffer type and its shader declaration
  * disagree in signedness: `glVertexAttribIPointer(..., GL_UNSIGNED_SHORT, ...)`
@@ -17522,9 +17856,16 @@ gex_wgpu_set_scissor_states(struct pipe_context *pipe, unsigned start_slot,
  *   shader's base type (Sint) in location (0).
  *
  * Since the two formats differ only in how the same bytes are read, naming the
- * one the shader declared is the whole fix. Anything that is not an integer
- * pair is returned unchanged -- a float format against an integer input is a
- * real mismatch GL would not have allowed.
+ * one the shader declared is the whole fix.
+ *
+ * A float or normalized array feeding an integer input is the same mismatch
+ * one step further: GL does not refuse it, it leaves the values undefined,
+ * so the bytes are fetched as integers of the same width. MakeUp declares
+ * `attribute int blockEntityId`, which Iris 1.4.5 never binds, and the linker
+ * placed it where Iris's own arrays are (a Float32 and a Snorm8x4). The
+ * pipeline was invalid at every such draw, and so was each command buffer it
+ * reached. The opposite case, an integer array feeding a float input, is the
+ * shader's to resolve (GEX_WGPU_UNPACK_SINT_BITS).
  */
 static WGPUVertexFormat
 gex_wgpu_vertex_format_signed_as(WGPUVertexFormat format, bool want_sint,
@@ -17532,6 +17873,7 @@ gex_wgpu_vertex_format_signed_as(WGPUVertexFormat format, bool want_sint,
 {
    if (want_sint == want_uint)
       return format;                   /* neither, or a shader that is both */
+   format = gex_wgpu_vertex_format_as_uint(format);
    if (want_sint) {
       switch (format) {
       case WGPUVertexFormat_Uint8:    return WGPUVertexFormat_Sint8;
@@ -17640,6 +17982,22 @@ gex_wgpu_vertex_format(enum pipe_format format, unsigned *size,
       *size = 8; *alignment = 2; return WGPUVertexFormat_Snorm16x4;
    case PIPE_FORMAT_R16G16B16_FLOAT:
       *size = 8; *alignment = 2; return WGPUVertexFormat_Float16x4;
+   /* Three 8-bit components, which WebGPU has no format for either: fetched
+    * four wide the same way, the fourth byte being the padding the stride
+    * already holds (u_vbuf moves anything not 4-byte aligned), and w set to
+    * GL's 1 in the shader. Declined, these were translated by u_vbuf at every
+    * draw -- and Iris's Sodium terrain carries its normal as R8G8B8_SNORM, so
+    * each multi-draw of chunk geometry read the whole GPU vertex buffer back,
+    * converted it on the CPU and uploaded it again. Complementary's MEDIUM
+    * profile ran at 10 fps natively for that alone, against 75 without it. */
+   case PIPE_FORMAT_R8G8B8_UNORM:
+      *size = 4; *alignment = 1; return WGPUVertexFormat_Unorm8x4;
+   case PIPE_FORMAT_R8G8B8_SNORM:
+      *size = 4; *alignment = 1; return WGPUVertexFormat_Snorm8x4;
+   case PIPE_FORMAT_R8G8B8_USCALED:
+      *size = 4; *alignment = 1; return WGPUVertexFormat_Uint8x4;
+   case PIPE_FORMAT_R8G8B8_SSCALED:
+      *size = 4; *alignment = 1; return WGPUVertexFormat_Sint8x4;
    case PIPE_FORMAT_R8G8_UNORM:
       *size = 2; *alignment = 1; return WGPUVertexFormat_Unorm8x2;
    case PIPE_FORMAT_R8G8B8A8_UNORM:
@@ -17756,6 +18114,16 @@ gex_wgpu_vertex_unpack_kind(enum pipe_format format)
    case PIPE_FORMAT_R16G16B16_SNORM:
    case PIPE_FORMAT_R16G16B16_FLOAT:
       return GEX_WGPU_UNPACK_W1 | GEX_WGPU_UNPACK_XYZ;
+   /* The 8-bit three-component forms, fetched four wide the same way. The
+    * scaled ones come back as integers and are converted like the 16-bit
+    * scaled ones are: the conversion does not care about the width. */
+   case PIPE_FORMAT_R8G8B8_UNORM:
+   case PIPE_FORMAT_R8G8B8_SNORM:
+      return GEX_WGPU_UNPACK_W1 | GEX_WGPU_UNPACK_XYZ;
+   case PIPE_FORMAT_R8G8B8_USCALED:
+      return GEX_WGPU_UNPACK_U16 | GEX_WGPU_UNPACK_XYZ;
+   case PIPE_FORMAT_R8G8B8_SSCALED:
+      return GEX_WGPU_UNPACK_S16 | GEX_WGPU_UNPACK_XYZ;
    default:                              return GEX_WGPU_UNPACK_NONE;
    }
 }
@@ -20589,6 +20957,8 @@ gex_wgpu_resource_destroy(struct pipe_screen *screen,
    gex_wgpu_doom_buffer(gscreen, gex->packed_image_header);
    gex_wgpu_doom_texture(gscreen, gex->image_alias);
    gex_wgpu_doom_buffer(gscreen, gex->image_alias_staging);
+   gex_wgpu_doom_buffer(gscreen, gex->image_alias_narrow);
+   gex_wgpu_doom_buffer(gscreen, gex->image_alias_params);
    if (gex->shadow) {
       gex_wgpu_shadow_live -= gex->allocation_size;
       --gex_wgpu_buffers_live;
@@ -22020,6 +22390,8 @@ static const WGPUTextureFormat gex_wgpu_decode_wgpu_format[GEX_WGPU_DECODE_FORMA
    [GEX_WGPU_DECODE_R16F] = WGPUTextureFormat_R16Float,
    [GEX_WGPU_DECODE_RG16F] = WGPUTextureFormat_RG16Float,
    [GEX_WGPU_DECODE_RGBA16F] = WGPUTextureFormat_RGBA16Float,
+   [GEX_WGPU_DECODE_RG16_UNORM_OF_32] = WGPUTextureFormat_RG32Float,
+   [GEX_WGPU_DECODE_RG16_SNORM_OF_32] = WGPUTextureFormat_RG32Float,
 };
 
 static struct pipe_sampler_view *
@@ -22241,7 +22613,21 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
     * nothing in the GL error path. Blender's EEVEE asks for this. Against the
     * *stored* format, because a promoted texture holds more bytes per texel
     * than its Gallium format says. */
-   if (templ->format != texture->format &&
+   /* Except a norm16 view over a 32-bit texel, which the decode pass below
+    * unpacks into a scratch of the view's stored format. */
+   const int norm16_decode =
+      templ->format != texture->format &&
+      util_format_get_blocksize(templ->format) == 4 &&
+      util_format_get_blocksize(texture->format) == 4 &&
+      util_format_get_blocksize(gex_wgpu_stored_format(templ->format)) == 8 &&
+      util_format_get_blocksize(gex_wgpu_stored_format(texture->format)) == 4 &&
+      texture->target != PIPE_TEXTURE_3D && templ->target != PIPE_TEXTURE_3D &&
+      !util_format_is_pure_integer(texture->format) &&
+      !util_format_is_depth_or_stencil(texture->format)
+         ? (templ->format == PIPE_FORMAT_R16G16_UNORM ? 1
+            : templ->format == PIPE_FORMAT_R16G16_SNORM ? 2 : 0)
+         : 0;
+   if (templ->format != texture->format && !norm16_decode &&
        util_format_get_blocksize(gex_wgpu_stored_format(templ->format)) !=
           util_format_get_blocksize(gex_wgpu_stored_format(texture->format))) {
       GEX_SAMPLER_VIEW_REFUSED("view format has a different stored texel size");
@@ -22336,7 +22722,7 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
       (gex_resource(texture)->texture_usage & WGPUTextureUsage_StorageBinding) &&
       gex_wgpu_storage_texture_format(templ->format) ==
          WGPUTextureFormat_Undefined;
-   const bool reinterpreting =
+   const bool reinterpreting = !norm16_decode &&
       (util_format_linear(templ->format) != util_format_linear(texture->format) ||
        storage_forbids_view) &&
       !gex_wgpu_is_stencil_only_format(templ->format) &&
@@ -22426,11 +22812,17 @@ gex_wgpu_create_sampler_view(struct pipe_context *pipe,
     * texture, as it was. */
    const uint32_t block_w = util_format_get_blockwidth(texture->format);
    const uint32_t block_h = util_format_get_blockheight(texture->format);
-   if (!reinterpreting && gex_wgpu_is_compressed_format(texture->format) &&
-       texture->target != PIPE_TEXTURE_3D && templ->target != PIPE_TEXTURE_3D &&
-       (texture->width0 % block_w || texture->height0 % block_h)) {
+   if (norm16_decode ||
+       (!reinterpreting && gex_wgpu_is_compressed_format(texture->format) &&
+        texture->target != PIPE_TEXTURE_3D && templ->target != PIPE_TEXTURE_3D &&
+        (texture->width0 % block_w || texture->height0 % block_h))) {
       const enum gex_wgpu_decode_format which =
-         gex_wgpu_decode_format_of(templ->format);
+         norm16_decode == 1 ? GEX_WGPU_DECODE_RG16_UNORM_OF_32
+         : norm16_decode == 2 ? GEX_WGPU_DECODE_RG16_SNORM_OF_32
+         : gex_wgpu_decode_format_of(templ->format);
+      /* The decode pass reads the texture as what it is. */
+      if (norm16_decode)
+         desc.format = gex_wgpu_texture_format(texture->format);
       WGPUTextureDescriptor scratch_desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
       scratch_desc.label = (WGPUStringView){"gex decoded", WGPU_STRLEN};
       scratch_desc.dimension = WGPUTextureDimension_2D;
@@ -22522,18 +22914,28 @@ static void
 gex_wgpu_sampler_view_release(struct pipe_context *pipe,
                               struct pipe_sampler_view *base);
 
+static void gex_wgpu_bg_cache_forget(struct gex_wgpu_screen *screen,
+                                     const void *const *handles,
+                                     unsigned count);
+
 static void
 gex_wgpu_sampler_view_destroy(struct pipe_context *pipe,
                               struct pipe_sampler_view *base)
 {
-   /* The bind group cache keys on the entry bytes, and those name
-    * this object by address -- which Dawn hands straight back for the
-    * next one. Retire every cached binding rather than let a key match
-    * a view that no longer exists (see gex_wgpu_bg_keep_on). */
    struct gex_wgpu_sampler_view *view = (struct gex_wgpu_sampler_view *)base;
+   /* The bind groups naming this view are retired, and only those. Bumping
+    * cache_epoch instead threw away every cached group, and st/mesa destroys
+    * views all the time -- a few a frame under Iris -- so every bind group
+    * was created again every frame, each one across the JS boundary in the
+    * browser. A live key cannot match a recycled handle anyway: the cache
+    * holds a reference to each object its keys name (gex_wgpu_bg_entries_ref),
+    * so the address is not handed out again while the entry exists. With
+    * GEX_WGPU_BG_KEEP they stay too, unless the view owned a texture of its
+    * own (see gex_wgpu_bg_keep_on). */
    if (!gex_wgpu_bg_keep_on() || view->reinterpret || view->decoded ||
        view->reinterpret_staging) {
-      ++gex_screen(pipe->screen)->cache_epoch;
+      const void *handles[2] = {view->view, view->array_view};
+      gex_wgpu_bg_cache_forget(gex_screen(pipe->screen), handles, 2);
       ++gex_wgpu_bg_epoch_view;
    }
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
@@ -22887,17 +23289,17 @@ gex_wgpu_bind_sampler_states(struct pipe_context *pipe,
 static void
 gex_wgpu_delete_sampler_state(struct pipe_context *pipe, void *state)
 {
-   /* The bind group cache keys on the entry bytes, and those name
-    * this object by address -- which Dawn hands straight back for the
-    * next one. Retire every cached binding rather than let a key match
-    * a sampler that no longer exists (see gex_wgpu_bg_keep_on). */
-   if (!gex_wgpu_bg_keep_on()) {
-      ++gex_screen(pipe->screen)->cache_epoch;
+   struct gex_wgpu_sampler *sampler = state;
+   /* Only the bind groups naming this sampler, and none with
+    * GEX_WGPU_BG_KEEP; see gex_wgpu_sampler_view_destroy. */
+   if (sampler && !gex_wgpu_bg_keep_on()) {
+      const void *handles[3] = {sampler->sampler, sampler->nonfiltering,
+                                sampler->flipped_comparison};
+      gex_wgpu_bg_cache_forget(gex_screen(pipe->screen), handles, 3);
       ++gex_wgpu_bg_epoch_sampler;
    }
    GEX_ENTRY_TIMER();
    (void)pipe;
-   struct gex_wgpu_sampler *sampler = state;
    if (sampler && sampler->flipped_comparison)
       wgpuSamplerRelease(sampler->flipped_comparison);
    if (sampler && sampler->nonfiltering)
@@ -25161,10 +25563,9 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
    if (clear_scratch) {
       clear_view.baseMipLevel = 0;
       clear_view.mipLevelCount = 1;
-      if (!clear_three_d) {
-         clear_view.baseArrayLayer = 0;
-         clear_view.arrayLayerCount = 1;
-      }
+      clear_view.dimension = WGPUTextureViewDimension_2D;
+      clear_view.baseArrayLayer = dst->first_layer;
+      clear_view.arrayLayerCount = 1;
    }
    WGPUTextureView view =
       wgpuTextureCreateView(clear_scratch ? gex_resource(resource)->rt_scratch
@@ -25186,7 +25587,7 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
    }
    WGPURenderPassColorAttachment attachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
    attachment.view = view;
-   if (clear_three_d)
+   if (clear_three_d && !clear_scratch)
       attachment.depthSlice = dst->first_layer;
    attachment.loadOp = WGPULoadOp_Clear;
    attachment.storeOp = WGPUStoreOp_Store;
@@ -26404,7 +26805,7 @@ struct gex_wgpu_compute_state {
    WGPUTextureSampleType texture_sample_types[GEX_WGPU_MAX_SAMPLERS];
    /* Which of those slots the shader declared multisampled, so the bind
       group layout can say so; see the note at its use. */
-   uint16_t multisampled_slots;
+   uint32_t multisampled_slots;
    unsigned sampler_count;
    uint8_t sampler_slots[GEX_WGPU_MAX_SAMPLERS];
    uint32_t sampler_bindings[GEX_WGPU_MAX_SAMPLERS];
@@ -26420,7 +26821,7 @@ struct gex_wgpu_compute_state {
     * Nonzero is the whole condition. A compute shader without integer
     * sampling keeps the old path exactly -- one module, built once, at
     * creation. */
-   uint16_t integer_sampled_slots;
+   uint32_t integer_sampled_slots;
    /* Images the shader declared with no format qualifier, as a bit per index
     * into image_slots. GLSL allows that only on a `writeonly` image, and GL
     * then says the store converts to the *image unit's* format -- so the
@@ -27750,7 +28151,9 @@ gex_wgpu_launch_grid(struct pipe_context *pipe,
        * above. */
       bindings[count].sampler = sampler
          ? ((compute_depth_as_float & (1u << slot)) && sampler->nonfiltering
-               ? sampler->nonfiltering : sampler->sampler)
+               ? gex_wgpu_sampler_nonfiltering(sampler)
+               : gex_wgpu_sampler_matching(sampler,
+                                           entries[count].sampler.type))
          : NULL;
       if (!bindings[count].sampler) {
          /* GL's default sampler state, which is what st/mesa would have sent
@@ -28052,14 +28455,28 @@ gex_wgpu_decode_pipeline(struct gex_wgpu_screen *screen,
       "}\n"
       "@fragment fn fs(@builtin(position) pos: vec4<f32>)"
       " -> @location(0) vec4<f32> {\n"
-      "  return textureLoad(src, vec2<i32>(pos.xy), 0);\n"
+      "  return DECODE(textureLoad(src, vec2<i32>(pos.xy), 0));\n"
       "}\n";
+   const char *decode =
+      which == GEX_WGPU_DECODE_RG16_UNORM_OF_32
+         ? "fn DECODE(t: vec4<f32>) -> vec4<f32> {"
+           " return vec4<f32>(unpack2x16unorm(bitcast<u32>(t.x)), 0.0, 1.0); }\n"
+      : which == GEX_WGPU_DECODE_RG16_SNORM_OF_32
+         ? "fn DECODE(t: vec4<f32>) -> vec4<f32> {"
+           " return vec4<f32>(unpack2x16snorm(bitcast<u32>(t.x)), 0.0, 1.0); }\n"
+         : "fn DECODE(t: vec4<f32>) -> vec4<f32> { return t; }\n";
+   char *full = malloc(strlen(decode) + sizeof(wgsl));
+   if (!full)
+      return NULL;
+   strcpy(full, decode);
+   strcat(full, wgsl);
    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
-   source.code = (WGPUStringView){wgsl, WGPU_STRLEN};
+   source.code = (WGPUStringView){full, WGPU_STRLEN};
    WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
    module_desc.nextInChain = &source.chain;
    WGPUShaderModule module =
       wgpuDeviceCreateShaderModule(screen->device, &module_desc);
+   free(full);
    if (!module)
       return NULL;
    WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
@@ -28219,6 +28636,205 @@ gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
    view->reinterpret_serial = source->write_serial;
 }
 
+/* ---- glGenerateMipmap ----
+ *
+ * Without this, st/mesa reaches util_gen_mipmap, which is a pipe->blit per
+ * level, each one a u_blitter draw with its own state save and restore,
+ * sampler view and surface -- and gex_wgpu_blit submits whatever is pending
+ * before it starts. A shaderpack mipmaps several full-screen colour targets
+ * every frame (Complementary: colortex0, 3 and 5), which was some thirty
+ * queue submits a frame for this alone.
+ *
+ * Here the chain is recorded into the pending encoder behind whatever the
+ * frame has drawn: one small render pass per level and layer, reading the
+ * level above with textureLoad and writing the 2x2 average. No submit, and
+ * the batch carries on. textureLoad rather than a filtering sampler so that
+ * unfilterable float formats are served too; the result is the box filter
+ * util_gen_mipmap's linear sampling also amounts to for even sizes (GL leaves
+ * the filter to the implementation).
+ *
+ * Declines -- returning false sends st/mesa to util_gen_mipmap as before --
+ * anything but a single-sampled 2D, array or cube colour texture with float
+ * sampling, rendered and sampled as its own format; and a texture kept in a
+ * render-target scratch, whose bytes reach the texture only at submit. */
+static WGPURenderPipeline
+gex_wgpu_mip_pipeline(struct gex_wgpu_screen *screen, WGPUTextureFormat format)
+{
+   for (unsigned i = 0; i < screen->mip_pipeline_count; ++i)
+      if (screen->mip_pipelines[i].format == format)
+         return screen->mip_pipelines[i].pipeline;
+   if (screen->mip_pipeline_count >= ARRAY_SIZE(screen->mip_pipelines))
+      return NULL;
+   if (!screen->mip_module) {
+      static const char wgsl[] =
+         "@group(0) @binding(0) var src: texture_2d<f32>;\n"
+         "@vertex fn vs(@builtin(vertex_index) i: u32)"
+         " -> @builtin(position) vec4<f32> {\n"
+         "  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0),"
+         " vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));\n"
+         "  return vec4<f32>(p[i], 0.0, 1.0);\n"
+         "}\n"
+         "@fragment fn fs(@builtin(position) pos: vec4<f32>)"
+         " -> @location(0) vec4<f32> {\n"
+         "  let m = vec2<i32>(textureDimensions(src, 0)) - vec2<i32>(1);\n"
+         "  let d = vec2<i32>(pos.xy) * 2;\n"
+         "  let a = textureLoad(src, min(d, m), 0);\n"
+         "  let b = textureLoad(src, min(d + vec2<i32>(1, 0), m), 0);\n"
+         "  let c = textureLoad(src, min(d + vec2<i32>(0, 1), m), 0);\n"
+         "  let e = textureLoad(src, min(d + vec2<i32>(1, 1), m), 0);\n"
+         "  return (a + b + c + e) * 0.25;\n"
+         "}\n";
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = (WGPUStringView){wgsl, WGPU_STRLEN};
+      WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      module_desc.nextInChain = &source.chain;
+      module_desc.label = (WGPUStringView){"gex mipmap", WGPU_STRLEN};
+      screen->mip_module =
+         wgpuDeviceCreateShaderModule(screen->device, &module_desc);
+      WGPUBindGroupLayoutEntry entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry.binding = 0;
+      entry.visibility = WGPUShaderStage_Fragment;
+      entry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+      entry.texture.viewDimension = WGPUTextureViewDimension_2D;
+      WGPUBindGroupLayoutDescriptor bgl_desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+      bgl_desc.entryCount = 1;
+      bgl_desc.entries = &entry;
+      screen->mip_bgl = wgpuDeviceCreateBindGroupLayout(screen->device, &bgl_desc);
+      WGPUPipelineLayoutDescriptor layout_desc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+      layout_desc.bindGroupLayoutCount = 1;
+      layout_desc.bindGroupLayouts = &screen->mip_bgl;
+      screen->mip_layout =
+         wgpuDeviceCreatePipelineLayout(screen->device, &layout_desc);
+   }
+   if (!screen->mip_module || !screen->mip_bgl || !screen->mip_layout)
+      return NULL;
+   WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+   target.format = format;
+   target.writeMask = WGPUColorWriteMask_All;
+   WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+   fragment.module = screen->mip_module;
+   fragment.entryPoint = (WGPUStringView){"fs", WGPU_STRLEN};
+   fragment.targetCount = 1;
+   fragment.targets = &target;
+   WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+   desc.label = (WGPUStringView){"gex mipmap", WGPU_STRLEN};
+   desc.layout = screen->mip_layout;
+   desc.vertex.module = screen->mip_module;
+   desc.vertex.entryPoint = (WGPUStringView){"vs", WGPU_STRLEN};
+   desc.fragment = &fragment;
+   desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+   desc.multisample.count = 1;
+   desc.multisample.mask = 0xffffffffu;
+   WGPURenderPipeline pipeline =
+      wgpuDeviceCreateRenderPipeline(screen->device, &desc);
+   if (!pipeline)
+      return NULL;
+   screen->mip_pipelines[screen->mip_pipeline_count].format = format;
+   screen->mip_pipelines[screen->mip_pipeline_count].pipeline = pipeline;
+   ++screen->mip_pipeline_count;
+   return pipeline;
+}
+
+/* Mipmap levels built by gex_wgpu_generate_mipmap rather than u_blitter. */
+uint64_t gex_wgpu_mip_levels;
+
+static bool
+gex_wgpu_generate_mipmap(struct pipe_context *pipe,
+                         struct pipe_resource *resource,
+                         enum pipe_format format, unsigned base_level,
+                         unsigned last_level, unsigned first_layer,
+                         unsigned last_layer)
+{
+   GEX_DEVICE_GUARD(gex_screen(pipe->screen));
+   struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
+   struct gex_wgpu_screen *screen = gex_screen(pipe->screen);
+   struct gex_wgpu_resource *gex = gex_resource(resource);
+   if (ctx->failed || !gex->texture || gex->rt_scratch ||
+       GEX_GETENV_ONCE("GEX_WGPU_NO_MIPMAP"))
+      return false;
+   if (format != resource->format || MAX2(resource->nr_samples, 1) != 1 ||
+       (resource->target != PIPE_TEXTURE_2D &&
+        resource->target != PIPE_TEXTURE_2D_ARRAY &&
+        resource->target != PIPE_TEXTURE_CUBE &&
+        resource->target != PIPE_TEXTURE_CUBE_ARRAY))
+      return false;
+   const struct util_format_description *fmt = util_format_description(format);
+   if (!fmt || util_format_is_depth_or_stencil(format) ||
+       util_format_is_pure_integer(format) ||
+       util_format_is_compressed(format) ||
+       fmt->colorspace == UTIL_FORMAT_COLORSPACE_YUV)
+      return false;
+   const WGPUTextureUsage needed =
+      WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+   if ((gex->texture_usage & needed) != needed)
+      return false;
+   const WGPUTextureFormat wgpu_format = gex_wgpu_texture_format(format);
+   if (wgpu_format == WGPUTextureFormat_Undefined)
+      return false;
+   if (last_level <= base_level)
+      return true;
+   WGPURenderPipeline pipeline = gex_wgpu_mip_pipeline(screen, wgpu_format);
+   if (!pipeline)
+      return false;
+   gex_wgpu_end_pass(ctx);
+   WGPUCommandEncoder encoder = gex_wgpu_pending_encoder(ctx);
+   if (!encoder)
+      return false;
+   for (unsigned layer = first_layer; layer <= last_layer; ++layer) {
+      for (unsigned level = base_level; level < last_level; ++level) {
+         WGPUTextureViewDescriptor view_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+         view_desc.format = wgpu_format;
+         view_desc.dimension = WGPUTextureViewDimension_2D;
+         view_desc.mipLevelCount = 1;
+         view_desc.baseArrayLayer = layer;
+         view_desc.arrayLayerCount = 1;
+         view_desc.aspect = WGPUTextureAspect_All;
+         view_desc.baseMipLevel = level;
+         WGPUTextureView from = wgpuTextureCreateView(gex->texture, &view_desc);
+         view_desc.baseMipLevel = level + 1;
+         WGPUTextureView into = wgpuTextureCreateView(gex->texture, &view_desc);
+         WGPUBindGroup group = NULL;
+         if (from) {
+            WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+            entry.binding = 0;
+            entry.textureView = from;
+            WGPUBindGroupDescriptor bg_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+            bg_desc.layout = screen->mip_bgl;
+            bg_desc.entryCount = 1;
+            bg_desc.entries = &entry;
+            group = wgpuDeviceCreateBindGroup(screen->device, &bg_desc);
+         }
+         if (into && group) {
+            WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            color.view = into;
+            /* Every texel of the level is written, so nothing is loaded. */
+            color.loadOp = WGPULoadOp_Clear;
+            color.storeOp = WGPUStoreOp_Store;
+            WGPURenderPassDescriptor pass_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            pass_desc.colorAttachmentCount = 1;
+            pass_desc.colorAttachments = &color;
+            WGPURenderPassEncoder pass =
+               wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+            wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+            wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+            wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+            wgpuRenderPassEncoderEnd(pass);
+            wgpuRenderPassEncoderRelease(pass);
+            ++gex_wgpu_mip_levels;
+         }
+         if (group) wgpuBindGroupRelease(group);
+         if (from) wgpuTextureViewRelease(from);
+         if (into) wgpuTextureViewRelease(into);
+      }
+   }
+   /* Written by this batch: a CPU upload or read of it has to wait for the
+    * submit, and views copied from it have to refresh. */
+   gex_wgpu_batch_touch(ctx, resource);
+   gex->texture_written = true;
+   gex->write_serial++;
+   return true;
+}
+
 /* ---- A colour target whose surface format is not the texture's ----
  *
  * GL attaches a texture through a *surface* that may name another format, and
@@ -28273,8 +28889,11 @@ gex_wgpu_rt_scratch_ensure(struct gex_wgpu_context *ctx,
    struct gex_wgpu_resource *gex = gex_resource(resource);
    const uint32_t width = u_minify(resource->width0, level);
    const uint32_t height = u_minify(resource->height0, level);
+   const uint32_t layers = resource->target == PIPE_TEXTURE_3D
+      ? MAX2(u_minify(resource->depth0, level), 1u)
+      : MAX2(resource->array_size, 1u);
    if (gex->rt_scratch && gex->rt_scratch_format == format &&
-       gex->rt_scratch_level == level &&
+       gex->rt_scratch_level == level && gex->rt_scratch_layers == layers &&
        gex->rt_scratch_width == width && gex->rt_scratch_height == height)
       return gex->rt_scratch;
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
@@ -28284,7 +28903,7 @@ gex_wgpu_rt_scratch_ensure(struct gex_wgpu_context *ctx,
    gex->rt_scratch_staging = NULL;
    WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
    desc.dimension = WGPUTextureDimension_2D;
-   desc.size = (WGPUExtent3D){width, height, 1};
+   desc.size = (WGPUExtent3D){width, height, layers};
    desc.format = gex_wgpu_texture_format(format);
    desc.mipLevelCount = 1;
    desc.sampleCount = 1;
@@ -28322,6 +28941,7 @@ gex_wgpu_rt_scratch_ensure(struct gex_wgpu_context *ctx,
    }
    gex->rt_scratch_format = format;
    gex->rt_scratch_level = level;
+   gex->rt_scratch_layers = layers;
    gex->rt_scratch_width = width;
    gex->rt_scratch_height = height;
    return gex->rt_scratch;
@@ -28352,7 +28972,7 @@ gex_wgpu_rt_scratch_copy(struct gex_wgpu_context *ctx,
    WGPUTexelCopyTextureInfo scratch = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
    scratch.texture = gex->rt_scratch;
    scratch.mipLevel = 0;
-   scratch.origin = (WGPUOrigin3D){0, 0, 0};
+   scratch.origin = (WGPUOrigin3D){0, 0, MIN2(layer, gex->rt_scratch_layers - 1)};
    scratch.aspect = WGPUTextureAspect_All;
    WGPUTexelCopyBufferInfo staging = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
    staging.buffer = gex->rt_scratch_staging;
@@ -30277,7 +30897,7 @@ gex_wgpu_set_framebuffer_state(struct pipe_context *pipe,
  */
 static bool
 gex_wgpu_stage_wants_texture_variant(
-   unsigned count, const uint8_t *slots, uint16_t integer_sampled_slots,
+   unsigned count, const uint8_t *slots, uint32_t integer_sampled_slots,
    struct gex_wgpu_sampler *const *samplers,
    struct pipe_sampler_view *const *views)
 {
@@ -34965,8 +35585,9 @@ gex_wgpu_capture_dispatch(struct gex_wgpu_context *ctx,
       if (sampler)
          wgpu_sampler =
             (sampler_type == WGPUSamplerBindingType_NonFiltering &&
-             sampler->nonfiltering) ? sampler->nonfiltering
-                                    : sampler->sampler;
+             sampler->nonfiltering)
+               ? gex_wgpu_sampler_nonfiltering(sampler)
+               : gex_wgpu_sampler_matching(sampler, sampler_type);
       if (!texture_view || !wgpu_sampler) {
          static bool said;
          if (!said) {
@@ -35356,7 +35977,7 @@ gex_wgpu_draw_vbo(struct pipe_context *pipe,
  * and a sampler for every unit. The masks below are 64-bit for this reason. */
 #define GEX_WGPU_MAX_GROUP_BINDINGS \
    (GEX_WGPU_MAX_CONSTANT_BUFFERS + GEX_WGPU_MAX_SHADER_IMAGES + \
-    2 * GEX_WGPU_MAX_SAMPLERS)
+    2 * GEX_WGPU_MAX_STAGE_SAMPLERS)
 struct gex_wgpu_bindings {
    unsigned count;
    uint64_t storage_mask;
@@ -35507,7 +36128,8 @@ gex_wgpu_bind_textures_from(struct pipe_context *pipe,
          group->sampler_type[at] == WGPUSamplerBindingType_NonFiltering;
       group->sampler[at] = sampler
          ? (wants_nonfiltering && sampler->nonfiltering
-               ? sampler->nonfiltering : sampler->sampler)
+               ? gex_wgpu_sampler_nonfiltering(sampler)
+               : gex_wgpu_sampler_matching(sampler, group->sampler_type[at]))
          : NULL;
       if (!group->sampler[at]) {
          if (GEX_GETENV_ONCE("GEX_WGPU_STAGE_TEXTURE_LOG"))
@@ -39677,6 +40299,13 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       for (unsigned i = 0; i < ve->count; ++i) {
          const unsigned location = vs->vertex_element_location[i];
          const enum pipe_format format = ve->elements[i].src_format;
+         /* An integer input takes its element's bytes as integers whatever
+          * the array's type (see gex_wgpu_vertex_format_signed_as), so a
+          * conversion to float meant for this format must not retype it. */
+         if (location < 64 &&
+             ((vs->vertex_locations_sint | vs->vertex_locations_uint) &
+              BITFIELD64_BIT(location)))
+            want_unpack[i] = GEX_WGPU_UNPACK_NONE;
          if (location < 64 && !vs->double_inputs[i] &&
              !(vs->vertex_locations_sint & BITFIELD64_BIT(location)) &&
              !(vs->vertex_locations_uint & BITFIELD64_BIT(location)) &&
@@ -39705,7 +40334,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
     * position from gl_VertexID), so 225 of its cases read the source's red
     * channel unswizzled. Silently wrong is worse than refused, and it is the
     * reason every fragment-stage reduction of that failure passed. */
-   uint16_t sampler_mask = 0;
+   uint32_t sampler_mask = 0;
    bool lower_textures = false;
    for (unsigned i = 0; i < vs->texture_count; ++i) {
       const unsigned slot = vs->texture_slots[i];
@@ -40028,7 +40657,7 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
        * the vertex stage. */
       if (vs->query_only_slots) {
          uint32_t vs_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
-         const uint16_t vs_query = gex_wgpu_query_only_geom(
+         const uint32_t vs_query = gex_wgpu_query_only_geom(
             vs, ctx->vertex_sampler_views, vs_query_geom);
          if (vs_query)
             gex_wgpu_lower_query_only(clone, vs_query, vs_query_geom);
@@ -40471,12 +41100,12 @@ gex_wgpu_timing_sample(void)
 static uint32_t
 gex_wgpu_cache_hash(const void *data, size_t bytes)
 {
-   const uint8_t *p = data;
-   uint32_t h = 2166136261u;
-   for (size_t i = 0; i < bytes; ++i) {
-      h ^= p[i];
-      h *= 16777619u;
-   }
+   /* XXH3 rather than a byte-at-a-time FNV-1a. Every draw hashes its bind
+    * group layouts and its whole serialised pipeline descriptor -- kilobytes
+    * -- and with a dependent multiply per byte that was a third of the render
+    * thread for a shaderpack's few thousand draws a frame. */
+   const uint64_t h64 = XXH3_64bits(data, bytes);
+   const uint32_t h = (uint32_t)(h64 ^ (h64 >> 32));
    return h ? h : 1u;
 }
 
@@ -41781,6 +42410,106 @@ gex_wgpu_image_also_sampled(const struct gex_wgpu_context *ctx,
    return false;
 }
 
+/* Two 16-bit normalized channels, between the four bytes GL keeps a texel
+ * in and the float32 pair this driver stores the format as in a browser
+ * (gex_wgpu_format_backing): an RG16 image view of an R32F texture -- one
+ * format class in GL, which Blender's EEVEE binds its G-buffer normals as --
+ * has no byte correspondence for gex_wgpu_image_alias to copy, so the copy
+ * through the staging buffer is converted on the way, by a compute pass
+ * between two buffers laid out as the texture copies lay them out. */
+static const char gex_wgpu_norm16_wgsl[] =
+   "struct P { width: u32, rows: u32, wide_row: u32, narrow_row: u32, mode: u32 };\n"
+   "@group(0) @binding(0) var<storage, read_write> wide: array<u32>;\n"
+   "@group(0) @binding(1) var<storage, read_write> narrow: array<u32>;\n"
+   "@group(0) @binding(2) var<uniform> p: P;\n"
+   "@compute @workgroup_size(64) fn pack(@builtin(global_invocation_id) g: vec3u) {\n"
+   "  if (g.x >= p.width || g.y >= p.rows) { return; }\n"
+   "  let w = g.y * p.wide_row + g.x * 2u;\n"
+   "  let v = vec2f(bitcast<f32>(wide[w]), bitcast<f32>(wide[w + 1u]));\n"
+   "  narrow[g.y * p.narrow_row + g.x] = select(pack2x16unorm(v), pack2x16snorm(v), p.mode == 2u);\n"
+   "}\n"
+   "@compute @workgroup_size(64) fn unpack(@builtin(global_invocation_id) g: vec3u) {\n"
+   "  if (g.x >= p.width || g.y >= p.rows) { return; }\n"
+   "  let b = narrow[g.y * p.narrow_row + g.x];\n"
+   "  let v = select(unpack2x16unorm(b), unpack2x16snorm(b), p.mode == 2u);\n"
+   "  let w = g.y * p.wide_row + g.x * 2u;\n"
+   "  wide[w] = bitcast<u32>(v.x);\n"
+   "  wide[w + 1u] = bitcast<u32>(v.y);\n"
+   "}\n";
+
+static bool
+gex_wgpu_norm16_pipelines(struct gex_wgpu_screen *screen)
+{
+   if (screen->norm16_pack)
+      return true;
+   WGPUBindGroupLayoutEntry entries[3];
+   for (unsigned i = 0; i < 3; ++i) {
+      entries[i] = (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entries[i].binding = i;
+      entries[i].visibility = WGPUShaderStage_Compute;
+      entries[i].buffer.type = i < 2 ? WGPUBufferBindingType_Storage
+                                     : WGPUBufferBindingType_Uniform;
+   }
+   WGPUBindGroupLayoutDescriptor layout_desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+   layout_desc.entryCount = 3;
+   layout_desc.entries = entries;
+   screen->norm16_layout = wgpuDeviceCreateBindGroupLayout(screen->device, &layout_desc);
+   WGPUPipelineLayoutDescriptor pl_desc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+   pl_desc.bindGroupLayoutCount = 1;
+   pl_desc.bindGroupLayouts = &screen->norm16_layout;
+   WGPUPipelineLayout pl = wgpuDeviceCreatePipelineLayout(screen->device, &pl_desc);
+   WGPUShaderSourceWGSL wgsl = WGPU_SHADER_SOURCE_WGSL_INIT;
+   wgsl.code = (WGPUStringView){gex_wgpu_norm16_wgsl, WGPU_STRLEN};
+   WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+   module_desc.nextInChain = &wgsl.chain;
+   WGPUShaderModule module = wgpuDeviceCreateShaderModule(screen->device, &module_desc);
+   WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+   desc.layout = pl;
+   desc.compute.module = module;
+   desc.compute.entryPoint = (WGPUStringView){"pack", WGPU_STRLEN};
+   screen->norm16_pack = wgpuDeviceCreateComputePipeline(screen->device, &desc);
+   desc.compute.entryPoint = (WGPUStringView){"unpack", WGPU_STRLEN};
+   screen->norm16_unpack = wgpuDeviceCreateComputePipeline(screen->device, &desc);
+   wgpuShaderModuleRelease(module);
+   wgpuPipelineLayoutRelease(pl);
+   return screen->norm16_pack && screen->norm16_unpack;
+}
+
+/* Record the conversion of an alias's staged texels onto `encoder`, outside
+ * any pass: pack (alias -> texture) or unpack (texture -> alias). */
+static void
+gex_wgpu_norm16_convert(struct gex_wgpu_screen *screen,
+                        struct gex_wgpu_resource *gex,
+                        WGPUCommandEncoder encoder, bool pack)
+{
+   if (!gex_wgpu_norm16_pipelines(screen))
+      return;
+   WGPUBindGroupEntry bindings[3];
+   const WGPUBuffer buffers[3] = {gex->image_alias_staging, gex->image_alias_narrow,
+                                  gex->image_alias_params};
+   for (unsigned i = 0; i < 3; ++i) {
+      bindings[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+      bindings[i].binding = i;
+      bindings[i].buffer = buffers[i];
+      bindings[i].size = WGPU_WHOLE_SIZE;
+   }
+   WGPUBindGroupDescriptor group_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   group_desc.layout = screen->norm16_layout;
+   group_desc.entryCount = 3;
+   group_desc.entries = bindings;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(screen->device, &group_desc);
+   WGPUComputePassDescriptor pass_desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+   WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder, &pass_desc);
+   wgpuComputePassEncoderSetPipeline(pass, pack ? screen->norm16_pack : screen->norm16_unpack);
+   wgpuComputePassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuComputePassEncoderDispatchWorkgroups(
+      pass, DIV_ROUND_UP(gex->image_alias_width, 64),
+      gex->image_alias_height * gex->image_alias_layers, 1);
+   wgpuComputePassEncoderEnd(pass);
+   wgpuComputePassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+}
+
 /* A texture of the *image's* format standing in for one bound at another
  * format in the same GL format class, or for one this draw also samples.
  *
@@ -41820,8 +42549,17 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
     * from a copy whose two ends disagreed. */
    const uint32_t bytes =
       util_format_get_blocksize(gex_wgpu_stored_format(iv->format));
-   if (bytes !=
-       util_format_get_blocksize(gex_wgpu_stored_format(resource->format))) {
+   const uint32_t texture_bytes =
+      util_format_get_blocksize(gex_wgpu_stored_format(resource->format));
+   /* Unless the difference is the norm16 widening over a four-byte texel,
+    * which gex_wgpu_norm16_convert undoes on the way through. */
+   const uint8_t convert =
+      bytes == 8 && texture_bytes == 4 &&
+      util_format_get_blocksize(iv->format) == 4
+         ? (iv->format == PIPE_FORMAT_R16G16_UNORM ? 1
+            : iv->format == PIPE_FORMAT_R16G16_SNORM ? 2 : 0)
+         : 0;
+   if (bytes != texture_bytes && !convert) {
       static bool said;
       if (!said) {
          said = true;
@@ -41842,6 +42580,7 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
    const uint32_t layers =
       MAX2(iv->u.tex.last_layer - iv->u.tex.first_layer + 1, 1);
    const uint32_t row_bytes = align(width * bytes, 256);
+   const uint32_t narrow_row_bytes = align(width * texture_bytes, 256);
 
    if (gex->image_alias &&
        (gex->image_alias_format != iv->format ||
@@ -41851,6 +42590,10 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
       gex->image_alias = NULL;
       gex_wgpu_doom_buffer(screen, gex->image_alias_staging);
       gex->image_alias_staging = NULL;
+      gex_wgpu_doom_buffer(screen, gex->image_alias_narrow);
+      gex->image_alias_narrow = NULL;
+      gex_wgpu_doom_buffer(screen, gex->image_alias_params);
+      gex->image_alias_params = NULL;
    }
    if (!gex->image_alias) {
       WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
@@ -41884,7 +42627,8 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
          return NULL;
       WGPUBufferDescriptor staging = WGPU_BUFFER_DESCRIPTOR_INIT;
       staging.size = (uint64_t)row_bytes * height * layers;
-      staging.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst;
+      staging.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst |
+                      (convert ? WGPUBufferUsage_Storage : 0);
       gex->image_alias_staging =
          wgpuDeviceCreateBuffer(screen->device, &staging);
       if (!gex->image_alias_staging) {
@@ -41897,6 +42641,28 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
       gex->image_alias_width = width;
       gex->image_alias_height = height;
       gex->image_alias_layers = layers;
+      gex->image_alias_convert = convert;
+      if (convert) {
+         WGPUBufferDescriptor narrow = WGPU_BUFFER_DESCRIPTOR_INIT;
+         narrow.size = (uint64_t)narrow_row_bytes * height * layers;
+         narrow.usage = WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst |
+                        WGPUBufferUsage_Storage;
+         gex->image_alias_narrow = wgpuDeviceCreateBuffer(screen->device, &narrow);
+         const uint32_t params[8] = {width, height * layers, row_bytes / 4,
+                                     narrow_row_bytes / 4, convert, 0, 0, 0};
+         WGPUBufferDescriptor pd = WGPU_BUFFER_DESCRIPTOR_INIT;
+         pd.size = sizeof(params);
+         pd.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+         gex->image_alias_params = wgpuDeviceCreateBuffer(screen->device, &pd);
+         if (!gex->image_alias_narrow || !gex->image_alias_params) {
+            gex_wgpu_free_texture(gex->image_alias);
+            gex->image_alias = NULL;
+            return NULL;
+         }
+         wgpuQueueWriteBuffer(screen->queue, gex->image_alias_params, 0,
+                              params, sizeof(params));
+         gex->image_alias_narrow_row_bytes = narrow_row_bytes;
+      }
    }
 
    /* Seeded whatever the access says, and *not* only when the image is read.
@@ -41927,6 +42693,14 @@ gex_wgpu_image_alias(struct gex_wgpu_context *ctx,
          through.layout.bytesPerRow = row_bytes;
          through.layout.rowsPerImage = height;
          const WGPUExtent3D extent = {width, height, layers};
+         if (gex->image_alias_convert) {
+            WGPUTexelCopyBufferInfo narrow = through;
+            narrow.buffer = gex->image_alias_narrow;
+            narrow.layout.bytesPerRow = gex->image_alias_narrow_row_bytes;
+            wgpuCommandEncoderCopyTextureToBuffer(encoder, &from, &narrow,
+                                                  &extent);
+            gex_wgpu_norm16_convert(screen, gex, encoder, false);
+         } else
          wgpuCommandEncoderCopyTextureToBuffer(encoder, &from, &through,
                                                &extent);
          WGPUTexelCopyTextureInfo into = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
@@ -42003,6 +42777,11 @@ gex_wgpu_flush_image_aliases(struct gex_wgpu_context *ctx,
       into.origin =
          (WGPUOrigin3D){0, 0, ctx->alias_copies[i].first_layer};
       into.aspect = WGPUTextureAspect_All;
+      if (gex->image_alias_convert) {
+         gex_wgpu_norm16_convert(gex_screen(ctx->base.screen), gex, encoder, true);
+         through.buffer = gex->image_alias_narrow;
+         through.layout.bytesPerRow = gex->image_alias_narrow_row_bytes;
+      }
       wgpuCommandEncoderCopyBufferToTexture(encoder, &through, &into, &extent);
       ++gex->write_serial;
    }
@@ -42093,11 +42872,69 @@ gex_wgpu_end_pass(struct gex_wgpu_context *ctx)
  * the shader wrote into the same buffer, and a buffer that is both
  * persistently mapped and written by a shader is precisely what an atomic
  * counter or an SSBO under ARB_buffer_storage is. The increments landed and
- * the next submit wiped them. */
+ * the next submit wiped them.
+ *
+ * A FLUSH_EXPLICIT, non-coherent persistent mapping is not re-sent here:
+ * glFlushMappedBufferRange already uploaded what the application named
+ * (gex_wgpu_transfer_flush_region), and GL leaves an unflushed write undefined.
+ * Every other write mapping takes the diff below instead of a whole-shadow
+ * upload. */
+
+/* The first byte at which a and b differ, or size; eight bytes a step. */
+static uint32_t
+gex_wgpu_first_diff(const uint8_t *a, const uint8_t *b, uint32_t size)
+{
+   uint32_t i = 0;
+   for (; i + 8 <= size; i += 8) {
+      uint64_t x, y;
+      memcpy(&x, a + i, 8);
+      memcpy(&y, b + i, 8);
+      if (x != y)
+         break;
+   }
+   while (i < size && a[i] == b[i])
+      ++i;
+   return i;
+}
+
+/* One past the last byte in [from, size) at which a and b differ, or from. */
+static uint32_t
+gex_wgpu_last_diff(const uint8_t *a, const uint8_t *b, uint32_t from,
+                   uint32_t size)
+{
+   uint32_t i = size;
+   while (i > from && (i & 7u)) {
+      if (a[i - 1] != b[i - 1])
+         return i;
+      --i;
+   }
+   for (; i >= from + 8; i -= 8) {
+      uint64_t x, y;
+      memcpy(&x, a + i - 8, 8);
+      memcpy(&y, b + i - 8, 8);
+      if (x != y)
+         break;
+   }
+   while (i > from && a[i - 1] == b[i - 1])
+      --i;
+   return i;
+}
+
+/* Bytes this function hands queue.writeBuffer, reported every 2,000 calls that
+ * found a write mapping: the per-submit cost the census line does not show. */
+static uint64_t gex_wgpu_persist_bytes, gex_wgpu_persist_calls;
+
 static void
 gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
 {
    struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   if (ctx->persistent_count && ++gex_wgpu_persist_calls % 2000 == 0) {
+      fprintf(stderr, "gex-wgpu: persistent mappings sent %.2f MiB a submit "
+              "over the last 2000 submits (%u mapped)\n",
+              gex_wgpu_persist_bytes / 2000.0 / 1048576.0,
+              ctx->persistent_count);
+      gex_wgpu_persist_bytes = 0;
+   }
    for (unsigned i = 0; i < ctx->persistent_count; ++i) {
       struct gex_wgpu_resource *gex = gex_resource(ctx->persistent[i]);
       if (!gex->buffer || !gex->shadow)
@@ -42116,15 +42953,14 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
        * glCopyNamedBufferSubData, waits on a fence and reads. The trace ran
        * `PERSIST upload [0,16)` and then `PERSIST refresh`, in that order, so
        * the test read the zeroed shadow back and reported [0, 0] against a
-       * reference of [3, 1415927]. Nothing in the driver said a word.
-       *
-       * The upload was reached because the copy had set gpu_written, which
-       * sends this down the diff path, where a freshly allocated
-       * persistent_sent is deliberately seeded to "everything differs". */
+       * reference of [3, 1415927]. Nothing in the driver said a word. */
       if (!(gex->persistent_usage & PIPE_MAP_WRITE))
          continue;
       const uint32_t size = (uint32_t)(gex->allocation_size & ~3u);
       if (!size)
+         continue;
+      if ((gex->persistent_usage & PIPE_MAP_FLUSH_EXPLICIT) &&
+          !(gex->persistent_usage & PIPE_MAP_COHERENT))
          continue;
       /* The diff exists to keep the *shader's* writes to this buffer, and a
          buffer no shader writes has none to keep. st/mesa's own uploader is
@@ -42154,6 +42990,7 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
             if (!gex->persistent_sent) {
                wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow,
                                     size);
+               gex_wgpu_persist_bytes += size;
                if (gex->bytes_written < size)
                   gex->bytes_written = size;
                continue;
@@ -42161,6 +42998,7 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
             gex->persistent_sent_size = size;
             wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow,
                                  size);
+            gex_wgpu_persist_bytes += size;
             memcpy(gex->persistent_sent, gex->shadow, size);
             if (gex->bytes_written < size)
                gex->bytes_written = size;
@@ -42181,6 +43019,7 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
                           (void *)&gex->base, run, end, size);
                wgpuQueueWriteBuffer(screen->queue, gex->buffer, run,
                                     gex->shadow + run, end - run);
+               gex_wgpu_persist_bytes += end - run;
                memcpy(gex->persistent_sent + run, gex->shadow + run, end - run);
                if (gex->bytes_written < size)
                   gex->bytes_written = size;
@@ -42201,6 +43040,7 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
             /* No record of what was sent, so send all of it, as before. */
             wgpuQueueWriteBuffer(screen->queue, gex->buffer, 0, gex->shadow,
                                  size);
+            gex_wgpu_persist_bytes += size;
             if (gex->bytes_written < size)
                gex->bytes_written = size;
             continue;
@@ -42209,14 +43049,10 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
          /* Nothing has been sent, so everything differs. */
          memset(gex->persistent_sent, ~gex->shadow[0], size);
       }
-      uint32_t first = 0;
-      while (first < size && gex->shadow[first] == gex->persistent_sent[first])
-         ++first;
+      uint32_t first = gex_wgpu_first_diff(gex->shadow, gex->persistent_sent, size);
       if (first == size)
          continue;
-      uint32_t last = size;
-      while (last > first && gex->shadow[last - 1] == gex->persistent_sent[last - 1])
-         --last;
+      uint32_t last = gex_wgpu_last_diff(gex->shadow, gex->persistent_sent, first, size);
       /* wgpuQueueWriteBuffer wants both ends on a four-byte boundary. Widening
        * can only re-send bytes that already agree. */
       first &= ~3u;
@@ -42226,6 +43062,7 @@ gex_wgpu_flush_persistent_maps(struct gex_wgpu_context *ctx)
                  (void *)&gex->base, first, last, size);
       wgpuQueueWriteBuffer(screen->queue, gex->buffer, first,
                            gex->shadow + first, last - first);
+      gex_wgpu_persist_bytes += last - first;
       memcpy(gex->persistent_sent + first, gex->shadow + first, last - first);
       /* So a later read map knows the buffer holds something. */
       if (gex->bytes_written < size)
@@ -42585,8 +43422,17 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
       return fresh;
    }
    const uint32_t hash = gex_wgpu_cache_hash(key, length);
-   struct gex_wgpu_pipeline_cache_slot *slot =
-      &screen->pipeline_cache[hash % GEX_WGPU_PIPELINE_CACHE_SLOTS];
+   /* Set-associative, GEX_WGPU_PIPELINE_CACHE_WAYS to a set, least recently
+    * used out. Direct-mapped, two live pipelines whose hashes met in a slot
+    * evicted each other every time a frame alternated between them -- a
+    * steady few re-creations a frame even in vanilla, and each one a backend
+    * pipeline compile in the browser's GPU process, because the evicted
+    * pipeline had been released and Dawn's own cache let it go. */
+   struct gex_wgpu_pipeline_cache_slot *set =
+      &screen->pipeline_cache[(hash % (GEX_WGPU_PIPELINE_CACHE_SLOTS /
+                                       GEX_WGPU_PIPELINE_CACHE_WAYS)) *
+                              GEX_WGPU_PIPELINE_CACHE_WAYS];
+   const uint64_t now = ++screen->pipeline_cache_clock;
    *cached = true;
    /* The epoch, as the bind group cache does. Serialising the descriptor
     * keeps every *field* in the key, which is what the note above is about,
@@ -42594,13 +43440,30 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
     * address and an address is reused once the module behind it is released.
     * Without this the cache returned a pipeline built from a deleted
     * shader. */
-   if (slot->used && slot->epoch == screen->pipeline_epoch &&
-       slot->hash == hash && slot->key_length == length &&
-       memcmp(slot->key, key, length) == 0) {
-      ++screen->pipeline_cache_hits;
-      { const WGPURenderPipeline gex_ret = slot->pipeline;
-        simple_mtx_unlock(&screen->cache_lock);
-        return gex_ret; }
+   struct gex_wgpu_pipeline_cache_slot *slot = NULL;
+   for (unsigned way = 0; way < GEX_WGPU_PIPELINE_CACHE_WAYS; ++way) {
+      struct gex_wgpu_pipeline_cache_slot *candidate = &set[way];
+      if (candidate->used && candidate->epoch == screen->pipeline_epoch &&
+          candidate->hash == hash && candidate->key_length == length &&
+          memcmp(candidate->key, key, length) == 0) {
+         candidate->last_used = now;
+         ++screen->pipeline_cache_hits;
+         { const WGPURenderPipeline gex_ret = candidate->pipeline;
+           simple_mtx_unlock(&screen->cache_lock);
+           return gex_ret; }
+      }
+      /* The victim, should this miss: an empty way, then one from a past
+       * epoch (it can never hit again), then the least recently used. */
+      if (!slot)
+         slot = candidate;
+      else if (slot->used &&
+               (!candidate->used ||
+                (candidate->epoch != screen->pipeline_epoch &&
+                 slot->epoch == screen->pipeline_epoch) ||
+                ((candidate->epoch == screen->pipeline_epoch) ==
+                    (slot->epoch == screen->pipeline_epoch) &&
+                 candidate->last_used < slot->last_used)))
+         slot = candidate;
    }
    ++screen->pipeline_cache_misses;
 
@@ -42639,6 +43502,7 @@ gex_wgpu_cached_pipeline(struct gex_wgpu_screen *screen,
    slot->epoch = screen->pipeline_epoch;
    slot->hash = hash;
    slot->key_length = length;
+   slot->last_used = now;
    memcpy(slot->key, key, length);
    slot->pipeline = pipeline;
    { const WGPURenderPipeline gex_ret = pipeline;
@@ -42786,16 +43650,39 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
       hash ^= gex_wgpu_cache_hash(key, sizeof(key)) * (i + 1u);
    }
 
-   struct gex_wgpu_bg_cache_slot *slot =
-      &screen->bg_cache[hash % GEX_WGPU_BG_CACHE_SLOTS];
-   if (slot->used && slot->epoch == screen->cache_epoch &&
-       slot->hash == hash && slot->layout == layout &&
-       slot->count == count &&
-       gex_wgpu_bg_entries_equal(slot->entries, entries, count)) {
-      ++screen->bg_cache_hits;
-      { const WGPUBindGroup gex_ret = slot->group;
-        simple_mtx_unlock(&screen->cache_lock);
-        return gex_ret; }
+   /* Set-associative with LRU, as the pipeline cache is, and for the same
+    * reason: direct-mapped, two groups a frame alternates between evicted each
+    * other whenever their hashes met in a slot, and a bind group is created
+    * across the JS boundary in the browser. */
+   struct gex_wgpu_bg_cache_slot *set =
+      &screen->bg_cache[(hash % (GEX_WGPU_BG_CACHE_SLOTS /
+                                 GEX_WGPU_BG_CACHE_WAYS)) *
+                        GEX_WGPU_BG_CACHE_WAYS];
+   const uint64_t now = ++screen->bg_cache_clock;
+   struct gex_wgpu_bg_cache_slot *slot = NULL;
+   for (unsigned way = 0; way < GEX_WGPU_BG_CACHE_WAYS; ++way) {
+      struct gex_wgpu_bg_cache_slot *candidate = &set[way];
+      if (candidate->used && candidate->epoch == screen->cache_epoch &&
+          candidate->hash == hash && candidate->layout == layout &&
+          candidate->count == count &&
+          gex_wgpu_bg_entries_equal(candidate->entries, entries, count)) {
+         candidate->last_used = now;
+         ++screen->bg_cache_hits;
+         { const WGPUBindGroup gex_ret = candidate->group;
+           simple_mtx_unlock(&screen->cache_lock);
+           return gex_ret; }
+      }
+      /* The victim: an empty way, then a stale one, then the oldest. */
+      if (!slot)
+         slot = candidate;
+      else if (slot->used &&
+               (!candidate->used ||
+                (candidate->epoch != screen->cache_epoch &&
+                 slot->epoch == screen->cache_epoch) ||
+                ((candidate->epoch == screen->cache_epoch) ==
+                    (slot->epoch == screen->cache_epoch) &&
+                 candidate->last_used < slot->last_used)))
+         slot = candidate;
    }
    ++screen->bg_cache_misses;
    /* For the timing report: what the slot held. Empty or another epoch, a
@@ -42867,6 +43754,7 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    slot->hash = hash;
    slot->layout = layout;
    slot->count = count;
+   slot->last_used = now;
    gex_wgpu_bg_entries_store(slot->entries, entries, count);
    /* Held until this slot is evicted; see gex_wgpu_bg_entries_ref. */
    gex_wgpu_bg_entries_ref(slot->entries, slot->count);
@@ -42874,6 +43762,45 @@ gex_wgpu_cached_bind_group(struct gex_wgpu_screen *screen,
    { const WGPUBindGroup gex_ret = group;
      simple_mtx_unlock(&screen->cache_lock);
      return gex_ret; }
+}
+
+/* Retire the cached bind groups whose entries name any of `handles` (views,
+ * samplers or buffers; NULLs are skipped), leaving every other entry live. */
+static void
+gex_wgpu_bg_cache_forget(struct gex_wgpu_screen *screen,
+                         const void *const *handles, unsigned count)
+{
+   bool any = false;
+   for (unsigned h = 0; h < count; ++h)
+      any |= handles[h] != NULL;
+   if (!any)
+      return;
+   simple_mtx_lock(&screen->cache_lock);
+   for (unsigned i = 0; i < GEX_WGPU_BG_CACHE_SLOTS; ++i) {
+      struct gex_wgpu_bg_cache_slot *slot = &screen->bg_cache[i];
+      if (!slot->used)
+         continue;
+      bool names = false;
+      for (unsigned e = 0; e < slot->count && !names; ++e) {
+         const WGPUBindGroupEntry *entry = &slot->entries[e];
+         for (unsigned h = 0; h < count && !names; ++h)
+            names = handles[h] &&
+                    (handles[h] == (const void *)entry->textureView ||
+                     handles[h] == (const void *)entry->sampler ||
+                     handles[h] == (const void *)entry->buffer);
+      }
+      if (!names)
+         continue;
+      if (screen->retired_count < ARRAY_SIZE(screen->retired_groups))
+         screen->retired_groups[screen->retired_count++] = slot->group;
+      else {
+         wgpuBindGroupRelease(slot->group);
+         ++screen->handle_epoch;
+      }
+      gex_wgpu_bg_entries_unref(slot->entries, slot->count);
+      slot->used = false;
+   }
+   simple_mtx_unlock(&screen->cache_lock);
 }
 
 static WGPUBuffer
@@ -45278,10 +46205,49 @@ gex_wgpu_quad_ib_enabled(void)
    return on;
 }
 
-static struct pipe_resource *
-gex_wgpu_quad_ib(struct gex_wgpu_context *ctx, unsigned quads, bool first)
+enum gex_wgpu_quad_order {
+   GEX_WGPU_QUADS_LAST = 0,      /* (0,1,3),(1,2,3): u_primconvert's, PV last */
+   GEX_WGPU_QUADS_FIRST = 1,     /* (0,1,2),(0,2,3): u_primconvert's, PV first */
+   /* (3,0,1),(3,1,2): the last-vertex triangulation with each triangle turned
+    * so GL's provoking vertex -- the quad's fourth -- is the one WebGPU's flat
+    * interpolation takes. Turning a triangle keeps its winding. */
+   GEX_WGPU_QUADS_LAST_AS_FIRST = 2,
+};
+
+/* Whether a GL_QUADS draw should be triangulated with GL's provoking vertex
+ * already first, rather than drawn with the last-vertex order and then have
+ * its indices rewritten by gex_wgpu_draw_provoking_last.
+ *
+ * The same test that path is entered by, less what a quad draw cannot be (a
+ * point, a patch, an indirect or multi-draw that the rewrite would take one
+ * command at a time). That rewrite is a CPU translation and an index upload
+ * per draw, and an uploaded index list cannot carry a multi-draw's other
+ * commands as repeats -- so a shaderpack, whose flat varyings are on nearly
+ * every program, sent each of Sodium's chunk sections through the whole draw
+ * path with its own rewritten indices. Built into the quad index buffer, the
+ * rotation costs nothing per draw.
+ *
+ * Not where the rewrite does more than rotate: a vertex shader whose side
+ * effects run against the application's own vertices (transform feedback,
+ * storage writes, an unrasterisable shader's replay) keeps the old path. */
+static bool
+gex_wgpu_quads_provoking_first(const struct gex_wgpu_context *ctx)
 {
-   const unsigned k = first ? 1 : 0;
+   return !GEX_GETENV_ONCE("GEX_WGPU_NO_PROVOKING") &&
+          ctx->fs && ctx->rasterizer &&
+          !ctx->rasterizer->flatshade_first &&
+          ctx->rasterizer->fill_mode == PIPE_POLYGON_MODE_FILL &&
+          !ctx->tcs && !ctx->tes && !ctx->gs &&
+          !ctx->so_target_count &&
+          !(ctx->vs && (ctx->vs->raster_invalid || ctx->vs->writes_storage)) &&
+          gex_wgpu_shader_has_flat_varying(ctx->fs);
+}
+
+static struct pipe_resource *
+gex_wgpu_quad_ib(struct gex_wgpu_context *ctx, unsigned quads,
+                 enum gex_wgpu_quad_order order)
+{
+   const unsigned k = order;
    if (ctx->quad_ib[k] && ctx->quad_ib_quads[k] >= quads)
       return ctx->quad_ib[k];
    unsigned n = MAX2(ctx->quad_ib_quads[k] * 2, 16384u);
@@ -45296,8 +46262,10 @@ gex_wgpu_quad_ib(struct gex_wgpu_context *ctx, unsigned quads, bool first)
    for (unsigned q = 0; q < n; ++q) {
       const uint32_t b = q * 4;
       uint32_t *o = idx + (size_t)q * 6;
-      if (first) {
+      if (order == GEX_WGPU_QUADS_FIRST) {
          o[0] = b; o[1] = b + 1; o[2] = b + 2; o[3] = b; o[4] = b + 2; o[5] = b + 3;
+      } else if (order == GEX_WGPU_QUADS_LAST_AS_FIRST) {
+         o[0] = b + 3; o[1] = b; o[2] = b + 1; o[3] = b + 3; o[4] = b + 1; o[5] = b + 2;
       } else {
          o[0] = b; o[1] = b + 1; o[2] = b + 3; o[3] = b + 1; o[4] = b + 2; o[5] = b + 3;
       }
@@ -45324,12 +46292,15 @@ gex_wgpu_draw_quads_indexed(struct gex_wgpu_context *ctx,
 {
    const struct gex_wgpu_rasterizer *rasterizer = ctx->rasterizer;
    const bool first = rasterizer && rasterizer->flatshade_first;
+   const bool pv_first = !first && gex_wgpu_quads_provoking_first(ctx);
    unsigned maxq = 0;
    for (unsigned i = 0; i < num_draws; ++i)
       maxq = MAX2(maxq, draws[i].count / 4);
    if (!maxq)
       return true;
-   struct pipe_resource *ib = gex_wgpu_quad_ib(ctx, maxq, first);
+   struct pipe_resource *ib = gex_wgpu_quad_ib(
+      ctx, maxq, first ? GEX_WGPU_QUADS_FIRST
+                 : pv_first ? GEX_WGPU_QUADS_LAST_AS_FIRST : GEX_WGPU_QUADS_LAST);
    if (!ib)
       return false;
    struct pipe_draw_start_count_bias stack[64];
@@ -45353,7 +46324,11 @@ gex_wgpu_draw_quads_indexed(struct gex_wgpu_context *ctx,
    ni.max_index = ~0u;
    ni.primitive_restart = false;
    ni.index_bias_varies = num_draws > 1;
+   /* Already in GL's provoking order: the rewrite must not turn it again. */
+   const bool saved_rewritten = ctx->provoking_rewritten;
+   ctx->provoking_rewritten |= pv_first;
    ctx->base.draw_vbo(&ctx->base, &ni, drawid_offset, NULL, nd, num_draws);
+   ctx->provoking_rewritten = saved_rewritten;
    if (nd != stack)
       free(nd);
    return true;
@@ -45454,8 +46429,29 @@ gex_wgpu_repeat_emit(struct gex_wgpu_context *ctx, WGPURenderPassEncoder pass,
                      unsigned vb_slot_count, const uint8_t *vb_buffer,
                      const bool *vb_instanced, const uint32_t *vb_stride)
 {
+   /* The base instance the bound instance-stepped offsets already carry.
+    * Where the vertex shader never reads gl_InstanceID, a later command's
+    * own base is passed to drawIndexed relative to that, instead of
+    * rebinding every instance-stepped buffer at a new offset first: one call
+    * a command rather than two, and Sodium issues a command per chunk
+    * section. A shader that reads it keeps the rebinding, which is what
+    * keeps instance_index counting from zero as gl_InstanceID does. */
+   uint32_t bound_instance = ctx->repeat.cmds[0].start_instance;
+   const bool by_first_instance =
+      ctx->vs && ctx->vs->original_nir &&
+      !BITSET_TEST(ctx->vs->original_nir->info.system_values_read,
+                   SYSTEM_VALUE_INSTANCE_ID);
    for (unsigned k = 1; k < ctx->repeat.count; ++k) {
       const struct gex_wgpu_repeat_cmd *c = &ctx->repeat.cmds[k];
+      if (by_first_instance && c->start_instance >= bound_instance) {
+         ++gex_wgpu_draws_issued;
+         wgpuRenderPassEncoderDrawIndexed(pass, c->index_count,
+                                          c->instance_count, c->first_index,
+                                          c->base_vertex,
+                                          c->start_instance - bound_instance);
+         continue;
+      }
+      bound_instance = c->start_instance;
       for (unsigned slot = 0; slot < vb_slot_count; ++slot) {
          if (!vb_instanced[slot])
             continue;
@@ -45507,10 +46503,16 @@ gex_wgpu_draw_quads_indirect(struct gex_wgpu_context *ctx,
       return n == 0;   /* no commands; a failed read goes to primconvert */
    const struct gex_wgpu_rasterizer *rasterizer = ctx->rasterizer;
    const bool first = rasterizer && rasterizer->flatshade_first;
+   const bool pv_first = !first && gex_wgpu_quads_provoking_first(ctx);
    unsigned maxq = 0;
    for (unsigned i = 0; i < n; ++i)
       maxq = MAX2(maxq, cmds[i].draw.count / 4);
-   struct pipe_resource *ib = maxq ? gex_wgpu_quad_ib(ctx, maxq, first) : NULL;
+   struct pipe_resource *ib = maxq
+      ? gex_wgpu_quad_ib(ctx, maxq,
+                         first ? GEX_WGPU_QUADS_FIRST
+                         : pv_first ? GEX_WGPU_QUADS_LAST_AS_FIRST
+                                    : GEX_WGPU_QUADS_LAST)
+      : NULL;
    if (maxq && !ib) {
       free(cmds);
       return false;
@@ -45548,6 +46550,9 @@ gex_wgpu_draw_quads_indirect(struct gex_wgpu_context *ctx,
     * reissues does; see own_draw_params. */
    const unsigned saved_resolve_at = ctx->indirect_resolve_at;
    ctx->indirect_resolve_at = ctx->draw_depth;
+   /* Already in GL's provoking order; see gex_wgpu_quads_provoking_first. */
+   const bool saved_rewritten = ctx->provoking_rewritten;
+   ctx->provoking_rewritten |= pv_first;
    for (unsigned k = 0; k < live && !ctx->failed;) {
       struct pipe_draw_info ni = cmds[which[k]].info;
       ni.mode = MESA_PRIM_TRIANGLES;
@@ -45570,6 +46575,7 @@ gex_wgpu_draw_quads_indirect(struct gex_wgpu_context *ctx,
                          1);
       k += gex_wgpu_repeat_disarm(ctx) ? live - k : 1;
    }
+   ctx->provoking_rewritten = saved_rewritten;
    ctx->indirect_resolve_at = saved_resolve_at;
    if (rc != stack_cmd)
       free(rc);
@@ -47050,10 +48056,18 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * skips reading back every index of every Sodium draw. */
       if (index_resource &&
           (index_resource == ctx->quad_ib[0] ||
-           index_resource == ctx->quad_ib[1]) &&
+           index_resource == ctx->quad_ib[1] ||
+           index_resource == ctx->quad_ib[2]) &&
           !uploaded_index_resource && first_index == 0) {
          last_vertex = draws[0].count >= 6
             ? (uint64_t)(draws[0].count / 6) * 4 - 1 : 0;
+      } else if (index_resource && info->index_bounds_valid) {
+         last_vertex = (uint64_t)info->max_index;
+      } else if (index_resource && !GEX_GETENV_ONCE("GEX_WGPU_BOUNDS_CHECK")) {
+         /* The scan below reads every index of every draw on the CPU to feed
+          * a diagnostic; opt in to it. */
+         bounds_known = false;
+         goto bounds_done;
       } else if (index_resource) {
          last_vertex = 0;
          const uint8_t *shadow = gex_resource(index_resource)->shadow;
@@ -47391,8 +48405,12 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    const int64_t t_fsmod_start = gex_timing ? gex_wgpu_clock() : 0;
    /* Slots this variant dropped because the bound state could not satisfy
     * their declaration; their bindings must be left out of the group too. */
-   uint16_t omitted_texture_slots = 0;
-   uint16_t demoted_ms_slots = 0;
+   uint32_t omitted_texture_slots = 0;
+   uint32_t demoted_ms_slots = 0;
+   /* Sampler slots this variant folded onto another slot's binding, and
+    * which; their entries are left out of group 0. */
+   uint32_t shared_samplers = 0;
+   uint8_t sampler_share[GEX_WGPU_MAX_SAMPLERS];
    /* Who derives gl_PrimitiveID for this draw, decided here because this is
     * where the topology is final: the strip and unsupported-topology rewrites
     * re-enter this function, so an earlier answer would describe the
@@ -47412,7 +48430,8 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       ctx, fs_topology == WGPUPrimitiveTopology_PointList,
       fs_topology == WGPUPrimitiveTopology_TriangleList ||
       fs_topology == WGPUPrimitiveTopology_TriangleStrip,
-      &omitted_texture_slots, &demoted_ms_slots);
+      &omitted_texture_slots, &demoted_ms_slots, &shared_samplers,
+      sampler_share);
    if (gex_timing) gex_wgpu_time_fsmod += (gex_wgpu_clock() - t_fsmod_start) * gex_wgpu_timing_every();
    if (!fragment.module)
       GEX_DRAW_DROP();
@@ -48652,6 +49671,38 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
                                * read-only header and the texel data */
                               3 * GEX_WGPU_MAX_SHADER_IMAGES +
                               GEX_WGPU_MAX_BUFFER_TEXTURES];
+   /* The sharing decision predicted `depth_as_float` before it was computed
+    * above; hold every borrowed binding to the real one. A slot borrowing a
+    * binding of another type is a rejected pipeline, and one of another
+    * sampler object is a wrong texel. */
+   for (unsigned i = 0; shared_samplers && i < ctx->fs->sampler_count; ++i) {
+      const unsigned slot = ctx->fs->sampler_slots[i];
+      if (!((shared_samplers >> slot) & 1))
+         continue;
+      unsigned j = 0;
+      while (j < ctx->fs->sampler_count &&
+             ctx->fs->sampler_slots[j] != sampler_share[slot])
+         ++j;
+      WGPUSamplerBindingType mine_type = WGPUSamplerBindingType_Undefined;
+      WGPUSamplerBindingType lent_type = WGPUSamplerBindingType_Undefined;
+      const WGPUSampler mine =
+         gex_wgpu_fs_sampler_binding(ctx, i, depth_as_float, &mine_type);
+      const WGPUSampler lent = j < ctx->fs->sampler_count
+         ? gex_wgpu_fs_sampler_binding(ctx, j, depth_as_float, &lent_type)
+         : NULL;
+      if (!lent || lent != mine || lent_type != mine_type) {
+         static bool said;
+         if (!said) {
+            said = true;
+            fprintf(stderr, "gex-wgpu: draw dropped (fragment slot %u cannot "
+                    "share slot %u's sampler)\n", slot,
+                    (unsigned)sampler_share[slot]);
+         }
+         GEX_DRAW_DROP();
+      }
+   }
+   const unsigned fs_sampler_entries =
+      ctx->fs ? ctx->fs->sampler_count - util_bitcount(shared_samplers) : 0;
    if (needs_texture) {
       for (unsigned i = 0; i < ctx->fs->texture_count; ++i) {
          texture_layout_entries[i] =
@@ -48692,7 +49743,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             !omitted && !demoted &&
             ((ctx->fs->multisampled_slots >> ctx->fs->texture_slots[i]) & 1);
       }
-      unsigned dst_entry = ctx->fs->texture_count + ctx->fs->sampler_count;
+      unsigned dst_entry = ctx->fs->texture_count + fs_sampler_entries;
       for (unsigned rt = 0; rt < 8; ++rt) {
          if (!(dst_mask & BITFIELD_BIT(rt)))
             continue;
@@ -48706,8 +49757,14 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          entry->texture.viewDimension = WGPUTextureViewDimension_2D;
          entry->texture.multisampled = !logicop && MAX2(ctx->fb_samples, 1) > 1;
       }
+      /* Packed: a slot that borrows another's sampler binding has no entry
+       * of its own, because the layout's sampler count is what WebGPU holds
+       * against maxSamplersPerShaderStage. */
+      unsigned next_sampler_entry = ctx->fs->texture_count;
       for (unsigned i = 0; i < ctx->fs->sampler_count; ++i) {
-         const unsigned entry = ctx->fs->texture_count + i;
+         if ((shared_samplers >> ctx->fs->sampler_slots[i]) & 1)
+            continue;
+         const unsigned entry = next_sampler_entry++;
          texture_layout_entries[entry] =
             (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
          texture_layout_entries[entry].binding =
@@ -49083,8 +50140,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
       if (group == 0 && needs_texture) {
          desc.entryCount =
-            ctx->fs->texture_count + ctx->fs->sampler_count +
-            dst_count;
+            ctx->fs->texture_count + fs_sampler_entries + dst_count;
          desc.entries = texture_layout_entries;
       } else if (group == 1 && needs_vertex_constant) {
          desc.entryCount = vertex_group_count;
@@ -49263,7 +50319,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             color_view.dimension = WGPUTextureViewDimension_2D;
             color_view.baseMipLevel = 0;
             color_view.mipLevelCount = 1;
-            color_view.baseArrayLayer = 0;
+            color_view.baseArrayLayer = ctx->color_layers[i];
             color_view.arrayLayerCount = 1;
             scratch_attached[i] = true;
          } else {
@@ -49359,26 +50415,19 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
             GEX_DRAW_DROP();
          }
       }
+      unsigned next_sampler_entry = ctx->fs->texture_count;
       for (unsigned i = 0; i < ctx->fs->sampler_count; ++i) {
-         const unsigned slot = ctx->fs->sampler_slots[i];
-         const unsigned entry = ctx->fs->texture_count + i;
+         /* Packed as the layout is: a borrowing slot has no entry. */
+         if ((shared_samplers >> ctx->fs->sampler_slots[i]) & 1)
+            continue;
+         const unsigned entry = next_sampler_entry++;
          entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[entry].binding = ctx->fs->sampler_bindings[i];
-         /* A slot whose depth view is being read as float declares a
-          * non-filtering sampler in the layout above, so the nearest twin is
-          * what may be bound to it. */
-         entries[entry].sampler = ctx->samplers[slot]
-            ? ((depth_as_float & (1u << slot)) &&
-               ctx->samplers[slot]->nonfiltering
-                  ? ctx->samplers[slot]->nonfiltering
-                  : gex_wgpu_sampler_matching(ctx->samplers[slot],
-                                              ctx->fs->sampler_types[i]))
-            : gex_wgpu_default_sampler(
-                 screen, (depth_as_float & (1u << slot))
-                            ? WGPUSamplerBindingType_NonFiltering
-                            : ctx->fs->sampler_types[i]);
+         WGPUSamplerBindingType type;
+         entries[entry].sampler =
+            gex_wgpu_fs_sampler_binding(ctx, i, depth_as_float, &type);
       }
-      unsigned dst_entry = ctx->fs->texture_count + ctx->fs->sampler_count;
+      unsigned dst_entry = ctx->fs->texture_count + fs_sampler_entries;
       for (unsigned rt = 0; rt < 8; ++rt) {
          if (!(dst_mask & BITFIELD_BIT(rt)))
             continue;
@@ -49390,8 +50439,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[0];
       bind_desc.entryCount =
-         ctx->fs->texture_count + ctx->fs->sampler_count +
-            dst_count;
+         ctx->fs->texture_count + fs_sampler_entries + dst_count;
       bind_desc.entries = entries;
       bind_groups[0] = gex_wgpu_cached_bind_group(
          screen, group_label[0], bind_desc.layout, bind_desc.entries,
@@ -49984,8 +51032,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const bool nonfiltering =
             ctx->vs->sampler_types[i] == WGPUSamplerBindingType_NonFiltering;
          entries[entry].sampler = ctx->vertex_samplers[slot]
-            ? (nonfiltering ? ctx->vertex_samplers[slot]->nonfiltering
-                            : ctx->vertex_samplers[slot]->sampler)
+            ? (nonfiltering
+                  ? gex_wgpu_sampler_nonfiltering(ctx->vertex_samplers[slot])
+                  : gex_wgpu_sampler_matching(ctx->vertex_samplers[slot],
+                                              ctx->vs->sampler_types[i]))
             : gex_wgpu_default_sampler(screen, ctx->vs->sampler_types[i]);
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
@@ -50963,6 +52013,7 @@ gex_wgpu_context_destroy(struct pipe_context *pipe)
       util_primconvert_destroy(ctx->primconvert);
    pipe_resource_reference(&ctx->quad_ib[0], NULL);
    pipe_resource_reference(&ctx->quad_ib[1], NULL);
+   pipe_resource_reference(&ctx->quad_ib[2], NULL);
    FREE(ctx->facing_pass);
    pipe_resource_reference(&ctx->facing_vs_out, NULL);
    util_copy_framebuffer_state(&ctx->framebuffer, NULL);
@@ -51158,6 +52209,7 @@ gex_wgpu_context_create(struct pipe_screen *screen, void *priv, unsigned flags)
    ctx->base.set_sample_mask = gex_wgpu_set_sample_mask;
    ctx->base.resource_copy_region = gex_wgpu_resource_copy_region;
    ctx->base.blit = gex_wgpu_blit;
+   ctx->base.generate_mipmap = gex_wgpu_generate_mipmap;
    ctx->base.set_polygon_stipple = gex_wgpu_set_polygon_stipple;
    ctx->base.set_min_samples = gex_wgpu_set_min_samples;
    ctx->base.set_clip_state = gex_wgpu_set_clip_state;
@@ -51712,6 +52764,8 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * a driver that orders every command on the WebGPU queue is exactly that
     * guarantee, not an approximation of it. */
    caps->texture_barrier = true;
+   /* gex_wgpu_generate_mipmap, which declines what it cannot do. */
+   caps->generate_mipmap = true;
    /* ARB_derivative_control, a third of the five. zink's emitter has
     * SpvOpDPdxFine/Coarse and declares the DerivativeControl capability for
     * them, and Tint takes those as WGSL's dpdxFine/dpdxCoarse -- so the whole
@@ -51955,6 +53009,17 @@ gex_wgpu_init_caps(struct gex_wgpu_screen *screen)
     * next person does not spend the afternoon on it. */
    caps->max_vertex_buffers = 8;
    caps->max_vertex_attrib_stride = 2048;
+   /* And so no dynamic VAO fast path. With it st/mesa gives every enabled
+    * attribute a vertex buffer of its own instead of folding interleaved
+    * attributes into one binding, which is free on hardware with thirty-two
+    * slots and a cliff with eight: a ninth attribute and u_vbuf marks *every*
+    * element incompatible ("more vertex buffers are used than the hardware
+    * supports"), reads the GPU buffer back, repacks it on the CPU and uploads
+    * it again, at every draw. Iris's Sodium terrain is nine attributes in one
+    * interleaved buffer -- with Complementary on, that was most of the render
+    * thread, waiting on readbacks that grow with the render distance. Folded,
+    * it is two bindings: the vertices and the per-instance chunk offset. */
+   caps->allow_dynamic_vao_fastpath = false;
    /* Per-instance vertex attributes, which is ARB_instanced_arrays.
     *
     * Left false, st/mesa never exposed the extension, so every
@@ -52231,8 +53296,9 @@ gex_wgpu_init_shader_caps(struct gex_wgpu_screen *screen)
       caps->max_const_buffers =
          MIN2(GEX_WGPU_MAX_CONSTANT_BUFFERS,
               screen->max_uniform_buffers + screen->max_storage_buffers_vertex);
-      caps->max_texture_samplers = GEX_WGPU_MAX_SAMPLERS;
-      caps->max_sampler_views = GEX_WGPU_MAX_SAMPLERS;
+      caps->max_texture_samplers = stages[i] == MESA_SHADER_FRAGMENT
+         ? screen->max_fs_samplers : GEX_WGPU_MAX_STAGE_SAMPLERS;
+      caps->max_sampler_views = caps->max_texture_samplers;
       /* Shader storage buffers, the first rung above GL 3.3: st_extensions
        * exposes ARB_shader_storage_buffer_object on the strength of the
        * fragment stage's count alone, and gates image load/store and compute
@@ -52392,6 +53458,8 @@ gex_wgpu_screen_create(WGPUDevice device)
    screen->max_inter_stage = GEX_WGPU_MAX_RASTER_VARYINGS;
    screen->max_raster_varyings = GEX_WGPU_MAX_RASTER_VARYINGS;
    screen->max_storage_textures = GEX_WGPU_MAX_SHADER_IMAGES;
+   screen->max_samplers = GEX_WGPU_MAX_STAGE_SAMPLERS;
+   screen->max_fs_samplers = GEX_WGPU_MAX_STAGE_SAMPLERS;
    screen->max_storage_buffer_size = 0;
    screen->uniform_offset_alignment = 256;   /* WebGPU's default, the worst */
    screen->storage_offset_alignment = 256;
@@ -52488,6 +53556,15 @@ gex_wgpu_screen_create(WGPUDevice device)
          limits.maxStorageTexturesPerShaderStage == WGPU_LIMIT_U32_UNDEFINED
             ? GEX_WGPU_MAX_SHADER_IMAGES
             : limits.maxStorageTexturesPerShaderStage;
+      if (limits.maxSamplersPerShaderStage != WGPU_LIMIT_U32_UNDEFINED &&
+          limits.maxSamplersPerShaderStage >= GEX_WGPU_MAX_STAGE_SAMPLERS)
+         screen->max_samplers = limits.maxSamplersPerShaderStage;
+      /* Lowers the count sampler sharing works to, below what WebGPU lets a
+       * device grant, so the sharing path can be exercised anywhere. */
+      const char *samplers_cap = getenv("GEX_WGPU_FS_SAMPLERS");
+      if (samplers_cap && atoi(samplers_cap) > 0)
+         screen->max_samplers =
+            MIN2(screen->max_samplers, (uint32_t)atoi(samplers_cap));
       screen->max_storage_buffer_size =
          limits.maxStorageBufferBindingSize == WGPU_LIMIT_U64_UNDEFINED
             ? 0 : (uint32_t)MIN2(limits.maxStorageBufferBindingSize,
@@ -52588,9 +53665,39 @@ gex_wgpu_screen_create(WGPUDevice device)
    const bool force_ordered_fetch = getenv("GEX_WGPU_FORCE_ORDERED_FETCH") != NULL;
    if (force_ordered_fetch)
       screen->framebuffer_fetch = false;
+   /* The fragment stage's texture units, from what the device grants.
+    *
+    * Every unit is a sampled texture, and so is every read-only image
+    * (GEX_WGPU_MAX_SHADER_IMAGES of them) and each of the eight colour
+    * attachment copies framebuffer fetch and logic ops bind
+    * (GEX_WGPU_LOGICOP_BINDING + rt); a shader may use all three at once, so
+    * the units are what is left after the other two. WebGPU's default of
+    * sixteen leaves the sixteen GL 3.x requires; Chrome's 48 leaves 24, and a
+    * device granting 56 or more gets all 32. Iris sizes its sampler pool
+    * from GL_MAX_TEXTURE_IMAGE_UNITS -- the fragment stage's figure -- and
+    * Complementary's HIGH profile and Photon both ask for more than sixteen.
+    * Samplers are a separate limit, sixteen in all of Chrome's tiers;
+    * gex_wgpu_fs_share_samplers lets units bind more textures than that.
+    * GEX_WGPU_FS_UNITS lowers it, for comparisons. */
+   {
+      const uint32_t reserved = GEX_WGPU_MAX_SHADER_IMAGES + 8;
+      const uint32_t granted =
+         got_limits &&
+         limits.maxSampledTexturesPerShaderStage != WGPU_LIMIT_U32_UNDEFINED
+            ? limits.maxSampledTexturesPerShaderStage : 0;
+      uint32_t units = granted > reserved ? granted - reserved : 0;
+      const char *cap = getenv("GEX_WGPU_FS_UNITS");
+      if (cap && *cap)
+         units = MIN2(units, (uint32_t)atoi(cap));
+      screen->max_fs_samplers =
+         CLAMP(units, GEX_WGPU_MAX_STAGE_SAMPLERS, GEX_WGPU_MAX_SAMPLERS);
+      fprintf(stderr, "gex-wgpu: fragment texture units %u (sampled textures "
+              "%u, samplers %u)\n", screen->max_fs_samplers, granted,
+              screen->max_samplers);
+   }
    screen->software_framebuffer_fetch = !screen->framebuffer_fetch && got_limits &&
       (limits.maxSampledTexturesPerShaderStage >=
-         GEX_WGPU_MAX_SAMPLERS + GEX_WGPU_MAX_SHADER_IMAGES + 8 || force_ordered_fetch);
+         screen->max_fs_samplers + GEX_WGPU_MAX_SHADER_IMAGES + 8 || force_ordered_fetch);
    /* Real GPU timestamps, if the device has them. ARB_timer_query is one of
     * the two things GL 3.3 still wants, and the alternative -- answering from
     * the CPU clock -- measures the gap between commands being recorded rather

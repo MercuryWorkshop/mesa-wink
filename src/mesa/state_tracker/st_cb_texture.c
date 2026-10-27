@@ -2992,8 +2992,20 @@ st_can_copyteximage_using_blit(const struct gl_texture_image *texImage,
    /* We can't blit from a RB where the GL base format doesn't match the RB's
     * chosen format (for example, GL RGB or ALPHA with rb->Format of an RGBA
     * type, because the other channels will be undefined).
+    *
+    * Except an RGB renderbuffer kept as RGBA copied into a texture with no
+    * alpha of its own: the one undefined channel lands where nothing reads it,
+    * since an RGB texture samples alpha as one through its view swizzle. A
+    * driver without RGB render targets stores every RGB16F/RGB8 target that
+    * way, and refusing sent each copy down the software path -- a GPU
+    * readback and a CPU conversion per glCopyTexSubImage, every frame, for
+    * Iris's history buffers.
     */
-   if (rb->_BaseFormat != _mesa_get_format_base_format(rb->Format))
+   if (rb->_BaseFormat != _mesa_get_format_base_format(rb->Format) &&
+       !(rb->_BaseFormat == GL_RGB &&
+         _mesa_get_format_base_format(rb->Format) == GL_RGBA &&
+         !_mesa_base_format_has_channel(texImage->_BaseFormat,
+                                        GL_TEXTURE_ALPHA_TYPE)))
       return false;
 
    return true;

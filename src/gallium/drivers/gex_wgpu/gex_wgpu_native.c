@@ -363,16 +363,25 @@ create_device(void)
        * -- and that "supports a higher maximum" is the whole point: nobody
        * had asked. Blender's EEVEE binds five in one dispatch and
        * KHR-GL44.shader_image_load_store's allTargets cases want seven. */
-      /* 8 and 16 are GEX_WGPU_MAX_SHADER_IMAGES and
-       * GEX_WGPU_MAX_SAMPLERS, which live in gex_wgpu_screen.c and are
-       * not visible here; keep them in step. */
+      /* 8 is GEX_WGPU_MAX_SHADER_IMAGES' writable share, and the 56 and 32
+       * below are GEX_WGPU_MAX_SAMPLERS plus the reserve the fragment unit
+       * count is taken from, and GEX_WGPU_MAX_SAMPLERS; they live in
+       * gex_wgpu_screen.c and are not visible here, so keep them in step. */
       GEX_WANT(maxStorageTexturesPerShaderStage, 8);
       GEX_WANT_STAGE(maxStorageTexturesInVertexStage, 8);
       GEX_WANT_STAGE(maxStorageTexturesInFragmentStage, 8);
       /* And sampled textures, for the same reason: GL 3.3 wants sixteen per
        * stage, which is WebGPU's default, but a stage that also splits
-       * combined samplers can name more. */
-      GEX_WANT(maxSampledTexturesPerShaderStage, 48);
+       * combined samplers can name more -- and the fragment stage's unit
+       * count is what this leaves after the read-only images and the
+       * framebuffer copies (gex_wgpu_screen.c, max_fs_samplers), so 56 is
+       * what all 32 units cost. */
+      GEX_WANT(maxSampledTexturesPerShaderStage, 56);
+      /* Samplers, which nobody asked for, so every device had WebGPU's
+       * sixteen. Dawn grants no more than that in any case, and the
+       * fragment stage shares bindings past it; an implementation granting
+       * more (Firefox's wgpu offers 64) needs no sharing at all. */
+      GEX_WANT(maxSamplersPerShaderStage, 32);
       /* Eight RGBA8 draw buffers is exactly WebGPU's default 32 bytes per
        * sample, so GL 3.2's eight draw buffers of any wider format fails on
        * it. */
@@ -391,7 +400,12 @@ create_device(void)
       GEX_WANT(maxComputeWorkgroupSizeX, 1024);
       GEX_WANT(maxComputeWorkgroupSizeY, 1024);
       GEX_WANT(maxComputeWorkgroupSizeZ, 64);
-      GEX_WANT(maxComputeWorkgroupStorageSize, 32768);
+      /* GL's minimum is 32 KiB, but GL_MAX_COMPUTE_SHARED_MEMORY_SIZE is
+       * whatever this grants, and shaders written against a desktop driver
+       * use more: Photon's deferred4_a declares 36 KiB and failed to link
+       * ("Too much shared memory used (36860/32768)") on an adapter that
+       * offers 48. As much as the adapter has, up to WebGPU's top tier. */
+      GEX_WANT(maxComputeWorkgroupStorageSize, 65536);
       /* Textures, because the *GL version* depends on them and nothing else
        * does: the 4.1 rung of _mesa_compute_version requires a 16384 texture
        * and 2048 array layers where WebGPU guarantees 8192 and 256. A device
@@ -423,6 +437,41 @@ create_device(void)
 #undef GEX_WANT_LOW
 #undef GEX_WANT_STAGE
 #undef GEX_WANT
+      /* GEX_WGPU_CAP_LIMITS="maxInterStageShaderVariables=16,..." lowers what
+       * is asked for, so a desktop run sees what a browser adapter grants:
+       * the GL caps, and so the extensions and the MC_GL_* paths a
+       * shaderpack takes, follow these. */
+      const char *cap = getenv("GEX_WGPU_CAP_LIMITS");
+      while (cap && *cap) {
+         char name[64];
+         unsigned value;
+         int used = 0;
+         if (sscanf(cap, "%63[^=]=%u%n", name, &value, &used) != 2)
+            break;
+#define GEX_CAP(field)                                                      \
+         if (!strcmp(name, #field)) limits.field = MIN2(limits.field, value);
+#define GEX_CAP_STAGE(field)                                                \
+         if (!strcmp(name, #field)) GEX_STAGE.field = MIN2(GEX_STAGE.field, value);
+         GEX_CAP(maxUniformBuffersPerShaderStage)
+         GEX_CAP(maxInterStageShaderVariables)
+         GEX_CAP(maxVertexAttributes)
+         GEX_CAP(maxStorageBuffersPerShaderStage)
+         GEX_CAP_STAGE(maxStorageBuffersInVertexStage)
+         GEX_CAP_STAGE(maxStorageBuffersInFragmentStage)
+         GEX_CAP(maxStorageTexturesPerShaderStage)
+         GEX_CAP_STAGE(maxStorageTexturesInVertexStage)
+         GEX_CAP_STAGE(maxStorageTexturesInFragmentStage)
+         GEX_CAP(maxDynamicUniformBuffersPerPipelineLayout)
+         GEX_CAP(maxDynamicStorageBuffersPerPipelineLayout)
+         GEX_CAP(maxSampledTexturesPerShaderStage)
+         GEX_CAP(maxSamplersPerShaderStage)
+         GEX_CAP(maxColorAttachmentBytesPerSample)
+#undef GEX_CAP_STAGE
+#undef GEX_CAP
+         cap += used;
+         if (*cap == ',')
+            ++cap;
+      }
       if (getenv("GEX_WGPU_LIMIT_TRACE"))
          fprintf(stderr, "gex-limits: adapter vertex attributes %u "
                  "(asked %u)\n", adapter_limits.maxVertexAttributes,

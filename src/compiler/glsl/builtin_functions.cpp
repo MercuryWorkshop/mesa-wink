@@ -173,16 +173,18 @@ v120(const _mesa_glsl_parse_state *state)
    return state->is_version(120, 300);
 }
 
+/* compat_130: a desktop compatibility shader below 1.30 gets 1.30's
+ * built-ins too; see _mesa_glsl_parse_state::process_version_directive. */
 static bool
 v130(const _mesa_glsl_parse_state *state)
 {
-   return state->is_version(130, 300);
+   return state->is_version(130, 300) || state->compat_130;
 }
 
 static bool
 v130_desktop(const _mesa_glsl_parse_state *state)
 {
-   return state->is_version(130, 0);
+   return state->is_version(130, 0) || state->compat_130;
 }
 
 static bool
@@ -194,7 +196,7 @@ v460_desktop(const _mesa_glsl_parse_state *state)
 static bool
 v130_derivatives_only(const _mesa_glsl_parse_state *state)
 {
-   return state->is_version(130, 300) &&
+   return (state->is_version(130, 300) || state->compat_130) &&
           derivatives_only(state);
 }
 

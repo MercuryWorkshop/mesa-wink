@@ -137,13 +137,21 @@ var LibraryWink = {
       'maxStorageTexturesInFragmentStage': 8,
       'maxDynamicUniformBuffersPerPipelineLayout': 32,
       'maxDynamicStorageBuffersPerPipelineLayout': 16,
-      'maxSampledTexturesPerShaderStage': 48,
+      // 32 fragment texture units plus the read-only images and framebuffer
+      // copies the driver reserves beside them (max_fs_samplers); Chrome
+      // grants at most 48, Firefox 64.
+      'maxSampledTexturesPerShaderStage': 56,
+      // Never asked for before, so every device had the default sixteen.
+      // Past it the driver shares sampler bindings between units.
+      'maxSamplersPerShaderStage': 32,
       'maxColorAttachmentBytesPerSample': 128,
       'maxComputeInvocationsPerWorkgroup': 1024,
       'maxComputeWorkgroupSizeX': 1024,
       'maxComputeWorkgroupSizeY': 1024,
       'maxComputeWorkgroupSizeZ': 64,
-      'maxComputeWorkgroupStorageSize': 32768,
+      // GL_MAX_COMPUTE_SHARED_MEMORY_SIZE is this; Photon wants 36 KiB, and
+      // Intel and most desktop adapters offer 48 or 64.
+      'maxComputeWorkgroupStorageSize': 65536,
       'maxTextureDimension1D': 16384,
       'maxTextureDimension2D': 16384,
       'maxTextureDimension3D': 2048,

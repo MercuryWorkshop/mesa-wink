@@ -889,6 +889,10 @@ struct _mesa_glsl_parse_state {
    bool EXT_geometry_shader_warn;
    bool EXT_gpu_shader4_enable;
    bool EXT_gpu_shader4_warn;
+   /* A desktop compatibility shader below GLSL 1.30 that may use 1.30's
+    * switch statement and built-in functions, as NVIDIA's compiler lets it;
+    * see process_version_directive. */
+   bool compat_130;
    bool EXT_gpu_shader5_enable;
    bool EXT_gpu_shader5_warn;
    bool EXT_mesh_shader_enable;

@@ -63,13 +63,25 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return false;
    }
 
+   /* The store may not be a whole vec4: a colour output can arrive split by
+    * component, or narrowed to the channels the shader writes. Only the store
+    * that carries alpha is tested. nir_channel(src, 3) on a narrower source
+    * built an invalid swizzle, which reached SPIR-V as an OpCompositeExtract
+    * of a scalar and lost the whole shader -- Iris's 1x1 centre-depth pass
+    * under the alpha test vanilla 1.16 leaves enabled. */
+   const unsigned component = nir_intrinsic_component(intr);
+   if (!state->alpha_to_one &&
+       (component > 3 || 3 - component >= intr->num_components ||
+        !(nir_intrinsic_write_mask(intr) & BITFIELD_BIT(3 - component))))
+      return false;
+
    b->cursor = nir_before_instr(&intr->instr);
 
    nir_def *alpha;
    if (state->alpha_to_one)
       alpha = nir_imm_float(b, 1.0);
    else
-      alpha = nir_channel(b, intr->src[0].ssa, 3);
+      alpha = nir_channel(b, intr->src[0].ssa, 3 - component);
 
    nir_variable *var =
       st_nir_state_variable_create(b->shader, glsl_float_type(),

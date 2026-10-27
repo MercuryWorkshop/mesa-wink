@@ -305,6 +305,8 @@ glthread_init_state(struct gl_context *ctx)
       .known = true, .enabled = false, .mode = GL_EXP,
       .start = 0.0f, .end = 1.0f, .density = 1.0f,
    };
+   glthread->DepthFunc = GL_LESS;
+   glthread->DepthMask = true;
 
    ctx->MarshalExec = _mesa_alloc_dispatch_table(true);
    if (!ctx->MarshalExec) {

@@ -13972,6 +13972,12 @@ _mesa_glthread_execute_list(struct gl_context *ctx, GLuint list)
          case OPCODE_ENABLE:
             _mesa_glthread_Enable(ctx, n[1].e);
             break;
+         case OPCODE_DEPTH_FUNC:
+            _mesa_glthread_DepthFunc(ctx, n[1].e);
+            break;
+         case OPCODE_DEPTH_MASK:
+            _mesa_glthread_DepthMask(ctx, n[1].b);
+            break;
          case OPCODE_LIST_BASE:
             _mesa_glthread_ListBase(ctx, n[1].ui);
             break;
@@ -14030,6 +14036,8 @@ _mesa_glthread_should_execute_list(struct gl_context *ctx,
       case OPCODE_CALL_LISTS:
       case OPCODE_DISABLE:
       case OPCODE_ENABLE:
+      case OPCODE_DEPTH_FUNC:
+      case OPCODE_DEPTH_MASK:
       case OPCODE_LIST_BASE:
       case OPCODE_MATRIX_MODE:
       case OPCODE_POP_ATTRIB:

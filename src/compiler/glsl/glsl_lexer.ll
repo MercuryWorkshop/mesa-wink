@@ -718,8 +718,8 @@ template	KEYWORD(110, 100, 0, 0, TEMPLATE);
 this		KEYWORD(110, 100, 0, 0, THIS);
 packed		KEYWORD_WITH_ALT(110, 100, 140, 300, yyextra->ARB_uniform_buffer_object_enable, PACKED_TOK);
 goto		KEYWORD(110, 100, 0, 0, GOTO);
-switch		KEYWORD(110, 100, 130, 300, SWITCH);
-default		KEYWORD(110, 100, 130, 300, DEFAULT);
+switch		KEYWORD_WITH_ALT(110, 100, 130, 300, yyextra->compat_130, SWITCH);
+default		KEYWORD_WITH_ALT(110, 100, 130, 300, yyextra->compat_130, DEFAULT);
 inline		KEYWORD(110, 100, 0, 0, INLINE_TOK);
 noinline	KEYWORD(110, 100, 0, 0, NOINLINE);
 public		KEYWORD(110, 100, 0, 0, PUBLIC_TOK);
@@ -771,7 +771,7 @@ highp		KEYWORD(120, 100, 130, 100, HIGHP);
 precision	KEYWORD(120, 100, 130, 100, PRECISION);
 
     /* Additional reserved words in GLSL 1.30. */
-case		KEYWORD(130, 300, 130, 300, CASE);
+case		KEYWORD_WITH_ALT(130, 300, 130, 300, yyextra->compat_130, CASE);
 common		KEYWORD(130, 300, 0, 0, COMMON);
 partition	KEYWORD(130, 300, 0, 0, PARTITION);
 active		KEYWORD(130, 300, 0, 0, ACTIVE);
