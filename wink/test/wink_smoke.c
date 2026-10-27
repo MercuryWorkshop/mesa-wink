@@ -103,6 +103,7 @@ note(const char *fmt, ...)
    X(void, BindTexture, (GLenum, GLuint))                                        \
    X(void, ActiveTexture, (GLenum))                                             \
    X(void, TexParameteri, (GLenum, GLenum, GLint))                               \
+   X(void, TexParameterf, (GLenum, GLenum, GLfloat))                            \
    X(void, TexParameterIiv, (GLenum, GLenum, const GLint *))                    \
    X(void, TexParameterIuiv, (GLenum, GLenum, const GLuint *))                  \
    X(void, TexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
@@ -1029,6 +1030,144 @@ integer_texture_offsets(void)
 }
 
 static void
+mip_border_filtering_target(unsigned shape)
+{
+   const GLenum target = shape == 0 ? GL_TEXTURE_2D : shape == 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_3D;
+   const char *vs = "#version 320 es\n"
+      "void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+      "gl_Position=vec4(p*2.0-1.0,0,1);}";
+   const char *samples_2d[] = {"textureLod(tex,p,params.z)",
+      "textureGrad(tex,p,vec2(params.w,0),vec2(0,params.w))", "texture(tex,p)",
+      "textureLodOffset(tex,p,params.z,ivec2(1,0))"};
+   const char *samples_array[] = {"textureLod(tex,q,params.z)",
+      "textureGrad(tex,q,vec2(params.w,0),vec2(0,params.w))", "texture(tex,q)",
+      "textureLodOffset(tex,q,params.z,ivec2(1,0))"};
+   const char *samples_3d[] = {"textureLod(tex,q,params.z)",
+      "textureGrad(tex,q,vec3(params.w,0,0),vec3(0,params.w,0))", "texture(tex,q)",
+      "textureLodOffset(tex,q,params.z,ivec3(1,0,0))"};
+   const char **samples = shape == 0 ? samples_2d : shape == 1 ? samples_array : samples_3d;
+   const struct { float x,y,lod,min_lod,max_lod; unsigned r,g,b,a; } cases[] = {
+      {0.125f,0.5f,0.5f,0,2,128,96,0,223},
+      {0.125f,0.5f,1.5f,0,2,0,96,80,175},
+      {-0.125f,0.5f,0.5f,0,2,0,32,0,32},
+      {0.125f,0.125f,0.5f,0,2,128,72,0,199},
+      {0.125f,0.5f,0,0.25f,2,191,48,0,239},
+      {0.125f,0.5f,2,0,1.25f,0,143,40,183},
+      {1e20f,0.5f,0.5f,0,2,0,0,0,0},
+      {-1e20f,0.5f,0.5f,0,2,0,0,0,0},
+   };
+   GLuint vao, texture;
+   p_glGenVertexArrays(1, &vao); p_glBindVertexArray(vao);
+   p_glGenTextures(1, &texture); p_glActiveTexture(GL_TEXTURE0);
+   p_glBindTexture(target, texture);
+   p_glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+   p_glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   p_glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+   p_glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+   p_glTexParameteri(target, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_BORDER);
+   for (unsigned level = 0; level < 3; ++level) {
+      const unsigned size = 4 >> level;
+      const unsigned depth = shape == 0 ? 1 : shape == 1 ? 2 : size;
+      uint8_t pixels[4*4*4*4];
+      for (unsigned p = 0; p < size*size*depth; ++p) {
+         for (unsigned c = 0; c < 3; ++c)
+            pixels[4*p+c] = c == level && !(shape == 1 && p < size*size) ? 255 : 0;
+         pixels[4*p+3] = 255;
+      }
+      if (shape == 0)
+         p_glTexImage2D(target, level, GL_RGBA8, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+      else
+         p_glTexImage3D(target, level, GL_RGBA8, size, size, depth, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+   }
+   for (unsigned mode = 0; mode < 4; ++mode) {
+      char fs[650];
+      snprintf(fs, sizeof(fs), "#version 320 es\nprecision highp float;"
+         "uniform highp sampler%s tex; uniform vec4 params; uniform vec4 extra; out vec4 color;"
+         "void main(){vec2 p=params.xy+(gl_FragCoord.xy-vec2(32.5,24.5))*params.w;"
+         "vec3 q=vec3(p,extra.x); color=%s;}",
+         shape == 0 ? "2D" : shape == 1 ? "2DArray" : "3D", samples[mode]);
+      GLuint prog = link_program(vs, fs, "mip border filtering");
+      p_glUseProgram(prog);
+      p_glUniform1i(p_glGetUniformLocation(prog, "tex"), 0);
+      GLint params = p_glGetUniformLocation(prog, "params");
+      GLint extra = p_glGetUniformLocation(prog, "extra");
+      p_glUniform4f(extra, shape == 1 ? 2.0f : 0.5f, 0, 0, 0);
+      for (unsigned c = 0; c < (mode == 3 ? 1u : sizeof(cases)/sizeof(cases[0])); ++c) {
+         p_glTexParameterf(target, GL_TEXTURE_MIN_LOD, cases[c].min_lod);
+         p_glTexParameterf(target, GL_TEXTURE_MAX_LOD, cases[c].max_lod);
+         p_glUniform4f(params, mode == 3 ? -0.125f : cases[c].x, cases[c].y,
+                       cases[c].lod, exp2f(cases[c].lod)/4);
+         p_glDrawArrays(GL_TRIANGLES, 0, 3);
+         uint8_t pixel[4]; read_center(pixel, W, H);
+         const unsigned r = mode == 3 ? 128 : cases[c].r;
+         const unsigned g = mode == 3 ? 128 : cases[c].g;
+         const unsigned a = mode == 3 ? 255 : cases[c].a;
+         CHECK(near(pixel, r, g, cases[c].b) && abs((int)pixel[3]-(int)a) <= 2,
+               "mip border shape=%u mode=%u case=%u: %u,%u,%u,%u", shape, mode, c,
+               pixel[0], pixel[1], pixel[2], pixel[3]);
+      }
+      if (mode == 0) {
+         p_glTexParameterf(target, GL_TEXTURE_MIN_LOD, 0);
+         p_glTexParameterf(target, GL_TEXTURE_MAX_LOD, 2);
+         p_glUniform4f(params, 0.5f, 0.5f, 2, 0);
+         for (unsigned last = 1; last <= 2; ++last) {
+            p_glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, last);
+            p_glDrawArrays(GL_TRIANGLES, 0, 3);
+            uint8_t pixel[4]; read_center(pixel, W, H);
+            CHECK(near(pixel, 0, last == 1 ? 255 : 0, last == 2 ? 255 : 0),
+                  "mip border changed view range last=%u: %u,%u,%u,%u",
+                  last, pixel[0], pixel[1], pixel[2], pixel[3]);
+         }
+      }
+      if (shape == 2) {
+         p_glTexParameterf(target, GL_TEXTURE_MIN_LOD, 0);
+         p_glTexParameterf(target, GL_TEXTURE_MAX_LOD, 2);
+         p_glUniform4f(extra, 0.125f, 0, 0, 0);
+         p_glUniform4f(params, 0.5f, 0.5f, 0.5f, exp2f(0.5f)/4);
+         p_glDrawArrays(GL_TRIANGLES, 0, 3);
+         uint8_t pixel[4]; read_center(pixel, W, H);
+         /* Offset mode also crosses the x edge of mip one, halving its
+          * contribution before interpolation with the z border footprint. */
+         CHECK(near(pixel, 128, mode == 3 ? 48 : 96, 0) &&
+               abs((int)pixel[3]-(mode == 3 ? 175 : 223)) <= 2,
+               "mip border third axis mode=%u: %u,%u,%u,%u", mode,
+               pixel[0], pixel[1], pixel[2], pixel[3]);
+      }
+      if (mode < 3) {
+         p_glUniform4f(extra, shape == 1 ? 2.0f : 0.5f, 0, 0, 0);
+         p_glTexParameterf(target, GL_TEXTURE_MIN_LOD, 0);
+         p_glTexParameterf(target, GL_TEXTURE_MAX_LOD, 2);
+         for (unsigned filter = 0; filter < 2; ++filter) {
+            p_glTexParameteri(target, GL_TEXTURE_MIN_FILTER,
+               filter ? GL_LINEAR_MIPMAP_NEAREST : GL_NEAREST_MIPMAP_LINEAR);
+            p_glTexParameteri(target, GL_TEXTURE_MAG_FILTER, filter ? GL_LINEAR : GL_NEAREST);
+            const float lod = filter ? 0.75f : 0.5f;
+            p_glUniform4f(params, 0.125f, 0.5f, lod, exp2f(lod)/4);
+            p_glDrawArrays(GL_TRIANGLES, 0, 3);
+            uint8_t pixel[4]; read_center(pixel, W, H);
+            CHECK(near(pixel, filter ? 0 : 128, filter ? 191 : 128, 0) &&
+                  abs((int)pixel[3]-(filter ? 191 : 255)) <= 2,
+                  "mip border shape=%u mode=%u filter=%u: %u,%u,%u,%u",
+                  shape, mode, filter, pixel[0], pixel[1], pixel[2], pixel[3]);
+         }
+         p_glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+         p_glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      }
+      p_glUseProgram(0); p_glDeleteProgram(prog);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "mip border context failed");
+   p_glDeleteTextures(1, &texture);
+   p_glBindVertexArray(0); p_glDeleteVertexArrays(1, &vao);
+}
+
+static void
+mip_border_filtering(void)
+{
+   for (unsigned shape = 0; shape < 3; ++shape)
+      mip_border_filtering_target(shape);
+}
+
+static void
 texture_query_variants(void)
 {
    const char *vs = "#version 320 es\nprecision highp float; precision highp int;"
@@ -1878,6 +2017,7 @@ exercise(const char *label, int api, wink_surface *surface)
       integer_cube_lod();
       integer_texture_offsets();
       texture_query_variants();
+      mip_border_filtering();
       framebuffer_fetch();
       external_image(ctx, surface);
    }

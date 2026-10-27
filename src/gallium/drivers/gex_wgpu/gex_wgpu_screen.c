@@ -8116,6 +8116,133 @@ gex_wgpu_swizzle_channel(nir_builder *b, nir_def *value, unsigned swizzle)
    return NULL;
 }
 
+/* Filter each mip footprint before interpolating levels. Scaling a clamped
+ * hardware sample by a base-level border weight is incorrect at other levels,
+ * and a sampler LOD clamp would also prevent sampling the two exact levels. */
+static nir_def *
+gex_wgpu_mip_border_sample(nir_builder *b, nir_tex_instr *tex,
+                           const struct gex_wgpu_border_lowering *lower,
+                           nir_def *border, unsigned spatial)
+{
+   const int lod_src = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   const int texture_src = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   if (tex->op != nir_texop_txl || lod_src < 0 || texture_src < 0)
+      return NULL;
+   nir_def *coord = tex->src[coord_src].src.ssa;
+   nir_def *texture = tex->src[texture_src].src.ssa;
+   /* Keep the level count dynamic: variants are shared by views with the
+    * same sampler state, including views exposing different mip ranges. */
+   nir_tex_instr *levels = nir_tex_instr_create(b->shader, 1);
+   levels->op = nir_texop_query_levels;
+   levels->sampler_dim = tex->sampler_dim;
+   levels->is_array = tex->is_array;
+   levels->dest_type = nir_type_int32;
+   levels->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture);
+   nir_def_init(&levels->instr, &levels->def, 1, 32);
+   nir_builder_instr_insert(b, &levels->instr);
+   nir_def *last_level = nir_iadd_imm(b, &levels->def, -1);
+   nir_def *lod = tex->src[lod_src].src.ssa;
+   lod = nir_fmin(b, nir_fmax(b, lod, nir_imm_float(b, lower->integer_min_lod)),
+                    nir_imm_float(b, lower->integer_max_lod));
+   lod = nir_fmin(b, nir_fmax(b, lod, nir_imm_float(b, 0.0f)),
+                    nir_i2f32(b, last_level));
+   const bool mip_linear = lower->integer_mip_filter == PIPE_TEX_MIPFILTER_LINEAR;
+   nir_def *level0 = nir_f2i32(b, nir_ffloor(b, mip_linear ? lod : nir_fadd_imm(b, lod, 0.5f)));
+   nir_def *level_weight = nir_ffract(b, lod);
+   nir_def *colors[2];
+   for (unsigned m = 0; m < (mip_linear ? 2u : 1u); ++m) {
+      nir_def *level = m ? nir_imin(b, nir_iadd_imm(b, level0, 1),
+                                      last_level) : level0;
+      nir_tex_instr *size = nir_tex_instr_create(b->shader, 2);
+      size->op = nir_texop_txs;
+      size->sampler_dim = tex->sampler_dim;
+      size->is_array = tex->is_array;
+      size->dest_type = nir_type_int32;
+      size->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture);
+      size->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, level);
+      nir_def_init(&size->instr, &size->def, spatial + tex->is_array, 32);
+      nir_builder_instr_insert(b, &size->instr);
+      nir_def *base[3], *fraction[3];
+      for (unsigned axis = 0; axis < spatial; ++axis) {
+         const unsigned wrap = axis == 0 ? lower->integer_wrap_s
+                               : axis == 1 ? lower->integer_wrap_t : lower->integer_wrap_r;
+         nir_def *component = nir_channel(b, coord, axis);
+         /* Bound the conversion to integer texel indices. Far border
+          * coordinates remain entirely outside, and periodic coordinates
+          * retain their phase without overflowing the signed conversion. */
+         if (wrap == PIPE_TEX_WRAP_REPEAT)
+            component = nir_ffract(b, component);
+         else if (wrap == PIPE_TEX_WRAP_MIRROR_REPEAT)
+            component = nir_fmul_imm(b, nir_ffract(b, nir_fmul_imm(b, component, 0.5f)), 2);
+         else
+            component = nir_fmin(b, nir_fmax(b, component,
+               nir_imm_float(b, wrap == PIPE_TEX_WRAP_CLAMP_TO_BORDER ? -1 : 0)),
+               nir_imm_float(b, wrap == PIPE_TEX_WRAP_CLAMP_TO_BORDER ? 2 : 1));
+         nir_def *p = nir_fmul(b, component,
+                                 nir_i2f32(b, nir_channel(b, &size->def, axis)));
+         if (lower->linear)
+            p = nir_fadd_imm(b, p, -0.5f);
+         fraction[axis] = nir_ffract(b, p);
+         base[axis] = nir_f2i32(b, nir_ffloor(b, p));
+         if (offset_src >= 0)
+            base[axis] = nir_iadd(b, base[axis],
+                                    nir_channel(b, tex->src[offset_src].src.ssa, axis));
+      }
+      nir_def *color = nir_imm_vec4(b, 0, 0, 0, 0);
+      for (unsigned tap = 0; tap < (lower->linear ? (1u << spatial) : 1u); ++tap) {
+         nir_def *indices[4], *inside = nir_imm_true(b), *weight = nir_imm_float(b, 1);
+         for (unsigned axis = 0; axis < spatial; ++axis) {
+            const unsigned wrap = axis == 0 ? lower->integer_wrap_s
+                                  : axis == 1 ? lower->integer_wrap_t : lower->integer_wrap_r;
+            nir_def *dimension = nir_channel(b, &size->def, axis);
+            const bool upper = (tap >> axis) & 1;
+            nir_def *index = nir_iadd_imm(b, base[axis], upper);
+            if (lower->linear)
+               weight = nir_fmul(b, weight, upper ? fraction[axis]
+                  : nir_fsub(b, nir_imm_float(b, 1), fraction[axis]));
+            if (wrap == PIPE_TEX_WRAP_CLAMP_TO_BORDER)
+               inside = nir_iand(b, inside, nir_iand(b, nir_ige_imm(b, index, 0),
+                                                       nir_ilt(b, index, dimension)));
+            if (wrap == PIPE_TEX_WRAP_REPEAT) {
+               index = nir_imod(b, index, dimension);
+            } else if (wrap == PIPE_TEX_WRAP_MIRROR_REPEAT) {
+               nir_def *period = nir_imul_imm(b, dimension, 2);
+               index = nir_imod(b, index, period);
+               index = nir_imin(b, index, nir_isub(b, nir_iadd_imm(b, period, -1), index));
+            } else {
+               index = nir_imin(b, nir_imax(b, index, nir_imm_int(b, 0)),
+                                   nir_iadd_imm(b, dimension, -1));
+            }
+            indices[axis] = index;
+         }
+         if (tex->is_array) {
+            nir_def *layer = nir_f2i32(b, nir_ffloor(b,
+               nir_fadd_imm(b, nir_channel(b, coord, spatial), 0.5f)));
+            indices[spatial] = nir_imin(b, nir_imax(b, layer, nir_imm_int(b, 0)),
+               nir_iadd_imm(b, nir_channel(b, &size->def, spatial), -1));
+         }
+         nir_tex_instr *fetch = nir_tex_instr_create(b->shader, 3);
+         fetch->op = nir_texop_txf;
+         fetch->sampler_dim = tex->sampler_dim;
+         fetch->is_array = tex->is_array;
+         fetch->dest_type = nir_type_float32;
+         fetch->coord_components = spatial + tex->is_array;
+         fetch->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture);
+         fetch->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, level);
+         fetch->src[2] = nir_tex_src_for_ssa(nir_tex_src_coord,
+                                           nir_vec(b, indices, fetch->coord_components));
+         nir_def_init(&fetch->instr, &fetch->def, 4, 32);
+         fetch->instr.pass_flags = GEX_WGPU_TEX_PASS_LOWERED;
+         nir_builder_instr_insert(b, &fetch->instr);
+         color = nir_fadd(b, color, nir_fmul(b, nir_bcsel(b, inside, &fetch->def, border), weight));
+      }
+      colors[m] = color;
+   }
+   return mip_linear ? nir_flrp(b, colors[0], colors[1], level_weight) : colors[0];
+}
+
 static bool
 gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
                                     void *data)
@@ -8244,7 +8371,13 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
    const bool bordered = lower->s || lower->t ||
                          (spatial > 2 && lower->r);
    nir_def *result = &tex->def;
-   if (bordered && lower->linear) {
+   if (bordered && !tex->is_shadow && lower->integer_mip_filter != PIPE_TEX_MIPFILTER_NONE) {
+      result = gex_wgpu_mip_border_sample(b, tex, lower, border, spatial);
+      if (!result) {
+         gex_tex_lower_fail(table, "a mipmapped border lookup without a resolved LOD");
+         return false;
+      }
+   } else if (bordered && lower->linear) {
       const int texture_index =
          nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
       if (texture_index < 0)
@@ -9453,9 +9586,9 @@ gex_wgpu_lower_mirror_clamp_instr(nir_builder *b, nir_instr *instr, void *data)
  * else fails the whole lowering, so `textureGrad`/`textureGradOffset` on a
  * usampler/isampler took eight KHR-GL33.texture_swizzle smoke cases with it.
  * An integer texture is never filtered, so the gradient only ever chooses a
- * mip level -- exactly what nir_lower_tex's txd lowering computes. Float
- * textureGrad is left alone: the nearest-border pass already handles it, and
- * lowering it would change working shaders. */
+ * mip level -- exactly what nir_lower_tex's txd lowering computes. This first
+ * pass selects integers only; state-dependent color border lookups resolve
+ * their gradients later. */
 static bool
 gex_wgpu_lower_integer_txd(const nir_tex_instr *tex, const void *data)
 {
@@ -9464,18 +9597,37 @@ gex_wgpu_lower_integer_txd(const nir_tex_instr *tex, const void *data)
    return base == nir_type_uint || base == nir_type_int;
 }
 
+static bool
+gex_wgpu_mip_border_tex(const nir_tex_instr *tex, const void *data)
+{
+   if (tex->is_shadow || tex->dest_type != nir_type_float32 ||
+       (tex->sampler_dim != GLSL_SAMPLER_DIM_2D && tex->sampler_dim != GLSL_SAMPLER_DIM_3D))
+      return false;
+   const int source = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   if (source < 0)
+      return false;
+   const nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(tex->src[source].src));
+   const struct gex_wgpu_texture_lowering *table = data;
+   if (!var || var->data.driver_location >= GEX_WGPU_MAX_SAMPLERS ||
+       !table->active[var->data.driver_location])
+      return false;
+   const struct gex_wgpu_border_lowering *lower = &table->slots[var->data.driver_location];
+   return (lower->s || lower->t || lower->r) && lower->integer_mip_filter != PIPE_TEX_MIPFILTER_NONE;
+}
+
 /* Resolve implicit derivatives before cube directions become face UVs.
  * Mesa's lower_txd computes LOD in the original sampler's coordinate space,
- * including the cube projection. A bias scales the gradients by exp2(bias). */
+ * including the cube projection. A bias scales the gradients by exp2(bias).
+ * With a lowering table, resolve color border lookups for per-mip filtering. */
 static bool
-gex_wgpu_integer_sample_gradients(nir_builder *b, nir_instr *instr, void *data)
+gex_wgpu_sample_gradients(nir_builder *b, nir_instr *instr, void *data)
 {
-   (void)data;
    if (instr->type != nir_instr_type_tex || b->shader->info.stage != MESA_SHADER_FRAGMENT)
       return false;
    nir_tex_instr *tex = nir_instr_as_tex(instr);
    const nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
-   if ((base != nir_type_uint && base != nir_type_int) ||
+   if ((data ? !gex_wgpu_mip_border_tex(tex, data) :
+                (base != nir_type_uint && base != nir_type_int)) ||
        (tex->op != nir_texop_tex && tex->op != nir_texop_txb))
       return false;
    const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
@@ -10012,7 +10164,7 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
     * explicit gradients already describe that space in GLSL. */
    NIR_PASS(progress, nir, nir_lower_tex, &projector_options);
    NIR_PASS(progress, nir, nir_shader_instructions_pass,
-            gex_wgpu_integer_sample_gradients, nir_metadata_control_flow, NULL);
+            gex_wgpu_sample_gradients, nir_metadata_control_flow, NULL);
    NIR_PASS(progress, nir, nir_lower_tex, &rect_options);
    bool has_integer_cube = false;
    for (unsigned i = 0; i < texture_count; ++i) {
@@ -10150,6 +10302,15 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
    progress |= nir_shader_instructions_pass(
       nir, gex_wgpu_lower_sampler_lod_bias_instr,
       nir_metadata_control_flow | nir_metadata_loop_analysis, &table);
+   /* State bias is already part of implicit/bias lookups. Explicit gradients
+    * bypass it. Resolve their LOD before filtering border texels per mip. */
+   NIR_PASS(progress, nir, nir_shader_instructions_pass,
+            gex_wgpu_sample_gradients, nir_metadata_control_flow, &table);
+   const nir_lower_tex_options border_options = {
+      .lower_txd_cb = gex_wgpu_mip_border_tex,
+      .lower_txd_data = &table,
+   };
+   NIR_PASS(progress, nir, nir_lower_tex, &border_options);
    progress |= nir_shader_instructions_pass(
       nir, gex_wgpu_lower_mirror_clamp_instr,
       nir_metadata_control_flow | nir_metadata_loop_analysis, &table);
@@ -21912,34 +22073,12 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
    if (comparison && (state->compare_func < PIPE_FUNC_NEVER ||
                       state->compare_func > PIPE_FUNC_ALWAYS))
       return gex_wgpu_sampler_refused(state, "compare function");
-   /* What the *lowering* needs, not more.
-    *
-    * GL_CLAMP_TO_BORDER is served by a shader pass that tests the coordinate
-    * and substitutes the border colour, so it needs one filter for both
-    * directions and no mip filtering -- with MIPFILTER_NONE only the base
-    * level is ever sampled and the lod *range* is irrelevant, which is where
-    * this was over-strict: it also demanded min_lod == max_lod == 0, and
-    * st/mesa gives a texture with GL_TEXTURE_MAX_LEVEL of 1 a non-zero range
-    * whatever the filter. So an ordinary NEAREST clamp-to-border sample of a
-    * two-level texture had its sampler *refused* -- and a refused sampler is
-    * served by the default one, which clamps to edge, so the picture was
-    * quietly wrong with nothing in the log. Four of
-    * gl44-sampling-matrix-probe's cases were exactly that, invisible until a
-    * GL 4.4 context let the probe run. */
-   /* Mip-NEAREST is allowed here because the shader lowering models it --
-    * gex_wgpu_border_lowering carries integer_mip_filter and integer_levels,
-    * computes the level and clamps it, and refuses only MIPFILTER_LINEAR.
-    * Refusing it here was stricter than the pass that would have served it,
-    * and a refusal is not a neutral outcome: create_sampler_state returns
-    * NULL, cso binds NULL, and every consumer then reads the slot as
-    * texelFetch-only -- so the border lowering that exists for exactly this
-    * case never runs. KHR-GL45.gpu_shader5's four texture_gather_offset clamp
-    * cases died that way: their reference sampler is CLAMP_TO_BORDER with
-    * mip-nearest, the gather on it was left as a sampled integer image, and
-    * Tint rejected the whole capture shader. */
+   /* Border filtering needs matching spatial filters. Color lookups can
+    * interpolate mip footprints in software; comparison and integer samplers
+    * retain their previous mip-filter restrictions. */
    if (border && (state->min_img_filter != state->mag_img_filter ||
-                  (state->min_mip_filter != PIPE_TEX_MIPFILTER_NONE &&
-                   state->min_mip_filter != PIPE_TEX_MIPFILTER_NEAREST) ||
+                  (state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR &&
+                   (comparison || state->border_color_is_integer)) ||
                   (!state->border_color_is_integer &&
                    (!isfinite(state->border_color.f[0]) ||
                     !isfinite(state->border_color.f[1]) ||
@@ -21947,7 +22086,7 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
                     !isfinite(state->border_color.f[3])))))
       return gex_wgpu_sampler_refused(state,
                                       "clamp-to-border with mismatched "
-                                      "filters, linear mip filtering or a "
+                                      "filters, unsupported comparison/integer mip filtering or a "
                                       "non-finite border colour");
    struct pipe_sampler_state supported = {0};
    supported.wrap_s = state->wrap_s;
