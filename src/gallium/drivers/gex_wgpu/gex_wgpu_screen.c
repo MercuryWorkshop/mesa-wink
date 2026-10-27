@@ -7006,6 +7006,17 @@ static void gex_wgpu_rt_scratch_copy(struct gex_wgpu_context *ctx,
 static void gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx,
                                           const char *why);
 static void gex_wgpu_end_pass(struct gex_wgpu_context *ctx);
+/* For the timing report: what closed each render pass (a write staged into
+ * the batch, a clear, a submit, another framebuffer, a counting or serial
+ * draw), and the writes staged by buffer size and binding. */
+enum { GEX_WGPU_PASS_END_STAGED, GEX_WGPU_PASS_END_CLEAR,
+       GEX_WGPU_PASS_END_SUBMIT, GEX_WGPU_PASS_END_TARGETS,
+       GEX_WGPU_PASS_END_ORDERED, GEX_WGPU_PASS_END_COUNT };
+static uint64_t gex_wgpu_pass_ends[GEX_WGPU_PASS_END_COUNT + 1];
+static uint64_t gex_wgpu_staged_by_size[4], gex_wgpu_staged_by_bind[4],
+   gex_wgpu_staged_bytes, gex_wgpu_norename_big_rename, gex_wgpu_norename_big_carry;
+#define GEX_WGPU_PASS_END(ctx, why) \
+   do { if ((ctx)->pending_pass) ++gex_wgpu_pass_ends[why]; } while (0)
 
 /* Packed shader images -- see GEX_WGPU_PACKED_IMAGE_FIRST_BINDING. Declared
  * here because the compute dispatch builds its bind group well above where
@@ -20788,7 +20799,16 @@ gex_wgpu_subdata_in_batch(struct gex_wgpu_context *ctx,
    }
    const uint32_t at = ctx->subdata_stage_offset;
    ctx->subdata_stage_offset = at + size;
+   GEX_WGPU_PASS_END(ctx, GEX_WGPU_PASS_END_STAGED);
    gex_wgpu_end_pass(ctx);
+   {
+      const unsigned w = resource->width0;
+      ++gex_wgpu_staged_by_size[w <= (64u << 10) ? 0 : w <= (1u << 20) ? 1 : w <= (4u << 20) ? 2 : 3];
+      ++gex_wgpu_staged_by_bind[(resource->bind & PIPE_BIND_VERTEX_BUFFER) ? 0 :
+                                (resource->bind & PIPE_BIND_INDEX_BUFFER) ? 1 :
+                                (resource->bind & PIPE_BIND_CONSTANT_BUFFER) ? 2 : 3];
+      gex_wgpu_staged_bytes += size;
+   }
    wgpuQueueWriteBuffer(screen->queue, ctx->subdata_stage, at, data, size);
    wgpuCommandEncoderCopyBufferToBuffer(ctx->pending_encoder,
                                         ctx->subdata_stage, at, gex->buffer,
@@ -20963,8 +20983,10 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIND);
    if (gex->gpu_written || gex->persistent_usage)
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_GPU);
-   if (gex->gpu_size > GEX_WGPU_RENAME_MAX_BYTES)
+   if (gex->gpu_size > GEX_WGPU_RENAME_MAX_BYTES) {
+      ++gex_wgpu_norename_big_rename;
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIG);
+   }
    /* What the new buffer is written with: the shadow, updated first; the
     * data when it is all of the buffer; or the old contents carried over and
     * the data on top. Whole words every way. */
@@ -20982,8 +21004,10 @@ gex_wgpu_subdata_rename(struct gex_wgpu_context *ctx,
        words > (uint64_t)size * GEX_WGPU_RENAME_REWRITE_RATIO)
       return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_REWRITE);
    if (carry) {
-      if (gex->gpu_size > GEX_WGPU_RENAME_CARRY_MAX_BYTES)
+      if (gex->gpu_size > GEX_WGPU_RENAME_CARRY_MAX_BYTES) {
+         ++gex_wgpu_norename_big_carry;
          return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_BIG);
+      }
       if (gex->staged_by)
          return gex_wgpu_refuse_rename(GEX_WGPU_NORENAME_STAGED);
       if ((offset | size) & 3u)
@@ -24687,6 +24711,7 @@ gex_wgpu_clear_encoder(struct gex_wgpu_context *ctx,
    *batched = gex_wgpu_batched_clears();
    if (!*batched)
       return gex_wgpu_local_encoder(screen);
+   GEX_WGPU_PASS_END(ctx, GEX_WGPU_PASS_END_CLEAR);
    gex_wgpu_end_pass(ctx);
    gex_wgpu_pending_encoder(ctx);
    gex_wgpu_batch_touch(ctx, resource);
@@ -40533,6 +40558,37 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                   wib[1] = dirk_index_bounds_indices;
                   wib[2] = (uint64_t)dirk_index_bounds_ns;
                }
+               {
+                  static uint64_t wpe[GEX_WGPU_PASS_END_COUNT + 1], wsz[4], wbd[4], wsb, wbig[2];
+                  uint64_t named = 0;
+                  for (unsigned i = 0; i < GEX_WGPU_PASS_END_COUNT; ++i)
+                     named += gex_wgpu_pass_ends[i] - wpe[i];
+                  const uint64_t all = gex_wgpu_pass_ends[GEX_WGPU_PASS_END_COUNT] -
+                                       wpe[GEX_WGPU_PASS_END_COUNT];
+                  fprintf(stderr,
+                          "gex-wgpu: passes per frame by what closed them -- staged write %.1f, "
+                          "clear %.1f, submit %.1f, other framebuffer %.1f, counting or "
+                          "serial %.1f, else %.1f; staged writes by buffer size: to 64 KiB "
+                          "%.1f, to 1 MiB %.1f, to 4 MiB %.1f, past %.1f; by binding: vertex "
+                          "%.1f, index %.1f, constant %.1f, other %.1f; %.1f KiB staged; "
+                          "not renamed as big: past 4 MiB %.1f, carry past 1 MiB %.1f\n",
+                          (gex_wgpu_pass_ends[0] - wpe[0]) / f, (gex_wgpu_pass_ends[1] - wpe[1]) / f,
+                          (gex_wgpu_pass_ends[2] - wpe[2]) / f, (gex_wgpu_pass_ends[3] - wpe[3]) / f,
+                          (gex_wgpu_pass_ends[4] - wpe[4]) / f, (all - named) / f,
+                          (gex_wgpu_staged_by_size[0] - wsz[0]) / f, (gex_wgpu_staged_by_size[1] - wsz[1]) / f,
+                          (gex_wgpu_staged_by_size[2] - wsz[2]) / f, (gex_wgpu_staged_by_size[3] - wsz[3]) / f,
+                          (gex_wgpu_staged_by_bind[0] - wbd[0]) / f, (gex_wgpu_staged_by_bind[1] - wbd[1]) / f,
+                          (gex_wgpu_staged_by_bind[2] - wbd[2]) / f, (gex_wgpu_staged_by_bind[3] - wbd[3]) / f,
+                          (gex_wgpu_staged_bytes - wsb) / f / 1024,
+                          (gex_wgpu_norename_big_rename - wbig[0]) / f,
+                          (gex_wgpu_norename_big_carry - wbig[1]) / f);
+                  memcpy(wpe, gex_wgpu_pass_ends, sizeof(wpe));
+                  memcpy(wsz, gex_wgpu_staged_by_size, sizeof(wsz));
+                  memcpy(wbd, gex_wgpu_staged_by_bind, sizeof(wbd));
+                  wsb = gex_wgpu_staged_bytes;
+                  wbig[0] = gex_wgpu_norename_big_rename;
+                  wbig[1] = gex_wgpu_norename_big_carry;
+               }
             }
             was_rn[0] = gex_wgpu_renamed;
             was_rn[1] = gex_wgpu_renamed_carried;
@@ -41648,6 +41704,7 @@ gex_wgpu_end_pass(struct gex_wgpu_context *ctx)
 {
    if (!ctx->pending_pass)
       return;
+   ++gex_wgpu_pass_ends[GEX_WGPU_PASS_END_COUNT];
    wgpuRenderPassEncoderEnd(ctx->pending_pass);
    wgpuRenderPassEncoderRelease(ctx->pending_pass);
    ctx->pending_pass = NULL;
@@ -41906,6 +41963,7 @@ gex_wgpu_track_persistent_map(struct gex_wgpu_context *ctx,
 static void
 gex_wgpu_submit_pending_named(struct gex_wgpu_context *ctx, const char *why)
 {
+   GEX_WGPU_PASS_END(ctx, GEX_WGPU_PASS_END_SUBMIT);
    gex_wgpu_end_pass(ctx);
    /* Before the early return, not after it. Uniforms are staged into a ring
     * and written to the GPU in one go here, and a compute pass -- a transform
@@ -49716,6 +49774,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       const uint32_t ordered_primitive = serial_fetch ? ordered % ordered_primitives : 0;
       const uint32_t ordered_instance = serial_fetch ? ordered / ordered_primitives : 0;
       if (ordered) {
+         GEX_WGPU_PASS_END(ctx, GEX_WGPU_PASS_END_ORDERED);
          gex_wgpu_end_pass(ctx);
          for (unsigned rt = 0; rt < 8; ++rt)
             if (dst_mask & BITFIELD_BIT(rt))
@@ -49733,6 +49792,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
        * A counting draw never reuses one and never leaves one open, because the
        * occlusion query index belongs to the pass. */
       if (!reuse || serial_fetch) {
+         GEX_WGPU_PASS_END(ctx, serial_fetch ? GEX_WGPU_PASS_END_ORDERED : GEX_WGPU_PASS_END_TARGETS);
          gex_wgpu_end_pass(ctx);
          gex_wgpu_cmd_note("BEGIN-PASS");
          ctx->pending_pass =
@@ -50132,8 +50192,10 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          const int64_t t_end_start = gex_timing ? gex_wgpu_clock() : 0;
          /* Left open for the next draw. Whatever stops recording -- a different
           * framebuffer, a clear, a map, the submit -- closes it. */
-         if (counting)
+         if (counting) {
+            GEX_WGPU_PASS_END(ctx, GEX_WGPU_PASS_END_ORDERED);
             gex_wgpu_end_pass(ctx);
+         }
          if (gex_timing) gex_wgpu_time_end += (gex_wgpu_clock() - t_end_start) * gex_wgpu_timing_every();
       }
    } /* ordered framebuffer-fetch primitives */
