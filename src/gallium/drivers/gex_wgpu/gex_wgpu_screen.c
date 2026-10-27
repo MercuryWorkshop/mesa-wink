@@ -7130,27 +7130,9 @@ enum { GEX_WGPU_PASS_END_STAGED, GEX_WGPU_PASS_END_CLEAR,
 static uint64_t gex_wgpu_pass_ends[GEX_WGPU_PASS_END_COUNT + 1];
 /* Bind group cache misses by what the slot held (gex_wgpu_cached_bind_group). */
 static uint64_t gex_wgpu_bg_miss_why[6];
-/* Bind group cache invalidations by what made them: a sampler view or a
- * sampler state deleted, for the timing report. */
-static uint64_t gex_wgpu_bg_epoch_view, gex_wgpu_bg_epoch_sampler;
-
-/* GEX_WGPU_BG_KEEP (on unless =0): a sampler view or sampler state deleted no longer
- * invalidates the whole bind group cache. Every slot holds a reference to
- * each buffer, view and sampler its key names (gex_wgpu_bg_entries_ref), so
- * a deleted one's handle stays alive, and its address cannot come back for
- * another object, until the slot naming it is evicted. A view that owned a
- * texture of its own (a reinterpreted or decoded copy) still invalidates,
- * since that texture is destroyed with it. */
-static bool
-gex_wgpu_bg_keep_on(void)
-{
-   static int on = -1;
-   if (on < 0) {
-      const char *v = getenv("GEX_WGPU_BG_KEEP");
-      on = !v || *v != '0';
-   }
-   return on != 0;
-}
+/* Bind groups retired because a sampler view that owned a texture of its own
+ * was deleted, for the timing report. */
+static uint64_t gex_wgpu_bg_forgot_view;
 static uint64_t gex_wgpu_staged_by_size[4], gex_wgpu_staged_by_bind[4],
    gex_wgpu_staged_bytes, gex_wgpu_norename_big_rename, gex_wgpu_norename_big_carry;
 #define GEX_WGPU_PASS_END(ctx, why) \
@@ -22923,20 +22905,21 @@ gex_wgpu_sampler_view_destroy(struct pipe_context *pipe,
                               struct pipe_sampler_view *base)
 {
    struct gex_wgpu_sampler_view *view = (struct gex_wgpu_sampler_view *)base;
-   /* The bind groups naming this view are retired, and only those. Bumping
-    * cache_epoch instead threw away every cached group, and st/mesa destroys
-    * views all the time -- a few a frame under Iris -- so every bind group
-    * was created again every frame, each one across the JS boundary in the
-    * browser. A live key cannot match a recycled handle anyway: the cache
-    * holds a reference to each object its keys name (gex_wgpu_bg_entries_ref),
-    * so the address is not handed out again while the entry exists. With
-    * GEX_WGPU_BG_KEEP they stay too, unless the view owned a texture of its
-    * own (see gex_wgpu_bg_keep_on). */
-   if (!gex_wgpu_bg_keep_on() || view->reinterpret || view->decoded ||
-       view->reinterpret_staging) {
+   /* The cached bind groups naming this view stay. Bumping cache_epoch threw
+    * away every cached group, and st/mesa destroys views all the time -- a few
+    * a frame under Iris -- so every bind group was created again every frame,
+    * each one across the JS boundary in the browser. A live key cannot match
+    * a recycled handle: the cache holds a reference to each object its keys
+    * name (gex_wgpu_bg_entries_ref), so the address is not handed out again
+    * while the entry exists, and the group is evicted as any other. Retiring
+    * only the groups naming the view cost Hades through dirk 10% of its frame
+    * rate against keeping them. A view that owned a texture of its own (a
+    * reinterpreted or decoded copy) does retire its groups, since that
+    * texture is destroyed with it. */
+   if (view->reinterpret || view->decoded || view->reinterpret_staging) {
       const void *handles[2] = {view->view, view->array_view};
       gex_wgpu_bg_cache_forget(gex_screen(pipe->screen), handles, 2);
-      ++gex_wgpu_bg_epoch_view;
+      ++gex_wgpu_bg_forgot_view;
    }
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
    GEX_ENTRY_TIMER();
@@ -23290,14 +23273,8 @@ static void
 gex_wgpu_delete_sampler_state(struct pipe_context *pipe, void *state)
 {
    struct gex_wgpu_sampler *sampler = state;
-   /* Only the bind groups naming this sampler, and none with
-    * GEX_WGPU_BG_KEEP; see gex_wgpu_sampler_view_destroy. */
-   if (sampler && !gex_wgpu_bg_keep_on()) {
-      const void *handles[3] = {sampler->sampler, sampler->nonfiltering,
-                                sampler->flipped_comparison};
-      gex_wgpu_bg_cache_forget(gex_screen(pipe->screen), handles, 3);
-      ++gex_wgpu_bg_epoch_sampler;
-   }
+   /* The cached bind groups naming this sampler stay; see
+    * gex_wgpu_sampler_view_destroy. */
    GEX_ENTRY_TIMER();
    (void)pipe;
    if (sampler && sampler->flipped_comparison)
@@ -41584,19 +41561,18 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
             was_bg[0] = sc->bg_cache_hits;
             was_bg[1] = sc->bg_cache_misses;
             {
-               static uint64_t wmw[6], wep[2];
+               static uint64_t wmw[6], wep[1];
                fprintf(stderr,
                        "gex-wgpu: bind group misses per frame by what the cache slot held -- "
                        "nothing %.1f, another layout %.1f; this layout with another buffer "
                        "%.1f, offset or size %.1f, view %.1f, sampler %.1f; "
-                       "whole cache dropped by a sampler view deleted %.1f, a sampler %.1f\n",
+                       "groups retired by a deleted view with its own texture %.1f\n",
                        (gex_wgpu_bg_miss_why[0] - wmw[0]) / f, (gex_wgpu_bg_miss_why[1] - wmw[1]) / f,
                        (gex_wgpu_bg_miss_why[2] - wmw[2]) / f, (gex_wgpu_bg_miss_why[3] - wmw[3]) / f,
                        (gex_wgpu_bg_miss_why[4] - wmw[4]) / f, (gex_wgpu_bg_miss_why[5] - wmw[5]) / f,
-                       (gex_wgpu_bg_epoch_view - wep[0]) / f, (gex_wgpu_bg_epoch_sampler - wep[1]) / f);
+                       (gex_wgpu_bg_forgot_view - wep[0]) / f);
                memcpy(wmw, gex_wgpu_bg_miss_why, sizeof(wmw));
-               wep[0] = gex_wgpu_bg_epoch_view;
-               wep[1] = gex_wgpu_bg_epoch_sampler;
+               wep[0] = gex_wgpu_bg_forgot_view;
             }
 #undef GEX_PER
             was = *m;
