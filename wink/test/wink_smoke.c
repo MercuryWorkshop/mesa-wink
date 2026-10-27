@@ -103,6 +103,7 @@ note(const char *fmt, ...)
    X(void, BindTexture, (GLenum, GLuint))                                        \
    X(void, ActiveTexture, (GLenum))                                             \
    X(void, TexParameteri, (GLenum, GLenum, GLint))                               \
+   X(void, GenerateMipmap, (GLenum))                                             \
    X(void, TexParameterf, (GLenum, GLenum, GLfloat))                            \
    X(void, TexParameterIiv, (GLenum, GLenum, const GLint *))                    \
    X(void, TexParameterIuiv, (GLenum, GLenum, const GLuint *))                  \
@@ -880,6 +881,66 @@ norm16_readback(void)
    p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
    p_glDeleteFramebuffers(1, &fbo);
    p_glDeleteTextures(2, textures);
+}
+
+static void
+mipmap_full_image(void)
+{
+   const struct {
+      unsigned width, height;
+      uint8_t level1[4];
+      int level2;
+   } cases[] = {
+      {5, 3, {50, 150}, 100},
+      {3, 1, {40}, -1},
+      {1, 3, {20}, -1},
+      {4, 4, {30, 110, 70, 150}, 90},
+   };
+   GLuint fbo;
+   p_glGenFramebuffers(1, &fbo);
+   p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+   p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+   p_glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+   p_glActiveTexture(GL_TEXTURE0);
+   for (unsigned c = 0; c < sizeof(cases)/sizeof(cases[0]); ++c) {
+      GLuint texture;
+      p_glGenTextures(1, &texture);
+      p_glBindTexture(GL_TEXTURE_2D, texture);
+      uint8_t pixels[5 * 4 * 4];
+      for (unsigned y = 0; y < cases[c].height; ++y) {
+         for (unsigned x = 0; x < cases[c].width; ++x) {
+            const unsigned i = 4 * (y * cases[c].width + x);
+            pixels[i] = 40 * x + 20 * y;
+            pixels[i+1] = 20; pixels[i+2] = 80; pixels[i+3] = 255;
+         }
+      }
+      p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cases[c].width, cases[c].height,
+                    0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+      p_glGenerateMipmap(GL_TEXTURE_2D);
+      for (unsigned level = 1; level <= (cases[c].level2 < 0 ? 1u : 2u); ++level) {
+         const unsigned count = level == 1
+            ? (cases[c].width > 1 ? cases[c].width / 2 : 1) *
+              (cases[c].height > 1 ? cases[c].height / 2 : 1) : 1;
+         p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                 texture, level);
+         CHECK(p_glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE,
+               "mipmap full image framebuffer case=%u level=%u", c, level);
+         uint8_t result[4 * 4];
+         p_glReadPixels(0, 0, level == 1 && cases[c].width >= 4 ? 2 : 1,
+                        level == 1 && cases[c].height >= 4 ? 2 : 1,
+                        GL_RGBA, GL_UNSIGNED_BYTE, result);
+         for (unsigned i = 0; i < count; ++i) {
+            const int red = level == 1 ? cases[c].level1[i] : cases[c].level2;
+            CHECK(near(result + 4*i, red, 20, 80) && result[4*i+3] == 255,
+                  "mipmap full image case=%u level=%u texel=%u: %u,%u,%u,%u",
+                  c, level, i, result[4*i], result[4*i+1], result[4*i+2], result[4*i+3]);
+         }
+      }
+      p_glDeleteTextures(1, &texture);
+   }
+   p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   p_glDeleteFramebuffers(1, &fbo);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "mipmap full image context failed");
 }
 
 static void
@@ -2075,6 +2136,7 @@ exercise(const char *label, int api, wink_surface *surface)
       layered_pbo_upload();
       helper_invocation();
       independent_samplers();
+      mipmap_full_image();
       integer_cube_lod();
       integer_texture_offsets();
       integer_mip_view_changes();

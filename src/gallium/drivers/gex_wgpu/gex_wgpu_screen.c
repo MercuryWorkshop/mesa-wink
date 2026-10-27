@@ -27622,11 +27622,12 @@ gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
  *
  * Here the chain is recorded into the pending encoder behind whatever the
  * frame has drawn: one small render pass per level and layer, reading the
- * level above with textureLoad and writing the 2x2 average. No submit, and
+ * level above with textureLoad and writing the linear downsample. No submit, and
  * the batch carries on. textureLoad rather than a filtering sampler so that
  * unfilterable float formats are served too; the result is the box filter
- * util_gen_mipmap's linear sampling also amounts to for even sizes (GL leaves
- * the filter to the implementation).
+ * util_gen_mipmap's linear sampling also amounts to for even sizes. Odd sizes
+ * sample at scaled texel centers so the reduction covers the full image,
+ * including its last row and column.
  *
  * Declines -- returning false sends st/mesa to util_gen_mipmap as before --
  * anything but a single-sampled 2D, array or cube colour texture with float
@@ -27651,13 +27652,24 @@ gex_wgpu_mip_pipeline(struct gex_wgpu_screen *screen, WGPUTextureFormat format)
          "}\n"
          "@fragment fn fs(@builtin(position) pos: vec4<f32>)"
          " -> @location(0) vec4<f32> {\n"
-         "  let m = vec2<i32>(textureDimensions(src, 0)) - vec2<i32>(1);\n"
-         "  let d = vec2<i32>(pos.xy) * 2;\n"
+         "  let size = vec2<i32>(textureDimensions(src, 0));\n"
+         "  let m = size - vec2<i32>(1);\n"
+         "  var d = vec2<i32>(pos.xy) * 2;\n"
+         "  var weight = vec2<f32>(0.5);\n"
+         "  let even = (size.x == 1 || (size.x & 1) == 0) &&\n"
+         "             (size.y == 1 || (size.y & 1) == 0);\n"
+         "  if (!even) {\n"
+         "    let into = max(size / vec2<i32>(2), vec2<i32>(1));\n"
+         "    let p = pos.xy / vec2<f32>(into) * vec2<f32>(size) - vec2<f32>(0.5);\n"
+         "    d = vec2<i32>(floor(p));\n"
+         "    weight = fract(p);\n"
+         "  }\n"
          "  let a = textureLoad(src, min(d, m), 0);\n"
          "  let b = textureLoad(src, min(d + vec2<i32>(1, 0), m), 0);\n"
          "  let c = textureLoad(src, min(d + vec2<i32>(0, 1), m), 0);\n"
          "  let e = textureLoad(src, min(d + vec2<i32>(1, 1), m), 0);\n"
-         "  return (a + b + c + e) * 0.25;\n"
+         "  if (even) { return (a + b + c + e) * 0.25; }\n"
+         "  return mix(mix(a, b, weight.x), mix(c, e, weight.x), weight.y);\n"
          "}\n";
       WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
       source.code = (WGPUStringView){wgsl, WGPU_STRLEN};
