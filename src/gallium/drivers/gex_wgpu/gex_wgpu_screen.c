@@ -105,10 +105,13 @@ static struct gex_wgpu_made {
  * copies until the next submit, a map, or a write that does not join (to a
  * buffer whose held range it does not touch, or too big), which sends the
  * held one first; the rest go as they come. GEX_WGPU_COALESCE=2 only counts
- * what would join. Each write to the browser costs a call and a view of the
- * heap: Hades through dirk made about 1,000 a frame. */
+ * what would join, and also what would join across a gap of at most
+ * GEX_WGPU_COALESCE_GAP bytes (a version that filled the gap from a host
+ * copy of the buffer). Each write to the browser costs a call and a view of
+ * the heap: Hades through dirk made about 1,000 a frame. */
 #define GEX_WGPU_COALESCE_SLOTS 16
 #define GEX_WGPU_COALESCE_MAX_BYTES (256u << 10)
+#define GEX_WGPU_COALESCE_GAP 4096u
 struct gex_wgpu_coalesce_slot {
    WGPUBuffer buffer;
    uint64_t lo, hi;
@@ -121,7 +124,7 @@ static struct {
    unsigned next;
    struct gex_wgpu_coalesce_slot slot[GEX_WGPU_COALESCE_SLOTS];
 } gex_wgpu_coalesce;
-static uint64_t gex_wgpu_coalesce_writes, gex_wgpu_coalesce_joined;
+static uint64_t gex_wgpu_coalesce_writes, gex_wgpu_coalesce_joined, gex_wgpu_coalesce_joined_gap;
 
 static void
 gex_wgpu_coalesce_send(struct gex_wgpu_coalesce_slot *s)
@@ -168,8 +171,10 @@ gex_wgpu_queue_write(WGPUQueue queue, WGPUBuffer buffer, uint64_t offset,
    }
    const uint64_t end = offset + size;
    const bool fits = !((offset | size) & 3u) && size <= GEX_WGPU_COALESCE_MAX_BYTES;
-   if (s && fits && offset <= s->hi && end >= s->lo &&
+   const uint64_t gap = held ? 0 : GEX_WGPU_COALESCE_GAP;
+   if (s && fits && offset <= s->hi + gap && end + gap >= s->lo &&
        MAX2(end, s->hi) - MIN2(offset, s->lo) <= GEX_WGPU_COALESCE_MAX_BYTES) {
+      const bool touching = offset <= s->hi && end >= s->lo;
       /* Joins the held range. */
       const uint64_t lo = MIN2(offset, s->lo), hi = MAX2(end, s->hi);
       if (held) {
@@ -194,7 +199,10 @@ gex_wgpu_queue_write(WGPUQueue queue, WGPUBuffer buffer, uint64_t offset,
       }
       s->lo = lo;
       s->hi = hi;
-      ++gex_wgpu_coalesce_joined;
+      if (touching)
+         ++gex_wgpu_coalesce_joined;
+      else
+         ++gex_wgpu_coalesce_joined_gap;
       return;
    }
    /* Does not join: what is held of this buffer goes first, keeping the
@@ -40722,7 +40730,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
             const double f = gex_wgpu_presents > was_presents
                                 ? (double)(gex_wgpu_presents - was_presents) : 1.0;
 #define GEX_PER(field) ((m->field - was.field) / f)
-            static uint64_t was_ver[2], was_rb[2], was_co[2];
+            static uint64_t was_ver[2], was_rb[2], was_co[3];
             static unsigned long was_rn[5], was_not[GEX_WGPU_NORENAME_COUNT];
 #define GEX_NOT(why) ((gex_wgpu_norename[why] - was_not[why]) / f)
             fprintf(stderr,
@@ -40732,7 +40740,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                     "buffers %.1f, textures %.1f, views %.1f, encoders %.1f, "
                     "render passes %.1f; queue: %.1f buffer writes (%.1f KiB), "
                     "%.1f texture writes, %.1f submits (%.1f buffer writes joined "
-                    "another, of %.1f); writes to a buffer the "
+                    "another, %.1f more across a gap of 4 KiB or less, of %.1f); writes to a buffer the "
                     "batch reads: %.1f direct beside its ranges (%.1f overlapped), "
                     "%.1f renamed (%.1f carried; %.0f KiB written, %.0f KiB "
                     "uploaded), %.1f staged, "
@@ -40750,6 +40758,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                     GEX_PER(write_buffers), GEX_PER(write_buffer_bytes) / 1024,
                     GEX_PER(write_textures), GEX_PER(submits),
                     (gex_wgpu_coalesce_joined - was_co[0]) / f,
+                    (gex_wgpu_coalesce_joined_gap - was_co[2]) / f,
                     (gex_wgpu_coalesce_writes - was_co[1]) / f,
                     (gex_wgpu_range_direct - was_rn[3]) / f,
                     (gex_wgpu_range_overlap - was_rn[4]) / f,
@@ -40770,6 +40779,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                     (gex_wgpu_versions_made_bytes - gex_wgpu_versions_freed_bytes) / 1048576.0);
             was_co[0] = gex_wgpu_coalesce_joined;
             was_co[1] = gex_wgpu_coalesce_writes;
+            was_co[2] = gex_wgpu_coalesce_joined_gap;
             was_rb[0] = gex_wgpu_renamed_bytes;
             was_rb[1] = gex_wgpu_renamed_upload_bytes;
             was_ver[0] = gex_wgpu_versions_made;
