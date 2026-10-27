@@ -1189,6 +1189,11 @@ st_AllocTextureImageBuffer(struct gl_context *ctx,
    stObj->needs_validation = true;
 
    compressed_tex_fallback_allocate(st, stImage);
+   if (stObj->pt_externally_shared) {
+      pipe_resource_reference(&stObj->pt, NULL);
+      st_texture_release_all_sampler_views(st, stObj);
+      stObj->pt_externally_shared = false;
+   }
    const bool allowAllocateToStObj = !stObj->pt ||
                                      stObj->pt->last_level == 0 ||
                                      texImage->Level == 0;

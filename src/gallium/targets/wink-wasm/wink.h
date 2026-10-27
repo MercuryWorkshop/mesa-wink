@@ -45,6 +45,7 @@ extern "C" {
 
 typedef struct wink_surface wink_surface;
 typedef struct wink_context wink_context;
+typedef struct wink_image wink_image;
 
 enum wink_status {
    WINK_OK = 0,
@@ -165,6 +166,15 @@ WINK_EXPORT int wink_make_current(wink_context *context,
                                   wink_surface *draw, wink_surface *read);
 WINK_EXPORT wink_context *wink_get_current_context(void);
 WINK_EXPORT wink_surface *wink_get_current_surface(void);
+
+/* Retain level zero of a complete GL_TEXTURE_2D in the current context.
+ * The image can be passed to glEGLImageTargetTexture2DOES in any Wink context,
+ * including one outside the creator's share group. Texture deletion or
+ * redefinition does not destroy the retained storage. Imported siblings keep
+ * it alive after wink_image_destroy. No EGL display is required.
+ * Destroy images before wink_shutdown; shutdown releases any remaining ones. */
+WINK_EXPORT wink_image *wink_image_create_texture_2d(uint32_t texture, int *status);
+WINK_EXPORT void wink_image_destroy(wink_image *image);
 
 /* Any GL or GL ES function this Mesa knows, extensions included; NULL for
  * anything else. Pointers are valid in every context. */

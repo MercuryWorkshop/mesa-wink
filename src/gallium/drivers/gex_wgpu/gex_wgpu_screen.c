@@ -12382,6 +12382,41 @@ gex_wgpu_lower_dynamic_sampler_index(nir_shader *nir)
 static bool
 gex_wgpu_split_combined_samplers(nir_shader *nir)
 {
+   /* The frontend imports RGB EGLImages as ordinary 2D resources. External
+    * sampler coordinates and filtering have the same semantics; WebGPU has
+    * no separate external image type for this retained GL storage. Normalize
+    * both declarations and instructions before splitting their bindings. */
+   bool external = false;
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      const bool sampler = glsl_type_is_sampler(type);
+      if ((!sampler && !glsl_type_is_texture(type)) ||
+          glsl_get_sampler_dim(type) != GLSL_SAMPLER_DIM_EXTERNAL)
+         continue;
+      const struct glsl_type *flat = sampler
+         ? glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false,
+                             glsl_get_sampler_result_type(type))
+         : glsl_texture_type(GLSL_SAMPLER_DIM_2D, false,
+                             glsl_get_sampler_result_type(type));
+      var->type = glsl_type_is_array(var->type)
+         ? glsl_array_type(flat, glsl_get_length(var->type), 0) : flat;
+      external = true;
+   }
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               if (tex->sampler_dim == GLSL_SAMPLER_DIM_EXTERNAL) {
+                  tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+                  external = true;
+               }
+            }
+         }
+      }
+   }
+   if (external)
+      nir_fixup_deref_types(nir);
    nir_variable *split_texture[GEX_WGPU_MAX_SAMPLERS] = {0};
    nir_variable *split_sampler[GEX_WGPU_MAX_SAMPLERS] = {0};
    /* Which combined variable, and which element of it, each pair replaces --

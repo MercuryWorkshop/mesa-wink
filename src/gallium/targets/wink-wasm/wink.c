@@ -39,8 +39,10 @@
 #include "mesa/glapi/glapi/glapi.h"
 #include "mesa/main/glthread.h"
 #include "mesa/main/mtypes.h"
+#include "mesa/main/texobj.h"
 #include "mesa/state_tracker/st_context.h"
 #include "pipe/p_screen.h"
+#include "pipe/p_context.h"
 #include "pipe/p_state.h"
 #include "util/u_atomic.h"
 #include "util/u_inlines.h"
@@ -83,6 +85,47 @@ struct wink_context {
    enum wink_api api;
    int major, minor;
 };
+
+struct image_entry {
+   struct image_entry *next;
+   wink_image *handle;
+   struct pipe_resource *texture;
+   unsigned internalformat;
+};
+
+/* Never dereference an application-provided image handle, or recycle handles
+ * after destruction. GL image validation must also reject stale handles. */
+static struct image_entry *images;
+static uintptr_t next_image_handle = 1;
+static pthread_mutex_t image_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static bool
+get_egl_image(struct pipe_frontend_screen *fscreen, void *handle,
+              struct st_egl_image *out)
+{
+   bool found = false;
+   pthread_mutex_lock(&image_mutex);
+   for (struct image_entry *image = images; image; image = image->next) {
+      if (image->handle != handle)
+         continue;
+      if (out) {
+         memset(out, 0, sizeof(*out));
+         pipe_resource_reference(&out->texture, image->texture);
+         out->format = image->texture->format;
+         out->internalformat = image->internalformat;
+      }
+      found = true;
+      break;
+   }
+   pthread_mutex_unlock(&image_mutex);
+   return found;
+}
+
+static bool
+validate_egl_image(struct pipe_frontend_screen *fscreen, void *handle)
+{
+   return get_egl_image(fscreen, handle, NULL);
+}
 
 static struct {
    bool initialized;
@@ -351,6 +394,8 @@ init_here(const wink_init_attribs *a)
    }
    wink.fscreen.get_param = get_frontend_param;
    wink.fscreen.set_background_context = set_background_context;
+   wink.fscreen.get_egl_image = get_egl_image;
+   wink.fscreen.validate_egl_image = validate_egl_image;
    wink.device = device;
    wink.owner = pthread_self();
    wink.lost = 0;
@@ -415,6 +460,14 @@ shutdown_rpc(void *p)
 {
    (void)p;
    st_api_make_current(NULL, NULL, NULL);
+   pthread_mutex_lock(&image_mutex);
+   while (images) {
+      struct image_entry *image = images;
+      images = image->next;
+      pipe_resource_reference(&image->texture, NULL);
+      free(image);
+   }
+   pthread_mutex_unlock(&image_mutex);
    st_screen_destroy(&wink.fscreen);
    wink.fscreen.screen->destroy(wink.fscreen.screen);
    wgpuDeviceRelease(wink.device);
@@ -1062,6 +1115,125 @@ wink_surface *
 wink_get_current_surface(void)
 {
    return tls_draw;
+}
+
+struct image_create_rpc {
+   struct st_context *st;
+   uint32_t texture;
+   wink_image *image;
+   int status;
+};
+
+static void
+image_create_rpc(void *p)
+{
+   struct image_create_rpc *rpc = p;
+   struct gl_context *ctx = rpc->st->ctx;
+   _mesa_glthread_finish(ctx);
+   struct gl_texture_object *obj = _mesa_lookup_texture(ctx, rpc->texture);
+   rpc->status = WINK_ERROR_BAD_ATTRIBUTE;
+   if (!obj || obj->Target != GL_TEXTURE_2D)
+      return;
+   _mesa_test_texobj_completeness(ctx, obj);
+   if (!obj->_BaseComplete || obj->Attrib.BaseLevel != 0)
+      return;
+   struct gl_texture_image *tex = obj->Image[0][0];
+   if (!tex || !tex->pt || tex->NumSamples > 1)
+      return;
+   struct image_entry *image = calloc(1, sizeof(*image));
+   rpc->status = WINK_ERROR_OUT_OF_MEMORY;
+   if (!image)
+      return;
+   pipe_resource_reference(&image->texture, tex->pt);
+   image->internalformat = tex->InternalFormat;
+   obj->pt_externally_shared = true;
+   ctx->Shared->HasExternallySharedImages = true;
+   rpc->st->pipe->flush_resource(rpc->st->pipe, tex->pt);
+   st_context_flush(rpc->st, 0, NULL, NULL, NULL);
+   pthread_mutex_lock(&image_mutex);
+   if (next_image_handle) {
+      image->handle = (wink_image *)next_image_handle++;
+      image->next = images;
+      images = image;
+      rpc->image = image->handle;
+      rpc->status = WINK_OK;
+   }
+   pthread_mutex_unlock(&image_mutex);
+   if (!rpc->image) {
+      pipe_resource_reference(&image->texture, NULL);
+      free(image);
+   }
+}
+
+#if MESA_GLTHREAD_REMOTE
+static void
+image_create_glthread(struct gl_context *ctx, void *p)
+{
+   image_create_rpc(p);
+}
+#endif
+
+wink_image *
+wink_image_create_texture_2d(uint32_t texture, int *status)
+{
+   int ready = check_ready();
+   if (ready == WINK_OK && !tls_current)
+      ready = WINK_ERROR_BAD_CONTEXT;
+   if (ready != WINK_OK) {
+      set_status(status, ready);
+      return NULL;
+   }
+   struct image_create_rpc rpc = { .st = tls_current->st, .texture = texture };
+#if MESA_GLTHREAD_REMOTE
+   if (wink.remote)
+      _mesa_glthread_call(tls_current->st->ctx, image_create_glthread, &rpc);
+   else
+#endif
+      wink_rpc(image_create_rpc, &rpc);
+   set_status(status, rpc.status);
+   return rpc.image;
+}
+
+static void
+image_destroy_rpc(void *handle)
+{
+   pthread_mutex_lock(&image_mutex);
+   for (struct image_entry **link = &images; *link; link = &(*link)->next) {
+      struct image_entry *image = *link;
+      if (image->handle != handle)
+         continue;
+      *link = image->next;
+      pipe_resource_reference(&image->texture, NULL);
+      free(image);
+      break;
+   }
+   pthread_mutex_unlock(&image_mutex);
+}
+
+#if MESA_GLTHREAD_REMOTE
+static void
+image_destroy_glthread(struct gl_context *ctx, void *handle)
+{
+   image_destroy_rpc(handle);
+}
+#endif
+
+void
+wink_image_destroy(wink_image *image)
+{
+   if (!image || check_ready() != WINK_OK)
+      return;
+#if MESA_GLTHREAD_REMOTE
+   /* An import recorded on this context must retain the image before its
+    * handle is removed. The separate control queue can overtake GL batches. */
+   if (wink.remote && tls_current) {
+      _mesa_glthread_call(tls_current->st->ctx, image_destroy_glthread, image);
+      return;
+   }
+#endif
+   if (tls_current)
+      _mesa_glthread_finish(tls_current->st->ctx);
+   wink_rpc(image_destroy_rpc, image);
 }
 
 void *

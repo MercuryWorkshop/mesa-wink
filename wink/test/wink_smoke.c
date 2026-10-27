@@ -668,6 +668,97 @@ raw_shadow_depth(void)
 }
 
 static void
+external_image(wink_context *original, wink_surface *surface)
+{
+   const GLenum external = 0x8D65; /* GL_TEXTURE_EXTERNAL_OES */
+   typedef void (*Import)(GLenum, void *);
+   Import import = (Import)wink_get_proc_address("glEGLImageTargetTexture2DOES");
+   CHECK(import != NULL, "external image import entry point");
+   if (!import)
+      return;
+   int status;
+   CHECK(!wink_image_create_texture_2d(0, &status) && status == WINK_ERROR_BAD_ATTRIBUTE,
+         "external image rejects missing texture");
+   GLuint source, fbo;
+   p_glGenTextures(1, &source);
+   p_glActiveTexture(GL_TEXTURE0);
+   p_glBindTexture(GL_TEXTURE_2D, source);
+   const uint8_t red[] = {255, 0, 0, 255}, blue[] = {0, 0, 255, 255};
+   p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, red);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+   wink_image *image = wink_image_create_texture_2d(source, &status);
+   CHECK(image && status == WINK_OK, "external image export: %d", status);
+   if (!image) {
+      p_glDeleteTextures(1, &source);
+      return;
+   }
+   /* A GPU write after export must be visible to the imported sibling. */
+   p_glGenFramebuffers(1, &fbo);
+   p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+   p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
+   p_glClearColor(0, 1, 0, 1);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   p_glDeleteFramebuffers(1, &fbo);
+   /* Redefinition and deletion must not change or free the exported storage. */
+   p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, blue);
+   p_glDeleteTextures(1, &source);
+
+   wink_context_attribs ca;
+   wink_context_attribs_default(&ca);
+   ca.api = WINK_API_OPENGL_ES;
+   ca.major = 3;
+   ca.minor = 0;
+   wink_context *other = wink_context_create(&ca, &status);
+   CHECK(other && status == WINK_OK, "external image independent context: %d", status);
+   if (!other) {
+      wink_image_destroy(image);
+      return;
+   }
+   CHECK(wink_make_current(other, surface, surface) == WINK_OK,
+         "external image make independent context current");
+   GLuint texture, vao;
+   p_glGenTextures(1, &texture);
+   p_glBindTexture(external, texture);
+   import(external, image);
+   /* No GL readback between import and destroy: in remote mode the import
+    * may still be queued on glthread when the handle is released. */
+   wink_image_destroy(image);
+   CHECK(p_glGetError() == GL_NO_ERROR, "external image import");
+   /* Destroying the handle releases only its ownership, not the sibling's. */
+   import(external, image);
+   CHECK(p_glGetError() == GL_INVALID_VALUE, "external image rejects destroyed handle");
+   wink_image_destroy(image);
+   const char *vs = "#version 300 es\n"
+      "void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+      "gl_Position=vec4(p*2.0-1.0,0,1);}";
+   const char *fs = "#version 300 es\n"
+      "#extension GL_OES_EGL_image_external_essl3 : require\n"
+      "precision highp float; uniform samplerExternalOES image; out vec4 color;"
+      "void main(){color=texture(image,vec2(0.5));}";
+   GLuint prog = link_program(vs, fs, "external image");
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glUseProgram(prog);
+   p_glViewport(0, 0, W, H);
+   p_glClearColor(0, 0, 0, 1);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glDrawArrays(GL_TRIANGLES, 0, 3);
+   uint8_t px[4];
+   read_center(px, W, H);
+   CHECK(near(px, 0, 255, 0), "external image retained GPU write: %u,%u,%u,%u",
+         px[0], px[1], px[2], px[3]);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "external image context failed");
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+   p_glDeleteTextures(1, &texture);
+   p_glDeleteVertexArrays(1, &vao);
+   CHECK(wink_make_current(original, surface, surface) == WINK_OK,
+         "external image restore context");
+   wink_context_destroy(other);
+}
+
+static void
 buffer_read_sources(void)
 {
    const uint32_t original[4] = {3, 11, 29, 47};
@@ -1650,6 +1741,7 @@ exercise(const char *label, int api, wink_surface *surface)
       independent_samplers();
       integer_cube_lod();
       framebuffer_fetch();
+      external_image(ctx, surface);
    }
 
    if (api == WINK_API_OPENGL_CORE) {

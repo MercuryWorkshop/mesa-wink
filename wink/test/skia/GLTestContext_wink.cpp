@@ -43,10 +43,16 @@ public:
         fContext = wink_context_create(&ca, &status);
         check(status);
         this->onPlatformMakeCurrent();
-        auto gl = GrGLMakeAssembledGLESInterface(nullptr, [](void*, const char* name) {
+        auto assembled = GrGLMakeAssembledGLESInterface(nullptr, [](void*, const char* name) {
             return reinterpret_cast<GrGLFuncPtr>(wink_get_proc_address(name));
         });
-        if (!gl || !gl->validate()) SK_ABORT("Wink GLES interface validation failed");
+        if (!assembled || !assembled->validate()) SK_ABORT("Wink GLES interface validation failed");
+        auto gl = sk_make_sp<GrGLInterface>(*assembled);
+        // Skia's EGLImageTest checks these platform capabilities before using
+        // the virtual image methods below. Wink implements their texture-image
+        // semantics directly, without an EGL display or EGL entry points.
+        gl->fExtensions.add("EGL_KHR_image");
+        gl->fExtensions.add("EGL_KHR_gl_texture_2D_image");
         const char* renderer = reinterpret_cast<const char*>(
                 gl->fFunctions.fGetString(GR_GL_RENDERER));
         if (!renderer || !strstr(renderer, "gex")) SK_ABORT("Unexpected GLES renderer");
@@ -67,6 +73,29 @@ public:
         auto context = std::make_unique<WinkGLTestContext>(nullptr);
         context->makeCurrent();
         return context;
+    }
+    GrEGLImage texture2DToEGLImage(GrGLuint texture) const override {
+        int status;
+        return wink_image_create_texture_2d(texture, &status);
+    }
+    void destroyEGLImage(GrEGLImage image) const override {
+        wink_image_destroy(static_cast<wink_image*>(image));
+    }
+    GrGLuint eglImageToExternalTexture(GrEGLImage image) const override {
+        using Import = void (*)(GrGLenum, GrGLeglImage);
+        auto import = reinterpret_cast<Import>(
+                wink_get_proc_address("glEGLImageTargetTexture2DOES"));
+        if (!image || !import) return 0;
+        GrGLuint texture = 0;
+        auto& gl = this->gl()->fFunctions;
+        gl.fGenTextures(1, &texture);
+        gl.fBindTexture(GR_GL_TEXTURE_EXTERNAL, texture);
+        import(GR_GL_TEXTURE_EXTERNAL, image);
+        if (gl.fGetError() != GR_GL_NO_ERROR) {
+            gl.fDeleteTextures(1, &texture);
+            return 0;
+        }
+        return texture;
     }
 private:
     // Each thread's restorer weakly tracks the factory-owned context. Avoid
