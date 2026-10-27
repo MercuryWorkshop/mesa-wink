@@ -57,6 +57,9 @@ char *gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y
 /* The compiler options every stage is built with. */
 const nir_shader_compiler_options *gex_wgpu_nir_options(void);
 
+/* Replace helper-invocation queries with sample coverage and demotion state. */
+bool gex_wgpu_nir_lower_helper_invocations(nir_shader *nir);
+
 /* Whether anything in the shader is 64 bits wide. */
 bool gex_wgpu_has_64_bit(nir_shader *nir);
 

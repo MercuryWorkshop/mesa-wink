@@ -783,6 +783,30 @@ norm16_readback(void)
 }
 
 static void
+helper_invocation(void)
+{
+   const char *vs = "#version 320 es\n"
+      "void main(){ gl_Position=vec4(0.015625,0.020833333,0,1); gl_PointSize=1.0; }\n";
+   const char *fs = "#version 320 es\n"
+      "precision highp float; layout(location=0) out vec4 color;"
+      "void main(){ float h=gl_HelperInvocation?1.0:0.0;"
+      "color=vec4(abs(dFdx(h)),h,0,1); }\n";
+   GLuint prog = link_program(vs, fs, "helper invocation");
+   p_glUseProgram(prog);
+   p_glDisable(GL_BLEND);
+   p_glClearColor(0, 0, 0, 1);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glDrawArrays(GL_POINTS, 0, 1);
+   uint8_t px[4] = {0};
+   p_glReadPixels(32, 24, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+   CHECK(near(px, 255, 0, 0), "helper invocation derivative: %u,%u,%u,%u",
+         px[0], px[1], px[2], px[3]);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "helper invocation: context failed");
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+}
+
+static void
 framebuffer_fetch(void)
 {
    GLint n = 0;
@@ -1402,6 +1426,7 @@ exercise(const char *label, int api, wink_surface *surface)
 
    if (api == WINK_API_OPENGL_ES) {
       norm16_readback();
+      helper_invocation();
       framebuffer_fetch();
    }
 

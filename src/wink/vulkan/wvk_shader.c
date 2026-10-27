@@ -249,52 +249,6 @@ dynamic_offset(const nir_instr *instr, const void *data)
    return i >= 0 && !nir_src_is_const(tex->src[i].src);
 }
 
-static bool
-lower_helper_invocations(nir_shader *nir)
-{
-   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   bool uses = false;
-   nir_foreach_block(block, impl) {
-      nir_foreach_instr(instr, block) {
-         if (instr->type == nir_instr_type_intrinsic &&
-             (nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_helper_invocation ||
-              nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_is_helper_invocation))
-            uses = true;
-      }
-   }
-   if (!uses)
-      return false;
-
-   nir_variable *demoted = nir_local_variable_create(impl, glsl_bool_type(), "demoted");
-   nir_builder b = nir_builder_at(nir_before_impl(impl));
-   nir_store_var(&b, demoted, nir_imm_false(&b), 0x1);
-   nir_foreach_block(block, impl) {
-      nir_foreach_instr_safe(instr, block) {
-         if (instr->type != nir_instr_type_intrinsic)
-            continue;
-         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         b.cursor = nir_before_instr(instr);
-         switch (intr->intrinsic) {
-         case nir_intrinsic_demote:
-            nir_store_var(&b, demoted, nir_imm_true(&b), 0x1);
-            break;
-         case nir_intrinsic_demote_if:
-            nir_store_var(&b, demoted, nir_ior(&b, nir_load_var(&b, demoted), intr->src[0].ssa), 0x1);
-            break;
-         case nir_intrinsic_load_helper_invocation:
-         case nir_intrinsic_is_helper_invocation: {
-            nir_def *uncovered = nir_ieq_imm(&b, nir_load_sample_mask_in(&b), 0);
-            nir_def_replace(&intr->def, nir_ior(&b, uncovered, nir_load_var(&b, demoted)));
-            break;
-         }
-         default:
-            break;
-         }
-      }
-   }
-   return nir_progress(true, impl, nir_metadata_none);
-}
-
 /* 64-bit floats, which WGSL has none of: Mesa's library of them in
  * integer arithmetic (float64.glsl), made once. Its 64-bit integers are
  * pairs of words later, as the shader's are. */
@@ -502,7 +456,7 @@ wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_frexp);
    NIR_PASS(_, nir, nir_shader_instructions_pass, lower_quantize_instr, nir_metadata_control_flow, NULL);
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      NIR_PASS(_, nir, lower_helper_invocations);
+      NIR_PASS(_, nir, gex_wgpu_nir_lower_helper_invocations);
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    }
    /* Input attachments are textures, fetched at the fragment: the

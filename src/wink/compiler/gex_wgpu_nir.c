@@ -20,6 +20,54 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* WGSL exposes coverage through sample_mask, but has no helper-invocation
+ * builtin. Uncovered lanes are helpers; explicit demotion adds helpers too. */
+bool
+gex_wgpu_nir_lower_helper_invocations(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool uses = false;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic &&
+             (nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_helper_invocation ||
+              nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_is_helper_invocation))
+            uses = true;
+      }
+   }
+   if (!uses)
+      return false;
+
+   nir_variable *demoted = nir_local_variable_create(impl, glsl_bool_type(), "demoted");
+   nir_builder b = nir_builder_at(nir_before_impl(impl));
+   nir_store_var(&b, demoted, nir_imm_false(&b), 0x1);
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         b.cursor = nir_before_instr(instr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_demote:
+            nir_store_var(&b, demoted, nir_imm_true(&b), 0x1);
+            break;
+         case nir_intrinsic_demote_if:
+            nir_store_var(&b, demoted, nir_ior(&b, nir_load_var(&b, demoted), intr->src[0].ssa), 0x1);
+            break;
+         case nir_intrinsic_load_helper_invocation:
+         case nir_intrinsic_is_helper_invocation: {
+            nir_def *uncovered = nir_ieq_imm(&b, nir_load_sample_mask_in(&b), 0);
+            nir_def_replace(&intr->def, nir_ior(&b, uncovered, nir_load_var(&b, demoted)));
+            break;
+         }
+         default:
+            break;
+         }
+      }
+   }
+   return nir_progress(true, impl, nir_metadata_none);
+}
+
 /* Colour outputs of fewer components than four, made four.
  *
  * GL lets a fragment shader write a float to an RGBA target and leaves the
@@ -1123,6 +1171,13 @@ gex_wgpu_nir_to_wgsl(nir_shader *nir, mesa_shader_stage stage, bool flip_y,
                      char **error_out)
 {
    *error_out = NULL;
+   if (stage == MESA_SHADER_FRAGMENT) {
+      NIR_PASS(_, nir, nir_lower_system_values);
+      NIR_PASS(_, nir, gex_wgpu_nir_lower_helper_invocations);
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_system_value, NULL);
+   }
    const nir_lower_tex_options texture_options = {
       .lower_1d = true,
       .lower_rect = true,
