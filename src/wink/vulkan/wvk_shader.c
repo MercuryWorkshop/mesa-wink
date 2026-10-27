@@ -8121,6 +8121,12 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    /* The compiler keeps a vertex input's driver_location as its WGSL
     * @location, which for Vulkan is the attribute location. */
    if (stage == MESA_SHADER_VERTEX) {
+      /* Optimizations can leave declarations for attributes no instruction
+       * reads. ntv still emits those as entrypoint inputs, while inputs_read
+       * omits them, producing a WebGPU pipeline missing declared locations.
+       * Keep the emitted interface and its reflected layout in agreement. */
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_in, NULL);
       nir_foreach_shader_in_variable(var, nir) {
          if (var->data.location >= VERT_ATTRIB_GENERIC0)
             var->data.driver_location = var->data.location - VERT_ATTRIB_GENERIC0;

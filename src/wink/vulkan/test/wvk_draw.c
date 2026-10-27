@@ -19,6 +19,7 @@
 #include "wvk_test.h"
 
 #include "quad_vert.h"
+#include "dead_input_vert.h"
 #include "color_frag.h"
 #include "discard_frag.h"
 #include "texture_frag.h"
@@ -209,7 +210,7 @@ mostly(const uint8_t *p, bool r, bool g, bool b)
 }
 
 static void
-test_colors(VkBuffer vertices)
+test_colors(VkBuffer vertices, const uint32_t *vertex_code, size_t vertex_bytes)
 {
    VkPipelineLayout layout;
    VK(vkCreatePipelineLayout(dev, &(VkPipelineLayoutCreateInfo){
@@ -218,7 +219,7 @@ test_colors(VkBuffer vertices)
          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(struct push),
       },
    }, NULL, &layout));
-   VkShaderModule vs = make_module(spv_quad_vert, sizeof(spv_quad_vert));
+   VkShaderModule vs = make_module(vertex_code, vertex_bytes);
    VkShaderModule fs = make_module(spv_color_frag, sizeof(spv_color_frag));
    VkPipeline pipeline = make_pipeline(layout, vs, fs);
 
@@ -742,7 +743,8 @@ main(void)
    struct buffer vertices = make_buffer(sizeof(quad), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, HOST);
    memcpy(vertices.map, quad, sizeof(quad));
 
-   test_colors(vertices.buffer);
+   test_colors(vertices.buffer, spv_quad_vert, sizeof(spv_quad_vert));
+   test_colors(vertices.buffer, spv_dead_input_vert, sizeof(spv_dead_input_vert));
    test_transient_stencil(vertices.buffer);
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_1_BIT, ~0u, 1);
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_4_BIT, ~0u, 4);

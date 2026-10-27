@@ -1,0 +1,17 @@
+#version 450
+/* Optimization removes the read, so the input must leave the emitted interface too. */
+layout(location = 0) in vec2 pos;
+layout(location = 1) in vec3 color;
+layout(location = 7) in vec3 unused_color;
+layout(location = 0) out vec3 v_color;
+layout(location = 1) out vec2 v_uv;
+layout(push_constant) uniform Push {
+   vec4 tint;
+   vec2 offset;
+} pc;
+void main()
+{
+   v_color = color + unused_color * 0.0;
+   v_uv = pos * 0.5 + 0.5;
+   gl_Position = vec4(pos + pc.offset, 0.0, 1.0);
+}
