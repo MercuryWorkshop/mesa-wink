@@ -32,7 +32,10 @@ python3 wink/test/skia/run.py run --dm build/skia/native-dawn/dm \
 The test adapter supplies Dawn an explicit EGL/GL resolver backed by Wink.
 The outer Dawn and its Tint symbols have hidden visibility to keep them
 independent from Wink's inner Dawn. This route currently builds natively;
-browser builds still require the outer Dawn integration.
+browser builds still require the outer Dawn integration. The adapter enables
+Dawn's `gl_allow_context_on_multi_threads` setting so Graphite's pipeline
+workers release the EGL context between calls instead of retaining stale
+current contexts across tests.
 
 ## Browser builds
 

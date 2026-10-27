@@ -59,7 +59,10 @@ class ExecutionIntegrity(unittest.TestCase):
 
     def test_skips_and_validation_errors_fail_even_with_exit_zero(self):
         for extra in ('WINK_SKIA_SKIP\tgles\tgm\t\tclip\tunsupported\n',
-                      'WebGPU validation error\n', 'Device lost\n'):
+                      'WebGPU validation error\n', 'Device lost\n',
+                      'gex-wgpu: WebGPU error (type 2): invalid attachment\n',
+                      '[skia] WARNING - Key context creation failed, draw dropped!\n',
+                      '[skia] ** ERROR ** unexpected failure\n'):
             self.assertFalse(self.check_log(self.log + extra)['pass'])
 
     def test_wrong_backend_and_wink_reference_fail(self):

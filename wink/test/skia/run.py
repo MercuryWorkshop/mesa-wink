@@ -83,8 +83,10 @@ def inspect_run(expected, log, returncode, route, reference=False):
     elif not matching or any('wink on' not in ' '.join(r).lower() for r in matching):
         problems.append('Vulkan backend is not Wink')
     # Capture errors even where the graphics API leaves DM's exit status zero.
-    if re.search(r'validation error|uncaptured error|device (?:lost|error)|WINK_SKIA_CONTEXT_FAILED', log, re.I):
+    if re.search(r'validation error|webgpu error|uncaptured error|device (?:lost|error)|WINK_SKIA_CONTEXT_FAILED', log, re.I):
         problems.append('graphics validation, device, or context error')
+    if re.search(r'draw dropped!|\*\* ERROR \*\*', log, re.I):
+        problems.append('Skia reported an error or dropped a draw')
     return {'pass': not problems, 'problems': problems,
             'discovered': len(expected), 'started': len(started),
             'completed': len(completed), 'skipped': skipped, 'backends': identities,

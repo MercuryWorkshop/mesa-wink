@@ -183,6 +183,20 @@ void (*winkSkiaEGLGetProc(const char* name))();''')
         options.nextInChain = &winkGL;
         options.backendType = wgpu::BackendType::OpenGLES;
     }''')
+    patch(source, 'tools/graphite/dawn/GraphiteDawnTestContext.cpp',
+          '    desc.nextInChain           = &togglesDesc;',
+          '''    desc.nextInChain           = &togglesDesc;
+    std::vector<const char*> winkDeviceToggles;
+    if (backend == wgpu::BackendType::OpenGLES) {
+        for (size_t i = 0; i < togglesDesc.enabledToggleCount; ++i) {
+            winkDeviceToggles.push_back(togglesDesc.enabledToggles[i]);
+        }
+        // Graphite compiles pipelines on its executor. Dawn must release
+        // the EGL context between calls before moving it to another thread.
+        winkDeviceToggles.push_back("gl_allow_context_on_multi_threads");
+        togglesDesc.enabledToggleCount = winkDeviceToggles.size();
+        togglesDesc.enabledToggles = winkDeviceToggles.data();
+    }''')
     # Skia's outer Dawn must not export weak Tint C++ symbols that could
     # coalesce with Wink's independently pinned inner Dawn/Tint library.
     patch(source, 'third_party/dawn/build_dawn.py',
