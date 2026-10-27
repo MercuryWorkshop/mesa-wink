@@ -100,9 +100,21 @@ def adapt(source):
                 fprintf(stderr, "WINK_SKIA_SKIP\\t%s\\t%s\\t%s\\t%s\\t%s\\n",
                         task.sink.tag.c_str(), task.src.tag.c_str(),
                         task.src.options.c_str(), name.c_str(), result.c_str());''')
+    # Some GPU-labelled units explicitly use a mock to test CPU bookkeeping.
+    # Permit it without attributing that work to the selected hardware route.
+    # Upgrade earlier harness patches in the disposable dependency checkout.
+    factory = source / 'tools/ganesh/GrContextFactory.cpp'
+    content = factory.read_text()
+    content = content.replace(
+        '    if (const char* route = getenv("WINK_SKIA_ROUTE")) {',
+        '    if (const char* route = type == ContextType::kMock ? nullptr : getenv("WINK_SKIA_ROUTE")) {')
+    content = content.replace(
+        '    if (result.directContext()) SkDebugf("WINK_SKIA_CONTEXT\\tganesh\\n");',
+        '    if (result.directContext() && type != ContextType::kMock) SkDebugf("WINK_SKIA_CONTEXT\\tganesh\\n");')
+    factory.write_text(content)
     patch(source, 'tools/ganesh/GrContextFactory.cpp',
           '    // (shareIndex != 0) -> (shareContext != nullptr)',
-          '''    if (const char* route = getenv("WINK_SKIA_ROUTE")) {
+          '''    if (const char* route = type == ContextType::kMock ? nullptr : getenv("WINK_SKIA_ROUTE")) {
         if ((!strcmp(route, "gles") && type != ContextType::kGLES) ||
             (!strcmp(route, "vk") && type != ContextType::kVulkan)) return {};
     }
@@ -110,7 +122,7 @@ def adapt(source):
     patch(source, 'tools/ganesh/GrContextFactory.cpp',
           '    return this->getContextInfoInternal(type, overrides, nullptr, 0);',
           '''    auto result = this->getContextInfoInternal(type, overrides, nullptr, 0);
-    if (result.directContext()) SkDebugf("WINK_SKIA_CONTEXT\\tganesh\\n");
+    if (result.directContext() && type != ContextType::kMock) SkDebugf("WINK_SKIA_CONTEXT\\tganesh\\n");
     return result;''')
     # Upstream DM deliberately skips GLES on desktop hosts. These are GLES
     # tests even on a Mac; selecting only a GLES sink does not change units.

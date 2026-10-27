@@ -54,11 +54,13 @@ def inspect_run(expected, log, returncode, route, reference=False):
     active_unit = None
     unit_context = False
     no_context = []
+    api = ROUTES[route][0]
     for line in log.splitlines():
         if line.startswith('WINK_SKIA_START\tunit\ttest\t'):
             active_unit = line.split('\t', 4)[4]
             unit_context = False
-        elif active_unit and line.startswith(('WINK_SKIA_CONTEXT\t', 'WINK_SKIA_BACKEND\t')):
+        elif active_unit and (line.startswith('WINK_SKIA_CONTEXT\t') or
+                              line.startswith('WINK_SKIA_BACKEND\t' + api + '\t')):
             unit_context = True
         elif line.startswith('WINK_SKIA_DONE\tunit\ttest\t') and active_unit:
             if not unit_context:
@@ -67,7 +69,6 @@ def inspect_run(expected, log, returncode, route, reference=False):
     if no_context:
         problems.append(f'{len(no_context)} GPU unit tests completed without an observed GPU context')
     identities = events(log, 'BACKEND')
-    api = ROUTES[route][0]
     matching = [r for r in identities if r[0] == api]
     if not matching:
         problems.append('no backend identity recorded')

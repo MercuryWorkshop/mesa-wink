@@ -75,6 +75,16 @@ class ExecutionIntegrity(unittest.TestCase):
         log = log.replace('WINK_SKIA_DONE\tunit', 'WINK_SKIA_CONTEXT\tganesh\nWINK_SKIA_DONE\tunit')
         self.assertTrue(self.check_log(log, expected)['pass'])
 
+    def test_vulkan_unit_cannot_count_sentinel_gles_as_gpu_work(self):
+        task = ('unit', 'test', '', 'VKOnly')
+        log = ('WINK_SKIA_BACKEND\tvulkan\twink on Metal\n'
+               'WINK_SKIA_START\tunit\ttest\t\tVKOnly\n'
+               'WINK_SKIA_BACKEND\tgles\tgex WebGPU\n'
+               'WINK_SKIA_DONE\tunit\ttest\t\tVKOnly\n')
+        result = suite.inspect_run([task], log, 0, 'vk')
+        self.assertFalse(result['pass'])
+        self.assertEqual(result['units_without_context'], ['VKOnly'])
+
 
 class ReferenceIntegrity(unittest.TestCase):
     def setUp(self):
