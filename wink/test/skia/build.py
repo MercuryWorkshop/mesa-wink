@@ -13,7 +13,8 @@ HERE = Path(__file__).resolve().parent
 MESA = HERE.parents[2]
 CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'freetype-wasm-svg-module-registration-v1',
-                     'dm-image-extension-boundary-v1']
+                     'dm-image-extension-boundary-v1',
+                     'ganesh-framebuffer-fetch-destination-swizzle-v1']
 
 
 def run(args, **kwargs):
@@ -51,6 +52,19 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # Framebuffer fetch returns physical attachment channels. Convert back to
+    # the logical surface color before shader blending, just as a destination
+    # texture's sampler swizzle does. Alpha_8 backed by R8 writes a000 and must
+    # read 000r; reading attachment alpha instead blends against constant one.
+    patch(source, 'src/gpu/ganesh/GrXferProcessor.cpp',
+          '        const char* dstColor = fragBuilder->dstColor();',
+          '''        const char* dstColor = fragBuilder->dstColor();
+        if (!args.fDstTextureSamplerHandle.isValid() &&
+            args.fShaderCaps->fFBFetchSupport && args.fWriteSwizzle) {
+            fragBuilder->codeAppendf("half4 _swizzledDstColor = %s.%s;", dstColor,
+                                    args.fWriteSwizzle.invert().asString().c_str());
+            dstColor = "_swizzledDstColor";
+        }''')
     # SkOSFile::Iter matches suffixes literally: "bmp" also found ".wbmp",
     # causing duplicate task identities and overwriting image artifacts.
     patch(source, 'tools/flags/CommonFlagsImages.cpp',

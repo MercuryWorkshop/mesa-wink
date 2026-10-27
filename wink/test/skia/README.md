@@ -28,6 +28,13 @@ this correction, and comparisons reject different fix sets. Keep unpatched
 failure artifacts when investigating upstream behavior. No image tolerance is
 added by this correction.
 
+Framebuffer-fetch shader blending also reverses the render target's write
+swizzle before reading destination color. An alpha-only surface backed by R8
+writes alpha into red and must read it back from red; reading the attachment's
+absent alpha instead produced black boxes around LCD text. The existing
+`skbug_12212` GM now matches the independent ANGLE reference exactly. This
+correction is recorded in `skia_fixes` for native and browser builds.
+
 The integration registers FreeType's compiled SVG renderer in its Wasm module
 list, fixing an SVG emoji metrics crash, and matches image extensions with a
 leading dot so `.wbmp` is not also collected as `bmp`. These corrections are
