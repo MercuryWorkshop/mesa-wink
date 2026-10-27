@@ -15,7 +15,8 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'freetype-wasm-svg-module-registration-v1',
                      'dm-image-extension-boundary-v1',
                      'ganesh-framebuffer-fetch-destination-swizzle-v1',
-                     'graphite-automatic-image-tiling-v1']
+                     'graphite-automatic-image-tiling-v1',
+                     'graphite-oversized-image-shader-paint-fallback-v1']
 
 
 def run(args, **kwargs):
@@ -53,6 +54,21 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # Match Ganesh's existing hugebitmapshader contract: an image shader
+    # beyond the texture limit draws using the paint color instead of dropping
+    # the geometry. Ordinary image draws use tiling; raw shaders and failures
+    # for images within the supported limit retain their existing error path.
+    patch(source, 'src/gpu/graphite/KeyHelpers.cpp',
+          '''static void add_to_key(const KeyContext& keyContext, const SkImageShader* shader) {
+    SkASSERT(shader);''',
+          '''static void add_to_key(const KeyContext& keyContext, const SkImageShader* shader) {
+    SkASSERT(shader);
+    const int maxTextureSize = keyContext.caps()->maxTextureSize();
+    if (!shader->isRaw() && (shader->image()->width() > maxTextureSize ||
+                            shader->image()->height() > maxTextureSize)) {
+        RGBPaintColorBlock::AddBlock(keyContext);
+        return;
+    }''')
     # Graphite implements drawAsTiledImageRect but inherits the false opt-in
     # from SkDevice, so ordinary canvas draws bypass it and try to upload
     # images larger than maxTextureSize. Use the existing tiling path as

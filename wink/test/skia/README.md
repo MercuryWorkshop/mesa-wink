@@ -41,6 +41,13 @@ drops images larger than the texture limit. The large bitmap and picture GMs
 now match their explicitly tiled variants exactly; this correction is also
 recorded in `skia_fixes`.
 
+For non-raw image shaders whose images exceed the texture limit, Graphite uses
+the paint-color fallback required by Skia's existing `hugebitmapshader` GM,
+matching Ganesh's behavior. This preserves the geometry when the shader image
+cannot be uploaded. Raw shaders and conversion failures for images within the
+texture limit keep their error path. This correction is recorded in
+`skia_fixes`.
+
 The integration registers FreeType's compiled SVG renderer in its Wasm module
 list, fixing an SVG emoji metrics crash, and matches image extensions with a
 leading dot so `.wbmp` is not also collected as `bmp`. These corrections are
