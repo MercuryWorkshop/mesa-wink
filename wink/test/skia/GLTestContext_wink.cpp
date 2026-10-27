@@ -6,6 +6,13 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <cstdlib>
+
+#ifdef WINK_SKIA_ANGLE_REFERENCE
+namespace sk_gpu_test {
+GLTestContext* CreateWinkReferenceGLTestContext(GrGLStandard, GLTestContext*);
+}
+#endif
 
 namespace {
 void check(int status) {
@@ -106,6 +113,10 @@ thread_local WinkGLTestContext::Current WinkGLTestContext::current;
 }
 namespace sk_gpu_test {
 GLTestContext* CreatePlatformGLTestContext(GrGLStandard api, GLTestContext* share) {
+#ifdef WINK_SKIA_ANGLE_REFERENCE
+    if (std::getenv("WINK_SKIA_REFERENCE_GLES"))
+        return CreateWinkReferenceGLTestContext(api, share);
+#endif
     if (api == kGL_GrGLStandard) return nullptr;
     return new WinkGLTestContext(static_cast<WinkGLTestContext*>(share));
 }

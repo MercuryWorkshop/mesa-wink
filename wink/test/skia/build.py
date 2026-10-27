@@ -51,6 +51,31 @@ def adapt(source):
     target = source / 'tools/ganesh/gl/wink'
     target.mkdir(parents=True, exist_ok=True)
     shutil.copy2(HERE / 'GLTestContext_wink.cpp', target)
+    # Reuse Skia's EGL context implementation for independent ANGLE references.
+    # Keep it in a separate translation unit and behind an opt-in build define.
+    egl = (source / 'tools/ganesh/gl/egl/CreatePlatformGLTestContext_egl.cpp').read_text()
+    egl = egl.replace('CreatePlatformGLTestContext(', 'CreateWinkReferenceGLTestContext(')
+    anchor = '        gl = GrGLInterfaces::MakeEGL();'
+    if egl.count(anchor) != 1:
+        raise RuntimeError('reference EGL factory anchor changed')
+    egl = egl.replace(anchor, '''        gl = GrGLMakeAssembledInterface(nullptr, [](void*, const char* name) {
+            return reinterpret_cast<GrGLFuncPtr>(eglGetProcAddress(name));
+        });
+        if (gl) SkDebugf("WINK_SKIA_BACKEND\\tgles\\t%s\\n", gl->fFunctions.fGetString(GR_GL_RENDERER));''')
+    (target / 'GLTestContext_reference.cpp').write_text(
+        '#ifdef WINK_SKIA_ANGLE_REFERENCE\n#include "include/gpu/ganesh/gl/GrGLAssembleInterface.h"\n' + egl + '\n#endif\n')
+    patch(source, 'BUILD.gn', '      if (skia_use_gl && !is_canvaskit) {',
+          '''      if (skia_use_gl && !is_canvaskit) {
+        sources += [ "tools/ganesh/gl/wink/GLTestContext_reference.cpp" ]''')
+    patch(source, 'gn/skia.gni', 'declare_args() {\n  is_canvaskit = false',
+          'declare_args() {\n  wink_skia_angle_dir = ""\n  is_canvaskit = false')
+    patch(source, 'BUILD.gn', '      defines = []\n      if (skia_enable_discrete_gpu)',
+          '''      defines = []
+      if (wink_skia_angle_dir != "") {
+        defines += [ "WINK_SKIA_ANGLE_REFERENCE=1" ]
+        include_dirs = [ "third_party/externals/angle2/include" ]
+      }
+      if (skia_enable_discrete_gpu)''')
     patch(source, 'BUILD.gn',
           '"tools/ganesh/gl/mac/CreatePlatformGLTestContext_mac.cpp"',
           '"tools/ganesh/gl/wink/GLTestContext_wink.cpp"')
@@ -116,6 +141,44 @@ def adapt(source):
           '    return ContextInfo{owned.fTestContext.get(), owned.fContext.get()};',
           '''    if (owned.fContext) SkDebugf("WINK_SKIA_CONTEXT\\tgraphite\\n");
     return ContextInfo{owned.fTestContext.get(), owned.fContext.get()};''')
+    dawn_dir = source / 'tools/graphite/dawn/wink'
+    dawn_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(HERE / 'DawnWinkEGL.cpp', dawn_dir)
+    patch(source, 'BUILD.gn', '            "tools/graphite/dawn/GraphiteDawnTestContext.cpp",',
+          '''            "tools/graphite/dawn/GraphiteDawnTestContext.cpp",
+            "tools/graphite/dawn/wink/DawnWinkEGL.cpp",''')
+    patch(source, 'BUILD.gn', '''      if (skia_use_dawn) {
+        public_deps += [ "//third_party/dawn" ]''',
+          '''      if (skia_use_dawn) {
+        if (!defined(include_dirs)) { include_dirs = [] }
+        include_dirs += [ "third_party/externals/angle2/include" ]
+        public_deps += [ "//third_party/dawn" ]''')
+    patch(source, 'tools/graphite/dawn/GraphiteDawnTestContext.cpp',
+          '#include "dawn/dawn_proc.h"',
+          '#include "dawn/dawn_proc.h"\n#include "dawn/native/OpenGLBackend.h"')
+    patch(source, 'tools/graphite/dawn/GraphiteDawnTestContext.cpp',
+          'namespace skiatest::graphite {',
+          '''namespace skiatest::graphite {
+void (*winkSkiaEGLGetProc(const char* name))();''')
+    patch(source, 'tools/graphite/dawn/GraphiteDawnTestContext.cpp',
+          '    options.nextInChain = &togglesDesc;',
+          '''    options.nextInChain = &togglesDesc;
+    dawn::native::opengl::RequestAdapterOptionsGetGLProc winkGL;
+    if (backend == wgpu::BackendType::OpenGLES && getenv("WINK_SKIA_ROUTE") &&
+        !strcmp(getenv("WINK_SKIA_ROUTE"), "grdawn_gles")) {
+        winkGL.getProc = winkSkiaEGLGetProc;
+        winkGL.nextInChain = options.nextInChain;
+        options.nextInChain = &winkGL;
+        options.backendType = wgpu::BackendType::OpenGLES;
+    }''')
+    # Skia's outer Dawn must not export weak Tint C++ symbols that could
+    # coalesce with Wink's independently pinned inner Dawn/Tint library.
+    patch(source, 'third_party/dawn/build_dawn.py',
+          '      "-DDAWN_BUILD_MONOLITHIC_LIBRARY=OFF",',
+          '''      "-DDAWN_BUILD_MONOLITHIC_LIBRARY=OFF",
+      "-DCMAKE_C_VISIBILITY_PRESET=hidden",
+      "-DCMAKE_CXX_VISIBILITY_PRESET=hidden",
+      "-DCMAKE_VISIBILITY_INLINES_HIDDEN=ON",''')
     # Opt in to portability enumeration when the selected loader offers it.
     patch(source, 'tools/gpu/vk/VkTestUtils.cpp',
           '    // Set up VkInstanceCreateInfo',
@@ -152,6 +215,8 @@ def main():
     p.add_argument('--library', type=Path, default=MESA / 'build/wink-mac/src/gallium/targets/wink-wasm/libwink.dylib')
     p.add_argument('--vk-loader', type=Path, default=Path('/opt/homebrew/opt/vulkan-loader/lib/libvulkan.dylib'))
     p.add_argument('--no-sync', action='store_true', help='Use an already synchronized pinned checkout')
+    p.add_argument('--angle', type=Path, help='Optional ANGLE output directory for independent GLES references')
+    p.add_argument('--dawn-gles', action='store_true', help='Build Graphite through an outer Dawn GLES backend into native-dawn/')
     a = p.parse_args()
     a.out = a.out.resolve()
     source = a.out / 'deps/skia' if a.no_sync else checkout(a.out)
@@ -175,7 +240,17 @@ def main():
                          f'-DSK_GPU_TOOLS_VK_LIBRARY_NAME={a.vk_loader.resolve()}'],
         'extra_ldflags': [str(a.library.resolve()), f'-Wl,-rpath,{a.library.resolve().parent}'],
     }
-    build = a.out / 'native'
+    if a.angle:
+        angle = a.angle.resolve()
+        for name in ('libEGL.dylib', 'libGLESv2.dylib'):
+            if not (angle / name).is_file():
+                p.error(f'missing {angle / name}; run build-angle.py first')
+        args['wink_skia_angle_dir'] = str(angle)
+        args['extra_ldflags'] += [str(angle / 'libEGL.dylib'), f'-Wl,-rpath,{angle}']
+    if a.dawn_gles:
+        args.update(skia_use_dawn=True, dawn_enable_opengles=True, dawn_enable_metal=False,
+                    dawn_enable_vulkan=False, dawn_enable_d3d11=False, dawn_enable_d3d12=False)
+    build = a.out / ('native-dawn' if a.dawn_gles else 'native')
     build.mkdir(parents=True, exist_ok=True)
     gn_args = '\n'.join(f'{k} = {json.dumps(v)}' for k, v in args.items()) + '\n'
     (build / 'args.gn').write_text(gn_args)
@@ -184,7 +259,7 @@ def main():
     (build / 'wink-build.json').write_text(json.dumps({
         'schema': 1, 'skia': pin, 'gn_args': args,
         'wink': subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
-        'routes': ['gles', 'vk', 'grvk'],
+        'routes': ['gles', 'vk', 'grvk'] + (['grdawn_gles'] if a.dawn_gles else []),
     }, indent=2) + '\n')
 
 

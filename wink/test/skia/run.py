@@ -150,7 +150,11 @@ def driver_provenance(dm, environment):
     manifest = dm.parent / 'wink-build.json'
     if manifest.is_file():
         build = json.loads(manifest.read_text())
-        paths.append(Path(build['gn_args']['extra_ldflags'][0]))
+        paths.extend(Path(flag) for flag in build['gn_args']['extra_ldflags']
+                     if Path(flag).is_absolute() and Path(flag).is_file())
+        angle = build['gn_args'].get('wink_skia_angle_dir')
+        if angle:
+            paths.extend(Path(angle) / name for name in ('libEGL.dylib', 'libGLESv2.dylib'))
     for name in environment.get('VK_DRIVER_FILES', '').split(os.pathsep):
         if not name:
             continue
@@ -183,6 +187,9 @@ def execute(a):
         env['WINK_SKIA_EXPECT_VULKAN'] = 'wink on'
     else:
         env.pop('WINK_SKIA_EXPECT_VULKAN', None)
+    env.pop('WINK_SKIA_REFERENCE_GLES', None)
+    if a.role == 'reference' and a.reference_angle:
+        env['WINK_SKIA_REFERENCE_GLES'] = '1'
     config, graphite = a.route, ROUTES[a.route][1]
     args = [str(a.dm.resolve()), '--config', config, '--src', *a.sources,
             '--resourcePath', str(source / 'resources'), '--images', str(source / 'resources/images'),
@@ -255,6 +262,7 @@ def main():
         s.add_argument('--match', nargs='+', default=[])
         s.add_argument('--timeout', type=int, default=7200)
         s.add_argument('--icd', type=Path, help='Explicit ICD manifest; required for Vulkan references')
+        s.add_argument('--reference-angle', action='store_true', help='Select the independent ANGLE factory in a reference build')
         s.set_defaults(role='reference' if name == 'reference' else 'candidate')
     s = sub.add_parser('compare')
     s.add_argument('reference', type=Path)

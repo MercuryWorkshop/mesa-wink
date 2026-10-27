@@ -20,10 +20,19 @@ its dependencies and `bin/fetch-gn` pins GN. `pins.json` pins Skia itself.
 The adapter modifies only that disposable dependency checkout. Patch anchors
 and revision checks fail if the upstream source no longer matches.
 
-The current native build enables `gles`, `vk`, and `grvk`. It does not yet
-build Graphite's outer Dawn GLES adapter. The runner recognizes
-`grdawn_gles`, but an unavailable configuration fails inventory and is not
-counted as tested.
+The default native build enables `gles`, `vk`, and `grvk`. To additionally
+build Graphite through an outer Dawn GLES backend:
+
+```sh
+python3 wink/test/skia/build.py --no-sync --dawn-gles
+python3 wink/test/skia/run.py run --dm build/skia/native-dawn/dm \
+  --route grdawn_gles --sources tests --match SkSL --out build/skia/sksl-grdawn-gles
+```
+
+The test adapter supplies Dawn an explicit EGL/GL resolver backed by Wink.
+The outer Dawn and its Tint symbols have hidden visibility to keep them
+independent from Wink's inner Dawn. This route currently builds natively;
+browser builds still require the outer Dawn integration.
 
 ## Browser builds
 
@@ -90,9 +99,21 @@ python3 wink/test/skia/run.py compare build/skia/clip-reference build/skia/clip-
   --out build/skia/clip-comparison.json
 ```
 
-A GLES reference needs a separately instrumented DM build using an independent
-GLES implementation (`--dm` and `--source`). The Wink GLES adapter cannot
-produce an independent reference; the runner rejects it as one.
+For an independent Ganesh GLES reference on macOS, build Skia's pinned ANGLE
+Metal implementation and add it to the native test binary:
+
+```sh
+python3 wink/test/skia/build-angle.py
+python3 wink/test/skia/build.py --no-sync --angle build/skia/angle
+python3 wink/test/skia/run.py reference --route gles --reference-angle \
+  --sources gm --match '^aaclip$' --out build/skia/clip-reference-gles
+```
+
+Only a reference invocation explicitly selects ANGLE; candidates always use
+Wink. The runner checks the actual renderer and hashes both ANGLE libraries.
+ANGLE Metal does not supply the GLES 3.1 required by Dawn, so this reference
+configuration covers Ganesh GLES. Graphite Dawn GLES still needs an independent
+GLES 3.1 reference.
 
 Comparisons require matching Skia revisions, fixtures, route, sources, and
 selection. They compare DM's raw output hashes, including alpha and output
@@ -119,6 +140,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s wink/test/skia -p 'tes
 ```
 
 Full acceptance additionally requires complete browser ST/MT corpus runs,
-outer Dawn GLES integration, independent GLES references, full CTS regression
+browser outer Dawn GLES integration, independent Graphite Dawn GLES references, full CTS regression
 comparisons, and repeated cold/warm-cache runs. Successful isolated browser
 GMs or the native SkSL suites do not establish that acceptance.
