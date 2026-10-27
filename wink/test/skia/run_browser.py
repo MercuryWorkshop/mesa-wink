@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Browser execution adapter for run.py; artifacts stream to the local runner."""
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ def execute(a):
     a.out.mkdir(parents=True)
     graphite = ROUTES[a.route][1]
     seed = selected_seed(a)
+    trace = os.environ.get('WINK_SKIA_TRACE_PRECOMPILE')
     args = ['--config', a.route, '--src', *a.sources, '--resourcePath', '/resources',
             '--images', '/resources/images', '--threads', '0',
             '--gpuThreads', '0' if a.target == 'st' else '2', '--verbose', '--nocpu']
@@ -37,6 +39,7 @@ def execute(a):
                     skia_fixes=skia_fixes,
                     skia=pin, sources=a.sources, match=a.match, fixtures=fixtures(a.source),
                     paint_key_seed=seed,
+                    environment={'WINK_SKIA_TRACE_PRECOMPILE': trace} if trace is not None else {},
                     wasm_sha256=digest(build / 'dm.wasm'), js_sha256=digest(build / 'dm.js'),
                     wink=subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
                     **{'pass': False, 'problems': ['execution has not completed']})
@@ -49,6 +52,8 @@ def execute(a):
         options = {'args': json.dumps(phase_args), 'route': a.route, 'target': a.target}
         if seed is not None:
             options['paint-key-seed'] = seed
+        if trace is not None:
+            options['trace-precompile'] = trace
         query = urlencode(options)
         command = ['node', str(HERE.parent / 'run-browser.mjs'), str(build),
                    '--page=index.html?' + query, '--timeout=' + str(a.timeout),

@@ -40,6 +40,11 @@ try {
     module.ENV.WINK_SKIA_PAINT_KEY_SEED = seed;
     envStrings.push(['WINK_SKIA_PAINT_KEY_SEED', seed]);
   }
+  if (options.has('trace-precompile')) {
+    const trace = options.get('trace-precompile');
+    module.ENV.WINK_SKIA_TRACE_PRECOMPILE = trace;
+    envStrings.push(['WINK_SKIA_TRACE_PRECOMPILE', trace]);
+  }
   for (const [key, value] of envStrings) {
     const alloc = s => {
       const b = new TextEncoder().encode(s + '\0');

@@ -18,7 +18,9 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'graphite-automatic-image-tiling-v1',
                      'graphite-oversized-image-shader-paint-fallback-v1',
                      'graphite-precompile-random-local-matrix-v1',
-                     'graphite-blur-precompile-coverage-v1']
+                     'graphite-blur-precompile-coverage-v2',
+                     'graphite-gradient-precompile-alpha-v1',
+                     'graphite-yuv-precompile-alpha-v1']
 
 
 def run(args, **kwargs):
@@ -56,6 +58,32 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # The real gradient path uses unpremultiplied interpolation for perceptual
+    # color spaces and for explicit unpremultiplied interpolation. This is
+    # visible in specialized keys inside working-color-space shaders.
+    patch(source, 'src/gpu/graphite/precompile/PrecompileShader.cpp',
+          '''        ColorSpaceTransformBlock::ColorSpaceTransformData csData(
+                intermediateCS.get(), kPremul_SkAlphaType,
+                dstCS, kPremul_SkAlphaType);''',
+          '''        using ColorSpace = SkGradient::Interpolation::ColorSpace;
+        bool inputPremul = static_cast<bool>(fInterpolation.fInPremul);
+        switch (fInterpolation.fColorSpace) {
+            case ColorSpace::kLab:
+            case ColorSpace::kOKLab:
+            case ColorSpace::kOKLabGamutMap:
+            case ColorSpace::kLCH:
+            case ColorSpace::kOKLCH:
+            case ColorSpace::kOKLCHGamutMap:
+            case ColorSpace::kHSL:
+            case ColorSpace::kHWB:
+                inputPremul = false;
+                break;
+            default:
+                break;
+        }
+        ColorSpaceTransformBlock::ColorSpaceTransformData csData(
+                intermediateCS.get(), inputPremul ? kPremul_SkAlphaType : kUnpremul_SkAlphaType,
+                dstCS, keyContext.dstColorInfo().alphaType());''')
     # Coverage-layer blur consumes Alpha_8 images, and non-normal blur styles
     # combine the original and blurred masks. Precompile all those real paths,
     # including the actual coverage geometry and text's bitmap-mask fallback.
@@ -108,6 +136,39 @@ def adapt(source):
 
         // c.f. AutoLayerForImageFilter::addMaskFilterLayer.''')
     patch(source, 'src/gpu/graphite/precompile/PrecompileMaskFilter.cpp',
+          '''            restoreOptions.setMaskFilters({});''',
+          '''            restoreOptions.setMaskFilters({});
+            // LCD text and complex paths with a mask filter can use a
+            // grayscale atlas fallback instead of a filtered coverage layer.
+            if (drawTypes & (DrawTypeFlags::kBitmapText_LCD | DrawTypeFlags::kNonSimpleShape)) {
+                restoreOptions.priv().buildCombinations(keyContext,
+                        DrawTypeFlags::kBitmapText_Mask, false, Coverage::kSingleChannel,
+                        renderPassDescIn, processCombination);
+            }''')
+    patch(source, 'src/gpu/graphite/precompile/PrecompileMaskFilter.cpp',
+          '''                    renderPassDescIn,
+                    processCombination);''',
+          '''                    renderPassDescIn,
+                    processCombination);
+            // A complex path's coverage draw may require MSAA/stencil, but
+            // restoring the filtered mask uses a single-sample depth pass.
+            if (renderPassDescIn.fSampleCount != SampleCount::k1) {
+                RenderPassDesc restorePass = renderPassDescIn;
+                restorePass.fSampleCount = SampleCount::k1;
+                restorePass.fColorAttachment.fSampleCount = SampleCount::k1;
+                restorePass.fColorResolveAttachment = {};
+                restorePass.fDepthStencilAttachment.fSampleCount = SampleCount::k1;
+                restorePass.fDepthStencilAttachment.fFormat = caps->getDepthStencilFormat(
+                        caps->avoidDepthMode() ? DepthStencilFlags::kNone
+                                               : DepthStencilFlags::kDepth);
+                restoreOptions.priv().buildCombinations(keyContext,
+                        static_cast<DrawTypeFlags>(InternalDrawTypeFlags::kCoverageMask),
+                        false, Coverage::kSingleChannel, restorePass, processCombination);
+                restoreOptions.priv().buildCombinations(keyContext,
+                        DrawTypeFlags::kBitmapText_Mask, false, Coverage::kSingleChannel,
+                        restorePass, processCombination);
+            }''')
+    patch(source, 'src/gpu/graphite/precompile/PrecompileMaskFilter.cpp',
           '''            coverageOptions.priv().buildCombinations(
                     keyContext,
                     DrawTypeFlags::kAnalyticRRect,
@@ -156,6 +217,21 @@ def adapt(source):
           '''        SkMatrix perspective = SkMatrix::I();
         perspective.setPerspX(0.5f);
         storage->postConcat(perspective);''')
+    # YUVA sampling returns unpremultiplied color even when the image's
+    # advertised alpha type is premultiplied; match add_yuv_image_to_key.
+    patch(source, 'src/gpu/graphite/precompile/PrecompileShader.cpp',
+          '''        colorXformData.fSteps = SkColorSpaceXformSteps(
+                colorInfo.colorSpace(), colorInfo.alphaType(),
+                dstColorSpace, colorInfo.alphaType());''',
+          '''        const SkAlphaType srcAT = colorInfo.alphaType() == kPremul_SkAlphaType
+                                                ? kUnpremul_SkAlphaType : colorInfo.alphaType();
+        SkAlphaType dstAT = fUseDstColorSpace ? keyContext.dstColorInfo().alphaType()
+                                            : colorInfo.alphaType();
+        if (dstAT == kOpaque_SkAlphaType && srcAT == kUnpremul_SkAlphaType) {
+            dstAT = kPremul_SkAlphaType;
+        }
+        colorXformData.fSteps = SkColorSpaceXformSteps(
+                colorInfo.colorSpace(), srcAT, dstColorSpace, dstAT);''')
     patch(source, 'tests/graphite/precompile/PaintParamsKeyTest.cpp',
           '#include "tests/Test.h"', '#include "tests/Test.h"\n#include <cstdlib>')
     patch(source, 'tests/graphite/precompile/PaintParamsKeyTest.cpp',

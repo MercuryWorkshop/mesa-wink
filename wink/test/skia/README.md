@@ -50,9 +50,13 @@ texture limit keep their error path. This correction is recorded in
 
 Graphite mask-filter precompilation includes alpha-only blur inputs, the
 inner/solid/outer mask combinations, and the coverage geometry and render
-passes used by rectangles and blurred text paths. The randomized precompile
+passes used by rectangles and blurred text paths, including single-sample
+restores after MSAA coverage and grayscale atlas fallbacks for LCD text and paths.
+Gradient and YUVA precompilation also use the same intermediate alpha types
+and destination alpha types as real draws, including specialized transforms
+inside working-color-space shaders. The randomized precompile
 test also composes its perspective transform instead of generating a singular
-matrix. Both corrections are recorded in `skia_fixes`; the original key and
+matrix. These corrections are recorded in `skia_fixes`; the original key and
 pipeline coverage assertions remain enabled.
 
 The integration registers FreeType's compiled SVG renderer in its Wasm module
@@ -130,8 +134,8 @@ Use `--paint-key-seed 1793113975` to replay `PaintParamsKeyTestReduced` with
 an unsigned 32-bit seed, on native or browser routes. The equivalent environment
 variable is `WINK_SKIA_PAINT_KEY_SEED`; the command-line option takes precedence.
 The selected seed is recorded in run metadata and must match for comparisons.
-Without an override, Skia keeps its time-derived seed. Native runs can set
-`WINK_SKIA_TRACE_PRECOMPILE=1` to print missing pipeline descriptions alongside
+Without an override, Skia keeps its time-derived seed. Set
+`WINK_SKIA_TRACE_PRECOMPILE=1` on native or browser runs to print missing pipeline descriptions alongside
 precompiled candidates when diagnosing a coverage assertion.
 
 GLES always uses Wink's context factory and proc-address API. Vulkan uses an
