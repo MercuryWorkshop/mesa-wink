@@ -411,6 +411,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   filter for them. The runtime's nir_vk_lower_ycbcr_tex samples each plane
   and converts, before the shader's source is kept. Of optimal tiling,
   they have layers as any other image does (ycbcrImageArrays).
+- **Sampled linear images**: uncompressed 2D color images, including YCbCr
+  planes, can be sampled from a texture uploaded from their linear memory
+  before shader use. Host rewrites and GPU transfer destinations remain
+  authoritative in that memory. Linear images have one mip and one layer;
+  storage and attachment usage are unsupported. Uploading before each use
+  favors correctness over caching host changes.
 - **Memory is one WGPUBuffer**, made when a buffer is first bound to it,
   which the buffers bound to it share. An optimal image is a texture of its
   own and its memory only accounting, of a memory type of its own that no

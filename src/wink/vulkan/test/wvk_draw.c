@@ -537,11 +537,68 @@ test_precise_queries(VkBuffer vertices, VkSampleCountFlagBits samples, VkSampleM
    printf("precise queries (%u samples, mask %x): done\n", samples, mask);
 }
 
+static struct image
+make_linear_texture(void **map, VkSubresourceLayout *layout)
+{
+   const VkFormat formats[] = { VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM };
+   for (unsigned i = 0; i < 2; ++i) {
+      VkSamplerYcbcrConversionImageFormatProperties ycbcr = {
+         .sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES,
+      };
+      VkImageFormatProperties2 props = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2, .pNext = &ycbcr,
+      };
+      VkPhysicalDeviceImageFormatInfo2 info = {
+         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+         .format = formats[i], .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_LINEAR,
+         .usage = VK_IMAGE_USAGE_SAMPLED_BIT,
+      };
+      VK(vkGetPhysicalDeviceImageFormatProperties2(pdev, &info, &props));
+      CHECK(ycbcr.combinedImageSamplerDescriptorCount == i + 1,
+            "linear plane descriptor count: %u", ycbcr.combinedImageSamplerDescriptorCount);
+      CHECK(props.imageFormatProperties.maxMipLevels == 1 && props.imageFormatProperties.maxArrayLayers == 1,
+            "linear subresource limits");
+      info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+      CHECK(vkGetPhysicalDeviceImageFormatProperties2(pdev, &info, &props) == VK_ERROR_FORMAT_NOT_SUPPORTED,
+            "linear storage images must remain unsupported");
+   }
+   struct image im = { 0 };
+   VK(vkCreateImage(dev, &(VkImageCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+      .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { 2, 2, 1 }, .mipLevels = 1, .arrayLayers = 1,
+      .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
+      .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+   }, NULL, &im.image));
+   VkMemoryRequirements req;
+   vkGetImageMemoryRequirements(dev, im.image, &req);
+   VK(vkAllocateMemory(dev, &(VkMemoryAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size + req.alignment,
+      .memoryTypeIndex = memory_type(req.memoryTypeBits, HOST),
+   }, NULL, &im.memory));
+   VK(vkBindImageMemory(dev, im.image, im.memory, req.alignment));
+   void *allocation;
+   VK(vkMapMemory(dev, im.memory, 0, VK_WHOLE_SIZE, 0, &allocation));
+   *map = (uint8_t *)allocation + req.alignment;
+   vkGetImageSubresourceLayout(dev, im.image, &(VkImageSubresource){
+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+   }, layout);
+   VK(vkCreateImageView(dev, &(VkImageViewCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im.image,
+      .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+   }, NULL, &im.view));
+   return im;
+}
+
 static void
-test_texture(VkBuffer vertices)
+test_texture(VkBuffer vertices, bool linear)
 {
    /* A 2x2 texture, a texel per corner, sampled nearest. */
-   struct image tex = make_image(2, 2, VK_FORMAT_R8G8B8A8_UNORM,
+   void *linear_map = NULL;
+   VkSubresourceLayout linear_layout;
+   struct image tex = linear ? make_linear_texture(&linear_map, &linear_layout)
+                            : make_image(2, 2, VK_FORMAT_R8G8B8A8_UNORM,
                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
    struct buffer staging = make_buffer(16, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST);
    const uint8_t texels[16] = { 255, 0, 0, 255,   0, 255, 0, 255,
@@ -608,30 +665,50 @@ test_texture(VkBuffer vertices)
    struct buffer out = make_buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST);
    const VkDeviceSize zero = 0;
 
-   VkCommandBuffer cmd = begin();
-   /* The aligned binding must copy the GPU's current bytes, rather than
-    * reading the zeroes from the mapped allocation. */
-   vkCmdUpdateBuffer(cmd, ubo.buffer, 0, sizeof(scale), scale);
-   vkCmdCopyBufferToImage(cmd, staging.buffer, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                          &(VkBufferImageCopy){
-      .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 2, 2, 1 },
-   });
-   begin_pass(cmd, &target, false);
-   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-   vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &zero);
-   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
-   const struct push push = { { 1, 1, 1, 1 }, { 0, 0 } };
-   vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
-   vkCmdDraw(cmd, 4, 1, 0, 0);
-   end_pass_and_read(cmd, &target, &out);
-   submit_and_wait(cmd);
+   for (unsigned round = 0; round < (linear ? 3u : 1u); ++round) {
+      /* Refresh after a host rewrite, then after a GPU buffer-to-image copy.
+       * The sampled shadow must never overwrite authoritative linear memory. */
+      if (linear && round < 2) {
+         for (unsigned y = 0; y < 2; ++y) {
+            uint8_t *row = (uint8_t *)linear_map + linear_layout.offset + y * linear_layout.rowPitch;
+            memcpy(row, texels + y * 8, 8);
+            if (round == 1)
+               for (unsigned x = 0; x < 2; ++x) {
+               const uint8_t r = row[x * 4];
+               row[x * 4] = row[x * 4 + 2];
+               row[x * 4 + 2] = r;
+               }
+         }
+      }
+      VkCommandBuffer cmd = begin();
+      /* The aligned binding must copy the GPU's current bytes, rather than
+       * reading the zeroes from the mapped allocation. */
+      vkCmdUpdateBuffer(cmd, ubo.buffer, 0, sizeof(scale), scale);
+      if (!linear || round == 2) {
+         vkCmdCopyBufferToImage(cmd, staging.buffer, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                                &(VkBufferImageCopy){
+            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, .imageExtent = { 2, 2, 1 },
+         });
+      }
+      begin_pass(cmd, &target, false);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+      vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &zero);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
+      const struct push push = { { 1, 1, 1, 1 }, { 0, 0 } };
+      vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push), &push);
+      vkCmdDraw(cmd, 4, 1, 0, 0);
+      end_pass_and_read(cmd, &target, &out);
+      submit_and_wait(cmd);
 
-   const uint8_t *tl = pixel(&out, 0, 0), *tr = pixel(&out, W - 1, 0);
-   const uint8_t *bl = pixel(&out, 0, H - 1), *br = pixel(&out, W - 1, H - 1);
-   CHECK(is(tl, 255, 0, 0), "texture top left: %u %u %u %u", tl[0], tl[1], tl[2], tl[3]);
-   CHECK(is(tr, 0, 128, 0), "texture top right: %u %u %u %u", tr[0], tr[1], tr[2], tr[3]);
-   CHECK(is(bl, 0, 0, 255), "texture bottom left: %u %u %u %u", bl[0], bl[1], bl[2], bl[3]);
-   CHECK(is(br, 255, 128, 255), "texture bottom right: %u %u %u %u", br[0], br[1], br[2], br[3]);
+      const uint8_t *tl = pixel(&out, 0, 0), *tr = pixel(&out, W - 1, 0);
+      const uint8_t *bl = pixel(&out, 0, H - 1), *br = pixel(&out, W - 1, H - 1);
+      CHECK(is(tl, round == 1 ? 0 : 255, 0, round == 1 ? 255 : 0),
+            "texture top left round %u: %u %u %u %u", round, tl[0], tl[1], tl[2], tl[3]);
+      CHECK(is(tr, 0, 128, 0), "texture top right: %u %u %u %u", tr[0], tr[1], tr[2], tr[3]);
+      CHECK(is(bl, round == 1 ? 255 : 0, 0, round == 1 ? 0 : 255),
+            "texture bottom left round %u: %u %u %u %u", round, bl[0], bl[1], bl[2], bl[3]);
+      CHECK(is(br, 255, 128, 255), "texture bottom right: %u %u %u %u", br[0], br[1], br[2], br[3]);
+   }
 
    free_buffer(&out);
    free_image(&target);
@@ -644,8 +721,10 @@ test_texture(VkBuffer vertices)
    vkDestroySampler(dev, sampler, NULL);
    free_buffer(&ubo);
    free_buffer(&staging);
+   if (linear_map)
+      vkUnmapMemory(dev, tex.memory);
    free_image(&tex);
-   printf("texture: done\n");
+   printf("%stexture: done\n", linear ? "linear sampled " : "");
 }
 
 static void
@@ -853,7 +932,8 @@ main(void)
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_1_BIT, ~0u, 1);
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_4_BIT, ~0u, 4);
    test_precise_queries(vertices.buffer, VK_SAMPLE_COUNT_4_BIT, 5u, 2);
-   test_texture(vertices.buffer);
+   test_texture(vertices.buffer, false);
+   test_texture(vertices.buffer, true);
    test_clear_attachments();
    test_blit();
    test_instances();

@@ -158,8 +158,10 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       image->linear = true;
       image->pitch = wvk_image_linear_pitch(pCreateInfo->format, pCreateInfo->extent.width);
       image->dimension = WGPUTextureDimension_2D;
-      *pImage = wvk_image_to_handle(image);
-      return VK_SUCCESS;
+      if (!(pCreateInfo->usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
+         *pImage = wvk_image_to_handle(image);
+         return VK_SUCCESS;
+      }
    }
 
    image->format = format->texture;
@@ -261,7 +263,7 @@ wvk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       image->shadow = wgpuDeviceCreateTexture(dev->wgpu, &sd);
    }
    /* Until written, any texture of it is as good as another. */
-   image->tracked = image->shadow != NULL;
+   image->tracked = image->shadow != NULL || image->linear;
    if (image->tracked)
       p_atomic_inc(&dev->tracked_images);
    for (uint32_t l = 0; l < ARRAY_SIZE(image->valid); ++l)
@@ -425,6 +427,12 @@ void
 wvk_image_make_current(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
                        uint32_t t, uint32_t first, uint32_t count)
 {
+   if (image->linear && image->texture) {
+      /* Linear memory remains authoritative: host writes and transfer
+       * destinations both update it, while sampling uses a texture copy. */
+      wvk_image_upload_linear(dev, replay, image);
+      wvk_image_written(image, WVK_IMAGE_TEXTURE, 0, 1);
+   }
    const enum pipe_format pformat = vk_format_to_pipe_format(image->vk.format);
    const uint32_t bw = util_format_get_blockwidth(pformat), bh = util_format_get_blockheight(pformat);
    const uint32_t block_bytes = util_format_get_blocksize(pformat);
@@ -555,7 +563,8 @@ wvk_image_linear_supported(const struct wvk_physical_device *pdev, VkFormat form
    return type == VK_IMAGE_TYPE_2D && caps &&
           !(caps & (WVK_CAP_COMPRESSED | WVK_CAP_DEPTH | WVK_CAP_STENCIL)) &&
           !(usage & ~(VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                      VK_IMAGE_USAGE_HOST_TRANSFER_BIT));
+                      VK_IMAGE_USAGE_HOST_TRANSFER_BIT | VK_IMAGE_USAGE_SAMPLED_BIT)) &&
+          (!(usage & VK_IMAGE_USAGE_SAMPLED_BIT) || (caps & WVK_CAP_SAMPLE));
 }
 
 uint32_t

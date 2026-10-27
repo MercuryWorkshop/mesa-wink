@@ -173,6 +173,8 @@ wvk_image_texture(const struct wvk_image *image, uint32_t t, uint32_t *first_lev
 static inline bool
 wvk_image_current(const struct wvk_image *image, uint32_t t, uint32_t first, uint32_t count)
 {
+   if (image->linear && image->texture)
+      return false;
    if (!image->tracked)
       return true;
    for (uint32_t l = first; l < first + count && l < ARRAY_SIZE(image->valid); ++l) {
@@ -186,6 +188,7 @@ wvk_image_current(const struct wvk_image *image, uint32_t t, uint32_t first, uin
  * any pass, whose end this is if one is going on. */
 void wvk_image_make_current(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
                             uint32_t t, uint32_t first, uint32_t count);
+void wvk_image_upload_linear(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image);
 
 /* After a write to texture `t` of the levels, the others are behind. */
 static inline void
@@ -205,7 +208,9 @@ static inline void
 wvk_image_use(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image, uint32_t first,
               uint32_t count, bool write)
 {
-   if (!image->tracked)
+   /* Transfers access linear memory directly; only shader reads need its
+    * texture uploaded (wvk_image_make_current). */
+   if (!image->tracked || image->linear)
       return;
    if (!wvk_image_current(image, WVK_IMAGE_TEXTURE, first, count))
       wvk_image_make_current(dev, replay, image, WVK_IMAGE_TEXTURE, first, count);

@@ -619,6 +619,25 @@ copy_color(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_i
       copy_buffer_texture(replay, to_texture, buffer, offset, l, tex, size);
 }
 
+void
+wvk_image_upload_linear(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image)
+{
+   if (!image->mem)
+      return;
+   wvk_replay_end_passes(replay);
+   const uint32_t width = image->vk.extent.width, height = image->vk.extent.height;
+   const uint32_t bytes = util_format_get_blocksize(vk_format_to_pipe_format(image->vk.format));
+   const struct copy_layout l = {
+      .block_w = 1, .block_h = 1, .block_bytes = bytes,
+      .row_bytes = image->pitch, .rows_per_image = height,
+   };
+   const WGPUExtent3D size = { width, height, 1 };
+   WGPUTexelCopyTextureInfo tex = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+   tex.texture = image->texture;
+   wvk_replay_read(replay, image->mem, image->offset, region_bytes(&l, size));
+   copy_color(dev, replay, image, true, image->mem->buffer, image->offset, &l, &tex, size);
+}
+
 static bool
 is_packed16_format(VkFormat format)
 {
