@@ -20826,7 +20826,8 @@ static unsigned long gex_wgpu_subdata_skipped, gex_wgpu_subdata_skipped_bytes;
 #define GEX_WGPU_INDEX_PATCH_SLAB_BYTES (1u << 20)
 #define GEX_WGPU_INDEX_PATCH_MAX_BYTES (64u << 10)
 static uint64_t gex_wgpu_index_patched, gex_wgpu_index_patched_bytes,
-   gex_wgpu_index_redirected, gex_wgpu_index_patch_applied_early;
+   gex_wgpu_index_redirected, gex_wgpu_index_patch_applied_early,
+   gex_wgpu_index_patch_grown;
 
 static bool
 gex_wgpu_index_patch_on(void)
@@ -20883,12 +20884,24 @@ gex_wgpu_index_patch(struct gex_wgpu_context *ctx,
    const uint32_t at = ctx->index_patch_used;
    ctx->index_patch_used = at + size;
    wgpuQueueWriteBuffer(screen->queue, ctx->index_patch_slab, at, data, size);
-   struct gex_wgpu_index_patch *p = &ctx->index_patches[ctx->index_patch_count++];
-   p->resource = NULL;
-   pipe_resource_reference(&p->resource, resource);
-   p->lo = offset;
-   p->hi = offset + size;
-   p->at = at;
+   /* A write that carries on where the last patch ended, in the buffer and
+    * in the slab, grows it: an application filling its indices a few draws'
+    * worth at a time then draws across those writes, and one patch still
+    * holds them all. The last patch is the newest, so all of it still is. */
+   struct gex_wgpu_index_patch *last =
+      ctx->index_patch_count ? &ctx->index_patches[ctx->index_patch_count - 1] : NULL;
+   if (last && last->resource == resource && last->hi == offset &&
+       last->at + (last->hi - last->lo) == at) {
+      last->hi = offset + size;
+      ++gex_wgpu_index_patch_grown;
+   } else {
+      struct gex_wgpu_index_patch *p = &ctx->index_patches[ctx->index_patch_count++];
+      p->resource = NULL;
+      pipe_resource_reference(&p->resource, resource);
+      p->lo = offset;
+      p->hi = offset + size;
+      p->at = at;
+   }
    gex->index_patched_by |= ctx->batch_bit;
    /* Read, as far as later writes go: one that overlaps it must not reach
     * the buffer ahead of the copy at the end of the batch. */
@@ -40748,7 +40761,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                   wib[2] = (uint64_t)dirk_index_bounds_ns;
                }
                {
-                  static uint64_t wpe[GEX_WGPU_PASS_END_COUNT + 1], wsz[4], wbd[4], wsb, wbig[2], wip[4];
+                  static uint64_t wpe[GEX_WGPU_PASS_END_COUNT + 1], wsz[4], wbd[4], wsb, wbig[2], wip[5];
                   uint64_t named = 0;
                   for (unsigned i = 0; i < GEX_WGPU_PASS_END_COUNT; ++i)
                      named += gex_wgpu_pass_ends[i] - wpe[i];
@@ -40761,7 +40774,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                           "%.1f, to 1 MiB %.1f, to 4 MiB %.1f, past %.1f; by binding: vertex "
                           "%.1f, index %.1f, constant %.1f, other %.1f; %.1f KiB staged; "
                           "not renamed as big: past 4 MiB %.1f, carry past 1 MiB %.1f; "
-                          "index patches %.1f (%.1f KiB), draws on them %.1f, applied "
+                          "index patches %.1f (%.1f KiB, %.1f grew the last), draws on them %.1f, applied "
                           "early %.1f, passes closed applying them %.1f\n",
                           (gex_wgpu_pass_ends[0] - wpe[0]) / f, (gex_wgpu_pass_ends[1] - wpe[1]) / f,
                           (gex_wgpu_pass_ends[2] - wpe[2]) / f, (gex_wgpu_pass_ends[3] - wpe[3]) / f,
@@ -40775,6 +40788,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                           (gex_wgpu_norename_big_carry - wbig[1]) / f,
                           (gex_wgpu_index_patched - wip[0]) / f,
                           (gex_wgpu_index_patched_bytes - wip[1]) / f / 1024,
+                          (gex_wgpu_index_patch_grown - wip[4]) / f,
                           (gex_wgpu_index_redirected - wip[2]) / f,
                           (gex_wgpu_index_patch_applied_early - wip[3]) / f,
                           (gex_wgpu_pass_ends[GEX_WGPU_PASS_END_PATCH] - wpe[GEX_WGPU_PASS_END_PATCH]) / f);
@@ -40782,6 +40796,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                   wip[1] = gex_wgpu_index_patched_bytes;
                   wip[2] = gex_wgpu_index_redirected;
                   wip[3] = gex_wgpu_index_patch_applied_early;
+                  wip[4] = gex_wgpu_index_patch_grown;
                   memcpy(wpe, gex_wgpu_pass_ends, sizeof(wpe));
                   memcpy(wsz, gex_wgpu_staged_by_size, sizeof(wsz));
                   memcpy(wbd, gex_wgpu_staged_by_bind, sizeof(wbd));
