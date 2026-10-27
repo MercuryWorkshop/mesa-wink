@@ -97,9 +97,154 @@ static struct gex_wgpu_made {
 #define wgpuQueueSubmit(...) GEX_WGPU_MADE(submits, wgpuQueueSubmit(__VA_ARGS__))
 #define wgpuDeviceCreateCommandEncoder(...) GEX_WGPU_MADE(encoders, wgpuDeviceCreateCommandEncoder(__VA_ARGS__))
 #define wgpuCommandEncoderBeginRenderPass(...) GEX_WGPU_MADE(render_passes, wgpuCommandEncoderBeginRenderPass(__VA_ARGS__))
+
+/* Queue writes coalesced (GEX_WGPU_COALESCE=1, one-thread screens only): a
+ * write lands on the queue ahead of every submit after it, so writes to one
+ * buffer between two submits can go as one where they touch or overlap --
+ * later bytes over earlier ones, in the order they were made. Held in host
+ * copies until the next submit, a map, or a write that does not join (to a
+ * buffer whose held range it does not touch, or too big), which sends the
+ * held one first; the rest go as they come. GEX_WGPU_COALESCE=2 only counts
+ * what would join. Each write to the browser costs a call and a view of the
+ * heap: Hades through dirk made about 1,000 a frame. */
+#define GEX_WGPU_COALESCE_SLOTS 16
+#define GEX_WGPU_COALESCE_MAX_BYTES (256u << 10)
+struct gex_wgpu_coalesce_slot {
+   WGPUBuffer buffer;
+   uint64_t lo, hi;
+   uint8_t *bytes;
+   uint32_t cap;
+};
+static struct {
+   WGPUQueue queue;
+   int mode;
+   unsigned next;
+   struct gex_wgpu_coalesce_slot slot[GEX_WGPU_COALESCE_SLOTS];
+} gex_wgpu_coalesce;
+static uint64_t gex_wgpu_coalesce_writes, gex_wgpu_coalesce_joined;
+
+static void
+gex_wgpu_coalesce_send(struct gex_wgpu_coalesce_slot *s)
+{
+   if (!s->buffer)
+      return;
+   if (gex_wgpu_coalesce.mode == 1) {
+      ++gex_wgpu_made.write_buffers;
+      gex_wgpu_made.write_buffer_bytes += s->hi - s->lo;
+      wgpuQueueWriteBuffer(gex_wgpu_coalesce.queue, s->buffer, s->lo, s->bytes,
+                           s->hi - s->lo);
+   }
+   wgpuBufferRelease(s->buffer);
+   s->buffer = NULL;
+}
+
+/* Everything held goes to the queue: before a submit or a map. */
+static void
+gex_wgpu_coalesce_flush(void)
+{
+   for (unsigned i = 0; i < GEX_WGPU_COALESCE_SLOTS; ++i)
+      gex_wgpu_coalesce_send(&gex_wgpu_coalesce.slot[i]);
+}
+
+static void
+gex_wgpu_queue_write(WGPUQueue queue, WGPUBuffer buffer, uint64_t offset,
+                     const void *data, size_t size)
+{
+   if (!gex_wgpu_coalesce.mode || queue != gex_wgpu_coalesce.queue) {
+      ++gex_wgpu_made.write_buffers;
+      gex_wgpu_made.write_buffer_bytes += size;
+      wgpuQueueWriteBuffer(queue, buffer, offset, data, size);
+      return;
+   }
+   ++gex_wgpu_coalesce_writes;
+   const bool held = gex_wgpu_coalesce.mode == 1;
+   struct gex_wgpu_coalesce_slot *s = NULL, *free_slot = NULL;
+   for (unsigned i = 0; i < GEX_WGPU_COALESCE_SLOTS; ++i) {
+      struct gex_wgpu_coalesce_slot *t = &gex_wgpu_coalesce.slot[i];
+      if (t->buffer == buffer)
+         s = t;
+      else if (!t->buffer && !free_slot)
+         free_slot = t;
+   }
+   const uint64_t end = offset + size;
+   const bool fits = !((offset | size) & 3u) && size <= GEX_WGPU_COALESCE_MAX_BYTES;
+   if (s && fits && offset <= s->hi && end >= s->lo &&
+       MAX2(end, s->hi) - MIN2(offset, s->lo) <= GEX_WGPU_COALESCE_MAX_BYTES) {
+      /* Joins the held range. */
+      const uint64_t lo = MIN2(offset, s->lo), hi = MAX2(end, s->hi);
+      if (held) {
+         if (hi - lo > s->cap) {
+            const uint32_t cap = MAX2((uint32_t)(hi - lo), s->cap * 2);
+            uint8_t *grown = MALLOC(cap);
+            if (!grown) {
+               gex_wgpu_coalesce_send(s);
+               ++gex_wgpu_made.write_buffers;
+               gex_wgpu_made.write_buffer_bytes += size;
+               wgpuQueueWriteBuffer(queue, buffer, offset, data, size);
+               return;
+            }
+            memcpy(grown + (s->lo - lo), s->bytes, s->hi - s->lo);
+            FREE(s->bytes);
+            s->bytes = grown;
+            s->cap = cap;
+         } else if (lo < s->lo) {
+            memmove(s->bytes + (s->lo - lo), s->bytes, s->hi - s->lo);
+         }
+         memcpy(s->bytes + (offset - lo), data, size);
+      }
+      s->lo = lo;
+      s->hi = hi;
+      ++gex_wgpu_coalesce_joined;
+      return;
+   }
+   /* Does not join: what is held of this buffer goes first, keeping the
+    * order of writes to it. */
+   if (s) {
+      gex_wgpu_coalesce_send(s);
+      free_slot = s;
+   }
+   if (!fits) {
+      ++gex_wgpu_made.write_buffers;
+      gex_wgpu_made.write_buffer_bytes += size;
+      wgpuQueueWriteBuffer(queue, buffer, offset, data, size);
+      return;
+   }
+   if (!free_slot) {
+      free_slot = &gex_wgpu_coalesce.slot[gex_wgpu_coalesce.next++ %
+                                          GEX_WGPU_COALESCE_SLOTS];
+      gex_wgpu_coalesce_send(free_slot);
+   }
+   s = free_slot;
+   if (held) {
+      if (size > s->cap) {
+         FREE(s->bytes);
+         s->cap = MAX2((uint32_t)size, 4096u);
+         s->bytes = MALLOC(s->cap);
+         if (!s->bytes) {
+            s->cap = 0;
+            ++gex_wgpu_made.write_buffers;
+            gex_wgpu_made.write_buffer_bytes += size;
+            wgpuQueueWriteBuffer(queue, buffer, offset, data, size);
+            return;
+         }
+      }
+      memcpy(s->bytes, data, size);
+   } else {
+      /* Counting only: sent now. */
+      ++gex_wgpu_made.write_buffers;
+      gex_wgpu_made.write_buffer_bytes += size;
+      wgpuQueueWriteBuffer(queue, buffer, offset, data, size);
+   }
+   wgpuBufferAddRef(buffer);
+   s->buffer = buffer;
+   s->lo = offset;
+   s->hi = end;
+}
+
 #define wgpuQueueWriteBuffer(queue, buffer, offset, data, size) \
-   (++gex_wgpu_made.write_buffers, gex_wgpu_made.write_buffer_bytes += (size), \
-    wgpuQueueWriteBuffer(queue, buffer, offset, data, size))
+   gex_wgpu_queue_write(queue, buffer, offset, data, size)
+#define wgpuBufferMapAsync(...) \
+   (gex_wgpu_coalesce_flush(), wgpuBufferMapAsync(__VA_ARGS__))
 
 extern void gex_wgpu_jspi_wait(void);
 extern void gex_wgpu_jspi_signal(void);
@@ -6596,6 +6741,7 @@ gex_wgpu_queue_submit(struct gex_wgpu_screen *screen, size_t count,
                       WGPUCommandBuffer const *buffers)
 {
    simple_mtx_lock(&screen->queue_lock);
+   gex_wgpu_coalesce_flush();
    wgpuQueueSubmit(screen->queue, count, buffers);
    simple_mtx_unlock(&screen->queue_lock);
    gex_wgpu_reap(screen);
@@ -6737,6 +6883,10 @@ gex_wgpu_doom(struct gex_wgpu_screen *screen, WGPUBuffer buffer, WGPUTexture tex
 {
    if (!buffer && !texture)
       return;
+   /* A held write goes before the buffer can be destroyed. */
+   for (unsigned i = 0; buffer && i < GEX_WGPU_COALESCE_SLOTS; ++i)
+      if (gex_wgpu_coalesce.slot[i].buffer == buffer)
+         gex_wgpu_coalesce_send(&gex_wgpu_coalesce.slot[i]);
    simple_mtx_lock(&screen->doom_lock);
    const struct gex_wgpu_doomed d = { ++screen->doom_serial, buffer, texture };
    util_dynarray_append(&screen->doomed, d);
@@ -19411,6 +19561,11 @@ gex_wgpu_screen_one_thread(struct pipe_screen *screen)
    simple_mtx_lock(&gex->cache_lock);
    gex->one_thread = true;
    gex->device_lock_needed = false;
+   const char *coalesce = getenv("GEX_WGPU_COALESCE");
+   if (coalesce && (*coalesce == '1' || *coalesce == '2') && !gex_wgpu_coalesce.queue) {
+      gex_wgpu_coalesce.queue = gex->queue;
+      gex_wgpu_coalesce.mode = *coalesce - '0';
+   }
    simple_mtx_unlock(&gex->cache_lock);
 }
 
@@ -40232,7 +40387,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
             const double f = gex_wgpu_presents > was_presents
                                 ? (double)(gex_wgpu_presents - was_presents) : 1.0;
 #define GEX_PER(field) ((m->field - was.field) / f)
-            static uint64_t was_ver[2], was_rb[2];
+            static uint64_t was_ver[2], was_rb[2], was_co[2];
             static unsigned long was_rn[5], was_not[GEX_WGPU_NORENAME_COUNT];
 #define GEX_NOT(why) ((gex_wgpu_norename[why] - was_not[why]) / f)
             fprintf(stderr,
@@ -40241,7 +40396,8 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                     "bind group layouts %.1f, pipeline layouts %.1f, samplers %.1f, "
                     "buffers %.1f, textures %.1f, views %.1f, encoders %.1f, "
                     "render passes %.1f; queue: %.1f buffer writes (%.1f KiB), "
-                    "%.1f texture writes, %.1f submits; writes to a buffer the "
+                    "%.1f texture writes, %.1f submits (%.1f buffer writes joined "
+                    "another, of %.1f); writes to a buffer the "
                     "batch reads: %.1f direct beside its ranges (%.1f overlapped), "
                     "%.1f renamed (%.1f carried; %.0f KiB written, %.0f KiB "
                     "uploaded), %.1f staged, "
@@ -40258,6 +40414,8 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                     GEX_PER(views), GEX_PER(encoders), GEX_PER(render_passes),
                     GEX_PER(write_buffers), GEX_PER(write_buffer_bytes) / 1024,
                     GEX_PER(write_textures), GEX_PER(submits),
+                    (gex_wgpu_coalesce_joined - was_co[0]) / f,
+                    (gex_wgpu_coalesce_writes - was_co[1]) / f,
                     (gex_wgpu_range_direct - was_rn[3]) / f,
                     (gex_wgpu_range_overlap - was_rn[4]) / f,
                     (gex_wgpu_renamed - was_rn[0]) / f,
@@ -40275,6 +40433,8 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                     (gex_wgpu_versions_freed - was_ver[1]) / f,
                     (unsigned long long)(gex_wgpu_versions_made - gex_wgpu_versions_freed),
                     (gex_wgpu_versions_made_bytes - gex_wgpu_versions_freed_bytes) / 1048576.0);
+            was_co[0] = gex_wgpu_coalesce_joined;
+            was_co[1] = gex_wgpu_coalesce_writes;
             was_rb[0] = gex_wgpu_renamed_bytes;
             was_rb[1] = gex_wgpu_renamed_upload_bytes;
             was_ver[0] = gex_wgpu_versions_made;
