@@ -72,6 +72,11 @@ of assuming a five-nanosecond sleep advances the quantized browser clock. Its
 purge and cache-content assertions remain enabled. This test correction is
 recorded in `skia_fixes`.
 
+Graphite's resource cache also enforces its memory budget before early returns
+from age-limited or time-limited purges. Returned resources can put it over
+budget even when none qualify for an age purge. This correction is recorded
+in `skia_fixes`; the existing budget and purge assertions remain enabled.
+
 The test typeface helper uses its portable fallback when a native font manager
 returns an empty typeface, as can happen without installed system fonts in
 Wasm. Resource fonts still load through FreeType. This correction is recorded

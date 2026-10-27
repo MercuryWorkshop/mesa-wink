@@ -24,7 +24,8 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'graphite-blend-precompile-child-context-v1',
                      'graphite-color-text-mask-precompile-v1',
                      'resource-cache-purge-clock-progress-v1',
-                     'test-typeface-empty-native-fallback-v1']
+                     'test-typeface-empty-native-fallback-v1',
+                     'graphite-cache-budget-early-exit-v1']
 
 
 def run(args, **kwargs):
@@ -62,6 +63,47 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # Returned resources may put the cache over budget even when no resource
+    # is old enough for an age purge, or its time limit has already elapsed.
+    # Budget cleanup takes precedence, including these fast-return paths.
+    patch(source, 'src/gpu/graphite/ResourceCache.cpp',
+          '''        fPurgeableQueue.peek()->lastAccessTime() >= *purgeTime) {
+        return;
+    }
+    if (!time_remains_before_stop_time()) {
+        return;
+    }''',
+          '''        fPurgeableQueue.peek()->lastAccessTime() >= *purgeTime) {
+        this->purgeAsNeeded();
+        return;
+    }
+    if (!time_remains_before_stop_time()) {
+        this->purgeAsNeeded();
+        return;
+    }''')
+    patch(source, 'tests/graphite/GraphiteResourceCacheTest.cpp',
+          '// Test call purgeResources on the ResourceCache and make sure all unlocked resources are getting',
+          '''// Budget enforcement must still run when the age-purge deadline has expired.
+DEF_GRAPHITE_TEST_FOR_ALL_CONTEXTS(GraphiteOverBudgetExpiredPurgeTest, reporter, context,
+                                   CtsEnforcement::kNever) {
+    auto recorder = context->makeRecorder();
+    auto* provider = recorder->priv().resourceProvider();
+    auto* cache = provider->resourceCache();
+    cache->setMaxBudget(10);
+    auto a = add_new_resource(reporter, provider->sharedContext(), cache, 9, Budgeted::kNo);
+    auto b = add_new_resource(reporter, provider->sharedContext(), cache, 8, Budgeted::kNo);
+    a.reset();
+    b.reset();
+    cache->forceProcessReturnedResources();
+    REPORTER_ASSERT(reporter, cache->currentBudgetedBytes() == 17);
+    cache->purgeResourcesNotUsedSince(skgpu::StdSteadyClock::time_point::max(),
+                                     skgpu::StdSteadyClock::time_point::min());
+    REPORTER_ASSERT(reporter, cache->getResourceCount() == 1);
+    REPORTER_ASSERT(reporter, cache->currentBudgetedBytes() == 8 ||
+                              cache->currentBudgetedBytes() == 9);
+}
+
+// Test call purgeResources on the ResourceCache and make sure all unlocked resources are getting''')
     # A host without installed fonts may return a non-null empty typeface.
     # Use the existing portable fallback for it as well as for null results,
     # while keeping the native manager's resource-font loading available.
