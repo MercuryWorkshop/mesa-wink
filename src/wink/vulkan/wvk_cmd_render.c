@@ -263,9 +263,17 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
    VkRenderingAttachmentInfo msrtss_atts[10];
    VkRenderingInfo fitted_info;
    VkRenderingAttachmentInfo fitted_depth, fitted_stencil;
+   struct wvk_image_view *msrtss_sources[8] = {0};
+   if (info->flags & VK_RENDERING_RESUMING_BIT)
+      memcpy(msrtss_sources, replay->pass_copy.msrtss_sources, sizeof(msrtss_sources));
    if (info != &replay->pass_copy.info) {
       wvk_replay_end_passes(replay);
       info = msrtss_rendering(cmd, info, info->flags & VK_RENDERING_RESUMING_BIT, &msrtss_info, msrtss_atts);
+      for (uint32_t i = 0; i < MIN2(info->colorAttachmentCount, 8); ++i) {
+         const VkImageView original = pRenderingInfo->pColorAttachments[i].imageView;
+         if (original != info->pColorAttachments[i].imageView)
+            msrtss_sources[i] = wvk_image_view_from_handle(original);
+      }
       info = fit_transient_ds(cmd, info, &fitted_info, &fitted_depth, &fitted_stencil);
    }
    replay->pass_idle = replay->pass_layered && replay->pass_multiview && info->viewMask &&
@@ -320,6 +328,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       }
       /* Kept, to begin the pass again with (wvk_replay_restart_pass). */
       replay->pass_copy.info = *info;
+      memcpy(replay->pass_copy.msrtss_sources, msrtss_sources, sizeof(msrtss_sources));
       replay->pass_copy.info.pNext = NULL;
       const VkRenderingFragmentShadingRateAttachmentInfoKHR *rate =
          vk_find_struct_const(pRenderingInfo->pNext, RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR);

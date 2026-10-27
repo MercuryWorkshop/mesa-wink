@@ -537,6 +537,9 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   loads or its render area is less than all of it: WebGPU's resolves are
   of all of an attachment. Of 4 samples, which is all WebGPU has, and of
   formats WebGPU multisamples.
+  Multisampled color input attachments read snapshots of the emulated
+  attachment's individual samples, while single-sample reads keep using
+  the application's image.
 - **VK_KHR_maintenance10**: a resolve of another mode, or of an sRGB
   format's encoded values -- WebGPU's average the linear ones -- is
   vk_meta's, of vkCmdResolveImage2 or of a pass whose attachment says so;

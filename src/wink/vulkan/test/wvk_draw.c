@@ -26,6 +26,7 @@
 #include "texture_frag.h"
 #include "instanced_vert.h"
 #include "norm16_sample_comp.h"
+#include "ms_input_frag.h"
 #include <math.h>
 
 enum { W = 64, H = 64 };
@@ -744,6 +745,123 @@ test_texture(VkBuffer vertices, bool linear, VkFormat format)
    printf("%stexture format %u: done\n", linear ? "linear sampled " : "", format);
 }
 
+/* A subpassInputMS of an MSRTSS image must read individual samples of
+ * the emulated attachment, not the application's resolved image. */
+static void
+test_msrtss_input(VkBuffer vertices)
+{
+   VkDescriptorSetLayout set_layout;
+   VK(vkCreateDescriptorSetLayout(dev, &(VkDescriptorSetLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1,
+      .pBindings = &(VkDescriptorSetLayoutBinding){ 0, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1,
+                                                  VK_SHADER_STAGE_FRAGMENT_BIT, NULL },
+   }, NULL, &set_layout));
+   VkPipelineLayout layout;
+   VK(vkCreatePipelineLayout(dev, &(VkPipelineLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+      .setLayoutCount = 1, .pSetLayouts = &set_layout, .pushConstantRangeCount = 1,
+      .pPushConstantRanges = &(VkPushConstantRange){
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(struct push) },
+   }, NULL, &layout));
+   VkShaderModule vs = make_module(spv_quad_vert, sizeof(spv_quad_vert));
+   VkShaderModule solid = make_module(spv_solid_frag, sizeof(spv_solid_frag));
+   VkShaderModule input = make_module(spv_ms_input_frag, sizeof(spv_ms_input_frag));
+   VkPipeline write = make_pipeline_samples(layout, vs, solid, 0, VK_SAMPLE_COUNT_4_BIT, 1);
+   VkPipeline read = make_pipeline_samples(layout, vs, input, 0, VK_SAMPLE_COUNT_4_BIT, ~0u);
+   struct image target = make_image_samples_flags(W, H, VK_FORMAT_R8G8B8A8_UNORM,
+      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+      VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT);
+   struct buffer out = make_buffer(W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HOST);
+   VkDescriptorPool desc_pool;
+   VK(vkCreateDescriptorPool(dev, &(VkDescriptorPoolCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1,
+      .pPoolSizes = &(VkDescriptorPoolSize){ VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1 },
+   }, NULL, &desc_pool));
+   VkDescriptorSet set;
+   VK(vkAllocateDescriptorSets(dev, &(VkDescriptorSetAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = desc_pool,
+      .descriptorSetCount = 1, .pSetLayouts = &set_layout,
+   }, &set));
+   vkUpdateDescriptorSets(dev, 1, &(VkWriteDescriptorSet){
+      .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
+      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
+      .pImageInfo = &(VkDescriptorImageInfo){ VK_NULL_HANDLE, target.view, VK_IMAGE_LAYOUT_GENERAL },
+   }, 0, NULL);
+   VkCommandBuffer cmd = begin();
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1,
+      &(VkImageMemoryBarrier){ .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+         .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+         .image = target.image, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1} });
+   const uint32_t index = 0;
+   const VkRenderingInputAttachmentIndexInfoKHR indices = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INPUT_ATTACHMENT_INDEX_INFO_KHR,
+      .colorAttachmentCount = 1, .pColorAttachmentInputIndices = &index,
+   };
+   const VkMultisampledRenderToSingleSampledInfoEXT ms = {
+      .sType = VK_STRUCTURE_TYPE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT,
+      .pNext = &indices, .multisampledRenderToSingleSampledEnable = VK_TRUE,
+      .rasterizationSamples = VK_SAMPLE_COUNT_4_BIT,
+   };
+   begin_rendering(cmd, &(VkRenderingInfo){
+      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .pNext = &ms,
+      .renderArea = {{0, 0}, {W, H}}, .layerCount = 1, .colorAttachmentCount = 1,
+      .pColorAttachments = &(VkRenderingAttachmentInfo){
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = target.view,
+         .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+      },
+   });
+   vkCmdSetViewport(cmd, 0, 1, &(VkViewport){0, 0, W, H, 0, 1});
+   vkCmdSetScissor(cmd, 0, 1, &(VkRect2D){{0, 0}, {W, H}});
+   const VkDeviceSize zero = 0;
+   const struct push push = { .tint = {1, 0, 0, 1} };
+   vkCmdBindVertexBuffers(cmd, 0, 1, &vertices, &zero);
+   vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                      sizeof(push), &push);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, write);
+   vkCmdDraw(cmd, 4, 1, 0, 0);
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1,
+      &(VkMemoryBarrier){ .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT }, 0, NULL, 0, NULL);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, read);
+   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, NULL);
+   /* Three reads swap red/green back and forth, invalidating snapshots
+    * and restarting the pass between them. The final color is green. */
+   for (unsigned draw = 0; draw < 3; ++draw) {
+      if (draw)
+         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1,
+            &(VkMemoryBarrier){ .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+               .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+               .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT }, 0, NULL, 0, NULL);
+      vkCmdDraw(cmd, 4, 1, 0, 0);
+   }
+   end_pass_and_read(cmd, &target, &out);
+   submit_and_wait(cmd);
+   for (unsigned y = 0; y < H; ++y) {
+      for (unsigned x = 0; x < W; ++x) {
+         const uint8_t *p = pixel(&out, x, y);
+         CHECK(is(p, 0, 255, 0), "MSRTSS sample-zero read at %u,%u: %u %u %u %u",
+               x, y, p[0], p[1], p[2], p[3]);
+      }
+   }
+   vkDestroyDescriptorPool(dev, desc_pool, NULL);
+   free_buffer(&out);
+   free_image(&target);
+   vkDestroyPipeline(dev, read, NULL);
+   vkDestroyPipeline(dev, write, NULL);
+   vkDestroyShaderModule(dev, input, NULL);
+   vkDestroyShaderModule(dev, solid, NULL);
+   vkDestroyShaderModule(dev, vs, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   vkDestroyDescriptorSetLayout(dev, set_layout, NULL);
+   printf("MSRTSS sample-zero input attachment: done\n");
+}
+
 static void
 test_norm16_precision(void)
 {
@@ -1017,10 +1135,20 @@ int
 main(void)
 {
    const char *extensions[] = { "VK_KHR_portability_subset", "VK_KHR_dynamic_rendering",
-                                "VK_KHR_vertex_attribute_divisor", "VK_EXT_blend_operation_advanced" };
+                                "VK_KHR_vertex_attribute_divisor", "VK_EXT_blend_operation_advanced",
+                                "VK_EXT_multisampled_render_to_single_sampled",
+                                "VK_KHR_dynamic_rendering_local_read" };
+   VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR local_read = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR,
+      .dynamicRenderingLocalRead = VK_TRUE,
+   };
+   VkPhysicalDeviceMultisampledRenderToSingleSampledFeaturesEXT msrtss = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_FEATURES_EXT,
+      .pNext = &local_read, .multisampledRenderToSingleSampled = VK_TRUE,
+   };
    VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_KHR,
-      .vertexAttributeInstanceRateDivisor = VK_TRUE,
+      .pNext = &msrtss, .vertexAttributeInstanceRateDivisor = VK_TRUE,
    };
    VkPhysicalDeviceDynamicRenderingFeatures rendering = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, .pNext = &divisor,
@@ -1030,7 +1158,7 @@ main(void)
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &rendering,
       .shaderDrawParameters = VK_TRUE,
    };
-   test_init(4, extensions, &(VkPhysicalDeviceFeatures2){
+   test_init(6, extensions, &(VkPhysicalDeviceFeatures2){
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &vk11,
       .features = { .multiDrawIndirect = VK_TRUE, .occlusionQueryPrecise = VK_TRUE },
    });
@@ -1056,6 +1184,7 @@ main(void)
    test_texture(vertices.buffer, false, VK_FORMAT_R16G16B16A16_UNORM);
    test_texture(vertices.buffer, false, VK_FORMAT_R16G16B16A16_SNORM);
    test_norm16_precision();
+   test_msrtss_input(vertices.buffer);
    test_clear_attachments();
    test_blit();
    test_instances();
