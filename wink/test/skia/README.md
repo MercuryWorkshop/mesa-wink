@@ -118,6 +118,23 @@ Dawn's `gl_allow_context_on_multi_threads` setting so Graphite's pipeline
 workers release the EGL context between calls instead of retaining stale
 current contexts across tests.
 
+An independent `grdawn_gles` reference needs GLES 3.1. ANGLE's Metal backend
+on this host supplies GLES 3.0; build its Vulkan backend instead:
+
+```sh
+python3 wink/test/skia/build-angle.py --backend vulkan
+python3 wink/test/skia/build.py --no-sync --dawn-gles --font-engine freetype \
+  --angle build/skia/angle-vulkan
+python3 wink/test/skia/run.py reference --route grdawn_gles --reference-angle \
+  --dm build/skia/native-dawn-freetype/dm --icd /path/to/vk_swiftshader_icd.json \
+  --sources gm --match '^aaclip$' --out build/skia/dawn-gles-reference
+```
+
+Use an independent Vulkan ICD that exposes GLES 3.1 through ANGLE; SwiftShader
+does on this host. The reference bypasses Wink's EGL resolver and records
+Dawn's actual GL renderer. The run also hashes the selected ICD, driver, and
+ANGLE libraries. `--build-dir` can reuse an existing native build directory.
+
 ## Browser builds
 
 Package both Wink variants first, then build DM with the same SDK:

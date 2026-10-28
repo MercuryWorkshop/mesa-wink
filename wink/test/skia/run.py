@@ -189,6 +189,12 @@ def driver_provenance(dm, environment):
         angle = build['gn_args'].get('wink_skia_angle_dir')
         if angle:
             paths.extend(Path(angle) / name for name in ('libEGL.dylib', 'libGLESv2.dylib'))
+            angle_manifest = Path(angle) / 'wink-angle-build.json'
+            if angle_manifest.is_file():
+                paths.append(angle_manifest)
+                loader = json.loads(angle_manifest.read_text()).get('vulkan_loader')
+                if loader:
+                    paths.append(Path(loader))
     for name in environment.get('VK_DRIVER_FILES', '').split(os.pathsep):
         if not name:
             continue

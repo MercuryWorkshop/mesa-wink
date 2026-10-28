@@ -632,9 +632,7 @@ FT_USE_MODULE( FT_Renderer_Class, ft_svg_renderer_class )
           'namespace skiatest::graphite {',
           '''namespace skiatest::graphite {
 void (*winkSkiaEGLGetProc(const char* name))();''')
-    patch(source, 'tools/graphite/dawn/GraphiteDawnTestContext.cpp',
-          '    options.nextInChain = &togglesDesc;',
-          '''    options.nextInChain = &togglesDesc;
+    legacy_dawn_dispatch = '''    options.nextInChain = &togglesDesc;
     dawn::native::opengl::RequestAdapterOptionsGetGLProc winkGL;
     if (backend == wgpu::BackendType::OpenGLES && getenv("WINK_SKIA_ROUTE") &&
         !strcmp(getenv("WINK_SKIA_ROUTE"), "grdawn_gles")) {
@@ -642,7 +640,26 @@ void (*winkSkiaEGLGetProc(const char* name))();''')
         winkGL.nextInChain = options.nextInChain;
         options.nextInChain = &winkGL;
         options.backendType = wgpu::BackendType::OpenGLES;
-    }''')
+    }'''
+    dawn_dispatch = legacy_dawn_dispatch.replace(
+        '!strcmp(getenv("WINK_SKIA_ROUTE"), "grdawn_gles")) {',
+        '''!strcmp(getenv("WINK_SKIA_ROUTE"), "grdawn_gles") &&
+        !getenv("WINK_SKIA_REFERENCE_GLES")) {''')
+    dawn_context = source / 'tools/graphite/dawn/GraphiteDawnTestContext.cpp'
+    content = dawn_context.read_text()
+    if legacy_dawn_dispatch in content:
+        dawn_context.write_text(content.replace(legacy_dawn_dispatch, dawn_dispatch))
+    patch(source, 'tools/graphite/dawn/GraphiteDawnTestContext.cpp',
+          '    options.nextInChain = &togglesDesc;', dawn_dispatch)
+    patch(source, 'tools/graphite/dawn/GraphiteDawnTestContext.cpp',
+          '''        if (backend == props.backendType) {
+            matchedAdaptor = adapter;''',
+          '''        if (backend == props.backendType) {
+            if (backend == wgpu::BackendType::OpenGLES) {
+                SkDebugf("WINK_SKIA_BACKEND\\tgles\\t%.*s\\n",
+                         static_cast<int>(props.device.length), props.device.data);
+            }
+            matchedAdaptor = adapter;''')
     patch(source, 'tools/graphite/dawn/GraphiteDawnTestContext.cpp',
           '    desc.nextInChain           = &togglesDesc;',
           '''    desc.nextInChain           = &togglesDesc;
@@ -705,6 +722,7 @@ def main():
     p.add_argument('--dawn-gles', action='store_true', help='Build Graphite through an outer Dawn GLES backend into native-dawn/')
     p.add_argument('--font-engine', choices=['platform', 'freetype'], default='platform',
                    help='Use FreeType for resource-font references to browser builds')
+    p.add_argument('--build-dir', type=Path, help='Override the native build directory')
     a = p.parse_args()
     a.out = a.out.resolve()
     source = a.out / 'deps/skia' if a.no_sync else checkout(a.out)
@@ -747,6 +765,8 @@ def main():
     build = a.out / ('native-dawn' if a.dawn_gles else 'native')
     if a.font_engine == 'freetype':
         build = build.with_name(build.name + '-freetype')
+    if a.build_dir:
+        build = a.build_dir.resolve()
     build.mkdir(parents=True, exist_ok=True)
     gn_args = '\n'.join(f'{k} = {json.dumps(v)}' for k, v in args.items()) + '\n'
     (build / 'args.gn').write_text(gn_args)
