@@ -94,6 +94,12 @@ the before image with itself and had malformed guard rectangles. This
 correction strengthens its preservation assertions and is recorded in
 `skia_fixes`.
 
+Gradient lookup textures encode premultiplied colors and numeric stop data
+directly with round-to-nearest half conversion. Bitmap color erasure uses
+different rounding on scalar and SIMD paths, shifting densely packed stops
+in Wasm. The gradient encoding test checks exact half values, including
+extended colors and subnormals. This correction is recorded in `skia_fixes`.
+
 The integration registers FreeType's compiled SVG renderer in its Wasm module
 list, fixing an SVG emoji metrics crash, and matches image extensions with a
 leading dot so `.wbmp` is not also collected as `bmp`. These corrections are

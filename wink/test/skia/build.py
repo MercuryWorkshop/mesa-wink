@@ -27,7 +27,8 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'test-typeface-empty-native-fallback-v1',
                      'graphite-cache-budget-early-exit-v1',
                      'skvx-scalar-logical-not-mask-v1',
-                     'gpu-write-pixels-guard-regions-v1']
+                     'gpu-write-pixels-guard-regions-v1',
+                     'gradient-texture-direct-half-encoding-v1']
 
 
 def run(args, **kwargs):
@@ -65,6 +66,66 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # This bitmap contains numeric shader data. Bitmap::erase runs a color
+    # pipeline whose scalar half stores truncate while native SIMD rounds.
+    # Write premul colors and encoded offsets directly with the same RNE
+    # conversion, without an unpremultiply/premultiply round trip.
+    patch(source, 'src/gpu/GradientBitmap.cpp',
+          '''        // TODO: there should be a way to directly set a premul pixel in a bitmap with
+        // a premul color.
+        SkColor4f unpremulColor = colors[i].unpremul();
+        colorsAndOffsetsBitmap.erase(unpremulColor, SkIRect::MakeXYWH(i, 0, 1, 1));''',
+          '''        auto* color = static_cast<SkHalf*>(colorsAndOffsetsBitmap.getAddr(i, 0));
+        color[0] = SkFloatToHalf(colors[i].fR);
+        color[1] = SkFloatToHalf(colors[i].fG);
+        color[2] = SkFloatToHalf(colors[i].fB);
+        color[3] = SkFloatToHalf(colors[i].fA);''')
+    patch(source, 'src/gpu/GradientBitmap.cpp',
+          '''        colorsAndOffsetsBitmap.erase(SkColor4f{mantissa, exponent, 0, 1},
+                                     SkIRect::MakeXYWH(i, 1, 1, 1));''',
+          '''        auto* encoded = static_cast<SkHalf*>(colorsAndOffsetsBitmap.getAddr(i, 1));
+        encoded[0] = SkFloatToHalf(mantissa);
+        encoded[1] = SkFloatToHalf(exponent);
+        encoded[2] = 0;
+        encoded[3] = SK_Half1;''')
+    patch(source, 'tests/GradientTest.cpp',
+          '#include "src/core/SkTLazy.h"',
+          '''#include "src/core/SkHalf.h"
+#include "src/core/SkTLazy.h"
+#if defined(SK_GANESH) || defined(SK_GRAPHITE)
+#include "src/gpu/GradientBitmap.h"
+#endif''')
+    patch(source, 'tests/GradientTest.cpp',
+          'DEF_TEST(Gradient, reporter) {',
+          '''#if defined(SK_GANESH) || defined(SK_GRAPHITE)
+DEF_TEST(GradientTextureDataEncoding, reporter) {
+    const SkPMColor4f colors[] = {{0.5003f, 0.25f, 0.75f, 1.f},
+                                 {1.0006f, -0.125f, 0x1p-20f, 1.f},
+                                 {0.1f, 0.2f, 0.3f, 0.5f}, {0, 0, 0, 0}};
+    const float offsets[] = {0.f, 3.f / 199.f, 0.5f, 1.f};
+    const SkHalf expected[2][4][4] = {
+        {{0x3801, 0x3400, 0x3a00, 0x3c00}, {0x3c01, 0xb000, 0x0010, 0x3c00},
+         {0x2e66, 0x3266, 0x34cd, 0x3800}, {0, 0, 0, 0}},
+        {{0, 0, 0, 0x3c00}, {0x3bb8, 0xc600, 0, 0x3c00},
+         {0x3800, 0, 0, 0x3c00}, {0x3800, 0x3c00, 0, 0x3c00}}
+    };
+    auto bitmap = skgpu::CreateGradientColorAndOffsetBitmap(4, colors, offsets);
+    REPORTER_ASSERT(reporter, !bitmap.empty());
+    if (bitmap.empty()) return;
+    for (int row = 0; row < 2; ++row) {
+        for (int x = 0; x < 4; ++x) {
+            const auto* actual = static_cast<const SkHalf*>(bitmap.getAddr(x, row));
+            for (int channel = 0; channel < 4; ++channel) {
+                REPORTER_ASSERT(reporter, actual[channel] == expected[row][x][channel],
+                                "row=%d x=%d channel=%d: %04x != %04x", row, x, channel,
+                                actual[channel], expected[row][x][channel]);
+            }
+        }
+    }
+}
+#endif
+
+DEF_TEST(Gradient, reporter) {''')
     # Compare pre-write and post-write pixels outside the updated rectangle.
     # The pinned test compared its initial read with itself, and its first
     # two guard rectangles included the write or had reversed bounds.
