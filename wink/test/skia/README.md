@@ -192,6 +192,12 @@ allow a reduced reproducer. A reduced run does not establish full coverage.
 Additional resource corpora such as SKPs must be separately pinned before
 being included in the acceptance suite.
 
+Add `--include-cpu-tests --sources tests` to execute the compiled CPU and serial
+CPU tests alongside the selected GPU tests. DM records their CPU registration
+explicitly in `unit_coverage.cpu`; they do not count as observed GPU coverage.
+Include a GPU control when using `--match` so the run can still verify its
+selected graphics backend.
+
 Use `--route gles --config glesmsaa4` or `--route vk --config vkmsaa4` to run
 Skia's four-sample rendering configurations on native or browser targets.
 The route still controls the context factory and backend identity checks.
@@ -235,9 +241,11 @@ Build native references with
 `--build-dir` can reuse an existing native build directory. This keeps resource
 fonts and distance-field text sizing comparable. macOS normally uses an extra
 256-pixel distance-field atlas size and switches to paths at a different size;
-the portable policy uses the browser's atlas sizes and threshold. Comparisons
-reject different font engines or text policies. Platform-specific GMs and
-default emoji selection still require separate applicability checks.
+the portable policy uses the browser's atlas sizes and threshold. It also
+selects the browser's default CBDT emoji resources. Explicit SBIX, CBDT, COLR,
+and SVG format tests keep their own fonts. Comparisons reject different font
+engines, text policies, or default font selections. Platform-specific GMs
+still require separate applicability checks.
 
 For Vulkan, the same test binary can select an independent ICD. For example,
 on a Mac with Homebrew MoltenVK:

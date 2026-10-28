@@ -83,9 +83,10 @@ def inspect_run(expected, log, returncode, route, reference=False):
     unit_context = False
     unit_mock = False
     unit_host = False
+    unit_cpu = False
     requests = set()
     no_context = []
-    unit_coverage = {scope: [] for scope in ('gpu', 'mock', 'host', 'other_api', 'unresolved')}
+    unit_coverage = {scope: [] for scope in ('gpu', 'cpu', 'mock', 'host', 'other_api', 'unresolved')}
     api = ROUTES[route][0]
     for line in log.splitlines():
         if line.startswith('WINK_SKIA_START\tunit\ttest\t'):
@@ -93,6 +94,7 @@ def inspect_run(expected, log, returncode, route, reference=False):
             unit_context = False
             unit_mock = False
             unit_host = False
+            unit_cpu = False
             requests = set()
         elif active_unit and line.startswith('WINK_SKIA_CONTEXT_REQUEST\t'):
             requests.add(line.rsplit('\t', 1)[-1])
@@ -100,13 +102,17 @@ def inspect_run(expected, log, returncode, route, reference=False):
             unit_mock = True
         elif active_unit and line == 'WINK_SKIA_HOST_UNIT\t' + active_unit:
             unit_host = True
+        elif active_unit and line == 'WINK_SKIA_CPU_UNIT\t' + active_unit:
+            unit_cpu = True
         elif active_unit and (line.startswith('WINK_SKIA_CONTEXT\t') or
                               line.startswith('WINK_SKIA_BACKEND\t' + api + '\t')):
             unit_context = True
         elif line.startswith('WINK_SKIA_DONE\tunit\ttest\t') and active_unit:
             if not unit_context:
                 no_context.append(active_unit)
-            if unit_context:
+            if unit_cpu:
+                scope = 'cpu'
+            elif unit_context:
                 scope = 'gpu'
             elif 'selected' in requests or ('mock' in requests and not unit_mock):
                 # A failed requested context cannot be excused by another
@@ -179,11 +185,17 @@ def compare(reference, candidate):
             problems.append(f'{key} differs')
     if ref_run.get('font_engine', 'platform') != cand_run.get('font_engine', 'platform'):
         problems.append('font_engine differs')
+    if ref_run.get('include_cpu_tests', False) != cand_run.get('include_cpu_tests', False):
+        problems.append('include_cpu_tests differs')
     def text_policy(run):
         # Existing browser builds already use the non-macOS policy.
         return run.get('text_policy', 'portable' if run.get('target') in ('st', 'mt') else 'platform')
     if text_policy(ref_run) != text_policy(cand_run):
         problems.append('text_policy differs')
+    def font_selection(run):
+        return run.get('font_selection', 'portable' if run.get('target') in ('st', 'mt') else 'platform')
+    if font_selection(ref_run) != font_selection(cand_run):
+        problems.append('font_selection differs')
     if ref_run.get('config', ref_run.get('route')) != cand_run.get('config', cand_run.get('route')):
         problems.append('config differs')
     if ref_run.get('role') != 'reference' or cand_run.get('role') != 'candidate':
@@ -273,7 +285,9 @@ def execute(a):
     config, graphite = selected_config(a), ROUTES[a.route][1]
     args = [str(a.dm.resolve()), '--config', config, '--src', *a.sources,
             '--resourcePath', str(source / 'resources'), '--images', str(source / 'resources/images'),
-            '--threads', '0', '--verbose', '--nocpu']
+            '--threads', '0', '--verbose']
+    if not a.include_cpu_tests:
+        args.append('--nocpu')
     args += ['--nogpu', '--graphite'] if graphite else ['--nographite']
     if a.match:
         args += ['--match', *a.match]
@@ -283,7 +297,9 @@ def execute(a):
     metadata = dict(schema=1, role=a.role, route=a.route, config=config, target='native', skia=revision,
                     skia_fixes=skia_fixes,
                     font_engine=build.get('font_engine', 'platform'),
+                    include_cpu_tests=a.include_cpu_tests,
                     text_policy=build.get('text_policy', 'platform'),
+                    font_selection=build.get('font_selection', 'platform'),
                     wink=subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
                     dm_sha256=digest(a.dm), host=platform.platform(), sources=a.sources,
                     match=a.match, fixtures=fixtures(source), command=args,
@@ -347,6 +363,8 @@ def main():
         s.add_argument('--route', choices=ROUTES, required=True)
         s.add_argument('--config', choices=CONFIG_ROUTES,
                        help='Skia rendering configuration; defaults to the selected route')
+        s.add_argument('--include-cpu-tests', action='store_true',
+                       help='Also execute compiled CPU and serial CPU unit tests')
         s.add_argument('--out', type=Path, required=True)
         s.add_argument('--sources', nargs='+', default=['tests', 'gm', 'image'])
         s.add_argument('--match', nargs='+', default=[])

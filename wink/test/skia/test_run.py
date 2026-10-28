@@ -156,6 +156,19 @@ class ExecutionIntegrity(unittest.TestCase):
         self.assertFalse(self.check_log(log.replace('WINK_SKIA_CONTEXT\tganesh\n', ''),
                                         [self.task, task])['pass'])
 
+    def test_cpu_registration_is_separate_from_hardware_coverage(self):
+        task = ('unit', 'test', '', 'CPUUnit')
+        log = (self.log + 'WINK_SKIA_START\tunit\ttest\t\tCPUUnit\n'
+               'WINK_SKIA_CPU_UNIT\tCPUUnit\n'
+               'WINK_SKIA_DONE\tunit\ttest\t\tCPUUnit\n')
+        result = self.check_log(log, [self.task, task])
+        self.assertTrue(result['pass'])
+        self.assertEqual(result['unit_coverage']['cpu'], ['CPUUnit'])
+        self.assertEqual(result['unit_coverage']['gpu'], [])
+        self.assertFalse(self.check_log(log.replace('WINK_SKIA_CPU_UNIT\tCPUUnit',
+                                                   'WINK_SKIA_CPU_UNIT\tWrongUnit'),
+                                        [self.task, task])['pass'])
+
 
 class ConfigurationIntegrity(unittest.TestCase):
     def test_configs_keep_the_selected_backend(self):
@@ -201,6 +214,13 @@ class ReferenceIntegrity(unittest.TestCase):
         suite.write_json(path, run)
         self.assertIn('font_engine differs', suite.compare(self.ref, self.candidate)['problems'])
 
+    def test_different_cpu_unit_selection_fails_with_identical_pixels(self):
+        path = self.candidate / 'run.json'
+        run = json.loads(path.read_text())
+        run['include_cpu_tests'] = True
+        suite.write_json(path, run)
+        self.assertIn('include_cpu_tests differs', suite.compare(self.ref, self.candidate)['problems'])
+
     def test_text_policy_mismatch_and_legacy_browser_policy(self):
         path = self.candidate / 'run.json'
         run = json.loads(path.read_text())
@@ -210,8 +230,16 @@ class ReferenceIntegrity(unittest.TestCase):
         path = self.ref / 'run.json'
         run = json.loads(path.read_text())
         run['text_policy'] = 'portable'
+        run['font_selection'] = 'portable'
         suite.write_json(path, run)
         self.assertTrue(suite.compare(self.ref, self.candidate)['pass_'])
+
+    def test_default_font_selection_mismatch_fails_with_identical_pixels(self):
+        path = self.candidate / 'run.json'
+        run = json.loads(path.read_text())
+        run['font_selection'] = 'portable'
+        suite.write_json(path, run)
+        self.assertIn('font_selection differs', suite.compare(self.ref, self.candidate)['problems'])
 
     def test_different_random_seed_fails_even_with_identical_pixels(self):
         path = self.candidate / 'run.json'

@@ -184,6 +184,18 @@ def checkout(out):
 
 def adapt(source):
     annotate_negative_operations(source)
+    # Portable references must choose the same default bitmap emoji fixtures
+    # as Wasm. Explicit SBIX/CBDT/COLR/SVG test cases keep their own selection.
+    for anchor in (
+        '#elif defined(SK_BUILD_FOR_MAC) || defined(SK_BUILD_FOR_IOS)\n'
+        '        filename = "fonts/planetsbix.ttf";',
+        '#elif defined(SK_BUILD_FOR_MAC) || defined(SK_BUILD_FOR_IOS)\n'
+        '        sample = EmojiSample(EmojiFontFormat::Sbix);',
+    ):
+        patch(source, 'tools/fonts/FontToolUtils.cpp', anchor,
+              anchor.replace('#elif defined(SK_BUILD_FOR_MAC) || defined(SK_BUILD_FOR_IOS)',
+                             '#elif (defined(SK_BUILD_FOR_MAC) || defined(SK_BUILD_FOR_IOS)) && '
+                             '!defined(WINK_SKIA_PORTABLE_TEXT)'))
     # Match the browser's text atlas sizing when generating native references.
     # Keep macOS's platform policy available for native application coverage.
     for anchor in ('#ifdef SK_BUILD_FOR_MAC\nstatic const int kExtraLargeDFFontLimit',
@@ -738,12 +750,21 @@ FT_USE_MODULE( FT_Renderer_Class, ft_svg_renderer_class )
               [ "tools/ganesh/gl/wink/GLTestContext_wink.cpp" ]''')
     # DM does not serialize unit-test successes in dm.json. Emit task lifecycle
     # records in dry runs too, so the runner can check inventory completeness.
+    patch(source, 'dm/DM.cpp', '        test.cpu(&reporter);',
+          '        SkDebugf("WINK_SKIA_CPU_UNIT\\t%s\\n", test.fName);\n'
+          '        test.cpu(&reporter);')
     for event, signature in (
         ('DONE', 'static void done(const char* config, const char* src, const char* srcOptions, const char* name) {'),
         ('START', 'static void start(const char* config, const char* src, const char* srcOptions, const char* name) {'),
     ):
+        # A test may leave a partial diagnostic line on stderr. Start lifecycle
+        # records on a fresh line so that completion cannot be swallowed.
+        old = f'fprintf(stderr, "WINK_SKIA_{event}\\t'
+        new = f'fprintf(stderr, "\\nWINK_SKIA_{event}\\t'
+        if old in (source / 'dm/DM.cpp').read_text():
+            patch(source, 'dm/DM.cpp', old, new)
         patch(source, 'dm/DM.cpp', signature, signature +
-              f'\n    fprintf(stderr, "WINK_SKIA_{event}\\t%s\\t%s\\t%s\\t%s\\n", config, src, srcOptions, name);')
+              f'\n    fprintf(stderr, "\\nWINK_SKIA_{event}\\t%s\\t%s\\t%s\\t%s\\n", config, src, srcOptions, name);')
     patch(source, 'dm/DM.cpp', '            if (result.isSkip()) {',
           '''            if (result.isSkip()) {
                 fprintf(stderr, "WINK_SKIA_SKIP\\t%s\\t%s\\t%s\\t%s\\t%s\\n",
@@ -1023,6 +1044,7 @@ def main():
         'schema': 1, 'skia': pin, 'gn_args': args, 'skia_fixes': CORRECTNESS_FIXES,
         'font_engine': a.font_engine,
         'text_policy': a.text_policy,
+        'font_selection': 'portable' if a.text_policy == 'portable' else 'platform',
         'wink': subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
         'routes': ['gles', 'vk', 'grvk'] + (['grdawn_gles'] if a.dawn_gles else []),
     }, indent=2) + '\n')

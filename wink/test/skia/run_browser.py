@@ -30,7 +30,9 @@ def execute(a):
     trace = os.environ.get('WINK_SKIA_TRACE_PRECOMPILE')
     args = ['--config', config, '--src', *a.sources, '--resourcePath', '/resources',
             '--images', '/resources/images', '--threads', '0',
-            '--gpuThreads', '0' if a.target == 'st' else '2', '--verbose', '--nocpu']
+            '--gpuThreads', '0' if a.target == 'st' else '2', '--verbose']
+    if not a.include_cpu_tests:
+        args.append('--nocpu')
     args += ['--nogpu', '--graphite'] if graphite else ['--nographite']
     if a.match:
         args += ['--match', *a.match]
@@ -38,7 +40,9 @@ def execute(a):
     skia_fixes = json.loads(manifest.read_text()).get('skia_fixes', []) if manifest.is_file() else []
     metadata = dict(schema=1, role='candidate', route=a.route, config=config, target=a.target,
                     font_engine='freetype',
+                    include_cpu_tests=a.include_cpu_tests,
                     text_policy='portable',
+                    font_selection='portable',
                     skia_fixes=skia_fixes,
                     skia=pin, sources=a.sources, match=a.match, fixtures=fixtures(a.source),
                     paint_key_seed=seed,

@@ -105,6 +105,7 @@ def main():
     (build / 'wink-build.json').write_text(json.dumps(dict(
         schema=1, skia=pin, skia_fixes=base.CORRECTNESS_FIXES, font_engine='freetype',
         text_policy='portable',
+        font_selection='portable',
         gn_args=args), indent=2) + '\n')
     shutil.copy2(HERE / 'browser.html', build / 'index.html')
 
