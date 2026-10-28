@@ -26,7 +26,8 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'resource-cache-purge-clock-progress-v1',
                      'test-typeface-empty-native-fallback-v1',
                      'graphite-cache-budget-early-exit-v1',
-                     'skvx-scalar-logical-not-mask-v1']
+                     'skvx-scalar-logical-not-mask-v1',
+                     'gpu-write-pixels-guard-regions-v1']
 
 
 def run(args, **kwargs):
@@ -64,6 +65,25 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # Compare pre-write and post-write pixels outside the updated rectangle.
+    # The pinned test compared its initial read with itself, and its first
+    # two guard rectangles included the write or had reversed bounds.
+    patch(source, 'tests/ReadWritePixelsGpuTest.cpp',
+          '''        SkIRect borders[]{
+                {               0,                 0, secondReadPM.width(), secondReadPM.height()},
+                {checkRect.fRight,                 0,      checkRect.fLeft, secondReadPM.height()},
+                { checkRect.fLeft,                 0,     checkRect.fRight,        checkRect.fTop},
+                { checkRect.fLeft, checkRect.fBottom,     checkRect.fRight, secondReadPM.height()}
+        };''',
+          '''        SkIRect borders[]{
+                {               0, checkRect.fTop,       checkRect.fLeft, checkRect.fBottom},
+                {checkRect.fRight, checkRect.fTop, secondReadPM.width(), checkRect.fBottom},
+                {               0,             0, secondReadPM.width(),    checkRect.fTop},
+                {               0, checkRect.fBottom, secondReadPM.width(), secondReadPM.height()}
+        };''')
+    patch(source, 'tests/ReadWritePixelsGpuTest.cpp',
+          'SkAssertResult(firstReadPM.extractSubset(&b, r));',
+          'SkAssertResult(secondReadPM.extractSubset(&b, r));')
     # Vector selection consumes all-bit masks. The scalar fallback's logical
     # NOT returned 1 instead of all ones, corrupting clipped perspective quads
     # when Wasm builds disable SIMD.

@@ -88,6 +88,12 @@ Ganesh's clipping of perspective quads in Wasm. The original `crbug_224618`
 GM exercises the missing geometry; the SkVx unit also checks mask selection.
 This correction is recorded in `skia_fixes`.
 
+The GPU pixel-write tests compare the before/after reads in four guard
+rectangles covering every pixel outside the write. The pinned test compared
+the before image with itself and had malformed guard rectangles. This
+correction strengthens its preservation assertions and is recorded in
+`skia_fixes`.
+
 The integration registers FreeType's compiled SVG renderer in its Wasm module
 list, fixing an SVG emoji metrics crash, and matches image extensions with a
 leading dot so `.wbmp` is not also collected as `bmp`. These corrections are
