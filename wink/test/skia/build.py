@@ -78,6 +78,94 @@ def annotate_host_units(source):
                   f'\n    SkDebugf("WINK_SKIA_HOST_UNIT\\t{match[2]}\\n");')
 
 
+def annotate_negative_operations(source):
+    files = ['tests/graphite/' + name + '.cpp' for name in (
+        'RecorderTest', 'RecordingSurfacesTest', 'ImageProviderTest',
+        'GraphitePromiseImageTest', 'GraphiteYUVAPromiseImageTest', 'BackendTextureTest')]
+    files.append('tests/VkProtectedContextTest.cpp')
+    shutil.copy2(HERE / 'expected_diagnostic.h', source / 'tests/WinkExpectedDiagnostic.h')
+    for name in files:
+        patch(source, name, '#include "tests/Test.h"',
+              '#include "tests/Test.h"\n#include "tests/WinkExpectedDiagnostic.h"')
+
+    def expect(expression, operation, enabled='true'):
+        return (f'wink_skia_expect_diagnostic({enabled}, "{operation}", '
+                f'[&] {{ return {expression}; }})')
+
+    patch(source, files[0], '!insert(o3.get())',
+          '!' + expect('insert(o3.get())', 'recording-order'))
+    patch(source, files[0],
+          'InsertStatus status = context->insertRecording(info); // Should not crash on the null Recording!',
+          'InsertStatus status = ' + expect('context->insertRecording(info)', 'null-recording') +
+          '; // Should not crash on the null Recording!')
+
+    # The test already checks that rejected replay leaves the target transparent.
+    # Also assert its insertion status, and bracket only this insertion.
+    patch(source, files[1],
+          '    context->insertRecording({recording.get(), surface.get(), replayOffset, replayClip});',
+          '''    const char* rejection = nullptr;
+    if (canvasMipmapped != targetMipmapped) {
+        rejection = "deferred-mipmaps";
+    } else if (canvasMipmapped == skgpu::Mipmapped::kYes) {
+        if (surfaceSize != recordingSize) rejection = "deferred-dimensions";
+        else if (replayOffset != kNoOffset) rejection = "deferred-translation";
+        else if (!replayClip.isEmpty()) rejection = "deferred-clip";
+    }
+    auto status = wink_skia_expect_diagnostic(rejection != nullptr, rejection, [&] {
+        return context->insertRecording({recording.get(), surface.get(), replayOffset, replayClip});
+    });
+    REPORTER_ASSERT(reporter, static_cast<bool>(status) == (rejection == nullptr));''')
+
+    patch(source, files[2],
+          '        SkRect rectToDraw = SkRect::MakeWH(kSurfaceSize.width(), kSurfaceSize.height());',
+          '''        SkRect rectToDraw = SkRect::MakeWH(kSurfaceSize.width(), kSurfaceSize.height());
+        wink_skia_expect_diagnostic(expectedColor == kBackgroundColor, "image-provider", [&] {''')
+    patch(source, files[2],
+          '''            canvas->drawImageRect(imageToDraw, rectToDraw, sampling);
+        }
+
+        if (!surface->readPixels''',
+          '''            canvas->drawImageRect(imageToDraw, rectToDraw, sampling);
+        }
+        });
+
+        if (!surface->readPixels''')
+
+    for name, yuva in ((files[3], False), (files[4], True)):
+        for volatile, count in ((False, 4), (True, 6)):
+            test = (('Volatile' if volatile else 'NonVolatile') + 'Graphite' +
+                    ('YUVA' if yuva else '') + 'PromiseImageFulfillFailureTest')
+            path = source / name
+            content = path.read_text()
+            declaration = re.search(r'\(\s*' + test + ',', content)
+            if declaration is None:
+                raise RuntimeError(f'{name}: {test} declaration changed')
+            start = declaration.start()
+            end = content.find('\nDEF_', start)
+            if end < 0:
+                end = len(content)
+            body = content[start:end]
+            old = '!context->insertRecording({ recording.get() })'
+            new = '!' + expect('context->insertRecording({ recording.get() })',
+                               'promise-volatile' if volatile else 'promise-nonvolatile')
+            if new not in body:
+                if body.count(old) != count:
+                    raise RuntimeError(f'{name}: {test} negative insertion count changed')
+                path.write_text(content[:start] + body.replace(old, new) + content[end:])
+
+    expression = '''SkSurfaces::WrapBackendTexture(recorder.get(),
+                                             texture,
+                                             /*colorSpace=*/nullptr,
+                                             /*props=*/nullptr)'''
+    patch(source, files[5], 'surface = ' + expression + ';',
+          'surface = ' + expect(expression, 'nonrenderable-surface') + ';')
+    expression = '''helper->recorder()->createBackendTexture({ kSize, kSize },
+                                                                         textureInfo)'''
+    patch(source, files[6], 'BackendTexture backendTex = ' + expression + ';',
+          'BackendTexture backendTex = ' + expect(expression, 'protected-texture',
+              '!contextIsProtected && beTexIsProtected') + ';')
+
+
 def checkout(out):
     source = out / 'deps/skia'
     pin = json.loads((HERE / 'pins.json').read_text())['skia']
@@ -95,6 +183,7 @@ def checkout(out):
 
 
 def adapt(source):
+    annotate_negative_operations(source)
     # Match the browser's text atlas sizing when generating native references.
     # Keep macOS's platform policy available for native application coverage.
     for anchor in ('#ifdef SK_BUILD_FOR_MAC\nstatic const int kExtraLargeDFFontLimit',

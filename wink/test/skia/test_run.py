@@ -139,6 +139,24 @@ class ExecutionIntegrity(unittest.TestCase):
         self.assertIn('no backend identity recorded', result['problems'])
 
 
+    def test_expected_rejection_does_not_excuse_other_failures(self):
+        task = ('unit', 'test', '', 'Negative')
+        log = (self.log + 'WINK_SKIA_START\tunit\ttest\t\tNegative\n'
+               'WINK_SKIA_CONTEXT\tganesh\n'
+               'WINK_SKIA_EXPECT_BEGIN\tnull-recording\n'
+               '[skia] ** ERROR ** Cannot insert null Recording\n'
+               'WINK_SKIA_EXPECT_END\tnull-recording\n'
+               'WINK_SKIA_DONE\tunit\ttest\t\tNegative\n')
+        result = self.check_log(log, [self.task, task])
+        self.assertTrue(result['pass'])
+        self.assertEqual(len(result['expected_diagnostics']), 1)
+        self.assertFalse(self.check_log(log, [self.task, task], code=1)['pass'])
+        self.assertFalse(self.check_log(log + 'WebGPU validation error\n',
+                                        [self.task, task])['pass'])
+        self.assertFalse(self.check_log(log.replace('WINK_SKIA_CONTEXT\tganesh\n', ''),
+                                        [self.task, task])['pass'])
+
+
 class ConfigurationIntegrity(unittest.TestCase):
     def test_configs_keep_the_selected_backend(self):
         for config, route in suite.CONFIG_ROUTES.items():

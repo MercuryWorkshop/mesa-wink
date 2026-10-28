@@ -217,6 +217,14 @@ without hardware evidence. A requested selected context without GPU evidence,
 a failed mock request, or an unclassified unit remains unresolved and fails
 the audit. A sentinel backend identity alone cannot excuse a missing context.
 
+Deliberate Graphite rejection tests bracket individual invalid calls with
+expected-diagnostic markers. The audit requires each specific message exactly
+once within that call and records it in `expected_diagnostics`; errors outside
+the call, additional errors, missing messages, and unbalanced scopes fail.
+The original return-status, callback, and pixel assertions still run. WebGPU
+validation errors and device/context failures always fail, including inside
+an expected Skia diagnostic scope.
+
 ## Independent reference and comparison
 
 Browser builds use FreeType, while the default native Mac build uses CoreText.

@@ -13,6 +13,8 @@ import subprocess
 import sys
 import time
 
+from diagnostics import inspect as inspect_diagnostics
+
 HERE = Path(__file__).resolve().parent
 MESA = HERE.parents[2]
 ROUTES = {'gles': ('gles', False), 'vk': ('vulkan', False), 'grvk': ('vulkan', True),
@@ -139,14 +141,15 @@ def inspect_run(expected, log, returncode, route, reference=False):
     # Capture errors even where the graphics API leaves DM's exit status zero.
     if re.search(r'validation error|webgpu error|uncaptured error|device (?:lost|error)|WINK_SKIA_CONTEXT_FAILED', log, re.I):
         problems.append('graphics validation, device, or context error')
-    if re.search(r'draw dropped!|\*\* ERROR \*\*', log, re.I):
-        problems.append('Skia reported an error or dropped a draw')
+    diagnostics = inspect_diagnostics(log)
+    problems.extend(diagnostics.pop('problems'))
     return {'pass': not problems, 'problems': problems,
             'discovered': len(expected), 'started': len(started),
             'completed': len(completed), 'skipped': skipped, 'backends': identities,
             'source_vetoes': events(log, 'VETO'), 'filtered': filtered,
             'units_without_context': no_context,
             'unit_coverage': unit_coverage,
+            **diagnostics,
             'missing': list((Counter(expected) - Counter(completed)).elements()),
             'unexpected': list((Counter(completed) - Counter(expected)).elements())}
 
