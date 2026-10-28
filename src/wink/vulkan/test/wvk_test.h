@@ -33,7 +33,7 @@ static VkCommandPool pool;
 static VkPhysicalDeviceMemoryProperties mem_props;
 
 static void
-test_init(uint32_t extension_count, const char *const *extensions, const void *features)
+test_init(uint32_t extension_count, const char *const *extensions, const VkPhysicalDeviceFeatures2 *features)
 {
    VK(vkCreateInstance(&(VkInstanceCreateInfo){
       .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
@@ -57,8 +57,13 @@ test_init(uint32_t extension_count, const char *const *extensions, const void *f
       exit(1);
    }
    vkGetPhysicalDeviceMemoryProperties(pdev, &mem_props);
+   VkPhysicalDeviceFeatures available;
+   vkGetPhysicalDeviceFeatures(pdev, &available);
+   VkPhysicalDeviceFeatures2 enabled = *features;
+   /* The compressed-format draw tests run only when BC is supported. */
+   enabled.features.textureCompressionBC = available.textureCompressionBC;
    VK(vkCreateDevice(pdev, &(VkDeviceCreateInfo){
-      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = features,
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &enabled,
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &(VkDeviceQueueCreateInfo){
          .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueCount = 1,

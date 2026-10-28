@@ -1133,10 +1133,13 @@ wvk_CreateImageView(VkDevice _device, const VkImageViewCreateInfo *pCreateInfo,
    view->format = format ? format->texture : image->format;
    view->aspect = wvk_aspect(view->vk.aspects);
    VkComponentMapping mapping = view->vk.swizzle;
-   /* A packed format without alpha in an RGBA8 texture: whatever alpha it
-    * was rendered with, the format's is one. */
-   if (format && (format->caps & WVK_CAP_PACKED16) &&
-       !util_format_has_alpha(vk_format_to_pipe_format(view->vk.view_format))) {
+   /* Alpha-less packed formats and RGB BC1 share RGBA backing textures.
+    * RGB BC1's transparent selector is opaque black. Replace source alpha
+    * even when the application maps it to a different output component. */
+   if ((format && (format->caps & WVK_CAP_PACKED16) &&
+        !util_format_has_alpha(vk_format_to_pipe_format(view->vk.view_format))) ||
+       view->vk.view_format == VK_FORMAT_BC1_RGB_UNORM_BLOCK ||
+       view->vk.view_format == VK_FORMAT_BC1_RGB_SRGB_BLOCK) {
       VkComponentSwizzle *c[4] = { &mapping.r, &mapping.g, &mapping.b, &mapping.a };
       for (unsigned i = 0; i < 4; ++i) {
          if (*c[i] == VK_COMPONENT_SWIZZLE_A)

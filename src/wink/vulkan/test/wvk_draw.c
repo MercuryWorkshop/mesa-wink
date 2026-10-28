@@ -965,6 +965,113 @@ test_norm16_precision(void)
 }
 
 static void
+test_bc1_alpha(void)
+{
+   const VkDescriptorSetLayoutBinding bindings[] = {
+      { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+      { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL },
+   };
+   VkDescriptorSetLayout sl;
+   VK(vkCreateDescriptorSetLayout(dev, &(VkDescriptorSetLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = bindings,
+   }, NULL, &sl));
+   VkPipelineLayout layout;
+   VK(vkCreatePipelineLayout(dev, &(VkPipelineLayoutCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &sl,
+   }, NULL, &layout));
+   VkShaderModule shader = make_module(spv_norm16_sample_comp, sizeof(spv_norm16_sample_comp));
+   VkPipeline pipeline;
+   VK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &(VkComputePipelineCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = layout,
+      .stage = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = shader, .pName = "main" },
+   }, NULL, &pipeline));
+   VkSampler sampler;
+   VK(vkCreateSampler(dev, &(VkSamplerCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .minFilter = VK_FILTER_LINEAR,
+      .magFilter = VK_FILTER_LINEAR, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+   }, NULL, &sampler));
+   const VkDescriptorPoolSize sizes[] = {
+      { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 }, { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 },
+   };
+   VkDescriptorPool pool;
+   VK(vkCreateDescriptorPool(dev, &(VkDescriptorPoolCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1,
+      .poolSizeCount = 2, .pPoolSizes = sizes,
+   }, NULL, &pool));
+   VkDescriptorSet set;
+   VK(vkAllocateDescriptorSets(dev, &(VkDescriptorSetAllocateInfo){
+      .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool,
+      .descriptorSetCount = 1, .pSetLayouts = &sl,
+   }, &set));
+   /* BC1's three-color selector 3 decodes to black, with alpha one for
+    * RGB and zero for RGBA. Check alpha remapped to red as well as identity. */
+   struct buffer source = make_buffer(8, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, HOST);
+   const uint8_t block[8] = {0, 0, 255, 255, 255, 255, 255, 255};
+   memcpy(source.map, block, sizeof(block));
+   struct buffer result = make_buffer(32, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, HOST);
+   const VkFormat formats[] = { VK_FORMAT_BC1_RGB_UNORM_BLOCK, VK_FORMAT_BC1_RGB_SRGB_BLOCK,
+                               VK_FORMAT_BC1_RGBA_UNORM_BLOCK, VK_FORMAT_BC1_RGBA_SRGB_BLOCK };
+   for (unsigned f = 0; f < 4; ++f) {
+      VkFormatProperties props;
+      vkGetPhysicalDeviceFormatProperties(pdev, formats[f], &props);
+      if (!(props.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+         printf("BC1 format %u unavailable\n", formats[f]);
+         continue;
+      }
+      struct image image = make_image(4, 4, formats[f],
+                                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+      for (unsigned remap = 0; remap < 2; ++remap) {
+         VkImageView view;
+         VK(vkCreateImageView(dev, &(VkImageViewCreateInfo){
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = image.image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = formats[f],
+            .components = remap ? (VkComponentMapping){ VK_COMPONENT_SWIZZLE_A,
+               VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_G }
+               : (VkComponentMapping){0},
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+         }, NULL, &view));
+         const VkWriteDescriptorSet writes[] = {
+            { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
+              .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+              .pImageInfo = &(VkDescriptorImageInfo){sampler, view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL} },
+            { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 1,
+              .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+              .pBufferInfo = &(VkDescriptorBufferInfo){ result.buffer, 0, 32 } },
+         };
+         vkUpdateDescriptorSets(dev, 2, writes, 0, NULL);
+         memset(result.map, 0xcd, 32);
+         VkCommandBuffer cmd = begin();
+         vkCmdCopyBufferToImage(cmd, source.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                               &(VkBufferImageCopy){ .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                                    .imageExtent = {4, 4, 1} });
+         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, NULL);
+         vkCmdDispatch(cmd, 1, 1, 1);
+         submit_and_wait(cmd);
+         const float alpha = f < 2 ? 1.0f : 0.0f;
+         const float expected[4] = {remap ? alpha : 0, 0, remap ? 1 : 0, remap ? 0 : alpha};
+         for (unsigned n = 0; n < 8; ++n)
+            CHECK(fabsf(((float *)result.map)[n] - expected[n % 4]) < 0.000001f,
+                  "BC1 format %u remap %u channel %u: %.6f expected %.6f",
+                  formats[f], remap, n, ((float *)result.map)[n], expected[n % 4]);
+         vkDestroyImageView(dev, view, NULL);
+      }
+      free_image(&image);
+   }
+   free_buffer(&source);
+   free_buffer(&result);
+   vkDestroyDescriptorPool(dev, pool, NULL);
+   vkDestroySampler(dev, sampler, NULL);
+   vkDestroyPipeline(dev, pipeline, NULL);
+   vkDestroyShaderModule(dev, shader, NULL);
+   vkDestroyPipelineLayout(dev, layout, NULL);
+   vkDestroyDescriptorSetLayout(dev, sl, NULL);
+   printf("BC1 RGB/RGBA alpha and component mapping: done\n");
+}
+
+static void
 test_clear_attachments(void)
 {
    struct image target = make_image(W, H, VK_FORMAT_R8G8B8A8_UNORM,
@@ -1184,6 +1291,7 @@ main(void)
    test_texture(vertices.buffer, false, VK_FORMAT_R16G16B16A16_UNORM);
    test_texture(vertices.buffer, false, VK_FORMAT_R16G16B16A16_SNORM);
    test_norm16_precision();
+   test_bc1_alpha();
    test_msrtss_input(vertices.buffer);
    test_clear_attachments();
    test_blit();
