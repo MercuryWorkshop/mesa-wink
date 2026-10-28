@@ -310,6 +310,43 @@ extra, duplicate, or empty image results fail. Use Skia's `skdiff` on output
 images to diagnose differences. No global image tolerance or failure allowlist
 is applied.
 
+## Diagnosing image mismatches
+
+Keep raw image comparisons strict, but inspect the GM before attributing a
+different hash to the driver. `bc1_transparency`, `compressed_textures*`, and
+`exoticformats` deliberately draw red outlines when compressed textures fall
+back to decompressed storage. ANGLE Metal and Wink can therefore produce
+different correct images because they support different compressed formats.
+The RGB BC1 transparent selector still has to sample as opaque black; the
+Vulkan draw regression checks this independently, including component remaps
+and sRGB views.
+
+GLES advanced blending can combine framebuffer fetch with sampled alpha
+masks or YUV planes. The driver's destination snapshot must not inherit an
+application sampler's swizzle. The shared smoke test combines these operations;
+run it with `GEX_WGPU_FORCE_ORDERED_FETCH=1` natively to exercise the browser's
+snapshot path. This catches the corruption previously visible in
+`ducky_yuv_blend`, `dstreadshuffle`, `blurrect_compare`, and `embossmaskfilter`.
+
+Matching pinned fonts and text policy does not guarantee identical CPU raster
+inputs between ARM and Wasm. `matrixconvolution_big` creates its source image
+on a raster canvas; one-unit input differences can be amplified by its large
+kernel. The crop image-filter GMs also upload CPU-generated tiles. For these
+cases, native and browser Wink emitted identical WGSL, and a diagnostic control
+that supplied identical input-upload bytes produced byte-identical outputs.
+Those controls isolate the cause; substituted inputs are not acceptance runs.
+
+An independent BT.709 narrow-range calculation for `ycbcrimage`, including
+cosited linear chroma reconstruction and the DM PNG's Rec.2020 color encoding,
+matched native/browser Wink within approximately 0.14 of an 8-bit channel unit.
+The MoltenVK reference differed by up to approximately 5 units. Do not tune
+Wink's conversion coefficients just to reproduce that reference's rounding.
+For `showmiplevels_explicit`, account for Skia's -0.475 texture-sharpening LOD
+bias before analyzing mip blends. Native/browser Wink agree with each other;
+the remaining reference difference is approximately 0.016 mip levels in the
+sampled solid-color regions. Downscale and mip-subset differences remain under
+investigation and retain their strict comparison failures.
+
 ## Gates
 
 A native run fails on a nonzero exit, timeout, changed task inventory,
