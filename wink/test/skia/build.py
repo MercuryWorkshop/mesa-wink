@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,22 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'gpu-write-pixels-guard-regions-v1',
                      'gradient-texture-direct-half-encoding-v1']
 
+# These pinned tests assert host-side layout, geometry, and packing. Keep
+# running them with their original GPU-labelled registration, while recording
+# their scope separately from hardware coverage.
+HOST_UNIT_TESTS = {
+    'tests/TestTest.cpp': ('DEF_GANESH_TEST', {'TestGpuFactory'}),
+    'tests/GpuRectanizerTest.cpp': ('DEF_GANESH_TEST', {'GpuRectanizer'}),
+    'tests/DrawOpAtlasTest.cpp': ('DEF_GANESH_TEST', {'GrDrawOpAtlasConfig_Basic'}),
+    'tests/graphite/DrawAtlasTest.cpp': ('DEF_GRAPHITE_TEST', None),
+    'tests/graphite/IntersectionTreeTest.cpp': ('DEF_GRAPHITE_TEST', None),
+    'tests/graphite/RectTest.cpp': ('DEF_GRAPHITE_TEST', None),
+    'tests/graphite/ShapeTest.cpp': ('DEF_GRAPHITE_TEST', None),
+    'tests/graphite/TransformTest.cpp': ('DEF_GRAPHITE_TEST', None),
+    'tests/graphite/UniformManagerTest.cpp': ('DEF_GRAPHITE_TEST', None),
+    'tests/graphite/UniformOffsetCalculatorTest.cpp': ('DEF_GRAPHITE_TEST', None),
+}
+
 
 def run(args, **kwargs):
     print('+', ' '.join(map(str, args)), flush=True)
@@ -46,6 +63,19 @@ def patch(source, name, before, after):
     if content.count(before) != 1:
         raise RuntimeError(f'{name}: patch anchor changed')
     path.write_text(content.replace(before, after))
+
+
+def annotate_host_units(source):
+    for name, (macro, allowed) in HOST_UNIT_TESTS.items():
+        content = (source / name).read_text()
+        pattern = r'(' + macro + r'\(\s*(\w+)\s*,[^{};]*\)\s*\{)'
+        matches = [m for m in re.finditer(pattern, content)
+                   if allowed is None or m[2] in allowed]
+        if not matches or (allowed is not None and {m[2] for m in matches} != allowed):
+            raise RuntimeError(f'{name}: host-unit declarations changed')
+        for match in matches:
+            patch(source, name, match[1], match[1] +
+                  f'\n    SkDebugf("WINK_SKIA_HOST_UNIT\\t{match[2]}\\n");')
 
 
 def checkout(out):
@@ -66,6 +96,21 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    annotate_host_units(source)
+    patch(source, 'src/gpu/ganesh/GrDirectContext.cpp',
+          '''    direct->fGpu = GrMockGpu::Make(mockOptions, options, direct.get());
+    if (!direct->init()) {
+        return nullptr;
+    }
+
+    return direct;''',
+          '''    direct->fGpu = GrMockGpu::Make(mockOptions, options, direct.get());
+    if (!direct->init()) {
+        return nullptr;
+    }
+
+    SkDebugf("WINK_SKIA_MOCK_CONTEXT\\tganesh\\n");
+    return direct;''')
     # This bitmap contains numeric shader data. Bitmap::erase runs a color
     # pipeline whose scalar half stores truncate while native SIMD rounds.
     # Write premul colors and encoded offsets directly with the same RNE
@@ -626,20 +671,31 @@ FT_USE_MODULE( FT_Renderer_Class, ft_svg_renderer_class )
     # Upgrade earlier harness patches in the disposable dependency checkout.
     factory = source / 'tools/ganesh/GrContextFactory.cpp'
     content = factory.read_text()
-    content = content.replace(
-        '    if (const char* route = getenv("WINK_SKIA_ROUTE")) {',
-        '    if (const char* route = type == ContextType::kMock ? nullptr : getenv("WINK_SKIA_ROUTE")) {')
+    legacy_guard = '''    if (const char* route = type == ContextType::kMock ? nullptr : getenv("WINK_SKIA_ROUTE")) {
+        if ((!strcmp(route, "gles") && type != ContextType::kGLES) ||
+            (!strcmp(route, "vk") && type != ContextType::kVulkan)) return {};
+    }
+'''
+    context_guard = '''    if (const char* route = getenv("WINK_SKIA_ROUTE")) {
+        if (!strcmp(route, "gles") || !strcmp(route, "vk")) {
+            const bool mock = type == ContextType::kMock;
+            const bool selected = (!strcmp(route, "gles") && type == ContextType::kGLES) ||
+                                  (!strcmp(route, "vk") && type == ContextType::kVulkan);
+            SkDebugf("WINK_SKIA_CONTEXT_REQUEST\\tganesh\\t%s\\n",
+                     mock ? "mock" : selected ? "selected" : "outside");
+            if (!mock && !selected) return {};
+        }
+    }
+'''
+    content = content.replace(legacy_guard, context_guard).replace(
+        legacy_guard.replace('type == ContextType::kMock ? nullptr : ', ''), context_guard)
     content = content.replace(
         '    if (result.directContext()) SkDebugf("WINK_SKIA_CONTEXT\\tganesh\\n");',
         '    if (result.directContext() && type != ContextType::kMock) SkDebugf("WINK_SKIA_CONTEXT\\tganesh\\n");')
     factory.write_text(content)
     patch(source, 'tools/ganesh/GrContextFactory.cpp',
           '    // (shareIndex != 0) -> (shareContext != nullptr)',
-          '''    if (const char* route = type == ContextType::kMock ? nullptr : getenv("WINK_SKIA_ROUTE")) {
-        if ((!strcmp(route, "gles") && type != ContextType::kGLES) ||
-            (!strcmp(route, "vk") && type != ContextType::kVulkan)) return {};
-    }
-    // (shareIndex != 0) -> (shareContext != nullptr)''')
+          context_guard + '    // (shareIndex != 0) -> (shareContext != nullptr)')
     patch(source, 'tools/ganesh/GrContextFactory.cpp',
           '    return this->getContextInfoInternal(type, overrides, nullptr, 0);',
           '''    auto result = this->getContextInfoInternal(type, overrides, nullptr, 0);
@@ -663,12 +719,36 @@ FT_USE_MODULE( FT_Renderer_Class, ft_svg_renderer_class )
         }
         GrContextFactory factory(options);
         ContextInfo ctxInfo = factory.getContextInfo(contextType);''')
-    patch(source, 'tools/graphite/ContextFactory.cpp',
-          'ContextInfo ContextFactory::getContextInfo(skgpu::ContextType type) {',
-          '''ContextInfo ContextFactory::getContextInfo(skgpu::ContextType type) {
+    legacy_graphite_guard = '''ContextInfo ContextFactory::getContextInfo(skgpu::ContextType type) {
     if (const char* route = getenv("WINK_SKIA_ROUTE")) {
         if ((!strcmp(route, "grvk") && type != skgpu::ContextType::kVulkan) ||
             (!strcmp(route, "grdawn_gles") && type != skgpu::ContextType::kDawn_OpenGLES)) return {};
+    }'''
+    graphite_guard = '''ContextInfo ContextFactory::getContextInfo(skgpu::ContextType type) {
+    if (const char* route = getenv("WINK_SKIA_ROUTE")) {
+        if (!strcmp(route, "grvk") || !strcmp(route, "grdawn_gles")) {
+            const bool selected = (!strcmp(route, "grvk") && type == skgpu::ContextType::kVulkan) ||
+                                  (!strcmp(route, "grdawn_gles") && type == skgpu::ContextType::kDawn_OpenGLES);
+            SkDebugf("WINK_SKIA_CONTEXT_REQUEST\\tgraphite\\t%s\\n", selected ? "selected" : "outside");
+            if (!selected) return {};
+        }
+    }'''
+    graphite_factory = source / 'tools/graphite/ContextFactory.cpp'
+    content = graphite_factory.read_text()
+    if legacy_graphite_guard in content:
+        graphite_factory.write_text(content.replace(legacy_graphite_guard, graphite_guard))
+    patch(source, 'tools/graphite/ContextFactory.cpp',
+          'ContextInfo ContextFactory::getContextInfo(skgpu::ContextType type) {', graphite_guard)
+    # Some Vulkan-specific tests manage their backend context directly instead
+    # of using either factory. Record that explicit API request too.
+    patch(source, 'tools/gpu/vk/VkTestUtils.cpp',
+          '''                            const CanPresentFn& canPresent,
+                            bool isProtected) {''',
+          '''                            const CanPresentFn& canPresent,
+                            bool isProtected) {
+    if (const char* route = getenv("WINK_SKIA_ROUTE")) {
+        const bool selected = !strcmp(route, "vk") || !strcmp(route, "grvk");
+        SkDebugf("WINK_SKIA_CONTEXT_REQUEST\\tvulkan\\t%s\\n", selected ? "selected" : "outside");
     }''')
     patch(source, 'tools/graphite/ContextFactory.cpp',
           '    return ContextInfo{owned.fTestContext.get(), owned.fContext.get()};',

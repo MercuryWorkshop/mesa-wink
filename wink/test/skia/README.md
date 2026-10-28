@@ -209,8 +209,13 @@ precompiled candidates when diagnosing a coverage assertion.
 GLES always uses Wink's context factory and proc-address API. Vulkan uses an
 explicit ICD manifest (`--icd` overrides the default native build). GPU unit
 context factories are restricted to the selected route, avoiding coverage
-being attributed to a different backend. Unit tests which do not exercise an
-observed GPU context are reported as unresolved, rather than passing silently.
+being attributed to a different backend. `unit_coverage` separates observed GPU
+contexts, successfully created mock contexts, reviewed host helpers, and tests
+which explicitly request only another API. These tasks all keep running with
+their original assertions. `units_without_context` retains the complete list
+without hardware evidence. A requested selected context without GPU evidence,
+a failed mock request, or an unclassified unit remains unresolved and fails
+the audit. A sentinel backend identity alone cannot excuse a missing context.
 
 ## Independent reference and comparison
 

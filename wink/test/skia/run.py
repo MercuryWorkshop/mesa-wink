@@ -79,21 +79,49 @@ def inspect_run(expected, log, returncode, route, reference=False):
         problems.append(f'{len(filtered)} tasks excluded by DM skip filters')
     active_unit = None
     unit_context = False
+    unit_mock = False
+    unit_host = False
+    requests = set()
     no_context = []
+    unit_coverage = {scope: [] for scope in ('gpu', 'mock', 'host', 'other_api', 'unresolved')}
     api = ROUTES[route][0]
     for line in log.splitlines():
         if line.startswith('WINK_SKIA_START\tunit\ttest\t'):
             active_unit = line.split('\t', 4)[4]
             unit_context = False
+            unit_mock = False
+            unit_host = False
+            requests = set()
+        elif active_unit and line.startswith('WINK_SKIA_CONTEXT_REQUEST\t'):
+            requests.add(line.rsplit('\t', 1)[-1])
+        elif active_unit and line.startswith('WINK_SKIA_MOCK_CONTEXT\t'):
+            unit_mock = True
+        elif active_unit and line == 'WINK_SKIA_HOST_UNIT\t' + active_unit:
+            unit_host = True
         elif active_unit and (line.startswith('WINK_SKIA_CONTEXT\t') or
                               line.startswith('WINK_SKIA_BACKEND\t' + api + '\t')):
             unit_context = True
         elif line.startswith('WINK_SKIA_DONE\tunit\ttest\t') and active_unit:
             if not unit_context:
                 no_context.append(active_unit)
+            if unit_context:
+                scope = 'gpu'
+            elif 'selected' in requests or ('mock' in requests and not unit_mock):
+                # A failed requested context cannot be excused by another
+                # API, a host annotation, or a successful mock fallback.
+                scope = 'unresolved'
+            elif unit_mock:
+                scope = 'mock'
+            elif unit_host:
+                scope = 'host'
+            elif requests == {'outside'}:
+                scope = 'other_api'
+            else:
+                scope = 'unresolved'
+            unit_coverage[scope].append(active_unit)
             active_unit = None
-    if no_context:
-        problems.append(f'{len(no_context)} GPU unit tests completed without an observed GPU context')
+    if unit_coverage['unresolved']:
+        problems.append(f"{len(unit_coverage['unresolved'])} GPU unit tests completed without an observed GPU context or explicit host/API scope")
     identities = events(log, 'BACKEND')
     matching = [r for r in identities if r[0] == api]
     if not matching:
@@ -118,6 +146,7 @@ def inspect_run(expected, log, returncode, route, reference=False):
             'completed': len(completed), 'skipped': skipped, 'backends': identities,
             'source_vetoes': events(log, 'VETO'), 'filtered': filtered,
             'units_without_context': no_context,
+            'unit_coverage': unit_coverage,
             'missing': list((Counter(expected) - Counter(completed)).elements()),
             'unexpected': list((Counter(completed) - Counter(expected)).elements())}
 

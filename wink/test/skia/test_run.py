@@ -97,6 +97,47 @@ class ExecutionIntegrity(unittest.TestCase):
         self.assertFalse(result['pass'])
         self.assertEqual(result['units_without_context'], ['VKOnly'])
 
+    def test_host_mock_and_other_api_work_are_not_hardware_coverage(self):
+        task = ('unit', 'test', '', 'ScopedUnit')
+        for scope, evidence in (
+                ('host', 'WINK_SKIA_HOST_UNIT\tScopedUnit\n'),
+                ('mock', 'WINK_SKIA_MOCK_CONTEXT\tganesh\n'),
+                ('other_api', 'WINK_SKIA_CONTEXT_REQUEST\tganesh\toutside\n')):
+            log = (self.log + 'WINK_SKIA_START\tunit\ttest\t\tScopedUnit\n' + evidence +
+                   'WINK_SKIA_DONE\tunit\ttest\t\tScopedUnit\n')
+            result = self.check_log(log, [self.task, task])
+            self.assertTrue(result['pass'])
+            self.assertEqual(result['unit_coverage'][scope], ['ScopedUnit'])
+            self.assertEqual(result['unit_coverage']['gpu'], [])
+            self.assertEqual(result['units_without_context'], ['ScopedUnit'])
+            self.assertFalse(self.check_log(log, [self.task, task], code=1)['pass'])
+            self.assertFalse(self.check_log(log + '[skia] ** ERROR ** unexpected\n',
+                                            [self.task, task])['pass'])
+
+    def test_failed_selected_or_mock_context_stays_unresolved(self):
+        task = ('unit', 'test', '', 'FailedContext')
+        for evidence in (
+                'WINK_SKIA_CONTEXT_REQUEST\tganesh\tmock\n',
+                'WINK_SKIA_HOST_UNIT\tAnotherUnit\n',
+                'WINK_SKIA_CONTEXT_REQUEST\tganesh\tselected\n'
+                'WINK_SKIA_CONTEXT_REQUEST\tganesh\toutside\n'
+                'WINK_SKIA_MOCK_CONTEXT\tganesh\n'
+                'WINK_SKIA_HOST_UNIT\tFailedContext\n'):
+            log = (self.log + 'WINK_SKIA_START\tunit\ttest\t\tFailedContext\n' + evidence +
+                   'WINK_SKIA_DONE\tunit\ttest\t\tFailedContext\n')
+            result = self.check_log(log, [self.task, task])
+            self.assertFalse(result['pass'])
+            self.assertEqual(result['unit_coverage']['unresolved'], ['FailedContext'])
+
+    def test_scoped_host_work_alone_cannot_establish_a_gpu_backend(self):
+        task = ('unit', 'test', '', 'HostOnly')
+        log = ('WINK_SKIA_START\tunit\ttest\t\tHostOnly\n'
+               'WINK_SKIA_HOST_UNIT\tHostOnly\n'
+               'WINK_SKIA_DONE\tunit\ttest\t\tHostOnly\n')
+        result = self.check_log(log, [task])
+        self.assertFalse(result['pass'])
+        self.assertIn('no backend identity recorded', result['problems'])
+
 
 class ConfigurationIntegrity(unittest.TestCase):
     def test_configs_keep_the_selected_backend(self):
