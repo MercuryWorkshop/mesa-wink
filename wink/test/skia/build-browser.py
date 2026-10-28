@@ -104,6 +104,7 @@ def main():
     base.run(['ninja', '-C', build, '-j', a.jobs, 'dm'], cwd=source)
     (build / 'wink-build.json').write_text(json.dumps(dict(
         schema=1, skia=pin, skia_fixes=base.CORRECTNESS_FIXES, font_engine='freetype',
+        text_policy='portable',
         gn_args=args), indent=2) + '\n')
     shutil.copy2(HERE / 'browser.html', build / 'index.html')
 

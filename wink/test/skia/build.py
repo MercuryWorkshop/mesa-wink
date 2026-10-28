@@ -95,6 +95,17 @@ def checkout(out):
 
 
 def adapt(source):
+    # Match the browser's text atlas sizing when generating native references.
+    # Keep macOS's platform policy available for native application coverage.
+    for anchor in ('#ifdef SK_BUILD_FOR_MAC\nstatic const int kExtraLargeDFFontLimit',
+                   '#ifdef SK_BUILD_FOR_MAC\n    } else if (scaledTextSize <= kLargeDFFontLimit)'):
+        patch(source, 'src/text/gpu/SubRunControl.cpp', anchor,
+              anchor.replace('#ifdef SK_BUILD_FOR_MAC',
+                             '#if defined(SK_BUILD_FOR_MAC) && !defined(WINK_SKIA_PORTABLE_TEXT)'))
+    patch(source, 'include/gpu/ganesh/GrContextOptions.h',
+          '#elif defined(SK_BUILD_FOR_MAC)\n    float fGlyphsAsPathsFontSize = 256;',
+          '#elif defined(SK_BUILD_FOR_MAC) && !defined(WINK_SKIA_PORTABLE_TEXT)\n'
+          '    float fGlyphsAsPathsFontSize = 256;')
     # Only modify the disposable pinned dependency, never the user's Skia tree.
     annotate_host_units(source)
     patch(source, 'src/gpu/ganesh/GrDirectContext.cpp',
@@ -863,6 +874,8 @@ def main():
     p.add_argument('--dawn-gles', action='store_true', help='Build Graphite through an outer Dawn GLES backend into native-dawn/')
     p.add_argument('--font-engine', choices=['platform', 'freetype'], default='platform',
                    help='Use FreeType for resource-font references to browser builds')
+    p.add_argument('--text-policy', choices=['platform', 'portable'], default='platform',
+                   help='Match browser distance-field atlas sizes and large-glyph thresholds')
     p.add_argument('--build-dir', type=Path, help='Override the native build directory')
     a = p.parse_args()
     a.out = a.out.resolve()
@@ -903,9 +916,13 @@ def main():
                     skia_enable_fontmgr_custom_directory=False,
                     skia_enable_fontmgr_custom_empty=True,
                     skia_enable_fontmgr_custom_embedded=True)
+    if a.text_policy == 'portable':
+        args['extra_cflags'].append('-DWINK_SKIA_PORTABLE_TEXT')
     build = a.out / ('native-dawn' if a.dawn_gles else 'native')
     if a.font_engine == 'freetype':
         build = build.with_name(build.name + '-freetype')
+    if a.text_policy == 'portable':
+        build = build.with_name(build.name + '-portable')
     if a.build_dir:
         build = a.build_dir.resolve()
     build.mkdir(parents=True, exist_ok=True)
@@ -916,6 +933,7 @@ def main():
     (build / 'wink-build.json').write_text(json.dumps({
         'schema': 1, 'skia': pin, 'gn_args': args, 'skia_fixes': CORRECTNESS_FIXES,
         'font_engine': a.font_engine,
+        'text_policy': a.text_policy,
         'wink': subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
         'routes': ['gles', 'vk', 'grvk'] + (['grdawn_gles'] if a.dawn_gles else []),
     }, indent=2) + '\n')

@@ -220,12 +220,16 @@ the audit. A sentinel backend identity alone cannot excuse a missing context.
 ## Independent reference and comparison
 
 Browser builds use FreeType, while the default native Mac build uses CoreText.
-Build native references with `build.py --no-sync --font-engine freetype`
+Build native references with
+`build.py --no-sync --font-engine freetype --text-policy portable`
 (and `--angle build/skia/angle` for GLES), then select
-`--dm build/skia/native-freetype/dm` when running those references. This keeps
-resource-font loading and rasterization comparable. Comparisons reject
-different font engines. Platform-specific GMs and default emoji selection
-still require separate applicability checks.
+`--dm build/skia/native-freetype-portable/dm` when running those references.
+`--build-dir` can reuse an existing native build directory. This keeps resource
+fonts and distance-field text sizing comparable. macOS normally uses an extra
+256-pixel distance-field atlas size and switches to paths at a different size;
+the portable policy uses the browser's atlas sizes and threshold. Comparisons
+reject different font engines or text policies. Platform-specific GMs and
+default emoji selection still require separate applicability checks.
 
 For Vulkan, the same test binary can select an independent ICD. For example,
 on a Mac with Homebrew MoltenVK:
@@ -251,8 +255,8 @@ python3 wink/test/skia/run.py reference --route gles --reference-angle \
 Only a reference invocation explicitly selects ANGLE; candidates always use
 Wink. The runner checks the actual renderer and hashes both ANGLE libraries.
 ANGLE Metal does not supply the GLES 3.1 required by Dawn, so this reference
-configuration covers Ganesh GLES. Graphite Dawn GLES still needs an independent
-GLES 3.1 reference.
+configuration covers Ganesh GLES. For Graphite Dawn GLES, use the ANGLE Vulkan
+GLES 3.1 reference described above.
 
 Comparisons require matching Skia revisions, fixtures, route, sources, and
 selection. They compare DM's raw output hashes, including alpha and output
@@ -279,6 +283,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s wink/test/skia -p 'tes
 ```
 
 Full acceptance additionally requires complete browser ST/MT corpus runs,
-browser outer Dawn GLES integration, independent Graphite Dawn GLES references, full CTS regression
+browser outer Dawn GLES integration, passing independent Graphite Dawn GLES references, full CTS regression
 comparisons, and repeated cold/warm-cache runs. Successful isolated browser
 GMs or the native SkSL suites do not establish that acceptance.

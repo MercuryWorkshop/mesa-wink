@@ -176,6 +176,11 @@ def compare(reference, candidate):
             problems.append(f'{key} differs')
     if ref_run.get('font_engine', 'platform') != cand_run.get('font_engine', 'platform'):
         problems.append('font_engine differs')
+    def text_policy(run):
+        # Existing browser builds already use the non-macOS policy.
+        return run.get('text_policy', 'portable' if run.get('target') in ('st', 'mt') else 'platform')
+    if text_policy(ref_run) != text_policy(cand_run):
+        problems.append('text_policy differs')
     if ref_run.get('config', ref_run.get('route')) != cand_run.get('config', cand_run.get('route')):
         problems.append('config differs')
     if ref_run.get('role') != 'reference' or cand_run.get('role') != 'candidate':
@@ -275,6 +280,7 @@ def execute(a):
     metadata = dict(schema=1, role=a.role, route=a.route, config=config, target='native', skia=revision,
                     skia_fixes=skia_fixes,
                     font_engine=build.get('font_engine', 'platform'),
+                    text_policy=build.get('text_policy', 'platform'),
                     wink=subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
                     dm_sha256=digest(a.dm), host=platform.platform(), sources=a.sources,
                     match=a.match, fixtures=fixtures(source), command=args,

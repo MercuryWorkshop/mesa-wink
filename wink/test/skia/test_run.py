@@ -183,6 +183,18 @@ class ReferenceIntegrity(unittest.TestCase):
         suite.write_json(path, run)
         self.assertIn('font_engine differs', suite.compare(self.ref, self.candidate)['problems'])
 
+    def test_text_policy_mismatch_and_legacy_browser_policy(self):
+        path = self.candidate / 'run.json'
+        run = json.loads(path.read_text())
+        run['target'] = 'mt'
+        suite.write_json(path, run)
+        self.assertIn('text_policy differs', suite.compare(self.ref, self.candidate)['problems'])
+        path = self.ref / 'run.json'
+        run = json.loads(path.read_text())
+        run['text_policy'] = 'portable'
+        suite.write_json(path, run)
+        self.assertTrue(suite.compare(self.ref, self.candidate)['pass_'])
+
     def test_different_random_seed_fails_even_with_identical_pixels(self):
         path = self.candidate / 'run.json'
         run = json.loads(path.read_text())
