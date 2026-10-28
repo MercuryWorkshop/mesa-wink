@@ -29,6 +29,8 @@ struct wvk_image_alias {
    /* The image's levels it has, from its level 0. */
    uint32_t first_level;
    uint32_t level_count;
+   bool sampling_copy;
+   uint32_t sampling_source;
 };
 
 #define WVK_IMAGE_MAX_ALIASES 8
@@ -154,6 +156,8 @@ wvk_image_for_aspect(struct wvk_image *image, VkImageAspectFlags *aspect)
  * slice, into its shadow (wvk_cmd_copy.c). */
 void wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
                              uint32_t level);
+void wvk_image_update_decoded(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+                              uint32_t source, uint32_t destination, uint32_t level);
 
 /* The image's texture `t`, and the image's level its level 0 is. */
 static inline WGPUTexture
@@ -173,6 +177,8 @@ wvk_image_texture(const struct wvk_image *image, uint32_t t, uint32_t *first_lev
 static inline bool
 wvk_image_current(const struct wvk_image *image, uint32_t t, uint32_t first, uint32_t count)
 {
+   if (image->linear && image->texture)
+      return false;
    if (!image->tracked)
       return true;
    for (uint32_t l = first; l < first + count && l < ARRAY_SIZE(image->valid); ++l) {
@@ -186,6 +192,7 @@ wvk_image_current(const struct wvk_image *image, uint32_t t, uint32_t first, uin
  * any pass, whose end this is if one is going on. */
 void wvk_image_make_current(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
                             uint32_t t, uint32_t first, uint32_t count);
+void wvk_image_upload_linear(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image);
 
 /* After a write to texture `t` of the levels, the others are behind. */
 static inline void
@@ -205,7 +212,9 @@ static inline void
 wvk_image_use(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image, uint32_t first,
               uint32_t count, bool write)
 {
-   if (!image->tracked)
+   /* Transfers access linear memory directly; only shader reads need its
+    * texture uploaded (wvk_image_make_current). */
+   if (!image->tracked || image->linear)
       return;
    if (!wvk_image_current(image, WVK_IMAGE_TEXTURE, first, count))
       wvk_image_make_current(dev, replay, image, WVK_IMAGE_TEXTURE, first, count);
@@ -253,6 +262,8 @@ WGPUTexture wvk_image_snapshot(WGPUDevice device, const struct wvk_image *image,
 
 /* The same of a multisampled colour image's first layer, which is what
  * shaders see of it: a pass copying each sample (wvk_cmd_copy.c). */
+bool wvk_image_copy_ms_views(struct wvk_device *dev, struct wvk_replay *replay, WGPUTextureView src,
+                              WGPUTextureView dst, WGPUTextureFormat format, VkFormat vk_format, unsigned samples);
 WGPUTexture wvk_image_snapshot_ms(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image);
 
 /* Whether a multisampled texture of `from` can be copied into one of
@@ -318,6 +329,11 @@ struct wvk_image_view {
     * that is all a storage image reads and writes, and WebGPU binds no
     * more than one level as storage. */
    WGPUTextureView storage_view;
+   /* Filterable float32 copy of a norm16 view; storage and attachments
+    * continue to access the original encoded texture. */
+   WGPUTextureView sampled_view, sampled_array_view;
+   WGPUTextureViewDescriptor sampled_desc;
+   uint32_t sampled_texture;
    /* How they were made, for a view alike of a copy of the image: a pass
     * that reads what it renders to reads a copy (wvk_cmd_draw.c). */
    WGPUTextureViewDescriptor view_desc, array_desc, storage_desc;
@@ -335,9 +351,16 @@ struct wvk_image_view {
     * (wvk_image_view_msrtss). */
    struct wvk_image_view *msrtss;
    struct wvk_image *msrtss_image;
+   /* Discarded depth/stencil attachment fitted to a colour target's size.
+    * WebGPU requires equal attachment extents, unlike Vulkan. */
+   struct wvk_image_view *transient_ds;
+   struct wvk_image *transient_ds_image;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(wvk_image_view, vk.base, VkImageView, VK_OBJECT_TYPE_IMAGE_VIEW)
+
+struct wvk_image_view *wvk_image_view_transient_ds(struct wvk_device *dev, struct wvk_image_view *view,
+                                                  VkExtent2D extent);
 
 /* The multisampled view of `samples` a single-sampled view is rendered to
  * (VK_EXT_multisampled_render_to_single_sampled), or NULL. */

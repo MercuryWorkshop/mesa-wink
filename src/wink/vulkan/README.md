@@ -394,6 +394,11 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   formats regardless), rendering to 8-bit snorm, storage for most 8- and
   16-bit and 10-bit packed formats (so `shaderStorageImageExtendedFormats`),
   and read-write storage for R8, R16, RGBA8, RGBA16 and RGBA32 formats.
+  Browsers can expose normalized 16-bit textures without filtering them.
+  With `float32-filterable`, sampled views use an RGBA32Float copy decoded
+  after writes, preserving normalized 16-bit precision. Attachments, storage
+  and transfers keep the original encoded texture. Without that feature,
+  these formats do not advertise linear filtering.
 - **16-bit packed formats** (565, 4444, 5551, 1555, and the extension ones:
   `VK_EXT_4444_formats`, maintenance5's A1B5G5R5), which WebGPU does not
   have, are RGBA8 textures. Copies to and from buffers are a shader's,
@@ -411,6 +416,12 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   filter for them. The runtime's nir_vk_lower_ycbcr_tex samples each plane
   and converts, before the shader's source is kept. Of optimal tiling,
   they have layers as any other image does (ycbcrImageArrays).
+- **Sampled linear images**: uncompressed 2D color images, including YCbCr
+  planes, can be sampled from a texture uploaded from their linear memory
+  before shader use. Host rewrites and GPU transfer destinations remain
+  authoritative in that memory. Linear images have one mip and one layer;
+  storage and attachment usage are unsupported. Uploading before each use
+  favors correctness over caching host changes.
 - **Memory is one WGPUBuffer**, made when a buffer is first bound to it,
   which the buffers bound to it share. An optimal image is a texture of its
   own and its memory only accounting, of a memory type of its own that no
@@ -526,6 +537,9 @@ dEQP-VK run. In a browser it is part of libwink, over emdawnwebgpu.
   loads or its render area is less than all of it: WebGPU's resolves are
   of all of an attachment. Of 4 samples, which is all WebGPU has, and of
   formats WebGPU multisamples.
+  Multisampled color input attachments read snapshots of the emulated
+  attachment's individual samples, while single-sample reads keep using
+  the application's image.
 - **VK_KHR_maintenance10**: a resolve of another mode, or of an sRGB
   format's encoded values -- WebGPU's average the linear ones -- is
   vk_meta's, of vkCmdResolveImage2 or of a pass whose attachment says so;
@@ -765,9 +779,6 @@ node wink/test/run-browser.mjs OUT --page='vk.html?test=wvk_draw'
   has no copy of, which are not counted.
 - Subgroups are one invocation each: Tint reads no subgroup operations from
   SPIR-V. Every operation but the quad ones is there, trivially.
-- Blend states whose colour factors use both CONSTANT_COLOR and
-  CONSTANT_ALPHA, on a multisampled pass: WebGPU has one constant, and
-  the fragment shader's blending reads single-sampled copies.
 - Views of multisampled images in formats WebGPU does not multisample
   (R32 integers, RG32): other formats' views are of a multisampled
   texture of the view's format, which a pass moving each sample's bits

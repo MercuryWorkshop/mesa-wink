@@ -170,6 +170,14 @@ wink_swap_buffers(surface);                        /* never suspends */
   context can be made current with any surface, or with none.
 * **Versions are never silently lowered.** A version that can't be had is
   `WINK_ERROR_BAD_VERSION`; 0.0 asks for the highest there is.
+* **Texture images can cross context share groups.** With the source context
+  current, `wink_image_create_texture_2d(texture, &status)` retains level zero
+  of a complete 2D texture. Pass the handle to
+  `glEGLImageTargetTexture2DOES(GL_TEXTURE_EXTERNAL_OES, image)` in the importing
+  context. Rendering and subimage writes update shared storage; redefining or
+  deleting the source texture preserves the image. `wink_image_destroy(image)`
+  releases the handle, while imported textures retain their own ownership.
+  Destroy handles before `wink_shutdown`.
 * **Legacy seam.** `wink_emscripten_compat.h` is the WebGL-context-shaped seam
   ikvm-wasm-build's emscripten-glfw dispatches to (`wink_webgl_create_context`
   and so on), for use until the move to SDL3.

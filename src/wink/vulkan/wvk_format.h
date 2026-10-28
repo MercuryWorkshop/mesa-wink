@@ -50,6 +50,7 @@ const struct wvk_format *wvk_format_get(VkFormat format);
 
 /* The capabilities on this physical device, optional features applied. */
 uint32_t wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format);
+bool wvk_format_needs_sampling_copy(const struct wvk_physical_device *pdev, VkFormat format);
 
 /* Whether WebGPU has a vertex format of it; and, where it has not,
  * whether a vertex shader can read an attribute of it itself. */

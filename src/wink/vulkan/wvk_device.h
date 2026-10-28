@@ -139,7 +139,7 @@ struct wvk_device {
    uint32_t tracked_images;
    /* Compressed texels into a shadow (wvk_image.h): for each format of
     * shadow, from a 2D array and from a 3D texture. */
-   WGPURenderPipeline shadow_pipelines[3][2];
+   WGPURenderPipeline shadow_pipelines[4][2];
    /* Copies of multisampled colour textures, a pass writing each sample:
     * by format and sample count. */
    struct {

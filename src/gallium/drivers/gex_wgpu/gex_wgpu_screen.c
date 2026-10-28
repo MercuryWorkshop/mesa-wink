@@ -2075,10 +2075,8 @@ struct gex_wgpu_screen {
     * using more units than this shares sampler bindings between units that
     * bind the same sampler; see gex_wgpu_fs_share_samplers. */
    uint32_t max_samplers;
-   /* Texture units the fragment stage offers: what the device's
-    * sampled-texture limit leaves after the read-only images and the
-    * framebuffer copies, between GEX_WGPU_MAX_STAGE_SAMPLERS and
-    * GEX_WGPU_MAX_SAMPLERS. See where it is set. */
+   /* Fragment texture units must fit both sampled textures and independent
+    * sampler bindings, after reserving textures for images and copies. */
    uint32_t max_fs_samplers;
    uint32_t max_storage_buffer_size;
    /* Buffers and textures let go of, destroyed once nothing recorded may
@@ -3328,6 +3326,9 @@ struct gex_wgpu_interp_variant {
    uint8_t aux[GEX_WGPU_MAX_VARYING_LOCATIONS];
    /* The fragment stage's varying widths this module was reshaped to. */
    uint8_t components[GEX_WGPU_MAX_VARYING_LOCATIONS];
+   /* Query answers are compiled into the module and change with the view. */
+   uint32_t query_only_slots;
+   uint32_t query_only_geom[GEX_WGPU_MAX_SAMPLERS][5];
    /* Sampler state this variant's texture lowering was built against, for a
     * vertex shader that samples an integer texture. The lowering reads
     * filters, wrap modes and view swizzles, so two draws with different
@@ -7917,7 +7918,6 @@ struct gex_wgpu_border_lowering {
    uint8_t integer_wrap_s;
    uint8_t integer_wrap_t;
    uint8_t integer_wrap_r;
-   uint8_t integer_levels;
    uint8_t integer_mip_filter;
    float lod_bias;
    float integer_min_lod;
@@ -8374,6 +8374,7 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
    const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
    const int lod_src = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   const int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_offset);
    struct gex_wgpu_texture_lowering *table = data;
    const bool is_1d = tex->sampler_dim == GLSL_SAMPLER_DIM_1D;
    const bool is_3d = tex->sampler_dim == GLSL_SAMPLER_DIM_3D;
@@ -8403,18 +8404,10 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
    nir_def *coord = tex->src[coord_src].src.ssa;
    b->cursor = nir_after_instr(instr);
    const struct gex_wgpu_border_lowering *lower = &table->slots[slot];
-   /* An implicit LOD needs the derivative-based computation below, and that
-    * works on the *spatial* coordinate -- which for a cube is a three-component
-    * direction, not the face UV it is converted to further down, so the
-    * formula does not apply to it.
-    *
-    * With a single level there is nothing to compute: the clamp to
-    * `integer_levels - 1` takes any LOD to zero, so level zero is the answer
-    * whatever the derivatives say. That makes this exact rather than an
-    * approximation, which is the only reason it is allowed -- a mipmapped
-    * integer cube sampled with an implicit LOD is still refused, by name. */
-   if (lower->integer_cube && tex->op != nir_texop_txl &&
-       lower->integer_levels > 1) {
+   /* A cube's LOD must be resolved while its coordinates are still a
+    * direction. The gradient prepass does that before face projection,
+    * including when the currently bound view exposes only one level. */
+   if (lower->integer_cube && tex->op != nir_texop_txl) {
       gex_tex_lower_fail(table,
                          "an implicit-LOD integer cube sample on a mipmapped "
                          "texture");
@@ -8446,12 +8439,18 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
    nir_builder_instr_insert(b, &base_txs->instr);
 
    nir_def *selected_lod = zero_lod;
-   /* `integer_levels > 1` is not an optimisation: with one level the clamp at
-      the end of this block takes every LOD to zero, so skipping it is the
-      same answer -- and it is what lets an implicit-LOD cube sample through
-      above, where the derivative formula would not apply. */
-   if (lower->integer_mip_filter == PIPE_TEX_MIPFILTER_NEAREST &&
-       lower->integer_levels > 1) {
+   if (lower->integer_mip_filter == PIPE_TEX_MIPFILTER_NEAREST) {
+      /* Sampler state and swizzles can stay unchanged when GL changes a
+       * texture's base/max level. Query the bound view rather than baking
+       * its original mip count into a cached module, even for one level. */
+      nir_tex_instr *levels = nir_tex_instr_create(b->shader, 1);
+      levels->op = nir_texop_query_levels;
+      levels->sampler_dim = tex->sampler_dim;
+      levels->is_array = tex->is_array;
+      levels->dest_type = nir_type_int32;
+      levels->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture_deref);
+      nir_def_init(&levels->instr, &levels->def, 1, 32);
+      nir_builder_instr_insert(b, &levels->instr);
       nir_def *lod;
       if (tex->op == nir_texop_txl) {
          lod = tex->src[lod_src].src.ssa;
@@ -8475,8 +8474,7 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       lod = nir_fmax(b, lod, nir_imm_float(b, lower->integer_min_lod));
       lod = nir_fmin(b, lod, nir_imm_float(b, lower->integer_max_lod));
       lod = nir_fmax(b, lod, nir_imm_float(b, 0.0f));
-      lod = nir_fmin(
-         b, lod, nir_imm_float(b, (float)(lower->integer_levels - 1)));
+      lod = nir_fmin(b, lod, nir_i2f32(b, nir_iadd_imm(b, &levels->def, -1)));
       selected_lod = nir_f2i32(
          b, nir_ffloor(b, nir_fadd_imm(b, lod, 0.5f)));
    }
@@ -8504,11 +8502,11 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       if (wrap == PIPE_TEX_WRAP_REPEAT) {
          wrapped[axis] = nir_ffract(b, component);
       } else if (wrap == PIPE_TEX_WRAP_MIRROR_REPEAT) {
-         nir_def *period = nir_fmul_imm(b, nir_ffract(
+         /* Keep the direction within the two-image period until after the
+          * integer texel offset is applied. Folding first would reverse an
+          * offset on every other mirrored image. */
+         wrapped[axis] = nir_fmul_imm(b, nir_ffract(
             b, nir_fmul_imm(b, component, 0.5f)), 2.0f);
-         wrapped[axis] = nir_fsub(
-            b, nir_imm_float(b, 1.0f),
-            nir_fabs(b, nir_fadd_imm(b, period, -1.0f)));
       } else {
          wrapped[axis] = component;
       }
@@ -8521,14 +8519,29 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
       nir_i2f32(
          b, nir_channels(b, &txs->def, spatial_mask)));
    nir_def *texel = nir_f2i32(b, nir_ffloor(b, scaled));
-   nir_def *zero_coord = is_1d ? nir_imm_int(b, 0)
-      : is_3d ? nir_imm_ivec3(b, 0, 0, 0)
-              : nir_imm_ivec2(b, 0, 0);
-   texel = nir_imin(
-      b, nir_imax(b, texel, zero_coord),
-      nir_iadd_imm(
-         b, nir_channels(
-            b, &txs->def, spatial_mask), -1));
+   if (offset_src >= 0)
+      texel = nir_iadd(b, texel, tex->src[offset_src].src.ssa);
+   nir_def *unwrapped_texel = texel;
+   nir_def *indices[3];
+   for (unsigned axis = 0; axis < spatial_components; ++axis) {
+      nir_def *index = nir_channel(b, texel, axis);
+      nir_def *size = nir_channel(b, &txs->def, axis);
+      const unsigned wrap = axis == 0 ? lower->integer_wrap_s
+                            : axis == 1 ? lower->integer_wrap_t
+                                        : lower->integer_wrap_r;
+      if (wrap == PIPE_TEX_WRAP_REPEAT) {
+         index = nir_imod(b, index, size);
+      } else if (wrap == PIPE_TEX_WRAP_MIRROR_REPEAT) {
+         nir_def *period = nir_imul_imm(b, size, 2);
+         index = nir_imod(b, index, period);
+         index = nir_imin(b, index, nir_isub(b, nir_iadd_imm(b, period, -1), index));
+      } else {
+         index = nir_imin(b, nir_imax(b, index, nir_imm_int(b, 0)),
+                           nir_iadd_imm(b, size, -1));
+      }
+      indices[axis] = index;
+   }
+   texel = nir_vec(b, indices, spatial_components);
    nir_def *fetch_coord = texel;
    if (tex->is_array) {
       const unsigned layer_component = spatial_components;
@@ -8573,13 +8586,11 @@ gex_wgpu_lower_integer_sample_instr(nir_builder *b, nir_instr *instr,
                                            : lower->integer_wrap_r;
          if (wrap != PIPE_TEX_WRAP_CLAMP_TO_BORDER)
             continue;
-         nir_def *component = nir_channel(b, coord, axis);
-         /* `>= 1` for the same reason as in the float path above: at c == 1.0
-          * the nearest texel index is `size`, one past the end. */
+         nir_def *component = nir_channel(b, unwrapped_texel, axis);
          outside = nir_ior(
             b, outside,
-            nir_ior(b, nir_flt_imm(b, component, 0.0f),
-                    nir_fge_imm(b, component, 1.0f)));
+            nir_ior(b, nir_ilt_imm(b, component, 0),
+                    nir_ige(b, component, nir_channel(b, &txs->def, axis))));
       }
       nir_def *border = nir_imm_ivec4(
          b, (int32_t)lower->integer_border[0],
@@ -8618,6 +8629,133 @@ gex_wgpu_swizzle_channel(nir_builder *b, nir_def *value, unsigned swizzle)
    if (swizzle == PIPE_SWIZZLE_1)
       return nir_imm_float(b, 1.0f);
    return NULL;
+}
+
+/* Filter each mip footprint before interpolating levels. Scaling a clamped
+ * hardware sample by a base-level border weight is incorrect at other levels,
+ * and a sampler LOD clamp would also prevent sampling the two exact levels. */
+static nir_def *
+gex_wgpu_mip_border_sample(nir_builder *b, nir_tex_instr *tex,
+                           const struct gex_wgpu_border_lowering *lower,
+                           nir_def *border, unsigned spatial)
+{
+   const int lod_src = nir_tex_instr_src_index(tex, nir_tex_src_lod);
+   const int texture_src = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   const int offset_src = nir_tex_instr_src_index(tex, nir_tex_src_offset);
+   if (tex->op != nir_texop_txl || lod_src < 0 || texture_src < 0)
+      return NULL;
+   nir_def *coord = tex->src[coord_src].src.ssa;
+   nir_def *texture = tex->src[texture_src].src.ssa;
+   /* Keep the level count dynamic: variants are shared by views with the
+    * same sampler state, including views exposing different mip ranges. */
+   nir_tex_instr *levels = nir_tex_instr_create(b->shader, 1);
+   levels->op = nir_texop_query_levels;
+   levels->sampler_dim = tex->sampler_dim;
+   levels->is_array = tex->is_array;
+   levels->dest_type = nir_type_int32;
+   levels->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture);
+   nir_def_init(&levels->instr, &levels->def, 1, 32);
+   nir_builder_instr_insert(b, &levels->instr);
+   nir_def *last_level = nir_iadd_imm(b, &levels->def, -1);
+   nir_def *lod = tex->src[lod_src].src.ssa;
+   lod = nir_fmin(b, nir_fmax(b, lod, nir_imm_float(b, lower->integer_min_lod)),
+                    nir_imm_float(b, lower->integer_max_lod));
+   lod = nir_fmin(b, nir_fmax(b, lod, nir_imm_float(b, 0.0f)),
+                    nir_i2f32(b, last_level));
+   const bool mip_linear = lower->integer_mip_filter == PIPE_TEX_MIPFILTER_LINEAR;
+   nir_def *level0 = nir_f2i32(b, nir_ffloor(b, mip_linear ? lod : nir_fadd_imm(b, lod, 0.5f)));
+   nir_def *level_weight = nir_ffract(b, lod);
+   nir_def *colors[2];
+   for (unsigned m = 0; m < (mip_linear ? 2u : 1u); ++m) {
+      nir_def *level = m ? nir_imin(b, nir_iadd_imm(b, level0, 1),
+                                      last_level) : level0;
+      nir_tex_instr *size = nir_tex_instr_create(b->shader, 2);
+      size->op = nir_texop_txs;
+      size->sampler_dim = tex->sampler_dim;
+      size->is_array = tex->is_array;
+      size->dest_type = nir_type_int32;
+      size->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture);
+      size->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, level);
+      nir_def_init(&size->instr, &size->def, spatial + tex->is_array, 32);
+      nir_builder_instr_insert(b, &size->instr);
+      nir_def *base[3], *fraction[3];
+      for (unsigned axis = 0; axis < spatial; ++axis) {
+         const unsigned wrap = axis == 0 ? lower->integer_wrap_s
+                               : axis == 1 ? lower->integer_wrap_t : lower->integer_wrap_r;
+         nir_def *component = nir_channel(b, coord, axis);
+         /* Bound the conversion to integer texel indices. Far border
+          * coordinates remain entirely outside, and periodic coordinates
+          * retain their phase without overflowing the signed conversion. */
+         if (wrap == PIPE_TEX_WRAP_REPEAT)
+            component = nir_ffract(b, component);
+         else if (wrap == PIPE_TEX_WRAP_MIRROR_REPEAT)
+            component = nir_fmul_imm(b, nir_ffract(b, nir_fmul_imm(b, component, 0.5f)), 2);
+         else
+            component = nir_fmin(b, nir_fmax(b, component,
+               nir_imm_float(b, wrap == PIPE_TEX_WRAP_CLAMP_TO_BORDER ? -1 : 0)),
+               nir_imm_float(b, wrap == PIPE_TEX_WRAP_CLAMP_TO_BORDER ? 2 : 1));
+         nir_def *p = nir_fmul(b, component,
+                                 nir_i2f32(b, nir_channel(b, &size->def, axis)));
+         if (lower->linear)
+            p = nir_fadd_imm(b, p, -0.5f);
+         fraction[axis] = nir_ffract(b, p);
+         base[axis] = nir_f2i32(b, nir_ffloor(b, p));
+         if (offset_src >= 0)
+            base[axis] = nir_iadd(b, base[axis],
+                                    nir_channel(b, tex->src[offset_src].src.ssa, axis));
+      }
+      nir_def *color = nir_imm_vec4(b, 0, 0, 0, 0);
+      for (unsigned tap = 0; tap < (lower->linear ? (1u << spatial) : 1u); ++tap) {
+         nir_def *indices[4], *inside = nir_imm_true(b), *weight = nir_imm_float(b, 1);
+         for (unsigned axis = 0; axis < spatial; ++axis) {
+            const unsigned wrap = axis == 0 ? lower->integer_wrap_s
+                                  : axis == 1 ? lower->integer_wrap_t : lower->integer_wrap_r;
+            nir_def *dimension = nir_channel(b, &size->def, axis);
+            const bool upper = (tap >> axis) & 1;
+            nir_def *index = nir_iadd_imm(b, base[axis], upper);
+            if (lower->linear)
+               weight = nir_fmul(b, weight, upper ? fraction[axis]
+                  : nir_fsub(b, nir_imm_float(b, 1), fraction[axis]));
+            if (wrap == PIPE_TEX_WRAP_CLAMP_TO_BORDER)
+               inside = nir_iand(b, inside, nir_iand(b, nir_ige_imm(b, index, 0),
+                                                       nir_ilt(b, index, dimension)));
+            if (wrap == PIPE_TEX_WRAP_REPEAT) {
+               index = nir_imod(b, index, dimension);
+            } else if (wrap == PIPE_TEX_WRAP_MIRROR_REPEAT) {
+               nir_def *period = nir_imul_imm(b, dimension, 2);
+               index = nir_imod(b, index, period);
+               index = nir_imin(b, index, nir_isub(b, nir_iadd_imm(b, period, -1), index));
+            } else {
+               index = nir_imin(b, nir_imax(b, index, nir_imm_int(b, 0)),
+                                   nir_iadd_imm(b, dimension, -1));
+            }
+            indices[axis] = index;
+         }
+         if (tex->is_array) {
+            nir_def *layer = nir_f2i32(b, nir_ffloor(b,
+               nir_fadd_imm(b, nir_channel(b, coord, spatial), 0.5f)));
+            indices[spatial] = nir_imin(b, nir_imax(b, layer, nir_imm_int(b, 0)),
+               nir_iadd_imm(b, nir_channel(b, &size->def, spatial), -1));
+         }
+         nir_tex_instr *fetch = nir_tex_instr_create(b->shader, 3);
+         fetch->op = nir_texop_txf;
+         fetch->sampler_dim = tex->sampler_dim;
+         fetch->is_array = tex->is_array;
+         fetch->dest_type = nir_type_float32;
+         fetch->coord_components = spatial + tex->is_array;
+         fetch->src[0] = nir_tex_src_for_ssa(nir_tex_src_texture_deref, texture);
+         fetch->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, level);
+         fetch->src[2] = nir_tex_src_for_ssa(nir_tex_src_coord,
+                                           nir_vec(b, indices, fetch->coord_components));
+         nir_def_init(&fetch->instr, &fetch->def, 4, 32);
+         fetch->instr.pass_flags = GEX_WGPU_TEX_PASS_LOWERED;
+         nir_builder_instr_insert(b, &fetch->instr);
+         color = nir_fadd(b, color, nir_fmul(b, nir_bcsel(b, inside, &fetch->def, border), weight));
+      }
+      colors[m] = color;
+   }
+   return mip_linear ? nir_flrp(b, colors[0], colors[1], level_weight) : colors[0];
 }
 
 static bool
@@ -8748,7 +8886,13 @@ gex_wgpu_lower_nearest_border_instr(nir_builder *b, nir_instr *instr,
    const bool bordered = lower->s || lower->t ||
                          (spatial > 2 && lower->r);
    nir_def *result = &tex->def;
-   if (bordered && lower->linear) {
+   if (bordered && !tex->is_shadow && lower->integer_mip_filter != PIPE_TEX_MIPFILTER_NONE) {
+      result = gex_wgpu_mip_border_sample(b, tex, lower, border, spatial);
+      if (!result) {
+         gex_tex_lower_fail(table, "a mipmapped border lookup without a resolved LOD");
+         return false;
+      }
+   } else if (bordered && lower->linear) {
       const int texture_index =
          nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
       if (texture_index < 0)
@@ -9957,15 +10101,69 @@ gex_wgpu_lower_mirror_clamp_instr(nir_builder *b, nir_instr *instr, void *data)
  * else fails the whole lowering, so `textureGrad`/`textureGradOffset` on a
  * usampler/isampler took eight KHR-GL33.texture_swizzle smoke cases with it.
  * An integer texture is never filtered, so the gradient only ever chooses a
- * mip level -- exactly what nir_lower_tex's txd lowering computes. Float
- * textureGrad is left alone: the nearest-border pass already handles it, and
- * lowering it would change working shaders. */
+ * mip level -- exactly what nir_lower_tex's txd lowering computes. This first
+ * pass selects integers only; state-dependent color border lookups resolve
+ * their gradients later. */
 static bool
 gex_wgpu_lower_integer_txd(const nir_tex_instr *tex, const void *data)
 {
    (void)data;
    const nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
    return base == nir_type_uint || base == nir_type_int;
+}
+
+static bool
+gex_wgpu_mip_border_tex(const nir_tex_instr *tex, const void *data)
+{
+   if (tex->is_shadow || tex->dest_type != nir_type_float32 ||
+       (tex->sampler_dim != GLSL_SAMPLER_DIM_2D && tex->sampler_dim != GLSL_SAMPLER_DIM_3D))
+      return false;
+   const int source = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   if (source < 0)
+      return false;
+   const nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(tex->src[source].src));
+   const struct gex_wgpu_texture_lowering *table = data;
+   if (!var || var->data.driver_location >= GEX_WGPU_MAX_SAMPLERS ||
+       !table->active[var->data.driver_location])
+      return false;
+   const struct gex_wgpu_border_lowering *lower = &table->slots[var->data.driver_location];
+   return (lower->s || lower->t || lower->r) && lower->integer_mip_filter != PIPE_TEX_MIPFILTER_NONE;
+}
+
+/* Resolve implicit derivatives before cube directions become face UVs.
+ * Mesa's lower_txd computes LOD in the original sampler's coordinate space,
+ * including the cube projection. A bias scales the gradients by exp2(bias).
+ * With a lowering table, resolve color border lookups for per-mip filtering. */
+static bool
+gex_wgpu_sample_gradients(nir_builder *b, nir_instr *instr, void *data)
+{
+   if (instr->type != nir_instr_type_tex || b->shader->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   const nir_alu_type base = nir_alu_type_get_base_type(tex->dest_type);
+   if ((data ? !gex_wgpu_mip_border_tex(tex, data) :
+                (base != nir_type_uint && base != nir_type_int)) ||
+       (tex->op != nir_texop_tex && tex->op != nir_texop_txb))
+      return false;
+   const int coord_src = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_src < 0)
+      return false;
+   b->cursor = nir_before_instr(instr);
+   nir_def *coord = tex->src[coord_src].src.ssa;
+   if (tex->is_array)
+      coord = nir_trim_vector(b, coord, coord->num_components - 1);
+   nir_def *dx = nir_ddx(b, coord), *dy = nir_ddy(b, coord);
+   const int bias_src = nir_tex_instr_src_index(tex, nir_tex_src_bias);
+   if (bias_src >= 0) {
+      nir_def *scale = nir_fexp2(b, tex->src[bias_src].src.ssa);
+      dx = nir_fmul(b, dx, scale);
+      dy = nir_fmul(b, dy, scale);
+      nir_tex_instr_remove_src(tex, bias_src);
+   }
+   tex->op = nir_texop_txd;
+   nir_tex_instr_add_src(tex, nir_tex_src_ddx, dx);
+   nir_tex_instr_add_src(tex, nir_tex_src_ddy, dy);
+   return true;
 }
 
 /* A texture slot the bound state cannot satisfy reads zero, and its binding
@@ -10462,9 +10660,13 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
                                struct pipe_sampler_view *const *views)
 {
    struct gex_wgpu_texture_lowering table = {0};
+   const nir_lower_tex_options projector_options = {
+      .lower_txp = ~0u,
+   };
    const nir_lower_tex_options rect_options = {
       .lower_rect = true,
       .lower_txd_cb = gex_wgpu_lower_integer_txd,
+      .lower_invalid_implicit_lod = true,
       /* textureGatherOffsets, split into four single-offset gathers taking
        * one texel each -- Mesa's own lowering, so the rule about *which*
        * texel of each footprint is authoritative rather than remembered. The
@@ -10472,6 +10674,12 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
       .lower_tg4_offsets = true,
    };
    bool progress = false;
+   /* Integer sampling becomes texelFetch, which has no projector operand.
+    * Divide first so implicit gradients describe the projected coordinates;
+    * explicit gradients already describe that space in GLSL. */
+   NIR_PASS(progress, nir, nir_lower_tex, &projector_options);
+   NIR_PASS(progress, nir, nir_shader_instructions_pass,
+            gex_wgpu_sample_gradients, nir_metadata_control_flow, NULL);
    NIR_PASS(progress, nir, nir_lower_tex, &rect_options);
    bool has_integer_cube = false;
    for (unsigned i = 0; i < texture_count; ++i) {
@@ -10569,8 +10777,6 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
          .integer_wrap_s = state->wrap_s,
          .integer_wrap_t = state->wrap_t,
          .integer_wrap_r = state->wrap_r,
-         .integer_levels =
-            view->u.tex.last_level - view->u.tex.first_level + 1,
          .integer_mip_filter = state->min_mip_filter,
          .lod_bias = state->lod_bias,
          .integer_min_lod = state->min_lod,
@@ -10609,6 +10815,15 @@ gex_wgpu_lower_texture_variant(nir_shader *nir,
    progress |= nir_shader_instructions_pass(
       nir, gex_wgpu_lower_sampler_lod_bias_instr,
       nir_metadata_control_flow | nir_metadata_loop_analysis, &table);
+   /* State bias is already part of implicit/bias lookups. Explicit gradients
+    * bypass it. Resolve their LOD before filtering border texels per mip. */
+   NIR_PASS(progress, nir, nir_shader_instructions_pass,
+            gex_wgpu_sample_gradients, nir_metadata_control_flow, &table);
+   const nir_lower_tex_options border_options = {
+      .lower_txd_cb = gex_wgpu_mip_border_tex,
+      .lower_txd_data = &table,
+   };
+   NIR_PASS(progress, nir, nir_lower_tex, &border_options);
    progress |= nir_shader_instructions_pass(
       nir, gex_wgpu_lower_mirror_clamp_instr,
       nir_metadata_control_flow | nir_metadata_loop_analysis, &table);
@@ -12865,6 +13080,41 @@ gex_wgpu_lower_dynamic_sampler_index(nir_shader *nir)
 static bool
 gex_wgpu_split_combined_samplers(nir_shader *nir)
 {
+   /* The frontend imports RGB EGLImages as ordinary 2D resources. External
+    * sampler coordinates and filtering have the same semantics; WebGPU has
+    * no separate external image type for this retained GL storage. Normalize
+    * both declarations and instructions before splitting their bindings. */
+   bool external = false;
+   nir_foreach_variable_with_modes(var, nir, nir_var_uniform) {
+      const struct glsl_type *type = glsl_without_array(var->type);
+      const bool sampler = glsl_type_is_sampler(type);
+      if ((!sampler && !glsl_type_is_texture(type)) ||
+          glsl_get_sampler_dim(type) != GLSL_SAMPLER_DIM_EXTERNAL)
+         continue;
+      const struct glsl_type *flat = sampler
+         ? glsl_sampler_type(GLSL_SAMPLER_DIM_2D, false, false,
+                             glsl_get_sampler_result_type(type))
+         : glsl_texture_type(GLSL_SAMPLER_DIM_2D, false,
+                             glsl_get_sampler_result_type(type));
+      var->type = glsl_type_is_array(var->type)
+         ? glsl_array_type(flat, glsl_get_length(var->type), 0) : flat;
+      external = true;
+   }
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_tex) {
+               nir_tex_instr *tex = nir_instr_as_tex(instr);
+               if (tex->sampler_dim == GLSL_SAMPLER_DIM_EXTERNAL) {
+                  tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+                  external = true;
+               }
+            }
+         }
+      }
+   }
+   if (external)
+      nir_fixup_deref_types(nir);
    nir_variable *split_texture[GEX_WGPU_MAX_SAMPLERS] = {0};
    nir_variable *split_sampler[GEX_WGPU_MAX_SAMPLERS] = {0};
    /* Which combined variable, and which element of it, each pair replaces --
@@ -15652,6 +15902,17 @@ gex_wgpu_lower_framebuffer_fetch(nir_shader *nir, const enum pipe_format *format
    nir_foreach_shader_out_variable_safe(var, nir) {
       if (!var->data.fb_fetch_output)
          continue;
+      /* gl_LastFragData is a read-only query, despite using shader_out
+       * storage in Mesa. Its loads were replaced above; initializing a new
+       * output here would collide with gl_FragColor's location zero.
+       * Scalarization can lose read_only, so retain the builtin's semantics
+       * by its reserved name too. */
+      if (var->data.read_only ||
+          (var->name && !strncmp(var->name, "gl_LastFragData", strlen("gl_LastFragData")))) {
+         nir_remove_dead_derefs(nir);
+         exec_node_remove(&var->node);
+         continue;
+      }
       const unsigned first = var->data.location == FRAG_RESULT_COLOR ? 0 :
                              var->data.location - FRAG_RESULT_DATA0;
       const unsigned slots = glsl_count_attribute_slots(var->type, false);
@@ -16848,6 +17109,11 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
       gex_wgpu_ignore_sample_mask(variant);
    if (want_drop_color)
       gex_wgpu_drop_color_outputs(variant);
+   /* Queries are independent of the sampled component type. Preserve their
+    * real answers before unusable-binding lowering zeros texture operations
+    * whose default sample-type classification disagrees with an integer view. */
+   if (want_query_only)
+      gex_wgpu_lower_query_only(variant, want_query_only, want_query_geom);
    if (want_omit_slots)
       gex_wgpu_omit_textures(variant, want_omit_slots);
    /* Before the texture lowering below, which reads each sampler's dimension
@@ -16859,9 +17125,6 @@ gex_wgpu_fragment_module(struct gex_wgpu_context *ctx, bool drawing_points,
    if (fs->ms_array_slots)
       gex_wgpu_flatten_ms_array(variant, fs->ms_array_slots, want_tiled_geom);
    gex_wgpu_lower_frag_coord_tile(variant, want_frag_tile_x);
-   if (want_query_only)
-      gex_wgpu_lower_query_only(variant, want_query_only,
-                                want_query_geom);
    /* Before the texture lowering, which reads gl_FragCoord for nothing and
     * would otherwise see the load this adds. */
    if (want_stipple)
@@ -18934,10 +19197,13 @@ gex_wgpu_ranges_on(void)
 }
 
 static unsigned long gex_wgpu_range_direct, gex_wgpu_range_overlap;
-/* The D3D front end's index-bounds scans, where it is linked in. */
+/* The Wasm D3D front end's optional index-bounds scans. Native GLES does
+ * not link that front end, and Mach-O rejects its undefined weak data. */
+#ifdef __EMSCRIPTEN__
 extern uint64_t dirk_index_bounds_calls __attribute__((weak));
 extern uint64_t dirk_index_bounds_indices __attribute__((weak));
 extern int64_t dirk_index_bounds_ns __attribute__((weak));
+#endif
 
 static void
 gex_wgpu_note_range(struct gex_wgpu_resource *gex, uint32_t bit, uint64_t lo,
@@ -23050,34 +23316,12 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
    if (comparison && (state->compare_func < PIPE_FUNC_NEVER ||
                       state->compare_func > PIPE_FUNC_ALWAYS))
       return gex_wgpu_sampler_refused(state, "compare function");
-   /* What the *lowering* needs, not more.
-    *
-    * GL_CLAMP_TO_BORDER is served by a shader pass that tests the coordinate
-    * and substitutes the border colour, so it needs one filter for both
-    * directions and no mip filtering -- with MIPFILTER_NONE only the base
-    * level is ever sampled and the lod *range* is irrelevant, which is where
-    * this was over-strict: it also demanded min_lod == max_lod == 0, and
-    * st/mesa gives a texture with GL_TEXTURE_MAX_LEVEL of 1 a non-zero range
-    * whatever the filter. So an ordinary NEAREST clamp-to-border sample of a
-    * two-level texture had its sampler *refused* -- and a refused sampler is
-    * served by the default one, which clamps to edge, so the picture was
-    * quietly wrong with nothing in the log. Four of
-    * gl44-sampling-matrix-probe's cases were exactly that, invisible until a
-    * GL 4.4 context let the probe run. */
-   /* Mip-NEAREST is allowed here because the shader lowering models it --
-    * gex_wgpu_border_lowering carries integer_mip_filter and integer_levels,
-    * computes the level and clamps it, and refuses only MIPFILTER_LINEAR.
-    * Refusing it here was stricter than the pass that would have served it,
-    * and a refusal is not a neutral outcome: create_sampler_state returns
-    * NULL, cso binds NULL, and every consumer then reads the slot as
-    * texelFetch-only -- so the border lowering that exists for exactly this
-    * case never runs. KHR-GL45.gpu_shader5's four texture_gather_offset clamp
-    * cases died that way: their reference sampler is CLAMP_TO_BORDER with
-    * mip-nearest, the gather on it was left as a sampled integer image, and
-    * Tint rejected the whole capture shader. */
+   /* Border filtering needs matching spatial filters. Color lookups can
+    * interpolate mip footprints in software; comparison and integer samplers
+    * retain their previous mip-filter restrictions. */
    if (border && (state->min_img_filter != state->mag_img_filter ||
-                  (state->min_mip_filter != PIPE_TEX_MIPFILTER_NONE &&
-                   state->min_mip_filter != PIPE_TEX_MIPFILTER_NEAREST) ||
+                  (state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR &&
+                   (comparison || state->border_color_is_integer)) ||
                   (!state->border_color_is_integer &&
                    (!isfinite(state->border_color.f[0]) ||
                     !isfinite(state->border_color.f[1]) ||
@@ -23085,7 +23329,7 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
                     !isfinite(state->border_color.f[3])))))
       return gex_wgpu_sampler_refused(state,
                                       "clamp-to-border with mismatched "
-                                      "filters, linear mip filtering or a "
+                                      "filters, unsupported comparison/integer mip filtering or a "
                                       "non-finite border colour");
    struct pipe_sampler_state supported = {0};
    supported.wrap_s = state->wrap_s;
@@ -23170,16 +23414,22 @@ gex_wgpu_create_sampler_state(struct pipe_context *pipe,
     * --anisotropic=0 for exactly that reason.
     *
     * WebGPU requires all three filters to be linear when maxAnisotropy is
-    * above one, and GL treats anisotropy as a quality hint rather than a
-    * promise, so a sampler that is not fully linear takes one instead of
-    * being turned away. 16 is what the cap advertises and what Dawn allows;
+    * above one. With no mip filtering, clamp LOD to zero so a linear mip
+    * filter still reads only the base level and allows anisotropy
+    * within that level. A nearest spatial or mip filter keeps anisotropy at
+    * one. 16 is what the cap advertises and what Dawn allows;
     * clamping keeps a larger request from being a validation error. */
    const bool fully_linear =
       state->mag_img_filter == PIPE_TEX_FILTER_LINEAR &&
       state->min_img_filter == PIPE_TEX_FILTER_LINEAR &&
-      state->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR;
+      state->min_mip_filter != PIPE_TEX_MIPFILTER_NEAREST;
    desc.maxAnisotropy = fully_linear && state->max_anisotropy > 1
       ? (uint16_t)MIN2(16u, (unsigned)state->max_anisotropy) : 1;
+   if (desc.maxAnisotropy > 1) {
+      desc.mipmapFilter = WGPUMipmapFilterMode_Linear;
+      if (state->min_mip_filter == PIPE_TEX_MIPFILTER_NONE)
+         desc.lodMaxClamp = 0.0f;
+   }
    if (comparison)
       desc.compare = gex_wgpu_compare(state->compare_func);
    struct gex_wgpu_sampler *sampler = CALLOC_STRUCT(gex_wgpu_sampler);
@@ -24725,18 +24975,10 @@ gex_wgpu_texture_map(struct pipe_context *pipe,
    return transfer->data;
 }
 
-/* Buffer mapping.
- *
- * Every buffer this driver creates carries a CPU shadow, which buffer_subdata
- * already treats as authoritative: nothing on the GPU writes a buffer yet (no
- * transform feedback, no shader storage, no compute), so the shadow and the
- * WGPUBuffer cannot disagree.  Mapping is therefore a pointer into the shadow
- * plus, on unmap, the same aligned upload buffer_subdata performs.
- *
- * When the GPU does gain the ability to write a buffer, a read map will have
- * to fall back to a readback the way texture_map does; until then that case
- * cannot arise and is asserted rather than silently mis-served.
- */
+/* CPU-authored buffers can read their shadow. Shader storage, feedback,
+ * copies and compute-emulated stages mark gpu_written, so their read maps
+ * fetch the device's current contents instead. Aligned write-only maps can
+ * use temporary staging without allocating a permanent shadow. */
 static void *
 gex_wgpu_buffer_map(struct pipe_context *pipe, struct pipe_resource *resource,
                     unsigned level, unsigned usage,
@@ -28624,11 +28866,12 @@ gex_wgpu_sampler_view_refresh(struct pipe_context *pipe,
  *
  * Here the chain is recorded into the pending encoder behind whatever the
  * frame has drawn: one small render pass per level and layer, reading the
- * level above with textureLoad and writing the 2x2 average. No submit, and
+ * level above with textureLoad and writing the linear downsample. No submit, and
  * the batch carries on. textureLoad rather than a filtering sampler so that
  * unfilterable float formats are served too; the result is the box filter
- * util_gen_mipmap's linear sampling also amounts to for even sizes (GL leaves
- * the filter to the implementation).
+ * util_gen_mipmap's linear sampling also amounts to for even sizes. Odd sizes
+ * sample at scaled texel centers so the reduction covers the full image,
+ * including its last row and column.
  *
  * Declines -- returning false sends st/mesa to util_gen_mipmap as before --
  * anything but a single-sampled 2D, array or cube colour texture with float
@@ -28653,13 +28896,24 @@ gex_wgpu_mip_pipeline(struct gex_wgpu_screen *screen, WGPUTextureFormat format)
          "}\n"
          "@fragment fn fs(@builtin(position) pos: vec4<f32>)"
          " -> @location(0) vec4<f32> {\n"
-         "  let m = vec2<i32>(textureDimensions(src, 0)) - vec2<i32>(1);\n"
-         "  let d = vec2<i32>(pos.xy) * 2;\n"
+         "  let size = vec2<i32>(textureDimensions(src, 0));\n"
+         "  let m = size - vec2<i32>(1);\n"
+         "  var d = vec2<i32>(pos.xy) * 2;\n"
+         "  var weight = vec2<f32>(0.5);\n"
+         "  let even = (size.x == 1 || (size.x & 1) == 0) &&\n"
+         "             (size.y == 1 || (size.y & 1) == 0);\n"
+         "  if (!even) {\n"
+         "    let into = max(size / vec2<i32>(2), vec2<i32>(1));\n"
+         "    let p = pos.xy / vec2<f32>(into) * vec2<f32>(size) - vec2<f32>(0.5);\n"
+         "    d = vec2<i32>(floor(p));\n"
+         "    weight = fract(p);\n"
+         "  }\n"
          "  let a = textureLoad(src, min(d, m), 0);\n"
          "  let b = textureLoad(src, min(d + vec2<i32>(1, 0), m), 0);\n"
          "  let c = textureLoad(src, min(d + vec2<i32>(0, 1), m), 0);\n"
          "  let e = textureLoad(src, min(d + vec2<i32>(1, 1), m), 0);\n"
-         "  return (a + b + c + e) * 0.25;\n"
+         "  if (even) { return (a + b + c + e) * 0.25; }\n"
+         "  return mix(mix(a, b, weight.x), mix(c, e, weight.x), weight.y);\n"
          "}\n";
       WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
       source.code = (WGPUStringView){wgsl, WGPU_STRLEN};
@@ -29733,8 +29987,14 @@ gex_wgpu_resolve(struct pipe_context *pipe, struct pipe_resource *dst,
    if (util_format_is_depth_or_stencil(src->format))
       return gex_wgpu_resolve_depth(pipe, dst, src);
 
-   WGPUTextureView msaa = wgpuTextureCreateView(gex_resource(src)->texture, NULL);
-   WGPUTextureView single = wgpuTextureCreateView(gex_resource(dst)->texture, NULL);
+   /* The destination may have a complete mip chain. A resolve attachment
+    * names one subresource, whereas the default view includes every mip. */
+   WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   vd.dimension = WGPUTextureViewDimension_2D;
+   vd.mipLevelCount = 1;
+   vd.arrayLayerCount = 1;
+   WGPUTextureView msaa = wgpuTextureCreateView(gex_resource(src)->texture, &vd);
+   WGPUTextureView single = wgpuTextureCreateView(gex_resource(dst)->texture, &vd);
    WGPUCommandEncoder encoder =
       gex_wgpu_local_encoder(screen);
    if (!msaa || !single || !encoder) {
@@ -35998,6 +36258,11 @@ gex_wgpu_bind_storage_access(struct gex_wgpu_bindings *group, uint32_t binding,
    const unsigned i = group->count++;
    group->binding[i] = binding;
    group->buffer[i] = gex_resource(resource)->buffer;
+   /* The emulated stages write these buffers directly, bypassing
+    * set_shader_buffers. Layer/viewport routing and feedback read them on
+    * the CPU afterwards and must not mistake their old shadow for output. */
+   if (!read_only)
+      gex_resource(resource)->gpu_written = true;
    group->offset[i] = 0;
    group->size[i] = gex_resource(resource)->allocation_size;
    group->storage_mask |= UINT64_C(1) << i;
@@ -40429,6 +40694,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    const uint8_t *want_interp = fs ? fs->varying_interp : NULL;
    const uint8_t *want_aux = fs ? fs->varying_aux : NULL;
    const uint8_t *want_components = fs ? fs->varying_components : NULL;
+   uint32_t want_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
+   const uint32_t want_query_only = gex_wgpu_query_only_geom(
+      vs, ctx->vertex_sampler_views, want_query_geom);
    uint8_t want_buftex[GEX_WGPU_MAX_BUFFER_TEXTURES];
    gex_wgpu_buftex_words(vs->buftex_count, vs->buftex_slots,
                          ctx->vertex_sampler_views, want_buftex);
@@ -40436,6 +40704,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
    for (struct gex_wgpu_interp_variant *v = vs->interp_variants; v;
         v = v->next) {
       bool match = v->mask == fs_mask && v->sampler_mask == sampler_mask &&
+                   v->query_only_slots == want_query_only &&
+                   memcmp(v->query_only_geom, want_query_geom,
+                          sizeof(v->query_only_geom)) == 0 &&
                    v->clip_halfz == want_halfz &&
                    v->clip_dist_for == want_clip_dist &&
                    v->inv_w_location == want_inv_w &&
@@ -40504,6 +40775,9 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       memcpy(variant->attrib_unpack, want_unpack,
              sizeof(variant->attrib_unpack));
       variant->sampler_mask = sampler_mask;
+      variant->query_only_slots = want_query_only;
+      memcpy(variant->query_only_geom, want_query_geom,
+             sizeof(variant->query_only_geom));
       for (unsigned slot = 0; slot < GEX_WGPU_MAX_SAMPLERS; ++slot) {
          if (!(sampler_mask & (UINT64_C(1) << slot)))
             continue;
@@ -40632,13 +40906,8 @@ gex_wgpu_interp_variant_get(struct gex_wgpu_context *ctx, bool flipped,
       /* And the vertex stage's query-only slots, for the same reason: three
        * of texture_query_levels' six shadow cases read the level count from
        * the vertex stage. */
-      if (vs->query_only_slots) {
-         uint32_t vs_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
-         const uint32_t vs_query = gex_wgpu_query_only_geom(
-            vs, ctx->vertex_sampler_views, vs_query_geom);
-         if (vs_query)
-            gex_wgpu_lower_query_only(clone, vs_query, vs_query_geom);
-      }
+      if (want_query_only)
+         gex_wgpu_lower_query_only(clone, want_query_only, want_query_geom);
       if (lower_textures &&
           !gex_wgpu_lower_texture_variant(clone, vs->texture_count,
                                           vs->texture_slots,
@@ -41473,6 +41742,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                        (reads_now - was_reads) / f,
                        gex_wgpu_timing_every(), sink == 1 ? " " : "");
                was_reads = gex_wgpu_clock_reads;
+#ifdef __EMSCRIPTEN__
                if (&dirk_index_bounds_calls && &dirk_index_bounds_indices &&
                    &dirk_index_bounds_ns) {
                   /* The D3D front end's index scans, which give indexed
@@ -41489,6 +41759,7 @@ gex_wgpu_report_timing_emit(const struct gex_wgpu_screen *sc)
                   wib[1] = dirk_index_bounds_indices;
                   wib[2] = (uint64_t)dirk_index_bounds_ns;
                }
+#endif
                {
                   static uint64_t wpe[GEX_WGPU_PASS_END_COUNT + 1], wsz[4], wbd[4], wsb, wbig[2], wip[8];
                   uint64_t named = 0;
@@ -49952,22 +50223,30 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    /* The vertex stage's textures, in group 3. */
    WGPUBindGroupLayoutEntry
       vertex_texture_entries[2 * GEX_WGPU_MAX_SAMPLERS];
-   const bool needs_vertex_texture = ctx->vs->texture_count != 0;
-   if (needs_vertex_texture) {
+   uint32_t vertex_query_geom[GEX_WGPU_MAX_SAMPLERS][5];
+   const uint32_t vertex_query_only = gex_wgpu_query_only_geom(
+      ctx->vs, ctx->vertex_sampler_views, vertex_query_geom);
+   unsigned vertex_texture_entry_count = 0;
+   if (ctx->vs->texture_count) {
       for (unsigned i = 0; i < ctx->vs->texture_count; ++i) {
-         vertex_texture_entries[i] =
+         if (vertex_query_only & BITFIELD_BIT(ctx->vs->texture_slots[i]))
+            continue;
+         const unsigned entry = vertex_texture_entry_count++;
+         vertex_texture_entries[entry] =
             (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
-         vertex_texture_entries[i].binding = ctx->vs->texture_bindings[i];
-         vertex_texture_entries[i].visibility = WGPUShaderStage_Vertex;
-         vertex_texture_entries[i].texture.sampleType =
+         vertex_texture_entries[entry].binding = ctx->vs->texture_bindings[i];
+         vertex_texture_entries[entry].visibility = WGPUShaderStage_Vertex;
+         vertex_texture_entries[entry].texture.sampleType =
             ctx->vs->texture_sample_types[i];
-         vertex_texture_entries[i].texture.viewDimension =
+         vertex_texture_entries[entry].texture.viewDimension =
             ctx->vs->texture_dimensions[i];
-         vertex_texture_entries[i].texture.multisampled =
+         vertex_texture_entries[entry].texture.multisampled =
             (ctx->vs->multisampled_slots >> ctx->vs->texture_slots[i]) & 1;
       }
       for (unsigned i = 0; i < ctx->vs->sampler_count; ++i) {
-         const unsigned entry = ctx->vs->texture_count + i;
+         if (vertex_query_only & BITFIELD_BIT(ctx->vs->sampler_slots[i]))
+            continue;
+         const unsigned entry = vertex_texture_entry_count++;
          vertex_texture_entries[entry] =
             (WGPUBindGroupLayoutEntry)WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
          vertex_texture_entries[entry].binding = ctx->vs->sampler_bindings[i];
@@ -49988,6 +50267,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          vertex_texture_entries[entry].sampler.type = ctx->vs->sampler_types[i];
       }
    }
+   const bool needs_vertex_texture = vertex_texture_entry_count != 0;
    /* The fragment stage's, which may be written. */
    for (unsigned i = 0; i < ctx->fs->ssbo_count; ++i) {
       const unsigned at = ctx->fs->ubo_count + i;
@@ -50125,7 +50405,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
          desc.entryCount = fragment_group_count;
          desc.entries = fragment_layout_entries;
       } else if (group == 3 && needs_vertex_texture) {
-         desc.entryCount = ctx->vs->texture_count + ctx->vs->sampler_count;
+         desc.entryCount = vertex_texture_entry_count;
          desc.entries = vertex_texture_entries;
       }
       {
@@ -50983,13 +51263,17 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
    }
    if (pipeline && needs_vertex_texture) {
       WGPUBindGroupEntry entries[2 * GEX_WGPU_MAX_SAMPLERS];
+      unsigned entry_count = 0;
       for (unsigned i = 0; i < ctx->vs->texture_count; ++i) {
          const unsigned slot = ctx->vs->texture_slots[i];
+         if (vertex_query_only & BITFIELD_BIT(slot))
+            continue;
+         const unsigned entry = entry_count++;
          struct gex_wgpu_sampler_view *view =
             (struct gex_wgpu_sampler_view *)ctx->vertex_sampler_views[slot];
-         entries[i] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
-         entries[i].binding = ctx->vs->texture_bindings[i];
-         entries[i].textureView = view
+         entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
+         entries[entry].binding = ctx->vs->texture_bindings[i];
+         entries[entry].textureView = view
             ? gex_wgpu_stage_texture_view(&view->base,
                                           ctx->vs->texture_dimensions[i])
             /* GL leaves units enabled with nothing bound, as in the fragment
@@ -51000,7 +51284,9 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
       for (unsigned i = 0; i < ctx->vs->sampler_count; ++i) {
          const unsigned slot = ctx->vs->sampler_slots[i];
-         const unsigned entry = ctx->vs->texture_count + i;
+         if (vertex_query_only & BITFIELD_BIT(slot))
+            continue;
+         const unsigned entry = entry_count++;
          entries[entry] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
          entries[entry].binding = ctx->vs->sampler_bindings[i];
          /* The sampler the layout above names: the application's, or its
@@ -51016,7 +51302,7 @@ gex_wgpu_draw_vbo_inner(struct pipe_context *pipe,
       }
       WGPUBindGroupDescriptor bind_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
       bind_desc.layout = group_layouts[3];
-      bind_desc.entryCount = ctx->vs->texture_count + ctx->vs->sampler_count;
+      bind_desc.entryCount = entry_count;
       bind_desc.entries = entries;
       bind_groups[3] = gex_wgpu_cached_bind_group(
          screen, group_label[3], bind_desc.layout, bind_desc.entries,
@@ -53641,20 +53927,11 @@ gex_wgpu_screen_create(WGPUDevice device)
    const bool force_ordered_fetch = getenv("GEX_WGPU_FORCE_ORDERED_FETCH") != NULL;
    if (force_ordered_fetch)
       screen->framebuffer_fetch = false;
-   /* The fragment stage's texture units, from what the device grants.
-    *
-    * Every unit is a sampled texture, and so is every read-only image
-    * (GEX_WGPU_MAX_SHADER_IMAGES of them) and each of the eight colour
-    * attachment copies framebuffer fetch and logic ops bind
-    * (GEX_WGPU_LOGICOP_BINDING + rt); a shader may use all three at once, so
-    * the units are what is left after the other two. WebGPU's default of
-    * sixteen leaves the sixteen GL 3.x requires; Chrome's 48 leaves 24, and a
-    * device granting 56 or more gets all 32. Iris sizes its sampler pool
-    * from GL_MAX_TEXTURE_IMAGE_UNITS -- the fragment stage's figure -- and
-    * Complementary's HIGH profile and Photon both ask for more than sixteen.
-    * Samplers are a separate limit, sixteen in all of Chrome's tiers;
-    * gex_wgpu_fs_share_samplers lets units bind more textures than that.
-    * GEX_WGPU_FS_UNITS lowers it, for comparisons. */
+   /* Every advertised GL unit may use an independent sampler state. Sharing
+    * compatible samplers is an optimization, not a way to promise more units
+    * than the device's sampler limit: a legal draw with distinct states must
+    * still execute. Reserve sampled textures for read-only images and color
+    * copies as well. GEX_WGPU_FS_UNITS can further lower this limit. */
    {
       const uint32_t reserved = GEX_WGPU_MAX_SHADER_IMAGES + 8;
       const uint32_t granted =
@@ -53662,6 +53939,10 @@ gex_wgpu_screen_create(WGPUDevice device)
          limits.maxSampledTexturesPerShaderStage != WGPU_LIMIT_U32_UNDEFINED
             ? limits.maxSampledTexturesPerShaderStage : 0;
       uint32_t units = granted > reserved ? granted - reserved : 0;
+      const uint32_t sampler_limit = got_limits &&
+         limits.maxSamplersPerShaderStage != WGPU_LIMIT_U32_UNDEFINED
+            ? limits.maxSamplersPerShaderStage : GEX_WGPU_MAX_STAGE_SAMPLERS;
+      units = MIN2(units, sampler_limit);
       const char *cap = getenv("GEX_WGPU_FS_UNITS");
       if (cap && *cap)
          units = MIN2(units, (uint32_t)atoi(cap));

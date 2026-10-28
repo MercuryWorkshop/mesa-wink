@@ -145,11 +145,12 @@ struct image {
 };
 
 static struct image
-make_image_samples(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkSampleCountFlagBits samples)
+make_image_samples_flags(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage,
+                         VkSampleCountFlagBits samples, VkImageCreateFlags flags)
 {
    struct image im = { 0 };
    VK(vkCreateImage(dev, &(VkImageCreateInfo){
-      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = VK_IMAGE_TYPE_2D,
       .format = format, .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
       .samples = samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
       .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
@@ -166,9 +167,17 @@ make_image_samples(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags us
    VK(vkCreateImageView(dev, &(VkImageViewCreateInfo){
       .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im.image,
       .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = format,
-      .subresourceRange = { depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+      .subresourceRange = { depth ? VK_IMAGE_ASPECT_DEPTH_BIT :
+                           format == VK_FORMAT_S8_UINT ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
+                           0, 1, 0, 1 },
    }, NULL, &im.view));
    return im;
+}
+
+static struct image
+make_image_samples(uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage, VkSampleCountFlagBits samples)
+{
+   return make_image_samples_flags(w, h, format, usage, samples, 0);
 }
 
 static struct image

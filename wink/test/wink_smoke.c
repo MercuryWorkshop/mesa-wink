@@ -101,16 +101,25 @@ note(const char *fmt, ...)
    X(void, Disable, (GLenum))                                                  \
    X(void, GenTextures, (GLsizei, GLuint *))                                     \
    X(void, BindTexture, (GLenum, GLuint))                                        \
+   X(void, ActiveTexture, (GLenum))                                             \
    X(void, TexParameteri, (GLenum, GLenum, GLint))                               \
+   X(void, GenerateMipmap, (GLenum))                                             \
+   X(void, TexParameterf, (GLenum, GLenum, GLfloat))                            \
+   X(void, TexParameterIiv, (GLenum, GLenum, const GLint *))                    \
+   X(void, TexParameterIuiv, (GLenum, GLenum, const GLuint *))                  \
    X(void, TexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
+   X(void, TexImage3D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *)) \
+   X(void, TexSubImage3D, (GLenum, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei, GLenum, GLenum, const void *)) \
    X(void, GenFramebuffers, (GLsizei, GLuint *))                                \
    X(void, BindFramebuffer, (GLenum, GLuint))                                   \
    X(void, FramebufferTexture2D, (GLenum, GLenum, GLenum, GLuint, GLint))       \
+   X(void, FramebufferTextureLayer, (GLenum, GLenum, GLuint, GLint, GLint))    \
    X(GLenum, CheckFramebufferStatus, (GLenum))                                 \
    X(void, DeleteFramebuffers, (GLsizei, const GLuint *))                       \
    X(void, DrawBuffers, (GLsizei, const GLenum *))                              \
    X(void, ReadBuffer, (GLenum))                                                \
    X(void, TexStorage2DMultisample, (GLenum, GLsizei, GLenum, GLsizei, GLsizei, GLboolean)) \
+   X(void, TexStorage2D, (GLenum, GLsizei, GLenum, GLsizei, GLsizei))          \
    X(void, BlitFramebuffer, (GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum)) \
    X(void, CompressedTexImage2D, (GLenum, GLint, GLenum, GLsizei, GLsizei, GLint, GLsizei, const void *)) \
    X(void, DeleteTextures, (GLsizei, const GLuint *))                             \
@@ -134,6 +143,8 @@ note(const char *fmt, ...)
    X(void, ColorPointer, (GLint, GLenum, GLsizei, const void *))                 \
    X(void, BlendFunc, (GLenum, GLenum))                                          \
    X(GLint, GetUniformLocation, (GLuint, const GLchar *))                        \
+   X(GLint, GetAttribLocation, (GLuint, const GLchar *))                         \
+   X(void, Uniform1i, (GLint, GLint))                                           \
    X(void, Uniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat))               \
    X(void, ClearTexImage, (GLuint, GLint, GLenum, GLenum, const void *))
 
@@ -661,6 +672,97 @@ raw_shadow_depth(void)
 }
 
 static void
+external_image(wink_context *original, wink_surface *surface)
+{
+   const GLenum external = 0x8D65; /* GL_TEXTURE_EXTERNAL_OES */
+   typedef void (*Import)(GLenum, void *);
+   Import import = (Import)wink_get_proc_address("glEGLImageTargetTexture2DOES");
+   CHECK(import != NULL, "external image import entry point");
+   if (!import)
+      return;
+   int status;
+   CHECK(!wink_image_create_texture_2d(0, &status) && status == WINK_ERROR_BAD_ATTRIBUTE,
+         "external image rejects missing texture");
+   GLuint source, fbo;
+   p_glGenTextures(1, &source);
+   p_glActiveTexture(GL_TEXTURE0);
+   p_glBindTexture(GL_TEXTURE_2D, source);
+   const uint8_t red[] = {255, 0, 0, 255}, blue[] = {0, 0, 255, 255};
+   p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, red);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+   wink_image *image = wink_image_create_texture_2d(source, &status);
+   CHECK(image && status == WINK_OK, "external image export: %d", status);
+   if (!image) {
+      p_glDeleteTextures(1, &source);
+      return;
+   }
+   /* A GPU write after export must be visible to the imported sibling. */
+   p_glGenFramebuffers(1, &fbo);
+   p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+   p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, source, 0);
+   p_glClearColor(0, 1, 0, 1);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   p_glDeleteFramebuffers(1, &fbo);
+   /* Redefinition and deletion must not change or free the exported storage. */
+   p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, blue);
+   p_glDeleteTextures(1, &source);
+
+   wink_context_attribs ca;
+   wink_context_attribs_default(&ca);
+   ca.api = WINK_API_OPENGL_ES;
+   ca.major = 3;
+   ca.minor = 0;
+   wink_context *other = wink_context_create(&ca, &status);
+   CHECK(other && status == WINK_OK, "external image independent context: %d", status);
+   if (!other) {
+      wink_image_destroy(image);
+      return;
+   }
+   CHECK(wink_make_current(other, surface, surface) == WINK_OK,
+         "external image make independent context current");
+   GLuint texture, vao;
+   p_glGenTextures(1, &texture);
+   p_glBindTexture(external, texture);
+   import(external, image);
+   /* No GL readback between import and destroy: in remote mode the import
+    * may still be queued on glthread when the handle is released. */
+   wink_image_destroy(image);
+   CHECK(p_glGetError() == GL_NO_ERROR, "external image import");
+   /* Destroying the handle releases only its ownership, not the sibling's. */
+   import(external, image);
+   CHECK(p_glGetError() == GL_INVALID_VALUE, "external image rejects destroyed handle");
+   wink_image_destroy(image);
+   const char *vs = "#version 300 es\n"
+      "void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+      "gl_Position=vec4(p*2.0-1.0,0,1);}";
+   const char *fs = "#version 300 es\n"
+      "#extension GL_OES_EGL_image_external_essl3 : require\n"
+      "precision highp float; uniform samplerExternalOES image; out vec4 color;"
+      "void main(){color=texture(image,vec2(0.5));}";
+   GLuint prog = link_program(vs, fs, "external image");
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glUseProgram(prog);
+   p_glViewport(0, 0, W, H);
+   p_glClearColor(0, 0, 0, 1);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glDrawArrays(GL_TRIANGLES, 0, 3);
+   uint8_t px[4];
+   read_center(px, W, H);
+   CHECK(near(px, 0, 255, 0), "external image retained GPU write: %u,%u,%u,%u",
+         px[0], px[1], px[2], px[3]);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "external image context failed");
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+   p_glDeleteTextures(1, &texture);
+   p_glDeleteVertexArrays(1, &vao);
+   CHECK(wink_make_current(original, surface, surface) == WINK_OK,
+         "external image restore context");
+   wink_context_destroy(other);
+}
+
+static void
 buffer_read_sources(void)
 {
    const uint32_t original[4] = {3, 11, 29, 47};
@@ -746,6 +848,743 @@ buffer_read_sources(void)
 /* Repeated triangles in a single draw must read earlier primitives' writes.
  * Three increments distinguish coherent fetch from a once-per-draw snapshot. */
 static void
+norm16_readback(void)
+{
+   GLuint fbo, textures[2];
+   p_glGenFramebuffers(1, &fbo);
+   p_glGenTextures(2, textures);
+   p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+   p_glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+   for (unsigned i = 0; i < 2; ++i) {
+      const GLenum type = i ? GL_SHORT : GL_UNSIGNED_SHORT;
+      p_glBindTexture(GL_TEXTURE_2D, textures[i]);
+      p_glTexImage2D(GL_TEXTURE_2D, 0, i ? GL_RG16_SNORM : GL_RG16,
+                    1, 1, 0, GL_RG, type, NULL);
+      p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, textures[i], 0);
+      CHECK(p_glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE,
+            "RG16 read framebuffer, signed=%u", i);
+      GLint format = 0, read_type = 0;
+      p_glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &format);
+      p_glGetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &read_type);
+      CHECK(format == GL_RG && (GLenum)read_type == type,
+            "RG16 preferred read pair, signed=%u: %x/%x", i, format, read_type);
+      p_glClearColor(0.25f, 0.75f, 0.0f, 1.0f);
+      p_glClear(GL_COLOR_BUFFER_BIT);
+      uint16_t pixel[2] = { 0, 0 };
+      p_glReadPixels(0, 0, 1, 1, GL_RG, type, pixel);
+      const int max = i ? 32767 : 65535;
+      CHECK(abs((int)pixel[0] - (int)lroundf(0.25f * max)) <= 1 &&
+            abs((int)pixel[1] - (int)lroundf(0.75f * max)) <= 1,
+            "RG16 read values, signed=%u: %u/%u", i, pixel[0], pixel[1]);
+      CHECK(p_glGetError() == GL_NO_ERROR, "RG16 read GL error, signed=%u", i);
+   }
+   p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   p_glDeleteFramebuffers(1, &fbo);
+   p_glDeleteTextures(2, textures);
+}
+
+static void
+mipmap_full_image(void)
+{
+   const struct {
+      unsigned width, height;
+      uint8_t level1[4];
+      int level2;
+   } cases[] = {
+      {5, 3, {50, 150}, 100},
+      {3, 1, {40}, -1},
+      {1, 3, {20}, -1},
+      {4, 4, {30, 110, 70, 150}, 90},
+   };
+   GLuint fbo;
+   p_glGenFramebuffers(1, &fbo);
+   p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+   p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+   p_glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+   p_glActiveTexture(GL_TEXTURE0);
+   for (unsigned c = 0; c < sizeof(cases)/sizeof(cases[0]); ++c) {
+      GLuint texture;
+      p_glGenTextures(1, &texture);
+      p_glBindTexture(GL_TEXTURE_2D, texture);
+      uint8_t pixels[5 * 4 * 4];
+      for (unsigned y = 0; y < cases[c].height; ++y) {
+         for (unsigned x = 0; x < cases[c].width; ++x) {
+            const unsigned i = 4 * (y * cases[c].width + x);
+            pixels[i] = 40 * x + 20 * y;
+            pixels[i+1] = 20; pixels[i+2] = 80; pixels[i+3] = 255;
+         }
+      }
+      p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, cases[c].width, cases[c].height,
+                    0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+      p_glGenerateMipmap(GL_TEXTURE_2D);
+      for (unsigned level = 1; level <= (cases[c].level2 < 0 ? 1u : 2u); ++level) {
+         const unsigned count = level == 1
+            ? (cases[c].width > 1 ? cases[c].width / 2 : 1) *
+              (cases[c].height > 1 ? cases[c].height / 2 : 1) : 1;
+         p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                 texture, level);
+         CHECK(p_glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE,
+               "mipmap full image framebuffer case=%u level=%u", c, level);
+         uint8_t result[4 * 4];
+         p_glReadPixels(0, 0, level == 1 && cases[c].width >= 4 ? 2 : 1,
+                        level == 1 && cases[c].height >= 4 ? 2 : 1,
+                        GL_RGBA, GL_UNSIGNED_BYTE, result);
+         for (unsigned i = 0; i < count; ++i) {
+            const int red = level == 1 ? cases[c].level1[i] : cases[c].level2;
+            CHECK(near(result + 4*i, red, 20, 80) && result[4*i+3] == 255,
+                  "mipmap full image case=%u level=%u texel=%u: %u,%u,%u,%u",
+                  c, level, i, result[4*i], result[4*i+1], result[4*i+2], result[4*i+3]);
+         }
+      }
+      p_glDeleteTextures(1, &texture);
+   }
+   p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+   p_glDeleteFramebuffers(1, &fbo);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "mipmap full image context failed");
+}
+
+/* Anisotropy must still filter within a level when mipmapping is disabled.
+ * The phase puts isotropic samples on black stripes; a 16-texel anisotropic
+ * footprint averages black and white. A green mip catches accidental mip
+ * interpolation when WebGPU's required linear mip filter is enabled. */
+static void
+base_level_anisotropy(void)
+{
+   const char *vs = "#version 300 es\nvoid main(){"
+      "vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+      "gl_Position=vec4(p*2.0-1.0,0,1);}";
+   GLuint vao, texture;
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glGenTextures(1, &texture);
+   p_glActiveTexture(GL_TEXTURE0);
+   p_glBindTexture(GL_TEXTURE_2D, texture);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+   p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 1);
+   p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+   p_glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+   for (unsigned axis = 0; axis < 2; ++axis) {
+      uint8_t pixels[64 * 32 * 4];
+      for (unsigned y = 0; y < 32; ++y) {
+         for (unsigned x = 0; x < 64; ++x) {
+            unsigned i = 4 * (y * 64 + x);
+            pixels[i] = ((axis ? y : x) & 1) * 255;
+            pixels[i+1] = 20; pixels[i+2] = 80; pixels[i+3] = 255;
+         }
+      }
+      p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 64, 32, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+      for (unsigned i = 0; i < 32 * 16; ++i) {
+         pixels[4*i] = 0; pixels[4*i+1] = 255;
+         pixels[4*i+2] = 0; pixels[4*i+3] = 255;
+      }
+      p_glTexImage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 32, 16, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+      unsigned width = axis ? 64 : 4, height = axis ? 2 : 32;
+      char fs[512];
+      snprintf(fs, sizeof(fs), "#version 300 es\nprecision highp float;"
+         "uniform sampler2D tex; out vec4 color; void main(){"
+         "color=texture(tex,gl_FragCoord.xy/vec2(%u,%u)+vec2(%s));}",
+         width, height, axis ? "0.0,0.5/32.0" : "0.5/64.0,0.0");
+      GLuint prog = link_program(vs, fs, "base level anisotropy");
+      p_glUseProgram(prog);
+      p_glUniform1i(p_glGetUniformLocation(prog, "tex"), 0);
+      p_glViewport(0, 0, width, height);
+      const unsigned anisotropy[] = {1, 16, 1};
+      for (unsigned i = 0; i < 3; ++i) {
+         p_glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, anisotropy[i]);
+         p_glDrawArrays(GL_TRIANGLES, 0, 3);
+         uint8_t pixel[4]; read_center(pixel, width, height);
+         CHECK(abs((int)pixel[0] - (anisotropy[i] > 1 ? 128 : 0)) <= 8 &&
+               abs((int)pixel[1] - 20) <= 1 && abs((int)pixel[2] - 80) <= 1 &&
+               pixel[3] == 255,
+               "base level anisotropy axis=%u aniso=%u: %u,%u,%u,%u",
+               axis, anisotropy[i], pixel[0], pixel[1], pixel[2], pixel[3]);
+      }
+      p_glUseProgram(0);
+      p_glDeleteProgram(prog);
+   }
+   p_glViewport(0, 0, W, H);
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glDeleteTextures(1, &texture);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(),
+         "base level anisotropy context failed");
+}
+
+static void
+integer_cube_lod(void)
+{
+   static const float axes[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+   const char *vs = "#version 320 es\nvoid main(){int i=gl_VertexID%3;"
+      "gl_Position=vec4(i==1?3.0:-1.0,i==2?3.0:-1.0,0,1);}";
+   const char *samples[] = {
+      "texture(tex,dir)", "texture(tex,dir,params.w)",
+      "textureGrad(tex,dir,0.5*u,0.5*v)", "textureLod(tex,params.xyz,2.0)"
+   };
+   for (unsigned sign = 0; sign < 2; ++sign) {
+      GLuint texture;
+      p_glGenTextures(1, &texture);
+      p_glActiveTexture(GL_TEXTURE0);
+      p_glBindTexture(GL_TEXTURE_CUBE_MAP, texture);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, 3);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      p_glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+      for (unsigned level = 0; level < 4; ++level) {
+         const unsigned size = 8 >> level;
+         for (unsigned face = 0; face < 6; ++face) {
+            uint8_t pixels[8 * 8 * 4];
+            for (unsigned p = 0; p < size * size; ++p) {
+               pixels[p * 4] = sign ? -80 + level * 20 + face * 3 : 20 + level * 40 + face * 3;
+               pixels[p * 4 + 1] = 7 + face * 19;
+               pixels[p * 4 + 2] = 5 + level * 31;
+               pixels[p * 4 + 3] = sign ? 127 : 255;
+            }
+            p_glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + face, level,
+               sign ? GL_RGBA8I : GL_RGBA8UI, size, size, 0, GL_RGBA_INTEGER,
+               sign ? GL_BYTE : GL_UNSIGNED_BYTE, pixels);
+         }
+      }
+      for (unsigned mode = 0; mode < 4; ++mode) {
+         char fs[1400];
+         snprintf(fs, sizeof(fs), "#version 320 es\nprecision highp float; precision highp int;"
+            "uniform highp %ssamplerCube tex; uniform vec4 params; layout(location=0) out vec4 color;"
+            "void main(){vec3 u=abs(params.x)>0.5?vec3(0,1,0):vec3(1,0,0);"
+            "vec3 v=abs(params.z)>0.5?vec3(0,1,0):vec3(0,0,1);"
+            "vec2 p=(gl_FragCoord.xy-vec2(32.5,24.5))*0.5;"
+            "vec3 dir=params.xyz+p.x*u+p.y*v; %svec4 c=%s;"
+            "color=vec4((vec3(c.rgb)+vec3(%u,0,0))/255.0,1);"
+            "if(any(notEqual(textureSize(tex,0),ivec2(8)))||"
+            "any(notEqual(textureSize(tex,2),ivec2(2)))) color=vec4(1,0,1,1);}",
+            sign ? "i" : "u", sign ? "i" : "u", samples[mode], sign ? 128 : 0);
+         GLuint prog = link_program(vs, fs, "integer cube LOD");
+         p_glUseProgram(prog);
+         p_glUniform1i(p_glGetUniformLocation(prog, "tex"), 0);
+         GLint params = p_glGetUniformLocation(prog, "params");
+         for (unsigned face = 0; face < 6; ++face) {
+            p_glUniform4f(params, axes[face][0], axes[face][1], axes[face][2], 1.0f);
+            p_glDrawArrays(GL_TRIANGLES, 0, 3);
+            uint8_t pixel[4]; read_center(pixel, W, H);
+            const unsigned level = mode == 1 || mode == 3 ? 2 : 1;
+            const unsigned red = sign ? 48 + level * 20 + face * 3 : 20 + level * 40 + face * 3;
+            CHECK(near(pixel, red, 7 + face * 19, 5 + level * 31),
+                  "integer cube LOD sign=%u mode=%u face=%u: %u,%u,%u,%u",
+                  sign, mode, face, pixel[0], pixel[1], pixel[2], pixel[3]);
+         }
+         CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "integer cube LOD context failed");
+         p_glUseProgram(0);
+         p_glDeleteProgram(prog);
+      }
+      p_glDeleteTextures(1, &texture);
+   }
+}
+
+static void
+integer_texture_offsets(void)
+{
+   const char *vs = "#version 320 es\n"
+      "void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+      "gl_Position=vec4(p*2.0-1.0,0,1);}";
+   const char *samples[] = {
+      "textureOffset(tex,p,ivec2(2,-1))",
+      "textureLodOffset(tex,p,1.0,ivec2(2,-1))",
+      "textureGradOffset(tex,p,vec2(0.25,0),vec2(0,0.25),ivec2(2,-1))",
+      "textureProjOffset(tex,vec3(p*2.0,2.0),ivec2(2,-1))",
+      "textureProjLodOffset(tex,vec3(p*2.0,2.0),1.0,ivec2(2,-1))",
+      "textureProjGradOffset(tex,vec3(p*2.0,2.0),vec2(0.25,0),vec2(0,0.25),ivec2(2,-1))",
+   };
+   const GLenum wraps[] = {GL_REPEAT, GL_MIRRORED_REPEAT, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_BORDER};
+   const float coords[][2] = {{0.875f,0.125f}, {1.125f,1.125f}, {-0.125f,0.875f}};
+   const unsigned expected[][4] = {{14,3,4,17}, {15,14,16,17}, {10,10,10,10}};
+   GLuint vao;
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glActiveTexture(GL_TEXTURE0);
+   for (unsigned sign = 0; sign < 2; ++sign) {
+      GLuint texture;
+      p_glGenTextures(1, &texture);
+      p_glBindTexture(GL_TEXTURE_2D, texture);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      const GLint signed_border[] = {-15,0,0,127};
+      const GLuint unsigned_border[] = {17,0,0,255};
+      if (sign)
+         p_glTexParameterIiv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, signed_border);
+      else
+         p_glTexParameterIuiv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, unsigned_border);
+      for (unsigned level = 0; level < 4; ++level) {
+         const unsigned size = 8 >> level;
+         uint8_t pixels[8 * 8 * 4];
+         for (unsigned p = 0; p < size * size; ++p) {
+            pixels[4*p] = (level == 1 ? p + 1 : 0) - (sign ? 32 : 0);
+            pixels[4*p+1] = pixels[4*p+2] = 0;
+            pixels[4*p+3] = sign ? 127 : 255;
+         }
+         p_glTexImage2D(GL_TEXTURE_2D, level, sign ? GL_RGBA8I : GL_RGBA8UI,
+                       size, size, 0, GL_RGBA_INTEGER, sign ? GL_BYTE : GL_UNSIGNED_BYTE, pixels);
+      }
+      for (unsigned mode = 0; mode < sizeof(samples)/sizeof(samples[0]); ++mode) {
+         char fs[900];
+         snprintf(fs, sizeof(fs), "#version 320 es\nprecision highp float; precision highp int;"
+            "uniform highp %ssampler2D tex; uniform vec4 coords; out vec4 color;"
+            "void main(){vec2 p=coords.xy+(gl_FragCoord.xy-vec2(32.5,24.5))*0.25;"
+            "color=vec4(float(%s.r+%s)*10.0/255.0,0,0,1);}",
+            sign ? "i" : "u", samples[mode], sign ? "32" : "0u");
+         GLuint prog = link_program(vs, fs, "integer texture offset");
+         p_glUseProgram(prog);
+         p_glUniform1i(p_glGetUniformLocation(prog, "tex"), 0);
+         GLint location = p_glGetUniformLocation(prog, "coords");
+         for (unsigned wrap = 0; wrap < 4; ++wrap) {
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wraps[wrap]);
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wraps[wrap]);
+            for (unsigned pos = 0; pos < 3; ++pos) {
+               p_glUniform4f(location, coords[pos][0], coords[pos][1], 0, 0);
+               p_glDrawArrays(GL_TRIANGLES, 0, 3);
+               uint8_t pixel[4]; read_center(pixel, W, H);
+               CHECK(near(pixel, expected[pos][wrap]*10, 0, 0),
+                     "integer offset sign=%u mode=%u wrap=%u pos=%u: %u,%u,%u,%u",
+                     sign, mode, wrap, pos, pixel[0], pixel[1], pixel[2], pixel[3]);
+            }
+         }
+         p_glUseProgram(0);
+         p_glDeleteProgram(prog);
+      }
+      p_glDeleteTextures(1, &texture);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "integer texture offset context failed");
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+}
+
+static void
+integer_mip_view_changes(void)
+{
+   GLuint vao;
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glActiveTexture(GL_TEXTURE0);
+   for (unsigned sign = 0; sign < 2; ++sign) {
+      GLuint texture;
+      p_glGenTextures(1, &texture);
+      p_glBindTexture(GL_TEXTURE_2D, texture);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      for (unsigned level = 0; level < 3; ++level) {
+         const unsigned size = 4 >> level;
+         uint8_t pixels[4 * 4 * 4];
+         for (unsigned p = 0; p < size * size; ++p) {
+            pixels[4*p] = (level + 1) * 50 - (sign ? 128 : 0);
+            pixels[4*p+1] = pixels[4*p+2] = 0;
+            pixels[4*p+3] = sign ? 127 : 255;
+         }
+         p_glTexImage2D(GL_TEXTURE_2D, level, sign ? GL_RGBA8I : GL_RGBA8UI,
+                       size, size, 0, GL_RGBA_INTEGER, sign ? GL_BYTE : GL_UNSIGNED_BYTE, pixels);
+      }
+      for (unsigned vertex = 0; vertex < 2; ++vertex) {
+         char vs[800], fs[800], expression[150];
+         snprintf(expression, sizeof(expression), "float(textureLod(tex,vec2(0.5),9.0).r+%s)/255.0",
+                  sign ? "128" : "0u");
+         const char *header = "#version 320 es\nprecision highp float; precision highp int;";
+         snprintf(vs, sizeof(vs), "%s uniform highp %ssampler2D tex; out vec4 sampled;"
+            "void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+            "gl_Position=vec4(p*2.0-1.0,0,1);sampled=vec4(%s,0,0,1);}",
+            header, sign ? "i" : "u", vertex ? expression : "0.0");
+         snprintf(fs, sizeof(fs), "%s uniform highp %ssampler2D tex; in vec4 sampled; out vec4 color;"
+            "void main(){color=vec4(%s,0,0,1);}", header, sign ? "i" : "u",
+            vertex ? "sampled.r" : expression);
+         GLuint prog = link_program(vs, fs, "integer mip view changes");
+         p_glUseProgram(prog);
+         p_glUniform1i(p_glGetUniformLocation(prog, "tex"), 0);
+         /* Reuse the program and sampler while both narrowing and expanding
+          * the exposed mip range. The first draw exposes only one level. */
+         const unsigned ranges[][2] = {{0,0}, {0,2}, {0,1}, {0,2}, {1,2}, {1,1}, {0,2}};
+         for (unsigned i = 0; i < sizeof(ranges)/sizeof(ranges[0]); ++i) {
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, ranges[i][0]);
+            p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, ranges[i][1]);
+            p_glDrawArrays(GL_TRIANGLES, 0, 3);
+            uint8_t pixel[4]; read_center(pixel, W, H);
+            CHECK(near(pixel, (ranges[i][1] + 1) * 50, 0, 0),
+                  "integer mip view sign=%u vertex=%u base=%u max=%u: %u,%u,%u,%u",
+                  sign, vertex, ranges[i][0], ranges[i][1], pixel[0], pixel[1], pixel[2], pixel[3]);
+         }
+         p_glUseProgram(0);
+         p_glDeleteProgram(prog);
+      }
+      p_glDeleteTextures(1, &texture);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "integer mip view context failed");
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+}
+
+static void
+mip_border_filtering_target(unsigned shape)
+{
+   const GLenum target = shape == 0 ? GL_TEXTURE_2D : shape == 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_3D;
+   const char *vs = "#version 320 es\n"
+      "void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+      "gl_Position=vec4(p*2.0-1.0,0,1);}";
+   const char *samples_2d[] = {"textureLod(tex,p,params.z)",
+      "textureGrad(tex,p,vec2(params.w,0),vec2(0,params.w))", "texture(tex,p)",
+      "textureLodOffset(tex,p,params.z,ivec2(1,0))"};
+   const char *samples_array[] = {"textureLod(tex,q,params.z)",
+      "textureGrad(tex,q,vec2(params.w,0),vec2(0,params.w))", "texture(tex,q)",
+      "textureLodOffset(tex,q,params.z,ivec2(1,0))"};
+   const char *samples_3d[] = {"textureLod(tex,q,params.z)",
+      "textureGrad(tex,q,vec3(params.w,0,0),vec3(0,params.w,0))", "texture(tex,q)",
+      "textureLodOffset(tex,q,params.z,ivec3(1,0,0))"};
+   const char **samples = shape == 0 ? samples_2d : shape == 1 ? samples_array : samples_3d;
+   const struct { float x,y,lod,min_lod,max_lod; unsigned r,g,b,a; } cases[] = {
+      {0.125f,0.5f,0.5f,0,2,128,96,0,223},
+      {0.125f,0.5f,1.5f,0,2,0,96,80,175},
+      {-0.125f,0.5f,0.5f,0,2,0,32,0,32},
+      {0.125f,0.125f,0.5f,0,2,128,72,0,199},
+      {0.125f,0.5f,0,0.25f,2,191,48,0,239},
+      {0.125f,0.5f,2,0,1.25f,0,143,40,183},
+      {1e20f,0.5f,0.5f,0,2,0,0,0,0},
+      {-1e20f,0.5f,0.5f,0,2,0,0,0,0},
+   };
+   GLuint vao, texture;
+   p_glGenVertexArrays(1, &vao); p_glBindVertexArray(vao);
+   p_glGenTextures(1, &texture); p_glActiveTexture(GL_TEXTURE0);
+   p_glBindTexture(target, texture);
+   p_glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+   p_glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   p_glTexParameteri(target, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+   p_glTexParameteri(target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+   p_glTexParameteri(target, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_BORDER);
+   for (unsigned level = 0; level < 3; ++level) {
+      const unsigned size = 4 >> level;
+      const unsigned depth = shape == 0 ? 1 : shape == 1 ? 2 : size;
+      uint8_t pixels[4*4*4*4];
+      for (unsigned p = 0; p < size*size*depth; ++p) {
+         for (unsigned c = 0; c < 3; ++c)
+            pixels[4*p+c] = c == level && !(shape == 1 && p < size*size) ? 255 : 0;
+         pixels[4*p+3] = 255;
+      }
+      if (shape == 0)
+         p_glTexImage2D(target, level, GL_RGBA8, size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+      else
+         p_glTexImage3D(target, level, GL_RGBA8, size, size, depth, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+   }
+   for (unsigned mode = 0; mode < 4; ++mode) {
+      char fs[650];
+      snprintf(fs, sizeof(fs), "#version 320 es\nprecision highp float;"
+         "uniform highp sampler%s tex; uniform vec4 params; uniform vec4 extra; out vec4 color;"
+         "void main(){vec2 p=params.xy+(gl_FragCoord.xy-vec2(32.5,24.5))*params.w;"
+         "vec3 q=vec3(p,extra.x); color=%s;}",
+         shape == 0 ? "2D" : shape == 1 ? "2DArray" : "3D", samples[mode]);
+      GLuint prog = link_program(vs, fs, "mip border filtering");
+      p_glUseProgram(prog);
+      p_glUniform1i(p_glGetUniformLocation(prog, "tex"), 0);
+      GLint params = p_glGetUniformLocation(prog, "params");
+      GLint extra = p_glGetUniformLocation(prog, "extra");
+      p_glUniform4f(extra, shape == 1 ? 2.0f : 0.5f, 0, 0, 0);
+      for (unsigned c = 0; c < (mode == 3 ? 1u : sizeof(cases)/sizeof(cases[0])); ++c) {
+         p_glTexParameterf(target, GL_TEXTURE_MIN_LOD, cases[c].min_lod);
+         p_glTexParameterf(target, GL_TEXTURE_MAX_LOD, cases[c].max_lod);
+         p_glUniform4f(params, mode == 3 ? -0.125f : cases[c].x, cases[c].y,
+                       cases[c].lod, exp2f(cases[c].lod)/4);
+         p_glDrawArrays(GL_TRIANGLES, 0, 3);
+         uint8_t pixel[4]; read_center(pixel, W, H);
+         const unsigned r = mode == 3 ? 128 : cases[c].r;
+         const unsigned g = mode == 3 ? 128 : cases[c].g;
+         const unsigned a = mode == 3 ? 255 : cases[c].a;
+         CHECK(near(pixel, r, g, cases[c].b) && abs((int)pixel[3]-(int)a) <= 2,
+               "mip border shape=%u mode=%u case=%u: %u,%u,%u,%u", shape, mode, c,
+               pixel[0], pixel[1], pixel[2], pixel[3]);
+      }
+      if (mode == 0) {
+         p_glTexParameterf(target, GL_TEXTURE_MIN_LOD, 0);
+         p_glTexParameterf(target, GL_TEXTURE_MAX_LOD, 2);
+         p_glUniform4f(params, 0.5f, 0.5f, 2, 0);
+         for (unsigned last = 1; last <= 2; ++last) {
+            p_glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, last);
+            p_glDrawArrays(GL_TRIANGLES, 0, 3);
+            uint8_t pixel[4]; read_center(pixel, W, H);
+            CHECK(near(pixel, 0, last == 1 ? 255 : 0, last == 2 ? 255 : 0),
+                  "mip border changed view range last=%u: %u,%u,%u,%u",
+                  last, pixel[0], pixel[1], pixel[2], pixel[3]);
+         }
+      }
+      if (shape == 2) {
+         p_glTexParameterf(target, GL_TEXTURE_MIN_LOD, 0);
+         p_glTexParameterf(target, GL_TEXTURE_MAX_LOD, 2);
+         p_glUniform4f(extra, 0.125f, 0, 0, 0);
+         p_glUniform4f(params, 0.5f, 0.5f, 0.5f, exp2f(0.5f)/4);
+         p_glDrawArrays(GL_TRIANGLES, 0, 3);
+         uint8_t pixel[4]; read_center(pixel, W, H);
+         /* Offset mode also crosses the x edge of mip one, halving its
+          * contribution before interpolation with the z border footprint. */
+         CHECK(near(pixel, 128, mode == 3 ? 48 : 96, 0) &&
+               abs((int)pixel[3]-(mode == 3 ? 175 : 223)) <= 2,
+               "mip border third axis mode=%u: %u,%u,%u,%u", mode,
+               pixel[0], pixel[1], pixel[2], pixel[3]);
+      }
+      if (mode < 3) {
+         p_glUniform4f(extra, shape == 1 ? 2.0f : 0.5f, 0, 0, 0);
+         p_glTexParameterf(target, GL_TEXTURE_MIN_LOD, 0);
+         p_glTexParameterf(target, GL_TEXTURE_MAX_LOD, 2);
+         for (unsigned filter = 0; filter < 2; ++filter) {
+            p_glTexParameteri(target, GL_TEXTURE_MIN_FILTER,
+               filter ? GL_LINEAR_MIPMAP_NEAREST : GL_NEAREST_MIPMAP_LINEAR);
+            p_glTexParameteri(target, GL_TEXTURE_MAG_FILTER, filter ? GL_LINEAR : GL_NEAREST);
+            const float lod = filter ? 0.75f : 0.5f;
+            p_glUniform4f(params, 0.125f, 0.5f, lod, exp2f(lod)/4);
+            p_glDrawArrays(GL_TRIANGLES, 0, 3);
+            uint8_t pixel[4]; read_center(pixel, W, H);
+            CHECK(near(pixel, filter ? 0 : 128, filter ? 191 : 128, 0) &&
+                  abs((int)pixel[3]-(filter ? 191 : 255)) <= 2,
+                  "mip border shape=%u mode=%u filter=%u: %u,%u,%u,%u",
+                  shape, mode, filter, pixel[0], pixel[1], pixel[2], pixel[3]);
+         }
+         p_glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+         p_glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      }
+      p_glUseProgram(0); p_glDeleteProgram(prog);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "mip border context failed");
+   p_glDeleteTextures(1, &texture);
+   p_glBindVertexArray(0); p_glDeleteVertexArrays(1, &vao);
+}
+
+static void
+mip_border_filtering(void)
+{
+   for (unsigned shape = 0; shape < 3; ++shape)
+      mip_border_filtering_target(shape);
+}
+
+static void
+texture_query_variants(void)
+{
+   const char *vs = "#version 320 es\nprecision highp float; precision highp int;"
+      "uniform highp isampler2D integerTex; uniform highp sampler2DShadow depthTex;"
+      "uniform highp sampler2D colorTex; flat out vec3 result;"
+      "void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);"
+      "gl_Position=vec4(p*2.0-1.0,0,1); ivec2 a=textureSize(integerTex,1);"
+      "result=vec3(vec2(a),float(textureSize(depthTex,0).x)+"
+      "textureLod(colorTex,vec2(0.5),0.0).r*4.0);}";
+   const char *fs = "#version 320 es\nprecision highp float; precision highp int;"
+      "uniform highp isampler2D integerTex; uniform highp sampler2DShadow depthTex;"
+      "flat in vec3 result; out vec4 color;"
+      "void main(){ivec2 a=textureSize(integerTex,1); ivec2 b=textureSize(depthTex,0);"
+      "color=vec4(result/255.0,1); if(any(notEqual(ivec2(result.xy),a))||"
+      "abs(result.z-float(b.x)-1.0)>0.01)color=vec4(1,0,1,1);}";
+   GLuint prog = link_program(vs, fs, "texture query variants"), vao, textures[3];
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glUseProgram(prog);
+   p_glUniform1i(p_glGetUniformLocation(prog, "integerTex"), 0);
+   p_glUniform1i(p_glGetUniformLocation(prog, "depthTex"), 1);
+   p_glUniform1i(p_glGetUniformLocation(prog, "colorTex"), 2);
+   p_glGenTextures(3, textures);
+   for (unsigned i = 0; i < 3; ++i) {
+      p_glActiveTexture(GL_TEXTURE0+i);
+      p_glBindTexture(GL_TEXTURE_2D, textures[i]);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+   }
+   const uint8_t color[] = {64,0,0,255};
+   p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, color);
+   const unsigned widths[] = {8,16,8};
+   for (unsigned draw = 0; draw < 3; ++draw) {
+      const unsigned w = widths[draw];
+      p_glActiveTexture(GL_TEXTURE0);
+      p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8I, w, w/2, 0, GL_RGBA_INTEGER, GL_BYTE, NULL);
+      p_glTexImage2D(GL_TEXTURE_2D, 1, GL_RGBA8I, w/2, w/4, 0, GL_RGBA_INTEGER, GL_BYTE, NULL);
+      p_glActiveTexture(GL_TEXTURE1);
+      p_glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, w+2, 3, 0,
+                    GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, NULL);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_COMPARE_MODE, GL_COMPARE_REF_TO_TEXTURE);
+      p_glDrawArrays(GL_TRIANGLES, 0, 3);
+      uint8_t pixel[4]; read_center(pixel, W, H);
+      CHECK(near(pixel, w/2, w/4, w+3),
+            "texture query variants draw=%u: %u,%u,%u,%u", draw,
+            pixel[0], pixel[1], pixel[2], pixel[3]);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "texture query variants context failed");
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+   p_glDeleteTextures(3, textures);
+   p_glBindVertexArray(0);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glActiveTexture(GL_TEXTURE0);
+}
+
+static void
+independent_samplers(void)
+{
+   GLint units = 0;
+   p_glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &units);
+   CHECK(units >= 16 && units <= 32, "fragment sampler unit count: %d", units);
+   if (units < 16 || units > 32)
+      return;
+   char fs[4096];
+   int at = snprintf(fs, sizeof(fs), "#version 320 es\nprecision highp float;"
+      "uniform sampler2D tex[%d]; layout(location=0) out vec4 color;"
+      "void main(){color=vec4(0);", units);
+   for (int i = 0; i < units; ++i)
+      at += snprintf(fs + at, sizeof(fs) - at,
+         "color+=texture(tex[%d],vec2(0.5))/%d.0;", i, units);
+   snprintf(fs + at, sizeof(fs) - at, "}");
+   const char *vs = "#version 320 es\nvoid main(){int i=gl_VertexID%3;"
+      "gl_Position=vec4(i==1?3.0:-1.0,i==2?3.0:-1.0,0,1);}";
+   GLuint prog = link_program(vs, fs, "independent samplers"), textures[32];
+   p_glUseProgram(prog);
+   p_glGenTextures(units, textures);
+   const GLenum wraps[] = { GL_REPEAT, GL_CLAMP_TO_EDGE, GL_MIRRORED_REPEAT };
+   int sum[3] = {0};
+   for (int i = 0; i < units; ++i) {
+      p_glActiveTexture(GL_TEXTURE0 + i);
+      p_glBindTexture(GL_TEXTURE_2D, textures[i]);
+      const uint8_t color[] = { 8 + i * 7, 247 - i * 7, i * 5, 255 };
+      for (unsigned c = 0; c < 3; ++c) sum[c] += color[c];
+      p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, color);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, (i / 9) & 1 ? GL_LINEAR : GL_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, (i / 18) & 1 ? GL_LINEAR : GL_NEAREST);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wraps[i % 3]);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wraps[(i / 3) % 3]);
+      p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_R, wraps[(i / 9) % 3]);
+      char name[24]; snprintf(name, sizeof(name), "tex[%d]", i);
+      p_glUniform1i(p_glGetUniformLocation(prog, name), i);
+   }
+   p_glDrawArrays(GL_TRIANGLES, 0, 3);
+   uint8_t px[4]; read_center(px, W, H);
+   CHECK(near(px, (sum[0] + units / 2) / units, (sum[1] + units / 2) / units,
+              (sum[2] + units / 2) / units),
+         "independent samplers (%d): %u,%u,%u,%u", units, px[0], px[1], px[2], px[3]);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "independent samplers: context failed");
+   p_glDeleteTextures(units, textures);
+   p_glActiveTexture(GL_TEXTURE0);
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+}
+
+static void
+layered_pbo_upload(void)
+{
+   enum { width = 11, height = 11, layers = 12, slice = width * height * 4 };
+   uint8_t source[slice * layers], result[slice];
+   const GLenum targets[] = { GL_TEXTURE_3D, GL_TEXTURE_2D_ARRAY, GL_TEXTURE_CUBE_MAP_ARRAY };
+   GLuint pbo, fbo, textures[3];
+   p_glGenBuffers(1, &pbo);
+   p_glGenFramebuffers(1, &fbo);
+   p_glGenTextures(3, textures);
+   p_glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+   for (unsigned t = 0; t < 3; ++t) {
+      p_glBindTexture(targets[t], textures[t]);
+      for (unsigned round = 0; round < 2; ++round) {
+         for (unsigned z = 0; z < layers; ++z)
+            for (unsigned y = 0; y < height; ++y)
+               for (unsigned x = 0; x < width; ++x) {
+                  uint8_t *p = source + z * slice + (y * width + x) * 4;
+                  p[0] = 13 + z * 17;
+                  p[1] = 211 - z * 7;
+                  p[2] = (x * 19 + y * 11) & 255;
+                  p[3] = 255;
+                  if (round) { uint8_t tmp = p[0]; p[0] = p[2]; p[2] = tmp; }
+               }
+         p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+         p_glBufferData(GL_PIXEL_UNPACK_BUFFER, sizeof(source), source, GL_STATIC_DRAW);
+         if (!round)
+            p_glTexImage3D(targets[t], 0, GL_RGBA8, width, height, layers, 0,
+                           GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+         else
+            p_glTexSubImage3D(targets[t], 0, 0, 0, 0, width, height, layers,
+                              GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+         p_glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+         p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+         for (unsigned z = 0; z < layers; ++z) {
+            p_glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, textures[t], 0, z);
+            CHECK(p_glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE,
+                  "PBO layer framebuffer target=%x layer=%u", targets[t], z);
+            memset(result, 0, sizeof(result));
+            p_glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, result);
+            CHECK(memcmp(result, source + z * slice, slice) == 0,
+                  "PBO layer data target=%x layer=%u round=%u", targets[t], z, round);
+         }
+         p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+         CHECK(p_glGetError() == GL_NO_ERROR, "PBO upload GL error target=%x round=%u", targets[t], round);
+      }
+   }
+   p_glDeleteTextures(3, textures);
+   p_glDeleteFramebuffers(1, &fbo);
+   p_glDeleteBuffers(1, &pbo);
+}
+
+static void
+helper_invocation(void)
+{
+   const char *vs = "#version 320 es\n"
+      "void main(){ gl_Position=vec4(0.015625,0.020833333,0,1); gl_PointSize=1.0; }\n";
+   const char *fs = "#version 320 es\n"
+      "precision highp float; layout(location=0) out vec4 color;"
+      "void main(){ float h=gl_HelperInvocation?1.0:0.0;"
+      "color=vec4(abs(dFdx(h)),h,0,1); }\n";
+   GLuint prog = link_program(vs, fs, "helper invocation");
+   p_glUseProgram(prog);
+   p_glDisable(GL_BLEND);
+   p_glClearColor(0, 0, 0, 1);
+   p_glClear(GL_COLOR_BUFFER_BIT);
+   p_glDrawArrays(GL_POINTS, 0, 1);
+   uint8_t px[4] = {0};
+   p_glReadPixels(32, 24, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+   CHECK(near(px, 255, 0, 0), "helper invocation derivative: %u,%u,%u,%u",
+         px[0], px[1], px[2], px[3]);
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "helper invocation: context failed");
+   p_glUseProgram(0);
+   p_glDeleteProgram(prog);
+}
+
+static void
+legacy_framebuffer_fetch(void)
+{
+   const char *vs = "#version 100\nattribute vec2 pos;"
+      "void main(){gl_Position=vec4(pos,0,1);}";
+   const char *fs = "#version 100\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; void main(){"
+      "gl_FragColor=gl_LastFragData[0]+vec4(0.125,0,0,0);}";
+   GLuint prog = link_program(vs, fs, "legacy framebuffer fetch"), vao, vbo;
+   GLint old_vao = 0, old_vbo = 0;
+   p_glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &old_vao);
+   p_glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &old_vbo);
+   p_glGenVertexArrays(1, &vao);
+   p_glBindVertexArray(vao);
+   p_glGenBuffers(1, &vbo);
+   p_glBindBuffer(GL_ARRAY_BUFFER, vbo);
+   const float vertices[] = {-1, -1, 3, -1, -1, 3};
+   p_glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+   GLint pos = p_glGetAttribLocation(prog, "pos");
+   CHECK(pos >= 0, "legacy framebuffer fetch position attribute");
+   if (pos >= 0) {
+      p_glEnableVertexAttribArray(pos);
+      p_glVertexAttribPointer(pos, 2, GL_FLOAT, GL_FALSE, 0, NULL);
+      p_glUseProgram(prog);
+      p_glClearColor(0, 0, 0, 1);
+      p_glClear(GL_COLOR_BUFFER_BIT);
+      for (unsigned draw = 0; draw < 3; ++draw)
+         p_glDrawArrays(GL_TRIANGLES, 0, 3);
+      uint8_t px[4]; read_center(px, W, H);
+      CHECK(near(px, 96, 0, 0), "legacy framebuffer fetch: %u,%u,%u,%u", px[0],px[1],px[2],px[3]);
+   }
+   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "legacy framebuffer fetch: context failed");
+   p_glUseProgram(0);
+   p_glBindVertexArray(old_vao);
+   p_glBindBuffer(GL_ARRAY_BUFFER, old_vbo);
+   p_glDeleteBuffers(1, &vbo);
+   p_glDeleteVertexArrays(1, &vao);
+   p_glDeleteProgram(prog);
+}
+
+static void
 framebuffer_fetch(void)
 {
    GLint n = 0;
@@ -758,6 +1597,7 @@ framebuffer_fetch(void)
       note("coherent framebuffer fetch: unavailable");
       return;
    }
+   legacy_framebuffer_fetch();
    const char *vs = "#version 300 es\n"
       "void main(){ int i=gl_VertexID%3; vec2 p=vec2(i==1?3.0:-1.0,i==2?3.0:-1.0);"
       "gl_Position=vec4(p,0,1); }\n";
@@ -807,7 +1647,11 @@ framebuffer_fetch(void)
    GLuint fb[2], tex[3]; p_glGenFramebuffers(2,fb); p_glGenTextures(3,tex);
    p_glBindFramebuffer(GL_FRAMEBUFFER,fb[1]);
    p_glBindTexture(GL_TEXTURE_2D,tex[2]);
-   p_glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,W,H,0,GL_RGBA,GL_UNSIGNED_BYTE,NULL);
+   /* Resolve into level zero of a mipmapped texture, not a default view of
+    * all its levels. Pixel checks below also catch a discarded invalid pass. */
+   unsigned levels = 1;
+   for (unsigned size = W > H ? W : H; size > 1; size >>= 1) ++levels;
+   p_glTexStorage2D(GL_TEXTURE_2D,levels,GL_RGBA8,W,H);
    p_glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,tex[2],0);
    for (unsigned samples = 1; samples <= 4; samples += 3) {
       const GLenum target = samples == 1 ? GL_TEXTURE_2D : GL_TEXTURE_2D_MULTISAMPLE;
@@ -1359,8 +2203,21 @@ exercise(const char *label, int api, wink_surface *surface)
    GLenum err = p_glGetError();
    CHECK(err == GL_NO_ERROR, "%s: GL error 0x%x", label, err);
 
-   if (api == WINK_API_OPENGL_ES)
+   if (api == WINK_API_OPENGL_ES) {
+      norm16_readback();
+      layered_pbo_upload();
+      helper_invocation();
+      independent_samplers();
+      mipmap_full_image();
+      base_level_anisotropy();
+      integer_cube_lod();
+      integer_texture_offsets();
+      integer_mip_view_changes();
+      texture_query_variants();
+      mip_border_filtering();
       framebuffer_fetch();
+      external_image(ctx, surface);
+   }
 
    if (api == WINK_API_OPENGL_CORE) {
       vertex_input_types();

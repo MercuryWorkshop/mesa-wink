@@ -25,6 +25,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifdef __EMSCRIPTEN_PTHREADS__
+#include <pthread.h>
+#include <emscripten/threading.h>
+#endif
 
 static int failures;
 
@@ -44,6 +49,61 @@ static VkCommandPool pool;
 static VkPhysicalDeviceMemoryProperties mem_props;
 static PFN_vkCmdBeginRenderingKHR begin_rendering;
 static PFN_vkCmdEndRenderingKHR end_rendering;
+
+static void
+test_multiple_devices(void)
+{
+   VkDevice others[2];
+   const VkDeviceCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .queueCreateInfoCount = 1,
+      .pQueueCreateInfos = &(VkDeviceQueueCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+         .queueFamilyIndex = 0, .queueCount = 1,
+         .pQueuePriorities = &(float){ 1.0f },
+      },
+   };
+   /* Keep the primary and both secondary devices alive together, then
+    * create another after destroying one. A browser GPUAdapter itself
+    * permits only one requestDevice, unlike a Vulkan physical device. */
+   for (unsigned i = 0; i < 2; ++i)
+      VK(vkCreateDevice(pdev, &info, NULL, &others[i]));
+   for (unsigned i = 0; i < 2; ++i) {
+      VkQueue other_queue;
+      VkFence fence;
+      vkGetDeviceQueue(others[i], 0, 0, &other_queue);
+      VK(vkCreateFence(others[i], &(VkFenceCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+      }, NULL, &fence));
+      VK(vkQueueSubmit(other_queue, 0, NULL, fence));
+      VK(vkWaitForFences(others[i], 1, &fence, VK_TRUE, UINT64_MAX));
+      vkDestroyFence(others[i], fence, NULL);
+   }
+   vkDestroyDevice(others[0], NULL);
+   VK(vkCreateDevice(pdev, &info, NULL, &others[0]));
+   VK(vkDeviceWaitIdle(others[0]));
+   vkDestroyDevice(others[0], NULL);
+   vkDestroyDevice(others[1], NULL);
+   printf("multiple logical devices: done\n");
+}
+
+#ifdef __EMSCRIPTEN_PTHREADS__
+struct host_signal {
+   VkSemaphore semaphore;
+   VkResult result;
+};
+
+static void *signal_from_worker(void *data)
+{
+   struct host_signal *a = data;
+   emscripten_thread_sleep(25);
+   a->result = vkSignalSemaphore(dev, &(VkSemaphoreSignalInfo){
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+      .semaphore = a->semaphore, .value = 4,
+   });
+   return NULL;
+}
+#endif
 
 static uint32_t
 memory_type(uint32_t bits, VkMemoryPropertyFlags want)
@@ -139,6 +199,45 @@ begin(VkCommandBufferUsageFlags flags)
       .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = flags,
    }));
    return cmd;
+}
+
+/* Status polling alone must finish the submit and publish mapped readback
+ * data. No blocking Vulkan wait is allowed to make this test pass. */
+static void
+test_fence_poll(void)
+{
+   const VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   struct buffer out = make_buffer(16, VK_BUFFER_USAGE_TRANSFER_DST_BIT, host);
+   VkCommandBuffer cmd = begin(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+   vkCmdFillBuffer(cmd, out.buffer, 0, 16, 0x12345678);
+   VK(vkEndCommandBuffer(cmd));
+   VkFence fence;
+   VK(vkCreateFence(dev, &(VkFenceCreateInfo){ .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO }, NULL, &fence));
+   CHECK(vkGetFenceStatus(dev, fence) == VK_NOT_READY, "unsubmitted fence signaled");
+   VK(vkQueueSubmit(queue, 1, &(VkSubmitInfo){
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd,
+   }, fence));
+   struct timespec start, now;
+   timespec_get(&start, TIME_UTC);
+   VkResult status;
+   unsigned polls = 0;
+   do {
+      status = (++polls & 1) ? vkGetFenceStatus(dev, fence) : vkWaitForFences(dev, 1, &fence, VK_TRUE, 0);
+      if (status == VK_SUCCESS)
+         break;
+      CHECK(status == VK_NOT_READY || status == VK_TIMEOUT, "fence poll returned %d", status);
+      timespec_get(&now, TIME_UTC);
+   } while (now.tv_sec - start.tv_sec < 10);
+   CHECK(status == VK_SUCCESS, "fence status polling made no progress");
+   if (status == VK_SUCCESS) {
+      for (unsigned i = 0; i < 4; ++i)
+         CHECK(((uint32_t *)out.map)[i] == 0x12345678, "poll readback word %u not published", i);
+   } else {
+      VK(vkWaitForFences(dev, 1, &fence, VK_TRUE, UINT64_MAX));
+   }
+   vkDestroyFence(dev, fence, NULL);
+   free_buffer(&out);
+   printf("fence status polling: done\n");
 }
 
 static void
@@ -376,6 +475,27 @@ test_sync(void)
       .pSemaphores = &timeline, .pValues = &three,
    }, UINT64_MAX));
    CHECK(((uint32_t *)c.map)[3] == 0x12345678, "wait-before-signal: %08x", ((uint32_t *)c.map)[3]);
+
+#ifdef __EMSCRIPTEN_PTHREADS__
+   if (getenv("WINK_VK_WORKER_TEST")) {
+      /* A main-thread RPC wait must release the runner for another worker's
+       * signal, including when the wait resolves through GetDeviceProcAddr. */
+      struct host_signal a = { .semaphore = timeline };
+      pthread_t thread;
+      if (pthread_create(&thread, NULL, signal_from_worker, &a)) {
+         printf("FAIL signal worker creation\n");
+         exit(1);
+      }
+      PFN_vkWaitSemaphores wait = (PFN_vkWaitSemaphores)vkGetDeviceProcAddr(dev, "vkWaitSemaphores");
+      const uint64_t four = 4;
+      VK(wait(dev, &(VkSemaphoreWaitInfo){
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
+         .pSemaphores = &timeline, .pValues = &four,
+      }, 2000000000ull));
+      pthread_join(thread, NULL);
+      VK(a.result);
+   }
+#endif
 
    VK(vkQueueWaitIdle(queue));
    VK(vkDeviceWaitIdle(dev));
@@ -616,6 +736,17 @@ main(void)
       .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
    }, NULL, &pool));
 
+   /* Direct browser linking has no loader to supply layer enumeration. */
+   PFN_vkEnumerateInstanceLayerProperties instance_layers =
+      (PFN_vkEnumerateInstanceLayerProperties)vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkEnumerateInstanceLayerProperties");
+   PFN_vkEnumerateDeviceLayerProperties device_layers =
+      (PFN_vkEnumerateDeviceLayerProperties)vkGetInstanceProcAddr(instance, "vkEnumerateDeviceLayerProperties");
+   CHECK(instance_layers && device_layers, "missing core layer enumeration entrypoints");
+   uint32_t layer_count = 0;
+   if (instance_layers) VK(instance_layers(&layer_count, NULL));
+   if (device_layers) VK(device_layers(pdev, &layer_count, NULL));
+   test_multiple_devices();
+   test_fence_poll();
    test_buffers();
    test_clears();
    test_sync();

@@ -132,6 +132,10 @@ for v in $WINK_VARIANTS; do
       for t in wvk_smoke wvk_draw; do
         run node "$WINK_DIR/test/run-browser.mjs" "$WINK_BUILD_ROOT/test/vk-$v" "--page=vk.html?test=$t" \
           || die "Vulkan test $t failed"
+        if [ "$v" = mt ]; then
+          run node "$WINK_DIR/test/run-browser.mjs" "$WINK_BUILD_ROOT/test/vk-$v" "--page=vk.html?test=$t&worker=1" \
+            || die "Vulkan worker test $t failed"
+        fi
       done
     else
       log "no glslangValidator: skipping the Vulkan tests"

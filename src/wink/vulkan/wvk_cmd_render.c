@@ -191,6 +191,66 @@ msrtss_rendering(struct wvk_cmd_buffer *cmd, const VkRenderingInfo *info, bool r
    return out;
 }
 
+/* Graphite pools depth/stencil attachments at sizes rounded up from the
+ * colour target. Vulkan permits this, but WebGPU attachments must agree.
+ * An attachment used only for depth/stencil, cleared/discarded on entry and
+ * discarded on exit, has no contents to move: use an auxiliary image of the
+ * colour target's size. LOAD/STORE, sampled/input attachments and suspended
+ * rendering need preservation and must not take this path. Pass restarts
+ * retain the auxiliary view through pass_copy, including its stencil writes.
+ */
+static const VkRenderingInfo *
+fit_transient_ds(struct wvk_cmd_buffer *cmd, const VkRenderingInfo *info, VkRenderingInfo *out,
+                 VkRenderingAttachmentInfo *depth, VkRenderingAttachmentInfo *stencil)
+{
+   if (info->flags & (VK_RENDERING_RESUMING_BIT | VK_RENDERING_SUSPENDING_BIT))
+      return info;
+   const VkRenderingAttachmentInfo *atts[] = { info->pDepthAttachment, info->pStencilAttachment };
+   struct wvk_image_view *ds = NULL;
+   for (unsigned a = 0; a < 2; ++a) {
+      const VkRenderingAttachmentInfo *att = atts[a];
+      if (!att || !att->imageView)
+         continue;
+      VK_FROM_HANDLE(wvk_image_view, view, att->imageView);
+      if ((ds && ds != view) || att->loadOp == VK_ATTACHMENT_LOAD_OP_LOAD ||
+          att->storeOp == VK_ATTACHMENT_STORE_OP_STORE || att->resolveMode != VK_RESOLVE_MODE_NONE ||
+          (view->vk.image->usage & ~(VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                     VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)))
+         return info;
+      ds = view;
+   }
+   if (!ds)
+      return info;
+   VkExtent2D extent = { 0 };
+   for (uint32_t a = 0; a < info->colorAttachmentCount; ++a) {
+      VK_FROM_HANDLE(wvk_image_view, view, info->pColorAttachments[a].imageView);
+      if (!view)
+         continue;
+      if (extent.width && (extent.width != view->vk.extent.width || extent.height != view->vk.extent.height))
+         return info;
+      extent = (VkExtent2D){ view->vk.extent.width, view->vk.extent.height };
+   }
+   if (!extent.width || (extent.width == ds->vk.extent.width && extent.height == ds->vk.extent.height))
+      return info;
+   struct wvk_image_view *fitted = wvk_image_view_transient_ds(wvk_cmd_buffer_device(cmd), ds, extent);
+   if (!fitted)
+      return info;
+   *out = *info;
+   if (info->pDepthAttachment) {
+      *depth = *info->pDepthAttachment;
+      if (depth->imageView)
+         depth->imageView = wvk_image_view_to_handle(fitted);
+      out->pDepthAttachment = depth;
+   }
+   if (info->pStencilAttachment) {
+      *stencil = *info->pStencilAttachment;
+      if (stencil->imageView)
+         stencil->imageView = wvk_image_view_to_handle(fitted);
+      out->pStencilAttachment = stencil;
+   }
+   return out;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRenderingInfo)
 {
@@ -201,9 +261,20 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
     * attachments: which a pass begun again has already. */
    VkRenderingInfo msrtss_info;
    VkRenderingAttachmentInfo msrtss_atts[10];
+   VkRenderingInfo fitted_info;
+   VkRenderingAttachmentInfo fitted_depth, fitted_stencil;
+   struct wvk_image_view *msrtss_sources[8] = {0};
+   if (info->flags & VK_RENDERING_RESUMING_BIT)
+      memcpy(msrtss_sources, replay->pass_copy.msrtss_sources, sizeof(msrtss_sources));
    if (info != &replay->pass_copy.info) {
       wvk_replay_end_passes(replay);
       info = msrtss_rendering(cmd, info, info->flags & VK_RENDERING_RESUMING_BIT, &msrtss_info, msrtss_atts);
+      for (uint32_t i = 0; i < MIN2(info->colorAttachmentCount, 8); ++i) {
+         const VkImageView original = pRenderingInfo->pColorAttachments[i].imageView;
+         if (original != info->pColorAttachments[i].imageView)
+            msrtss_sources[i] = wvk_image_view_from_handle(original);
+      }
+      info = fit_transient_ds(cmd, info, &fitted_info, &fitted_depth, &fitted_stencil);
    }
    replay->pass_idle = replay->pass_layered && replay->pass_multiview && info->viewMask &&
                        !(info->viewMask & BITFIELD_BIT(replay->pass_layer));
@@ -257,6 +328,7 @@ wvk_CmdBeginRendering(VkCommandBuffer commandBuffer, const VkRenderingInfo *pRen
       }
       /* Kept, to begin the pass again with (wvk_replay_restart_pass). */
       replay->pass_copy.info = *info;
+      memcpy(replay->pass_copy.msrtss_sources, msrtss_sources, sizeof(msrtss_sources));
       replay->pass_copy.info.pNext = NULL;
       const VkRenderingFragmentShadingRateAttachmentInfoKHR *rate =
          vk_find_struct_const(pRenderingInfo->pNext, RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR);

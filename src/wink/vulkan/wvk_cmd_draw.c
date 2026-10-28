@@ -1637,14 +1637,19 @@ descriptor_aspect(const struct wvk_descriptor *d, const struct wvk_shader_bindin
 
 /* What a snapshot of what the descriptor reads is of: the view's texture,
  * or of a depth-stencil image the aspect read. */
+#define WVK_SNAPSHOT_MSRTSS 28
 #define WVK_SNAPSHOT_DEPTH 29
 #define WVK_SNAPSHOT_STENCIL 30
 
 static uint32_t
 snapshot_key(const struct wvk_descriptor *d, const struct wvk_shader_binding *b)
 {
-   if (!(d->view_image->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)))
+   if (!(d->view_image->vk.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
+      if (b->multisampled && d->view_image->vk.samples == 1 &&
+          (d->view_image->vk.create_flags & VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT))
+         return WVK_SNAPSHOT_MSRTSS;
       return d->view_texture;
+   }
    return descriptor_aspect(d, b) == WGPUTextureAspect_StencilOnly ||
                 (d->view_image->vk.aspects == VK_IMAGE_ASPECT_STENCIL_BIT)
              ? WVK_SNAPSHOT_STENCIL : WVK_SNAPSHOT_DEPTH;
@@ -1867,6 +1872,11 @@ make_bind_group(struct wvk_device *dev, const struct wvk_bgl *bgl, const struct 
             WGPUTexture copy = find_snapshot(replay, d->view_image, key);
             /* A copy of depth or stencil is of that alone, as a colour. */
             WGPUTextureViewDescriptor vd = d->view_desc;
+            if (key == WVK_SNAPSHOT_MSRTSS) {
+               vd.dimension = b->view_dimension;
+               vd.baseMipLevel = vd.baseArrayLayer = 0;
+               vd.mipLevelCount = vd.arrayLayerCount = 1;
+            }
             if (key == WVK_SNAPSHOT_DEPTH || key == WVK_SNAPSHOT_STENCIL) {
                vd.format = WGPUTextureFormat_Undefined;
                vd.aspect = WGPUTextureAspect_All;
@@ -2102,6 +2112,28 @@ is_rendered_to(const struct wvk_replay *replay, const struct wvk_descriptor *d, 
    }
 }
 
+/* MSRTSS input attachments name the application's single-sample image,
+ * but a multisampled subpass load reads the emulated attachment's samples. */
+static struct wvk_image *
+msrtss_input_image(const struct wvk_replay *replay, const struct wvk_descriptor *d,
+                   const struct wvk_shader_binding *b)
+{
+   if (snapshot_key(d, b) != WVK_SNAPSHOT_MSRTSS)
+      return NULL;
+   for (uint32_t i = 0; i < replay->rendering.color_count; ++i) {
+      const struct wvk_image_view *color = replay->rendering.color[i];
+      const struct wvk_image_view *resolve = replay->pass_copy.msrtss_sources[i];
+      if (!resolve)
+         resolve = wvk_image_view_from_handle(replay->pass_copy.colors[i].resolveImageView);
+      if (color && resolve && wvk_image_view_image(resolve) == d->view_image &&
+          resolve->vk.base_mip_level == d->view_level &&
+          resolve->vk.base_array_layer == d->view_desc.baseArrayLayer &&
+          color->vk.image->samples > 1)
+         return wvk_image_view_image(color);
+   }
+   return NULL;
+}
+
 /* What a draw reads of images the pass renders to: copies, made before it
  * with the pass begun again after, and kept until a barrier or the pass
  * ends -- which is when Vulkan has what it rendered visible to reads. */
@@ -2122,7 +2154,10 @@ snapshot_feedback(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout)
          bool sampler;
          uint32_t dynamic_index;
          const struct wvk_descriptor *d = slot_descriptor(set, b->binding, &sampler, &dynamic_index);
-         if (!d || !d->view_image || !is_rendered_to(replay, d, descriptor_aspect(d, b)))
+         if (!d || !d->view_image)
+            continue;
+         struct wvk_image *msrtss = msrtss_input_image(replay, d, b);
+         if (!msrtss && !is_rendered_to(replay, d, descriptor_aspect(d, b)))
             continue;
          const uint32_t key = snapshot_key(d, b);
          if (find_snapshot(replay, d->view_image, key))
@@ -2132,7 +2167,9 @@ snapshot_feedback(struct wvk_cmd_buffer *cmd, const struct wvk_layout *layout)
             ended = true;
          }
          WGPUTexture copy;
-         if (key == WVK_SNAPSHOT_DEPTH || key == WVK_SNAPSHOT_STENCIL)
+         if (msrtss)
+            copy = wvk_image_snapshot_ms(dev, replay, msrtss);
+         else if (key == WVK_SNAPSHOT_DEPTH || key == WVK_SNAPSHOT_STENCIL)
             copy = wvk_image_snapshot_ds(dev, replay, d->view_image, key == WVK_SNAPSHOT_STENCIL);
          else if (d->view_image->vk.samples > 1)
             copy = wvk_image_snapshot_ms(dev, replay, d->view_image);
@@ -2964,7 +3001,9 @@ snapshot_logic_op(struct wvk_cmd_buffer *cmd)
       const VkExtent3D e = vk_image_mip_level_extent(&image->vk, level);
       WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
       td.label = wvk_sv("wvk logic op destination");
-      td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+      td.sampleCount = image->vk.samples;
+      td.usage = WGPUTextureUsage_TextureBinding |
+                 (td.sampleCount > 1 ? WGPUTextureUsage_RenderAttachment : WGPUTextureUsage_CopyDst);
       td.dimension = WGPUTextureDimension_2D;
       td.size = (WGPUExtent3D){ e.width, e.height, 1 };
       td.format = wgpuTextureGetFormat(texture);
@@ -2980,7 +3019,7 @@ snapshot_logic_op(struct wvk_cmd_buffer *cmd)
        * its own for each, all of them the submit's until it is done. */
       struct wvk_attachment_copy *c = &replay->logic_op_copies[i];
       if (!c->texture || c->width != e.width || c->height != e.height || c->format != td.format ||
-          c->view_format != view->format) {
+          c->view_format != view->format || c->samples != td.sampleCount) {
          WGPUTexture copy = wgpuDeviceCreateTexture(dev->wgpu, &td);
          if (!copy)
             continue;
@@ -2991,14 +3030,30 @@ snapshot_logic_op(struct wvk_cmd_buffer *cmd)
          if (!v)
             continue;
          util_dynarray_append(&replay->views, v);
-         *c = (struct wvk_attachment_copy){ copy, v, td.format, view->format, e.width, e.height };
+         *c = (struct wvk_attachment_copy){ copy, v, td.format, view->format, e.width, e.height, td.sampleCount };
       }
       WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT, dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
       src.texture = texture;
       src.mipLevel = level - first_level;
       src.origin.z = texture_layer;
       dst.texture = c->texture;
-      wgpuCommandEncoderCopyTextureToTexture(replay->encoder, &src, &dst, &td.size);
+      if (td.sampleCount > 1) {
+         WGPUTextureView src_view;
+         WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+         vd.format = view->format;
+         vd.dimension = WGPUTextureViewDimension_2D;
+         vd.baseMipLevel = level - first_level;
+         vd.mipLevelCount = 1;
+         vd.baseArrayLayer = texture_layer;
+         vd.arrayLayerCount = 1;
+         src_view = wgpuTextureCreateView(texture, &vd);
+         util_dynarray_append(&replay->views, src_view);
+         if (!wvk_image_copy_ms_views(dev, replay, src_view, c->view, view->format, view->vk.view_format,
+                                      td.sampleCount))
+            continue;
+      } else {
+         wgpuCommandEncoderCopyTextureToTexture(replay->encoder, &src, &dst, &td.size);
+      }
       replay->logic_op_views[i] = c->view;
    }
    wvk_replay_restart_pass(cmd, replay->pass_layer);

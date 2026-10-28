@@ -249,52 +249,6 @@ dynamic_offset(const nir_instr *instr, const void *data)
    return i >= 0 && !nir_src_is_const(tex->src[i].src);
 }
 
-static bool
-lower_helper_invocations(nir_shader *nir)
-{
-   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-   bool uses = false;
-   nir_foreach_block(block, impl) {
-      nir_foreach_instr(instr, block) {
-         if (instr->type == nir_instr_type_intrinsic &&
-             (nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_helper_invocation ||
-              nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_is_helper_invocation))
-            uses = true;
-      }
-   }
-   if (!uses)
-      return false;
-
-   nir_variable *demoted = nir_local_variable_create(impl, glsl_bool_type(), "demoted");
-   nir_builder b = nir_builder_at(nir_before_impl(impl));
-   nir_store_var(&b, demoted, nir_imm_false(&b), 0x1);
-   nir_foreach_block(block, impl) {
-      nir_foreach_instr_safe(instr, block) {
-         if (instr->type != nir_instr_type_intrinsic)
-            continue;
-         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         b.cursor = nir_before_instr(instr);
-         switch (intr->intrinsic) {
-         case nir_intrinsic_demote:
-            nir_store_var(&b, demoted, nir_imm_true(&b), 0x1);
-            break;
-         case nir_intrinsic_demote_if:
-            nir_store_var(&b, demoted, nir_ior(&b, nir_load_var(&b, demoted), intr->src[0].ssa), 0x1);
-            break;
-         case nir_intrinsic_load_helper_invocation:
-         case nir_intrinsic_is_helper_invocation: {
-            nir_def *uncovered = nir_ieq_imm(&b, nir_load_sample_mask_in(&b), 0);
-            nir_def_replace(&intr->def, nir_ior(&b, uncovered, nir_load_var(&b, demoted)));
-            break;
-         }
-         default:
-            break;
-         }
-      }
-   }
-   return nir_progress(true, impl, nir_metadata_none);
-}
-
 /* 64-bit floats, which WGSL has none of: Mesa's library of them in
  * integer arithmetic (float64.glsl), made once. Its 64-bit integers are
  * pairs of words later, as the shader's are. */
@@ -502,7 +456,7 @@ wvk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_frexp);
    NIR_PASS(_, nir, nir_shader_instructions_pass, lower_quantize_instr, nir_metadata_control_flow, NULL);
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      NIR_PASS(_, nir, lower_helper_invocations);
+      NIR_PASS(_, nir, gex_wgpu_nir_lower_helper_invocations);
       NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    }
    /* Input attachments are textures, fetched at the fragment: the
@@ -1126,12 +1080,15 @@ lower_blend(nir_shader *nir, const struct wvk_shader_key *key, uint8_t *reads)
                               .align_mul = 16, .access = ACCESS_NON_WRITEABLE);
    u_foreach_bit(rt, key->blend_mask) {
       nir_variable *tex = nir_variable_create(nir, nir_var_uniform,
-                                              glsl_texture_type(GLSL_SAMPLER_DIM_2D, false, GLSL_TYPE_FLOAT),
+                                              glsl_texture_type(key->samples > 1 ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D,
+                                                                false, GLSL_TYPE_FLOAT),
                                               "wvk_blend_dst");
       tex->data.descriptor_set = WVK_DRIVER_GROUP;
       tex->data.binding = WVK_DRIVER_SLOT_LOGIC_OP + rt;
-      nir_def *d = nir_txf(&b, coord, .texture_deref = nir_build_deref_var(&b, tex), .lod = nir_imm_int(&b, 0),
-                           .dest_type = nir_type_float32);
+      nir_deref_instr *deref = nir_build_deref_var(&b, tex);
+      nir_def *d = key->samples > 1
+         ? nir_txf_ms(&b, coord, nir_load_sample_id(&b), .texture_deref = deref, .dest_type = nir_type_float32)
+         : nir_txf(&b, coord, .texture_deref = deref, .lod = nir_imm_int(&b, 0), .dest_type = nir_type_float32);
       nir_def *s1 = rt == 0 && src1 ? nir_load_var(&b, src1) : nir_imm_vec4(&b, 0, 0, 0, 0);
       nir_def *r = blend_apply(&b, key->blend_equation[rt], (VkFormat)key->logic_format[rt],
                                nir_load_var(&b, src[rt]), s1, d, k);
@@ -8121,6 +8078,12 @@ compile_one(struct wvk_device *dev, struct vk_shader_compile_info *info,
    /* The compiler keeps a vertex input's driver_location as its WGSL
     * @location, which for Vulkan is the attribute location. */
    if (stage == MESA_SHADER_VERTEX) {
+      /* Optimizations can leave declarations for attributes no instruction
+       * reads. ntv still emits those as entrypoint inputs, while inputs_read
+       * omits them, producing a WebGPU pipeline missing declared locations.
+       * Keep the emitted interface and its reflected layout in agreement. */
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_in, NULL);
       nir_foreach_shader_in_variable(var, nir) {
          if (var->data.location >= VERT_ATTRIB_GENERIC0)
             var->data.driver_location = var->data.location - VERT_ATTRIB_GENERIC0;
@@ -9103,23 +9066,20 @@ wvk_shader_draw_variant(struct wvk_device *dev, struct wvk_shader *shader, const
                                   ? wvk_shader_blend_mask(dyn, outputs & dyn->cb.color_write_enables)
                                   : 0) |
                               advanced;
-      if (blends && samples > 1) {
-         mesa_logw_once("wvk: colour blend factors with both CONSTANT_COLOR and CONSTANT_ALPHA, or advanced "
-                        "blending, on a multisampled pass, which is not done");
-      } else {
-         u_foreach_bit(i, blends) {
-            const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
-            if (!color_formats[i])
-               continue;
-            key.blend_mask |= BITFIELD_BIT(i);
-            key.blend_equation[i] =
-               (advanced & BITFIELD_BIT(i))
-                  ? wvk_blend_advanced(vk_advanced_blend_op_to_pipe(a->color_blend_op), a->src_premultiplied,
-                                       a->dst_premultiplied, vk_blend_overlap_to_pipe(a->blend_overlap))
-                  : wvk_blend_equation(a->src_color_blend_factor, a->dst_color_blend_factor, a->color_blend_op,
-                                       a->src_alpha_blend_factor, a->dst_alpha_blend_factor, a->alpha_blend_op);
-            key.logic_format[i] = color_formats[i];
-         }
+      if (blends && samples > 1)
+         key.samples = samples;
+      u_foreach_bit(i, blends) {
+         const struct vk_color_blend_attachment_state *a = &dyn->cb.attachments[i];
+         if (!color_formats[i])
+            continue;
+         key.blend_mask |= BITFIELD_BIT(i);
+         key.blend_equation[i] =
+            (advanced & BITFIELD_BIT(i))
+               ? wvk_blend_advanced(vk_advanced_blend_op_to_pipe(a->color_blend_op), a->src_premultiplied,
+                                    a->dst_premultiplied, vk_blend_overlap_to_pipe(a->blend_overlap))
+               : wvk_blend_equation(a->src_color_blend_factor, a->dst_color_blend_factor, a->color_blend_op,
+                                    a->src_alpha_blend_factor, a->dst_alpha_blend_factor, a->alpha_blend_op);
+         key.logic_format[i] = color_formats[i];
       }
       /* The discard rectangle test, of the rectangles the draw's data has. */
       key.discard_rects = dyn->dr.enable;

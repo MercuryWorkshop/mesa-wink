@@ -1588,8 +1588,8 @@ wvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat
 
    const VkFormatFeatureFlags2 optimal = optimal_features(pdev, format);
    const VkFormatFeatureFlags2 buffer = buffer_features(pdev, format);
-   /* WebGPU has no linear textures: a linear image is memory, and only
-    * copied to and from. */
+   /* Linear images keep their bytes in memory. Sampling uploads a texture
+    * copy before use; rendering and storage writes remain unsupported. */
    VkFormatFeatureFlags2 linear =
       wvk_image_linear_supported(pdev, format, VK_IMAGE_TYPE_2D, 0)
          ? VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
@@ -1597,6 +1597,13 @@ wvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice, VkFormat
          : 0;
    if (linear && (wvk_format_caps(pdev, format) & WVK_CAP_PLANAR))
       linear |= VK_FORMAT_FEATURE_2_DISJOINT_BIT;
+   if (linear && (wvk_format_caps(pdev, format) & WVK_CAP_SAMPLE))
+      linear |= optimal & (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+                           VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                           VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT |
+                           VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT |
+                           VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT |
+                           VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT);
 
    pFormatProperties->formatProperties = (VkFormatProperties){
       .linearTilingFeatures = vk_format_features2_to_features(linear),
@@ -1652,6 +1659,51 @@ format_usage_supported(const struct wvk_physical_device *pdev, VkFormat format, 
    return true;
 }
 
+static VkResult
+image_format_properties_extensions(const VkPhysicalDeviceImageFormatInfo2 *info,
+                                    VkImageFormatProperties2 *pImageFormatProperties)
+{
+   vk_foreach_struct(stype, ext, pImageFormatProperties->pNext) {
+      switch (stype) {
+      case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES: {
+         /* A texture a plane, in the bindings a descriptor of it takes. */
+         VkSamplerYcbcrConversionImageFormatProperties *p = ext;
+         p->combinedImageSamplerDescriptorCount = vk_format_get_plane_count(info->format);
+         break;
+      }
+      case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY: {
+         /* The texture is the same with host transfers or without. */
+         VkHostImageCopyDevicePerformanceQuery *p = ext;
+         p->optimalDeviceAccess = info->tiling != VK_IMAGE_TILING_LINEAR;
+         p->identicalMemoryLayout = true;
+         break;
+      }
+      case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES: {
+         VkExternalImageFormatProperties *p = ext;
+         p->externalMemoryProperties = (VkExternalMemoryProperties){ 0 };
+         break;
+      }
+      case VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT: {
+         /* WebGPU says nothing of how textures are stored. */
+         VkImageCompressionPropertiesEXT *p = ext;
+         p->imageCompressionFlags = VK_IMAGE_COMPRESSION_DISABLED_EXT;
+         p->imageCompressionFixedRateFlags = VK_IMAGE_COMPRESSION_FIXED_RATE_NONE_EXT;
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(stype);
+         break;
+      }
+   }
+
+   const VkPhysicalDeviceExternalImageFormatInfo *external =
+      vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
+   if (external && external->handleType)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
                                             const VkPhysicalDeviceImageFormatInfo2 *info,
@@ -1666,8 +1718,7 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
    if (!caps)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
    if (info->tiling == VK_IMAGE_TILING_LINEAR) {
-      /* A linear image is memory copied to and from, and never has a view,
-       * so being allowed views of other formats changes nothing about it. */
+      /* Linear images permit sampled views, backed by uploaded textures. */
       if (!wvk_image_linear_supported(pdev, info->format, info->type, info->usage) ||
           (info->flags & ~(VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT |
                            ((caps & WVK_CAP_PLANAR) ? VK_IMAGE_CREATE_DISJOINT_BIT : 0))))
@@ -1679,7 +1730,7 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
          .sampleCounts = VK_SAMPLE_COUNT_1_BIT,
          .maxResourceSize = 1ull << 31,
       };
-      return VK_SUCCESS;
+      return image_format_properties_extensions(info, pImageFormatProperties);
    }
    if (info->tiling != VK_IMAGE_TILING_OPTIMAL)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -1795,45 +1846,7 @@ wvk_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
       };
    }
 
-   vk_foreach_struct(stype, ext, pImageFormatProperties->pNext) {
-      switch (stype) {
-      case VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_IMAGE_FORMAT_PROPERTIES: {
-         /* A texture a plane, in the bindings a descriptor of it takes. */
-         VkSamplerYcbcrConversionImageFormatProperties *p = ext;
-         p->combinedImageSamplerDescriptorCount = vk_format_get_plane_count(info->format);
-         break;
-      }
-      case VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY: {
-         /* The texture is the same with host transfers or without. */
-         VkHostImageCopyDevicePerformanceQuery *p = ext;
-         p->optimalDeviceAccess = true;
-         p->identicalMemoryLayout = true;
-         break;
-      }
-      case VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES: {
-         VkExternalImageFormatProperties *p = ext;
-         p->externalMemoryProperties = (VkExternalMemoryProperties){ 0 };
-         break;
-      }
-      case VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT: {
-         /* WebGPU says nothing of how textures are stored. */
-         VkImageCompressionPropertiesEXT *p = ext;
-         p->imageCompressionFlags = VK_IMAGE_COMPRESSION_DISABLED_EXT;
-         p->imageCompressionFixedRateFlags = VK_IMAGE_COMPRESSION_FIXED_RATE_NONE_EXT;
-         break;
-      }
-      default:
-         vk_debug_ignored_stype(stype);
-         break;
-      }
-   }
-
-   const VkPhysicalDeviceExternalImageFormatInfo *external =
-      vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO);
-   if (external && external->handleType)
-      return VK_ERROR_FORMAT_NOT_SUPPORTED;
-
-   return VK_SUCCESS;
+   return image_format_properties_extensions(info, pImageFormatProperties);
 }
 
 VKAPI_ATTR void VKAPI_CALL

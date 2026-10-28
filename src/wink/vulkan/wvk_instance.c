@@ -68,6 +68,24 @@ wvk_EnumerateInstanceExtensionProperties(const char *pLayerName,
                                                      pPropertyCount, pProperties);
 }
 
+/* A browser links the ICD directly, with no Vulkan loader to provide these
+ * core queries. There are no layers in that configuration. Native loaders
+ * enumerate their own layers independently of the ICD's empty list. */
+VKAPI_ATTR VkResult VKAPI_CALL
+wvk_EnumerateInstanceLayerProperties(uint32_t *pPropertyCount, VkLayerProperties *pProperties)
+{
+   *pPropertyCount = 0;
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+wvk_EnumerateDeviceLayerProperties(VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
+                                   VkLayerProperties *pProperties)
+{
+   *pPropertyCount = 0;
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 wvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
                    const VkAllocationCallbacks *pAllocator,

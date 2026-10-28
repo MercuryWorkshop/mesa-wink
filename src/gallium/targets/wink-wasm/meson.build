@@ -21,6 +21,14 @@
 
 wink_is_wasm = host_machine.system() == 'emscripten'
 wink_platform_sources = wink_is_wasm ? files('wink_emscripten_compat.c') : files('wink_native.c')
+if wink_is_wasm and with_wink_vk
+  wink_platform_sources += custom_target(
+    'wink_vk_rpc',
+    input : ['wink_vk_rpc_gen.py', '../../../../include/vulkan/vulkan_core.h'],
+    output : 'wink_vk_rpc.h',
+    command : [prog_python, '@INPUT0@', '@INPUT1@', '@OUTPUT@'],
+  )
+endif
 
 libwink_api = static_library(
   'wink_api',

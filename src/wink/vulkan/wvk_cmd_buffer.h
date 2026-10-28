@@ -53,6 +53,7 @@ struct wvk_attachment_copy {
    WGPUTextureView view;
    WGPUTextureFormat format, view_format;
    uint32_t width, height;
+   unsigned samples;
 };
 
 struct wvk_replay {
@@ -126,6 +127,9 @@ struct wvk_replay {
    struct {
       VkRenderingInfo info;
       VkRenderingAttachmentInfo colors[8];
+      /* The application's views behind emulated MSRTSS attachments,
+       * including ones whose storeOp does not request a resolve. */
+      struct wvk_image_view *msrtss_sources[8];
       VkRenderingAttachmentInfo depth, stencil;
       /* Its shading rate attachment, the one thing of its chain kept. */
       VkRenderingFragmentShadingRateAttachmentInfoKHR fsr;

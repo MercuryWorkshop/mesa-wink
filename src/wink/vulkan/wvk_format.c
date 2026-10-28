@@ -294,6 +294,31 @@ wvk_format_vertex_native(VkFormat format)
    return f && f->vertex;
 }
 
+#ifdef __EMSCRIPTEN__
+static bool
+norm16_format(WGPUTextureFormat format)
+{
+   return format == WGPUTextureFormat_R16Unorm || format == WGPUTextureFormat_RG16Unorm ||
+          format == WGPUTextureFormat_RGBA16Unorm || format == WGPUTextureFormat_R16Snorm ||
+          format == WGPUTextureFormat_RG16Snorm || format == WGPUTextureFormat_RGBA16Snorm;
+}
+#endif
+
+bool
+wvk_format_needs_sampling_copy(const struct wvk_physical_device *pdev, VkFormat format)
+{
+#ifdef __EMSCRIPTEN__
+   /* Tier1 permits norm16 textures, but current browsers make them
+    * unfilterable. Sample a lossless float32 copy where that can filter. */
+   const struct wvk_format *f = wvk_format_get(format);
+   return f && norm16_format(f->texture) &&
+          wvk_physical_device_has_feature(pdev, WGPUFeatureName_Float32Filterable);
+#else
+   /* The pinned native Dawn makes Tier1 norm16 textures filterable. */
+   return false;
+#endif
+}
+
 uint32_t
 wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format)
 {
@@ -304,6 +329,10 @@ wvk_format_caps(const struct wvk_physical_device *pdev, VkFormat format)
       return 0;
 
    uint32_t caps = f->caps;
+#ifdef __EMSCRIPTEN__
+   if (norm16_format(f->texture) && !wvk_format_needs_sampling_copy(pdev, format))
+      caps &= ~WVK_CAP_FILTER;
+#endif
    /* A packed format's texture is RGBA8 holding its channels, not its
     * bits, so what WebGPU grants RGBA8Unorm is not the packed format's: a
     * storage view of one as R16 or RG8 would read and write the wrong

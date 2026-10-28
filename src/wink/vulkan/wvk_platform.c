@@ -124,11 +124,23 @@ wvk_platform_request_adapter(WGPUInstance instance)
 WGPUDevice
 wvk_platform_request_device(WGPUInstance instance, WGPUAdapter adapter, const WGPUDeviceDescriptor *desc)
 {
+#ifdef __EMSCRIPTEN__
+   /* Browser adapters are consumed by their first requestDevice. Vulkan
+    * permits multiple logical devices per physical device, so keep the
+    * physical device's adapter for queries and request a fresh equivalent
+    * adapter for each logical device. Native Dawn permits adapter reuse. */
+   adapter = wvk_platform_request_adapter(instance);
+   if (!adapter)
+      return NULL;
+#endif
    struct request r = { 0 };
    WGPURequestDeviceCallbackInfo cb = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
    cb.mode = wvk_platform_callback_mode();
    cb.callback = on_device;
    cb.userdata1 = &r;
    wait_for(instance, wgpuAdapterRequestDevice(adapter, desc, cb), &r);
+#ifdef __EMSCRIPTEN__
+   wgpuAdapterRelease(adapter);
+#endif
    return r.device;
 }

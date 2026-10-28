@@ -619,6 +619,25 @@ copy_color(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_i
       copy_buffer_texture(replay, to_texture, buffer, offset, l, tex, size);
 }
 
+void
+wvk_image_upload_linear(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image)
+{
+   if (!image->mem)
+      return;
+   wvk_replay_end_passes(replay);
+   const uint32_t width = image->vk.extent.width, height = image->vk.extent.height;
+   const uint32_t bytes = util_format_get_blocksize(vk_format_to_pipe_format(image->vk.format));
+   const struct copy_layout l = {
+      .block_w = 1, .block_h = 1, .block_bytes = bytes,
+      .row_bytes = image->pitch, .rows_per_image = height,
+   };
+   const WGPUExtent3D size = { width, height, 1 };
+   WGPUTexelCopyTextureInfo tex = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+   tex.texture = image->texture;
+   wvk_replay_read(replay, image->mem, image->offset, region_bytes(&l, size));
+   copy_color(dev, replay, image, true, image->mem->buffer, image->offset, &l, &tex, size);
+}
+
 static bool
 is_packed16_format(VkFormat format)
 {
@@ -846,7 +865,8 @@ static WGPURenderPipeline
 shadow_pipeline(struct wvk_device *dev, WGPUTextureFormat format, bool is_3d)
 {
    const uint32_t which = format == WGPUTextureFormat_RGBA8Unorm ? 0
-                          : format == WGPUTextureFormat_RGBA8UnormSrgb ? 1 : 2;
+                          : format == WGPUTextureFormat_RGBA8UnormSrgb ? 1
+                          : format == WGPUTextureFormat_RGBA16Float ? 2 : 3;
    simple_mtx_lock(&dev->cache_lock);
    WGPURenderPipeline *slot = &dev->shadow_pipelines[which][is_3d];
    if (!*slot) {
@@ -878,7 +898,23 @@ shadow_pipeline(struct wvk_device *dev, WGPUTextureFormat format, bool is_3d)
       desc.vertex.module = module;
       desc.vertex.entryPoint = wvk_sv("vs");
       desc.fragment = &fragment;
+      WGPUBindGroupLayoutEntry entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry.binding = 0;
+      entry.visibility = WGPUShaderStage_Fragment;
+      entry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+      entry.texture.viewDimension = is_3d ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2DArray;
+      WGPUBindGroupLayoutDescriptor bd = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+      bd.entryCount = 1;
+      bd.entries = &entry;
+      WGPUBindGroupLayout bgl = wgpuDeviceCreateBindGroupLayout(dev->wgpu, &bd);
+      WGPUPipelineLayoutDescriptor ld = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+      ld.bindGroupLayoutCount = 1;
+      ld.bindGroupLayouts = &bgl;
+      WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(dev->wgpu, &ld);
+      desc.layout = layout;
       *slot = wgpuDeviceCreateRenderPipeline(dev->wgpu, &desc);
+      wgpuPipelineLayoutRelease(layout);
+      wgpuBindGroupLayoutRelease(bgl);
       wgpuShaderModuleRelease(module);
    }
    WGPURenderPipeline pipeline = *slot;
@@ -889,8 +925,17 @@ shadow_pipeline(struct wvk_device *dev, WGPUTextureFormat format, bool is_3d)
 void
 wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image, uint32_t level)
 {
+   wvk_image_update_decoded(dev, replay, image, WVK_IMAGE_TEXTURE, WVK_IMAGE_SHADOW, level);
+}
+
+void
+wvk_image_update_decoded(struct wvk_device *dev, struct wvk_replay *replay, struct wvk_image *image,
+                          uint32_t source, uint32_t destination, uint32_t level)
+{
    const bool is_3d = image->dimension == WGPUTextureDimension_3D;
-   WGPURenderPipeline pipeline = shadow_pipeline(dev, image->shadow_format, is_3d);
+   const WGPUTextureFormat format = destination == WVK_IMAGE_SHADOW ? image->shadow_format
+                                                                   : image->aliases[destination - 1].format;
+   WGPURenderPipeline pipeline = shadow_pipeline(dev, format, is_3d);
    if (!pipeline)
       return;
    const uint32_t base_layer = 0;
@@ -898,11 +943,14 @@ wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struc
 
    WGPUTextureViewDescriptor vd = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
    vd.dimension = is_3d ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2DArray;
-   vd.baseMipLevel = level;
+   uint32_t source_first, destination_first;
+   WGPUTexture source_texture = wvk_image_texture(image, source, &source_first);
+   WGPUTexture destination_texture = wvk_image_texture(image, destination, &destination_first);
+   vd.baseMipLevel = level - source_first;
    vd.mipLevelCount = 1;
    vd.baseArrayLayer = 0;
    vd.arrayLayerCount = is_3d ? 1 : image->vk.array_layers;
-   WGPUTextureView src = wgpuTextureCreateView(image->texture, &vd);
+   WGPUTextureView src = wgpuTextureCreateView(source_texture, &vd);
    util_dynarray_append(&replay->views, src);
    WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
    const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src };
@@ -917,11 +965,11 @@ wvk_image_update_shadow(struct wvk_device *dev, struct wvk_replay *replay, struc
    for (uint32_t z = base_layer; z < base_layer + layer_count; ++z) {
       WGPUTextureViewDescriptor ad = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
       ad.dimension = is_3d ? WGPUTextureViewDimension_3D : WGPUTextureViewDimension_2D;
-      ad.baseMipLevel = level;
+      ad.baseMipLevel = level - destination_first;
       ad.mipLevelCount = 1;
       ad.baseArrayLayer = is_3d ? 0 : z;
       ad.arrayLayerCount = 1;
-      WGPUTextureView view = wgpuTextureCreateView(image->shadow, &ad);
+      WGPUTextureView view = wgpuTextureCreateView(destination_texture, &ad);
       util_dynarray_append(&replay->views, view);
       WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
       color.view = view;
@@ -1008,6 +1056,41 @@ ms_copy_pipeline(struct wvk_device *dev, WGPUTextureFormat format, VkFormat vk_f
    return pipeline;
 }
 
+bool
+wvk_image_copy_ms_views(struct wvk_device *dev, struct wvk_replay *replay, WGPUTextureView src,
+                         WGPUTextureView dst, WGPUTextureFormat format, VkFormat vk_format, unsigned samples)
+{
+   WGPURenderPipeline pipeline = ms_copy_pipeline(dev, format, vk_format, samples);
+   if (!pipeline)
+      return false;
+   WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
+   const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src };
+   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+   bg.layout = bgl;
+   bg.entryCount = 1;
+   bg.entries = &entry;
+   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
+   wgpuBindGroupLayoutRelease(bgl);
+
+   wvk_replay_end_passes(replay);
+   WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+   color.view = dst;
+   color.loadOp = WGPULoadOp_Clear;
+   color.storeOp = WGPUStoreOp_Store;
+   WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+   pd.label = wvk_sv("wvk ms copy");
+   pd.colorAttachmentCount = 1;
+   pd.colorAttachments = &color;
+   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &pd);
+   wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+   wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+   wgpuRenderPassEncoderEnd(pass);
+   wgpuRenderPassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+   return true;
+}
+
 WGPUTexture
 wvk_image_snapshot_ms(struct wvk_device *dev, struct wvk_replay *replay, const struct wvk_image *image)
 {
@@ -1034,31 +1117,10 @@ wvk_image_snapshot_ms(struct wvk_device *dev, struct wvk_replay *replay, const s
    util_dynarray_append(&replay->views, src);
    WGPUTextureView dst = wgpuTextureCreateView(copy, &vd);
    util_dynarray_append(&replay->views, dst);
-   WGPUBindGroupLayout bgl = wgpuRenderPipelineGetBindGroupLayout(pipeline, 0);
-   const WGPUBindGroupEntry entry = { .binding = 0, .textureView = src };
-   WGPUBindGroupDescriptor bg = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-   bg.layout = bgl;
-   bg.entryCount = 1;
-   bg.entries = &entry;
-   WGPUBindGroup group = wgpuDeviceCreateBindGroup(dev->wgpu, &bg);
-   wgpuBindGroupLayoutRelease(bgl);
-
-   wvk_replay_end_passes(replay);
-   WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
-   color.view = dst;
-   color.loadOp = WGPULoadOp_Clear;
-   color.storeOp = WGPUStoreOp_Store;
-   WGPURenderPassDescriptor pd = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-   pd.label = wvk_sv("wvk ms copy");
-   pd.colorAttachmentCount = 1;
-   pd.colorAttachments = &color;
-   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(replay->encoder, &pd);
-   wgpuRenderPassEncoderSetPipeline(pass, pipeline);
-   wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
-   wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
-   wgpuRenderPassEncoderEnd(pass);
-   wgpuRenderPassEncoderRelease(pass);
-   wgpuBindGroupRelease(group);
+   if (!wvk_image_copy_ms_views(dev, replay, src, dst, image->format, image->vk.format, image->vk.samples)) {
+      wgpuTextureRelease(copy);
+      return NULL;
+   }
    return copy;
 }
 

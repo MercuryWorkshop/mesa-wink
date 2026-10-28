@@ -40,6 +40,11 @@ EDITS = {
          '"beginningOfPassWriteIndex": WebGPU.optionalQuerySetIndex({{{ gpu.makeGetU32(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.beginningOfPassWriteIndex) }}})'),
         ('"endOfPassWriteIndex": {{{ gpu.makeGetU32(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.endOfPassWriteIndex) }}}',
          '"endOfPassWriteIndex": WebGPU.optionalQuerySetIndex({{{ gpu.makeGetU32(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.endOfPassWriteIndex) }}})'),
+        # WGPU_DEPTH_CLEAR_VALUE_UNDEFINED is NaN. The WebIDL float conversion
+        # rejects NaN even when depth is read-only or the format is stencil
+        # only. Omit the JS dictionary value as the C sentinel requests.
+        ('"depthClearValue": {{{ makeGetValue(\'dsaPtr\', C_STRUCTS.WGPURenderPassDepthStencilAttachment.depthClearValue, \'float\') }}}',
+         '"depthClearValue": ((value) => Number.isNaN(value) ? undefined : value)({{{ makeGetValue(\'dsaPtr\', C_STRUCTS.WGPURenderPassDepthStencilAttachment.depthClearValue, \'float\') }}})'),
     ],
     'webgpu/src/library_webgpu_enum_tables.js': [
         # Upstream typo: the WebGPU blend factor is 'src1-alpha'. The wrong

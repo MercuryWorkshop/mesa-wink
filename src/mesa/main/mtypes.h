@@ -1002,6 +1002,11 @@ struct gl_texture_object
     */
    bool needs_yuv_plane_views;
 
+   /* Storage exported as an image must be orphaned by TexImage, even when
+    * the new image would fit in the existing resource. TexSubImage and
+    * rendering still update the exported storage in place. */
+   bool pt_externally_shared;
+
    /* Protect modifications of the sampler_views array */
    simple_mtx_t validate_mutex;
 

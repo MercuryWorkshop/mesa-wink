@@ -70,6 +70,13 @@ wvk_sync_wait_many(struct vk_device *vk_device, uint32_t wait_count,
    const bool any = flags & VK_SYNC_WAIT_ANY;
    const bool pending = flags & VK_SYNC_WAIT_PENDING;
 
+   /* GetFenceStatus and zero-timeout waits must advance completion too.
+    * Native callbacks are WaitAnyOnly, and retiring a submit publishes its
+    * readbacks. Testing the deadline before polling leaves a polling-only
+    * client (Skia's async readback) observing NOT_READY forever. */
+   if (!pending)
+      wvk_queue_wait_progress(&dev->queue, 0);
+
    for (;;) {
       uint32_t done = 0;
       for (uint32_t i = 0; i < wait_count; ++i) {
