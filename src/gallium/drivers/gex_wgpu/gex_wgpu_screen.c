@@ -15759,6 +15759,10 @@ gex_wgpu_fetch_value(nir_builder *b, struct gex_wgpu_fetch_state *state, unsigne
          input->data.descriptor_set = 0;
          input->data.binding = GEX_WGPU_LOGICOP_BINDING + rt;
          input->data.explicit_binding = true;
+         /* This is an attachment snapshot, not application texture unit 0.
+          * Sampler-view lowering runs later and must not apply unit 0's
+          * swizzle (e.g. an alpha mask or a YUV plane) to destination reads. */
+         input->data.driver_location = GEX_WGPU_MAX_SAMPLERS;
       } else {
          input = nir_variable_create(b->shader, nir_var_shader_in, glsl_vector_type(base, n), name);
          input->data.location = VARYING_SLOT_VAR0 + location;
@@ -15956,6 +15960,7 @@ gex_wgpu_lower_logicop(nir_shader *nir, unsigned func)
    state.texture->data.descriptor_set = 0;
    state.texture->data.binding = GEX_WGPU_LOGICOP_BINDING;
    state.texture->data.explicit_binding = 1;
+   state.texture->data.driver_location = GEX_WGPU_MAX_SAMPLERS;
    nir_shader_intrinsics_pass(nir, gex_wgpu_lower_logicop_store,
                               nir_metadata_control_flow, &state);
    if (!state.lowered) {

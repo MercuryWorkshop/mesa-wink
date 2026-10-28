@@ -1765,6 +1765,33 @@ framebuffer_fetch(void)
    p_glReadPixels(9,10,1,1,GL_RGBA,GL_UNSIGNED_BYTE,px);
    CHECK(near(px,160,32,0),"fetch coordinates: %u,%u,%u,%u",px[0],px[1],px[2],px[3]);
    p_glDeleteProgram(prog);
+   /* Application texture-unit swizzles must not affect the driver's
+    * destination snapshot. Skia samples alpha masks and YUV planes while
+    * using framebuffer fetch for advanced blending. */
+   const char *swizzled_sample_fs = "#version 300 es\n"
+      "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+      "precision highp float; uniform sampler2D tex; layout(location=0) inout vec4 c;"
+      "void main(){ c+=vec4(0,texture(tex,vec2(0.5)).r*0.25,0,0); }";
+   GLuint sampled;
+   const uint8_t half_red = 128;
+   p_glGenTextures(1,&sampled); p_glBindTexture(GL_TEXTURE_2D,sampled);
+   p_glTexImage2D(GL_TEXTURE_2D,0,GL_R8,1,1,0,GL_RED,GL_UNSIGNED_BYTE,&half_red);
+   p_glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+   p_glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+   prog=link_program(vs,swizzled_sample_fs,"fetch with swizzled sampler"); p_glUseProgram(prog);
+   p_glUniform1i(p_glGetUniformLocation(prog,"tex"),0);
+   for (unsigned remap=0;remap<2;++remap) {
+      p_glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_SWIZZLE_G,remap?GL_ZERO:GL_RED);
+      p_glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_SWIZZLE_B,remap?GL_ONE:GL_RED);
+      p_glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_SWIZZLE_A,remap?GL_RED:GL_ONE);
+      p_glClearColor(0.25,0.5,0.75,1); p_glClear(GL_COLOR_BUFFER_BIT);
+      p_glDrawArrays(GL_TRIANGLES,0,3); read_center(px,W,H);
+      CHECK(near(px,64,160,191) && px[3]==255,
+            "fetch with sampler swizzle %u: %u,%u,%u,%u",remap,px[0],px[1],px[2],px[3]);
+   }
+   p_glClearColor(0,0,0,1);
+   p_glDeleteProgram(prog); p_glDeleteTextures(1,&sampled);
+   p_glBindTexture(GL_TEXTURE_2D,tex[0]);
    const char *uint_fs = "#version 300 es\n"
       "#extension GL_EXT_shader_framebuffer_fetch : require\n"
       "precision highp float; precision highp int; layout(location=0) inout uvec4 c;"
