@@ -82,6 +82,12 @@ returns an empty typeface, as can happen without installed system fonts in
 Wasm. Resource fonts still load through FreeType. This correction is recorded
 in `skia_fixes` and preserves the remote-glyph cache assertions.
 
+SkVx's scalar logical NOT returns an all-bit mask, matching the SIMD path.
+Returning the scalar boolean value `1` corrupts vector selection, including
+Ganesh's clipping of perspective quads in Wasm. The original `crbug_224618`
+GM exercises the missing geometry; the SkVx unit also checks mask selection.
+This correction is recorded in `skia_fixes`.
+
 The integration registers FreeType's compiled SVG renderer in its Wasm module
 list, fixing an SVG emoji metrics crash, and matches image extensions with a
 leading dot so `.wbmp` is not also collected as `bmp`. These corrections are

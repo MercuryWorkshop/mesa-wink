@@ -25,7 +25,8 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'graphite-color-text-mask-precompile-v1',
                      'resource-cache-purge-clock-progress-v1',
                      'test-typeface-empty-native-fallback-v1',
-                     'graphite-cache-budget-early-exit-v1']
+                     'graphite-cache-budget-early-exit-v1',
+                     'skvx-scalar-logical-not-mask-v1']
 
 
 def run(args, **kwargs):
@@ -63,6 +64,22 @@ def checkout(out):
 
 def adapt(source):
     # Only modify the disposable pinned dependency, never the user's Skia tree.
+    # Vector selection consumes all-bit masks. The scalar fallback's logical
+    # NOT returned 1 instead of all ones, corrupting clipped perspective quads
+    # when Wasm builds disable SIMD.
+    patch(source, 'src/core/SkVx.h',
+          'SIT Vec<1,T> operator!(const Vec<1,T>& x) { return !x.val; }',
+          '''SIT Vec<1,T> operator!(const Vec<1,T>& x) {
+        return sk_bit_cast<T>(x.val ? M<T>(0) : M<T>(-1));
+    }''')
+    patch(source, 'tests/SkVxTest.cpp',
+          'DEF_TEST(SkVx, r) {',
+          '''DEF_TEST(SkVx, r) {
+    // Logical masks must select complete values, including without SIMD.
+    const int4 input{0, 1, -1, 0};
+    REPORTER_ASSERT(r, all(!input == int4{-1, 0, 0, -1}));
+    REPORTER_ASSERT(r, all(if_then_else(!input, float4(42), float4(47)) ==
+                           float4{42, 47, 47, 42}));''')
     # Returned resources may put the cache over budget even when no resource
     # is old enough for an age purge, or its time limit has already elapsed.
     # Budget cleanup takes precedence, including these fast-return paths.
