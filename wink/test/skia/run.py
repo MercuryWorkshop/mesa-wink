@@ -187,6 +187,8 @@ def compare(reference, candidate):
         problems.append('font_engine differs')
     if ref_run.get('font_manager', 'platform') != cand_run.get('font_manager', 'platform'):
         problems.append('font_manager differs')
+    if font_profile(ref_run) != font_profile(cand_run):
+        problems.append('font_profile differs')
     if ref_run.get('include_cpu_tests', False) != cand_run.get('include_cpu_tests', False):
         problems.append('include_cpu_tests differs')
     def text_policy(run):
@@ -228,6 +230,14 @@ def fixtures(source):
             h.update(str(path.relative_to(root)).encode() + b'\0')
             h.update(bytes.fromhex(digest(path)))
     return h.hexdigest()
+
+
+def font_profile(build):
+    if 'font_profile' in build:
+        return build['font_profile']
+    if build.get('font_engine') == 'freetype':
+        return 'freetype-no-type1' if build.get('target') in ('st', 'mt') else 'freetype-full'
+    return 'platform'
 
 
 def driver_provenance(dm, environment):
@@ -302,6 +312,7 @@ def execute(a):
                     skia_fixes=skia_fixes,
                     font_engine=build.get('font_engine', 'platform'),
                     font_manager=build.get('font_manager', 'platform'),
+                    font_profile=font_profile(build),
                     include_cpu_tests=a.include_cpu_tests,
                     text_policy=build.get('text_policy', 'platform'),
                     font_selection=build.get('font_selection', 'platform'),

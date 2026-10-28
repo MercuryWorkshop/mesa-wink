@@ -261,6 +261,10 @@ fallbacks. CPU-inclusive runs pass `--paragraph_fonts extra_fonts` so the
 paragraph tests exercise their fixtures. Font-manager selection is recorded
 and must match for comparisons.
 
+Browser builds enable FreeType's complete module profile, including Type 1 and
+CID fonts, instead of Skia's reduced Wasm default. Font-module profiles must
+match for comparisons; the PFA/PFB GMs therefore execute on browser backends.
+
 Browser builds fingerprint the complete resource corpus. A changed fingerprint
 forces relinking and regeneration of `dm.data`; runs reject a stale or
 unrecorded resource pack and hash the actual data file alongside JS and Wasm.

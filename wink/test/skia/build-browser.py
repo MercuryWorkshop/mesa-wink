@@ -104,6 +104,7 @@ def main():
                 skia_gl_standard='gles', skia_enable_ganesh=True, skia_enable_graphite=True,
                 skia_use_vulkan=True, skia_use_dawn=False, skia_use_partition_alloc=False,
                 skia_use_freetype=True, skia_enable_fontmgr_custom_embedded=True,
+                skia_use_freetype_type1=True,
                 skia_use_system_freetype2=False,
                 skia_use_system_libpng=False, skia_use_system_libjpeg_turbo=False,
                 skia_use_system_libwebp=False, skia_use_system_zlib=False,
@@ -118,6 +119,7 @@ def main():
         text_policy='portable',
         font_selection='portable',
         font_manager='pinned-fixtures',
+        font_profile='freetype-full',
         fixtures=fixture_hash,
         gn_args=args), indent=2) + '\n')
     shutil.copy2(HERE / 'browser.html', build / 'index.html')

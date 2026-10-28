@@ -185,6 +185,13 @@ def checkout(out):
 
 def adapt(source):
     annotate_negative_operations(source)
+    patch(source, 'third_party/freetype2/BUILD.gn',
+          '  skia_use_freetype_woff2 = is_canvaskit',
+          '  skia_use_freetype_type1 = target_cpu != "wasm"\n'
+          '  skia_use_freetype_woff2 = is_canvaskit')
+    patch(source, 'third_party/freetype2/BUILD.gn',
+          '    if (target_cpu == "wasm") {',
+          '    if (!skia_use_freetype_type1) {')
     # This test compares subpixel advances. Its default 0.01-pixel layout
     # rounding erased the valid 0.00390625-pixel difference in pinned Roboto.
     patch(source, 'modules/skparagraph/tests/SkParagraphTest.cpp',
@@ -1074,6 +1081,7 @@ def main():
         'text_policy': a.text_policy,
         'font_selection': 'portable' if a.text_policy == 'portable' else 'platform',
         'font_manager': 'pinned-fixtures' if a.font_engine == 'freetype' else 'platform',
+        'font_profile': 'freetype-full' if a.font_engine == 'freetype' else 'platform',
         'wink': subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
         'routes': ['gles', 'vk', 'grvk'] + (['grdawn_gles'] if a.dawn_gles else []),
     }, indent=2) + '\n')

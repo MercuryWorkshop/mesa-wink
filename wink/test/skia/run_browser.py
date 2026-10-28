@@ -47,6 +47,7 @@ def execute(a):
     metadata = dict(schema=1, role='candidate', route=a.route, config=config, target=a.target,
                     font_engine='freetype',
                     font_manager=build_info.get('font_manager', 'platform'),
+                    font_profile=build_info.get('font_profile', 'freetype-no-type1'),
                     include_cpu_tests=a.include_cpu_tests,
                     text_policy='portable',
                     font_selection='portable',

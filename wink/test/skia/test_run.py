@@ -228,6 +228,17 @@ class ReferenceIntegrity(unittest.TestCase):
         suite.write_json(path, run)
         self.assertIn('font_manager differs', suite.compare(self.ref, self.candidate)['problems'])
 
+    def test_font_module_profiles_and_legacy_defaults(self):
+        self.assertEqual(suite.font_profile({'font_engine': 'freetype', 'target': 'mt'}),
+                         'freetype-no-type1')
+        self.assertEqual(suite.font_profile({'font_engine': 'freetype', 'target': 'native'}),
+                         'freetype-full')
+        path = self.candidate / 'run.json'
+        run = json.loads(path.read_text())
+        run['font_profile'] = 'freetype-full'
+        suite.write_json(path, run)
+        self.assertIn('font_profile differs', suite.compare(self.ref, self.candidate)['problems'])
+
     def test_text_policy_mismatch_and_legacy_browser_policy(self):
         path = self.candidate / 'run.json'
         run = json.loads(path.read_text())
