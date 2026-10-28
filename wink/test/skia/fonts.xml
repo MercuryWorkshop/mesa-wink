@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Pinned test fonts for FreeType builds without a host system font service. -->
+<familyset version="21">
+  <family name="sans-serif">
+    <font weight="400" style="normal">wink_fonts/Roboto-Regular.ttf</font>
+    <font weight="400" style="italic">wink_fonts/Roboto-Italic.ttf</font>
+    <font weight="700" style="normal">wink_fonts/Roboto-Bold.ttf</font>
+    <font weight="700" style="italic">wink_fonts/Roboto-BoldItalic.ttf</font>
+  </family>
+  <alias name="Roboto" to="sans-serif"/>
+  <alias name="Arial" to="sans-serif"/>
+  <alias name="Helvetica" to="sans-serif"/>
+  <family lang="zh-Hans">
+    <font>extra_fonts/NotoSansCJK-Regular.ttc</font>
+  </family>
+  <family lang="und-Zsye">
+    <font>extra_fonts/NotoColorEmoji.ttf</font>
+  </family>
+  <family lang="ar">
+    <font>extra_fonts/NotoNaskhArabic-Regular.ttf</font>
+  </family>
+</familyset>

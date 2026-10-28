@@ -221,6 +221,13 @@ class ReferenceIntegrity(unittest.TestCase):
         suite.write_json(path, run)
         self.assertIn('include_cpu_tests differs', suite.compare(self.ref, self.candidate)['problems'])
 
+    def test_font_manager_mismatch_fails_with_identical_pixels(self):
+        path = self.candidate / 'run.json'
+        run = json.loads(path.read_text())
+        run['font_manager'] = 'pinned-fixtures'
+        suite.write_json(path, run)
+        self.assertIn('font_manager differs', suite.compare(self.ref, self.candidate)['problems'])
+
     def test_text_policy_mismatch_and_legacy_browser_policy(self):
         path = self.candidate / 'run.json'
         run = json.loads(path.read_text())

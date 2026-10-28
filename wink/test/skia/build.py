@@ -29,7 +29,8 @@ CORRECTNESS_FIXES = ['graphite-vulkan-compressed-host-copy-row-texels-v1',
                      'graphite-cache-budget-early-exit-v1',
                      'skvx-scalar-logical-not-mask-v1',
                      'gpu-write-pixels-guard-regions-v1',
-                     'gradient-texture-direct-half-encoding-v1']
+                     'gradient-texture-direct-half-encoding-v1',
+                     'paragraph-font-style-raw-width-test-v1']
 
 # These pinned tests assert host-side layout, geometry, and packing. Keep
 # running them with their original GPU-labelled registration, while recording
@@ -184,6 +185,30 @@ def checkout(out):
 
 def adapt(source):
     annotate_negative_operations(source)
+    # This test compares subpixel advances. Its default 0.01-pixel layout
+    # rounding erased the valid 0.00390625-pixel difference in pinned Roboto.
+    patch(source, 'modules/skparagraph/tests/SkParagraphTest.cpp',
+          '''    auto widthOf = [&](const TextStyle& first, const TextStyle& second) {
+        ParagraphStyle paragraphStyle;''',
+          '''    auto widthOf = [&](const TextStyle& first, const TextStyle& second) {
+        ParagraphStyle paragraphStyle;
+        paragraphStyle.setApplyRoundingHack(false);''')
+    patch(source, 'tools/fonts/FontToolUtils.cpp',
+          '#if defined(SK_BUILD_FOR_ANDROID) && defined(SK_FONTMGR_ANDROID_AVAILABLE)\n'
+          '#include "include/ports/SkFontMgr_android.h"',
+          '#if defined(SK_FONTMGR_ANDROID_AVAILABLE)\n'
+          '#include "include/ports/SkFontMgr_android.h"')
+    patch(source, 'tools/fonts/FontToolUtils.cpp',
+          '#elif defined(SK_FONTMGR_FREETYPE_DIRECTORY_AVAILABLE)',
+          '''#elif defined(SK_FONTMGR_ANDROID_AVAILABLE) && defined(SK_TYPEFACE_FACTORY_FREETYPE)
+            SkString base = GetResourcePath("");
+            base.append("/");
+            SkString config = GetResourcePath("wink-fonts.xml");
+            SkFontMgr_Android_CustomFonts fonts{
+                SkFontMgr_Android_CustomFonts::kOnlyCustom,
+                base.c_str(), config.c_str(), nullptr, true};
+            mgr = SkFontMgr_New_Android(&fonts, TestFontScanner());
+#elif defined(SK_FONTMGR_FREETYPE_DIRECTORY_AVAILABLE)''')
     # Portable references must choose the same default bitmap emoji fixtures
     # as Wasm. Explicit SBIX/CBDT/COLR/SVG test cases keep their own selection.
     for anchor in (
@@ -996,6 +1021,9 @@ def main():
     if not a.library.is_file() or not a.vk_loader.is_file():
         p.error('Build native Wink and install a Vulkan loader first')
     adapt(source)
+    if a.font_engine == 'freetype':
+        from sync_fonts import ensure
+        ensure(source, a.out / 'skparagraph-v4.zip')
     args = {
         'is_debug': False, 'is_component_build': False,
         'skia_enable_ganesh': True, 'skia_enable_graphite': True,
@@ -1045,6 +1073,7 @@ def main():
         'font_engine': a.font_engine,
         'text_policy': a.text_policy,
         'font_selection': 'portable' if a.text_policy == 'portable' else 'platform',
+        'font_manager': 'pinned-fixtures' if a.font_engine == 'freetype' else 'platform',
         'wink': subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
         'routes': ['gles', 'vk', 'grvk'] + (['grdawn_gles'] if a.dawn_gles else []),
     }, indent=2) + '\n')

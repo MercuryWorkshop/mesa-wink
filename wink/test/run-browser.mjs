@@ -33,7 +33,9 @@ if (!dir || !existsSync(join(dir, pageName.split('?')[0]))) {
 
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
                 '.wasm': 'application/wasm', '.json': 'application/json' };
-const server = createServer(async (req, res) => {
+// A full Skia unit selection can contain thousands of names in the page's
+// argument query. Node's default 16 KiB header limit rejects that navigation.
+const server = createServer({maxHeaderSize: 1024 * 1024}, async (req, res) => {
   // Opt-in persistence for large test outputs, uploaded one file at a time.
   // Keep upload paths inside the caller's designated artifact directory.
   if (req.method === 'PUT' && artifactDir && req.url.startsWith('/__wink_artifacts/')) {

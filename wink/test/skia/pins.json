@@ -4,6 +4,21 @@
     "url": "https://github.com/google/skia.git",
     "commit": "f22d4495ea6b7f40201599e40defd35f52af9a86"
   },
+  "paragraph_fonts": {
+    "url": "https://chrome-infra-packages.appspot.com/dl/skia/bots/skparagraph/+/version:4",
+    "version": "4",
+    "sha256": "43ffb9c8c2a2ae0f3510065d952766480ed7257a1c19386fd1b69d47aaa7d890"
+  },
+  "system_fonts": {
+    "url": "https://raw.githubusercontent.com/googlefonts/roboto-2/38062f4b4a0be4346d07a928408da21602545e9e/",
+    "files": {
+      "Roboto-Regular.ttf": "56a45233d29f11b4dfb86d248e921939d115778f87325e7ae8cc108383d6664d",
+      "Roboto-Italic.ttf": "fa0b17bb4aaac4a1b2ee149dd4ca3b55e97d3077aa6ba9bb02541b316e7c46ce",
+      "Roboto-Bold.ttf": "61f89f8db49261c2f6106e8dccc35df7b2f7ed909020db40a3fc905e95f99334",
+      "Roboto-BoldItalic.ttf": "40083ed54338397cf49d2c49f59eddcd963a30fdb301813d4bd3abbb37a13d12",
+      "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    }
+  },
   "wink_base": "51eb6bdb32520dc3c50fee1d94242ae099bd6bac",
   "fix_stack": "0c859229e6445934abfb9ddcf0682b6457f1c3e2"
 }

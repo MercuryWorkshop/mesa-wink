@@ -100,6 +100,11 @@ different rounding on scalar and SIMD paths, shifting densely packed stops
 in Wasm. The gradient encoding test checks exact half values, including
 extended colors and subnormals. This correction is recorded in `skia_fixes`.
 
+The paragraph font-style precision test disables its default 0.01-pixel
+layout rounding when comparing subpixel advances. That rounding hid a valid
+0.00390625-pixel difference with Roboto. Both original inequality assertions
+remain in place; production layout rounding is unchanged.
+
 The integration registers FreeType's compiled SVG renderer in its Wasm module
 list, fixing an SVG emoji metrics crash, and matches image extensions with a
 leading dot so `.wbmp` is not also collected as `bmp`. These corrections are
@@ -246,6 +251,19 @@ selects the browser's default CBDT emoji resources. Explicit SBIX, CBDT, COLR,
 and SVG format tests keep their own fonts. Comparisons reject different font
 engines, text policies, or default font selections. Platform-specific GMs
 still require separate applicability checks.
+
+FreeType builds install the paragraph-font asset version pinned by Skia's
+bot configuration, plus complete regular/italic/bold/bold-italic Roboto faces
+from an immutable Google Fonts revision. Archive and font hashes are recorded
+in `pins.json`; `sync_fonts.py` verifies them before installation. The custom
+FreeType font manager uses only these pinned resources, including CJK and emoji
+fallbacks. CPU-inclusive runs pass `--paragraph_fonts extra_fonts` so the
+paragraph tests exercise their fixtures. Font-manager selection is recorded
+and must match for comparisons.
+
+Browser builds fingerprint the complete resource corpus. A changed fingerprint
+forces relinking and regeneration of `dm.data`; runs reject a stale or
+unrecorded resource pack and hash the actual data file alongside JS and Wasm.
 
 For Vulkan, the same test binary can select an independent ICD. For example,
 on a Mac with Homebrew MoltenVK:

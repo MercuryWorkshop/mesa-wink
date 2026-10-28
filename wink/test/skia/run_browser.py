@@ -16,13 +16,18 @@ def execute(a):
     if a.out.exists():
         raise ValueError(f'output already exists: {a.out}')
     build = (a.browser_dir or MESA / 'build/skia' / a.target).resolve()
-    for name in ('dm.js', 'dm.wasm', 'index.html'):
+    for name in ('dm.js', 'dm.wasm', 'dm.data', 'index.html'):
         if not (build / name).is_file():
             raise ValueError(f'missing {build / name}; run build-browser.py {a.target}')
     revision = subprocess.check_output(['git', '-C', a.source, 'rev-parse', 'HEAD'], text=True).strip()
     pin = json.loads((HERE / 'pins.json').read_text())['skia']['commit']
     if revision != pin:
         raise ValueError('Skia revision differs from pins.json')
+    manifest = build / 'wink-build.json'
+    build_info = json.loads(manifest.read_text()) if manifest.is_file() else {}
+    fixture_hash = fixtures(a.source)
+    if build_info.get('fixtures') != fixture_hash:
+        raise ValueError('browser resource pack differs from the source fixtures; rebuild browser DM')
     a.out.mkdir(parents=True)
     graphite = ROUTES[a.route][1]
     config = selected_config(a)
@@ -36,18 +41,21 @@ def execute(a):
     args += ['--nogpu', '--graphite'] if graphite else ['--nographite']
     if a.match:
         args += ['--match', *a.match]
-    manifest = build / 'wink-build.json'
-    skia_fixes = json.loads(manifest.read_text()).get('skia_fixes', []) if manifest.is_file() else []
+    skia_fixes = build_info.get('skia_fixes', [])
+    if a.include_cpu_tests and build_info.get('font_manager') == 'pinned-fixtures':
+        args += ['--paragraph_fonts', 'extra_fonts']
     metadata = dict(schema=1, role='candidate', route=a.route, config=config, target=a.target,
                     font_engine='freetype',
+                    font_manager=build_info.get('font_manager', 'platform'),
                     include_cpu_tests=a.include_cpu_tests,
                     text_policy='portable',
                     font_selection='portable',
                     skia_fixes=skia_fixes,
-                    skia=pin, sources=a.sources, match=a.match, fixtures=fixtures(a.source),
+                    skia=pin, sources=a.sources, match=a.match, fixtures=fixture_hash,
                     paint_key_seed=seed,
                     environment={'WINK_SKIA_TRACE_PRECOMPILE': trace} if trace is not None else {},
                     wasm_sha256=digest(build / 'dm.wasm'), js_sha256=digest(build / 'dm.js'),
+                    data_sha256=digest(build / 'dm.data'),
                     wink=subprocess.check_output(['git', '-C', MESA, 'rev-parse', 'HEAD'], text=True).strip(),
                     **{'pass': False, 'problems': ['execution has not completed']})
     write_json(a.out / 'run.json', metadata)

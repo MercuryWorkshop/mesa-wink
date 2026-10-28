@@ -69,6 +69,18 @@ def main():
     if not (package / 'manifest.json').is_file():
         p.error('Build and package Wink first')
     adapt(source)
+    from sync_fonts import ensure
+    ensure(source, a.out.resolve() / 'skparagraph-v4.zip')
+    from run import fixtures
+    fixture_hash = fixtures(source)
+    build = a.out.resolve() / a.target
+    build.mkdir(parents=True, exist_ok=True)
+    # Emscripten's preload directory contents are not GN source dependencies.
+    # A content-addressed pre-js path makes resource changes force a relink
+    # and regeneration of dm.data without recompiling Skia's C++ objects.
+    resource_stamp = build / ('resources-' + fixture_hash + '.js')
+    if not resource_stamp.exists():
+        resource_stamp.write_text('// Resource corpus SHA256: ' + fixture_hash + '\n')
     flags = ['-fwasm-exceptions', '-sSUPPORT_LONGJMP=wasm',
              f'-I{MESA / "src/gallium/targets/wink-wasm"}']
     if a.target == 'mt':
@@ -79,6 +91,7 @@ def main():
     link = [str(package / 'lib' / name) for name in ('libwink.a', 'libwink_webgpu.a', 'libwink_tint.a')]
     link += (package / 'wink.rsp').read_text().splitlines()
     link += [f'--js-library={HERE / "library_skia.js"}', f'--post-js={HERE / "publish.js"}',
+             f'--pre-js={resource_stamp}',
              '-sEXPORTED_FUNCTIONS=' + json.dumps(exports),
              '-sEXPORTED_RUNTIME_METHODS=FS,HEAPU8,HEAPU32,ENV',
              '-sENVIRONMENT=web,worker', '-sINITIAL_MEMORY=256MB', '-sASSERTIONS=1']
@@ -97,8 +110,6 @@ def main():
                 skia_use_system_expat=False, skia_use_system_harfbuzz=False,
                 skia_use_icu=True, skia_use_system_icu=False,
                 extra_cflags=flags, extra_ldflags=link)
-    build = a.out.resolve() / a.target
-    build.mkdir(parents=True, exist_ok=True)
     (build / 'args.gn').write_text('\n'.join(f'{k} = {json.dumps(v)}' for k, v in args.items()) + '\n')
     base.run([source / 'bin/gn', 'gen', build], cwd=source)
     base.run(['ninja', '-C', build, '-j', a.jobs, 'dm'], cwd=source)
@@ -106,6 +117,8 @@ def main():
         schema=1, skia=pin, skia_fixes=base.CORRECTNESS_FIXES, font_engine='freetype',
         text_policy='portable',
         font_selection='portable',
+        font_manager='pinned-fixtures',
+        fixtures=fixture_hash,
         gn_args=args), indent=2) + '\n')
     shutil.copy2(HERE / 'browser.html', build / 'index.html')
 

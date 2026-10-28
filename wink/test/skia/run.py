@@ -185,6 +185,8 @@ def compare(reference, candidate):
             problems.append(f'{key} differs')
     if ref_run.get('font_engine', 'platform') != cand_run.get('font_engine', 'platform'):
         problems.append('font_engine differs')
+    if ref_run.get('font_manager', 'platform') != cand_run.get('font_manager', 'platform'):
+        problems.append('font_manager differs')
     if ref_run.get('include_cpu_tests', False) != cand_run.get('include_cpu_tests', False):
         problems.append('include_cpu_tests differs')
     def text_policy(run):
@@ -293,10 +295,13 @@ def execute(a):
         args += ['--match', *a.match]
     manifest = a.dm.parent / 'wink-build.json'
     build = json.loads(manifest.read_text()) if manifest.is_file() else {}
+    if a.include_cpu_tests and build.get('font_manager') == 'pinned-fixtures':
+        args += ['--paragraph_fonts', 'extra_fonts']
     skia_fixes = build.get('skia_fixes', [])
     metadata = dict(schema=1, role=a.role, route=a.route, config=config, target='native', skia=revision,
                     skia_fixes=skia_fixes,
                     font_engine=build.get('font_engine', 'platform'),
+                    font_manager=build.get('font_manager', 'platform'),
                     include_cpu_tests=a.include_cpu_tests,
                     text_policy=build.get('text_policy', 'platform'),
                     font_selection=build.get('font_selection', 'platform'),
