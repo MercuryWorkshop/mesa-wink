@@ -19,8 +19,18 @@ HERE = Path(__file__).resolve().parent
 MESA = HERE.parents[2]
 ROUTES = {'gles': ('gles', False), 'vk': ('vulkan', False), 'grvk': ('vulkan', True),
           'grdawn_gles': ('gles', True)}
-CONFIG_ROUTES = {**{route: route for route in ROUTES},
-                 'glesmsaa4': 'gles', 'vkmsaa4': 'vk'}
+CONFIG_ROUTES = {
+    config: route for route, configs in {
+        'gles': ('gles', 'glesmsaa4', 'glesf16', 'glessrgba', 'gles1010102',
+                 'gles4444', 'gles888x', 'glesdmsaa', 'glesbetex', 'glesbert',
+                 'glesdft', 'glestestprecompile', 'glesreducedshaders'),
+        'vk': ('vk', 'vkmsaa4', 'vkmsaa8', 'vkf16', 'vk1010102', 'vkdmsaa',
+               'vknostencils', 'vkbetex', 'vkbert', 'vktestpersistentcache', 'vkddl'),
+        'grvk': ('grvk', 'grvktestprecompile', 'grvktesttracking',
+                 'grvktestpersistentstorage'),
+        'grdawn_gles': ('grdawn_gles',),
+    }.items() for config in configs
+}
 
 
 def selected_config(a):

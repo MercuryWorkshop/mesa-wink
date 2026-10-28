@@ -208,6 +208,13 @@ Skia's four-sample rendering configurations on native or browser targets.
 The route still controls the context factory and backend identity checks.
 Comparisons require the same rendering configuration, including sample count.
 
+`--config` also exposes Skia's GLES/Vulkan floating-point, sRGB, 10-bit,
+opaque, backend-texture/render-target, dynamic-MSAA, and shader/cache testing
+configurations. Graphite Vulkan exposes its precompile, tracking, and persistent
+storage configurations. The selected route still constrains every context
+factory. Unsupported configurations and skipped tasks remain failures in the
+strict audit.
+
 Use `--paint-key-seed 1793113975` to replay `PaintParamsKeyTestReduced` with
 an unsigned 32-bit seed, on native or browser routes. The equivalent environment
 variable is `WINK_SKIA_PAINT_KEY_SEED`; the command-line option takes precedence.
