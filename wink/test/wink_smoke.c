@@ -1519,28 +1519,42 @@ layered_pbo_upload(void)
    p_glDeleteBuffers(1, &pbo);
 }
 
+/* A one-pixel point: its quad's other lanes are helpers. dFdx/dFdy may be
+ * coarse (one row/column of the quad for all four lanes), so which of them
+ * sees the live lane depends on where in its quad the pixel lies; the point
+ * is drawn at all four quad positions, and the live lane must never read as
+ * a helper while some position must see a helper through a derivative.
+ */
 static void
 helper_invocation(void)
 {
-   const char *vs = "#version 320 es\n"
-      "void main(){ gl_Position=vec4(0.015625,0.020833333,0,1); gl_PointSize=1.0; }\n";
    const char *fs = "#version 320 es\n"
       "precision highp float; layout(location=0) out vec4 color;"
       "void main(){ float h=gl_HelperInvocation?1.0:0.0;"
-      "color=vec4(abs(dFdx(h)),h,0,1); }\n";
-   GLuint prog = link_program(vs, fs, "helper invocation");
-   p_glUseProgram(prog);
-   p_glDisable(GL_BLEND);
-   p_glClearColor(0, 0, 0, 1);
-   p_glClear(GL_COLOR_BUFFER_BIT);
-   p_glDrawArrays(GL_POINTS, 0, 1);
-   uint8_t px[4] = {0};
-   p_glReadPixels(32, 24, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-   CHECK(near(px, 255, 0, 0), "helper invocation derivative: %u,%u,%u,%u",
-         px[0], px[1], px[2], px[3]);
-   CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "helper invocation: context failed");
-   p_glUseProgram(0);
-   p_glDeleteProgram(prog);
+      "color=vec4(abs(dFdx(h)),h,abs(dFdy(h)),1); }\n";
+   unsigned seen = 0;
+   for (int q = 0; q < 4; q++) {
+      int x = 32 + (q & 1), y = 24 + (q >> 1);
+      char vs[256];
+      snprintf(vs, sizeof(vs), "#version 320 es\n"
+               "void main(){ gl_Position=vec4(%.9f,%.9f,0,1); gl_PointSize=1.0; }\n",
+               (x + 0.5) / 32.0 - 1.0, (y + 0.5) / 24.0 - 1.0);
+      GLuint prog = link_program(vs, fs, "helper invocation");
+      p_glUseProgram(prog);
+      p_glDisable(GL_BLEND);
+      p_glClearColor(0, 0, 0, 1);
+      p_glClear(GL_COLOR_BUFFER_BIT);
+      p_glDrawArrays(GL_POINTS, 0, 1);
+      uint8_t px[4] = {0};
+      p_glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+      CHECK(px[1] < 8 && px[3] == 255, "helper invocation: live lane at %d,%d reads %u,%u,%u,%u",
+            x, y, px[0], px[1], px[2], px[3]);
+      seen |= px[0] > 247 || px[2] > 247;
+      CHECK(p_glGetError() == GL_NO_ERROR && !wink_device_lost(), "helper invocation: context failed");
+      p_glUseProgram(0);
+      p_glDeleteProgram(prog);
+   }
+   CHECK(seen, "helper invocation derivative: no quad position sees a helper lane");
 }
 
 static void
