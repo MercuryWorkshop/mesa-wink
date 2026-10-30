@@ -932,12 +932,9 @@ context_create_here(const wink_context_attribs *a, int *status)
    gl_api profile;
    switch (a->api) {
    case WINK_API_OPENGL_ES:
-      if (want && want < 20) {
-         /* ES 1.x is not built (gles1=disabled). */
-         set_status(status, WINK_ERROR_BAD_VERSION);
-         return NULL;
-      }
-      profile = API_OPENGLES2;
+      /* ES 1.x is its own API (fixed function, st/mesa's emulation of it);
+       * no version asked for means the newest, ES 3.x. */
+      profile = want && want < 20 ? API_OPENGLES : API_OPENGLES2;
       break;
    case WINK_API_OPENGL_CORE:
       /* There is no core profile below 3.2; GLX and EGL give compatibility
@@ -982,7 +979,7 @@ context_create_here(const wink_context_attribs *a, int *status)
       return NULL;
    }
    c->st = st;
-   c->api = profile == API_OPENGLES2 ? WINK_API_OPENGL_ES
+   c->api = profile == API_OPENGLES2 || profile == API_OPENGLES ? WINK_API_OPENGL_ES
           : profile == API_OPENGL_CORE ? WINK_API_OPENGL_CORE : WINK_API_OPENGL_COMPAT;
    c->major = have / 10;
    c->minor = have % 10;

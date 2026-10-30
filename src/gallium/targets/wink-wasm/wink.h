@@ -126,7 +126,7 @@ typedef struct wink_surface_attribs {
 typedef struct wink_context_attribs {
    uint32_t size;
    int32_t api;                  /* enum wink_api */
-   int32_t major, minor;         /* 0.0: the highest version there is */
+   int32_t major, minor;         /* 0.0: the highest version there is; ES below 2.0 is ES 1.x */
    uint32_t flags;               /* WINK_CONTEXT_* */
    wink_context *share;          /* share objects with this context, or NULL */
 } wink_context_attribs;

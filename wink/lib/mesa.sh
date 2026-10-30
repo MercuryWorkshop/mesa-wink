@@ -16,7 +16,7 @@ mesa_options() {  # <variant>
     -Db_staticpic=false -Db_lto=false \
     -Dplatforms=[] -Dgallium-drivers=gex_wgpu -Dvulkan-drivers=wink -Dvulkan-beta=true \
     -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dglvnd=disabled \
-    -Dopengl=true -Dgles1=disabled -Dgles2=enabled -Dllvm=disabled \
+    -Dopengl=true -Dgles1=enabled -Dgles2=enabled -Dllvm=disabled \
     -Dgallium-va=disabled -Dgallium-rusticl=false -Dteflon=false \
     -Dvideo-codecs=[] -Dvalgrind=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
     -Dzstd=disabled -Dzlib=disabled -Ddisplay-info=disabled -Dexpat=disabled \
