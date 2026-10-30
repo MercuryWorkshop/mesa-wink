@@ -910,6 +910,21 @@ _mesa_initialize_dispatch_tables(struct gl_context *ctx)
    _mesa_init_dispatch(ctx);
    vbo_init_dispatch_begin_end(ctx);
 
+   /* glthread replays draws through entry points of its choosing (an ES 1.x
+    * context's DrawArrays as DrawArraysInstanced, its DrawElements with a base
+    * vertex), which ES 1.x does not have; wink runs every context under
+    * glthread. What the application calls through glthread's marshal table is
+    * unchanged.
+    */
+   if (ctx->API == API_OPENGLES) {
+      struct _glapi_table *t = ctx->Dispatch.OutsideBeginEnd;
+      SET_DrawArraysInstanced(t, _mesa_DrawArraysInstanced);
+      SET_DrawElementsBaseVertex(t, _mesa_DrawElementsBaseVertex);
+      SET_DrawElementsInstancedBaseVertex(t, _mesa_DrawElementsInstancedBaseVertex);
+      SET_DrawElementsInstancedBaseInstance(t, _mesa_DrawElementsInstancedBaseInstance);
+      SET_DrawRangeElements(t, _mesa_DrawRangeElements);
+   }
+
    if (_mesa_is_desktop_gl_compat(ctx)) {
       _mesa_init_dispatch_save(ctx);
       _mesa_init_dispatch_save_begin_end(ctx);
