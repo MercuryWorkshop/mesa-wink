@@ -31,11 +31,18 @@ gex_mesa_smoke = executable(
 # Compile gex's wire decoder against Mesa.  The source is owned by gex rather
 # than vendored into Mesa, so the wire format and its decoder change together.
 gex_root = join_paths(meson.project_source_root(), '..', '..')
-gex_decoder = join_paths(gex_root, 'web', 'mesa', 'gexgl-mesa.cpp')
-gex_jspi_js = join_paths(gex_root, 'web', 'gex-wgpu-jspi.js')
+# gex keeps them under ports/mesa (web/ in a tree from before its restructure).
+gex_mesa = join_paths(gex_root, 'ports', 'mesa')
+gex_mesa_src = join_paths(gex_mesa, 'src')
+if not fs.exists(join_paths(gex_mesa_src, 'gexgl-mesa.cpp'))
+  gex_mesa = join_paths(gex_root, 'web')
+  gex_mesa_src = join_paths(gex_mesa, 'mesa')
+endif
+gex_decoder = join_paths(gex_mesa_src, 'gexgl-mesa.cpp')
+gex_jspi_js = join_paths(gex_mesa, 'gex-wgpu-jspi.js')
 # The loader for the replay's cold part (gex: docs/mesa-wasm-size.md), which
 # the build splits off with wasm-split after the link (SPLIT_MODULE below).
-gex_split_js = join_paths(gex_root, 'web', 'gex-wgpu-split.js')
+gex_split_js = join_paths(gex_mesa, 'gex-wgpu-split.js')
 # Both live in gex, which holds this tree at third_party/mesa. Anywhere else
 # the targets built from them are skipped rather than failing configuration.
 have_gex_decoder = fs.exists(gex_decoder)
@@ -144,7 +151,7 @@ if gex_emdawn_dir != ''
   # Gallium driver.  Same source and same exported ABI as gex-mesa-replay, so
   # one recorded guest stream runs against softpipe and WebGPU unchanged and
   # the two can be compared directly.
-  # The D3D device beside the GL one (gex: web/mesa/gexd3d-mesa.cpp), on
+  # The D3D device beside the GL one (gex: ports/mesa/src/gexd3d-mesa.cpp), on
   # a dirk package. dirk is DXVK's front end and uses C++ exceptions, so the
   # link has them; Mesa's own objects are compiled as without it.
   gex_dirk_dir = get_option('gex-dirk-dir')
@@ -154,7 +161,7 @@ if gex_emdawn_dir != ''
   gex_dirk_include = []
   gex_dirk_depends = []
   if gex_dirk_dir != ''
-    gex_dirk_sources = [join_paths(gex_root, 'web', 'mesa', 'gexd3d-mesa.cpp')]
+    gex_dirk_sources = [join_paths(gex_mesa_src, 'gexd3d-mesa.cpp')]
     gex_dirk_args = ['-DGEX_MESA_DIRK=1']
     gex_dirk_link_args = [join_paths(gex_dirk_dir, 'lib', 'libdirk.a'), '-fwasm-exceptions']
     gex_dirk_include = include_directories(join_paths(gex_dirk_dir, 'include'))
@@ -212,7 +219,7 @@ if gex_emdawn_dir != ''
         '--profiling-funcs',
         # Emscripten's glue for a module split in two: the link also writes an
         # instrumented .wasm and the plain one as .wasm.orig, which gex's build
-        # (web/mesa-split.py) splits into the module the page loads and the
+        # (gex's ports/mesa/split.py) splits into the module the page loads and the
         # cold part it loads only when a function there first runs.
         '-sSPLIT_MODULE=1',
         '--pre-js=' + gex_split_js,
