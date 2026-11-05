@@ -2,5 +2,5 @@
 directory = dxvk
 
 url = https://github.com/MercuryWorkshop/dirk.git
-revision = e8312540f937757b2524e29b6f86b124727f626a
+revision = f69873e5f463fcdc0d5eea30f0ec24c4327b6c31
 clone-recursive = true
