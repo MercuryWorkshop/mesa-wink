@@ -77,7 +77,7 @@ e = os.environ
 v, tmp = e['WINK_V'], e['WINK_TMP']
 mt = v == 'mt'
 js = e['WINK_JS_ORDER'].split()
-required = ['-fwasm-exceptions', '-sSUPPORT_LONGJMP=wasm', '-sWASM_BIGINT=1'] + (['-pthread'] if mt else [])
+required = ['-fwasm-exceptions', '-sWASM_LEGACY_EXCEPTIONS=0', '-sSUPPORT_LONGJMP=wasm', '-sWASM_BIGINT=1'] + (['-pthread'] if mt else [])
 # Tint's passes recurse deeply; a 16 MB stack needs an initial memory above it.
 # Every pthread's stack is DEFAULT_PTHREAD_STACK_SIZE, which is STACK_SIZE
 # unless set: 16 MB each of the program's threads. GL compiles its shaders

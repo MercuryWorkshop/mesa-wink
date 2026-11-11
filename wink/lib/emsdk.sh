@@ -1,4 +1,4 @@
-# emsdk: the compiler .NET 10 links with. Sourced by wink/build.sh.
+# emsdk: the compiler .NET 11 links with. Sourced by wink/build.sh.
 #
 # .NET 10's browser-wasm workload is pinned to Emscripten 3.1.56, and objects
 # built by any other emcc risk a different libc/libc++ ABI in the final link, so
@@ -24,7 +24,9 @@
 # accepted, and the packaging stage's symbol check stops the build with that
 # explanation if their compiler and compiler-rt disagree.
 
-WINK_EMSDK_VERSION=3.1.56
+# .NET 11's emscripten reports 6.0.3 (commit 6ea9c28c38cd), although its tool cache and the runtime's
+# emscripten-version.txt say 6.0.2; ikvm-wasm-build builds wink with that compiler (the frozen statics/emsdk).
+WINK_EMSDK_VERSION=6.0.3
 WINK_EMSDK_REPO=https://github.com/emscripten-core/emsdk.git
 
 # The host's .NET runtime identifier, for finding the workload's pack.
@@ -146,7 +148,7 @@ emsdk_setup() {
     if [ "${WINK_ALLOW_ANY_EMSDK:-0}" = 1 ]; then
       warn "emcc is not $WINK_EMSDK_VERSION: $WINK_EMCC_VERSION_LINE"
     else
-      die "emcc is not $WINK_EMSDK_VERSION (.NET 10's): $WINK_EMCC_VERSION_LINE -- WINK_ALLOW_ANY_EMSDK=1 to override"
+      die "emcc is not $WINK_EMSDK_VERSION (.NET 11's): $WINK_EMCC_VERSION_LINE -- WINK_ALLOW_ANY_EMSDK=1 to override"
     fi
   fi
   WINK_CLANG_VERSION_LINE=$("$WINK_EMBIN/emcc" -v 2>&1 | grep -m1 'clang version' || true)

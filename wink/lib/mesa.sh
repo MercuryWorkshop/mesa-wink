@@ -47,6 +47,8 @@ for e in json.load(open(path)):
         bad.append('%s: -pthread in the st variant' % name)
     if '-fwasm-exceptions' not in args:
         bad.append('%s: missing -fwasm-exceptions' % name)
+    if '-sWASM_LEGACY_EXCEPTIONS=0' not in args:
+        bad.append('%s: missing -sWASM_LEGACY_EXCEPTIONS=0 (legacy EH would mix with the app\'s exnref)' % name)
 if bad:
     sys.stderr.write('\n'.join(bad[:20]) + '\n')
     sys.exit('%d compile commands with the wrong ABI flags' % len(bad))
