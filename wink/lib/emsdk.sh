@@ -1,28 +1,25 @@
 # emsdk: the compiler .NET 11 links with. Sourced by wink/build.sh.
 #
-# .NET 10's browser-wasm workload is pinned to Emscripten 3.1.56, and objects
-# built by any other emcc risk a different libc/libc++ ABI in the final link, so
-# the version is checked, not assumed.
+# Objects built by another emcc than the app's link risk a different
+# libc/libc++ ABI, so the version is checked, not assumed.
 #
 # Layouts accepted for --emsdk / $EMSDK:
 #   upstream emsdk   <root>/upstream/emscripten/emcc, config <root>/.emscripten
 #   dotnet/runtime   <root>/emscripten/emcc,          config <root>/emscripten/.emscripten
-#                    what the runtime repo provisions (src/mono/browser/emsdk) and
-#                    fna-wasm-build's freeze-emsdk.sh zips; Linux binaries only
-#   .NET workload    the Microsoft.NET.Runtime.Emscripten.3.1.56.Sdk.<rid> pack,
-#                    or a dotnet root to find it in: the very compiler a .NET
-#                    app's link uses, configured through DOTNET_EMSCRIPTEN_*
-#                    variables and a frozen cache from the sibling Cache pack
-# Without one, upstream 3.1.56 is bootstrapped, and that is the one to compile
-# with. Every .NET-built emsdk measured -- the workload pack (10.0.12) and the
-# dotnet/runtime-provisioned one fna-wasm-build freezes -- pairs a clang
-# (dotnet-llvm-project 19.1.0) that emits the newer __wasm_setjmp helpers with
-# a compiler-rt that still has only saveSetjmp, so an object with setjmp in it
-# (spirv_to_nir) built by that clang does not link, not even against .NET's own
-# libraries. ikvm-wasm-build compiles its natives with upstream 3.1.56 and
-# links with .NET's emsdk for exactly this reason. The .NET layouts are still
-# accepted, and the packaging stage's symbol check stops the build with that
-# explanation if their compiler and compiler-rt disagree.
+#                    what the runtime provisions (.NET 11: its wasm tool cache)
+#                    and fna-wasm-build's freeze-emsdk.sh zips -- ikvmcraft's
+#                    statics/emsdk, which ikvm-wasm-build builds wink with;
+#                    Linux binaries only
+#   .NET workload    the Microsoft.NET.Runtime.Emscripten.<ver>.Sdk.<rid> pack,
+#                    or a dotnet root to find it in, configured through
+#                    DOTNET_EMSCRIPTEN_* variables and a frozen cache from the
+#                    sibling Cache pack
+# Without one, upstream $WINK_EMSDK_VERSION is bootstrapped. Under .NET 10
+# (3.1.56) every .NET-built emsdk paired a clang that emitted the newer
+# __wasm_setjmp helpers with a compiler-rt that had only saveSetjmp, so wink
+# had to be compiled with upstream 3.1.56; .NET 11's (6.0.3) passes the
+# packaging stage's symbol check against its own libc and compiler-rt
+# (2026-11-10: 15870 defined, 2658 undefined), and is what wink is built with.
 
 # .NET 11's emscripten reports 6.0.3 (commit 6ea9c28c38cd), although its tool cache and the runtime's
 # emscripten-version.txt say 6.0.2; ikvm-wasm-build builds wink with that compiler (the frozen statics/emsdk).

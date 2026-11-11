@@ -1,13 +1,14 @@
 # emdawnwebgpu: webgpu.h and its JS implementation. Sourced by wink/build.sh.
 #
-# Pinned to the release whose Dawn revision is the one Tint is built from
-# (cdda346): the last with Tint's AST SPIR-V reader, and the first release
-# with texture-formats-tier1/tier2 and primitive-index that still has it. The
-# package was built against emsdk 4.0.8; tools/patch-emdawnwebgpu.py carries
-# the edits that make its JS load under 3.1.56 and behave in a heap over 2 GB.
+# A recent release, built for Emscripten 4.0.10+ (its README), which .NET 11's
+# emscripten 6.0.3 is. It is independent of Tint, which stays at Dawn cdda346
+# for the AST SPIR-V reader (lib/tint.sh): the two share no code in the link.
+# Until .NET 11 the pin was v20250822.104650 (Tint's revision, built against
+# emsdk 4.0.8) with edits that made its JS load under 3.1.56; those are gone.
+# tools/patch-emdawnwebgpu.py carries the fixes upstream still lacks.
 
-WINK_EMDAWN_VERSION=v20250822.104650
-WINK_EMDAWN_SHA512=7658dabf1bc593d23f57878edf48c8b1d3e5e55cab40cfb7523598ac90accddde6c4806e8ce9c53bd668f9116ad8c1bc7ed81d46b889feb8f7beb180b8eac0d3
+WINK_EMDAWN_VERSION=v20261109.214834
+WINK_EMDAWN_SHA512=ac0dfb47b7bc8f356778f711382a86d45528d53a8619f1df6e6325eeee0e0982a4f1bd7c53cec0640c65e8fd2d604a28fdced1003cd3ae9f76827d6b02bac9b6
 WINK_EMDAWN_URL="https://github.com/google/dawn/releases/download/$WINK_EMDAWN_VERSION/emdawnwebgpu_pkg-$WINK_EMDAWN_VERSION.zip"
 
 emdawn_setup() {

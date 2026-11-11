@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
-"""Make the pinned emdawnwebgpu package work under Emscripten 3.1.56.
+"""Fix the pinned emdawnwebgpu package (v20261109.214834, Dawn 7435fd8) for wink.
 
-The package (Dawn cdda346, release v20250822.104650) was built against emsdk
-4.0.8. Each edit below is applied independently and idempotently: text already
-in its new form is left alone, text in its old form is replaced, and text in
-neither form is an error -- a silently unpatched library is the failure this
-exists to prevent.
-
-The compatibility edits originated in MobileGL's
-cmake/FetchEmdawnwebgpu.cmake; the API corrections are exercised by Wink.
+Each edit below is applied independently and idempotently: text already in its
+new form is left alone, text in its old form is replaced, and text in neither
+form is an error -- a silently unpatched library is the failure this exists to
+prevent. Upstream has since fixed the dual-source blend factor spelling; the
+Emscripten 3.1.56 compatibility edits (stack helper deps, the emwgpuWaitAny
+stub's arity) went with the move to .NET 11's emscripten 6.0.3.
 """
+
 import os
 import sys
 
 EDITS = {
     'webgpu/src/library_webgpu.js': [
-        # 3.1.56 spells the stack helpers without the '$' library prefix.
-        ("errorCallback__deps: ['$stackSave', '$stackRestore', '$stringToUTF8OnStack']",
-         "errorCallback__deps: ['stackSave', 'stackRestore', '$stringToUTF8OnStack']"),
-        # The non-Asyncify stub must take the arguments its signature declares,
-        # or 3.1.56's library processing rejects the mismatch.
-        ('emwgpuWaitAny: () => {',
-         'emwgpuWaitAny: (futurePtr, futureCount, timeoutMSPtr) => {'),
-        # Objects are keyed by pointer, but _emwgpuCreate* returns reach JS as
-        # signed i32: in a heap over 2 GB -- the .NET host's is about 4 GB --
-        # inserts land under negative keys while lookups are >>> 0. Upstream
-        # made jsObjectInsert and getJsObject unsigned; the import and delete
-        # paths still are not.
+        # Objects are keyed by pointer, but the _emwgpuCreate* result importJs*
+        # inserts reaches JS as a signed i32: in a heap over 2 GB -- the .NET
+        # host's is about 4 GB -- it lands under a negative key while every
+        # lookup (getJsObject, and jsObjectInsert's ensurePointerUnsigned) is
+        # unsigned. emwgpuDelete's is a 'p' parameter, which emscripten makes
+        # unsigned once the heap can pass 2 GB; kept explicit anyway.
         ('WebGPU.Internals.jsObjects[ptr] = obj;',
          'WebGPU.Internals.jsObjects[ptr >>> 0] = obj;'),
         ('delete WebGPU.Internals.jsObjects[ptr];',
@@ -36,21 +29,15 @@ EDITS = {
         ('makePassTimestampWrites: (ptr) => {',
          'optionalQuerySetIndex: (index) => index === 0xffffffff ? undefined : index,\n\n'
          '    makePassTimestampWrites: (ptr) => {'),
-        ('"beginningOfPassWriteIndex": {{{ gpu.makeGetU32(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.beginningOfPassWriteIndex) }}}',
-         '"beginningOfPassWriteIndex": WebGPU.optionalQuerySetIndex({{{ gpu.makeGetU32(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.beginningOfPassWriteIndex) }}})'),
-        ('"endOfPassWriteIndex": {{{ gpu.makeGetU32(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.endOfPassWriteIndex) }}}',
-         '"endOfPassWriteIndex": WebGPU.optionalQuerySetIndex({{{ gpu.makeGetU32(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.endOfPassWriteIndex) }}})'),
+        ('"beginningOfPassWriteIndex": {{{ makeGetValue(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.beginningOfPassWriteIndex, \'u32\') }}}',
+         '"beginningOfPassWriteIndex": WebGPU.optionalQuerySetIndex({{{ makeGetValue(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.beginningOfPassWriteIndex, \'u32\') }}})'),
+        ('"endOfPassWriteIndex": {{{ makeGetValue(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.endOfPassWriteIndex, \'u32\') }}}',
+         '"endOfPassWriteIndex": WebGPU.optionalQuerySetIndex({{{ makeGetValue(\'ptr\', C_STRUCTS.WGPUPassTimestampWrites.endOfPassWriteIndex, \'u32\') }}})'),
         # WGPU_DEPTH_CLEAR_VALUE_UNDEFINED is NaN. The WebIDL float conversion
         # rejects NaN even when depth is read-only or the format is stencil
         # only. Omit the JS dictionary value as the C sentinel requests.
         ('"depthClearValue": {{{ makeGetValue(\'dsaPtr\', C_STRUCTS.WGPURenderPassDepthStencilAttachment.depthClearValue, \'float\') }}}',
          '"depthClearValue": ((value) => Number.isNaN(value) ? undefined : value)({{{ makeGetValue(\'dsaPtr\', C_STRUCTS.WGPURenderPassDepthStencilAttachment.depthClearValue, \'float\') }}})'),
-    ],
-    'webgpu/src/library_webgpu_enum_tables.js': [
-        # Upstream typo: the WebGPU blend factor is 'src1-alpha'. The wrong
-        # string makes the browser reject every dual-source-blend pipeline.
-        ("'one-minus-src1alpha'", "'one-minus-src1-alpha'"),
-        ("'src1alpha'", "'src1-alpha'"),
     ],
 }
 

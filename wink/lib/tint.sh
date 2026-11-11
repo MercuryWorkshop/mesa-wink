@@ -64,8 +64,10 @@ tint_setup() {  # <variant>
     return 0
   fi
 
-  local flags=""
-  [ "$variant" = mt ] && flags="-pthread"
+  # Tint (Dawn cdda346) builds with -pedantic-errors and abseil with -Werror; with .NET 11's emscripten (6.0.3, LLVM 23)
+  # that rejects __COUNTER__ (-Wc2y-extensions) and abseil's __EMSCRIPTEN_major__ (deprecated, -Wdeprecated-pragma).
+  local flags="-Wno-c2y-extensions -Wno-deprecated-pragma"
+  [ "$variant" = mt ] && flags="$flags -pthread"
   local key="variant=$variant emcc=$WINK_EMCC_VERSION_LINE dawn=$WINK_DAWN_REF patch=$(hash_file "$WINK_DIR/patches/dawn-tint-emscripten.patch") formats=$(hash_file "$WINK_DIR/patches/tint-spirv-reader-texel-formats.patch") novalidate=$(hash_file "$WINK_DIR/patches/tint-spirv-reader-skip-validation.patch") spvtools=$WINK_SPIRV_TOOLS_REV flags=$flags"
   WINK_TINT="$WINK_CACHE/tint/$variant-em$WINK_EMSDK_VERSION-$(hash_str "$key")"
   stamp_ok "$WINK_TINT" "$key" && { log "cached at $WINK_TINT"; return 0; }
