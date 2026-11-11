@@ -194,9 +194,12 @@ wink_swap_buffers(surface);                        /* never suspends */
   `library_wink.js` wraps its imports in `WebAssembly.Suspending` itself.
   There is no `-sJSPI`, which is how ikvm-wasm-build's .NET runtime already
   paces frames.
-* **Stock .NET runtimes.** They do not wrap exports in `promising`;
-  fna-wasm-build's runtime fork does (`WasmEnableJSPI`). Without JSPI,
-  `wink_init` returns `WINK_ERROR_NO_JSPI` rather than hanging later.
+* **.NET runtimes do not wrap exports in `promising`.** Neither stock .NET
+  nor, since its move to .NET 11, fna-wasm-build's runtime fork (which dropped
+  `WasmEnableJSPI`). Without JSPI, `wink_init` returns `WINK_ERROR_NO_JSPI`
+  rather than hanging later. A .NET embedder therefore uses
+  `WINK_INIT_GL_ON_MAIN_THREAD` (below), where only wink's own main-thread
+  runner suspends; ikvmcraft does.
 * **Frames.** A frame reaches the canvas when the owning thread returns to its
   event loop. By default pacing is the caller's job (requestAnimationFrame),
   and `wink_swap_buffers` never suspends.
