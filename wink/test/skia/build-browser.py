@@ -81,7 +81,9 @@ def main():
     resource_stamp = build / ('resources-' + fixture_hash + '.js')
     if not resource_stamp.exists():
         resource_stamp.write_text('// Resource corpus SHA256: ' + fixture_hash + '\n')
-    flags = ['-fwasm-exceptions', '-sSUPPORT_LONGJMP=wasm',
+    # The encoding wink's archives use (.NET 11's exnref): V8 rejects a module
+    # that mixes it with legacy EH, emscripten's compile-time default.
+    flags = ['-fwasm-exceptions', '-sWASM_LEGACY_EXCEPTIONS=0', '-sSUPPORT_LONGJMP=wasm',
              f'-I{MESA / "src/gallium/targets/wink-wasm"}']
     if a.target == 'mt':
         flags += ['-pthread']
