@@ -2412,6 +2412,14 @@ struct gl_sync_object
 
    struct pipe_fence_handle *fence;
    simple_mtx_t mutex; /**< protects "fence" */
+
+#if MESA_GLTHREAD_REMOTE
+   /* WINK_ASYNC_FENCE (glthread.c _mesa_glthread_remote_FenceSync): made on a
+    * remote context's application thread, with its flush queued to the driver
+    * thread; remote_done is signalled once that flush has run there. */
+   bool remote;
+   struct util_queue_fence remote_done;
+#endif
 };
 
 

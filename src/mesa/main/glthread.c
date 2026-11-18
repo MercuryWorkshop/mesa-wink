@@ -46,6 +46,8 @@
 #include "util/u_cpu_detect.h"
 #include "util/u_debug.h"
 #include "util/thread_sched.h"
+#include "util/os_time.h"
+#include "main/syncobj.h"
 
 #include "state_tracker/st_context.h"
 
@@ -805,6 +807,125 @@ _mesa_glthread_call_async(struct gl_context *ctx,
    _mesa_glthread_flush_batch(ctx);
    util_queue_add_job(&ctx->GLThread.queue, call, fence, glthread_call_execute,
                       glthread_call_free, 0);
+}
+
+/* WINK_ASYNC_FENCE (default on; "0" is the A/B): glFenceSync and
+ * glClientWaitSync on a remote context's application thread, without waiting
+ * for the driver thread to run everything queued.
+ *
+ * Both return a value, so glthread marshals them synchronously, and in remote
+ * mode each was a round trip: the application thread stopped until the main
+ * thread had executed the whole queue. Minecraft 26.2 calls the pair once a
+ * frame (GlCommandEncoder.submit pacing its staging memory, MAX_SUBMITS_IN_FLIGHT
+ * = 2), so the render thread and the main thread took turns: ~3.2 ms of a
+ * 14 ms frame (findings 2026-11-15, "wink on 26.2").
+ *
+ * FenceSync makes the sync object here and queues only its flush (which
+ * submits) to the driver thread, with a fence of its own; ClientWaitSync
+ * answers from that fence: signalled -> ALREADY_SIGNALED, timeout 0 ->
+ * TIMEOUT_EXPIRED, else wait for that job alone -> CONDITION_SATISFIED or
+ * TIMEOUT_EXPIRED. "Signalled" means the driver thread has executed everything
+ * before the fence and submitted it -- what the synchronous path answered too:
+ * gex_wgpu returns no driver fence, so a flushed fence was always signalled.
+ * Anything this does not take (another condition, flags, a sync object made
+ * the synchronous way, an invalid name) goes the synchronous way and gets its
+ * error there. */
+uint64_t _mesa_glthread_remote_fences[3];
+
+static bool
+glthread_async_fence(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("WINK_ASYNC_FENCE", true);
+   return enabled;
+}
+
+static void
+glthread_fence_flush_run(struct gl_context *ctx, void *data)
+{
+   _mesa_fence_sync_flush(ctx, data);
+}
+
+static void
+glthread_unref_sync_run(struct gl_context *ctx, void *data)
+{
+   _mesa_unref_sync_object(ctx, data, 1);
+}
+
+/* Drops the reference ClientWaitSync took. Deleting the object calls into the
+ * driver, so if this would be the last reference (a DeleteSync ran on the driver
+ * thread meanwhile), the drop goes there. */
+static void
+glthread_unref_sync(struct gl_context *ctx, struct gl_sync_object *obj)
+{
+   simple_mtx_lock(&ctx->Shared->Mutex);
+   if (obj->RefCount > 1) {
+      obj->RefCount--;
+      simple_mtx_unlock(&ctx->Shared->Mutex);
+      return;
+   }
+   simple_mtx_unlock(&ctx->Shared->Mutex);
+   _mesa_glthread_call_async(ctx, glthread_unref_sync_run, obj, NULL);
+}
+
+GLsync
+_mesa_glthread_remote_FenceSync(struct gl_context *ctx, GLenum condition,
+                                GLbitfield flags)
+{
+   if (condition != GL_SYNC_GPU_COMMANDS_COMPLETE || flags != 0 ||
+       !glthread_async_fence())
+      return NULL;
+
+   struct gl_sync_object *obj = _mesa_new_remote_sync(ctx, condition, flags);
+   if (!obj)
+      return NULL;
+
+   /* Queued BEFORE the object is visible: queueing resets its fence, so no
+    * thread can find it signalled before the flush has run. */
+   _mesa_glthread_call_async(ctx, glthread_fence_flush_run, obj,
+                             &obj->remote_done);
+   _mesa_publish_sync(ctx, obj);
+   return (GLsync)obj;
+}
+
+bool
+_mesa_glthread_remote_ClientWaitSync(struct gl_context *ctx, GLsync sync,
+                                     GLbitfield flags, GLuint64 timeout,
+                                     GLenum *ret)
+{
+   if ((flags & ~GL_SYNC_FLUSH_COMMANDS_BIT) || !glthread_async_fence())
+      return false;
+
+   struct gl_sync_object *obj = _mesa_get_and_ref_sync(ctx, sync, true);
+   if (!obj)
+      return false;
+   if (!obj->remote) {
+      glthread_unref_sync(ctx, obj);
+      return false;
+   }
+
+   /* The flush was queued with the batch before it (call_async flushes), so
+    * GL_SYNC_FLUSH_COMMANDS_BIT has nothing left to do. */
+   if (util_queue_fence_is_signalled(&obj->remote_done)) {
+      *ret = GL_ALREADY_SIGNALED;
+      _mesa_glthread_remote_fences[0]++;
+   } else if (timeout == 0) {
+      *ret = GL_TIMEOUT_EXPIRED;
+      _mesa_glthread_remote_fences[2]++;
+   } else {
+      bool done = true;
+      if (timeout == GL_TIMEOUT_IGNORED)
+         util_queue_fence_wait(&obj->remote_done);
+      else
+         done = util_queue_fence_wait_timeout(&obj->remote_done,
+                                              os_time_get_absolute_timeout(timeout));
+      *ret = done ? GL_CONDITION_SATISFIED : GL_TIMEOUT_EXPIRED;
+      _mesa_glthread_remote_fences[done ? 1 : 2]++;
+   }
+
+   glthread_unref_sync(ctx, obj);
+   return true;
 }
 #endif
 

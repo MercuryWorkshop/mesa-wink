@@ -1777,6 +1777,16 @@ struct gex_wgpu_screen {
    WGPUShaderModule mip_module;
    WGPUBindGroupLayout mip_bgl;
    WGPUPipelineLayout mip_layout;
+   /* A vertically flipping blit drawn (gex_wgpu_flip_blit): one pipeline per
+    * destination format, sharing a layout and a module. */
+   struct {
+      WGPUTextureFormat format;
+      WGPURenderPipeline pipeline;
+   } flip_pipelines[8];
+   unsigned flip_pipeline_count;
+   WGPUShaderModule flip_module;
+   WGPUBindGroupLayout flip_bgl;
+   WGPUPipelineLayout flip_layout;
    /* The multisampled-depth resolve, one pipeline per depth format. Distinct
     * from `depth_resolve` above, which turns a packed depth texture into
     * something readable: this one turns 4x samples into one. WebGPU resolves
@@ -25791,10 +25801,18 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
       clear_view.baseArrayLayer = dst->first_layer;
       clear_view.arrayLayerCount = 1;
    }
-   WGPUTextureView view =
-      wgpuTextureCreateView(clear_scratch ? gex_resource(resource)->rt_scratch
-                                          : gex_resource(resource)->texture,
-                            &clear_view);
+   /* The draw path's cached attachment view when the clear targets the
+    * texture's own 2D slice -- the same descriptor a draw into it uses -- so a
+    * clear pass makes no view (8 createView a frame on Minecraft 26.2, every
+    * one a clear's; findings 2026-11-15, "wink on 26.2"). Borrowed: not
+    * released here. A 3D slice or a scratch keeps a view of its own. */
+   const bool view_borrowed = !clear_three_d && !clear_scratch &&
+      !GEX_GETENV_ONCE("GEX_WGPU_NO_CLEAR_VIEW_CACHE");
+   WGPUTextureView view = view_borrowed
+      ? gex_wgpu_attachment_view(ctx, gex_resource(resource)->texture, &clear_view)
+      : wgpuTextureCreateView(clear_scratch ? gex_resource(resource)->rt_scratch
+                                            : gex_resource(resource)->texture,
+                              &clear_view);
    /* Into the batch unless the clear goes to a scratch, whose bytes are
     * copied back right after it. */
    bool batched = false;
@@ -25804,7 +25822,7 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
       ? gex_wgpu_local_encoder(screen)
       : gex_wgpu_clear_encoder(ctx, resource, &batched);
    if (!view || !encoder) {
-      if (view) wgpuTextureViewRelease(view);
+      if (view && !view_borrowed) wgpuTextureViewRelease(view);
       if (encoder && !batched) gex_wgpu_local_encoder_release(screen, encoder);
       gex_decline(ctx);
       return;
@@ -25859,14 +25877,16 @@ gex_wgpu_clear_render_target(struct pipe_context *pipe,
       wgpuRenderPassEncoderRelease(pass);
    }
    if (batched) {
-      wgpuTextureViewRelease(view);
+      if (!view_borrowed)
+         wgpuTextureViewRelease(view);
       if (!pass)
          gex_decline(ctx);
       return;
    }
    WGPUCommandBuffer command = wgpuCommandEncoderFinish(encoder, NULL);
    gex_wgpu_local_encoder_release(screen, encoder);
-   wgpuTextureViewRelease(view);
+   if (!view_borrowed)
+      wgpuTextureViewRelease(view);
    if (!pass || !command) {
       if (command) wgpuCommandBufferRelease(command);
       gex_decline(ctx);
@@ -25974,8 +25994,12 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
    clear_desc.mipLevelCount = 1;
    clear_desc.baseArrayLayer = dst->first_layer;
    clear_desc.arrayLayerCount = 1;
-   WGPUTextureView view =
-      wgpuTextureCreateView(gex_resource(resource)->texture, &clear_desc);
+   /* The draw path's cached attachment view (the same descriptor), as for a
+    * colour clear above. Borrowed: not released here. */
+   const bool view_borrowed = !GEX_GETENV_ONCE("GEX_WGPU_NO_CLEAR_VIEW_CACHE");
+   WGPUTextureView view = view_borrowed
+      ? gex_wgpu_attachment_view(ctx, gex_resource(resource)->texture, &clear_desc)
+      : wgpuTextureCreateView(gex_resource(resource)->texture, &clear_desc);
    bool batched = false;
    WGPUCommandEncoder encoder = view
       ? gex_wgpu_clear_encoder(ctx, resource, &batched) : NULL;
@@ -26016,7 +26040,7 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
       wgpuRenderPassEncoderRelease(pass);
    }
    if (batched) {
-      if (view) wgpuTextureViewRelease(view);
+      if (view && !view_borrowed) wgpuTextureViewRelease(view);
       if (!pass)
          gex_decline(ctx);
       return;
@@ -26024,7 +26048,7 @@ gex_wgpu_clear_depth_stencil(struct pipe_context *pipe,
    WGPUCommandBuffer command = pass
       ? wgpuCommandEncoderFinish(encoder, NULL) : NULL;
    if (encoder) gex_wgpu_local_encoder_release(screen, encoder);
-   if (view) wgpuTextureViewRelease(view);
+   if (view && !view_borrowed) wgpuTextureViewRelease(view);
    if (!pass || !command) {
       if (command) wgpuCommandBufferRelease(command);
       gex_decline(ctx);
@@ -30330,6 +30354,229 @@ gex_wgpu_blit_by_transfer(struct pipe_context *pipe,
    return ok;
 }
 
+/* ---- A vertically flipping blit, drawn ----
+ *
+ * GL asks for a flip whenever the window origin and a texture's disagree, and
+ * WebGPU has no flipping copy, so gex_wgpu_copy_texture_region's flip is one
+ * copyTextureToTexture per row, in a command buffer of its own after a submit.
+ * Minecraft 26.2 presents through such a blit every frame: 427 one-row copies a
+ * frame at the harness's 761x427 window, 7.6% of the browser main thread, and
+ * 63% of every WebGPU call the FO pack makes (findings 2026-11-15, "wink on
+ * 26.2"). This draws it instead: one fullscreen triangle under a scissor that is
+ * the destination box, whose fragment loads the source texel at the mirrored
+ * row; recorded into the pending batch like gex_wgpu_generate_mipmap, so no
+ * submit. Two offsets reach the shader without a uniform: the source column
+ * minus the destination column through firstInstance (biased by 2^30), and the
+ * mirror row (source box y - 1 + destination box y) through firstVertex / 3.
+ *
+ * Taken only where a draw reproduces the copy bit for bit: one sample, a 2D
+ * texture's single slice, the same unorm or float format on both sides (an
+ * 8- or 16-bit unorm value, or a float, survives f32 exactly; snorm's -1.0 does
+ * not, and sRGB would be decoded and re-encoded), different textures, no
+ * render-target scratch. Everything else -- and GEX_WGPU_NO_FLIP_DRAW=1 -- keeps
+ * the per-row copies. */
+uint64_t gex_wgpu_flip_draws;
+
+static WGPURenderPipeline
+gex_wgpu_flip_pipeline(struct gex_wgpu_screen *screen, WGPUTextureFormat format)
+{
+   for (unsigned i = 0; i < screen->flip_pipeline_count; ++i)
+      if (screen->flip_pipelines[i].format == format)
+         return screen->flip_pipelines[i].pipeline;
+   if (screen->flip_pipeline_count >= ARRAY_SIZE(screen->flip_pipelines))
+      return NULL;
+   if (!screen->flip_module) {
+      static const char wgsl[] =
+         "@group(0) @binding(0) var src: texture_2d<f32>;\n"
+         "struct V {\n"
+         "  @builtin(position) pos: vec4<f32>,\n"
+         "  @location(0) @interpolate(flat) o: vec2<i32>,\n"
+         "};\n"
+         "@vertex fn vs(@builtin(vertex_index) v: u32,"
+         " @builtin(instance_index) n: u32) -> V {\n"
+         "  var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0),"
+         " vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));\n"
+         "  var out: V;\n"
+         "  out.pos = vec4<f32>(p[v % 3u], 0.0, 1.0);\n"
+         "  out.o = vec2<i32>(i32(n) - 0x40000000, i32(v / 3u));\n"
+         "  return out;\n"
+         "}\n"
+         "@fragment fn fs(@builtin(position) pos: vec4<f32>,"
+         " @location(0) @interpolate(flat) o: vec2<i32>)"
+         " -> @location(0) vec4<f32> {\n"
+         "  let f = vec2<i32>(pos.xy);\n"
+         "  return textureLoad(src, vec2<i32>(f.x + o.x, o.y - f.y), 0);\n"
+         "}\n";
+      WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+      source.code = (WGPUStringView){wgsl, WGPU_STRLEN};
+      WGPUShaderModuleDescriptor module_desc = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+      module_desc.nextInChain = &source.chain;
+      module_desc.label = (WGPUStringView){"gex flip blit", WGPU_STRLEN};
+      screen->flip_module =
+         wgpuDeviceCreateShaderModule(screen->device, &module_desc);
+      WGPUBindGroupLayoutEntry entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+      entry.binding = 0;
+      entry.visibility = WGPUShaderStage_Fragment;
+      entry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
+      entry.texture.viewDimension = WGPUTextureViewDimension_2D;
+      WGPUBindGroupLayoutDescriptor bgl_desc = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+      bgl_desc.entryCount = 1;
+      bgl_desc.entries = &entry;
+      screen->flip_bgl = wgpuDeviceCreateBindGroupLayout(screen->device, &bgl_desc);
+      WGPUPipelineLayoutDescriptor layout_desc = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+      layout_desc.bindGroupLayoutCount = 1;
+      layout_desc.bindGroupLayouts = &screen->flip_bgl;
+      screen->flip_layout =
+         wgpuDeviceCreatePipelineLayout(screen->device, &layout_desc);
+   }
+   if (!screen->flip_module || !screen->flip_bgl || !screen->flip_layout)
+      return NULL;
+   WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+   target.format = format;
+   target.writeMask = WGPUColorWriteMask_All;
+   WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+   fragment.module = screen->flip_module;
+   fragment.entryPoint = (WGPUStringView){"fs", WGPU_STRLEN};
+   fragment.targetCount = 1;
+   fragment.targets = &target;
+   WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+   desc.label = (WGPUStringView){"gex flip blit", WGPU_STRLEN};
+   desc.layout = screen->flip_layout;
+   desc.vertex.module = screen->flip_module;
+   desc.vertex.entryPoint = (WGPUStringView){"vs", WGPU_STRLEN};
+   desc.fragment = &fragment;
+   desc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+   desc.multisample.count = 1;
+   desc.multisample.mask = 0xffffffffu;
+   WGPURenderPipeline pipeline =
+      wgpuDeviceCreateRenderPipeline(screen->device, &desc);
+   if (!pipeline)
+      return NULL;
+   screen->flip_pipelines[screen->flip_pipeline_count].format = format;
+   screen->flip_pipelines[screen->flip_pipeline_count].pipeline = pipeline;
+   ++screen->flip_pipeline_count;
+   return pipeline;
+}
+
+static bool
+gex_wgpu_flip_blit(struct gex_wgpu_context *ctx, const struct pipe_blit_info *info)
+{
+   struct gex_wgpu_screen *screen = gex_screen(ctx->base.screen);
+   struct pipe_resource *src = info->src.resource, *dst = info->dst.resource;
+   if (ctx->failed || !src || !dst || src == dst ||
+       GEX_GETENV_ONCE("GEX_WGPU_NO_FLIP_DRAW"))
+      return false;
+   /* the flipped shape st/mesa sends: the source box runs upward (blit.c) */
+   if (info->src.box.height >= 0 || info->dst.box.height <= 0 ||
+       info->src.box.width != info->dst.box.width || info->src.box.width <= 0 ||
+       -info->src.box.height != info->dst.box.height ||
+       info->src.box.depth != 1 || info->dst.box.depth != 1 ||
+       info->src.box.z != 0 || info->dst.box.z != 0 ||
+       info->src.box.x < 0 || info->dst.box.x < 0 || info->dst.box.y < 0 ||
+       info->src.box.y + info->src.box.height < 0)
+      return false;
+   if (info->scissor_enable || info->swizzle_enable || info->alpha_blend ||
+       info->num_window_rectangles != 0 || info->mask != PIPE_MASK_RGBA)
+      return false;
+   if (info->render_condition_enable && !gex_wgpu_render_cond_passes(ctx))
+      return false;   /* the general path skips it */
+   const enum pipe_format format = info->dst.format;
+   if (info->src.format != format || src->format != format ||
+       dst->format != format || util_format_is_srgb(format) ||
+       !(util_format_is_unorm(format) || util_format_is_float(format)) ||
+       util_format_is_depth_or_stencil(format) ||
+       util_format_is_pure_integer(format) || util_format_is_compressed(format))
+      return false;
+   if ((src->target != PIPE_TEXTURE_2D && src->target != PIPE_TEXTURE_RECT) ||
+       (dst->target != PIPE_TEXTURE_2D && dst->target != PIPE_TEXTURE_RECT) ||
+       MAX2(src->nr_samples, 1) != 1 || MAX2(dst->nr_samples, 1) != 1)
+      return false;
+   struct gex_wgpu_resource *gsrc = gex_resource(src), *gdst = gex_resource(dst);
+   if (!gsrc->texture || !gdst->texture || gsrc->texture == gdst->texture ||
+       gsrc->rt_scratch || gdst->rt_scratch || gsrc->ms_tile_layers ||
+       gdst->ms_tile_layers ||
+       !(gsrc->texture_usage & WGPUTextureUsage_TextureBinding) ||
+       !(gdst->texture_usage & WGPUTextureUsage_RenderAttachment))
+      return false;
+   const WGPUTextureFormat wgpu_format = gex_wgpu_texture_format(format);
+   if (wgpu_format == WGPUTextureFormat_Undefined)
+      return false;
+   WGPURenderPipeline pipeline = gex_wgpu_flip_pipeline(screen, wgpu_format);
+   if (!pipeline)
+      return false;
+
+   WGPUTextureViewDescriptor view_desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+   view_desc.format = wgpu_format;
+   view_desc.dimension = WGPUTextureViewDimension_2D;
+   view_desc.mipLevelCount = 1;
+   view_desc.arrayLayerCount = 1;
+   view_desc.aspect = WGPUTextureAspect_All;
+   view_desc.baseMipLevel = info->src.level;
+   WGPUTextureView from = wgpuTextureCreateView(gsrc->texture, &view_desc);
+   view_desc.baseMipLevel = info->dst.level;
+   WGPUTextureView into = gex_wgpu_attachment_view(ctx, gdst->texture, &view_desc);
+   WGPUBindGroup group = NULL;
+   if (from) {
+      WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
+      entry.binding = 0;
+      entry.textureView = from;
+      WGPUBindGroupDescriptor bg_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+      bg_desc.layout = screen->flip_bgl;
+      bg_desc.entryCount = 1;
+      bg_desc.entries = &entry;
+      group = wgpuDeviceCreateBindGroup(screen->device, &bg_desc);
+   }
+   if (!into || !group) {
+      if (group) wgpuBindGroupRelease(group);
+      if (from) wgpuTextureViewRelease(from);
+      return false;
+   }
+
+   gex_wgpu_end_pass(ctx);
+   WGPUCommandEncoder encoder = gex_wgpu_pending_encoder(ctx);
+   if (!encoder) {
+      wgpuBindGroupRelease(group);
+      wgpuTextureViewRelease(from);
+      return false;
+   }
+   WGPURenderPassColorAttachment color = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+   color.view = into;
+   color.loadOp = WGPULoadOp_Load;   /* outside the box stays */
+   color.storeOp = WGPUStoreOp_Store;
+   WGPURenderPassDescriptor pass_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+   pass_desc.colorAttachmentCount = 1;
+   pass_desc.colorAttachments = &color;
+   WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+   wgpuRenderPassEncoderSetPipeline(pass, pipeline);
+   wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 0, NULL);
+   wgpuRenderPassEncoderSetScissorRect(pass, (uint32_t)info->dst.box.x,
+                                       (uint32_t)info->dst.box.y,
+                                       (uint32_t)info->dst.box.width,
+                                       (uint32_t)info->dst.box.height);
+   const uint32_t mirror = (uint32_t)(info->src.box.y - 1 + info->dst.box.y);
+   const uint32_t column = (uint32_t)(info->src.box.x - info->dst.box.x + 0x40000000);
+   wgpuRenderPassEncoderDraw(pass, 3, 1, 3 * mirror, column);
+   wgpuRenderPassEncoderEnd(pass);
+   wgpuRenderPassEncoderRelease(pass);
+   wgpuBindGroupRelease(group);
+   wgpuTextureViewRelease(from);
+
+   /* Read and written by this batch: a CPU upload of either, or a read of the
+    * destination, waits for the submit. */
+   gex_wgpu_batch_touch(ctx, src);
+   gex_wgpu_batch_touch(ctx, dst);
+   gdst->texture_written = true;
+   gdst->write_serial++;
+   if (gex_wgpu_flip_draws++ == 0)
+      fprintf(stderr, "gex-wgpu: flipping blits are drawn (%ux%u %s; "
+                      "GEX_WGPU_NO_FLIP_DRAW=1 copies them by row)\n",
+              info->dst.box.width, info->dst.box.height,
+              util_format_short_name(format));
+   if (ctx->batch_touched_overflowed)
+      gex_wgpu_submit_pending(ctx);
+   return true;
+}
+
 static void
 gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
 {
@@ -30340,6 +30587,9 @@ gex_wgpu_blit(struct pipe_context *pipe, const struct pipe_blit_info *info)
                               info->src.box.width, info->src.box.height,
                               info->dst.box.width, info->dst.box.height);
    GEX_DEVICE_GUARD(gex_screen(pipe->screen));
+   /* Before the submit below: the drawn flip records into the batch. */
+   if (info && gex_wgpu_flip_blit((struct gex_wgpu_context *)pipe, info))
+      return;
    gex_wgpu_submit_pending((struct gex_wgpu_context *)pipe);
    struct gex_wgpu_context *ctx = (struct gex_wgpu_context *)pipe;
    if (ctx->failed)

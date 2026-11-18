@@ -47,7 +47,11 @@
 static inline uint32_t
 _mul32by64_hi(uint32_t a, uint64_t b)
 {
-#ifdef HAVE_UINT128
+/* wink: wasm has __int128 but no 64x64->128 multiply, so it becomes a call to
+ * compiler-rt's __multi3 -- 1.9% of the browser main thread on Minecraft 26.2,
+ * under hash_table.c / set.c lookups (findings 2026-11-15, "wink on 26.2"). The
+ * two-multiply form below is what a 32-bit target uses. */
+#if defined(HAVE_UINT128) && !defined(__wasm__)
    return ((__uint128_t) b * a) >> 64;
 #else
    /*

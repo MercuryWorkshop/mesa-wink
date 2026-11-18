@@ -110,6 +110,11 @@ delete_sync_object(struct gl_context *ctx,
 
    screen->fence_reference(screen, &obj->fence, NULL);
    simple_mtx_destroy(&obj->mutex);
+#if MESA_GLTHREAD_REMOTE
+   /* the last reference goes on the driver thread, after the flush job ran */
+   if (obj->remote)
+      util_queue_fence_destroy(&obj->remote_done);
+#endif
    free(obj->Label);
    FREE(obj);
 }
@@ -305,6 +310,49 @@ _mesa_fence_sync(struct gl_context *ctx, GLenum condition, GLbitfield flags)
 
    return NULL;
 }
+
+
+#if MESA_GLTHREAD_REMOTE
+/* WINK_ASYNC_FENCE: _mesa_fence_sync in two halves. This one runs on a remote
+ * context's application thread and touches no driver state: the object, not
+ * yet visible to anyone (_mesa_publish_sync makes it so). */
+struct gl_sync_object *
+_mesa_new_remote_sync(struct gl_context *ctx, GLenum condition, GLbitfield flags)
+{
+   struct gl_sync_object *syncObj = new_sync_object(ctx);
+   if (!syncObj)
+      return NULL;
+   syncObj->Name = 1;
+   syncObj->RefCount = 1;
+   syncObj->DeletePending = GL_FALSE;
+   syncObj->SyncCondition = condition;
+   syncObj->Flags = flags;
+   syncObj->StatusFlag = 0;
+   syncObj->remote = true;
+   util_queue_fence_init(&syncObj->remote_done);
+   return syncObj;
+}
+
+/* ... and this one runs on the driver thread, in queue order: the flush
+ * _mesa_fence_sync makes, which SUBMITS (gex_wgpu: persistent mappings reach
+ * the GPU only in a submit's upload, and the fence's user rotates its staging
+ * memory on the answer). */
+void
+_mesa_fence_sync_flush(struct gl_context *ctx, struct gl_sync_object *syncObj)
+{
+   simple_mtx_lock(&syncObj->mutex);
+   ctx->pipe->flush(ctx->pipe, &syncObj->fence, ctx->Shared->RefCount == 1 ? PIPE_FLUSH_DEFERRED : 0);
+   simple_mtx_unlock(&syncObj->mutex);
+}
+
+void
+_mesa_publish_sync(struct gl_context *ctx, struct gl_sync_object *syncObj)
+{
+   simple_mtx_lock(&ctx->Shared->Mutex);
+   _mesa_set_add(ctx->Shared->SyncObjects, syncObj);
+   simple_mtx_unlock(&ctx->Shared->Mutex);
+}
+#endif
 
 
 GLsync GLAPIENTRY

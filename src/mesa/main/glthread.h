@@ -390,6 +390,17 @@ void _mesa_glthread_call_async(struct gl_context *ctx,
  * The application thread's own census: call it there. */
 void _mesa_glthread_remote_census(char *out, size_t len, uint64_t *waits,
                                   uint64_t *copies);
+
+/* WINK_ASYNC_FENCE (glthread.c): FenceSync / ClientWaitSync on the application
+ * thread, called first by their generated marshal functions in remote mode. NULL
+ * / false: not taken, go the synchronous way. Counts of ClientWaitSync answers
+ * given here: [0] already signalled, [1] waited for and satisfied, [2] timed out. */
+GLsync _mesa_glthread_remote_FenceSync(struct gl_context *ctx, GLenum condition,
+                                       GLbitfield flags);
+bool _mesa_glthread_remote_ClientWaitSync(struct gl_context *ctx, GLsync sync,
+                                          GLbitfield flags, GLuint64 timeout,
+                                          GLenum *ret);
+extern uint64_t _mesa_glthread_remote_fences[3];
 /* Counted by the copying draw paths: draws copied, and client arrays a copied
  * draw found no copy for and read live (must stay 0). */
 extern uint64_t _mesa_glthread_remote_copies;

@@ -57,6 +57,12 @@ note(const char *fmt, ...)
    X(const GLubyte *, GetStringi, (GLenum, GLuint))                               \
    X(GLenum, GetError, (void))                                                   \
    X(void, GetIntegerv, (GLenum, GLint *))                                       \
+   X(GLsync, FenceSync, (GLenum, GLbitfield))                                    \
+   X(GLenum, ClientWaitSync, (GLsync, GLbitfield, GLuint64))                     \
+   X(void, WaitSync, (GLsync, GLbitfield, GLuint64))                             \
+   X(void, DeleteSync, (GLsync))                                                 \
+   X(GLboolean, IsSync, (GLsync))                                                \
+   X(void, GetSynciv, (GLsync, GLenum, GLsizei, GLsizei *, GLint *))             \
    X(void, Viewport, (GLint, GLint, GLsizei, GLsizei))                           \
    X(void, ClearColor, (GLfloat, GLfloat, GLfloat, GLfloat))                     \
    X(void, Clear, (GLbitfield))                                                  \
@@ -1969,6 +1975,68 @@ glthread_queries(const char *label, wink_surface *surface)
    wink_context_destroy(ctx);
 }
 
+/* Sync objects the way Minecraft 26.2's GlCommandEncoder uses them -- a fence a
+ * frame, waited on two frames later with FLUSH_COMMANDS_BIT and no timeout, and
+ * a timeout-0 poll -- plus the calls that stay synchronous. With GL on the main
+ * thread FenceSync and ClientWaitSync are answered on this thread
+ * (WINK_ASYNC_FENCE, glthread.c); the answers must be what GL allows, and the
+ * objects must stay valid until deleted. */
+static void
+sync_objects(const char *label, wink_surface *surface)
+{
+   wink_context_attribs ca;
+   wink_context_attribs_default(&ca);
+   ca.api = WINK_API_OPENGL_CORE;
+   int status = 0;
+   wink_context *ctx = wink_context_create(&ca, &status);
+   CHECK(ctx, "%s: core context: %s", label, wink_status_string(status));
+   if (!ctx)
+      return;
+   wink_make_current(ctx, surface, surface);
+   GLsync fences[6] = {0};
+   for (unsigned frame = 0; frame < 6; ++frame) {
+      p_glClearColor(frame / 6.0f, 0.0f, 0.0f, 1.0f);
+      p_glClear(GL_COLOR_BUFFER_BIT);
+      fences[frame] = p_glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+      CHECK(fences[frame], "%s sync: FenceSync returned 0 (frame %u)", label, frame);
+      CHECK(p_glIsSync(fences[frame]), "%s sync: IsSync false (frame %u)", label, frame);
+      GLenum poll = p_glClientWaitSync(fences[frame], 0, 0);
+      CHECK(poll == GL_ALREADY_SIGNALED || poll == GL_TIMEOUT_EXPIRED,
+            "%s sync: timeout-0 poll 0x%x (frame %u)", label, poll, frame);
+      if (frame >= 2) {
+         GLenum r = p_glClientWaitSync(fences[frame - 2], GL_SYNC_FLUSH_COMMANDS_BIT,
+                                       GL_TIMEOUT_IGNORED);
+         CHECK(r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED,
+               "%s sync: wait answered 0x%x (frame %u)", label, r, frame);
+         p_glDeleteSync(fences[frame - 2]);
+         fences[frame - 2] = 0;
+      }
+   }
+   /* Waited for, it is signalled from then on; a finite timeout too. */
+   GLenum r = p_glClientWaitSync(fences[5], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
+   CHECK(r == GL_ALREADY_SIGNALED || r == GL_CONDITION_SATISFIED,
+         "%s sync: finite wait answered 0x%x", label, r);
+   r = p_glClientWaitSync(fences[5], 0, 0);
+   CHECK(r == GL_ALREADY_SIGNALED, "%s sync: after a wait, a poll answered 0x%x", label, r);
+   GLint value = 0;
+   GLsizei length = 0;
+   p_glGetSynciv(fences[5], GL_SYNC_STATUS, 1, &length, &value);
+   CHECK(length == 1 && value == GL_SIGNALED, "%s sync: SYNC_STATUS %d (%d values)", label, value, length);
+   p_glWaitSync(fences[4], 0, GL_TIMEOUT_IGNORED);
+   p_glDeleteSync(fences[4]);
+   p_glDeleteSync(fences[5]);
+   CHECK(!p_glIsSync(fences[5]), "%s sync: IsSync true after DeleteSync", label);
+   GLenum err = p_glGetError();
+   CHECK(err == GL_NO_ERROR, "%s sync: GL error 0x%x", label, err);
+   /* An invalid name gets the synchronous path's error. */
+   r = p_glClientWaitSync((GLsync)(uintptr_t)0x10, 0, 0);
+   err = p_glGetError();
+   CHECK(r == GL_WAIT_FAILED && err == GL_INVALID_VALUE,
+         "%s sync: bad name answered 0x%x, error 0x%x", label, r, err);
+   wink_make_current(NULL, NULL, NULL);
+   wink_context_destroy(ctx);
+}
+
 /* Texture uploads from client memory, the way Minecraft uploads its animated
  * sprites and lightmap: with GL on the main thread they are sent along as a
  * copy, and the application rewrites its pixels the moment each call returns.
@@ -2347,6 +2415,7 @@ run_pass(const char *label)
    client_arrays(label, surface);
    big_uploads(label, surface);
    glthread_queries(label, surface);
+   sync_objects(label, surface);
    client_textures(label, surface);
    alphaless_targets(label, surface);
 

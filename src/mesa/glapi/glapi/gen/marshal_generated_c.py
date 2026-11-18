@@ -103,6 +103,22 @@ class PrintCode(gl_XML.gl_print_base):
             if func.name in ('TexImage2D', 'TexSubImage2D'):
                 out('if (_mesa_glthread_remote_{0}(ctx, {1}))'.format(func.name, args))
                 out('   return;')
+            # A fence made, and waited on, without a round trip (WINK_ASYNC_FENCE,
+            # glthread.c); what that does not take falls through to the wait.
+            if func.name == 'FenceSync':
+                out('{')
+                with indent():
+                    out('GLsync s = _mesa_glthread_remote_FenceSync(ctx, {0});'.format(args))
+                    out('if (s)')
+                    out('   return s;')
+                out('}')
+            if func.name == 'ClientWaitSync':
+                out('{')
+                with indent():
+                    out('GLenum r;')
+                    out('if (_mesa_glthread_remote_ClientWaitSync(ctx, {0}, &r))'.format(args))
+                    out('   return r;')
+                out('}')
             # Named for _mesa_glthread_remote_census: every wait is one round
             # trip through the driver thread, and which calls make them is the
             # question the census answers -- by pname where there is one.

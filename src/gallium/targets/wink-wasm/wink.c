@@ -1475,6 +1475,18 @@ wink_swap_buffers(wink_surface *s)
                  (int)tls_current->st->ctx->GLThread.queue.max_jobs + 2,
                  (readbacks - last_readbacks) / 240.0,
                  (kicks - last_kicks) / 240.0);
+         /* WINK_ASYNC_FENCE (glthread.c): ClientWaitSync answered here, with no
+          * round trip: the fence already signalled, waited for, or timed out. */
+         static uint64_t last_fences[3];
+         uint64_t fences[3];
+         for (unsigned f = 0; f < 3; ++f) {
+            fences[f] = _mesa_glthread_remote_fences[f] - last_fences[f];
+            last_fences[f] = _mesa_glthread_remote_fences[f];
+         }
+         fprintf(stderr, "wink: ClientWaitSync answered on the GL thread %.2f "
+                 "already signalled, %.2f waited for, %.2f timed out a frame "
+                 "over 240 frames (WINK_ASYNC_FENCE)\n", fences[0] / 240.0,
+                 fences[1] / 240.0, fences[2] / 240.0);
          swap_wait_ns = 0;
          last_full_ns = full_ns;
          last_readbacks = readbacks;

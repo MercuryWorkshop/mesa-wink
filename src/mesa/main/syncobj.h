@@ -47,6 +47,17 @@ _mesa_free_sync_data(struct gl_context *);
 extern GLsync
 _mesa_fence_sync(struct gl_context *ctx, GLenum condition, GLbitfield flags);
 
+#if MESA_GLTHREAD_REMOTE
+struct gl_sync_object *
+_mesa_new_remote_sync(struct gl_context *ctx, GLenum condition, GLbitfield flags);
+
+void
+_mesa_fence_sync_flush(struct gl_context *ctx, struct gl_sync_object *syncObj);
+
+void
+_mesa_publish_sync(struct gl_context *ctx, struct gl_sync_object *syncObj);
+#endif
+
 struct gl_sync_object *
 _mesa_get_and_ref_sync(struct gl_context *ctx, GLsync sync, bool incRefCount);
 
